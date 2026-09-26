@@ -150,7 +150,7 @@ async def test_executor_resumes_from_actual_sqlite_roundtrip(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("work_kind", ["support_finalize", "claim_assess"])
+@pytest.mark.parametrize("work_kind", ["support_finalize", "candidate_admission", "claim_assess"])
 async def test_atomic_commit_requires_complete_final_work(tmp_path, work_kind):
     from memforge.memory.lifecycle_plan import (
         LifecyclePlan,

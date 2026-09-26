@@ -18,8 +18,8 @@ from pydantic import ConfigDict, ValidationError
 from memforge.evals.agent_evaluation import QualitySignalCollector, quality_signal_scope
 from memforge.llm.structured import (
     AgentSessionAuthorityResponse,
-    CandidateLedgerDecision,
-    CandidateLedgerResponse,
+    CandidateAdmissionDecision,
+    CandidateAdmissionResponse,
     EntityBatchValidationDecision,
     EntityBatchValidationResponse,
     LiteLlmStructuredClient,
@@ -136,7 +136,7 @@ async def test_structured_llm_admission_is_shared_across_client_instances(
         max_concurrent=2,
     )
     clients = (LiteLlmStructuredClient(config), LiteLlmStructuredClient(config))
-    tasks = [asyncio.create_task(clients[index % 2].select_memory_candidates(f"prompt-{index}")) for index in range(6)]
+    tasks = [asyncio.create_task(clients[index % 2].admit_candidates(f"prompt-{index}", max_tokens=512)) for index in range(6)]
 
     await asyncio.wait_for(two_admitted.wait(), timeout=0.5)
     await asyncio.sleep(0)
@@ -745,7 +745,7 @@ async def test_litellm_structured_client_uses_explicit_json_schema_response_form
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
         return CompletionResponse(
-            '{"decisions":[{"candidate_index":0,"action":"KEEP","canonical_index":null,"reason":"unique"}]}'
+            '{"decisions":[{"candidate_id":"CND-0001","verdict":"ADMITTED","reject_reason":null,"duplicate_of":[],"reason":"complete"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -760,18 +760,18 @@ async def test_litellm_structured_client_uses_explicit_json_schema_response_form
         )
     )
 
-    response = await client.select_memory_candidates("classify the candidate")
+    response = await client.admit_candidates("admit the candidate", max_tokens=512)
 
-    assert response.decisions[0].action == "KEEP"
+    assert response.decisions[0].verdict == "ADMITTED"
     assert len(calls) == 1
     call = calls[0]
     assert "output_config" not in call
     assert call["response_format"] == {
         "type": "json_schema",
         "json_schema": {
-            "name": "CandidateLedgerResponse",
+            "name": "CandidateAdmissionResponse",
             "strict": True,
-            "schema": CandidateLedgerResponse.model_json_schema(),
+            "schema": CandidateAdmissionResponse.model_json_schema(),
         },
     }
 
@@ -786,7 +786,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "ClaimRevisionWireResponse": '{"results":[]}',
         "ProjectionFragmentMemoryExtractionResponse": '{"memories":[]}',
         "ProjectionFragmentSelectorCorrectionResponse": '{"corrections":[]}',
-        "CandidateLedgerResponse": '{"decisions":[]}',
+        "CandidateAdmissionResponse": '{"decisions":[]}',
         "MemoryRelationResponse": '{"decisions":[]}',
         "MemoryRelationCatalogResponse": '{"results":[]}',
         "CrossDocumentRelationResponse": '{"decisions":[]}',
@@ -825,7 +825,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "correct_projection_fragment_selectors": lambda: client.correct_projection_fragment_selectors(
             "prompt", max_tokens=512,
         ),
-        "select_memory_candidates": lambda: client.select_memory_candidates("prompt"),
+        "admit_candidates": lambda: client.admit_candidates("prompt", max_tokens=512),
         "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
         "discover_memory_relations": lambda: client.discover_memory_relations("prompt"),
         "classify_cross_document_relations": lambda: client.classify_cross_document_relations(
@@ -1118,9 +1118,9 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
         schema = kwargs["response_format"]
-        if schema is CandidateLedgerResponse:
+        if schema is CandidateAdmissionResponse:
             return CompletionResponse(
-                '{"decisions":[{"candidate_index":0,"action":"KEEP"}]}'
+                '{"decisions":[{"candidate_id":"CND-0001","verdict":"ADMITTED"}]}'
             )
         if schema is EntityBatchValidationResponse:
             return CompletionResponse(
@@ -1147,13 +1147,13 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
         )
     )
 
-    assert (await client.select_memory_candidates("prompt")).decisions[0].action == "KEEP"
+    assert (await client.admit_candidates("prompt", max_tokens=512)).decisions[0].verdict == "ADMITTED"
     assert (await client.classify_memory_relations("prompt")).decisions[0].direction == "challenger_to_candidate"
     assert (await client.validate_entity_batch("prompt")).decisions[0].matched_id == 7
     assert (await client.rerank_memories("prompt")).ranking == [2, 0, 1]
 
     assert [call["response_format"] for call in calls] == [
-        CandidateLedgerResponse,
+        CandidateAdmissionResponse,
         MemoryRelationResponse,
         EntityBatchValidationResponse,
         RerankResponse,
@@ -1196,16 +1196,16 @@ def test_memory_relation_schema_requires_scope_proof_for_contradiction() -> None
 
 def test_batch_decisions_name_the_item_they_judge() -> None:
     with pytest.raises(ValidationError):
-        CandidateLedgerResponse.model_validate({"decisions": [{"action": "KEEP"}]})
+        CandidateAdmissionResponse.model_validate({"decisions": [{"verdict": "ADMITTED"}]})
     with pytest.raises(ValidationError):
         EntityBatchValidationResponse.model_validate({"decisions": [{"matched_id": 7, "confidence": 0.99}]})
     with pytest.raises(ValidationError):
-        CandidateLedgerResponse.model_validate({"decisions": [{"index": 0, "action": "KEEP"}]})
+        CandidateAdmissionResponse.model_validate({"decisions": [{"index": 0, "verdict": "ADMITTED"}]})
 
 
 def test_transient_batch_schemas_use_decision_arrays() -> None:
-    ledger = CandidateLedgerResponse(
-        decisions=[CandidateLedgerDecision(candidate_index=0, action="KEEP")]
+    admission = CandidateAdmissionResponse(
+        decisions=[CandidateAdmissionDecision(candidate_id="CND-0001", verdict="ADMITTED")]
     )
     entities = EntityBatchValidationResponse(
         decisions=[
@@ -1213,16 +1213,16 @@ def test_transient_batch_schemas_use_decision_arrays() -> None:
         ]
     )
 
-    assert ledger.decisions[0].action == "KEEP"
+    assert admission.decisions[0].verdict == "ADMITTED"
     assert entities.decisions[0].matched_id == 7
-    assert set(CandidateLedgerResponse.model_json_schema()["properties"]) == {
+    assert set(CandidateAdmissionResponse.model_json_schema()["properties"]) == {
         "decisions"
     }
     assert set(EntityBatchValidationResponse.model_json_schema()["properties"]) == {
         "decisions"
     }
     with pytest.raises(ValidationError):
-        CandidateLedgerResponse.model_validate({"slot_00": {"action": "KEEP"}})
+        CandidateAdmissionResponse.model_validate({"slot_00": {"verdict": "ADMITTED"}})
     with pytest.raises(ValidationError):
         EntityBatchValidationResponse.model_validate(
             {"slot_00": {"matched_id": 7, "confidence": 0.99}}
@@ -1599,7 +1599,7 @@ async def test_litellm_structured_client_fails_closed_when_litellm_rejects_schem
     )
 
     with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response") as raised:
-        await client.select_memory_candidates("prompt")
+        await client.admit_candidates("prompt", max_tokens=512)
     assert raised.value.error_code == "Exception"
 
 
@@ -1619,7 +1619,7 @@ async def test_litellm_structured_client_fails_closed_on_missing_content(monkeyp
     )
 
     with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response") as raised:
-        await client.select_memory_candidates("prompt")
+        await client.admit_candidates("prompt", max_tokens=512)
     assert raised.value.error_code == "structured_llm_error"
 
 
@@ -1992,7 +1992,7 @@ async def test_litellm_structured_client_fails_closed_on_invalid_schema(monkeypa
     )
 
     with pytest.raises(StructuredLlmError):
-        await client.select_memory_candidates("prompt")
+        await client.admit_candidates("prompt", max_tokens=512)
 
 
 @pytest.mark.asyncio
@@ -2011,7 +2011,7 @@ async def test_litellm_structured_client_fails_closed_when_decisions_missing(mon
     )
 
     with pytest.raises(StructuredLlmError):
-        await client.select_memory_candidates("prompt")
+        await client.admit_candidates("prompt", max_tokens=512)
 
 
 @pytest.mark.asyncio

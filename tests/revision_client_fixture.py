@@ -46,7 +46,6 @@ class RevisionProof(BaseModel):
     same_memory_identity: bool
     preserves_incumbent_truth: bool
     candidate_is_canonical_composite: bool
-    current_evidence_entails_candidate: bool
     reason: str = ""
 
 
@@ -89,14 +88,14 @@ def legacy_groups(prompt):
     return [dict(challenger={"content": c["text"], "type": c["type"], "valid_from": c["valid_from"], "valid_until": c["valid_until"]},
         current_evidence=[data["evidence_catalog"][ref] for ref in c["evidence_refs"]],
         candidates=[dict(pair_index=i * len(data["existing_claims"]) + j, content=m["text"], type=m["type"],
-            valid_from=m["valid_from"], valid_until=m["valid_until"], incumbent_support=m["current_support"])
+            valid_from=m["valid_from"], valid_until=m["valid_until"])
             for j, m in enumerate(data["existing_claims"])]) for i, c in enumerate(data["new_claims"])]
 
 
 def sparse_response(prompt, decisions):
     from memforge.llm.structured import ClaimRevisionWireResponse
     data = catalog_payload(prompt)
-    rows = [dict(candidate_id=c["id"], evidence_status="entailed", relations=[], uncertain_existing_ids=[]) for c in data["new_claims"]]
+    rows = [dict(candidate_id=c["id"], relations=[], uncertain_existing_ids=[]) for c in data["new_claims"]]
     count = len(data["existing_claims"])
     for d in decisions:
         i, j = divmod(d.pair_index, count)
@@ -128,6 +127,12 @@ class RevisionClientFixture:
 
     def request_tokens(self, prompt, **kwargs):
         return len(prompt)
+
+    async def admit_candidates(self, prompt, **kwargs):
+        """Admit every Candidate; admission scenarios have their own contract tests."""
+        from tests.llm_fixture import admit_every_candidate
+
+        return admit_every_candidate(prompt)
 
     async def discover_memory_relations(self, prompt, **kwargs):
         """Adapt existing scenario judgments to the sparse wire fixture."""
@@ -256,7 +261,6 @@ class RevisionClientFixture:
                 "challenger": group["challenger"],
                 "candidate": old,
                 "current_evidence": group["current_evidence"],
-                "incumbent_support": old["incumbent_support"],
             }
             for group in groups
             for old in group["candidates"]
@@ -278,13 +282,11 @@ class RevisionClientFixture:
                 ClaimRevisionDecision(
                     pair_index=relation.pair_index,
                     status="resolved",
-                    consistent_with_support=True,
                     relation=MemoryRelationAssessment.model_validate(relation.model_dump(exclude={"pair_index"})),
                     revision_assessment=RevisionAssessment(
                         same_knowledge_item=proofs[relation.pair_index].same_memory_identity,
                         preserves_incumbent_truth=proofs[relation.pair_index].preserves_incumbent_truth,
                         challenger_is_complete_current_claim=proofs[relation.pair_index].candidate_is_canonical_composite,
-                        current_evidence_entails_challenger=proofs[relation.pair_index].current_evidence_entails_candidate,
                     )
                     if relation.pair_index in proofs
                     else (
@@ -292,7 +294,6 @@ class RevisionClientFixture:
                             same_knowledge_item=False,
                             preserves_incumbent_truth=False,
                             challenger_is_complete_current_claim=False,
-                            current_evidence_entails_challenger=False,
                         )
                         if not hasattr(self, "prove_revisions")
                         and relation.classification == "refines"

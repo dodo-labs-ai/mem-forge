@@ -13,7 +13,8 @@ if TYPE_CHECKING:
     from memforge.llm.batch_runner import ItemFailure, LlmRequest
 
 WorkKind = Literal[
-    "support_assess", "support_scan", "support_reduce", "support_finalize", "claim_assess", "change_impact",
+    "support_assess", "support_scan", "support_reduce", "support_finalize", "candidate_admission", "claim_assess",
+    "change_impact",
 ]
 
 

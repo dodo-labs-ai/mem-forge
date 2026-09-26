@@ -112,7 +112,7 @@ from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.source_sync_manifest import SourceSyncManifestStore
 from memforge.scheduler import SOURCE_SCHEDULE_SCAN_JOB_ID, SyncScheduler
-from tests.llm_fixture import NoopMemoryExtractor
+from tests.llm_fixture import AdmittingClient, NoopMemoryExtractor
 from tests.unit_support_fixture import active_support_evidence
 
 
@@ -9991,6 +9991,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
             ),
             db=db,
             memory_store=memory_store,
+            structured_llm_client=AdmittingClient(),
         ),
         memory_store=memory_store,
         max_concurrent=1,

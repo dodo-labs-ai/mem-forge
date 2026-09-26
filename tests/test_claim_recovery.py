@@ -37,8 +37,7 @@ async def test_last_of_24_claim_requests_resumes_after_database_reopen(tmp_path)
     path = tmp_path / "claim.db"
     db, root = await prepare_database(path)
     olds = [replace(memory(), id=f"old-{i:03}") for i in range(183)]
-    kwargs = dict(candidates=[replace(candidate(), content=f"claim {i}") for i in range(8)], incumbents=olds,
-        support_audits=[SupportAuditEntry(old.id, True) for old in olds], model="fixture",
+    kwargs = dict(candidates=[replace(candidate(), content=f"claim {i}") for i in range(8)], incumbents=olds, model="fixture",
         derivation_id=root.id, operation_input_hash="a" * 64)
     # Each candidate reads its 183 incumbents in the longest fitting chunks: 64 + 64 + 55.
     first = PairClient(fail_at=24)
@@ -55,7 +54,6 @@ async def test_last_of_24_claim_requests_resumes_after_database_reopen(tmp_path)
         result = await assess_claim_pairs(**kwargs, client=retry, store=db)
         assert retry.calls == 1
         assert len(result.decisions) == 0
-        assert result.blocked_candidates == ()
         assert len(result.work_ids) == 24
         cursor = await db.db.execute("SELECT id FROM lifecycle_plans")
         assert not await cursor.fetchall()
@@ -100,7 +98,7 @@ async def test_provider_validation_diagnostic_reaches_durable_lifecycle_event(mo
     from memforge.evals.agent_evaluation import bind_source_lifecycle_outcome
     from tests.test_structured_llm import CompletionResponse
     async def invalid(**kwargs):
-        return CompletionResponse('{"results":[{"candidate_id":"NEW-0001","evidence_status":"entailed","relations":[{"existing_id":"MEM-0001","relation":"invalid"}],"uncertain_existing_ids":[]}]}')
+        return CompletionResponse('{"results":[{"candidate_id":"NEW-0001","relations":[{"existing_id":"MEM-0001","relation":"invalid"}],"uncertain_existing_ids":[]}]}')
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", invalid)
     client = LiteLlmStructuredClient(StructuredLlmConfig(model="openai/gpt-4o-mini", api_key="fixture",
         base_url=None, timeout_s=5, num_retries=0, native_schema_transport="response_format"))

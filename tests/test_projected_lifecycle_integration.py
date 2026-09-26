@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from tests.llm_fixture import FixtureBudgetClient
+from tests.llm_fixture import AdmittingClient, FixtureBudgetClient, admission_payload
 from tests.unit_support_fixture import (
     active_support_evidence,
     primary_reference,
@@ -31,8 +31,8 @@ import pytest_asyncio
 
 
 from memforge.llm.structured import (
-    CandidateLedgerDecision,
-    CandidateLedgerResponse,
+    CandidateAdmissionDecision,
+    CandidateAdmissionResponse,
     MemoryRelationDecision,
     MemoryRelationResponse,
     StructuredLlmError,
@@ -47,6 +47,7 @@ from memforge.evals.agent_evaluation import (
     record_quality_signal,
 )
 from memforge.memory.audit import MemoryAuditLogger
+from memforge.memory.candidate_admission import CandidateAdmissionError
 from memforge.memory.engine import (
     DeferredProjectedLifecycleHandle,
     MemoryEngine,
@@ -567,7 +568,6 @@ class _AdditiveRevisionClient(RevisionClientFixture):
                     same_memory_identity=True,
                     preserves_incumbent_truth=True,
                     candidate_is_canonical_composite=True,
-                    current_evidence_entails_candidate=True,
                     reason="The candidate is the complete current timeout claim.",
                 )
             ]
@@ -614,7 +614,7 @@ class _RunbookComponentFallbackClient(RevisionClientFixture):
         pairs = json.loads(prompt.split("<refinement_pairs>")[1].split("</refinement_pairs>")[0])
         return RevisionProofs(decisions=[RevisionProof(
             pair_index=index, same_memory_identity=False, preserves_incumbent_truth=False,
-            candidate_is_canonical_composite=False, current_evidence_entails_candidate=True,
+            candidate_is_canonical_composite=False,
             reason="Resolved separate procedure; not a lossless replacement.",
         ) for index in range(len(pairs))])
 
@@ -633,7 +633,6 @@ class _RunbookComponentRevisionClient(_RunbookComponentFallbackClient):
                     same_memory_identity=True,
                     preserves_incumbent_truth=True,
                     candidate_is_canonical_composite=True,
-                    current_evidence_entails_candidate=True,
                     reason="The canonical procedure preserves this branch verbatim.",
                 )
                 for item in json.loads(pairs_json)
@@ -696,6 +695,7 @@ async def test_lifecycle_commit_rejection_returns_failure_bundle_without_success
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
     )
 
     with pytest.raises(SourceUnitLifecycleExecutionError) as failure:
@@ -755,6 +755,7 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
         db=db,
         memory_store=_OutboxDrainer(db),
         runtime_event_trace_sink=runtime_sink,
+        structured_llm_client=AdmittingClient(),
     )
     await engine.prepare_and_commit_projected_lifecycle(
         projection=first,
@@ -854,6 +855,7 @@ async def test_additive_refinement_commits_revision_with_candidate_local_evidenc
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
     )
     await initial_engine.prepare_and_commit_projected_lifecycle(
         projection=first,
@@ -942,11 +944,7 @@ async def test_runbook_component_fallback_commits_candidate_once_and_keeps_branc
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_AuditedOutboxDrainer(db),
-        structured_llm_client=_CandidateLedgerClient(
-            _candidate_ledger_response(
-                *(CandidateLedgerDecision(candidate_index=index, action="KEEP") for index in range(len(branch_claims)))
-            )
-        ),
+        structured_llm_client=AdmittingClient(),
     )
     await initial_engine.prepare_and_commit_projected_lifecycle(
         projection=first,
@@ -1042,11 +1040,7 @@ async def test_runbook_component_revision_creates_one_replacement_for_all_branch
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_AuditedOutboxDrainer(db),
-        structured_llm_client=_CandidateLedgerClient(
-            _candidate_ledger_response(
-                *(CandidateLedgerDecision(candidate_index=index, action="KEEP") for index in range(len(branch_claims)))
-            )
-        ),
+        structured_llm_client=AdmittingClient(),
     )
     await initial_engine.prepare_and_commit_projected_lifecycle(
         projection=first,
@@ -1146,7 +1140,9 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
     engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
+        document_store=SimpleNamespace(read_artifact=lambda uri: b"valid-image-revision"),
         memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
     )
     await engine.prepare_and_commit_projected_lifecycle(
         projection=first,
@@ -1243,6 +1239,7 @@ async def test_context_artifact_does_not_become_active_support_dependency(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
     )
     await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
@@ -1296,7 +1293,9 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
     engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
+        document_store=SimpleNamespace(read_artifact=lambda uri: b"current-body-image"),
         memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
     )
     await engine.prepare_and_commit_projected_lifecycle(
         projection=first,
@@ -1387,6 +1386,23 @@ class _RecordingAddClient(RevisionClientFixture):
         )
 
 
+class _RejectingAddClient(_RecordingAddClient):
+    """Rejects one Candidate for incomplete Evidence and admits the rest."""
+
+    def __init__(self, incumbent_id: str, rejected_claim: str) -> None:
+        super().__init__(incumbent_id)
+        self.rejected_claim = rejected_claim
+
+    async def admit_candidates(self, prompt: str, **kwargs):
+        del kwargs
+        return CandidateAdmissionResponse(decisions=[
+            CandidateAdmissionDecision(candidate_id=row["id"], verdict="REJECTED", reject_reason="evidence_incomplete")
+            if row["claim"] == self.rejected_claim
+            else CandidateAdmissionDecision(candidate_id=row["id"], verdict="ADMITTED")
+            for row in admission_payload(prompt)["candidates"]
+        ])
+
+
 class _PersistentlyIncompleteAuditClient(RevisionClientFixture):
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
@@ -1466,22 +1482,17 @@ class _AuditedOutboxDrainer(_OutboxDrainer):
         await self.audit_logger.emit(event_type, status, **fields)
 
 
-class _CandidateLedgerClient(FixtureBudgetClient):
-    def __init__(self, response: CandidateLedgerResponse) -> None:
-        super().__init__(respond=lambda _prompt: response)
+class _AdmissionClient(FixtureBudgetClient):
+    """Answers every admission request with the scenario's decisions for its Candidates."""
 
-    @property
-    def calls(self) -> int:
-        return len(self.prompts)
+    def __init__(self, *decisions: CandidateAdmissionDecision) -> None:
+        by_id = {decision.candidate_id: decision for decision in decisions}
+        super().__init__(respond=lambda prompt: CandidateAdmissionResponse(decisions=[
+            by_id[candidate["id"]] for candidate in admission_payload(prompt)["candidates"] if candidate["id"] in by_id
+        ]))
 
-    async def select_memory_candidates(self, prompt: str, *, max_tokens: int, model=None):
+    async def admit_candidates(self, prompt: str, *, max_tokens: int, model=None, images=()):
         return await self.call(prompt, max_tokens=max_tokens, model=model)
-
-
-def _candidate_ledger_response(
-    *decisions: CandidateLedgerDecision,
-) -> CandidateLedgerResponse:
-    return CandidateLedgerResponse(decisions=list(decisions))
 
 
 class _FailingOutboxDrainer(_OutboxDrainer):
@@ -1553,7 +1564,7 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=store,
-        structured_llm_client=None,
+        structured_llm_client=(client := AdmittingClient()),
     )
 
     stats = await engine.prepare_and_commit_projected_lifecycle(
@@ -1572,41 +1583,19 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
 
     async with db.db.execute("SELECT content FROM memories") as cursor:
         rows = await cursor.fetchall()
-    events = await db.list_memory_audit_events(event_type="candidate_ledger_completed")
+    events = await db.list_memory_audit_events(event_type="candidate_admission_rejected")
 
     assert stats["added"] == 1
     assert stats["skipped"] == 1
-    assert stats["candidate_ledger_input_count"] == 2
-    assert stats["candidate_ledger_selected_count"] == 1
-    assert stats["candidate_ledger_llm_calls"] == 0
+    assert stats["candidate_admission_admitted_count"] == 1
+    assert stats["candidate_admission_merged_count"] == 1
+    assert stats["candidate_admission_rejected_count"] == 0
+    assert stats["candidate_admission_llm_calls"] == 1
+    [request] = [admission_payload(prompt) for prompt in client.admission_prompts]
+    assert [candidate["claim"] for candidate in request["candidates"]] == [canonical.content]
+    assert [row["claim"] for row in request["round_claims"]] == [canonical.content]
     assert [row["content"] for row in rows] == [canonical.content]
-    assert len(events) == 1
-    assert events[0].source_id == "src-1"
-    assert events[0].doc_id == "confluence-123"
-    assert events[0].payload == {
-        "input_count": 2,
-        "semantic_input_count": 1,
-        "selected_count": 1,
-        "dropped_exact_count": 1,
-        "dropped_redundant_count": 0,
-        "dropped_low_value_count": 0,
-        "structured_llm_calls": 0,
-        "structured_llm_elapsed_ms": 0,
-        "validation_retries": 0,
-        "fallback_batch_count": 0,
-        "fallback_candidate_count": 0,
-        "prompt_chars": 0,
-        "drops": [
-            {
-                "candidate_content_hash": content_hash(duplicate.content),
-                "candidate_source_observation_id": observation_id,
-                "canonical_content_hash": content_hash(canonical.content),
-                "canonical_source_observation_id": observation_id,
-                "method": "exact_content",
-                "reason": "normalized content is identical",
-            }
-        ],
-    }
+    assert events == []
 
 
 @pytest.mark.asyncio
@@ -1632,15 +1621,14 @@ async def test_projected_lifecycle_records_low_value_admission_without_content(
         evidence_quote=instance_content,
         source_observation_id=observation_id,
     )
-    client = _CandidateLedgerClient(
-        _candidate_ledger_response(
-            CandidateLedgerDecision(candidate_index=0, action="KEEP"),
-            CandidateLedgerDecision(
-                candidate_index=1,
-                action="DROP_LOW_VALUE",
-                reason=f"Do not persist: {instance_content}",
-            ),
-        )
+    client = _AdmissionClient(
+        CandidateAdmissionDecision(candidate_id="CND-0001", verdict="ADMITTED"),
+        CandidateAdmissionDecision(
+            candidate_id="CND-0002",
+            verdict="REJECTED",
+            reject_reason="low_value",
+            reason=f"Do not persist: {instance_content}",
+        ),
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
@@ -1665,15 +1653,32 @@ async def test_projected_lifecycle_records_low_value_admission_without_content(
     )
 
     memories = await db.list_memories()
-    [event] = await db.list_memory_audit_events(event_type="candidate_ledger_completed")
+    [event] = await db.list_memory_audit_events(event_type="candidate_admission_rejected")
+    revision = projection.source_unit_revisions[0]
 
     assert [memory.content for memory in memories] == [durable_content]
-    assert stats["candidate_ledger_dropped_low_value_count"] == 1
-    assert event.payload["dropped_low_value_count"] == 1
-    [drop] = event.payload["drops"]
-    assert drop["method"] == "structured_quality"
-    assert drop["reason"] == "low_value_admission"
-    assert instance_content not in str(event.payload)
+    assert stats["candidate_admission_admitted_count"] == 1
+    assert stats["candidate_admission_rejected_count"] == 1
+    assert stats["candidate_admission_merged_count"] == 0
+    assert event.reason == "low_value"
+    assert event.payload == {
+        "source_unit_id": revision.source_unit_id,
+        "target_unit_revision_id": revision.id,
+        "candidate_claim": instance_content,
+        "candidate_memory_type": "fact",
+        "reject_reason": "low_value",
+        "selected_evidence": [
+            {
+                "role": "primary",
+                "kind": "text",
+                "observation_id": observation_id,
+                "observation_revision_id": projection.observation_revisions[0].id,
+                "range_start": event.payload["selected_evidence"][0]["range_start"],
+                "range_end": event.payload["selected_evidence"][0]["range_end"],
+            }
+        ],
+    }
+    assert "Do not persist" not in str(event.payload)
 
 
 @pytest.mark.asyncio
@@ -1696,7 +1701,7 @@ async def test_projected_create_persists_validity_as_dates(db: Database) -> None
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
-        structured_llm_client=None,
+        structured_llm_client=AdmittingClient(),
     )
 
     stats = await engine.prepare_and_commit_projected_lifecycle(
@@ -1738,7 +1743,7 @@ async def test_entity_resolution_reads_each_mention_with_its_own_memory_text(db:
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
-        structured_llm_client=None,
+        structured_llm_client=AdmittingClient(),
     )
     received: list[dict[str, list[str]]] = []
     resolve_many = engine.entity_resolver.resolve_many
@@ -1767,17 +1772,15 @@ async def test_entity_resolution_reads_each_mention_with_its_own_memory_text(db:
 
 
 @pytest.mark.asyncio
-async def test_incomplete_candidate_ledger_is_audited_as_fallback_and_keeps_memories(
+async def test_incomplete_candidate_admission_leaves_the_revision_uncommitted(
     db: Database,
 ) -> None:
     projection = _projection(
-        run_id="projection-candidate-ledger-failed",
+        run_id="projection-candidate-admission-failed",
         body="The trigger remained OPEN. The trigger was not processed.",
     )
     observation_id = projection.observations[0].id
-    client = _CandidateLedgerClient(
-        _candidate_ledger_response(CandidateLedgerDecision(candidate_index=0, action="KEEP"))
-    )
+    client = _AdmissionClient(CandidateAdmissionDecision(candidate_id="CND-0001", verdict="ADMITTED"))
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
@@ -1786,47 +1789,41 @@ async def test_incomplete_candidate_ledger_is_audited_as_fallback_and_keeps_memo
         structured_llm_client=client,
     )
 
-    await engine.prepare_and_commit_projected_lifecycle(
-        projection=projection,
-        doc_id="confluence-123",
-        raw_memories=_selected(projection, [
-            RawMemory(
-                content="The trigger remained OPEN.",
-                memory_type="fact",
-                evidence_quote="The trigger remained OPEN.",
-                source_observation_id=observation_id,
-            ),
-            RawMemory(
-                content="The trigger was not processed.",
-                memory_type="fact",
-                evidence_quote="The trigger was not processed.",
-                source_observation_id=observation_id,
-            ),
-        ]),
-        doc_type="ticket",
-        project_key="ENG",
-        repo_identifier=None,
-        document_content=projection.observation_revisions[0].content,
-        update_mode="full_document",
-        changed_hunks=None,
-        update_plan_stats=None,
-        source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
-    )
+    with pytest.raises(CandidateAdmissionError, match="judge every requested Candidate"):
+        await engine.prepare_and_commit_projected_lifecycle(
+            projection=projection,
+            doc_id="confluence-123",
+            raw_memories=_selected(projection, [
+                RawMemory(
+                    content="The trigger remained OPEN.",
+                    memory_type="fact",
+                    evidence_quote="The trigger remained OPEN.",
+                    source_observation_id=observation_id,
+                ),
+                RawMemory(
+                    content="The trigger was not processed.",
+                    memory_type="fact",
+                    evidence_quote="The trigger was not processed.",
+                    source_observation_id=observation_id,
+                ),
+            ]),
+            doc_type="ticket",
+            project_key="ENG",
+            repo_identifier=None,
+            document_content=projection.observation_revisions[0].content,
+            update_mode="full_document",
+            changed_hunks=None,
+            update_plan_stats=None,
+            source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+        )
 
     async with db.db.execute("SELECT COUNT(*) AS total FROM memories") as cursor:
         row = await cursor.fetchone()
-    events = await db.list_memory_audit_events(event_type="candidate_ledger_completed")
 
-    assert row["total"] == 2
-    assert client.calls == 2
-    assert len(events) == 1
-    assert events[0].status == "committed"
-    assert events[0].reason == "candidate_admission_with_fallback"
-    assert events[0].payload["input_count"] == 2
-    assert events[0].payload["semantic_input_count"] == 2
-    assert events[0].payload["selected_count"] == 2
-    assert events[0].payload["fallback_batch_count"] == 1
-    assert events[0].payload["fallback_candidate_count"] == 2
+    assert row["total"] == 0
+    # The first request and its one correction both omit the second Candidate.
+    assert len(client.prompts) == 2
+    assert await db.get_current_source_unit_revision(projection.source_units[0].id) is None
 
 
 class _SemanticEquivalentClient(RevisionClientFixture):
@@ -4883,7 +4880,7 @@ async def test_explicit_empty_revision_deterministically_removes_incumbent_suppo
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
-        structured_llm_client=None,
+        structured_llm_client=AdmittingClient(),
     )
 
     stats = await engine.prepare_and_commit_projected_lifecycle(
@@ -5234,6 +5231,79 @@ async def test_partial_jira_projection_keeps_a_validated_support_on_an_unreturne
 
 
 @pytest.mark.asyncio
+async def test_only_admitted_candidates_reach_relation_and_rejections_add_nothing(db: Database) -> None:
+    await _set_fixture_source_type(db, "jira")
+    first = _jira_projection(
+        run_id="projection-jira-admission-1",
+        description="Initial issue description.",
+        comment_body="Decision: retain A7",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(
+        db,
+        projection=first,
+        memory_id="mem-jira-admission-incumbent",
+        memory_content="Decision: retain A7",
+        observation_index=1,
+        source_type="jira",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    description_text = "Payroll validation requires approval before release."
+    second = _jira_projection(
+        run_id="projection-jira-admission-2",
+        description=description_text,
+        comment_body="Decision: retain A7",
+        prior=first.source_unit_revisions[0],
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
+    )
+    description = second.observations[0]
+    admitted = RawMemory(
+        content=description_text, memory_type="procedure",
+        evidence_quote=description_text, source_observation_id=description.id,
+    )
+    rejected_claim = "Payroll validation for US employees requires approval before release."
+    rejected = RawMemory(
+        content=rejected_claim, memory_type="procedure",
+        evidence_quote=description_text, source_observation_id=description.id,
+    )
+    client = _RejectingAddClient(incumbent.id, rejected_claim)
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_AuditedOutboxDrainer(db),
+        structured_llm_client=client,
+    )
+
+    stats = await engine.prepare_and_commit_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=_selected(second, [rejected, admitted]),
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=description_text,
+        update_mode="diff_guided",
+        changed_hunks=description_text,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+
+    [relation_prompt] = client.prompts
+    assert description_text in relation_prompt and rejected_claim not in relation_prompt
+    assert stats["added"] == 1 and stats["pending_review"] == 0
+    assert stats["candidate_admission_admitted_count"] == 1
+    assert stats["candidate_admission_rejected_count"] == 1
+    assert sorted(memory.content for memory in await db.list_memories(status="active")) == sorted(
+        [incumbent.content, description_text]
+    )
+    [event] = await db.list_memory_audit_events(event_type="candidate_admission_rejected")
+    assert event.payload["candidate_claim"] == rejected_claim
+    assert event.payload["reject_reason"] == "evidence_incomplete"
+    assert event.payload["target_unit_revision_id"] == second.source_unit_revisions[0].id
+
+
+@pytest.mark.asyncio
 async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation(
     db: Database,
     caplog: pytest.LogCaptureFixture,
@@ -5278,11 +5348,12 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
 
     async def provider(**kwargs):
         prompt = kwargs["messages"][0]["content"]
-        response = (
-            await responses.assess_claim_revisions(prompt)
-            if "<claim_catalog>" in prompt
-            else await responses.evaluate_revision_work(prompt, response_format=SupportAssessmentWireResponse)
-        )
+        if "<admission>" in prompt:
+            response = await responses.admit_candidates(prompt)
+        elif "<claim_catalog>" in prompt:
+            response = await responses.assess_claim_revisions(prompt)
+        else:
+            response = await responses.evaluate_revision_work(prompt, response_format=SupportAssessmentWireResponse)
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
@@ -5937,7 +6008,7 @@ async def test_destructive_commit_defers_on_stale_cross_unit_support(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
-        structured_llm_client=None,
+        structured_llm_client=AdmittingClient(),
     )
 
     with pytest.raises(ProjectedLifecycleDeferredError) as raised:
@@ -6288,7 +6359,7 @@ async def test_prepared_commit_rejects_undeclared_support_drift(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
-        structured_llm_client=None,
+        structured_llm_client=AdmittingClient(),
     )
     with pytest.raises(SourceUnitLifecycleDeferred) as raised:
         await engine.prepare_and_commit_projected_lifecycle(
@@ -7085,7 +7156,7 @@ async def test_same_source_cross_unit_exact_claim_reuses_memory_id_and_preserves
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
-        structured_llm_client=None,
+        structured_llm_client=AdmittingClient(),
     )
     first = _projection(
         run_id="projection-same-source-exact-1",
@@ -7246,7 +7317,7 @@ async def test_cross_source_exact_claim_reuses_memory_without_llm_and_preserves_
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
-        structured_llm_client=None,
+        structured_llm_client=AdmittingClient(),
     )
 
     stats = await engine.prepare_and_commit_projected_lifecycle(
@@ -7378,7 +7449,7 @@ async def test_ordinary_exact_admission_preserves_agent_claim_identity(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
-        structured_llm_client=None,
+        structured_llm_client=AdmittingClient(),
     )
 
     stats = await engine.prepare_and_commit_projected_lifecycle(
@@ -8937,6 +9008,7 @@ async def test_projected_quality_consumes_typed_observation_semantics(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
     )
 
     stats = await engine.prepare_and_commit_projected_lifecycle(
@@ -9007,6 +9079,7 @@ async def test_projected_lifecycle_enforces_candidate_quality_before_persistence
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
     )
 
     stats = await engine.prepare_and_commit_projected_lifecycle(
@@ -9059,6 +9132,7 @@ async def test_enabled_source_tombstone_retires_last_supported_incumbent(db: Dat
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
     )
 
     result = await engine.apply_projected_tombstone(
@@ -9099,6 +9173,7 @@ async def test_gated_source_tombstone_only_opens_review(db: Database) -> None:
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
     )
 
     result = await engine.apply_projected_tombstone(
@@ -9147,6 +9222,7 @@ async def test_tombstone_retains_document_when_unmapped_provenance_remains(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
     )
 
     result = await engine.apply_projected_tombstone(

@@ -120,18 +120,16 @@ class RevisionCompositionProof:
     same_memory_identity: bool
     preserves_incumbent_truth: bool
     candidate_is_canonical_composite: bool
-    current_evidence_entails_candidate: bool
-    complete_current_evidence: bool
     reason: str = ""
 
     @property
     def eligible(self) -> bool:
+        """Candidate admission already proved the candidate's current Evidence complete."""
+
         return (
             self.same_memory_identity
             and self.preserves_incumbent_truth
             and self.candidate_is_canonical_composite
-            and self.current_evidence_entails_candidate
-            and self.complete_current_evidence
         )
 
 
@@ -186,7 +184,7 @@ async def reconcile_memories(
         try:
             classifier = StructuredMemoryPairClassifier(client=structured_llm_client, model=llm_model)
             transient_candidates = tuple(_transient_candidate(index, raw) for index, raw in enumerate(new_extractions))
-            from memforge.pipeline.claim_revision import assess_claim_pairs, candidate_evidence
+            from memforge.pipeline.claim_revision import assess_claim_pairs
 
             operation = "assess_revision_support"
             if {entry.incumbent_id for entry in support_audits} != {old.id for old in existing_memories}:
@@ -194,8 +192,7 @@ async def reconcile_memories(
             operation = "assess_claim_revisions"
             relation_pair_count += len(new_extractions) * len(existing_memories)
             assessed = await assess_claim_pairs(
-                candidates=new_extractions, incumbents=existing_memories,
-                support_audits=support_audits, client=structured_llm_client,
+                candidates=new_extractions, incumbents=existing_memories, client=structured_llm_client,
                 model=llm_model, images=images, image_loader=image_loader,
                 store=work_store, derivation_id=derivation_id, operation_input_hash=operation_input_hash,
             )
@@ -225,13 +222,13 @@ async def reconcile_memories(
                         same_memory_identity=assessment.same_knowledge_item,
                         preserves_incumbent_truth=assessment.preserves_incumbent_truth,
                         candidate_is_canonical_composite=assessment.challenger_is_complete_current_claim,
-                        current_evidence_entails_candidate=assessment.current_evidence_entails_challenger,
-                        complete_current_evidence=candidate_evidence(new_extractions[index])[1],
                         reason=decision.reason,
                     ))
             revision_proof_count = len(proofs)
 
-            _, unresolved_incumbents = _unresolved_component(relation_entries, set(assessed.blocked_candidates))
+            _, unresolved_incumbents = _unresolved_component(
+                relation_entries, _support_conflicting_refinements(relation_entries, support_audits, proofs),
+            )
             refiners_by_incumbent = _supported_revision_candidates(
                 [entry for entry in relation_entries if entry.incumbent_id not in unresolved_incumbents], support_audits,
             )
@@ -268,7 +265,6 @@ async def reconcile_memories(
                 relations=relation_entries,
                 support_audits=support_audits,
                 revision_proofs=proofs,
-                blocked_candidates=assessed.blocked_candidates,
             )
             return _return_result(operations, metrics=metrics(), include_metadata=include_metadata, work_ids=assessed.work_ids)
         except ReconciliationContractError as error:
@@ -329,15 +325,18 @@ def reduce_relation_ledger(
     relations: list[RelationLedgerEntry],
     support_audits: list[SupportAuditEntry],
     revision_proofs: list[RevisionCompositionProof] | None = None,
-    blocked_candidates: tuple[int, ...] = (),
 ) -> list[ReconcileOperation]:
-    """Reduce explicit relationships and complete Support; omitted edges propose no action."""
+    """Reduce explicit relationships and complete Support; omitted edges propose no action.
+
+    Program code alone combines relations with Support. An unsupported incumbent
+    whose truth an admitted candidate preserves while refining it cannot lose its
+    Support: the two judgments conflict, so the pair stays unresolved locally.
+    """
 
     incumbent_ids = {memory.id for memory in existing_memories}
     candidate_indices = set(range(len(new_extractions)))
     actual_pairs = {(entry.candidate_index, entry.incumbent_id) for entry in relations}
     if (len(actual_pairs) != len(relations)
-            or not set(blocked_candidates).issubset(candidate_indices)
             or any(index not in candidate_indices or old_id not in incumbent_ids for index, old_id in actual_pairs)):
         raise ReconciliationContractError(
             "relation_ledger_incomplete",
@@ -361,7 +360,9 @@ def reduce_relation_ledger(
     for entry in relations:
         by_incumbent[entry.incumbent_id].append(entry)
 
-    skipped_candidates, skipped_incumbents = _unresolved_component(relations, set(blocked_candidates))
+    skipped_candidates, skipped_incumbents = _unresolved_component(
+        relations, _support_conflicting_refinements(relations, support_audits, proofs),
+    )
     consumed_candidates: set[int] = set(skipped_candidates)
     incumbent_operations: list[ReconcileOperation] = []
     for incumbent in existing_memories:
@@ -458,14 +459,38 @@ def reduce_relation_ledger(
     return [*candidate_operations, *incumbent_operations]
 
 
-def _unresolved_component(relations: list[RelationLedgerEntry], blocked_candidates: set[int] | None = None) -> tuple[set[int], set[str]]:
+def _support_conflicting_refinements(
+    relations: list[RelationLedgerEntry],
+    audits: list[SupportAuditEntry],
+    proofs: list[RevisionCompositionProof],
+) -> set[tuple[int, str]]:
+    """Refinement pairs whose candidate preserves the truth of an incumbent Support rejected."""
+
+    unsupported = {entry.incumbent_id for entry in audits if not entry.supported}
+    preserving = {(proof.candidate_index, proof.incumbent_id) for proof in proofs if proof.preserves_incumbent_truth}
+    return {
+        (entry.candidate_index, entry.incumbent_id)
+        for entry in relations
+        if entry.incumbent_id in unsupported
+        and entry.relation_type is MemoryRelationType.REFINES
+        and entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
+        and (entry.candidate_index, entry.incumbent_id) in preserving
+    }
+
+
+def _unresolved_component(
+    relations: list[RelationLedgerEntry], conflicting_pairs: set[tuple[int, str]],
+) -> tuple[set[int], set[str]]:
     """Keep uncertainty local without letting a shared candidate escape as ADD.
 
-    A candidate can touch more than one incumbent. Preserve the related component
-    together; unrelated pairs never spread uncertainty to independent knowledge.
+    Unresolved pairs and pairs whose relation conflicts with Support seed the
+    component. A candidate can touch more than one incumbent. Preserve the related
+    component together; unrelated pairs never spread uncertainty to independent knowledge.
     """
-    candidates = {entry.candidate_index for entry in relations if entry.relation_type is None} | (blocked_candidates or set())
-    incumbents = {entry.incumbent_id for entry in relations if entry.relation_type is None}
+    seeds = {(entry.candidate_index, entry.incumbent_id) for entry in relations if entry.relation_type is None}
+    seeds |= conflicting_pairs
+    candidates = {candidate_index for candidate_index, _ in seeds}
+    incumbents = {incumbent_id for _, incumbent_id in seeds}
     while True:
         size = len(candidates) + len(incumbents)
         for entry in relations:
