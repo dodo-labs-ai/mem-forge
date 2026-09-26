@@ -206,6 +206,7 @@ from memforge.local_agent.source_contract import (
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
     local_agent_sync_operation,
+    local_package_requires_source_time,
     validate_local_agent_replay_package,
 )
 from memforge.storage.admin_memory import MemoryAdminListFilters
@@ -1678,6 +1679,9 @@ class LocalSourcePackageRequest(BaseModel):
     File-like sources use ``markdown_body`` as raw file text for the declared
     ``content_type``. Structured sources such as Jira and Teams use
     ``raw_payload`` and defer canonical markdown rendering to the source gene.
+    ``source_updated_at`` is a file-like source's own time for this content
+    (an offset-aware ISO time); structured sources carry their times in
+    ``raw_payload``.
     """
 
     vault_id: str | None = None
@@ -1700,6 +1704,7 @@ class LocalSourcePackageRequest(BaseModel):
     source_url: str | None = None
     title: str | None = None
     raw_hash: str | None = None
+    source_updated_at: str | None = None
     provider_revision: str | None = None
     sync_snapshot_id: str | None = None
     local_agent_job_id: str | None = None
@@ -1772,12 +1777,20 @@ class LocalSourceManifestItemRequest(BaseModel):
 
 
 class LocalSourceManifestRequest(BaseModel):
+    """One covered local collection, planned against the retained packages.
+
+    ``package_contract_version`` is the package contract the local agent
+    collects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates
+    the numbered contract sends none.
+    """
+
     items: list[LocalSourceManifestItemRequest] = Field(max_length=10_000)
     coverage: Literal["complete_snapshot", "bounded_delta", "partial"]
     sync_snapshot_id: str
     local_agent_job_id: str
     local_agent_attempt_count: int = Field(ge=1)
     scope_attestations: list[dict[str, Any]] = Field(default_factory=list, max_length=10_000)
+    package_contract_version: int | None = Field(default=None, ge=1)
 
 
 class AgentSessionWindowRequest(BaseModel):
@@ -7485,6 +7498,7 @@ def create_admin_app(
                     blob_sha=req.blob_sha,
                     symlink_chain=req.symlink_chain,
                     resolved_relative_path=req.resolved_relative_path,
+                    source_updated_at=req.source_updated_at,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
                     document_store=artifact_store,
@@ -7539,6 +7553,7 @@ def create_admin_app(
                     content_type=req.content_type,
                     title=req.title,
                     raw_hash=req.raw_hash,
+                    source_updated_at=req.source_updated_at,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
                     document_store=artifact_store,
@@ -7572,7 +7587,7 @@ def create_admin_app(
                 )
                 raw_sha256 = local_agent_semantic_input_sha256(
                     result.get("doc_id"),
-                    result.get("document_hash"),
+                    result.get("semantic_hash"),
                 )
                 if not raw_sha256:
                     raise HTTPException(
@@ -7726,6 +7741,10 @@ def create_admin_app(
                 ],
                 retained_inputs,
                 coverage=coverage,
+                require_source_time=local_package_requires_source_time(
+                    source.get("type"),
+                    req.package_contract_version,
+                ),
             )
             manifest_sha256 = hashlib.sha256(
                 json.dumps(

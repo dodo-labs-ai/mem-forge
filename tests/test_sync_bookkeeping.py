@@ -6172,7 +6172,7 @@ async def test_force_resync_extracts_a_unit_whose_location_alone_changed(
 
 
 @pytest.mark.asyncio
-async def test_document_last_modified_becomes_memory_source_updated_at(db: Database):
+async def test_document_last_modified_is_not_read_as_memory_source_updated_at(db: Database):
     source_id = "src-document-source-updated"
     markdown = "# Design Doc\n\nThe service keeps source timestamps."
     last_modified = datetime(2026, 6, 10, 8, 30, tzinfo=timezone.utc)
@@ -6202,14 +6202,13 @@ async def test_document_last_modified_becomes_memory_source_updated_at(db: Datab
 
     assert state.last_sync_status == "success"
     assert len(memory_engine.projected_lifecycle_calls) == 1
-    # No source-specific metadata was supplied; document last_modified is the
-    # canonical source-side update time forwarded into memory provenance.
-    assert len(memory_engine.projected_lifecycle_calls) == 1
-    assert memory_engine.projected_lifecycle_calls[0]["source_updated_at"] == last_modified
+    # The Gene reported no source time. ``last_modified`` may be a discovery or
+    # submission time, so the Memory has no source time rather than that one.
+    assert memory_engine.projected_lifecycle_calls[0]["source_updated_at"] is None
 
 
 @pytest.mark.asyncio
-async def test_explicit_source_updated_at_overrides_document_last_modified(db: Database):
+async def test_gene_reported_source_updated_at_becomes_memory_source_updated_at(db: Database):
     source_id = "src-explicit-source-updated"
     markdown = "# Design Doc\n\nThe source gives a separate updated time."
     last_modified = datetime(2026, 6, 10, 8, 30, tzinfo=timezone.utc)

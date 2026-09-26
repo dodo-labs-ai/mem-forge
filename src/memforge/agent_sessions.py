@@ -33,6 +33,7 @@ from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, Llm
 from memforge.llm.structured import AgentSessionAuthorityResponse
 from memforge.models import AgentHookReceipt, AgentSessionReceipt, content_hash, slugify
 from memforge.repo_identity import normalize_repo_identifier
+from memforge.source_time import parse_source_time, reported_source_time
 from memforge.storage.database import Database
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 
@@ -484,6 +485,26 @@ def _agent_patch_primary_evidence_error(
     if not required_ids <= user_event_ids:
         return "Agent-session patch cites assistant or tool-only Required evidence."
     return None
+
+
+def _primary_event_source_time(
+    proposal: AgentKnowledgePatchProposal,
+    events: list[dict[str, Any]],
+) -> datetime | None:
+    """The time of the event that authorizes a patch: the source time of what it writes.
+
+    An event without a timestamp, or with one that is not an offset-aware ISO
+    time, has no source time. The window's own ``source_updated_at`` marks when
+    the window started, not when this content was stated, so it is not used here.
+    """
+
+    primary_event_id = (proposal.primary_event_id or "").strip()
+    if not primary_event_id:
+        return None
+    event = next((item for item in events if item.get("evidence_id") == primary_event_id), None)
+    if event is None:
+        return None
+    return parse_source_time(reported_source_time(event.get("timestamp")))
 
 
 def _default_actor_for_kind(kind: str) -> str:
@@ -1191,11 +1212,7 @@ async def submit_agent_session_window(
             repo_identifier=repo_identifier,
             project_key=project_key,
             submitted_at=_parse_submitted_at(submitted_at),
-            source_updated_at=(
-                _parse_source_updated_at(normalized_source_updated_at)
-                if normalized_source_updated_at is not None
-                else None
-            ),
+            source_updated_at=_primary_event_source_time(proposal, canonical_events),
         )
 
         if proposal.action != "no_output" and patch.outcome == "applied":

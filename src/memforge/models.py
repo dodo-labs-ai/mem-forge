@@ -361,7 +361,18 @@ class MemoryExtractionResult:
 
 @dataclass
 class ContentItem:
-    """A content item discovered by a gene (the unit of sync)."""
+    """A content item discovered by a gene (the unit of sync).
+
+    ``last_modified`` orders and filters discovery (``since``) and becomes the
+    document's ``last_modified``. Where the provider gives no change time it
+    may be the discovery or submission time, so it is never read as the
+    content's source time; a Gene reports that time in ``normalize()`` under
+    ``source_semantics["source_updated_at"]`` (design 0.9).
+
+    ``stored_extra`` is the ``extra`` recorded when this document was last
+    synced, empty for a new document. A Gene may reuse a provider fact it
+    recorded for an unchanged provider revision instead of asking again.
+    """
 
     item_id: str  # becomes doc_id
     title: str
@@ -373,6 +384,7 @@ class ContentItem:
     author: str | None = None
     labels: list[str] = field(default_factory=list)
     extra: dict = field(default_factory=dict)  # source-specific metadata
+    stored_extra: dict = field(default_factory=dict)
 
     def to_doc_ref(self, source_id: str) -> DocRef:
         return DocRef(
@@ -404,7 +416,11 @@ class RawContent:
 
 @dataclass
 class NormalizedContent:
-    """Normalized content produced by a gene's normalizer."""
+    """Normalized content produced by a gene's normalizer.
+
+    ``source_semantics["source_updated_at"]`` is the source's own time for the
+    Unit's body, an offset-aware ISO time, absent when the source records none.
+    """
 
     item: ContentItem
     markdown_body: str

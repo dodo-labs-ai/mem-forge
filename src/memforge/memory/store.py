@@ -1027,7 +1027,9 @@ class MemoryStore:
                 "supported_memory_id": target_memory.id,
                 "support_kind": "extracted",
             },
-            observed_at=datetime.now(timezone.utc).isoformat(),
+            # Deduplication Support cites a Memory, not a source revision, so it
+            # has no source time.
+            observed_at=None,
         )
         relation_run_id = _dedup_support_relation_run_id(unit, target_memory.id)
         reason = "deduplication candidate within threshold"

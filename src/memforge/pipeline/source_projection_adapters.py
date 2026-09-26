@@ -35,6 +35,11 @@ from memforge.source_projection import (
     SourceUnit,
     SourceUnitRevision,
 )
+from memforge.source_time import (
+    SOURCE_UPDATED_AT_KEY,
+    latest_source_time,
+    reported_source_time,
+)
 from memforge.source_representation import (
     UNIT_TITLE_OBSERVATION_TYPE,
     representation_profile_for_observation_contract,
@@ -63,11 +68,16 @@ BUILTIN_SPECIALIZED_SOURCE_TYPES = frozenset(
     }
 )
 
-# Source types whose adapter records the provider's revision time of the one
-# Observation that holds the whole document body (a Confluence page version)
-# as the document time. Other adapters record a sync or submission time, or the
-# update time of an item made of several Observations, as the document time.
-SOURCE_TYPES_WITH_DOCUMENT_REVISION_TIME = frozenset({"confluence"})
+# The Jira fields that make up an issue's core Observation.
+_JIRA_CORE_FIELDS = (
+    "summary",
+    "description",
+    "status",
+    "priority",
+    "assignee",
+    "labels",
+    "resolution",
+)
 
 _JIRA_OPERATIONAL_HISTORY_FIELDS = frozenset(
     {
@@ -110,6 +120,13 @@ def source_run_projection_coverage(
 
 @dataclass(frozen=True, slots=True)
 class _ObservationInput:
+    """One Observation as the provider payload gives it.
+
+    ``observed_at`` is the source's own time for this content (design 0.9):
+    when the provider last changed it, or ``None`` when the provider records
+    no usable time. It is never a discovery, fetch, submission or sync time.
+    """
+
     observation_type: str
     provider_key: str
     content: str
@@ -118,6 +135,10 @@ class _ObservationInput:
     observed_at: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
     semantic_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        # One UTC form for every provider's time, whatever format it reported.
+        object.__setattr__(self, "observed_at", reported_source_time(self.observed_at))
 
 
 _REVISION_SEMANTIC_METADATA_KEYS = ("claim_evidence_scope",)
@@ -332,6 +353,11 @@ def project_source_item(
         provider_key=provider_key,
         locator={**locator, "document_id": item.item_id},
     )
+    # An Artifact is part of its parent Observation's content and carries its time.
+    parent_times = {
+        (value.observation_type, value.provider_key): value.observed_at
+        for value in native_projection.observations
+    }
     artifact_inputs = tuple(
         _ObservationInput(
             observation_type=SOURCE_ARTIFACT_OBSERVATION_TYPE,
@@ -339,6 +365,9 @@ def project_source_item(
             content="",
             semantic_value=artifact.sha256,
             locator=dict(artifact.locator),
+            observed_at=parent_times.get(
+                (artifact.parent_observation_type, artifact.parent_provider_key)
+            ),
             metadata=source_artifact_observation_metadata(
                 artifact,
                 parent_observation_id=_stable_id(
@@ -393,7 +422,9 @@ def project_source_item(
         )
         prior_revision = prior_observation_revisions.get(observation_id)
         # Revision identity is semantic. Operational metadata enrichment under
-        # an unchanged semantic hash must preserve the exact immutable row.
+        # an unchanged semantic hash must preserve the exact immutable row; a
+        # revision recorded without a source time takes the one the source now
+        # gives, and a recorded source time is never replaced.
         if (
             prior_revision is not None
             and prior_revision.observation_id == observation_id
@@ -401,11 +432,12 @@ def project_source_item(
         ):
             if prior_revision.evidence_profile not in {None, evidence_profile}:
                 raise ValueError("immutable Observation Revision changed representation profile")
-            revisions.append(
-                prior_revision
-                if prior_revision.evidence_profile is not None
-                else replace(prior_revision, evidence_profile=evidence_profile)
-            )
+            reused = prior_revision
+            if reused.evidence_profile is None:
+                reused = replace(reused, evidence_profile=evidence_profile)
+            if reused.observed_at is None and value.observed_at is not None:
+                reused = replace(reused, observed_at=value.observed_at)
+            revisions.append(reused)
         else:
             revisions.append(projected_revision)
     if coverage is ProjectionCoverage.PARTIAL_PROJECTION:
@@ -436,7 +468,7 @@ def project_source_item(
         membership_hash=membership_hash,
         access_hash=access_hash,
         observation_revision_ids=tuple(sorted(item.id for item in revisions)),
-        observed_at=item.last_modified.isoformat(),
+        observed_at=latest_source_time(revision.observed_at for revision in revisions),
     )
     unit_revision = (
         prior_unit_revision
@@ -781,6 +813,8 @@ def _project_native(
     native: object,
     normalized: NormalizedContent,
 ) -> _NativeProjection:
+    # The source time of a Unit whose body is one Observation, as the Gene reports it.
+    body_time = normalized.source_semantics.get(SOURCE_UPDATED_AT_KEY)
     if source_type == "confluence":
         page_id = str(item.extra.get("page_id") or item.item_id.removeprefix("confluence-"))
         parent_id = str(item.extra.get("parent_page_id") or "")
@@ -812,6 +846,7 @@ def _project_native(
                     semantic_content,
                     semantic_value,
                     {},
+                    body_time,
                 ),
             ),
             relations=relations,
@@ -841,15 +876,14 @@ def _project_native(
         if not issue_id.isdigit():
             raise ValueError("jira projection requires immutable numeric issue id")
         issue_key = str(data.get("key") or item.extra.get("issue_key") or item.item_id)
-        core_value = {
-            "summary": fields.get("summary"),
-            "description": fields.get("description"),
-            "status": fields.get("status"),
-            "priority": fields.get("priority"),
-            "assignee": fields.get("assignee"),
-            "labels": fields.get("labels"),
-            "resolution": fields.get("resolution"),
-        }
+        core_value = {name: fields.get(name) for name in _JIRA_CORE_FIELDS}
+        changelog = data.get("changelog") if isinstance(data.get("changelog"), dict) else {}
+        raw_histories = changelog.get("histories", [])
+        histories = raw_histories if isinstance(raw_histories, list) else []
+        changelog_total = changelog.get("total")
+        changelog_complete = not data.get("_changelog_truncated") and not (
+            isinstance(changelog_total, int) and changelog_total > len(histories)
+        )
         inputs = [
             _ObservationInput(
                 "issue_core",
@@ -857,6 +891,12 @@ def _project_native(
                 _canonical_json(core_value),
                 core_value,
                 {"issue_key": issue_key},
+                _jira_core_revised_at(
+                    fields,
+                    histories,
+                    # A payload without a changelog says nothing about core changes.
+                    changelog_complete=changelog_complete and isinstance(data.get("changelog"), dict),
+                ),
             )
         ]
         relations: list[tuple[SourceRelationType, str, str, str | None, Mapping[str, object]]] = []
@@ -881,9 +921,7 @@ def _project_native(
             )
             relations.append((SourceRelationType.PRECEDES, previous_key, comment_id, None, {}))
             previous_key = comment_id
-        changelog = data.get("changelog") if isinstance(data.get("changelog"), dict) else {}
-        histories = changelog.get("histories", [])
-        for history in histories if isinstance(histories, list) else []:
+        for history in histories:
             if not isinstance(history, dict):
                 continue
             history_id = str(history["id"])
@@ -902,13 +940,9 @@ def _project_native(
                     },
                 )
             )
-        changelog_total = changelog.get("total")
-        changelog_incomplete = isinstance(changelog_total, int) and changelog_total > len(
-            histories if isinstance(histories, list) else []
-        )
         coverage = (
             ProjectionCoverage.PARTIAL_PROJECTION
-            if data.get("_comments_truncated") or data.get("_changelog_truncated") or changelog_incomplete
+            if data.get("_comments_truncated") or not changelog_complete
             else ProjectionCoverage.COMPLETE_SNAPSHOT
         )
         return _NativeProjection(
@@ -984,6 +1018,7 @@ def _project_native(
                     normalized.markdown_body,
                     normalized.markdown_body,
                     {"path": path},
+                    body_time,
                 ),
             ),
             relations=relations,
@@ -1005,7 +1040,9 @@ def _project_native(
         return _NativeProjection(
             unit_type="rendered_page",
             provider_key=canonical_url,
-            observations=(_ObservationInput("page_content", "content", semantic_content, semantic_value, {}),),
+            observations=(
+                _ObservationInput("page_content", "content", semantic_content, semantic_value, {}, body_time),
+            ),
             relations=(),
             coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
             locator={"canonical_url": canonical_url, "title": item.title},
@@ -1020,7 +1057,7 @@ def _project_native(
         return _NativeProjection(
             unit_type="local_file",
             provider_key=f"{vault}:{lineage}",
-            observations=(_ObservationInput("file_content", "content", body, body, {"path": path}),),
+            observations=(_ObservationInput("file_content", "content", body, body, {"path": path}, body_time),),
             relations=(),
             coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
             locator={"vault_id": vault, "path": path, "url": item.source_url},
@@ -1036,10 +1073,13 @@ def _project_native(
             data = data["raw_payload"]
         window_id = str(item.extra.get("window_id") or data.get("window_id") or item.item_id)
         conversation_id = str(item.extra.get("conversation_id") or data.get("conversation_id") or "")
+        from memforge.local_agent.teams_contract import (
+            teams_message_source_time,
+            validate_teams_canonical_messages,
+        )
+
         messages = data.get("messages") if isinstance(data.get("messages"), list) else []
         if messages:
-            from memforge.local_agent.teams_contract import validate_teams_canonical_messages
-
             messages = list(validate_teams_canonical_messages(messages))
         inputs = []
         relations = []
@@ -1058,7 +1098,7 @@ def _project_native(
                     _canonical_json(semantic_message),
                     semantic_message,
                     {"conversation_id": conversation_id},
-                    str(message.get("lastModifiedDateTime") or message.get("time") or "") or None,
+                    teams_message_source_time(message),
                     {"claim_evidence_scope": "atomic"},
                 )
             )
@@ -1128,7 +1168,7 @@ def _project_native(
         return _NativeProjection(
             unit_type="agent_session_window",
             provider_key=window_id,
-            observations=(_ObservationInput("session_summary", window_id, body, body, {}),),
+            observations=(_ObservationInput("session_summary", window_id, body, body, {}, body_time),),
             relations=(),
             coverage=ProjectionCoverage.PARTIAL_PROJECTION,
             locator={
@@ -1152,7 +1192,7 @@ def _project_native(
     return _NativeProjection(
         unit_type="generic_document",
         provider_key=item.item_id,
-        observations=(_ObservationInput("document_content", item.item_id, body, body, {}),),
+        observations=(_ObservationInput("document_content", item.item_id, body, body, {}, body_time),),
         relations=(),
         coverage=ProjectionCoverage.PARTIAL_PROJECTION,
         locator={
@@ -1169,6 +1209,39 @@ def _provider_name(value: object) -> object:
     """A provider object's display name, such as a Jira issue type's name."""
 
     return value.get("name") if isinstance(value, Mapping) else value
+
+
+def _jira_core_revised_at(
+    fields: Mapping[str, object],
+    histories: list[object],
+    *,
+    changelog_complete: bool,
+) -> str | None:
+    """When the issue's core fields last changed, from the issue's own records.
+
+    The latest changelog entry that touches a core field gives the time; an
+    issue whose complete changelog never touches one has kept its core since
+    ``fields.created``. A truncated changelog may omit the latest core change,
+    so the time is unknown. ``fields.updated`` is not used: comments and other
+    fields move it too.
+    """
+
+    if not changelog_complete:
+        return None
+    core_fields = frozenset(_JIRA_CORE_FIELDS)
+    core_change_times = [
+        history.get("created")
+        for history in histories
+        if isinstance(history, Mapping)
+        and any(
+            isinstance(entry, Mapping)
+            and str(entry.get("fieldId") or entry.get("field") or "").strip().lower() in core_fields
+            for entry in (history.get("items") if isinstance(history.get("items"), list) else [])
+        )
+    ]
+    if core_change_times:
+        return latest_source_time(core_change_times)
+    return reported_source_time(fields.get("created"))
 
 
 def _jira_changelog_semantic_class(history: Mapping[str, object]) -> str:

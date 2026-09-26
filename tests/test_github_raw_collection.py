@@ -16,6 +16,12 @@ from tests.test_cli_agent_tools import FakeToolClient, _cloud_test_client
 
 HELLO = b"hello\n"
 HELLO_SHA = "ce013625030ba8dba906f756967f9e9ca394464a"
+COMMIT_DATE = "2026-05-01T10:00:00Z"
+COMMIT_TIME = "2026-05-01T10:00:00+00:00"
+
+
+def commits_listing(date):
+    return [{"sha": "file-commit", "commit": {"committer": {"date": date}}}]
 
 
 class Response:
@@ -52,6 +58,9 @@ class RepositorySession:
         self.calls.append((url, kwargs))
         if "/commits/main" in url:
             return Response({"sha": "commit-one", "commit": {"tree": {"sha": "tree-one"}}})
+        if "/commits?" in url:
+            assert "sha=commit-one&path=README.md&per_page=1" in url
+            return Response(commits_listing(COMMIT_DATE))
         if "/git/trees/" in url:
             return Response({"truncated": False, "tree": [{
                 "path": "README.md", "type": self.entry_type, "mode": self.mode,
@@ -87,7 +96,10 @@ async def test_collection_reads_original_blob_despite_transformed_contents(cloud
     item = [item async for item in gene.discover()][0]
     raw = await gene.fetch(item)
     assert raw.body == HELLO
-    assert (await gene.normalize(raw)).markdown_body == "hello\n"
+    normalized = await gene.normalize(raw)
+    assert normalized.markdown_body == "hello\n"
+    # The file's source time is its latest commit at the collection commit, not the sync time.
+    assert normalized.source_semantics["source_updated_at"] == COMMIT_TIME
     urls = [url for url, _ in session.calls]
     assert any("/git/trees/tree-one?" in url for url in urls)
     assert any(url.endswith("/git/blobs/" + HELLO_SHA) for url in urls)
@@ -143,6 +155,7 @@ def test_daemon_collects_raw_blob_and_uploads_exact_text(monkeypatch, body, size
     [call] = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
     assert call[1]["markdown_body"] == body.decode()
     assert call[1]["blob_sha"] == session.sha
+    assert call[1]["source_updated_at"] == COMMIT_TIME
 
 
 @pytest.mark.asyncio
@@ -261,6 +274,10 @@ async def test_cloud_collection_resolves_selected_text_symlink_at_pinned_tree(mo
             self.calls.append((url, kwargs))
             if "/commits/main" in url:
                 return Response({"sha": "commit-one", "commit": {"tree": {"sha": "tree-one"}}})
+            if "/commits?" in url:
+                return Response(commits_listing(
+                    "2026-06-02T08:00:00Z" if "path=docs/CONTRIBUTIONS.md" in url else COMMIT_DATE
+                ))
             if "/git/trees/" in url:
                 return Response({"truncated": False, "tree": [
                     {"path": "README.md", "type": "blob", "mode": "120000",
@@ -295,6 +312,8 @@ async def test_cloud_collection_resolves_selected_text_symlink_at_pinned_tree(mo
     assert raw.body == target_body
     assert normalized.source_semantics["relative_path"] == "README.md"
     assert normalized.source_semantics["resolved_relative_path"] == "docs/CONTRIBUTIONS.md"
+    # A symlinked file changes when either the link or its target changes.
+    assert normalized.source_semantics["source_updated_at"] == "2026-06-02T08:00:00+00:00"
 
 
 @pytest.mark.asyncio
@@ -346,6 +365,10 @@ def test_daemon_collection_resolves_selected_text_symlink_with_cloud_parity(monk
         endpoint = cmd[2]
         if "/commits/main" in endpoint:
             payload = {"sha": "commit-one", "commit": {"tree": {"sha": "tree-one"}}}
+        elif "/commits?" in endpoint:
+            payload = commits_listing(
+                "2026-06-02T08:00:00Z" if "path=docs/CONTRIBUTIONS.md" in endpoint else COMMIT_DATE
+            )
         elif "/git/trees/" in endpoint:
             payload = {"truncated": False, "tree": [
                 {"path": "README.md", "type": "blob", "mode": "120000",
@@ -394,6 +417,7 @@ def test_daemon_collection_resolves_selected_text_symlink_with_cloud_parity(monk
     assert call[1]["symlink_chain"] == [{
         "path": "README.md", "blob_sha": link_sha, "target_path": "docs/CONTRIBUTIONS.md",
     }]
+    assert call[1]["source_updated_at"] == "2026-06-02T08:00:00+00:00"
 
 
 def test_daemon_collection_rejects_text_symlink_to_binary_before_manifest(monkeypatch):

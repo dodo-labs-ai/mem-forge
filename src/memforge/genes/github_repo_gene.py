@@ -32,12 +32,15 @@ from memforge.github_repo_utils import (
     GitHubResolvedTreeEntry,
     GitHubTreeEntryResolver,
     decode_github_text,
+    github_content_paths,
     github_content_type,
     github_content_type_is_binary,
     github_exclude_paths,
     github_extension_allowed,
     github_include_extensions,
     github_include_paths,
+    github_latest_commit_time,
+    github_path_commits_query,
     github_path_in_scope,
     list_config,
     normalize_github_scope_paths,
@@ -57,6 +60,7 @@ from memforge.models import (
     RawContent,
 )
 from memforge.repo_identity import normalize_repo_identifier
+from memforge.source_time import SOURCE_UPDATED_AT_KEY, latest_source_time
 from memforge.source_artifacts import (
     SOURCE_ARTIFACT_STREAM_CHUNK_BYTES,
     SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
@@ -76,6 +80,8 @@ GITHUB_REPO_PACKAGE_KIND = "github_repo_document"
 GITHUB_REPO_CONTENT_ROLE = "repository_file"
 GITHUB_REPO_SOURCE_TYPE = "github_repo"
 DEFAULT_MAX_FILES = 500
+# ``ContentItem.extra`` key for the file's latest commit time at the collection commit.
+LAST_COMMIT_AT_KEY = "last_commit_at"
 
 
 @dataclass(frozen=True)
@@ -307,6 +313,7 @@ class GitHubRepoGene(Gene):
                 ),
                 title=_title_from_path(path),
                 source_url=_file_url(repo_ref, ref, path),
+                # Discovery time. The file's source time is its commit time, read in fetch.
                 last_modified=datetime.now(timezone.utc),
                 content_type=content_type,
                 version=blob_sha,
@@ -367,6 +374,8 @@ class GitHubRepoGene(Gene):
             raise SourceArtifactContractError(
                 f"GitHub selected file has unsupported binary media type: {item.content_type}"
             )
+        # Kept with the item so reprocessing from the stored document reads it too.
+        item.extra[LAST_COMMIT_AT_KEY] = await self._last_commit_at(item)
 
         if item.content_type in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES:
             relative_path = str(item.extra.get("relative_path") or "").strip()
@@ -458,6 +467,7 @@ class GitHubRepoGene(Gene):
         text = decode_github_text(raw.body, label=str(raw.item.extra.get("relative_path") or raw.item.item_id))
         markdown = _to_markdown(raw.content_type, text)
         semantics = {
+            SOURCE_UPDATED_AT_KEY: raw.item.extra.get(LAST_COMMIT_AT_KEY),
             "source_type": GITHUB_REPO_SOURCE_TYPE,
             "connection_mode": raw.item.extra.get("connection_mode"),
             "repo_url": raw.item.extra.get("repo_url"),
@@ -478,6 +488,35 @@ class GitHubRepoGene(Gene):
                 "resolved_relative_path": raw.item.extra.get("resolved_relative_path"),
             })
         return NormalizedContent(item=raw.item, markdown_body=markdown, source_semantics=semantics)
+
+    async def _last_commit_at(self, item: ContentItem) -> str | None:
+        """The latest commit time of the file, or its symlink target, at the collection commit.
+
+        A blob synced before keeps the time recorded then: a later commit that
+        leaves the blob unchanged does not change its content. Otherwise one
+        commits request per path. GitHub lists no commit only for a path with
+        no history, and a refused request tells nothing about the content; both
+        leave the time unknown, and the next sync asks again.
+        """
+
+        stored_time = item.stored_extra.get(LAST_COMMIT_AT_KEY)
+        if stored_time and item.stored_extra.get("blob_sha") == item.extra.get("blob_sha"):
+            return str(stored_time)
+        commit_sha = str(item.extra.get("commit_sha") or "").strip()
+        relative_path = str(item.extra.get("relative_path") or "").strip()
+        if not commit_sha or not relative_path:
+            raise RuntimeError("GitHub file identity is missing its collection commit or path")
+        commit_times = []
+        for path in github_content_paths(relative_path, item.extra.get("resolved_relative_path")):
+            query = github_path_commits_query(relative_path=path, ref=commit_sha)
+            try:
+                response = await self._client.get(f"{_repo_api_url(self._repo_ref)}/commits?{query}")
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                logger.warning("GitHub commit time for %s is unknown: %s", path, exc)
+                return None
+            commit_times.append(github_latest_commit_time(response.json()))
+        return latest_source_time(commit_times)
 
     async def _resolve_repo_entry(
         self,
@@ -753,6 +792,7 @@ def _package_matches_config(package: dict, config: dict) -> bool:
 
 def _semantics_from_package(package: dict) -> dict:
     semantics = {
+        SOURCE_UPDATED_AT_KEY: package.get(SOURCE_UPDATED_AT_KEY),
         "source_type": GITHUB_REPO_SOURCE_TYPE,
         "connection_mode": CONNECTION_MODE_LOCAL_PUSH,
         "repo_url": package.get("repo_url"),

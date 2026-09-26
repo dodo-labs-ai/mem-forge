@@ -22,11 +22,13 @@ from memforge.local_agent.document_identity import (
 from memforge.local_agent.source_contract import (
     TEAMS_TOMBSTONE_REASONS,
     local_agent_semantic_input_sha256,
+    local_file_package_semantic_hash,
 )
 from memforge.source_artifacts import (
     SourceArtifactContractError,
     source_artifact_semantic_refs,
 )
+from memforge.source_time import SOURCE_UPDATED_AT_KEY, source_time_iso
 
 
 INVALID_REPLAY_ARTIFACT = "source_lifecycle_local_replay_artifact_invalid"
@@ -50,6 +52,8 @@ class LocalSourceReplayAdapter(ABC):
     source_type: str
     package_kind: str
     authoritative_collection: bool = False
+    # A file package carries the file's source time beside its content.
+    package_source_time: bool = False
 
     def validate(
         self,
@@ -103,25 +107,34 @@ class LocalSourceReplayAdapter(ABC):
 
 
 class _MarkdownPackageAdapter(LocalSourceReplayAdapter):
+    package_source_time = True
+
     def _validate_semantics(
         self,
         package: Mapping[str, Any],
         package_version: str,
     ) -> str:
+        content_hash = self._content_hash(package)
+        if not self._version_matches(package, package_version, content_hash):
+            raise ValueError(INVALID_REPLAY_ARTIFACT)
+        try:
+            source_time = source_time_iso(package.get(SOURCE_UPDATED_AT_KEY))
+        except ValueError as exc:
+            raise ValueError(INVALID_REPLAY_ARTIFACT) from exc
+        return local_file_package_semantic_hash(content_hash, source_time)
+
+    def _content_hash(self, package: Mapping[str, Any]) -> str:
         markdown = package.get("markdown")
         if not isinstance(markdown, str):
             raise ValueError(INVALID_REPLAY_ARTIFACT)
-        semantic_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
-        if not self._version_matches(package, package_version, semantic_hash):
-            raise ValueError(INVALID_REPLAY_ARTIFACT)
-        return semantic_hash
+        return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
 
     @abstractmethod
     def _version_matches(
         self,
         package: Mapping[str, Any],
         package_version: str,
-        semantic_hash: str,
+        content_hash: str,
     ) -> bool:
         pass
 
@@ -144,39 +157,31 @@ class GitHubRepoReplayAdapter(_MarkdownPackageAdapter):
             relative_path=str(package.get("relative_path") or ""),
         )
 
-    def _validate_semantics(
-        self,
-        package: Mapping[str, Any],
-        package_version: str,
-    ) -> str:
+    def _content_hash(self, package: Mapping[str, Any]) -> str:
         markdown = package.get("markdown")
         if not isinstance(markdown, str):
             raise ValueError(INVALID_REPLAY_ARTIFACT)
         source_artifacts = package.get("source_artifacts")
-        if source_artifacts:
-            try:
-                artifact_semantic_refs = source_artifact_semantic_refs(source_artifacts)
-            except SourceArtifactContractError:
-                raise ValueError(INVALID_REPLAY_ARTIFACT)
-            semantic_hash = _semantic_json_hash(
-                {
-                    "markdown": markdown,
-                    "source_artifacts": artifact_semantic_refs,
-                }
-            )
-        else:
-            semantic_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
-        if not self._version_matches(package, package_version, semantic_hash):
+        if not source_artifacts:
+            return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+        try:
+            artifact_semantic_refs = source_artifact_semantic_refs(source_artifacts)
+        except SourceArtifactContractError:
             raise ValueError(INVALID_REPLAY_ARTIFACT)
-        return semantic_hash
+        return _semantic_json_hash(
+            {
+                "markdown": markdown,
+                "source_artifacts": artifact_semantic_refs,
+            }
+        )
 
     def _version_matches(
         self,
         package: Mapping[str, Any],
         package_version: str,
-        semantic_hash: str,
+        content_hash: str,
     ) -> bool:
-        return package_version == str(package.get("blob_sha") or package.get("raw_hash") or semantic_hash).strip()
+        return package_version == str(package.get("blob_sha") or package.get("raw_hash") or content_hash).strip()
 
 
 class LocalMarkdownReplayAdapter(_MarkdownPackageAdapter):
@@ -200,9 +205,9 @@ class LocalMarkdownReplayAdapter(_MarkdownPackageAdapter):
         self,
         package: Mapping[str, Any],
         package_version: str,
-        semantic_hash: str,
+        content_hash: str,
     ) -> bool:
-        return package_version == semantic_hash
+        return package_version == content_hash
 
 
 class JiraReplayAdapter(LocalSourceReplayAdapter):

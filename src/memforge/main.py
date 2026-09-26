@@ -45,12 +45,15 @@ from memforge.github_repo_utils import (
     build_github_repo_doc_id,
     decode_github_base64_content,
     decode_github_text,
+    github_content_paths,
     github_content_type,
     github_content_type_is_binary,
     github_exclude_paths,
     github_extension,
     github_include_extensions,
     github_include_paths,
+    github_latest_commit_time,
+    github_path_commits_query,
     github_path_in_scope,
     normalize_github_relative_path,
     parse_github_repo_url,
@@ -70,6 +73,7 @@ from memforge.local_agent.source_contract import (
     source_processing_receipt,
 )
 from memforge.retrieval.intents import RANKED_RETRIEVAL_INTENTS
+from memforge.source_time import latest_source_time, source_time_iso
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT,
@@ -91,6 +95,8 @@ from memforge.workspace_bindings import (
 
 console = Console()
 log_console = Console(stderr=True)
+logger = logging.getLogger(__name__)
+
 DEFAULT_CLI_CONFIG_PATH = Path.home() / ".memforge" / "cli.toml"
 DEFAULT_LOCAL_AGENT_STATE_PATH = Path.home() / ".memforge" / "local-agent-state.json"
 DEFAULT_LOCAL_AGENT_LOCK_PATH = Path.home() / ".memforge" / "local-agent-daemon.lock"
@@ -507,6 +513,11 @@ def _github_gh_env(host: str) -> dict[str, str]:
 
 
 def _gh_api_json(repo: dict[str, str], endpoint: str) -> dict[str, Any]:
+    payload = _gh_api_payload(repo, endpoint)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _gh_api_payload(repo: dict[str, str], endpoint: str) -> object:
     try:
         result = subprocess.run(
             ["gh", "api", endpoint],
@@ -521,10 +532,37 @@ def _gh_api_json(repo: dict[str, str], endpoint: str) -> dict[str, Any]:
         detail = (result.stderr or result.stdout or "gh api failed").strip()
         _raise_github_cli_error(detail)
     try:
-        payload = json.loads(result.stdout or "{}")
+        return json.loads(result.stdout or "{}")
     except ValueError as exc:
         raise click.ClickException("GitHub CLI returned invalid JSON.") from exc
-    return payload if isinstance(payload, dict) else {}
+
+
+def _github_last_commit_at(
+    repo: dict[str, str],
+    *,
+    commit_sha: str,
+    relative_path: str,
+    resolved_relative_path: object,
+) -> str | None:
+    """The file's latest commit time at the collection commit, its symlink target included.
+
+    A refused request leaves the time unknown; the service then asks for the
+    file again on the next collection (``LOCAL_PACKAGE_SOURCE_TIME_CONTRACT_VERSION``).
+    """
+
+    commit_times = []
+    for path in github_content_paths(relative_path, resolved_relative_path):
+        try:
+            payload = _gh_api_payload(
+                repo,
+                f"repos/{repo['owner']}/{repo['repo']}/commits?"
+                + github_path_commits_query(relative_path=path, ref=commit_sha),
+            )
+        except click.ClickException as exc:
+            logger.warning("GitHub commit time for %s is unknown: %s", path, exc.message)
+            return None
+        commit_times.append(github_latest_commit_time(payload))
+    return latest_source_time(commit_times)
 
 
 def _raise_github_cli_error(detail: str) -> None:
@@ -2778,6 +2816,7 @@ def _push_github_source_entry(
     *,
     repo: dict[str, str],
     ref: str,
+    commit_sha: str,
     source_id: str,
     client: ToolClient,
     sync_snapshot_id: str | None,
@@ -2809,6 +2848,12 @@ def _push_github_source_entry(
         if is_source_artifact and len(raw) != declared_size:
             raise click.ClickException("GitHub blob size changed after tree discovery")
         text_body = "" if is_source_artifact else decode_github_text(raw, label=relative_path)
+        last_commit_at = _github_last_commit_at(
+            repo,
+            commit_sha=commit_sha,
+            relative_path=relative_path,
+            resolved_relative_path=entry.get("resolved_relative_path"),
+        )
     except ValueError as exc:
         return _GitHubTransferResult({"relative_path": relative_path, "error": str(exc)})
     except click.ClickException as exc:
@@ -2863,6 +2908,7 @@ def _push_github_source_entry(
         resolved_relative_path=(
             str(entry.get("resolved_relative_path") or "").strip() or None
         ),
+        source_updated_at=last_commit_at,
         sync_snapshot_id=sync_snapshot_id,
         local_agent_job_id=local_agent_job_id,
         local_agent_attempt_count=local_agent_attempt_count,
@@ -3016,6 +3062,7 @@ def _push_github_profile_to_source(
             entry,
             repo=repo,
             ref=ref,
+            commit_sha=str(preview["commit_sha"]),
             source_id=source_id,
             client=client,
             sync_snapshot_id=sync_snapshot_id,
@@ -5444,6 +5491,7 @@ def _push_kb_profile_to_source(
     )
 
     uploaded_body_bytes = 0
+    worktree = _git_worktree(root) if entries_to_upload else None
     for index, entry in enumerate(entries_to_upload, start=1):
         uploaded_body_bytes += int(entry["bytes"])
         response = client.push_local_markdown_document(
@@ -5454,6 +5502,7 @@ def _push_kb_profile_to_source(
             content_type=entry["content_type"],
             title=entry["title"],
             raw_hash=entry["raw_hash"],
+            source_updated_at=_local_file_source_time(root, entry, worktree),
             sync_snapshot_id=sync_snapshot_id,
             local_agent_job_id=local_agent_job_id,
             local_agent_attempt_count=local_agent_attempt_count,
@@ -5638,7 +5687,78 @@ def _scan_kb_profile(
             "text": text,
             "bytes": size,
             "stat_fingerprint": fingerprint_after,
+            "modified_at": datetime.fromtimestamp(stat_after.st_mtime, timezone.utc).isoformat(),
         }
+
+
+@dataclass(frozen=True)
+class _GitWorktree:
+    """The Git checkout that holds a local collection root."""
+
+    # Root-relative paths Git reports as modified, staged, renamed or untracked.
+    changed_paths: frozenset[str]
+
+
+def _git_output(root: Path, *args: str) -> str | None:
+    """Run a read-only ``git`` command in ``root``; None when Git is absent or refuses."""
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            # Reading status must not take the index lock from the user's own Git work.
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+    except FileNotFoundError:
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _git_worktree(root: Path) -> _GitWorktree | None:
+    """The Git checkout holding ``root`` and its uncommitted paths; None outside Git."""
+
+    prefix = _git_output(root, "rev-parse", "--show-prefix")
+    status = (
+        _git_output(root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".")
+        if prefix is not None
+        else None
+    )
+    if prefix is None or status is None:
+        return None
+    prefix = prefix.strip()
+    changed: set[str] = set()
+    records = iter(status.split("\0"))
+    for record in records:
+        if not record:
+            continue
+        state, path = record[:2], record[3:]
+        changed.add(path)
+        if "R" in state or "C" in state:
+            # A rename or copy record is followed by its original path.
+            changed.add(next(records, ""))
+    return _GitWorktree(
+        changed_paths=frozenset(path.removeprefix(prefix) for path in changed if path.startswith(prefix)),
+    )
+
+
+def _local_file_source_time(root: Path, entry: dict[str, Any], worktree: _GitWorktree | None) -> str:
+    """A local file's own time for its current content.
+
+    A committed file without local changes takes its latest commit time,
+    because a checkout or clone sets the modification time to when it ran.
+    Any other file takes its modification time, the only time the file
+    system records for its content.
+    """
+
+    relative_path = str(entry["relative_path"])
+    if worktree is not None and relative_path not in worktree.changed_paths:
+        # Empty for a file Git does not track, such as an ignored one.
+        committed_at = source_time_iso((_git_output(root, "log", "-1", "--format=%cI", "--", relative_path) or "").strip())
+        if committed_at is not None:
+            return committed_at
+    return str(entry["modified_at"])
 
 
 def _attest_kb_scan_stable(

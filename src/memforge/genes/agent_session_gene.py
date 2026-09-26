@@ -15,6 +15,7 @@ from memforge.agent_session_contract import (
 )
 from memforge.repo_identity import normalize_repo_identifier
 from memforge.genes.base import Gene
+from memforge.source_time import SOURCE_UPDATED_AT_KEY
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -240,7 +241,7 @@ class AgentSessionGene(Gene):
                 "commit_sha": receipt.get("commit_sha"),
                 "history_window_kind": receipt.get("history_window_kind"),
                 "uploader_user_id": uploader_user_id,
-                "source_updated_at": package.get("source_updated_at"),
+                SOURCE_UPDATED_AT_KEY: package.get(SOURCE_UPDATED_AT_KEY),
             },
         )
 
