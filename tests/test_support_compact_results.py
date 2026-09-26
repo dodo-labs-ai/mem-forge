@@ -100,9 +100,9 @@ async def test_correction_log_names_the_rule_class_without_source_content(caplog
     executor = RevisionWorkExecutor(client=WrongRef(limit=50000), model='gpt-4o', store=Store(), derivation_id='root')
     [result] = (await executor.assess_many(work_items(CHANGED))).values()
     assert result.unresolved == 'invalid_response'
-    records = [r.message for r in caplog.records if r.message.startswith('llm_batch_output_rejected')]
-    assert len(records) == 2
-    assert all('FragmentSelectionError' in r and 'items=1' in r for r in records)
+    records = [r.message for r in caplog.records if r.message.startswith('llm_batch_rows_rejected')]
+    assert len(records) == 1
+    assert all('FragmentSelectionError' in r and 'rejected=1' in r for r in records)
     assert all('reviewers' not in r and 'PRM-9999' not in r for r in records)
 
 

@@ -16,6 +16,7 @@ from memforge.llm.batch_runner import (
     ItemTask,
     LlmBatchRunner,
     LlmRequest,
+    RejectedRow,
     RequestTooLarge,
 )
 from memforge.llm.structured import (
@@ -58,7 +59,9 @@ def prompt_parts(prompt: str) -> list[str]:
 
 
 def answer(prompt: str) -> Rows:
-    return Rows(rows=[Row(id=item_id, read=prompt_parts(prompt)) for item_id in prompt_ids(prompt)])
+    """One row per requested item; a correction's error lines are not requests."""
+    request = prompt.split("<correction>")[0]
+    return Rows(rows=[Row(id=item_id, read=prompt_parts(request)) for item_id in prompt_ids(request)])
 
 
 def failing(error: StructuredLlmError, *, when: Callable[[str], bool]) -> Callable[[str], Rows]:
@@ -277,15 +280,44 @@ async def test_an_unexpected_exception_from_the_call_raises_without_splitting():
     assert (runner.stats.calls, runner.stats.splits) == (1, 0)
 
 
+class SelectionError(ValueError):
+    pass
+
+
+def rejecting(item_id: str, *, until_reasked: bool = False):
+    """Decode every row, rejecting the row of ``item_id``; with ``until_reasked``, only before its re-ask."""
+    def decode_rows(response, item_ids, context):
+        for row_id, read in decode(response, item_ids, context):
+            if row_id == item_id and not (until_reasked and len(item_ids) == 1):
+                yield row_id, RejectedRow(f"{row_id} names p99, which is not supplied")
+            else:
+                yield row_id, read
+
+    return decode_rows
+
+
+def unreadable(item_id: str):
+    """Any response to a request that carries ``item_id`` cannot be read into rows."""
+    def reject(response, item_ids, context):
+        if item_id in item_ids:
+            raise SelectionError("unknown ref")
+        return decode(response, item_ids, context)
+
+    return reject
+
+
+def reasked_ids(prompt: str) -> list[str]:
+    return prompt_ids(prompt.split("<correction>")[0])
+
+
 @pytest.mark.parametrize(
     "first_reply",
     [
         pytest.param(lambda rows: rows[:-1], id="missing"),
-        pytest.param(lambda rows: [*rows, rows[0]], id="duplicate"),
-        pytest.param(lambda rows: [*rows, Row(id="i99", read=[])], id="unknown"),
+        pytest.param(lambda rows: [*rows, rows[-1]], id="duplicate"),
     ],
 )
-async def test_one_correction_repairs_incomplete_coverage(first_reply):
+async def test_a_missing_or_duplicated_row_is_re_asked_alone(first_reply):
     def respond(prompt):
         rows = answer(prompt).rows
         return Rows(rows=rows if "<correction>" in prompt else first_reply(rows))
@@ -296,37 +328,84 @@ async def test_one_correction_repairs_incomplete_coverage(first_reply):
     results = await runner.run_items(item_task(client, ids(3)))
 
     assert results == {item_id: ((),) for item_id in ids(3)}
-    assert runner.stats.calls == 2
-    assert runner.stats.corrections == 1
-    assert client.prompts[1].startswith(client.prompts[0])
+    # The two accepted rows are never sent again; only i02 is re-asked, naming its error.
+    assert [reasked_ids(prompt) for prompt in client.prompts] == [list(ids(3)), ["i02"]]
+    assert "i02" in client.prompts[1].split("<correction>")[1]
+    assert (runner.stats.calls, runner.stats.reasks, runner.stats.corrections) == (2, 1, 0)
 
 
-class SelectionError(ValueError):
-    pass
+async def test_a_row_for_an_unrequested_id_is_ignored():
+    client = FixtureBudgetClient(respond=lambda prompt: Rows(rows=[*answer(prompt).rows, Row(id="i99", read=[])]))
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+
+    assert await runner.run_items(item_task(client, ids(3))) == {item_id: ((),) for item_id in ids(3)}
+    assert runner.stats.calls == 1
 
 
-def rejecting(item_id: str):
-    """Decode every row, but reject any response to a request that carries ``item_id``."""
-    def reject(response, item_ids, context):
-        if item_id in item_ids:
-            raise SelectionError("unknown ref")
-        return decode(response, item_ids, context)
+async def test_rejected_rows_cost_one_re_ask_whatever_their_number_and_the_request_size():
+    """A request of 53 items with 2 rejected rows: the 51 accepted rows stay, the 2 are re-asked together."""
+    item_count = 53
+    rejected = {"i07", "i41"}
 
-    return reject
+    def decode_rows(response, item_ids, context):
+        for row_id, read in decode(response, item_ids, context):
+            first_attempt = len(item_ids) == item_count
+            yield row_id, RejectedRow(f"{row_id} is invalid") if row_id in rejected and first_attempt else read
 
-
-async def test_output_still_invalid_after_the_correction_splits_until_the_item_stands_alone():
     client = FixtureBudgetClient(respond=answer)
     runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
 
-    results = await runner.run_items(item_task(client, ids(4), decode=rejecting("i02")))
+    results = await runner.run_items(item_task(client, ids(item_count), decode=decode_rows))
+
+    assert results == {item_id: ((),) for item_id in ids(item_count)}
+    assert [sorted(reasked_ids(prompt)) for prompt in client.prompts] == [list(ids(item_count)), sorted(rejected)]
+    assert (runner.stats.calls, runner.stats.splits) == (2, 0)
+
+
+async def test_a_row_still_rejected_after_its_re_ask_is_unjudgeable_and_costs_one_extra_call():
+    item_count = 53
+    client = FixtureBudgetClient(respond=answer)
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+
+    results = await runner.run_items(item_task(client, ids(item_count), decode=rejecting("i30")))
+
+    failure = results.pop("i30")
+    assert results == {item_id: ((),) for item_id in ids(item_count) if item_id != "i30"}
+    assert (failure.category, failure.error_code, failure.unjudgeable) == ("invalid_response", OUTPUT_INVALID, True)
+    assert isinstance(failure.error, RejectedRow) and "i30 names p99" in str(failure.error)
+    assert [reasked_ids(prompt) for prompt in client.prompts] == [list(ids(item_count)), ["i30"]]
+    assert (runner.stats.calls, runner.stats.splits) == (2, 0)
+
+
+async def test_a_re_ask_that_does_not_fit_together_is_packed_by_capacity():
+    # Each re-ask carries its error lines: one rejected item fits a request (41 words), two do not (52).
+    client = FixtureBudgetClient(respond=answer, input_tokens=45)
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+
+    def decode_rows(response, item_ids, context):
+        for row_id, read in decode(response, item_ids, context):
+            first_attempt = len(item_ids) == 4
+            yield row_id, RejectedRow(" ".join([row_id, "is", "invalid", *["pad"] * 6])) if first_attempt else read
+
+    results = await runner.run_items(item_task(client, ids(4), decode=decode_rows))
+
+    assert results == {item_id: ((),) for item_id in ids(4)}
+    assert [reasked_ids(prompt) for prompt in client.prompts] == [list(ids(4)), ["i00"], ["i01"], ["i02"], ["i03"]]
+    assert runner.stats.reasks == 4
+
+
+async def test_output_that_cannot_be_read_into_rows_is_corrected_once_then_split():
+    client = FixtureBudgetClient(respond=answer)
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+
+    results = await runner.run_items(item_task(client, ids(4), decode=unreadable("i02")))
 
     failure = results.pop("i02")
     assert results == {item_id: ((),) for item_id in ("i00", "i01", "i03")}
     assert (failure.category, failure.error_code, failure.unjudgeable) == ("invalid_response", OUTPUT_INVALID, True)
     assert isinstance(failure.error, SelectionError)
-    # Each request that carries i02 is sent with its one correction; the others once.
-    assert [prompt_ids(prompt.split("<correction>")[0]) for prompt in client.prompts] == [
+    # The failing item cannot be named, so each request that carries i02 gets its one correction and is halved.
+    assert [reasked_ids(prompt) for prompt in client.prompts] == [
         list(ids(4)), list(ids(4)), ["i00", "i01"], ["i02", "i03"], ["i02", "i03"], ["i02"], ["i02"], ["i03"],
     ]
     assert (runner.stats.splits, runner.stats.corrections, runner.stats.failed_requests) == (2, 3, 1)
@@ -343,32 +422,29 @@ async def test_malformed_output_for_one_item_is_isolated_without_a_runner_correc
 
     assert results.pop("i02") == ItemFailure("invalid_response", "ValueError", malformed)
     assert results == {item_id: ((),) for item_id in ("i00", "i01", "i03")}
+    # The client already repaired the response once, so the runner only halves.
     assert [prompt_ids(prompt) for prompt in client.prompts] == [
         list(ids(4)), ["i00", "i01"], ["i02", "i03"], ["i02"], ["i03"],
     ]
 
 
-async def test_a_journaled_split_reuses_every_completed_half_on_retry():
+async def test_a_retried_run_reuses_accepted_rows_and_the_re_ask_without_a_call():
     store = MemoryWorkStore()
     first = FixtureBudgetClient(respond=answer)
-    failed = await LlmBatchRunner(first, model=FIXTURE_MODEL).run_items(
-        item_task(first, ids(4), decode=rejecting("i02"), journal=fixture_journal(store)))
-    assert failed["i02"].category == "invalid_response"
+    decode_rows = rejecting("i02", until_reasked=True)
+    await LlmBatchRunner(first, model=FIXTURE_MODEL).run_items(
+        item_task(first, ids(4), decode=decode_rows, journal=fixture_journal(store)))
+    assert len(first.prompts) == 2
 
     second = FixtureBudgetClient(respond=answer)
     runner = LlmBatchRunner(second, model=FIXTURE_MODEL)
-    retried = await runner.run_items(item_task(second, ids(4), decode=rejecting("i02"), journal=fixture_journal(store)))
+    results = await runner.run_items(item_task(second, ids(4), decode=decode_rows, journal=fixture_journal(store)))
 
-    assert (retried.pop("i02").error_code, failed.pop("i02").error_code) == (OUTPUT_INVALID, OUTPUT_INVALID)
-    assert retried == failed
-    # Only requests that never completed are sent again; the completed halves are reused.
-    assert [prompt_ids(prompt.split("<correction>")[0]) for prompt in second.prompts] == [
-        list(ids(4)), list(ids(4)), ["i02", "i03"], ["i02", "i03"], ["i02"], ["i02"],
-    ]
-    assert runner.stats.reused == 2
+    assert results == {item_id: ((),) for item_id in ids(4)}
+    assert second.prompts == [] and runner.stats.reused == 2
 
 
-async def test_a_correction_that_does_not_fit_is_not_sent():
+async def test_a_re_ask_that_does_not_fit_is_not_sent():
     client = FixtureBudgetClient(respond=lambda prompt: Rows(rows=[]), input_tokens=4)
     runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
 
@@ -377,8 +453,7 @@ async def test_a_correction_that_does_not_fit_is_not_sent():
     assert {(failure.category, failure.error_code) for failure in results.values()} == {
         ("invalid_response", OUTPUT_INVALID)
     }
-    # Each request is sent once: its correction would not fit, so the items split down to one each.
-    assert [prompt_ids(prompt) for prompt in client.prompts] == [list(ids(3)), ["i00"], ["i01", "i02"], ["i01"], ["i02"]]
+    assert runner.stats.calls == 1
 
 
 async def test_shared_context_is_chunked_for_an_item_that_needs_it():
@@ -441,7 +516,7 @@ async def test_chain_single_item_single_part_failure_leaves_other_lanes_complete
     assert results == {"i00": ("p0",), "i01": ItemFailure("deadline_exceeded", error.error_code, error, part=0)}
 
 
-async def test_chain_output_still_invalid_splits_the_lane_until_the_item_stands_alone():
+async def test_chain_output_that_cannot_be_read_into_rows_splits_the_lane_until_the_item_stands_alone():
     def carry_unless_i01(response, step: ChainStep):
         if "i01" in step.item_ids:
             raise SelectionError("unknown ref")
@@ -464,6 +539,43 @@ async def test_chain_output_still_invalid_splits_the_lane_until_the_item_stands_
     assert (runner.stats.splits, runner.stats.failed_requests) == (2, 1)
 
 
+async def test_chain_re_asks_a_rejected_row_with_the_same_step_and_state_then_rejoins_the_lane():
+    def carry_rows(response, step: ChainStep):
+        for item_id, state in carry(response, step):
+            # i01's first answer to the second step is rejected; its re-ask is accepted.
+            rejected = item_id == "i01" and step.position == 1 and len(step.item_ids) > 1
+            yield item_id, RejectedRow("i01 names p9, which is not supplied") if rejected else state
+
+    client = FixtureBudgetClient(respond=answer)
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+    task = chain_task(client, ids(3), parts(3), render=one_part_per_step, decode=carry_rows)
+
+    results = await runner.run_chain(task)
+
+    assert results == dict.fromkeys(ids(3), parts(3))
+    # The re-ask reads the same part at the same position, for i01 alone; then the lane reads on together.
+    assert [(reasked_ids(prompt), prompt_parts(prompt.split("<correction>")[0])) for prompt in client.prompts] == [
+        (list(ids(3)), ["p0"]), (list(ids(3)), ["p1"]), (["i01"], ["p1"]), (list(ids(3)), ["p2"]),
+    ]
+
+
+async def test_chain_row_still_rejected_after_its_re_ask_fails_that_item_at_its_part():
+    def carry_rows(response, step: ChainStep):
+        for item_id, state in carry(response, step):
+            yield item_id, RejectedRow("i01 names p9, which is not supplied") if item_id == "i01" else state
+
+    client = FixtureBudgetClient(respond=answer)
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+
+    results = await runner.run_chain(chain_task(client, ids(2), parts(2), render=one_part_per_step, decode=carry_rows))
+
+    failure = results.pop("i01")
+    assert results == {"i00": parts(2)}
+    assert (failure.category, failure.part, failure.unjudgeable) == ("invalid_response", 0, True)
+    # i00 reads on alone; i01 had one re-ask.
+    assert [reasked_ids(prompt) for prompt in client.prompts] == [["i00", "i01"], ["i01"], ["i00"]]
+
+
 async def test_chain_item_exits_only_after_its_first_part():
     def done(item_id, prompt):
         read = prompt_parts(prompt.split("<correction>")[0])
@@ -479,8 +591,10 @@ async def test_chain_item_exits_only_after_its_first_part():
 
     results = await runner.run_chain(task)
 
-    # i01 tried to finish inside its first part, so the first step was corrected once.
-    assert "<correction>" in client.prompts[1] and runner.stats.corrections == 1
+    # i01 tried to finish inside its first part: i00's row was accepted, and only i01 re-read the step.
+    assert reasked_ids(client.prompts[1]) == ["i01"] and prompt_parts(client.prompts[1].split("<correction>")[0]) == ["p0"]
+    assert "i01 finished before reading its first part" in client.prompts[1]
+    assert (runner.stats.reasks, runner.stats.corrections) == (1, 0)
     assert results == {"i00": ("p0", "done"), "i01": ("p0", "p1", "p2", "p3", "done")}
     # A finished item leaves the chain: later requests no longer carry it.
     assert [prompt_ids(prompt) for prompt in client.prompts[2:]] == [["i01"]] * 3

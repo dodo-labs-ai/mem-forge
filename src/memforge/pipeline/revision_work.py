@@ -23,7 +23,9 @@ import litellm
 from pydantic import BaseModel, ConfigDict
 
 from memforge.derivation_work import DerivationWork, DerivationWorkJournal, DerivationWorkStore, payload_hash
-from memforge.llm.batch_runner import ChainStep, ChainTask, ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
+from memforge.llm.batch_runner import (
+    ChainStep, ChainTask, ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow,
+)
 from memforge.llm.failure_trace import failure_trace_context
 from memforge.llm.structured import (
     ChangeImpactWireResponse as ImpactResponse,
@@ -312,6 +314,7 @@ class RevisionWorkExecutor:
             decode=lambda response, _item_ids, _parts: wire.decode_impacts(response),
             call=partial(self.client.evaluate_revision_work, response_format=ImpactResponse),
             journal=journal,
+            label=wire.works.__getitem__,
         ))
         unaffected = []
         for item in items:
@@ -465,46 +468,54 @@ class RevisionWorkExecutor:
             return context.attach_images(request, readable, fits=self._runner.fits)
 
         def decode(response, step: ChainStep):
+            """Decode every row alone; a row whose refs or selection are invalid is rejected by itself."""
             step_catalog, carried = supplied(step)
             allowed = _refs(step_catalog) | _refs(carried)
-            read_parts = step.position + len(step.parts)
-            last = read_parts == step.total
             decoded = []
-            for row in wire.decode(response).results:
-                alias = wire.works[row.work_id]
-                if row.work_id not in step.states:
-                    raise FragmentSelectionError(
-                        FragmentSelectionErrorCode.UNKNOWN_REF, f"{alias} was not requested in this step",
-                    )
-                state = step.states[row.work_id]
-                if isinstance(row, ContinueReadingWireResult):
-                    delta = row.witness_delta
-                    _require_supplied(alias, (*delta.support_witness_refs, *delta.opposing_witness_refs), allowed, wire)
-                    state = state.witnessed(
-                        support=delta.support_witness_refs, opposing=delta.opposing_witness_refs, read_parts=read_parts,
-                    )
-                elif isinstance(row, SupportedWireResult):
-                    selected = (row.primary_ref, *row.required_refs)
-                    _require_supplied(alias, selected, allowed, wire)
-                    state = state.witnessed(support=selected, read_parts=read_parts)
-                    # Support found before the first part is complete only adds witnesses, so the
-                    # runner's early-finish correction never fires for a Support.
-                    if row.work_id in step.may_finish:
-                        _log_unselected_prior(alias, selected, by_id[row.work_id].matched_refs)
-                        _resolved_selection(catalog, row.primary_ref, row.required_refs)
-                        state = state.model_copy(update={
-                            "verdict": "supported",
-                            "primary_ref": row.primary_ref,
-                            "required_refs": _distinct_required(row.primary_ref, row.required_refs),
-                        })
-                else:
-                    state = state.witnessed(read_parts=read_parts)
-                    # Absence of Support is known only after the whole order is read.
-                    if last:
-                        state = state.model_copy(update={"verdict": "unsupported"})
-                decoded.append((row.work_id, state))
-            latest.update(decoded)
+            for work_id, row in wire.decode_rows(response):
+                alias = wire.works[work_id]
+                if work_id not in step.states:
+                    continue
+                try:
+                    if isinstance(row, FragmentSelectionError):
+                        raise row
+                    state = read_row(row, step, allowed)
+                except FragmentSelectionError as error:
+                    decoded.append((work_id, RejectedRow(f"{alias}: {error}", cause=error)))
+                    continue
+                decoded.append((work_id, state))
+            latest.update((work_id, state) for work_id, state in decoded if not isinstance(state, RejectedRow))
             return decoded
+
+        def read_row(row, step: ChainStep, allowed) -> SupportReadingState:
+            """One work's next state from its row, or FragmentSelectionError for this row alone."""
+            alias = wire.works[row.work_id]
+            state = step.states[row.work_id]
+            read_parts = step.position + len(step.parts)
+            if isinstance(row, ContinueReadingWireResult):
+                delta = row.witness_delta
+                _require_supplied((*delta.support_witness_refs, *delta.opposing_witness_refs), allowed, wire)
+                return state.witnessed(
+                    support=delta.support_witness_refs, opposing=delta.opposing_witness_refs, read_parts=read_parts,
+                )
+            if isinstance(row, SupportedWireResult):
+                selected = (row.primary_ref, *row.required_refs)
+                _require_supplied(selected, allowed, wire)
+                state = state.witnessed(support=selected, read_parts=read_parts)
+                # Support found before the first part is complete only adds witnesses, so the
+                # runner's early-finish rule never fires for a Support.
+                if row.work_id not in step.may_finish:
+                    return state
+                _log_unselected_prior(alias, selected, by_id[row.work_id].matched_refs)
+                _resolved_selection(catalog, row.primary_ref, row.required_refs)
+                return state.model_copy(update={
+                    "verdict": "supported",
+                    "primary_ref": row.primary_ref,
+                    "required_refs": _distinct_required(row.primary_ref, row.required_refs),
+                })
+            state = state.witnessed(read_parts=read_parts)
+            # Absence of Support is known only after the whole order is read.
+            return state.model_copy(update={"verdict": "unsupported"}) if read_parts == step.total else state
 
         return ChainTask(
             initial_states={support.item.id: SupportReadingState() for support in supports},
@@ -515,6 +526,7 @@ class RevisionWorkExecutor:
             decode=decode,
             call=partial(self.client.evaluate_revision_work, response_format=AssessmentResponse),
             journal=journal,
+            label=wire.works.__getitem__,
         )
 
     @staticmethod
@@ -771,12 +783,12 @@ def _refs(catalog: ProjectionFragmentCatalog) -> set[str]:
     return {fragment.reference for fragment in catalog.fragments}
 
 
-def _require_supplied(alias: str, refs, allowed, wire: SupportWireAliases) -> None:
+def _require_supplied(refs, allowed, wire: SupportWireAliases) -> None:
     unavailable = set(refs) - allowed
     if unavailable:
         raise FragmentSelectionError(
             FragmentSelectionErrorCode.UNKNOWN_REF,
-            f"{alias} names current Evidence that this request did not supply: "
+            "current Evidence that this request did not supply: "
             + ", ".join(sorted(wire.refs[ref] for ref in unavailable)),
         )
 

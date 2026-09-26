@@ -102,7 +102,8 @@ async def test_wire_id_text_is_not_rewritten_and_unknown_namespace_fails_closed(
     assert result.unresolved == 'invalid_response'
     assert len(client.prompts) == 2
     assert 'Literal p000001 and w000068 are source text.' in client.prompts[0]
-    assert all(w.status != 'completed' for w in store.works.values() if w.kind == 'support_assess')
+    # The rejected row is never a completed judgment: no completion receipt is recorded.
+    assert not executor.final_work_ids
 
 
 @pytest.mark.asyncio

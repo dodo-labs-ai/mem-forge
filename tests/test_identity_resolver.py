@@ -401,11 +401,11 @@ async def test_identity_resolver_isolates_a_pair_whose_output_stays_invalid(firs
     batch = await resolver.resolve((IdentityResolutionRequest(challenger, "doc-a"),))
     result = batch.resolutions[0]
 
-    # Both pairs with their correction, then each pair alone: the second one with its correction.
-    assert len(client.calls) == 5
-    assert "<correction>" in client.calls[1][0]
+    # Pair 0's row is accepted; pair 1, which has no row, is re-asked once.
+    assert len(client.calls) == 2
+    assert "no result was returned for pair_index 1" in client.calls[1][0]
     assert batch.metrics.pair_count == 2
-    assert batch.metrics.llm_calls == 5
+    assert batch.metrics.llm_calls == 2
     assert batch.metrics.prompt_chars > 0
     if first_label == "equivalent":
         # A proven equivalent attaches even though the other pair could not be judged.

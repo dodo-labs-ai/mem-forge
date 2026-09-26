@@ -92,30 +92,37 @@ class SupportWireAliases:
         return self._work_ids[alias]
 
     def decode_impacts(self, response: ChangeImpactWireResponse) -> list[tuple[str, str]]:
-        """Each row's canonical work id with its impact label."""
-        return [
-            (self._work(row.work_id, f"results[{index}].work_id"), row.impact)
-            for index, row in enumerate(response.results)
-        ]
+        """Each row's canonical work id with its impact label; a row for an unknown work is not an answer."""
+        return [(self._work_ids[row.work_id], row.impact) for row in response.results if row.work_id in self._work_ids]
 
     def decode(self, response):
-        """Return the same response with canonical work ids and catalog refs."""
-        rows = []
+        """Return the same response with canonical work ids and catalog refs; any invalid row raises."""
+        return SupportAssessmentWireResponse(
+            results=[self._decode_row(row, f"results[{index}]") for index, row in enumerate(response.results)],
+        )
+
+    def decode_rows(self, response):
+        """Each row of a known work, decoded alone: its canonical work id and the decoded row or its error."""
         for index, row in enumerate(response.results):
-            at = f"results[{index}]"
-            work_id = self._work(row.work_id, f"{at}.work_id")
-            if isinstance(row, ContinueReadingWireResult):
-                delta = row.witness_delta
-                rows.append(row.model_copy(update={"work_id": work_id, "witness_delta": SupportWitnessDelta(
-                    support_witness_refs=self._refs(delta.support_witness_refs, f"{at}.support_witness_refs"),
-                    opposing_witness_refs=self._refs(delta.opposing_witness_refs, f"{at}.opposing_witness_refs"),
-                )}))
-            elif isinstance(row, SupportedWireResult):
-                rows.append(row.model_copy(update={
-                    "work_id": work_id,
-                    "primary_ref": self._ref(row.primary_ref, f"{at}.primary_ref", allowed=self._primary_ids),
-                    "required_refs": self._refs(row.required_refs, f"{at}.required_refs"),
-                }))
-            else:
-                rows.append(row.model_copy(update={"work_id": work_id}))
-        return SupportAssessmentWireResponse(results=rows)
+            if row.work_id not in self._work_ids:
+                continue
+            try:
+                yield self._work_ids[row.work_id], self._decode_row(row, f"results[{index}]")
+            except FragmentSelectionError as error:
+                yield self._work_ids[row.work_id], error
+
+    def _decode_row(self, row, at: str):
+        work_id = self._work(row.work_id, f"{at}.work_id")
+        if isinstance(row, ContinueReadingWireResult):
+            delta = row.witness_delta
+            return row.model_copy(update={"work_id": work_id, "witness_delta": SupportWitnessDelta(
+                support_witness_refs=self._refs(delta.support_witness_refs, f"{at}.support_witness_refs"),
+                opposing_witness_refs=self._refs(delta.opposing_witness_refs, f"{at}.opposing_witness_refs"),
+            )})
+        if isinstance(row, SupportedWireResult):
+            return row.model_copy(update={
+                "work_id": work_id,
+                "primary_ref": self._ref(row.primary_ref, f"{at}.primary_ref", allowed=self._primary_ids),
+                "required_refs": self._refs(row.required_refs, f"{at}.required_refs"),
+            })
+        return row.model_copy(update={"work_id": work_id})

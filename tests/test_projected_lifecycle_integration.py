@@ -1862,8 +1862,8 @@ async def test_a_candidate_whose_admission_stays_invalid_is_rejected_and_the_rev
     )
 
     assert [memory.content for memory in await db.list_memories()] == ["The trigger was not processed."]
-    # The pair and its correction, then each Candidate alone: one call, and one call with its correction.
-    assert len(client.prompts) == 5
+    # Both Candidates, then the one re-ask of the Candidate whose decision is missing.
+    assert len(client.prompts) == 2
     assert stats["candidate_admission_rejected_count"] == 1
     [event] = await db.list_memory_audit_events(event_type="candidate_admission_rejected")
     assert event.reason == "invalid_response"

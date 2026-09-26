@@ -238,13 +238,13 @@ async def test_change_impact_output_that_stays_invalid_isolates_one_work_and_rou
     with caplog.at_level(logging.WARNING, logger="memforge.pipeline.revision_work"):
         results = await executor.assess_many(work_items(CHANGED, 2))
 
-    # WRK-0000 is judged alone and rebound; only WRK-0001 is read by Support Assessment.
+    # WRK-0000's row is accepted and rebound; only WRK-0001 is read by Support Assessment.
     assert executor.change_impact_counts == {"unaffected": 1, "affected": 0, "failed": 1}
     assert results["w0"].rebound and not results["w1"].rebound
     assert results["w1"].memory.support_validation["route"] == "support_assessment"
     assert {work["work_id"] for p in client.prompts for work in payload(p)["works"]} == {"WRK-0001"}
-    # Both works with the correction, then WRK-0000 alone, then WRK-0001 alone with its correction.
-    assert len(client.impact_prompts) == 5
+    # Both works, then WRK-0001's one re-ask.
+    assert len(client.impact_prompts) == 2
     records = [r.getMessage() for r in caplog.records if r.getMessage().startswith("change_impact_failed")]
     assert len(records) == 1 and "memory_id=memory-1" in records[0] and "category=invalid_response" in records[0]
 
@@ -302,9 +302,11 @@ async def test_work_id_coverage_is_validated(defect):
     executor = RevisionWorkExecutor(client=client, model="fixture")
     results = await executor.assess_many(work_items(CHANGED, 2))
     assert len(client.impact_prompts) == 2 and "<correction>" in client.impact_prompts[1]
-    # The correction completes the same request instead of sending a new one.
-    assert executor.stage_counts["change_impact"] == 1
-    # The corrected response decides both works.
+    # The accepted row is kept; only WRK-0001, which has no row, is re-asked in its own request.
+    assert [work["work_id"] for work in change_impact_payload(client.impact_prompts[1])["works"]] == ["WRK-0001"]
+    assert "no result was returned for WRK-0001" in client.impact_prompts[1]
+    assert executor.stage_counts["change_impact"] == 2
+    # The two requests decide both works.
     assert all(r.memory.support_validation["route"] == "change_impact" for r in results.values())
     assert executor.change_impact_counts == {"unaffected": 2, "affected": 0, "failed": 0}
 

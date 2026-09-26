@@ -519,10 +519,11 @@ class StructuredCrossDocumentRelationClassifier:
             )
 
         def decode(response: CrossDocumentRelationResponse, _item_ids: tuple[str, ...], _context: tuple):
+            """Each decision is its pair's row; a decision for an unknown pair_index is not an answer."""
             for decision in response.decisions:
                 pair_index = int(decision.pair_index)
                 if not 0 <= pair_index < len(pairs):
-                    raise ValueError(f"unknown pair_index {pair_index}")
+                    continue
                 yield str(pair_index), CrossDocumentRelationJudgment(
                     pair=pairs[pair_index],
                     label=CrossDocumentRelationLabel(decision.label),
@@ -536,6 +537,7 @@ class StructuredCrossDocumentRelationClassifier:
                 render=render,
                 decode=decode,
                 call=self._client.classify_cross_document_relations,
+                label=lambda item_id: f"pair_index {item_id}",
             ),
             pair_count=len(pairs),
             label="cross-document relation classification",
