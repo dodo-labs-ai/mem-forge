@@ -352,14 +352,24 @@ class RevisionWorkExecutor:
         """Stream one cohort through its reading order; each Support stops at its validated verdict."""
         reading = reading if reading is not None else plan.reading_order(supports)
         items = [support.item for support in supports]
+        scope = _reading_scope(candidate_evidence)
         if not reading.has_current_content:
-            # No current Evidence exists to select, and no assessed part is UNKNOWN.
+            # No current Evidence exists to select, and no assessed part is UNKNOWN: the
+            # empty reading order is read completely, and its receipt says so.
+            await self._complete(
+                SUPPORT_ASSESSMENT_CONTRACT, plan.catalog, items, (),
+                {"results": [{"work_id": item.id, "verdict": "unsupported", "read_parts": 0} for item in items]},
+                coverage={"total": 0, "read_parts": {item.id: 0 for item in items}},
+                reading=scope,
+            )
             return {
-                item.id: SupportAssessment(False, "The target revision has no current Evidence.", None)
+                item.id: SupportAssessment(
+                    False, "The target revision has no current Evidence.", None,
+                    complete_read=not candidate_evidence,
+                )
                 for item in items
             }
         context = plan.context
-        scope = _reading_scope(candidate_evidence)
         journal = self._journal("support_assess", SUPPORT_ASSESSMENT_CONTRACT, plan.catalog, items, scope)
         # Each Support's most recently decoded state; a capacity diagnostic reports its carried witnesses.
         latest = {item.id: SupportReadingState() for item in items}
@@ -402,6 +412,7 @@ class RevisionWorkExecutor:
                 "The Candidate's current Evidence does not support the claim." if candidate_evidence
                 else "The complete current revision was read without complete Support.",
                 None,
+                complete_read=not candidate_evidence,
             )
         # Claims that read the same requests share one completion receipt.
         readers = {}

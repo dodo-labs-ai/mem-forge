@@ -101,6 +101,8 @@ class MemorySupport:
     evidence: tuple[RawMemory, ...] = ()
     # This revision already re-checked the claim; a remaining conflict goes to Review.
     rechecked: bool = False
+    # The Support assessments this result rests on; DestructiveValidation verifies them.
+    assessments: tuple[SupportAssessment, ...] = ()
 
     def after_candidate_recheck(self, assessment: SupportAssessment) -> MemorySupport:
         """The result once the claim was read against its equivalent Candidates' current Evidence.
@@ -109,9 +111,14 @@ class MemorySupport:
         Not finding it there says nothing about the rest of the revision.
         """
         if assessment.supported and assessment.memory is not None:
-            return MemorySupport(SupportResult.SUPPORTED, assessment.reason, (assessment.memory,), rechecked=True)
+            return MemorySupport(
+                SupportResult.SUPPORTED, assessment.reason, (assessment.memory,), rechecked=True,
+                assessments=(assessment,),
+            )
         if assessment.unresolved == "capacity":
-            return MemorySupport(SupportResult.UNRESOLVED_CAPACITY, assessment.reason, rechecked=True)
+            return MemorySupport(
+                SupportResult.UNRESOLVED_CAPACITY, assessment.reason, rechecked=True, assessments=(assessment,),
+            )
         return replace(self, rechecked=True)
 
 
@@ -125,15 +132,16 @@ def memory_support(assessments: Sequence[SupportAssessment], *, rechecked: bool 
     complete Support is the Memory UNSUPPORTED.
     """
     reason = "; ".join(dict.fromkeys(assessment.reason for assessment in assessments))
+    assessments = tuple(assessments)
     for unresolved in ("capacity", "partial_coverage"):
         if any(assessment.unresolved == unresolved for assessment in assessments):
-            return MemorySupport(_UNRESOLVED[unresolved], reason, rechecked=rechecked)
+            return MemorySupport(_UNRESOLVED[unresolved], reason, rechecked=rechecked, assessments=assessments)
     evidence = tuple(assessment.memory for assessment in assessments if assessment.supported and assessment.memory)
     if any(assessment.supported and not assessment.rebound for assessment in assessments):
-        return MemorySupport(SupportResult.SUPPORTED, reason, evidence, rechecked)
+        return MemorySupport(SupportResult.SUPPORTED, reason, evidence, rechecked, assessments)
     if evidence:
-        return MemorySupport(SupportResult.UNAFFECTED, reason, evidence, rechecked)
-    return MemorySupport(SupportResult.UNSUPPORTED, reason, rechecked=rechecked)
+        return MemorySupport(SupportResult.UNAFFECTED, reason, evidence, rechecked, assessments)
+    return MemorySupport(SupportResult.UNSUPPORTED, reason, rechecked=rechecked, assessments=assessments)
 
 
 @dataclass(frozen=True, slots=True)

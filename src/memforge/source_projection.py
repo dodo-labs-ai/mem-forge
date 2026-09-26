@@ -86,12 +86,6 @@ class AnchorKind(str, Enum):
     REVISION_RANGE = "revision_range"
 
 
-class ImpactResult(str, Enum):
-    AFFECTED = "affected"
-    DISJOINT = "disjoint"
-    UNKNOWN = "unknown"
-
-
 class SourceRelationType(str, Enum):
     CONTAINED_BY = "contained_by"
     REPLIES_TO = "replies_to"
@@ -812,65 +806,6 @@ def source_projection_from_payload(payload: Mapping[str, object]) -> SourceProje
             str(value) for value in payload.get("carried_observation_revision_ids", [])
         ),
     )
-
-
-def resolve_anchor_impact(anchor: SourceAnchor, delta: RevisionDelta) -> ImpactResult:
-    """Resolve source impact using only the controlled anchor contract.
-
-    Precision is an optimization.  Missing or unreliable mapping returns
-    ``UNKNOWN`` so callers expand toward the whole Source Unit rather than
-    silently keeping stale support.
-    """
-
-    if anchor.observation_id in delta.removed_observation_ids:
-        return ImpactResult.AFFECTED
-    if anchor.observation_id in delta.added_observation_ids:
-        return ImpactResult.AFFECTED
-    if DeltaAxis.SEMANTIC not in delta.axes and DeltaAxis.MEMBERSHIP not in delta.axes:
-        return ImpactResult.DISJOINT
-
-    changed = tuple(item for item in delta.changed_anchors if item.observation_id == anchor.observation_id)
-    if not changed:
-        return ImpactResult.DISJOINT
-    if anchor.kind is AnchorKind.WHOLE_OBSERVATION:
-        # A whole-observation support anchor is affected by any semantic
-        # change to that same Observation.  Returning UNKNOWN here prevented
-        # partial Jira/Teams projections from reconciling the exact incumbent
-        # they had deterministically changed, leaving stale Memory active.
-        return ImpactResult.AFFECTED
-
-    if anchor.kind is AnchorKind.REVISION_RANGE:
-        if not all(item.kind is AnchorKind.REVISION_RANGE for item in changed):
-            return ImpactResult.UNKNOWN
-        for item in changed:
-            if anchor.observation_revision_id != item.observation_revision_id:
-                return ImpactResult.UNKNOWN
-            assert anchor.range_start is not None and anchor.range_end is not None
-            assert item.range_start is not None and item.range_end is not None
-            if anchor.range_start < item.range_end and item.range_start < anchor.range_end:
-                return ImpactResult.AFFECTED
-        return ImpactResult.DISJOINT
-
-    assert anchor.fragment_id is not None
-    current_fragment_id = anchor.fragment_id
-    current_revision_id = anchor.observation_revision_id
-    for mapping in delta.fragment_mappings:
-        if (
-            mapping.observation_id == anchor.observation_id
-            and mapping.previous_revision_id == current_revision_id
-            and mapping.previous_fragment_id == current_fragment_id
-        ):
-            current_fragment_id = mapping.current_fragment_id
-            current_revision_id = mapping.current_revision_id
-            break
-    if not delta.fragment_mappings and any(item.observation_revision_id != current_revision_id for item in changed):
-        return ImpactResult.UNKNOWN
-    for item in changed:
-        if item.kind is not AnchorKind.STABLE_FRAGMENT:
-            return ImpactResult.UNKNOWN
-        if item.fragment_id == current_fragment_id:
-            return ImpactResult.AFFECTED
-    return ImpactResult.DISJOINT
 
 
 def _require_unique(label: str, values: tuple[str, ...]) -> None:
