@@ -318,6 +318,27 @@ def test_review_proposing_support_without_evidence_units_fails_its_stale_guard()
         build_lifecycle_review_approval_plan(review, lifecycle_plan_to_payload(original))
 
 
+def test_review_proposing_a_retired_mutation_type_fails_its_stale_guard() -> None:
+    original = _build(gate=LifecycleGateState.GATED)
+    mutation = original.mutations[0]
+    staged_evidence = dict(mutation.payload["staged_evidence"])
+    staged_evidence["proposed_mutations"] = [
+        {**proposed, "mutation_type": "reactivate_memory"}
+        for proposed in staged_evidence["proposed_mutations"]
+    ]
+    review = LifecycleReview(
+        id=str(mutation.payload["review_id"]),
+        lifecycle_plan_id=original.id,
+        incumbent_memory_id=mutation.memory_id,
+        status=LifecycleReviewStatus.PENDING,
+        staged_evidence=staged_evidence,
+        reason=str(mutation.payload["reason"]),
+    )
+
+    with pytest.raises(ValueError, match="stale guard failed: unsupported mutation reactivate_memory"):
+        build_lifecycle_review_approval_plan(review, lifecycle_plan_to_payload(original))
+
+
 def test_pending_review_without_activation_does_not_enqueue_relation_discovery() -> None:
     old = _memory()
     original = build_lifecycle_plan(

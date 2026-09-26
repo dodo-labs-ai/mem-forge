@@ -41,7 +41,6 @@ def primary_evidence_unit_fixture(memory_id: str) -> MemoryEvidenceUnitProjectio
         source_unit_revision_id=f"rev-{memory_id}",
         doc_id=f"doc-{memory_id}",
         current=True,
-        legacy_limited=False,
         items=(
             MemoryEvidenceItemProjection(
                 reference_id=f"ref-{memory_id}",

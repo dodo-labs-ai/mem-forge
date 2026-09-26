@@ -24,7 +24,6 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import tiktoken
@@ -49,14 +48,8 @@ from memforge.models import (
     SyncState,
     content_hash as compute_content_hash,
 )
-from memforge.pipeline.bounded_work import collect_bounded
-from memforge.pipeline.claim_evidence import (
-    ClaimEvidenceWorkKind,
-    localize_claim_evidence,
-)
 from memforge.pipeline.sync_memory import ProcessMemoryReclaimer, SyncMemoryObserver
 
-from memforge.pipeline.document_units import ExtractionContextPacker, UnitizationPolicy, unitize_markdown
 from memforge.pipeline.document_update import (
     DocumentUpdatePlan,
     plan_document_update,
@@ -93,9 +86,7 @@ from memforge.source_artifacts import (
 )
 from memforge.source_derivation import (
     DERIVATION_INPUT_SUPERSEDED,
-    DiffGuidedExtractionBatch,
     SourceDerivationAttempt,
-    StructuralExtractionBatch,
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
     SourceUnitDeriver,
@@ -104,8 +95,7 @@ from memforge.source_derivation import (
 )
 from memforge.pipeline.extraction_contract import (
     CONTRACT_SUPERSEDED,
-    PROJECTION_EXTRACTION_V9,
-    projection_extraction_contract,
+    PROJECTION_EXTRACTION_CONTRACT_VERSION,
 )
 from memforge.pipeline.projection_fragments import (
     compile_projection_fragment_catalog,
@@ -134,21 +124,11 @@ __all__ = [
     "DocumentLifecycleAdmission",
     "ExtractionWorkPool",
     "GeneSyncOrchestrator",
-    "SourceSyncMode",
     "SyncMemoryObserver",
     "get_process_document_lifecycle_admission",
 ]
 
 DEFAULT_INCREMENTAL_SYNC_OVERLAP = timedelta(minutes=10)
-
-
-class SourceSyncMode(str, Enum):
-    """Execution contract for one Gene discovery run."""
-
-    NORMAL = "normal"
-    PROJECTION_REPAIR = "projection_repair"
-    REBASELINE_PREFLIGHT = "rebaseline_preflight"
-    REBASELINE_REPLAY = "rebaseline_replay"
 
 
 # ---------------------------------------------------------------------------
@@ -734,7 +714,6 @@ class GeneSyncOrchestrator:
         force_full_sync: bool = False,
         authoritative_snapshot: bool = False,
         reprocess_doc_ids: frozenset[str] | None = None,
-        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
         lifecycle_cycle_id: str | None = None,
@@ -765,15 +744,6 @@ class GeneSyncOrchestrator:
         reprocess_doc_ids:
             Optional document identifiers that should be re-extracted during a
             full discovery. Other unchanged documents remain skipped.
-        execution_mode:
-            ``projection_repair`` establishes the current provider-neutral
-            projection baseline for explicitly requested documents without
-            running enrichment, Memory lifecycle, vector writes, deletion
-            detection, or advancing the ordinary source sync cursor.
-            ``rebaseline_replay`` runs only after a successful preflight and
-            lifecycle reset, so it may remove legacy documents that predate
-            persisted Source Unit lineage when complete discovery proves their
-            absence.
         record_terminal_result:
             Persist the terminal SyncState and history here. Durable workers
             disable this so their lease-fenced completion transaction owns the
@@ -796,12 +766,6 @@ class GeneSyncOrchestrator:
         run_id = uuid.uuid4().hex[:12]
         durable_cycle_id = lifecycle_cycle_id or run_id
         transition_run_id = scope_transition_run_id or durable_cycle_id
-        projection_repair = execution_mode is SourceSyncMode.PROJECTION_REPAIR
-        rebaseline_preflight = execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT
-        rebaseline_replay = execution_mode is SourceSyncMode.REBASELINE_REPLAY
-        non_mutating_run = projection_repair or rebaseline_preflight
-        if projection_repair and not reprocess_doc_ids:
-            raise ValueError("projection repair requires explicit document identifiers")
         started_at = datetime.now(timezone.utc)
         bind_document_store = getattr(gene, "bind_document_store", None)
         if callable(bind_document_store):
@@ -835,12 +799,10 @@ class GeneSyncOrchestrator:
             "access_policy": str((configured_source or {}).get("access_policy") or "workspace"),
             "owner_user_id": (configured_source or {}).get("owner_user_id"),
         }
-        scope_transition = None
-        if not non_mutating_run:
-            scope_transition = await self.db.get_open_projection_scope_transition(source_id)
-        if force_full_sync or execution_mode is not SourceSyncMode.NORMAL or scope_transition is not None:
-            # Reuse is an ordinary incremental optimization only. Recovery
-            # modes and scope transitions require the full per-document path.
+        scope_transition = await self.db.get_open_projection_scope_transition(source_id)
+        if force_full_sync or scope_transition is not None:
+            # Reuse is an ordinary incremental optimization only. Full syncs
+            # and scope transitions require the full per-document path.
             reusable_projection_doc_ids = frozenset()
         transition_started = False
         run_coverage = ProjectionCoverage.PARTIAL_PROJECTION
@@ -851,17 +813,16 @@ class GeneSyncOrchestrator:
         recovered_deferred_results: tuple[dict[str, Any], ...] = ()
 
         try:
-            if execution_mode is SourceSyncMode.NORMAL:
-                recovered = await self._resume_source_derivations(
-                    source_id=source_id,
-                    source_activity_epoch=source_activity_epoch,
-                    source_activity=source_activity,
-                    run_id=run_id,
-                    lifecycle_execution_owner_id=durable_cycle_id,
-                    progress_callback=progress_callback,
-                )
-                recovered_completed_results = recovered.completed_results
-                recovered_deferred_results = recovered.deferred_results
+            recovered = await self._resume_source_derivations(
+                source_id=source_id,
+                source_activity_epoch=source_activity_epoch,
+                source_activity=source_activity,
+                run_id=run_id,
+                lifecycle_execution_owner_id=durable_cycle_id,
+                progress_callback=progress_callback,
+            )
+            recovered_completed_results = recovered.completed_results
+            recovered_deferred_results = recovered.deferred_results
 
             # ----------------------------------------------------------
             # Step 0: Authenticate
@@ -892,7 +853,7 @@ class GeneSyncOrchestrator:
             # ----------------------------------------------------------
             last_sync_time = (
                 None
-                if non_mutating_run or force_full_sync or authoritative_snapshot or scope_transition is not None
+                if force_full_sync or authoritative_snapshot or scope_transition is not None
                 else (existing_state.last_sync_at if existing_state else None)
             )
             if last_sync_time and hasattr(gene, "fetch_pdf"):
@@ -946,29 +907,11 @@ class GeneSyncOrchestrator:
                         }
                     )
 
-            # Preflight remains non-mutating, but its provider-level discovery
-            # attestation still decides whether absent historical units are a
-            # proven scope removal or an incomplete replay.
-            discovery_coverage = source_run_projection_coverage(
+            run_coverage = source_run_projection_coverage(
                 incremental=last_sync_time is not None,
                 authoritative_snapshot=authoritative_snapshot,
                 discovery_complete=bool(getattr(gene, "discovery_complete", False)),
             )
-            run_coverage = ProjectionCoverage.PARTIAL_PROJECTION if non_mutating_run else discovery_coverage
-
-            if projection_repair:
-                requested_doc_ids = set(reprocess_doc_ids or ())
-                discovered_by_id = {item.item_id: item for item in items}
-                items = [discovered_by_id[doc_id] for doc_id in sorted(requested_doc_ids) if doc_id in discovered_by_id]
-                for missing_doc_id in sorted(requested_doc_ids - discovered_by_id.keys()):
-                    failed_docs.append(
-                        FailedDoc(
-                            doc_id=missing_doc_id,
-                            title=missing_doc_id,
-                            error="requested document was not returned by provider discovery",
-                        )
-                    )
-                    docs_failed += 1
 
             logger.info(
                 "Discovered %d content items from %s (since=%s)",
@@ -1046,8 +989,6 @@ class GeneSyncOrchestrator:
                     "memories_extracted": 0,
                     "memories_corroborated": 0,
                     "failed": False,
-                    "preflight_source_unit_id": None,
-                    "preflight_observation_ids": (),
                     "runtime_bundle": None,
                     "source_unit_id": None,
                     "provider_target_unit_revision_id": None,
@@ -1118,7 +1059,6 @@ class GeneSyncOrchestrator:
                                 projection_access_context=configured_access_context,
                                 projection_scope_attestations=projection_scope_attestations,
                                 authoritative_snapshot=authoritative_snapshot,
-                                execution_mode=execution_mode,
                                 expected_source_activity_epoch=source_activity_epoch,
                                 source_activity=source_activity,
                                 lifecycle_execution_owner_id=durable_cycle_id,
@@ -1143,11 +1083,6 @@ class GeneSyncOrchestrator:
                             stats["memories_corroborated"] = item_stats.get(
                                 "memories_corroborated",
                                 0,
-                            )
-                            stats["preflight_source_unit_id"] = item_stats.get("preflight_source_unit_id")
-                            stats["preflight_observation_ids"] = item_stats.get(
-                                "preflight_observation_ids",
-                                (),
                             )
                             stats["source_unit_id"] = item_stats.get(
                                 "source_unit_id"
@@ -1339,28 +1274,6 @@ class GeneSyncOrchestrator:
                 if r.get("runtime_bundle") is not None:
                     runtime_bundles.append(r["runtime_bundle"])
 
-            if rebaseline_preflight and docs_failed == 0:
-                current_units = await self.db.list_current_source_unit_observation_ids(source_id)
-                replayed_units = {
-                    str(result["preflight_source_unit_id"]): frozenset(
-                        str(observation_id) for observation_id in result["preflight_observation_ids"]
-                    )
-                    for result in results
-                    if result["preflight_source_unit_id"] is not None
-                }
-                missing_units = sorted(set(current_units) - set(replayed_units))
-                missing_observations = {
-                    unit_id: sorted(set(observation_ids) - replayed_units.get(unit_id, frozenset()))
-                    for unit_id, observation_ids in current_units.items()
-                    if set(observation_ids) - replayed_units.get(unit_id, frozenset())
-                }
-                if (missing_units or missing_observations) and not discovery_coverage.proves_absence:
-                    raise ValueError(
-                        "source rebaseline replay closure is incomplete: "
-                        f"missing_units={missing_units}, "
-                        f"missing_observations={missing_observations}"
-                    )
-
             # ----------------------------------------------------------
             # Step 5: Detect deletions (only on full sync, not incremental)
             # ----------------------------------------------------------
@@ -1369,7 +1282,7 @@ class GeneSyncOrchestrator:
             # Only run deletion detection on full syncs (since=None).
             deleted_count = 0
             tombstoned_source_unit_ids: set[str] = set()
-            absence_is_authoritative = not non_mutating_run and run_coverage.proves_absence and docs_failed == 0
+            absence_is_authoritative = run_coverage.proves_absence and docs_failed == 0
 
             if absence_is_authoritative:
                 if progress_callback:
@@ -1395,7 +1308,6 @@ class GeneSyncOrchestrator:
                     indexed_doc_ids=indexed_doc_ids,
                     crawled_doc_ids=crawled_doc_ids,
                     source_filter_summary=_source_filter_summary(gene, last_sync_time),
-                    allow_legacy_orphan_cleanup=rebaseline_replay,
                     expected_source_activity_epoch=source_activity_epoch,
                     source_activity=source_activity,
                 )
@@ -1474,9 +1386,8 @@ class GeneSyncOrchestrator:
             # ----------------------------------------------------------
             # Step 6: Update source doc_count
             # ----------------------------------------------------------
-            if not non_mutating_run:
-                total_docs = await self.db.count_documents(source=source_id)
-                await self.db.update_source_doc_count(source_id, total_docs)
+            total_docs = await self.db.count_documents(source=source_id)
+            await self.db.update_source_doc_count(source_id, total_docs)
 
             # ----------------------------------------------------------
             # Determine final status
@@ -1562,7 +1473,7 @@ class GeneSyncOrchestrator:
             runtime_bundles=tuple(runtime_bundles),
         )
 
-        if record_terminal_result and not non_mutating_run:
+        if record_terminal_result:
             await self.db.record_source_sync_result(
                 sync_state,
                 started_at=started_at,
@@ -1725,14 +1636,13 @@ class GeneSyncOrchestrator:
                 "completed",
             ),
         )
-        active_contract = projection_extraction_contract(PROJECTION_EXTRACTION_V9)
         latest_by_projection: dict[
             tuple[int | None, str, str, str],
             SourceDerivationAttempt,
         ] = {}
         superseded_attempts: list[tuple[SourceDerivationAttempt, str | None]] = []
         for attempt in attempts:
-            if attempt.extraction_contract_version != active_contract.version:
+            if attempt.extraction_contract_version != PROJECTION_EXTRACTION_CONTRACT_VERSION:
                 if attempt.status in {"pending", "retryable_failure"}:
                     superseded_attempts.append(
                         (attempt, CONTRACT_SUPERSEDED)
@@ -1928,7 +1838,6 @@ class GeneSyncOrchestrator:
             doc_type=context.doc_type,
             source_id=source_id,
             derivation_context=context,
-            current_changed_ranges=context.current_changed_ranges,
         )
         if extraction.error_type:
             diagnostics.error_class = extraction.error_type
@@ -2032,7 +1941,6 @@ class GeneSyncOrchestrator:
         projection_access_context: dict[str, object] | None = None,
         projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         authoritative_snapshot: bool = False,
-        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
         lifecycle_execution_owner_id: str | None = None,
@@ -2073,27 +1981,18 @@ class GeneSyncOrchestrator:
                         projection_access_context=projection_access_context,
                         projection_scope_attestations=projection_scope_attestations,
                         authoritative_snapshot=authoritative_snapshot,
-                        execution_mode=execution_mode,
                         expected_source_activity_epoch=expected_source_activity_epoch,
                         source_activity=source_activity,
                         lifecycle_execution_owner_id=lifecycle_execution_owner_id,
                         lifecycle_attempt_count=lifecycle_attempt_count,
                         source_unit_target_callback=source_unit_target_callback,
                         recovered_deferred_targets=recovered_deferred_targets,
-                        source_unit_id_callback=(
-                            None
-                            if execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT
-                            else diagnostics.bind_source_unit
-                        ),
+                        source_unit_id_callback=diagnostics.bind_source_unit,
                     )
                     if result.get("recovered_deferred_target") is not None:
                         diagnostics.status = "prepared"
                     else:
-                        diagnostics.status = (
-                            "skipped"
-                            if execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT
-                            else "committed"
-                        )
+                        diagnostics.status = "committed"
                 return result
             except Exception as exc:
                 lifecycle_error = exc
@@ -2133,7 +2032,6 @@ class GeneSyncOrchestrator:
         projection_access_context: dict[str, object] | None = None,
         projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         authoritative_snapshot: bool = False,
-        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
         source_unit_id_callback: Callable[[str], None] | None = None,
@@ -2440,9 +2338,7 @@ class GeneSyncOrchestrator:
                             },
                             run_mode=(
                                 ProjectionRunMode.FULL_SNAPSHOT
-                                if (
-                                    execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT or prior_unit_revision is None
-                                )
+                                if prior_unit_revision is None
                                 else ProjectionRunMode.DELTA
                             ),
                             scope_transition=scope_transition,
@@ -2453,17 +2349,13 @@ class GeneSyncOrchestrator:
                         raw=raw,
                         normalized=normalized,
                         artifacts=stored_source_artifacts,
-                        prior_unit_revision=(
-                            None if execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT else prior_unit_revision
-                        ),
-                        prior_observation_revisions=(
-                            {} if execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT else prior_observation_revisions
-                        ),
+                        prior_unit_revision=prior_unit_revision,
+                        prior_observation_revisions=prior_observation_revisions,
                     )
                 )
 
             projection_requires_extraction = projection.deltas[0].requires_extraction
-            if not projection_requires_extraction and execution_mode is not SourceSyncMode.REBASELINE_PREFLIGHT:
+            if not projection_requires_extraction:
                 # Location/access-only and idempotent observations carry no
                 # Memory mutation, so their lineage can advance independently.
                 await self.db.record_source_projection(
@@ -2473,15 +2365,6 @@ class GeneSyncOrchestrator:
                 )
 
             lineage_document_ids = await self.db.list_source_unit_document_ids(source_unit.id)
-
-        if execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT:
-            if not projection.coverage.proves_absence:
-                raise ValueError(
-                    f"source rebaseline projection is not complete: {doc_id} coverage={projection.coverage.value}"
-                )
-            stats["preflight_source_unit_id"] = source_unit.id
-            stats["preflight_observation_ids"] = tuple(observation.id for observation in projection.observations)
-            return stats
 
         lineage_predecessor_docs: list[DocumentRecord] = []
         for lineage_doc_id in lineage_document_ids:
@@ -2556,8 +2439,7 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         pdf_uri = existing_doc.pdf_content_uri if reuse_content_artifacts and existing_doc else None
         should_fetch_pdf = (
-            execution_mode is not SourceSyncMode.PROJECTION_REPAIR
-            and not raw.authoritative_empty
+            not raw.authoritative_empty
             and hasattr(gene, "fetch_pdf")
             and (force_reprocess or requires_pdf_uri or not pdf_uri)
         )
@@ -2620,34 +2502,6 @@ class GeneSyncOrchestrator:
             last_synced=now,
             client=normalized.source_semantics.get("client") or None,
         )
-
-        if execution_mode is SourceSyncMode.PROJECTION_REPAIR:
-            stats["updated"] = existing_doc is None or not content_unchanged
-            async with self._db_lock:
-                await self.db.upsert_document(
-                    doc_record,
-                    require_configured_source=True,
-                    source_activity=source_activity,
-                )
-                await self.db.record_source_projection(
-                    projection,
-                    expected_source_activity_epoch=expected_source_activity_epoch,
-                    source_activity=source_activity,
-                )
-            if progress_callback:
-                progress_callback(
-                    {
-                        "phase": "processing",
-                        "event": "document_processed",
-                        "title": item.title,
-                    }
-                )
-            logger.info(
-                "Repaired Source Projection baseline for %s (%s) without Memory lifecycle",
-                item.title,
-                doc_id,
-            )
-            return stats
 
         if skip_semantic_work:
             stats["updated"] = not content_unchanged
@@ -2988,202 +2842,26 @@ class GeneSyncOrchestrator:
                 extraction_metadata=result.metadata,
             )
             return result
-        if (changed_observation_ids or reprocess_current_observations) and hasattr(
-            self.memory_extractor,
-            "extract_projection_fragment_memories",
-        ):
-            if derivation_context is None:
-                raise ValueError("Source derivation work requires a durable derivation context")
-            result = await self._extract_source_derivation_work(
-                projection=projection,
-                source_type=source_type,
-                doc_type=doc_type,
-                source_id=source_id,
-                derivation_context=derivation_context,
-                current_changed_ranges=(update_plan.current_changed_ranges if update_plan is not None else ()),
-            )
-            work_kinds = result.metadata.get("derivation_work_kinds", [])
-            extraction_mode = (
-                "diff_guided"
-                if work_kinds == ["diff_guided"]
-                else ("full_document" if work_kinds == ["structural_unit"] else "projection_batches")
-            )
-            await self._record_memory_extraction_result(
-                mode=extraction_mode,
-                plan=update_plan,
-                doc_id=doc_id,
-                source_id=source_id,
-                source_type=source_type,
-                run_id=run_id,
-                result=result,
-                extraction_metadata=result.metadata,
-            )
-            return result
-
-        if (
-            update_plan
-            and update_plan.mode == "diff_guided"
-            and hasattr(self.memory_extractor, "extract_memory_changes")
-        ):
-            try:
-                async with self._heavy_work_slot(source_id):
-                    result = await self.memory_extractor.extract_memory_changes(
-                        changed_hunks=update_plan.changed_hunks or "",
-                        updated_document=markdown_body,
-                        current_changed_ranges=update_plan.current_changed_ranges,
-                        source_type=source_type,
-                        doc_type=doc_type,
-                    )
-                if not result.error_type:
-                    result = self._enforce_diff_guided_evidence_boundary(
-                        result=result,
-                        updated_document=markdown_body,
-                        current_changed_ranges=(update_plan.current_changed_ranges),
-                        source_id=source_id,
-                        doc_id=doc_id,
-                    )
-                await self._record_memory_extraction_result(
-                    mode=update_plan.mode,
-                    plan=update_plan,
-                    doc_id=doc_id,
-                    source_id=source_id,
-                    source_type=source_type,
-                    run_id=run_id,
-                    result=result,
-                    extraction_metadata={
-                        "current_changed_range_count": len(update_plan.current_changed_ranges),
-                        "rejected_outside_changed_range_count": result.metadata.get(
-                            "rejected_outside_changed_range_count",
-                            0,
-                        ),
-                    },
-                )
-                if not result.error_type:
-                    return result
-                await self._record_document_update_strategy_fallback(
-                    plan=update_plan,
-                    doc_id=doc_id,
-                    source_id=source_id,
-                    run_id=run_id,
-                    reason="diff_guided_extraction_failed",
-                    error=result.error or result.error_type,
-                )
-            except Exception as e:
-                await self._record_document_update_strategy_fallback(
-                    plan=update_plan,
-                    doc_id=doc_id,
-                    source_id=source_id,
-                    run_id=run_id,
-                    reason="diff_guided_extraction_failed",
-                    error=str(e),
-                )
-                logger.warning(
-                    "Diff-guided extraction failed for %s; falling back to full extraction: %s",
-                    doc_id,
-                    e,
-                )
-
-        if hasattr(self.memory_extractor, "extract_unit_memories"):
-            result = await self._extract_full_document_units(
-                markdown_body=markdown_body,
-                source_type=source_type,
-                doc_type=doc_type,
-                doc_id=doc_id,
-                source_id=source_id,
-                document_title=document_title,
-                document_url=document_url,
-            )
-            unit_metadata = result.metadata or {}
-            await self._record_memory_extraction_result(
-                mode="full_document",
-                plan=update_plan,
-                doc_id=doc_id,
-                source_id=source_id,
-                source_type=source_type,
-                run_id=run_id,
-                result=result,
-                extraction_metadata={
-                    key: value
-                    for key, value in {
-                        "unitized": True,
-                        "unit_count": unit_metadata.get("unit_count", 0),
-                        "failed_unit_count": unit_metadata.get("failed_unit_count", 0),
-                        "partial_error_type": unit_metadata.get("partial_error_type"),
-                        "segmentation_version": unit_metadata.get("segmentation_version"),
-                        "partition_strategy": unit_metadata.get("partition_strategy"),
-                        "max_unit_input_tokens": unit_metadata.get("max_unit_input_tokens"),
-                    }.items()
-                    if value is not None
-                },
-            )
-            return result
-
-        async with self._heavy_work_slot(source_id):
-            result = await self.memory_extractor.extract_memories(
-                content=markdown_body,
-                source_type=source_type,
-                doc_type=doc_type,
-            )
+        if derivation_context is None:
+            raise ValueError("Source derivation work requires a durable derivation context")
+        result = await self._extract_source_derivation_work(
+            projection=projection,
+            source_type=source_type,
+            doc_type=doc_type,
+            source_id=source_id,
+            derivation_context=derivation_context,
+        )
         await self._record_memory_extraction_result(
-            mode="full_document",
+            mode="projection_batches",
             plan=update_plan,
             doc_id=doc_id,
             source_id=source_id,
             source_type=source_type,
             run_id=run_id,
             result=result,
+            extraction_metadata=result.metadata,
         )
         return result
-
-    def _enforce_diff_guided_evidence_boundary(
-        self,
-        *,
-        result: MemoryExtractionResult,
-        updated_document: str,
-        current_changed_ranges: tuple[tuple[int, int], ...],
-        source_id: str,
-        doc_id: str,
-    ) -> MemoryExtractionResult:
-        """Keep only candidates whose exact evidence intersects the current diff."""
-
-        kept = []
-        rejected = 0
-        for memory in result.memories:
-            localized = localize_claim_evidence(
-                memory,
-                authority_text=updated_document,
-                work_kind=ClaimEvidenceWorkKind.CHANGED_RANGE,
-                current_changed_ranges=current_changed_ranges,
-            )
-            if not localized.accepted:
-                rejected += 1
-                continue
-            localized.memory.evidence_anchor = "changed_range"
-            kept.append(localized.memory)
-        if rejected:
-            logger.warning(
-                "Rejected %d diff-guided memory candidate(s) outside changed ranges for %s/%s",
-                rejected,
-                source_id,
-                doc_id,
-            )
-        return MemoryExtractionResult(
-            memories=kept,
-            metadata={
-                **result.metadata,
-                "rejected_outside_changed_range_count": rejected,
-            },
-            error_type=(
-                "diff_guided_evidence_invalid"
-                if result.memories and not kept
-                else None
-            ),
-            error=(
-                "No diff-guided candidate had canonical Evidence in the changed range."
-                if result.memories and not kept
-                else None
-            ),
-        )
 
     async def _extract_source_derivation_work(
         self,
@@ -3193,12 +2871,9 @@ class GeneSyncOrchestrator:
         doc_type: str,
         source_id: str,
         derivation_context: SourceUnitDerivationContext,
-        current_changed_ranges: tuple[tuple[int, int], ...],
     ) -> MemoryExtractionResult:
         """Execute durable extraction work for one Source Unit revision."""
 
-        active_contract = projection_extraction_contract(PROJECTION_EXTRACTION_V9)
-        extraction_contract_version = active_contract.version
         visibility, owner_user_id = await memory_visibility_for_source_id(
             self.db,
             source_id=source_id,
@@ -3221,21 +2896,17 @@ class GeneSyncOrchestrator:
             ),
         )
 
-        revision_context = None
-        if active_contract.uses_fragment_catalog and projection.deltas[0].previous_unit_revision_id:
-            from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-            base_projection = await self.db.get_current_source_unit_projection(projection.source_units[0].id)
-            revision_context = RevisionAssessmentContext(
-                projection=projection, base=base_projection,
-                access_context_hash=access_context_hash,
-                image_loader=lambda ids: self._projection_images(projection=projection, observation_ids=ids),
-            )
-
-        if active_contract.uses_fragment_catalog and revision_context is None:
-            from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-            revision_context = RevisionAssessmentContext(projection=projection, base=None,
-                access_context_hash=access_context_hash,
-                image_loader=lambda ids: self._projection_images(projection=projection, observation_ids=ids))
+        from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+        base_projection = (
+            await self.db.get_current_source_unit_projection(projection.source_units[0].id)
+            if projection.deltas[0].previous_unit_revision_id
+            else None
+        )
+        revision_context = RevisionAssessmentContext(
+            projection=projection, base=base_projection,
+            access_context_hash=access_context_hash,
+            image_loader=lambda ids: self._projection_images(projection=projection, observation_ids=ids),
+        )
 
         async def prepare_batches(batches):
             from memforge.pipeline.extraction_requests import plan_fragment_requests
@@ -3261,40 +2932,6 @@ class GeneSyncOrchestrator:
             return tuple(planned)
 
         async def extract_one(batch):
-            if isinstance(batch, DiffGuidedExtractionBatch):
-                async with self._heavy_work_slot(source_id):
-                    result = await self.memory_extractor.extract_memory_changes(
-                        changed_hunks=batch.changed_hunks,
-                        updated_document=batch.updated_document,
-                        current_changed_ranges=current_changed_ranges,
-                        source_type=source_type,
-                        doc_type=doc_type,
-                    )
-                if not result.error_type:
-                    result = self._enforce_diff_guided_evidence_boundary(
-                        result=result,
-                        updated_document=batch.updated_document,
-                        current_changed_ranges=current_changed_ranges,
-                        source_id=source_id,
-                        doc_id=derivation_context.document.doc_id,
-                    )
-                return result
-
-            if isinstance(batch, StructuralExtractionBatch):
-                async with self._heavy_work_slot(source_id) as admission:
-                    result = await self.memory_extractor.extract_unit_memories(
-                        batch.context,
-                        doc_type=doc_type,
-                    )
-                    result.metadata = {
-                        **(result.metadata or {}),
-                        "extraction_queue_wait_ms": admission.queue_wait_ms,
-                        "input_binary_bytes": 0,
-                        "multimodal_calls": 0,
-                        "max_active_multimodal": admission.active_multimodal,
-                    }
-                    return result
-
             primary_ids = set(batch.primary_observation_ids)
             supplied_observation_ids = primary_ids | set(
                 batch.context_observation_ids
@@ -3310,48 +2947,40 @@ class GeneSyncOrchestrator:
                 source_id,
                 # Context expansion may turn a text batch into an image request.
                 # Reserve existing image admission before any possible byte reads.
-                multimodal=input_binary_bytes > 0 or bool(revision_context and any(
+                multimodal=input_binary_bytes > 0 or any(
                     fragment.kind.value == "artifact" for fragment in revision_context.full_fragments
-                )),
+                ),
             ) as admission:
                 batch_images = self._projection_images(
                     projection=projection,
                     observation_ids=supplied_observation_ids,
                 )
-                if active_contract.uses_fragment_catalog:
-                    catalog = batch.prepared_catalog or compile_projection_fragment_catalog(
-                        projection,
-                        batch,
-                        access_context_hash=access_context_hash,
-                        inference_capability_hash=inference_capability_hash,
-                        supplied_artifact_observation_ids=tuple(
-                            image.source_observation_id for image in batch_images
-                        ),
-                    )
-                    result = await self.memory_extractor.extract_projection_fragment_memories(
-                        catalog,
-                        source_type=source_type,
-                        doc_type=doc_type,
-                        context_markdown=batch.context_markdown,
-                        context_observation_ids=batch.context_observation_ids,
-                        images=batch_images,
-                        revision_context=revision_context,
-                        prepared_prompt=batch.prepared_prompt,
-                        prepared_input_mode=batch.prepared_input_mode,
-                        prepared_selection_reason=batch.prepared_selection_reason,
-                        prepared_estimated_cost=(
-                            dict(batch.prepared_estimated_cost)
-                            if batch.prepared_estimated_cost is not None
-                            else None
-                        ),
-                    )
-                else:
-                    result = await self.memory_extractor.extract_projection_batch_memories(
-                        batch,
-                        source_type=source_type,
-                        doc_type=doc_type,
-                        images=batch_images,
-                    )
+                catalog = batch.prepared_catalog or compile_projection_fragment_catalog(
+                    projection,
+                    batch,
+                    access_context_hash=access_context_hash,
+                    inference_capability_hash=inference_capability_hash,
+                    supplied_artifact_observation_ids=tuple(
+                        image.source_observation_id for image in batch_images
+                    ),
+                )
+                result = await self.memory_extractor.extract_projection_fragment_memories(
+                    catalog,
+                    source_type=source_type,
+                    doc_type=doc_type,
+                    context_markdown=batch.context_markdown,
+                    context_observation_ids=batch.context_observation_ids,
+                    images=batch_images,
+                    revision_context=revision_context,
+                    prepared_prompt=batch.prepared_prompt,
+                    prepared_input_mode=batch.prepared_input_mode,
+                    prepared_selection_reason=batch.prepared_selection_reason,
+                    prepared_estimated_cost=(
+                        dict(batch.prepared_estimated_cost)
+                        if batch.prepared_estimated_cost is not None
+                        else None
+                    ),
+                )
                 input_binary_bytes = (result.metadata or {}).get("image_bytes", input_binary_bytes)
                 result.metadata = {
                     **(result.metadata or {}),
@@ -3360,20 +2989,6 @@ class GeneSyncOrchestrator:
                     "multimodal_calls": int(input_binary_bytes > 0),
                     "max_active_multimodal": admission.active_multimodal,
                 }
-                revisions = {
-                    revision.observation_id: revision.id
-                    for revision in projection.observation_revisions
-                }
-                for sample in result.metadata.get(
-                    "evidence_block_fallback_samples",
-                    [],
-                ):
-                    if not isinstance(sample, dict):
-                        continue
-                    observation_id = sample.get("source_observation_id")
-                    sample["source_observation_revision_id"] = revisions.get(
-                        observation_id
-                    )
                 return result
 
         result = await SourceUnitDeriver(
@@ -3384,9 +2999,8 @@ class GeneSyncOrchestrator:
                 projection=projection,
                 context=derivation_context,
                 extract_batch=extract_one,
-                prepare_batches=prepare_batches if active_contract.uses_fragment_catalog else None,
+                prepare_batches=prepare_batches,
                 max_concurrent=self._source_parallelism_limit(),
-                extraction_contract_version=extraction_contract_version,
                 committed_base_snapshot=committed_base_snapshot,
                 access_context_hash=access_context_hash,
                 inference_capability_hash=inference_capability_hash,
@@ -3452,88 +3066,6 @@ class GeneSyncOrchestrator:
             projection=projection,
             observation_ids=observation_ids,
             document_store=self.doc_store,
-        )
-
-    async def _extract_full_document_units(
-        self,
-        *,
-        markdown_body: str,
-        source_type: str,
-        doc_type: str,
-        doc_id: str,
-        source_id: str,
-        document_title: str,
-        document_url: str,
-    ) -> MemoryExtractionResult:
-        """Extract a full document by deterministic structural units."""
-        unitization_policy = UnitizationPolicy()
-        units = unitize_markdown(markdown_body, doc_id=doc_id, policy=unitization_policy)
-        packer = ExtractionContextPacker(units)
-
-        async def extract_one(unit) -> MemoryExtractionResult:
-            context = packer.pack(
-                document_title=document_title,
-                document_url=document_url,
-                source_type=source_type,
-                unit=unit,
-                entities=(),
-            )
-            async with self._heavy_work_slot(source_id) as admission:
-                result = await self.memory_extractor.extract_unit_memories(
-                    context,
-                    doc_type=doc_type,
-                )
-                result.metadata = {
-                    **(result.metadata or {}),
-                    "extraction_queue_wait_ms": admission.queue_wait_ms,
-                    "input_binary_bytes": 0,
-                    "multimodal_calls": 0,
-                    "max_active_multimodal": admission.active_multimodal,
-                }
-                return result
-
-        results = await collect_bounded(
-            units,
-            extract_one,
-            max_concurrent=self._source_parallelism_limit(),
-        )
-        llm_metrics = _aggregate_extraction_metrics(results)
-
-        all_memories = []
-        first_error: MemoryExtractionResult | None = None
-        failed_unit_count = 0
-        for result in results:
-            if result.error_type:
-                failed_unit_count += 1
-                first_error = first_error or result
-                continue
-            all_memories.extend(result.memories)
-
-        if first_error:
-            return MemoryExtractionResult(
-                error_type="partial_unit_failure",
-                error=first_error.error or first_error.error_type,
-                metadata={
-                    **llm_metrics,
-                    "unit_count": len(units),
-                    "failed_unit_count": failed_unit_count,
-                    "extracted_count_before_failure": len(all_memories),
-                    "segmentation_version": units[0].segmentation_version if units else "v1",
-                    "partition_strategy": "recursive_fit_first",
-                    "max_unit_input_tokens": unitization_policy.max_unit_input_tokens,
-                },
-            )
-        return MemoryExtractionResult(
-            memories=all_memories,
-            metadata={
-                **llm_metrics,
-                "unit_count": len(units),
-                "failed_unit_count": failed_unit_count,
-                "partial_error_type": first_error.error_type if first_error else None,
-                "segmentation_version": units[0].segmentation_version if units else "v1",
-                "partition_strategy": "recursive_fit_first",
-                "max_unit_input_tokens": unitization_policy.max_unit_input_tokens,
-            },
         )
 
     def _document_update_plan_stats(self, plan: DocumentUpdatePlan | None) -> dict[str, int | float | str] | None:
@@ -3721,40 +3253,6 @@ class GeneSyncOrchestrator:
             payload=payload,
             error=result.error,
         )
-        fallback_count = int(
-            payload.get("evidence_refinement_counts", {}).get(
-                "block_fallback",
-                0,
-            )
-            if isinstance(payload.get("evidence_refinement_counts"), dict)
-            else 0
-        )
-        if fallback_count:
-            await self.memory_store.record_audit_event(
-                "memory_evidence_block_fallback",
-                "committed",
-                context=context,
-                doc_id=doc_id,
-                source_id=source_id,
-                decision="block_fallback",
-                reason="quote_not_localized_in_selected_block",
-                payload={
-                    key: payload[key]
-                    for key in (
-                        "source_type",
-                        "extraction_mode",
-                        "derivation_id",
-                        "source_unit_id",
-                        "target_unit_revision_id",
-                        "extraction_contract_version",
-                        "evidence_refinement_counts",
-                        "evidence_block_fallback_samples",
-                        "evidence_block_fallback_sample_truncated_count",
-                        "invalid_evidence_block_count",
-                    )
-                    if key in payload
-                },
-            )
 
     async def _record_source_unit_llm_summary(
         self,
@@ -3885,7 +3383,6 @@ class GeneSyncOrchestrator:
         indexed_doc_ids: set[str],
         crawled_doc_ids: set[str],
         source_filter_summary: str | None,
-        allow_legacy_orphan_cleanup: bool = False,
         expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
     ) -> tuple[int, list[FailedDoc], set[str]]:
@@ -3925,28 +3422,6 @@ class GeneSyncOrchestrator:
 
                 source_unit = await self.db.find_source_unit_by_document_id(source_id, doc_id)
                 if source_unit is None:
-                    if allow_legacy_orphan_cleanup:
-                        deletion_context = {
-                            "deletion_kind": "rebaseline_legacy_absence",
-                            "reason": "not_returned_by_complete_rebaseline_replay",
-                        }
-                        if self.memory_store is not None:
-                            await self.memory_store.delete_projected_document(
-                                doc_id,
-                                deletion_context=deletion_context,
-                                source_activity=source_activity,
-                            )
-                        else:
-                            await self.db.delete_projected_document(
-                                doc_id,
-                                source_activity=source_activity,
-                            )
-                        logger.info(
-                            "Removed legacy document %s after complete rebaseline replay proved absence",
-                            doc_id,
-                        )
-                        deleted_count += 1
-                        continue
                     raise RuntimeError("source absence cannot be reconciled without persisted Source Unit lineage")
                 lineage_document_ids = await self.db.list_source_unit_document_ids(source_unit.id)
                 current_document_id = lineage_document_ids[0] if lineage_document_ids else doc_id

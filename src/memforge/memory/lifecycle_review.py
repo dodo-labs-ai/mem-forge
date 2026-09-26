@@ -259,11 +259,7 @@ def _relation_discovery_requests(
     activations = {
         mutation.memory_id: mutation
         for mutation in proposed
-        if mutation.mutation_type
-        in {
-            LifecycleMutationType.CREATE_MEMORY,
-            LifecycleMutationType.REACTIVATE_MEMORY,
-        }
+        if mutation.mutation_type is LifecycleMutationType.CREATE_MEMORY
     }
     if not activations:
         return ()
@@ -282,14 +278,8 @@ def _relation_discovery_requests(
     activation = activations.get(memory_id)
     if activation is None:
         raise ValueError("relation discovery seed does not identify the activated Memory")
-    if activation.mutation_type is LifecycleMutationType.CREATE_MEMORY:
-        memory_payload = _mapping(activation.payload.get("memory"), "create_memory.payload.memory")
-        activation_content_hash = _text(memory_payload.get("content_hash"), "memory.content_hash")
-    else:
-        activation_content_hash = _text(
-            activation.payload.get("expected_content_hash"),
-            "reactivate_memory.expected_content_hash",
-        )
+    memory_payload = _mapping(activation.payload.get("memory"), "create_memory.payload.memory")
+    activation_content_hash = _text(memory_payload.get("content_hash"), "memory.content_hash")
     if activation_content_hash != expected_content_hash:
         raise ValueError("relation discovery seed content hash does not match activation")
     if (
@@ -329,7 +319,15 @@ def _deserialize_mutation(
     mutation_source_id = _text(raw.get("source_id"), "mutation.source_id")
     if mutation_source_id != source_id:
         raise ValueError("review mutation belongs to another source")
-    mutation_type = LifecycleMutationType(_text(raw.get("mutation_type"), "mutation_type"))
+    raw_mutation_type = _text(raw.get("mutation_type"), "mutation_type")
+    try:
+        mutation_type = LifecycleMutationType(raw_mutation_type)
+    except ValueError as exc:
+        # A proposal for a mutation this version no longer applies can never
+        # match the current Memory state.
+        raise ValueError(
+            f"review stale guard failed: unsupported mutation {raw_mutation_type}"
+        ) from exc
     if mutation_type in {LifecycleMutationType.CREATE_REVIEW, LifecycleMutationType.RESOLVE_REVIEW}:
         raise ValueError("review proposal contains a nested review mutation")
     memory_id = _text(raw.get("memory_id"), "mutation.memory_id")

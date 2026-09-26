@@ -84,7 +84,6 @@ from memforge.memory.cross_document_relation_reader import (
     relation_notice,
 )
 from memforge.memory.lifecycle import normalize_memory_status
-from memforge.memory.cutover import run_with_lifecycle_activity_heartbeat
 from memforge.memory.lifecycle_service import (
     MaintenanceClosureEntry,
     MemoryLifecycleConflict,
@@ -193,13 +192,11 @@ from memforge.local_agent.source_contract import (
     is_local_agent_backed_source,
     local_agent_collection_attempt_id,
     local_agent_collection_is_authoritative,
-    local_agent_rebaseline_snapshot_is_authoritative,
     local_agent_semantic_input_sha256,
     local_agent_completion_status,
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
     local_agent_sync_operation,
-    source_with_sync_inputs,
     validate_local_agent_replay_package,
 )
 from memforge.storage.admin_memory import MemoryAdminListFilters
@@ -756,7 +753,6 @@ class MemoryEvidenceGroupDetail(BaseModel):
     doc_id: str | None = None
     document: MemoryEvidenceDocumentDetail | None = None
     current: bool
-    legacy_limited: bool
     items: list[MemoryEvidenceItemDetail]
 
 
@@ -1543,15 +1539,6 @@ class SourceSyncRequest(BaseModel):
     local_agent_job_id: str | None = None
     local_agent_attempt_count: int | None = Field(default=None, ge=1)
     retry_target: SourceSyncRetryTarget | None = None
-
-
-class SourceRebaselineRequest(BaseModel):
-    confirm_source_id: str = Field(min_length=1)
-
-
-class LifecycleFindingRepairRequest(BaseModel):
-    observation_id: str = Field(min_length=1)
-    evidence_quote: str | None = Field(default=None, min_length=1)
 
 
 class LocalAgentJobCreateRequest(BaseModel):
@@ -2975,7 +2962,6 @@ def _memory_evidence_unit_detail(
         doc_id=group.doc_id,
         document=document,
         current=group.current,
-        legacy_limited=group.legacy_limited,
         items=items,
     )
 
@@ -2999,7 +2985,6 @@ def _application_document_evidence_detail(
         doc_id=source_row.doc_id,
         document=document,
         current=True,
-        legacy_limited=source_row.support_kind == "legacy_limited",
         items=[
             MemoryEvidenceItemDetail(
                 authority="application_document",
@@ -5917,15 +5902,13 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
     ):
-        """Return independent scope, gate, job, finding, review, and delivery axes."""
+        """Return independent scope, gate, review, and delivery axes."""
 
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         _require_source_management(request, source)
         gate = await db.get_lifecycle_gate(source_id)
-        jobs = await db.list_lifecycle_backfill_jobs(source_id)
-        findings = await db.list_lifecycle_cutover_findings(source_id)
         reviews = await db.list_lifecycle_reviews(source_id)
         vector_tasks = await db.list_lifecycle_vector_tasks(source_id=source_id, limit=200)
         scope_transitions = await db.list_projection_scope_transitions(source_id)
@@ -5952,36 +5935,6 @@ def create_admin_app(
                 "audited_at": gate.audited_at,
                 "enabled_at": gate.enabled_at,
             },
-            "jobs": [
-                {
-                    "id": job.id,
-                    "status": job.status.value,
-                    "scanned_memories": job.scanned_memories,
-                    "mapped_memories": job.mapped_memories,
-                    "finding_count": job.finding_count,
-                    "error": job.error,
-                    "created_at": job.created_at,
-                    "started_at": job.started_at,
-                    "completed_at": job.completed_at,
-                }
-                for job in jobs
-            ],
-            "findings": [
-                {
-                    "id": finding.id,
-                    "memory_id": finding.memory_id,
-                    "reason": finding.reason.value,
-                    "status": finding.status.value,
-                    "available_provenance": dict(finding.available_provenance),
-                    "mapping_attempt": dict(finding.mapping_attempt),
-                    "observation_id": finding.observation_id,
-                    "source_unit_id": finding.source_unit_id,
-                    "created_at": finding.created_at,
-                    "updated_at": finding.updated_at,
-                    "resolved_at": finding.resolved_at,
-                }
-                for finding in findings
-            ],
             "reviews": [
                 {
                     "id": review.id,
@@ -6072,552 +6025,6 @@ def create_admin_app(
                 }
                 for unit in page.units
             ],
-        }
-
-    async def _prepare_local_source_replay(
-        db: Database,
-        source: dict[str, Any],
-        document_store: DocumentArtifactStore,
-        *,
-        workspace_id: str,
-    ) -> tuple[dict[str, Any], bool]:
-        """Build an exact current-corpus replay for local collection sources."""
-
-        source_id = str(source["id"])
-        if local_agent_sync_operation(source["type"], source.get("config")) is None:
-            return source, False
-        latest_run = await db.get_latest_source_sync_run(
-            source_id=source_id,
-            workspace_id=workspace_id,
-        )
-        if latest_run is None or latest_run.status not in {"success", "failed"}:
-            raise ValueError("source_lifecycle_terminal_local_replay_required")
-        if latest_run.status == "failed" and not latest_run.force_full_sync:
-            raise ValueError("source_lifecycle_terminal_local_replay_required")
-        if latest_run.source_config_revision != local_agent_source_config_revision(source):
-            raise ValueError("source_lifecycle_local_replay_config_changed")
-        authoritative_snapshot = local_agent_rebaseline_snapshot_is_authoritative(
-            source["type"],
-            force_full_sync=latest_run.force_full_sync,
-            input_snapshot_id=latest_run.input_snapshot_id,
-        )
-        inputs = await db.list_source_sync_inputs(
-            source_id=source_id,
-            workspace_id=latest_run.workspace_id,
-            input_snapshot_id=(latest_run.input_snapshot_id if authoritative_snapshot else None),
-        )
-        if not authoritative_snapshot:
-            if latest_run.input_generation_watermark is None:
-                raise ValueError("source_lifecycle_local_replay_inputs_unavailable")
-            inputs = [
-                source_input
-                for source_input in inputs
-                if source_input.input_generation <= latest_run.input_generation_watermark
-            ]
-        replay_source = source_with_sync_inputs(
-            source,
-            inputs,
-            authoritative_snapshot=True,
-            preserve_version_history=not authoritative_snapshot,
-        )
-        manifest = replay_source.get("config", {}).get("local_agent_package_manifest") or []
-        manifest_by_doc_version = {
-            (
-                str(entry.get("doc_id") or ""),
-                str(entry.get("version") or ""),
-            ): entry
-            for entry in manifest
-            if isinstance(entry, dict) and str(entry.get("doc_id") or "") and str(entry.get("version") or "")
-        }
-        manifest_doc_ids = {doc_id for doc_id, _version in manifest_by_doc_version}
-        current_document_versions = await db.list_indexed_document_versions(source_id)
-        current_doc_ids = set(current_document_versions)
-        if authoritative_snapshot:
-            if len(manifest) != len(inputs) or len(manifest_doc_ids) != len(manifest):
-                raise ValueError("source_lifecycle_local_replay_inputs_unavailable")
-            selected_manifest = sorted(
-                manifest,
-                key=lambda entry: str(entry.get("doc_id") or ""),
-            )
-        else:
-            if not current_doc_ids or not current_doc_ids.issubset(manifest_doc_ids):
-                raise ValueError("source_lifecycle_local_replay_inputs_unavailable")
-            try:
-                selected_manifest = [
-                    manifest_by_doc_version[(doc_id, current_document_versions[doc_id])]
-                    for doc_id in sorted(current_doc_ids)
-                ]
-            except KeyError as exc:
-                raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
-        for entry in selected_manifest:
-            doc_id = str(entry["doc_id"])
-            expected_version = str(entry.get("version") or "")
-            if not authoritative_snapshot and expected_version != current_document_versions[doc_id]:
-                raise ValueError("source_lifecycle_local_replay_artifact_invalid")
-            package_sha256 = str(entry.get("package_sha256") or "").strip()
-            if not package_sha256:
-                raise ValueError("source_lifecycle_local_replay_attestation_required")
-            try:
-                body = document_store.read_artifact(str(entry["package_uri"]))
-            except Exception as exc:
-                raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
-            _validate_local_source_replay_artifact_identity(
-                source_type=str(source["type"]),
-                source_id=source_id,
-                body=body,
-                expected_doc_id=doc_id,
-                expected_version=expected_version,
-                expected_input_sha256=str(entry.get("input_sha256") or ""),
-                expected_package_sha256=package_sha256,
-            )
-        replay_source["config"]["local_agent_package_manifest"] = selected_manifest
-        return replay_source, True
-
-    async def _run_lifecycle_backfill_safely(
-        db: Database,
-        source_id: str,
-        job_id: str,
-        source: dict[str, Any],
-        config: AppConfig,
-        runtime_provider: RuntimeProvider,
-        document_store: DocumentArtifactStore,
-        workspace_id: str,
-    ) -> None:
-        from memforge.memory.cutover import (
-            reconstruct_historical_source_projection,
-            run_source_lifecycle_recovery_job,
-        )
-
-        async def reconstruct_documents(document_ids: frozenset[str]) -> None:
-            for document_id in sorted(document_ids):
-                try:
-                    await reconstruct_historical_source_projection(
-                        db,
-                        document_store,
-                        source_id=source_id,
-                        source_type=str(source["type"]),
-                        document_id=document_id,
-                        lifecycle_job_id=job_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Historical projection reconstruction skipped for %s/%s: %s",
-                        source_id,
-                        document_id,
-                        exc,
-                    )
-
-        async def repair_source_projections(document_ids: frozenset[str]) -> None:
-            from memforge.pipeline.sync import SourceSyncMode
-
-            latest_run = (
-                await db.get_latest_source_sync_run(
-                    source_id=source_id,
-                    workspace_id=workspace_id,
-                )
-                if hasattr(db, "get_latest_source_sync_run")
-                else None
-            )
-            if latest_run is not None and latest_run.status in {"pending", "running"}:
-                raise RuntimeError(
-                    f"source sync {latest_run.run_id} is already {latest_run.status}; retry recovery later"
-                )
-            replay_source, _ = await _prepare_local_source_replay(
-                db,
-                source,
-                document_store,
-                workspace_id=workspace_id,
-            )
-            state = await runtime_provider.run_source_sync(
-                db=db,
-                config=config,
-                source=replay_source,
-                force_full_sync=True,
-                reprocess_doc_ids=document_ids,
-                execution_mode=SourceSyncMode.PROJECTION_REPAIR,
-                lifecycle_job_id=job_id,
-            )
-            if state.last_sync_status != "success":
-                unavailable_error = "requested document was not returned by provider discovery"
-                unavailable_docs = [
-                    failed_doc for failed_doc in state.failed_docs if failed_doc.error == unavailable_error
-                ]
-                unexpected_failures = [
-                    failed_doc for failed_doc in state.failed_docs if failed_doc.error != unavailable_error
-                ]
-                if unexpected_failures or not unavailable_docs:
-                    raise RuntimeError(
-                        "targeted lifecycle projection repair did not complete safely: "
-                        f"{state.last_sync_status}: {state.error_message or 'unknown error'}"
-                    )
-                logger.warning(
-                    "Projection repair left %d unavailable document(s) for %s; their lifecycle findings remain open",
-                    len(unavailable_docs),
-                    source_id,
-                )
-
-        async def run_recovery() -> None:
-            await run_source_lifecycle_recovery_job(
-                db,
-                source_id,
-                job_id=job_id,
-                reconstruct_documents=reconstruct_documents,
-                # Agent-session concepts are managed database records. Their
-                # historical canonical content is reconstructed above; the
-                # Gene directory is ephemeral in Cloud Foundry and is not a
-                # valid recovery source for records that predate artifacts.
-                repair_projections=(None if str(source["type"]) == "agent_session" else repair_source_projections),
-            )
-
-        try:
-            await run_with_lifecycle_activity_heartbeat(
-                db,
-                job_id,
-                run_recovery,
-            )
-        except Exception:
-            logger.exception("Lifecycle backfill job %s failed for source %s", job_id, source_id)
-
-    @source_router.post("/{source_id}/memory-lifecycle/backfill", status_code=202)
-    async def trigger_source_memory_lifecycle_backfill(
-        source_id: str,
-        request: Request,
-        background_tasks: BackgroundTasks,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
-        document_store: DocumentArtifactStore = Depends(get_document_store),
-        workspace_id: str = Depends(get_workspace_id),
-    ):
-        """Queue a conservative exact-lineage cutover audit for one source."""
-
-        from memforge.memory.lifecycle_plan import (
-            LifecycleBackfillJob,
-            LifecycleBackfillJobStatus,
-        )
-
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_management(request, source)
-        try:
-            job = await db.create_lifecycle_backfill_job(
-                LifecycleBackfillJob(
-                    id=f"lifecycle-backfill-{uuid.uuid4().hex}",
-                    source_id=source_id,
-                    status=LifecycleBackfillJobStatus.QUEUED,
-                )
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        fenced_source = await db.get_source(source_id)
-        if fenced_source is None:
-            await db.fail_lifecycle_backfill_job(
-                job.id,
-                error="Source disappeared after lifecycle maintenance fence acquisition",
-            )
-            raise HTTPException(status_code=409, detail="Source lifecycle changed")
-        background_tasks.add_task(
-            _run_lifecycle_backfill_safely,
-            db,
-            source_id,
-            job.id,
-            fenced_source,
-            config,
-            runtime_provider,
-            document_store,
-            workspace_id,
-        )
-        return {
-            "source_id": source_id,
-            "job_id": job.id,
-            "status": job.status.value,
-        }
-
-    async def _run_source_rebaseline_safely(
-        db: Database,
-        source_id: str,
-        source: dict[str, Any],
-        authoritative_snapshot: bool,
-        job_id: str,
-        config: AppConfig,
-        runtime_provider: RuntimeProvider,
-    ) -> None:
-        """Reset, replay, audit, and only then reopen destructive lifecycle."""
-
-        from memforge.memory.cutover import run_source_lifecycle_backfill
-        from memforge.pipeline.sync import SourceSyncMode
-
-        async def run_rebaseline() -> None:
-            await db.start_lifecycle_backfill_job(job_id)
-            preflight = await runtime_provider.run_source_sync(
-                db=db,
-                config=config,
-                source=source,
-                force_full_sync=True,
-                authoritative_snapshot=authoritative_snapshot,
-                execution_mode=SourceSyncMode.REBASELINE_PREFLIGHT,
-                lifecycle_job_id=job_id,
-            )
-            if preflight.last_sync_status != "success":
-                raise RuntimeError(
-                    "source rebaseline preflight failed: "
-                    f"{preflight.last_sync_status}: "
-                    f"{preflight.error_message or 'unknown error'}"
-                )
-            activity = await db.renew_source_activity(
-                activity_id=job_id,
-                capability=job_id,
-                lease_seconds=900,
-            )
-            memory_store = await _build_memory_store(db, config, runtime_provider)
-            await memory_store.rebaseline_source_lifecycle(
-                source_id,
-                source_activity=activity,
-            )
-            state = await runtime_provider.run_source_sync(
-                db=db,
-                config=config,
-                source=source,
-                force_full_sync=True,
-                authoritative_snapshot=authoritative_snapshot,
-                execution_mode=SourceSyncMode.REBASELINE_REPLAY,
-                lifecycle_job_id=job_id,
-            )
-            if state.last_sync_status != "success":
-                raise RuntimeError(
-                    "source rebaseline replay failed: "
-                    f"{state.last_sync_status}: {state.error_message or 'unknown error'}"
-                )
-            while True:
-                vector_delivery = await memory_store.attempt_lifecycle_vector_delivery(source_id=source_id)
-                if not vector_delivery.pending:
-                    break
-                # A source maintenance fence prevents new lifecycle tasks for
-                # this source. Keep draining bounded store batches only while
-                # the previous pass made monotonic progress.
-                if vector_delivery.delivered_tasks:
-                    continue
-                error_types = ",".join(vector_delivery.error_types) or "pending_tasks"
-                raise RuntimeError(
-                    "source rebaseline vector delivery remains pending: "
-                    f"failed_tasks={vector_delivery.failed_tasks} "
-                    f"error_types={error_types}"
-                )
-            audit = await run_source_lifecycle_backfill(
-                db,
-                source_id,
-                lifecycle_job_id=job_id,
-            )
-            if not audit.gate_enabled or audit.finding_count:
-                raise RuntimeError(f"source rebaseline audit left {audit.finding_count} open finding(s)")
-            await db.complete_lifecycle_backfill_job(
-                job_id,
-                scanned_memories=audit.scanned_memories,
-                mapped_memories=audit.mapped_memories,
-                finding_count=audit.finding_count,
-            )
-
-        try:
-            await run_with_lifecycle_activity_heartbeat(
-                db,
-                job_id,
-                run_rebaseline,
-            )
-        except Exception as exc:
-            logger.exception("Source rebaseline job %s failed for source %s", job_id, source_id)
-            try:
-                await db.fail_lifecycle_backfill_job(job_id, error=str(exc))
-            except Exception:
-                logger.exception("Failed to persist rebaseline job failure for %s", job_id)
-
-    @source_router.post("/{source_id}/memory-lifecycle/rebaseline", status_code=202)
-    async def trigger_source_memory_lifecycle_rebaseline(
-        source_id: str,
-        body: SourceRebaselineRequest,
-        request: Request,
-        background_tasks: BackgroundTasks,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
-        sync_service: SyncService = Depends(get_sync_service),
-        document_store: DocumentArtifactStore = Depends(get_document_store),
-    ):
-        """Destructively reset derived lifecycle and replay one source in place."""
-
-        from memforge.memory.lifecycle_plan import (
-            LifecycleBackfillJob,
-            LifecycleBackfillJobStatus,
-        )
-
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_management(request, source)
-        if body.confirm_source_id != source_id:
-            raise HTTPException(status_code=409, detail="source_rebaseline_confirmation_mismatch")
-        if str(source["type"]) == "agent_session":
-            raise HTTPException(
-                status_code=409,
-                detail="agent_session_requires_managed_claim_lineage_repair",
-            )
-        try:
-            job = await db.create_source_rebaseline_job(
-                LifecycleBackfillJob(
-                    id=f"source-rebaseline-{uuid.uuid4().hex}",
-                    source_id=source_id,
-                    status=LifecycleBackfillJobStatus.QUEUED,
-                )
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        await sync_service.cancel_source(source_id)
-        fenced_source = await db.get_source(source_id)
-        if fenced_source is None:
-            await db.fail_lifecycle_backfill_job(
-                job.id,
-                error="Source disappeared after lifecycle maintenance fence acquisition",
-            )
-            raise HTTPException(status_code=409, detail="Source lifecycle changed")
-        try:
-            replay_source, authoritative_snapshot = await _prepare_local_source_replay(
-                db,
-                fenced_source,
-                document_store,
-                workspace_id=sync_service.workspace_id,
-            )
-        except Exception as exc:
-            try:
-                await db.fail_lifecycle_backfill_job(job.id, error=str(exc))
-            except Exception:
-                logger.exception(
-                    "Failed to persist rebaseline preflight failure for %s",
-                    job.id,
-                )
-            if isinstance(exc, ValueError):
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            logger.exception(
-                "Source rebaseline preflight failed for %s",
-                source_id,
-            )
-            raise HTTPException(
-                status_code=500,
-                detail="source_rebaseline_preflight_failed",
-            ) from exc
-        background_tasks.add_task(
-            _run_source_rebaseline_safely,
-            db,
-            source_id,
-            replay_source,
-            authoritative_snapshot,
-            job.id,
-            config,
-            runtime_provider,
-        )
-        return {
-            "source_id": source_id,
-            "job_id": job.id,
-            "status": job.status.value,
-            "operation": "source_rebaseline",
-        }
-
-    @source_router.post("/{source_id}/memory-lifecycle/findings/{finding_id}/repair")
-    async def repair_source_memory_lifecycle_finding(
-        source_id: str,
-        finding_id: str,
-        body: LifecycleFindingRepairRequest,
-        request: Request,
-        db: Database = Depends(get_db),
-    ):
-        """Bind one open finding to an explicitly selected exact Observation."""
-
-        from memforge.memory.cutover import (
-            repair_lifecycle_cutover_finding,
-            run_source_lifecycle_backfill,
-        )
-        from memforge.memory.lifecycle_plan import (
-            LifecycleBackfillJob,
-            LifecycleBackfillJobStatus,
-        )
-
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_management(request, source)
-        try:
-            job = await db.create_lifecycle_backfill_job(
-                LifecycleBackfillJob(
-                    id=f"lifecycle-finding-repair-{uuid.uuid4().hex}",
-                    source_id=source_id,
-                    status=LifecycleBackfillJobStatus.QUEUED,
-                )
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        try:
-            await db.start_lifecycle_backfill_job(job.id)
-        except Exception as exc:
-            try:
-                await db.fail_lifecycle_backfill_job(job.id, error=str(exc))
-            except Exception:
-                logger.exception(
-                    "Failed to persist lifecycle finding repair startup failure for %s",
-                    job.id,
-                )
-            if isinstance(exc, ValueError):
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            raise
-
-        async def run_finding_repair():
-            repaired_finding = await repair_lifecycle_cutover_finding(
-                db,
-                source_id=source_id,
-                finding_id=finding_id,
-                observation_id=body.observation_id,
-                evidence_quote=body.evidence_quote,
-                operator_id=resolve_request_principal(request),
-                lifecycle_job_id=job.id,
-            )
-            backfill_result = await run_source_lifecycle_backfill(
-                db,
-                source_id,
-                lifecycle_job_id=job.id,
-            )
-            await db.complete_lifecycle_backfill_job(
-                job.id,
-                scanned_memories=backfill_result.scanned_memories,
-                mapped_memories=backfill_result.mapped_memories,
-                finding_count=backfill_result.finding_count,
-            )
-            return repaired_finding, backfill_result
-
-        try:
-            finding, result = await run_with_lifecycle_activity_heartbeat(
-                db,
-                job.id,
-                run_finding_repair,
-            )
-        except Exception as exc:
-            try:
-                await db.fail_lifecycle_backfill_job(job.id, error=str(exc))
-            except Exception:
-                logger.exception(
-                    "Failed to persist lifecycle finding repair failure for %s",
-                    job.id,
-                )
-            if isinstance(exc, LookupError):
-                raise HTTPException(status_code=404, detail=str(exc)) from exc
-            if isinstance(exc, ValueError):
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            raise
-        return {
-            "source_id": source_id,
-            "finding_id": finding.id,
-            "status": finding.status.value,
-            "observation_id": finding.observation_id,
-            "source_unit_id": finding.source_unit_id,
-            "gate_enabled": result.gate_enabled,
-            "remaining_findings": result.finding_count,
         }
 
     async def _decide_lifecycle_review(
@@ -7209,9 +6616,8 @@ def create_admin_app(
                 creator_user_id if is_local_agent_backed_source(source_for_classification) else None
             ),
         )
-        # A newly created source has no legacy rows to audit. Start it on the
-        # projected lifecycle contract immediately; only pre-cutover sources
-        # without this gate remain conservatively gated.
+        # A newly created Source has no Memories yet, so every Memory it ever
+        # holds is written through the projected lifecycle.
         await db.enable_lifecycle_gate(source_id)
         if req.sync_schedule is not None:
             await db.set_source_sync_schedule(
@@ -7423,13 +6829,6 @@ def create_admin_app(
         db: Database,
         **job: Any,
     ) -> tuple[str, bool]:
-        source_id = str(job.get("source_id") or "")
-        lifecycle_job = await db.get_active_lifecycle_backfill_job(source_id)
-        if lifecycle_job is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=f"source lifecycle maintenance active: {lifecycle_job.id}",
-            )
         enqueuer = getattr(request.app.state, "local_agent_job_enqueuer", None)
         try:
             if enqueuer is not None:
@@ -7923,12 +7322,6 @@ def create_admin_app(
         )
         if source.get("status") == SOURCE_PAUSED_STATUS:
             raise HTTPException(status_code=400, detail="Source is paused")
-        lifecycle_job = await db.get_active_lifecycle_backfill_job(source_id)
-        if lifecycle_job is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=f"source lifecycle maintenance active: {lifecycle_job.id}",
-            )
         try:
             input_snapshot_id = local_agent_collection_attempt_id(
                 source_type,

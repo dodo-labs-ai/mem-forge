@@ -279,9 +279,6 @@ export function SourcesPage() {
         if (source.access_state === "changing" && source.access_transition?.status !== "failed") {
           return true;
         }
-        if (["queued", "running"].includes(source.lifecycle_maintenance?.status ?? "")) {
-          return true;
-        }
         const status = source.sync?.status;
         return Boolean(status && !terminal.has(status));
       }) ? 2000 : false;
@@ -796,7 +793,6 @@ export function SourcesPage() {
                     const syncActivity = selectSourceSyncActivity({
                       sync: source.sync,
                       localJob: localAgentJob,
-                      lifecycleMaintenance: source.lifecycle_maintenance,
                       pending: awaitingSyncAdmission(source.id, pendingSyncAdmissions.get(`${workspaceKey}:${source.id}`), sources, currentLocalJobsQuery.data, terminalAdmission(pendingSyncAdmissions.get(`${workspaceKey}:${source.id}`))),
                     });
                     const isSourceBusy = sourceSyncActivityBlocksActions(syncActivity);

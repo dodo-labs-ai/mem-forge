@@ -800,35 +800,6 @@ class MemoryStore:
         if len(vector_hit_batches) != len(queries):
             raise RuntimeError("vector query batch did not cover every identity query")
 
-        reactivation_candidates: list[Memory | None] = [None] * len(queries)
-        reactivation_groups: dict[
-            tuple[str, str | None, str | None],
-            list[int],
-        ] = {}
-        for index, query in enumerate(queries):
-            memory = query.memory
-            reactivation_groups.setdefault(
-                (
-                    memory.visibility,
-                    memory.owner_user_id,
-                    memory.repo_identifier,
-                ),
-                [],
-            ).append(index)
-        for (
-            visibility,
-            owner_user_id,
-            repo_identifier,
-        ), indices in reactivation_groups.items():
-            candidates = await self.relational.find_rebaseline_reactivation_candidates(
-                tuple(queries[index].memory.content_hash for index in indices),
-                visibility=visibility,
-                owner_user_id=owner_user_id,
-                repo_identifier=repo_identifier,
-            )
-            by_hash = {candidate.content_hash: candidate for candidate in candidates}
-            for index in indices:
-                reactivation_candidates[index] = by_hash.get(queries[index].memory.content_hash)
         vector_candidate_ids = tuple(
             dict.fromkeys(
                 memory_id
@@ -861,9 +832,8 @@ class MemoryStore:
                 entity_candidate_batches.append(())
 
         output: list[tuple[Memory, ...]] = []
-        for query, reactivation, vector_hits, entity_candidates in zip(
+        for query, vector_hits, entity_candidates in zip(
             queries,
-            reactivation_candidates,
             vector_hit_batches,
             entity_candidate_batches,
             strict=True,
@@ -896,7 +866,6 @@ class MemoryStore:
                 compatible.append(candidate)
                 compatible_ids.add(candidate.id)
 
-            add_candidate(reactivation)
             vector_candidates = (
                 ordinary_by_id.get(memory_id)
                 for memory_id, score in vector_hits
@@ -948,14 +917,6 @@ class MemoryStore:
                 return
             compatible.append(candidate)
             compatible_ids.add(candidate.id)
-
-        reactivation_candidate = await self.relational.find_rebaseline_reactivation_candidate(
-            memory.content_hash,
-            visibility=memory.visibility,
-            owner_user_id=memory.owner_user_id,
-            repo_identifier=memory.repo_identifier,
-        )
-        add_candidate(reactivation_candidate)
 
         vector_hits = await self.vector.query(
             embedding,
@@ -2179,35 +2140,6 @@ class MemoryStore:
                 )
         await self._emit(
             "source_delete_cascade_committed",
-            "committed",
-            context=context,
-            source_id=source_id,
-            payload={"retired_memory_ids": retired_ids},
-        )
-        return retired_ids
-
-    async def rebaseline_source_lifecycle(
-        self,
-        source_id: str,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> list[str]:
-        """Reset replayable source derivations and remove retired vectors."""
-
-        context = self._operation_context(source_id=source_id)
-        result = await self.relational.rebaseline_source_lifecycle(
-            source_id,
-            source_activity=source_activity,
-        )
-        retired_ids = list(result.retired_memory_ids)
-        if result.retired_search_cleanup_required:
-            # SQLite records these external vector deletes in the durable
-            # lifecycle outbox as part of the relational reset.  Retry earlier
-            # failures for this source without coupling its job to another
-            # source's pending vector work.
-            await self.attempt_lifecycle_vector_delivery(source_id=source_id)
-        await self._emit(
-            "source_rebaseline_committed",
             "committed",
             context=context,
             source_id=source_id,

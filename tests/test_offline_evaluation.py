@@ -254,6 +254,29 @@ async def test_real_candidate_can_be_annotated_before_ground_truth_exists(db) ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ("access_context_hash", "inference_capability_hash"))
+async def test_derivation_case_requires_the_pinned_evidence_work_identity(db, missing: str) -> None:
+    manifest = {
+        "projection": {},
+        "context": {},
+        "access_context_hash": "access-derivation-case",
+        "inference_capability_hash": "inference-derivation-case",
+    }
+    del manifest[missing]
+
+    with pytest.raises(ValueError, match=f"{missing} is required"):
+        await OfflineAgentEvaluation(db, executors={}).curate_case(
+            case_kind=AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION,
+            source_id="src-teams",
+            doc_id="doc-derivation",
+            source_unit_id="teams-channel:derivation",
+            manifest=manifest,
+            promotion_policy_version="manual-v1",
+            created_by="reviewer-1",
+        )
+
+
+@pytest.mark.asyncio
 async def test_offline_evaluation_records_frozen_lineage_and_result_assessments(db) -> None:
     executor = _FixedExecutor()
     evaluation = OfflineAgentEvaluation(
@@ -1082,8 +1105,8 @@ async def test_derivation_replay_uses_shared_planner_without_durable_staging() -
     )
     seen_batches = []
 
-    async def extract(batch, candidate_manifest):
-        seen_batches.append((batch.id, candidate_manifest["prompt_hash"]))
+    async def extract(batch, work, candidate_manifest):
+        seen_batches.append((batch.id, work.access_context_hash, candidate_manifest["prompt_hash"]))
         return MemoryExtractionResult(
             memories=[
                 RawMemory(
@@ -1106,6 +1129,8 @@ async def test_derivation_replay_uses_shared_planner_without_durable_staging() -
             manifest={
                 "projection": source_projection_to_payload(projection),
                 "context": source_unit_derivation_context_to_payload(context),
+                "access_context_hash": "access-derivation-case",
+                "inference_capability_hash": "inference-derivation-case",
             },
             manifest_hash="c" * 64,
             promotion_policy_version="manual-v1",
@@ -1116,6 +1141,7 @@ async def test_derivation_replay_uses_shared_planner_without_durable_staging() -
     )
 
     assert seen_batches
+    assert {access for _, access, _ in seen_batches} == {"access-derivation-case"}
     assert output["error_type"] is None
     assert output["extraction"]["memories"][0]["evidence_quote"] == body
 

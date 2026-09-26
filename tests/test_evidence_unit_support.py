@@ -46,7 +46,7 @@ from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.source_access import source_is_discoverable
 from memforge.storage.database import Database
-from tests.unit_support_fixture import record_unit_support
+from tests.unit_support_fixture import active_support_evidence, record_unit_support
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
@@ -632,7 +632,6 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
     )
     batch = plan_projection_extraction_batches(
         projection,
-        extraction_contract_version="projection-extraction-v9",
     )[0]
     access_hash = hashlib.sha256("workspace\x1f\x1f".encode()).hexdigest()
     catalog = compile_projection_fragment_catalog(
@@ -732,7 +731,7 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
     assert len(created) == 1
     unit_ids = await db.get_active_memory_support_unit_ids(created[0].id)
     assert unit_ids == evidence.evidence_unit_ids_by_claim_hash[claim_hash]
-    parts = await db.get_active_memory_support_evidence(created[0].id)
+    parts = await active_support_evidence(db, created[0].id)
     assert len(parts) == 1 and parts[0].role is EvidenceRole.PRIMARY
 
     updated_body = "# Deployment rule\n\nDeploy only after two approvals.\n"
@@ -769,7 +768,6 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
     await db.record_source_projection(updated_projection)
     updated_batch = plan_projection_extraction_batches(
         updated_projection,
-        extraction_contract_version="projection-extraction-v9",
     )[0]
     updated_catalog = compile_projection_fragment_catalog(
         updated_projection,
@@ -1043,7 +1041,6 @@ async def test_v2_deriver_stages_projection_extraction_v9_without_ingestion_repl
             ),
             extract_batch=extract,
             max_concurrent=1,
-            extraction_contract_version="projection-extraction-v9",
             access_context_hash="access-support-v2",
             inference_capability_hash="inference-support-v2",
         )

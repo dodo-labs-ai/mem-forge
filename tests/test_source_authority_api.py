@@ -6,17 +6,10 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
-from memforge.memory.lifecycle_plan import (
-    LifecycleGate,
-    LifecycleGateState,
-    LifecycleBackfillJob,
-    LifecycleBackfillJobStatus,
-)
 from memforge.models import (
     ContentItem,
     Memory,
@@ -25,9 +18,6 @@ from memforge.models import (
     content_hash,
 )
 from memforge.pipeline.source_projection_adapters import project_source_item
-from memforge.server.source_admin_service import (
-    _current_lifecycle_maintenance_payload,
-)
 from memforge.storage.database import Database
 
 
@@ -490,155 +480,6 @@ def test_agent_session_rejects_ordinary_sync_and_hides_historical_sync_failure(t
         asyncio.run(database.close())
 
 
-def test_source_list_projects_active_lifecycle_maintenance(tmp_path):
-    database = _connect_database(tmp_path)
-    try:
-        app = _app(tmp_path, database)
-        owner_headers = {
-            "x-test-user": "owner-user",
-            "x-test-workspace-role": "member",
-        }
-        with TestClient(app) as client:
-            created = client.post(
-                "/api/v1/sources",
-                headers=owner_headers,
-                json=_confluence_payload(),
-            )
-            assert created.status_code == 200, created.text
-            source_id = created.json()["id"]
-            now = datetime.now(timezone.utc).isoformat()
-            asyncio.run(
-                database.create_lifecycle_backfill_job(
-                    LifecycleBackfillJob(
-                        id="maintenance-job",
-                        source_id=source_id,
-                        status=LifecycleBackfillJobStatus.QUEUED,
-                        created_at=now,
-                    )
-                )
-            )
-            asyncio.run(database.start_lifecycle_backfill_job("maintenance-job"))
-
-            listed = client.get("/api/v1/sources", headers=owner_headers)
-
-        assert listed.status_code == 200, listed.text
-        source = listed.json()["data"][0]
-        assert source["lifecycle_maintenance"] == {
-            "status": "running",
-            "created_at": now,
-            "started_at": source["lifecycle_maintenance"]["started_at"],
-            "finished_at": None,
-        }
-        assert source["lifecycle_maintenance"]["started_at"] is not None
-    finally:
-        asyncio.run(database.close())
-
-
-def test_source_list_suppresses_resolved_lifecycle_failure_but_keeps_history(tmp_path):
-    database = _connect_database(tmp_path)
-    try:
-        app = _app(tmp_path, database)
-        owner_headers = {
-            "x-test-user": "owner-user",
-            "x-test-workspace-role": "member",
-        }
-        with TestClient(app) as client:
-            created = client.post(
-                "/api/v1/sources",
-                headers=owner_headers,
-                json=_confluence_payload(),
-            )
-            assert created.status_code == 200, created.text
-            source_id = created.json()["id"]
-            asyncio.run(
-                database.create_lifecycle_backfill_job(
-                    LifecycleBackfillJob(
-                        id="historical-failed-maintenance",
-                        source_id=source_id,
-                        status=LifecycleBackfillJobStatus.QUEUED,
-                        created_at=datetime.now(timezone.utc).isoformat(),
-                    )
-                )
-            )
-            asyncio.run(database.start_lifecycle_backfill_job("historical-failed-maintenance"))
-            asyncio.run(
-                database.fail_lifecycle_backfill_job(
-                    "historical-failed-maintenance",
-                    error="operator recovered stale lifecycle job",
-                )
-            )
-            asyncio.run(
-                database.gate_destructive_lifecycle(
-                    source_id,
-                    reason="maintenance failure still requires operator action",
-                )
-            )
-            actionable = client.get("/api/v1/sources", headers=owner_headers)
-            asyncio.run(database.enable_lifecycle_gate(source_id))
-
-            listed = client.get("/api/v1/sources", headers=owner_headers)
-            lifecycle = client.get(
-                f"/api/v1/sources/{source_id}/memory-lifecycle",
-                headers=owner_headers,
-            )
-
-        assert actionable.status_code == 200, actionable.text
-        assert actionable.json()["data"][0]["lifecycle_maintenance"]["status"] == "failed"
-        assert listed.status_code == 200, listed.text
-        assert listed.json()["data"][0]["lifecycle_maintenance"] is None
-        assert lifecycle.status_code == 200, lifecycle.text
-        assert lifecycle.json()["jobs"][0]["status"] == "failed"
-        assert lifecycle.json()["jobs"][0]["error"] == "operator recovered stale lifecycle job"
-    finally:
-        asyncio.run(database.close())
-
-
-@pytest.mark.parametrize(
-    ("has_open_finding", "has_vector_task"),
-    [(True, False), (False, True)],
-)
-def test_failed_lifecycle_maintenance_keeps_each_current_blocker_actionable(
-    has_open_finding,
-    has_vector_task,
-):
-    class LifecycleAttentionReader:
-        async def get_lifecycle_gate(self, source_id):
-            return LifecycleGate(
-                source_id=source_id,
-                state=LifecycleGateState.ENABLED,
-            )
-
-        async def list_lifecycle_cutover_findings(self, source_id, *, status=None):
-            return [object()] if has_open_finding else []
-
-        async def list_lifecycle_vector_tasks(
-            self,
-            *,
-            source_id=None,
-            lifecycle_plan_id=None,
-            limit=100,
-        ):
-            return [object()] if has_vector_task else []
-
-    failed_job = LifecycleBackfillJob(
-        id="failed-maintenance",
-        source_id="src-actionable",
-        status=LifecycleBackfillJobStatus.FAILED,
-        created_at=datetime.now(timezone.utc).isoformat(),
-    )
-
-    projected = asyncio.run(
-        _current_lifecycle_maintenance_payload(
-            LifecycleAttentionReader(),
-            source_id=failed_job.source_id,
-            latest_job=failed_job,
-        )
-    )
-
-    assert projected is not None
-    assert projected["status"] == "failed"
-
-
 def test_member_can_pin_source_only_for_their_own_source_list(tmp_path):
     database = _connect_database(tmp_path)
     try:
@@ -693,7 +534,7 @@ def test_member_can_pin_source_only_for_their_own_source_list(tmp_path):
         asyncio.run(database.close())
 
 
-def test_delete_source_is_idempotent_functional_removal_after_v2_cutover(tmp_path):
+def test_delete_source_is_idempotent_functional_removal(tmp_path):
     database = _connect_database(tmp_path)
     try:
         app = _app(tmp_path, database)

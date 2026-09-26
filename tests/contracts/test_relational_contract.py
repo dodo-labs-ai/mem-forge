@@ -25,7 +25,6 @@ are part of the concrete implementation.
 
 from __future__ import annotations
 
-from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -396,48 +395,6 @@ class RelationalStoreContract:
                 "repo-a",
             ),
         }
-
-    async def test_rebaseline_reactivation_candidate_is_exact_and_access_scoped(
-        self,
-        adapters: ContractAdapters,
-    ) -> None:
-        store = adapters.relational
-        exact = replace(
-            make_memory("rebaseline-exact", content="same replayed claim", status="retired"),
-            retirement_reason="source_rebaseline",
-        )
-        wrong_reason = replace(
-            make_memory("retired-for-another-reason", content="same replayed claim", status="retired"),
-            retirement_reason="support_removed",
-        )
-        wrong_repository = replace(
-            make_memory(
-                "rebaseline-other-repository",
-                content="same replayed claim",
-                status="retired",
-                repo_identifier="repo-b",
-            ),
-            retirement_reason="source_rebaseline",
-        )
-        for memory in (wrong_reason, wrong_repository, exact):
-            await store.insert_memory(memory)
-
-        candidate = await store.find_rebaseline_reactivation_candidate(
-            exact.content_hash,
-            visibility=exact.visibility,
-            owner_user_id=exact.owner_user_id,
-            repo_identifier=exact.repo_identifier,
-        )
-        batch_candidates = await store.find_rebaseline_reactivation_candidates(
-            (exact.content_hash, "missing-hash"),
-            visibility=exact.visibility,
-            owner_user_id=exact.owner_user_id,
-            repo_identifier=exact.repo_identifier,
-        )
-
-        assert candidate is not None
-        assert candidate.id == exact.id
-        assert [memory.id for memory in batch_candidates] == [exact.id]
 
     # -- Visibility filtering ----------------------------------------------
 

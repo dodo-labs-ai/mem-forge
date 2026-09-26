@@ -32,8 +32,7 @@ def test_large_complete_table_reaches_actual_request_budget(representation, rows
     assert len(table) > 30_000
     projection = _confluence_projection("Before the table.\n\n" + table + "\n\nAfter the table.")
     batches = plan_projection_evidence_work(
-        projection, committed_base_snapshot=None, reprocess_all_current_observations=False,
-        extraction_contract_version="projection-extraction-v9")
+        projection, committed_base_snapshot=None, reprocess_all_current_observations=False)
     assert isinstance(batches, tuple)
     context = RevisionAssessmentContext(projection=projection, base=None, access_context_hash="scope")
 

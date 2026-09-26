@@ -35,22 +35,21 @@ from memforge.models import Memory, MemoryExtractionResult, RawMemory, Reconcile
 from memforge.pipeline.reconciler import ReconciliationResult, SupportAuditEntry, reconcile_memories
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import ProjectionExtractionBatch
+from memforge.pipeline.projection_fragments import compile_projection_fragment_catalog
 from memforge.source_derivation import (
-    DiffGuidedExtractionBatch,
-    SourceDerivationBatch,
-    StructuralExtractionBatch,
+    SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
     memory_extraction_output_payload,
     replay_source_unit_derivation,
     source_unit_derivation_context_from_payload,
 )
-from memforge.source_projection import source_projection_from_payload
+from memforge.source_projection import SourceProjection, source_projection_from_payload
 
 
 OFFLINE_EVALUATION_SCHEMA_VERSION = "1"
 OFFLINE_CONTENT_POLICY_SCHEMA_VERSION = "2"
 ACCEPTED_GROUND_TRUTH_SCHEMA_VERSION = "2"
-OFFLINE_DETERMINISTIC_EVALUATOR_VERSION = "2"
+OFFLINE_DETERMINISTIC_EVALUATOR_VERSION = "3"
 SEMANTIC_JUDGE_INPUT_MAPPING_VERSION = "1"
 SEMANTIC_JUDGE_OUTPUT_SCHEMA_VERSION = "1"
 _SEMANTIC_JUDGE_PROMPT_TEMPLATE = """You are an offline quality evaluator.
@@ -122,6 +121,16 @@ class ExternalAnnotationTaskState(str, Enum):
 
 class OfflineArtifactUnavailable(RuntimeError):
     """A revision-pinned input required by replay cannot be resolved."""
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayedEvidenceWork:
+    """The pinned Source Unit target and Evidence work identity of one case."""
+
+    projection: SourceProjection
+    context: SourceUnitDerivationContext
+    access_context_hash: str
+    inference_capability_hash: str
 
 
 class AgentEvaluationContentProfile(str, Enum):
@@ -810,12 +819,16 @@ class StructuredOfflineSemanticJudge:
 
 
 class SourceUnitDerivationReplayExecutor:
-    """Replay the production Source Unit derivation planner without staging."""
+    """Replay the production Source Unit derivation planner without staging.
+
+    The case pins the access context and inference capability hashes of the
+    derivation it was curated from, so replay plans the same Evidence work.
+    """
 
     def __init__(
         self,
         extract_batch: Callable[
-            [SourceDerivationBatch, Mapping[str, object]],
+            [ProjectionExtractionBatch, ReplayedEvidenceWork, Mapping[str, object]],
             Awaitable[MemoryExtractionResult],
         ],
     ) -> None:
@@ -830,9 +843,20 @@ class SourceUnitDerivationReplayExecutor:
         context_payload = _mapping(case.manifest, "context")
         projection = source_projection_from_payload(projection_payload)
         context = source_unit_derivation_context_from_payload(context_payload)
+        work = ReplayedEvidenceWork(
+            projection=projection,
+            context=context,
+            access_context_hash=_required(
+                "access_context_hash", str(case.manifest.get("access_context_hash") or "")
+            ),
+            inference_capability_hash=_required(
+                "inference_capability_hash",
+                str(case.manifest.get("inference_capability_hash") or ""),
+            ),
+        )
 
-        async def extract(batch: SourceDerivationBatch) -> MemoryExtractionResult:
-            return await self._extract_batch(batch, candidate_manifest)
+        async def extract(batch: ProjectionExtractionBatch) -> MemoryExtractionResult:
+            return await self._extract_batch(batch, work, candidate_manifest)
 
         result = await replay_source_unit_derivation(
             SourceUnitDerivationRequest(
@@ -840,6 +864,8 @@ class SourceUnitDerivationReplayExecutor:
                 context=context,
                 extract_batch=extract,
                 max_concurrent=_positive_int(candidate_manifest.get("max_concurrent"), default=1),
+                access_context_hash=work.access_context_hash,
+                inference_capability_hash=work.inference_capability_hash,
             )
         )
         return {
@@ -860,43 +886,33 @@ class ProductionSourceUnitDerivationReplayExecutor:
         case: AgentEvaluationCase,
         candidate_manifest: Mapping[str, object],
     ) -> Mapping[str, object]:
-        projection = source_projection_from_payload(_mapping(case.manifest, "projection"))
-        context = source_unit_derivation_context_from_payload(
-            _mapping(case.manifest, "context")
-        )
         extractor = MemoryExtractor(
             model=str(candidate_manifest["model"]),
             structured_llm_client=self._structured_llm_client,
         )
 
         async def extract(
-            batch: SourceDerivationBatch,
+            batch: ProjectionExtractionBatch,
+            work: ReplayedEvidenceWork,
             _candidate_manifest: Mapping[str, object],
         ) -> MemoryExtractionResult:
-            if isinstance(batch, DiffGuidedExtractionBatch):
-                return await extractor.extract_memory_changes(
-                    changed_hunks=batch.changed_hunks,
-                    updated_document=batch.updated_document,
-                    current_changed_ranges=context.current_changed_ranges,
-                    source_type=projection.source_type,
-                    doc_type=context.doc_type,
+            if batch.primary_image_bytes or batch.candidate_context_image_bytes:
+                raise OfflineArtifactUnavailable(
+                    "offline derivation requires pinned binary artifacts"
                 )
-            if isinstance(batch, StructuralExtractionBatch):
-                return await extractor.extract_unit_memories(
-                    batch.context,
-                    doc_type=context.doc_type,
-                )
-            if isinstance(batch, ProjectionExtractionBatch):
-                if batch.primary_image_bytes:
-                    raise OfflineArtifactUnavailable(
-                        "offline derivation requires pinned binary artifacts"
-                    )
-                return await extractor.extract_projection_batch_memories(
-                    batch,
-                    source_type=projection.source_type,
-                    doc_type=context.doc_type,
-                )
-            raise TypeError(f"unsupported derivation batch: {type(batch).__name__}")
+            catalog = compile_projection_fragment_catalog(
+                work.projection,
+                batch,
+                access_context_hash=work.access_context_hash,
+                inference_capability_hash=work.inference_capability_hash,
+            )
+            return await extractor.extract_projection_fragment_memories(
+                catalog,
+                source_type=work.projection.source_type,
+                doc_type=work.context.doc_type,
+                context_markdown=batch.context_markdown,
+                context_observation_ids=batch.context_observation_ids,
+            )
 
         return await SourceUnitDerivationReplayExecutor(extract).execute(
             case,
@@ -2472,33 +2488,16 @@ def deterministic_checks(
         invalid_evidence = sum(
             not _derivation_evidence_resolves(memory, revisions) for memory in memories
         )
-        uses_v9 = any(
-            isinstance(memory, Mapping)
-            and isinstance(memory.get("resolved_evidence_selection"), Mapping)
-            for memory in memories
-        )
         checks.append(
             DeterministicCheck(
-                criterion=(
-                    "fragment_selection_resolution"
-                    if uses_v9
-                    else "claim_local_evidence"
-                ),
+                criterion="fragment_selection_resolution",
                 label=(
                     DeterministicCheckLabel.FAIL if invalid_evidence else DeterministicCheckLabel.PASS
                 ),
                 reason_code=(
-                    (
-                        "fragment_selection_rejected"
-                        if invalid_evidence
-                        else "fragment_selection_accepted"
-                    )
-                    if uses_v9
-                    else (
-                        "claim_local_evidence_missing"
-                        if invalid_evidence
-                        else "claim_local_evidence_resolved"
-                    )
+                    "fragment_selection_rejected"
+                    if invalid_evidence
+                    else "fragment_selection_accepted"
                 ),
             )
         )
@@ -2604,92 +2603,77 @@ def _derivation_evidence_resolves(
     if not isinstance(memory, Mapping):
         return False
     selection = memory.get("resolved_evidence_selection")
-    if isinstance(selection, Mapping):
-        parts = selection.get("parts")
-        if not isinstance(parts, list) or not parts:
-            return False
-        if sum(
-            isinstance(part, Mapping) and part.get("role") == "primary"
-            for part in parts
-        ) != 1:
-            return False
-        seen: set[tuple[object, ...]] = set()
-        for part in parts:
-            if not isinstance(part, Mapping):
-                return False
-            anchor = part.get("anchor")
-            if not isinstance(anchor, Mapping):
-                return False
-            observation_id = str(anchor.get("observation_id") or "")
-            revision = revisions.get(observation_id)
-            if (
-                revision is None
-                or str(revision.get("id") or "")
-                != str(anchor.get("observation_revision_id") or "")
-            ):
-                return False
-            identity = (
-                part.get("role"),
-                part.get("kind"),
-                observation_id,
-                anchor.get("observation_revision_id"),
-                anchor.get("kind"),
-                anchor.get("range_start"),
-                anchor.get("range_end"),
-                part.get("raw_content_sha256"),
-            )
-            if identity in seen:
-                return False
-            seen.add(identity)
-            if part.get("kind") == "artifact":
-                metadata = revision.get("metadata")
-                artifact = (
-                    metadata.get("source_artifact")
-                    if isinstance(metadata, Mapping)
-                    else None
-                )
-                if (
-                    not isinstance(artifact, Mapping)
-                    or artifact.get("sha256") != part.get("raw_content_sha256")
-                ):
-                    return False
-                continue
-            content = str(revision.get("content") or "")
-            start = anchor.get("range_start")
-            end = anchor.get("range_end")
-            if (
-                not isinstance(start, int)
-                or not isinstance(end, int)
-                or not 0 <= start < end <= len(content)
-            ):
-                return False
-            raw = content[start:end]
-            if hashlib.sha256(raw.encode("utf-8")).hexdigest() != part.get(
-                "raw_content_sha256"
-            ):
-                return False
-            excerpt = part.get("excerpt")
-            if not isinstance(excerpt, str) or hashlib.sha256(
-                excerpt.encode("utf-8")
-            ).hexdigest() != part.get("presentation_sha256"):
-                return False
-        return True
-    observation_id = str(memory.get("source_observation_id") or "")
-    quote = str(memory.get("evidence_quote") or "")
-    revision = revisions.get(observation_id)
-    authority = str(revision.get("content") or "") if revision is not None else None
-    if authority is None or not quote.strip() or quote not in authority:
+    if not isinstance(selection, Mapping):
         return False
-    start = memory.get("evidence_range_start")
-    end = memory.get("evidence_range_end")
-    if start is None and end is None:
-        return True
-    return (
-        isinstance(start, int)
-        and isinstance(end, int)
-        and 0 <= start < end <= len(authority)
-        and authority[start:end] == quote
-    )
+    parts = selection.get("parts")
+    if not isinstance(parts, list) or not parts:
+        return False
+    if sum(
+        isinstance(part, Mapping) and part.get("role") == "primary"
+        for part in parts
+    ) != 1:
+        return False
+    seen: set[tuple[object, ...]] = set()
+    for part in parts:
+        if not isinstance(part, Mapping):
+            return False
+        anchor = part.get("anchor")
+        if not isinstance(anchor, Mapping):
+            return False
+        observation_id = str(anchor.get("observation_id") or "")
+        revision = revisions.get(observation_id)
+        if (
+            revision is None
+            or str(revision.get("id") or "")
+            != str(anchor.get("observation_revision_id") or "")
+        ):
+            return False
+        identity = (
+            part.get("role"),
+            part.get("kind"),
+            observation_id,
+            anchor.get("observation_revision_id"),
+            anchor.get("kind"),
+            anchor.get("range_start"),
+            anchor.get("range_end"),
+            part.get("raw_content_sha256"),
+        )
+        if identity in seen:
+            return False
+        seen.add(identity)
+        if part.get("kind") == "artifact":
+            metadata = revision.get("metadata")
+            artifact = (
+                metadata.get("source_artifact")
+                if isinstance(metadata, Mapping)
+                else None
+            )
+            if (
+                not isinstance(artifact, Mapping)
+                or artifact.get("sha256") != part.get("raw_content_sha256")
+            ):
+                return False
+            continue
+        content = str(revision.get("content") or "")
+        start = anchor.get("range_start")
+        end = anchor.get("range_end")
+        if (
+            not isinstance(start, int)
+            or not isinstance(end, int)
+            or not 0 <= start < end <= len(content)
+        ):
+            return False
+        raw = content[start:end]
+        if hashlib.sha256(raw.encode("utf-8")).hexdigest() != part.get(
+            "raw_content_sha256"
+        ):
+            return False
+        excerpt = part.get("excerpt")
+        if not isinstance(excerpt, str) or hashlib.sha256(
+            excerpt.encode("utf-8")
+        ).hexdigest() != part.get("presentation_sha256"):
+            return False
+    return True
 
 
 def _assessment_for_check(
@@ -2738,6 +2722,8 @@ def _validate_case_manifest(
     elif case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION:
         _mapping(manifest, "projection")
         _mapping(manifest, "context")
+        for field in ("access_context_hash", "inference_capability_hash"):
+            _required(field, str(manifest.get(field) or ""))
     else:
         _mapping_list(manifest, "new_extractions")
         incumbents = _mapping_list(manifest, "incumbents")

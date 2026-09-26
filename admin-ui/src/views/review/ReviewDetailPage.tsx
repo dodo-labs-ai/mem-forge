@@ -69,9 +69,6 @@ function StateCard({
                 <Badge variant="secondary" className="text-[10px]">
                   {group.source_type}
                 </Badge>
-                {group.legacy_limited && (
-                  <Badge variant="outline" className="text-[10px]">Legacy limited</Badge>
-                )}
                 {group.document?.source_url && (
                   <a
                     href={group.document.source_url}

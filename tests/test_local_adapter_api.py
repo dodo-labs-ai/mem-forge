@@ -15,10 +15,6 @@ from memforge.config import AppConfig
 from memforge.github_repo_utils import build_github_repo_doc_id
 from memforge.local_agent.source_contract import source_with_sync_inputs
 from memforge.local_adapter import submit_github_repo_document
-from memforge.memory.lifecycle_plan import (
-    LifecycleBackfillJob,
-    LifecycleBackfillJobStatus,
-)
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.source_artifacts import SourceArtifactContractError
@@ -2496,47 +2492,6 @@ def test_local_adapter_push_rejects_paused_source(tmp_path):
         asyncio.run(database.close())
 
 
-def test_local_adapter_push_rejects_lifecycle_maintenance_before_artifact_write(
-    tmp_path,
-):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(
-            db=database,
-            config=cfg,
-            local_agent_lease_validator=_allow_local_agent_lease,
-        )
-        with LeaseAwareTestClient(app) as client:
-            source_id = _create_local_markdown_source(client)["id"]
-            asyncio.run(
-                database.create_lifecycle_backfill_job(
-                    LifecycleBackfillJob(
-                        id="lifecycle-package-fence",
-                        source_id=source_id,
-                        status=LifecycleBackfillJobStatus.QUEUED,
-                    )
-                )
-            )
-            response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "vault_id": "engineering",
-                    "relative_path": "notes.md",
-                    "markdown_body": "# Notes",
-                    "process_now": False,
-                },
-            )
-
-        assert response.status_code == 409
-        assert response.json()["detail"] == ("source lifecycle maintenance active: lifecycle-package-fence")
-        assert list(Path(cfg.storage.docs_path).rglob("*package*.json")) == []
-    finally:
-        asyncio.run(database.close())
-
-
 def test_local_adapter_push_cleans_artifact_when_lease_expires_after_write(
     tmp_path,
 ):
@@ -2574,61 +2529,6 @@ def test_local_adapter_push_cleans_artifact_when_lease_expires_after_write(
         assert list(Path(cfg.storage.docs_path).rglob("*package*.json")) == []
         assert asyncio.run(database.list_source_artifact_cleanup_tasks()) == []
         assert asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id)) == []
-    finally:
-        asyncio.run(database.close())
-
-
-def test_local_adapter_push_epoch_cas_rejects_maintenance_after_lease_check(
-    tmp_path,
-):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    original_create_input = database.create_source_sync_input
-    maintenance_started = False
-
-    async def create_input_after_maintenance_started(**kwargs):
-        nonlocal maintenance_started
-        if not maintenance_started:
-            maintenance_started = True
-            await database.create_lifecycle_backfill_job(
-                LifecycleBackfillJob(
-                    id="lifecycle-after-package-lease-check",
-                    source_id=str(kwargs["source_id"]),
-                    status=LifecycleBackfillJobStatus.QUEUED,
-                )
-            )
-            await database.fail_lifecycle_backfill_job(
-                "lifecycle-after-package-lease-check",
-                error="maintenance completed before stale upload",
-            )
-        return await original_create_input(**kwargs)
-
-    database.create_source_sync_input = create_input_after_maintenance_started
-    try:
-        app = create_admin_app(
-            db=database,
-            config=cfg,
-            local_agent_lease_validator=_allow_local_agent_lease,
-        )
-        with LeaseAwareTestClient(app) as client:
-            source_id = _create_local_markdown_source(client)["id"]
-            response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "vault_id": "engineering",
-                    "relative_path": "notes.md",
-                    "markdown_body": "# Notes",
-                    "process_now": False,
-                },
-            )
-
-        assert response.status_code == 409, response.text
-        assert "source activity epoch changed" in response.json()["detail"]
-        assert asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id)) == []
-        assert list(Path(cfg.storage.docs_path).rglob("*package*.json")) == []
-        assert asyncio.run(database.list_source_artifact_cleanup_tasks()) == []
     finally:
         asyncio.run(database.close())
 
