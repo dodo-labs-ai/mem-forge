@@ -221,7 +221,7 @@ def test_legacy_limited_evidence_cannot_supersede_memory() -> None:
     result = service.derive_lifecycle(unit, [decision])
 
     assert result.action is LifecycleAction.CREATE_REVIEW
-    assert result.review_case is ReviewCase.LEGACY_LIMITED_EVIDENCE
+    assert result.review_case is ReviewCase.MISSING_CONTENT_PROVENANCE
 
 
 def test_llm_proposed_content_requires_source_provenance() -> None:

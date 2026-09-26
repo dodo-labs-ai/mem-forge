@@ -4,13 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from hashlib import sha256
 from typing import Mapping, Protocol, Sequence, runtime_checkable
 
 from memforge.memory.evidence import (
     EvidenceReference,
     EvidenceUnit,
-    SupportScopeVersion,
     evidence_part_set_digest,
     validate_evidence_references,
 )
@@ -80,149 +78,6 @@ class ProjectedLifecycleDeferredError(ProjectedSupportInvariantError):
         return tuple(dict.fromkeys(item.evidence_unit_id for item in self.blockers))
 
 
-class CutoverFindingStatus(str, Enum):
-    OPEN = "open"
-    RESOLVED = "resolved"
-
-
-class CutoverFindingReason(str, Enum):
-    MISSING_SOURCE_PROVENANCE = "missing_source_provenance"
-    OBSERVATION_NOT_FOUND = "observation_not_found"
-    AMBIGUOUS_OBSERVATION = "ambiguous_observation"
-    LINEAGE_VALIDATION_FAILED = "lineage_validation_failed"
-
-
-class HistoricalProjectionFailureReason(str, Enum):
-    """Deterministic absence reasons that may justify cutover retirement."""
-
-    DOCUMENT_MISSING = "document_missing"
-    RAW_ARTIFACT_MISSING = "raw_artifact_missing"
-    NORMALIZED_ARTIFACT_MISSING = "normalized_artifact_missing"
-    CANONICAL_CONCEPT_MISSING = "canonical_concept_missing"
-    CANONICAL_CONCEPT_EMPTY = "canonical_concept_empty"
-    EXACT_INPUTS_MISSING = "exact_inputs_missing"
-
-
-AGENT_SESSION_TERMINAL_PROJECTION_FAILURES = frozenset(
-    {
-        HistoricalProjectionFailureReason.DOCUMENT_MISSING,
-        HistoricalProjectionFailureReason.CANONICAL_CONCEPT_MISSING,
-        HistoricalProjectionFailureReason.CANONICAL_CONCEPT_EMPTY,
-        HistoricalProjectionFailureReason.EXACT_INPUTS_MISSING,
-    }
-)
-
-
-def build_unprovable_cutover_resolution(
-    *,
-    reconstruction_attempt_id: str,
-    operator_id: str,
-    unavailable_documents: Mapping[str, str],
-) -> dict[str, object]:
-    """Normalize the exact terminal evidence persisted by both adapters."""
-
-    if not reconstruction_attempt_id.strip() or not operator_id.strip():
-        raise ValueError("unprovable retirement requires operator and reconstruction attempt ids")
-    normalized: dict[str, str] = {}
-    for document_id, raw_reason in unavailable_documents.items():
-        if not isinstance(document_id, str) or not document_id.strip():
-            raise ValueError("unprovable retirement requires deterministic unavailable documents")
-        reason = HistoricalProjectionFailureReason(raw_reason)
-        if reason not in AGENT_SESSION_TERMINAL_PROJECTION_FAILURES:
-            raise ValueError("unprovable retirement requires exhausted Agent Session recovery paths")
-        normalized[document_id.strip()] = reason.value
-    if len(normalized) != len(unavailable_documents) or not normalized:
-        raise ValueError("unprovable retirement requires deterministic unavailable documents")
-    return {
-        "kind": "unprovable_source_retired",
-        "operator_id": operator_id.strip(),
-        "reconstruction_attempt_id": reconstruction_attempt_id.strip(),
-        "unavailable_documents": dict(sorted(normalized.items())),
-    }
-
-
-def validate_unprovable_cutover_evidence(
-    *,
-    available_provenance: Mapping[str, object],
-    mapping_attempt: Mapping[str, object],
-    source_rows: Sequence[Mapping[str, object]],
-    source_id: str,
-    unavailable_documents: Mapping[str, str],
-) -> tuple[str, ...]:
-    """Reject every malformed or contradictory entry before destructive cutover."""
-
-    raw_documents = available_provenance.get("documents")
-    raw_attempts = mapping_attempt.get("attempts")
-    if not isinstance(raw_documents, list) or not raw_documents:
-        raise ValueError("unprovable retirement requires strict exact source provenance")
-    if not isinstance(raw_attempts, list) or not raw_attempts or not source_rows:
-        raise ValueError("unprovable retirement requires strict exact source provenance")
-
-    document_ids: list[str] = []
-    for item in raw_documents:
-        if not isinstance(item, Mapping) or set(item) != {"doc_id", "source_type", "excerpt"}:
-            raise ValueError("unprovable retirement requires strict exact source provenance")
-        doc_id = item.get("doc_id")
-        excerpt = item.get("excerpt")
-        if (
-            not isinstance(doc_id, str)
-            or not doc_id.strip()
-            or item.get("source_type") != "agent_session"
-            or (excerpt is not None and not isinstance(excerpt, str))
-        ):
-            raise ValueError("unprovable retirement requires strict exact source provenance")
-        document_ids.append(doc_id.strip())
-
-    attempt_ids: list[str] = []
-    for item in raw_attempts:
-        if not isinstance(item, Mapping) or set(item) != {"doc_id", "result"}:
-            raise ValueError("unprovable retirement requires strict exact source provenance")
-        doc_id = item.get("doc_id")
-        if not isinstance(doc_id, str) or not doc_id.strip() or item.get("result") != "source_unit_not_found":
-            raise ValueError("unprovable retirement requires strict exact source provenance")
-        attempt_ids.append(doc_id.strip())
-
-    edge_ids: list[str] = []
-    for row in source_rows:
-        if set(row) != {"doc_id", "source_id", "source_type"}:
-            raise ValueError("unprovable retirement requires strict exact source provenance")
-        doc_id = row.get("doc_id")
-        if (
-            not isinstance(doc_id, str)
-            or not doc_id.strip()
-            or row.get("source_id") != source_id
-            or row.get("source_type") != "agent_session"
-        ):
-            raise ValueError("unprovable retirement requires exclusive source provenance")
-        edge_ids.append(doc_id.strip())
-
-    unavailable_ids = list(unavailable_documents)
-    if (
-        len(set(document_ids)) != len(document_ids)
-        or len(set(attempt_ids)) != len(attempt_ids)
-        or len(set(edge_ids)) != len(edge_ids)
-        or set(document_ids) != set(attempt_ids)
-        or set(document_ids) != set(edge_ids)
-        or set(document_ids) != set(unavailable_ids)
-    ):
-        raise ValueError("unprovable retirement requires strict exact source provenance")
-    return tuple(sorted(document_ids))
-
-
-def unprovable_cutover_retirement_plan_id(finding_id: str) -> str:
-    """Stable lifecycle-plan identity for one terminal cutover finding."""
-
-    digest = sha256(f"unprovable-cutover-retirement\x1f{finding_id}".encode()).hexdigest()[:20]
-    return f"lifecycle-cutover-retire-{digest}"
-
-
-class LifecycleBackfillJobStatus(str, Enum):
-    QUEUED = "queued"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
 class LifecycleVectorOperation(str, Enum):
     UPSERT = "upsert"
     DELETE = "delete"
@@ -271,50 +126,6 @@ class LifecycleGate:
     reason: str | None = None
     enabled_at: str | None = None
     audited_at: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class LifecycleCutoverFinding:
-    id: str
-    source_id: str
-    memory_id: str
-    reason: CutoverFindingReason
-    status: CutoverFindingStatus
-    available_provenance: Mapping[str, object]
-    mapping_attempt: Mapping[str, object]
-    observation_id: str | None = None
-    source_unit_id: str | None = None
-    created_at: str | None = None
-    updated_at: str | None = None
-    resolved_at: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class LifecycleBackfillJob:
-    id: str
-    source_id: str
-    status: LifecycleBackfillJobStatus
-    scanned_memories: int = 0
-    mapped_memories: int = 0
-    finding_count: int = 0
-    error: str | None = None
-    created_at: str | None = None
-    started_at: str | None = None
-    completed_at: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class LegacyMemoryProvenance:
-    memory_id: str
-    doc_id: str
-    source_id: str
-    source_type: str
-    content: str
-    excerpt: str | None
-    visibility: str
-    owner_user_id: str | None
-    project_key: str | None
-    repo_identifier: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,7 +183,6 @@ class IncumbentAuthorityGrant:
 
 class LifecycleMutationType(str, Enum):
     CREATE_MEMORY = "create_memory"
-    REACTIVATE_MEMORY = "reactivate_memory"
     ATTACH_SUPPORT = "attach_support"
     REMOVE_SUPPORT = "remove_support"
     SUPERSEDE_MEMORY = "supersede_memory"
@@ -442,7 +252,7 @@ def plan_skips_support_revalidation(
     if any(
         mutation.memory_id == memory_id
         and mutation.mutation_type is LifecycleMutationType.ATTACH_SUPPORT
-        and support_id in (*mutation.evidence_reference_ids, *mutation.evidence_unit_ids)
+        and support_id in mutation.evidence_unit_ids
         for mutation in plan.mutations
     ):
         return False
@@ -521,7 +331,6 @@ class CoverageProof:
 class StaleGuard:
     observation_revision_ids: tuple[str, ...]
     support_set_hashes: Mapping[str, str]
-    support_scope_version: SupportScopeVersion = SupportScopeVersion.REFERENCE_SET_V1
     memory_versions: Mapping[str, str] = field(default_factory=dict)
 
 
@@ -530,7 +339,6 @@ class LifecycleMutation:
     mutation_type: LifecycleMutationType
     memory_id: str
     source_id: str
-    evidence_reference_ids: tuple[str, ...] = ()
     evidence_unit_ids: tuple[str, ...] = ()
     replacement_memory_id: str | None = None
     payload: Mapping[str, object] = field(default_factory=dict)
@@ -544,11 +352,9 @@ class LifecycleMutation:
                 LifecycleMutationType.ATTACH_SUPPORT,
                 LifecycleMutationType.REMOVE_SUPPORT,
             }
-            and not (self.evidence_reference_ids or self.evidence_unit_ids)
+            and not self.evidence_unit_ids
         ):
-            raise ValueError("support mutation requires Evidence identity")
-        if self.evidence_reference_ids and self.evidence_unit_ids:
-            raise ValueError("support mutation cannot mix v1 References and v2 Units")
+            raise ValueError("support mutation requires Evidence Unit ids")
 
 
 @dataclass(frozen=True, slots=True)
@@ -586,7 +392,7 @@ class LifecyclePlan:
                 mutation.memory_id == decision.memory_id
                 and mutation.mutation_type is LifecycleMutationType.ATTACH_SUPPORT
                 and set(decision.skipped_support_ids).intersection(
-                    (*mutation.evidence_reference_ids, *mutation.evidence_unit_ids)
+                    mutation.evidence_unit_ids
                 )
                 for mutation in self.mutations
             ):
@@ -610,15 +416,6 @@ class LifecyclePlan:
         for item in self.mutations:
             if item.mutation_type in DESTRUCTIVE_MUTATIONS and item.memory_id not in incumbents:
                 raise ValueError("destructive mutation targets memory outside mandatory incumbent ledger")
-            if item.mutation_type in {
-                LifecycleMutationType.ATTACH_SUPPORT,
-                LifecycleMutationType.REMOVE_SUPPORT,
-            }:
-                if self.stale_guard.support_scope_version is SupportScopeVersion.REFERENCE_SET_V1:
-                    if not item.evidence_reference_ids or item.evidence_unit_ids:
-                        raise ValueError("v1 Plan support mutation requires Reference ids")
-                elif not item.evidence_unit_ids or item.evidence_reference_ids:
-                    raise ValueError("v2 Plan support mutation requires Evidence Unit ids")
         unit_ids = {item.id for item in self.evidence_units}
         if len(unit_ids) != len(self.evidence_units):
             raise ValueError("duplicate staged Evidence Unit")
@@ -631,10 +428,7 @@ class LifecyclePlan:
             item.memory_id
             for item in self.mutations
             if item.mutation_type
-            in {
-                LifecycleMutationType.CREATE_MEMORY,
-                LifecycleMutationType.REACTIVATE_MEMORY,
-            }
+            is LifecycleMutationType.CREATE_MEMORY
         }
         for request in self.relation_discovery_requests:
             if request.source_id != self.scope.source_id:
@@ -658,11 +452,9 @@ class LifecyclePlan:
                 references,
                 available_revision_ids=available_revisions,
             )
-            if self.stale_guard.support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
-                unit = next(item for item in self.evidence_units if item.id == unit_id)
-                digest = evidence_part_set_digest(references)
-                if unit.part_set_digest != digest:
-                    raise ValueError("v2 staged Evidence Unit part digest mismatch")
+            unit = next(item for item in self.evidence_units if item.id == unit_id)
+            if unit.part_set_digest != evidence_part_set_digest(references):
+                raise ValueError("staged Evidence Unit part digest mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -672,12 +464,7 @@ class ContestedSupportEdge:
     memory_id: str
     source_id: str
     source_unit_id: str
-    evidence_reference_id: str | None = None
-    evidence_unit_id: str | None = None
-
-    def __post_init__(self) -> None:
-        if (self.evidence_reference_id is None) == (self.evidence_unit_id is None):
-            raise ValueError("contested Support requires exactly one versioned identity")
+    evidence_unit_id: str
 
 
 def contested_supports_from_staged_evidence(
@@ -706,26 +493,21 @@ def contested_supports_from_staged_evidence(
             continue
         if raw_mutation.get("memory_id") != incumbent_memory_id or raw_mutation.get("source_id") != source_id:
             raise ValueError("create_review remove_support targets another incumbent")
-        reference_ids = raw_mutation.get("evidence_reference_ids")
         unit_ids = raw_mutation.get("evidence_unit_ids")
-        if reference_ids and unit_ids:
-            raise ValueError("create_review remove_support cannot mix Support versions")
-        identities = unit_ids or reference_ids
-        if not isinstance(identities, Sequence) or isinstance(identities, (str, bytes)):
-            raise ValueError("create_review remove_support requires versioned Evidence ids")
-        if not identities or not all(
-            isinstance(identity, str) and identity for identity in identities
+        if not isinstance(unit_ids, Sequence) or isinstance(unit_ids, (str, bytes)):
+            raise ValueError("create_review remove_support requires Evidence Unit ids")
+        if not unit_ids or not all(
+            isinstance(unit_id, str) and unit_id for unit_id in unit_ids
         ):
-            raise ValueError("create_review remove_support requires stable Evidence ids")
+            raise ValueError("create_review remove_support requires stable Evidence Unit ids")
         contested.update(
             ContestedSupportEdge(
                 memory_id=incumbent_memory_id,
                 source_id=source_id,
                 source_unit_id=source_unit_id,
-                evidence_reference_id=(identity if reference_ids else None),
-                evidence_unit_id=(identity if unit_ids else None),
+                evidence_unit_id=unit_id,
             )
-            for identity in identities
+            for unit_id in unit_ids
         )
     return frozenset(contested)
 
@@ -799,7 +581,6 @@ def lifecycle_plan_to_payload(plan: LifecyclePlan) -> dict[str, object]:
         "stale_guard": {
             "observation_revision_ids": list(plan.stale_guard.observation_revision_ids),
             "support_set_hashes": dict(plan.stale_guard.support_set_hashes),
-            "support_scope_version": plan.stale_guard.support_scope_version.value,
             "memory_versions": dict(plan.stale_guard.memory_versions),
         },
         "evidence_units": [
@@ -867,7 +648,6 @@ def lifecycle_plan_to_payload(plan: LifecyclePlan) -> dict[str, object]:
                 "mutation_type": item.mutation_type.value,
                 "memory_id": item.memory_id,
                 "source_id": item.source_id,
-                "evidence_reference_ids": list(item.evidence_reference_ids),
                 "evidence_unit_ids": list(item.evidence_unit_ids),
                 "replacement_memory_id": item.replacement_memory_id,
                 "payload": dict(item.payload),

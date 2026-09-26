@@ -23,13 +23,9 @@ from memforge.agent_sessions import (
 )
 from memforge.config import AppConfig
 from memforge.llm.structured import AgentSessionAuthorityResponse, StructuredLlmError
-from memforge.memory.lifecycle_plan import (
-    LifecycleBackfillJob,
-    LifecycleBackfillJobStatus,
-)
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.storage.database import Database
-from memforge.source_activity import SourceActivityConflict
+from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from tests.llm_fixture import fixture_budget
 
 
@@ -596,17 +592,19 @@ def test_agent_session_window_holds_activity_while_llm_builds_patch(
     )
 
     class MaintenanceDuringLLM(_AuthorizesAllCandidateUserEvidence):
+        maintenance_rejected = False
+
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
-            await database.create_lifecycle_backfill_job(
-                LifecycleBackfillJob(
-                    id="agent-maintenance-during-llm",
+            with pytest.raises(SourceActivityConflict, match="source activity already active"):
+                await database.acquire_source_activity(
+                    activity_id="agent-maintenance-during-llm",
                     source_id=source_id,
-                    status=LifecycleBackfillJobStatus.QUEUED,
+                    kind=SourceActivityKind.MAINTENANCE,
                 )
-            )
+            self.maintenance_rejected = True
             return _knowledge_patch(
-                title="Must not persist",
-                claim_text="A stale Agent Session patch must not cross maintenance.",
+                title="Held activity",
+                claim_text="Agent Session patch generation holds the Source activity.",
             )
 
     try:
@@ -615,7 +613,8 @@ def test_agent_session_window_holds_activity_while_llm_builds_patch(
             config=cfg,
             principal_resolver=lambda request: "u-race",
         )
-        app.state.agent_session_window_client = MaintenanceDuringLLM()
+        window_client = MaintenanceDuringLLM()
+        app.state.agent_session_window_client = window_client
         with TestClient(app) as client:
             response = client.post(
                 "/api/v1/agent-sessions/windows",
@@ -636,9 +635,8 @@ def test_agent_session_window_holds_activity_while_llm_builds_patch(
                 },
             )
 
-        assert response.status_code == 409, response.text
-        assert "source activity already active" in response.json()["detail"]
-        assert asyncio.run(database.list_memories(source=source_id)) == []
+        assert response.status_code == 200, response.text
+        assert window_client.maintenance_rejected
     finally:
         asyncio.run(database.close())
 
@@ -661,12 +659,10 @@ def test_agent_session_window_does_not_build_prompt_during_active_maintenance(tm
         )
     )
     asyncio.run(
-        database.create_lifecycle_backfill_job(
-            LifecycleBackfillJob(
-                id="agent-maintenance-active",
-                source_id=source_id,
-                status=LifecycleBackfillJobStatus.QUEUED,
-            )
+        database.acquire_source_activity(
+            activity_id="agent-maintenance-active",
+            source_id=source_id,
+            kind=SourceActivityKind.MAINTENANCE,
         )
     )
 

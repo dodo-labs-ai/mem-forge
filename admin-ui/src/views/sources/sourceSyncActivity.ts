@@ -1,12 +1,9 @@
 import type {
   LocalAgentJobStatusResponse,
-  SourceLifecycleMaintenance,
   SyncProgressSnapshot,
   SyncProgressUnit,
   SyncStatus,
 } from "../../api/types.js";
-
-export type SourceSyncActivityKind = "sync" | "memory_maintenance";
 
 export interface SourceSyncRetryTarget {
   execution_kind: "local_agent_job" | "source_sync_run";
@@ -22,7 +19,6 @@ export type SourceSyncActivityState =
   | "failed";
 
 export interface SourceSyncActivity {
-  kind: SourceSyncActivityKind;
   state: SourceSyncActivityState;
   progress?: SyncProgressSnapshot;
   error?: {
@@ -48,7 +44,6 @@ export interface SourceSyncActivityPolicy {
   activeRowLabel: string;
   busyActionLabel: string;
   busyAriaLabel: string;
-  canRetry: boolean;
 }
 
 export function sourceSyncActivityFromLocalJob(job: LocalAgentJobStatusResponse): SourceSyncActivity {
@@ -56,7 +51,6 @@ export function sourceSyncActivityFromLocalJob(job: LocalAgentJobStatusResponse)
     && job.leased_until != null
     && new Date(job.leased_until).getTime() <= Date.now();
   return {
-    kind: "sync",
     state: job.status === "queued"
       ? "queued"
       : job.status === "leased"
@@ -75,7 +69,6 @@ export function sourceSyncActivityFromLocalJob(job: LocalAgentJobStatusResponse)
 
 export function sourceSyncActivityFromStatus(sync: SyncStatus): SourceSyncActivity {
   return {
-    kind: "sync",
     state: sync.status === "pending"
       ? "queued"
       : sync.status === "running"
@@ -92,39 +85,18 @@ export function sourceSyncActivityFromStatus(sync: SyncStatus): SourceSyncActivi
   };
 }
 
-export function sourceSyncActivityFromLifecycleMaintenance(
-  maintenance: SourceLifecycleMaintenance,
-): SourceSyncActivity {
-  return {
-    kind: "memory_maintenance",
-    state: maintenance.status === "queued"
-      ? "queued"
-      : maintenance.status === "running"
-        ? "active"
-        : maintenance.status === "completed" ? "success" : "failed",
-    startedAt: maintenance.started_at ?? maintenance.created_at,
-    updatedAt: maintenance.finished_at ?? maintenance.started_at ?? maintenance.created_at,
-    finishedAt: maintenance.finished_at,
-  };
-}
-
 export function selectSourceSyncActivity({
   sync,
   localJob,
-  lifecycleMaintenance,
   pending = false,
 }: {
   sync?: SyncStatus | null;
   localJob?: LocalAgentJobStatusResponse | null;
-  lifecycleMaintenance?: SourceLifecycleMaintenance | null;
   pending?: boolean;
 }): SourceSyncActivity | undefined {
-  if (lifecycleMaintenance && ["queued", "running"].includes(lifecycleMaintenance.status)) {
-    return sourceSyncActivityFromLifecycleMaintenance(lifecycleMaintenance);
-  }
   if (pending && !["pending", "running", "recovering"].includes(sync?.status ?? "")
     && !["queued", "leased"].includes(localJob?.status ?? "")) {
-    return { kind: "sync", state: "queued" };
+    return { state: "queued" };
   }
   const handedOffRunId = localJob?.status === "succeeded"
     ? localJob.result?.source_sync_run_id?.trim()
@@ -132,7 +104,6 @@ export function selectSourceSyncActivity({
   if (handedOffRunId && sync?.run_id === handedOffRunId) return sourceSyncActivityFromStatus(sync);
   if (pendingSourceSyncHandoff(localJob, sync)) {
     return {
-      kind: "sync",
       state: "active",
       progress: {
         schema_version: 1,
@@ -148,14 +119,11 @@ export function selectSourceSyncActivity({
   if (localJob && ["queued", "leased"].includes(localJob.status)) {
     return sourceSyncActivityFromLocalJob(localJob);
   }
-  if (pending) return { kind: "sync", state: "queued" };
+  if (pending) return { state: "queued" };
 
   const terminalActivities = [
     sync ? sourceSyncActivityFromStatus(sync) : undefined,
     localJob ? sourceSyncActivityFromLocalJob(localJob) : undefined,
-    lifecycleMaintenance
-      ? sourceSyncActivityFromLifecycleMaintenance(lifecycleMaintenance)
-      : undefined,
   ].filter((activity): activity is SourceSyncActivity => activity != null);
   return terminalActivities.sort((left, right) => activityTime(right) - activityTime(left))[0];
 }
@@ -190,27 +158,19 @@ export function sourceSyncActivityIsActionable(
   activity: SourceSyncActivity,
   canSync: boolean,
 ): boolean {
-  return activity.kind !== "sync" || activity.state !== "failed" || canSync;
+  return activity.state !== "failed" || canSync;
 }
 
 export function sourceSyncActivityPolicy(
   activity: SourceSyncActivity,
 ): SourceSyncActivityPolicy {
-  return activity.kind === "memory_maintenance"
-    ? {
-        activeRowLabel: "Updating memories",
-        busyActionLabel: "Updating",
-        busyAriaLabel: "Memory maintenance in progress",
-        canRetry: false,
-      }
-    : {
-        activeRowLabel: activity.state === "queued"
-          ? isWaitingForRetry(activity) ? "Waiting to retry" : "Waiting to sync"
-          : "Syncing now",
-        busyActionLabel: "Syncing",
-        busyAriaLabel: "Sync in progress",
-        canRetry: true,
-      };
+  return {
+    activeRowLabel: activity.state === "queued"
+      ? isWaitingForRetry(activity) ? "Waiting to retry" : "Waiting to sync"
+      : "Syncing now",
+    busyActionLabel: "Syncing",
+    busyAriaLabel: "Sync in progress",
+  };
 }
 
 function isWaitingForRetry(activity: SourceSyncActivity): boolean {
@@ -218,13 +178,16 @@ function isWaitingForRetry(activity: SourceSyncActivity): boolean {
     && new Date(activity.nextAttemptAt!).getTime() > Date.now();
 }
 
+// A finished sync stays on screen briefly so its result is readable.
+export const COMPLETED_SYNC_VISIBLE_MS = 30_000;
+
 export function sourceSyncActivityIsVisible(
   activity: SourceSyncActivity,
   nowMs = Date.now(),
 ): boolean {
   if (activity.state !== "success" || !activity.finishedAt) return true;
   const finishedAtMs = new Date(activity.finishedAt).getTime();
-  return !Number.isFinite(finishedAtMs) || nowMs - finishedAtMs <= 30_000;
+  return !Number.isFinite(finishedAtMs) || nowMs - finishedAtMs <= COMPLETED_SYNC_VISIBLE_MS;
 }
 
 export function presentSourceSyncActivity(
@@ -232,21 +195,6 @@ export function presentSourceSyncActivity(
   sourceName: string,
   fallbackItems: string,
 ): SourceSyncPresentation {
-  if (activity.kind === "memory_maintenance") {
-    if (activity.state === "queued") {
-      return { message: "Waiting to update memories", detail: "Queued" };
-    }
-    if (activity.state === "active" || activity.state === "recovering") {
-      return { message: "Updating memories", detail: "Working" };
-    }
-    if (activity.state === "success") {
-      return { message: "Memories updated", detail: "Complete" };
-    }
-    return {
-      message: "Memory update needs attention",
-      detail: "Memory maintenance failed. Review the maintenance details.",
-    };
-  }
   if (activity.state === "queued") {
     if (isWaitingForRetry(activity)) {
       return {

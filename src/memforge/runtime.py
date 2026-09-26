@@ -42,7 +42,6 @@ from memforge.pipeline.sync import (
     DocumentLifecycleAdmission,
     ExtractionWorkPool,
     GeneSyncOrchestrator,
-    SourceSyncMode,
     get_process_document_lifecycle_admission,
     get_process_extraction_work_pool,
 )
@@ -88,26 +87,8 @@ class SourceSyncUnsupportedError(SourceSyncBoundaryError):
     """Raised when a source type has no ordinary sync execution kind."""
 
 
-class SourceLifecycleMaintenanceError(SourceSyncBoundaryError, SourceActivityConflict):
-    """Raised when an ordinary sync overlaps durable lifecycle maintenance."""
-
-
-async def authorize_source_sync_maintenance(
-    db: Any,
-    source_id: str,
-    *,
-    lifecycle_job_id: str | None = None,
-) -> None:
-    """Require the exact active lifecycle job token, or no active maintenance."""
-    active = await db.get_active_lifecycle_backfill_job(source_id)
-    if active is None:
-        if lifecycle_job_id is not None:
-            raise SourceLifecycleMaintenanceError(
-                f"source lifecycle maintenance token is not active: {lifecycle_job_id}"
-            )
-        return
-    if lifecycle_job_id != active.id:
-        raise SourceLifecycleMaintenanceError(f"source lifecycle maintenance active: {active.id}")
+class SourceSyncActivityConflict(SourceSyncBoundaryError, SourceActivityConflict):
+    """Raised when an ordinary sync overlaps another Source activity lease."""
 
 
 @dataclass
@@ -255,8 +236,6 @@ class RuntimeProvider(Protocol):
         force_full_sync: bool = False,
         authoritative_snapshot: bool = False,
         reprocess_doc_ids: frozenset[str] | None = None,
-        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
-        lifecycle_job_id: str | None = None,
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
@@ -355,8 +334,6 @@ class DefaultRuntimeProvider:
         force_full_sync: bool = False,
         authoritative_snapshot: bool = False,
         reprocess_doc_ids: frozenset[str] | None = None,
-        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
-        lifecycle_job_id: str | None = None,
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
@@ -373,8 +350,6 @@ class DefaultRuntimeProvider:
             force_full_sync=force_full_sync,
             authoritative_snapshot=authoritative_snapshot,
             reprocess_doc_ids=reprocess_doc_ids,
-            execution_mode=execution_mode,
-            lifecycle_job_id=lifecycle_job_id,
             lifecycle_cycle_id=lifecycle_cycle_id,
             scope_transition_run_id=scope_transition_run_id,
             reusable_projection_doc_ids=reusable_projection_doc_ids,
@@ -733,8 +708,6 @@ async def run_source_sync(
     force_full_sync: bool = False,
     authoritative_snapshot: bool = False,
     reprocess_doc_ids: frozenset[str] | None = None,
-    execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
-    lifecycle_job_id: str | None = None,
     lifecycle_cycle_id: str | None = None,
     scope_transition_run_id: str | None = None,
     reusable_projection_doc_ids: frozenset[str] = frozenset(),
@@ -742,25 +715,18 @@ async def run_source_sync(
     record_terminal_result: bool = True,
     source_activity: SourceActivityLease | None = None,
 ) -> SyncState:
-    await authorize_source_sync_maintenance(
-        db,
-        str(source["id"]),
-        lifecycle_job_id=lifecycle_job_id,
-    )
     activity_id = source_activity.id if source_activity is not None else None
     owns_activity = False
     source_activity_epoch: int | None = None
     heartbeat_task: asyncio.Task[None] | None = None
     activity_lease = source_activity
     if source_activity is not None:
-        if lifecycle_job_id is not None:
-            raise ValueError("durable Source activity cannot be combined with lifecycle maintenance")
         if source_activity.source_id != str(source["id"]):
             raise ValueError("durable Source activity does not belong to the synced Source")
         if source_activity.kind is not SourceActivityKind.SYNC:
             raise ValueError("durable Source activity must be a sync authority")
         source_activity_epoch = source_activity.epoch
-    elif lifecycle_job_id is None:
+    else:
         activity_id = f"source-sync-{uuid.uuid4().hex}"
         try:
             activity_lease = await db.acquire_source_activity(
@@ -772,7 +738,7 @@ async def run_source_sync(
             source_activity_epoch = activity_lease.epoch
             owns_activity = True
         except SourceActivityConflict as exc:
-            raise SourceLifecycleMaintenanceError(str(exc)) from exc
+            raise SourceSyncActivityConflict(str(exc)) from exc
 
         async def heartbeat_activity() -> None:
             while True:
@@ -783,11 +749,7 @@ async def run_source_sync(
                 )
 
         heartbeat_task = asyncio.create_task(heartbeat_activity())
-    else:
-        source_activity_epoch = await db.get_source_activity_epoch(str(source["id"]))
-    lifecycle_cycle_id = lifecycle_cycle_id or lifecycle_job_id or activity_id
-    if lifecycle_cycle_id is None:
-        lifecycle_cycle_id = f"source-sync-cycle-{uuid.uuid4().hex}"
+    lifecycle_cycle_id = lifecycle_cycle_id or activity_id
     try:
         runtime = runtime or await build_sync_runtime(db, config)
         secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
@@ -814,8 +776,6 @@ async def run_source_sync(
             "projection_scope_attestations": projection_scope_attestations,
             "record_terminal_result": record_terminal_result,
         }
-        if execution_mode is not SourceSyncMode.NORMAL:
-            sync_kwargs["execution_mode"] = execution_mode
         sync_operation = runtime.orchestrator().sync_gene(**sync_kwargs)
         if heartbeat_task is None:
             return await sync_operation
@@ -829,7 +789,7 @@ async def run_source_sync(
             with contextlib.suppress(asyncio.CancelledError):
                 await sync_task
             await heartbeat_task
-            raise SourceLifecycleMaintenanceError(f"source activity heartbeat stopped: {activity_id}")
+            raise SourceSyncActivityConflict(f"source activity heartbeat stopped: {activity_id}")
         return await sync_task
     finally:
         if heartbeat_task is not None:
@@ -1413,7 +1373,6 @@ class SyncService:
             raise SourceNotActiveError(f"Source is not active: {source_id} ({source.get('status')})")
         if not source_type_supports_sync(str(source.get("type") or "")):
             raise SourceSyncUnsupportedError(f"Source type {source.get('type')!r} does not support ordinary sync")
-        await authorize_source_sync_maintenance(self.db, source_id)
         return source
 
     async def enqueue_source(

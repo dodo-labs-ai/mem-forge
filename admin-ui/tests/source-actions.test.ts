@@ -152,29 +152,14 @@ assert.match(
   "Only the execution owner should see local or connection readiness",
 );
 assert.match(
-  sourcesPageSource,
-  /\["queued", "running"\]\.includes\(source\.lifecycle_maintenance\?\.status/,
-  "Active lifecycle maintenance should keep source status polling active",
-);
-assert.match(
-  sourcesPageSource,
-  /lifecycleMaintenance:\s*source\.lifecycle_maintenance[\s\S]*sourceSyncActivityBlocksActions\(syncActivity\)/,
-  "The source row should project lifecycle maintenance through the shared activity selector",
-);
-assert.match(
   sourceRowSource,
   /aria-label=\{`Configure \$\{source\.name\}`\}[\s\S]*disabled=\{isSourceBusy \|\| isDeleting\}/,
-  "Lifecycle maintenance should block source configuration at the row seam",
+  "An active sync should block source configuration at the row seam",
 );
 assert.match(
   sourcesPageSource,
   /disabled=\{disableMutatingActions\}[\s\S]*onClick=\{onChangeAccess\}[\s\S]*disabled=\{disableMutatingActions\}[\s\S]*onClick=\{onDelete\}/,
-  "Lifecycle maintenance should block access changes and deletion",
-);
-assert.match(
-  syncStatusCardSource,
-  /\(failed \|\| \(queued && activity\.retryTarget\)\) && policy\.canRetry && onRetry/,
-  "Lifecycle-maintenance failures must not expose an ordinary sync retry",
+  "An active sync should block access changes and deletion",
 );
 assert.match(
   syncActivitySource,

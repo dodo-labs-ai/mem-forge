@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 
 from memforge.llm.failure_trace import failure_trace_context
 from memforge.derivation_work import DerivationWorkStore
@@ -40,16 +40,8 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.pipeline.bounded_work import collect_bounded
 from memforge.pipeline.extraction_contract import (
-    CONTRACT_SUPERSEDED,
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
     PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION,
-    projection_extraction_contract,
-)
-from memforge.pipeline.document_units import (
-    ExtractionContext,
-    ExtractionContextPacker,
-    UnitizationPolicy,
-    unitize_markdown,
 )
 from memforge.pipeline.projection_context import (
     CommittedSourceUnitSnapshot,
@@ -59,7 +51,6 @@ from memforge.pipeline.projection_context import (
     ProjectionExtractionBatch,
     observation_is_inference_eligible,
     plan_projection_evidence_work,
-    plan_projection_extraction_batches,
 )
 from memforge.source_artifacts import SourceArtifactSummary
 from memforge.source_projection import (
@@ -69,8 +60,6 @@ from memforge.source_projection import (
     source_projection_to_payload,
 )
 
-
-SOURCE_DERIVATION_CONTRACT_VERSION = PROJECTION_EXTRACTION_CONTRACT_VERSION
 
 SOURCE_DERIVATION_PENDING = "pending"
 SOURCE_DERIVATION_RETRYABLE_FAILURE = "retryable_failure"
@@ -85,7 +74,6 @@ SOURCE_DERIVATION_BATCH_RETRYABLE_FAILURE = "retryable_failure"
 
 _SAFE_DERIVATION_DIAGNOSTIC_RE = re.compile(r"^[A-Za-z0-9_.\[\]$-]+$")
 _MAX_SAFE_DERIVATION_ERROR_FIELDS = 32
-_EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT = 16
 _SELECTOR_NORMALIZATION_FINGERPRINT_LIMIT = 32
 
 logger = logging.getLogger(__name__)
@@ -219,35 +207,6 @@ class SourceUnitDerivationContext:
     current_changed_ranges: tuple[tuple[int, int], ...] = ()
     reprocess_all_current_observations: bool = False
     reprocess_operation_id: str | None = None
-    work_strategy: Literal["auto", "structural"] = "auto"
-
-
-@dataclass(frozen=True, slots=True)
-class DiffGuidedExtractionBatch:
-    """One changed-range work item for a single textual Source Observation."""
-
-    id: str
-    source_unit_id: str
-    primary_observation_ids: tuple[str, ...]
-    changed_hunks: str
-    updated_document: str
-    kind: Literal["diff_guided"] = "diff_guided"
-
-
-@dataclass(frozen=True, slots=True)
-class StructuralExtractionBatch:
-    """One deterministic Markdown unit in full-document extraction."""
-
-    id: str
-    source_unit_id: str
-    primary_observation_ids: tuple[str, ...]
-    context: ExtractionContext
-    kind: Literal["structural_unit"] = "structural_unit"
-
-
-SourceDerivationBatch = ProjectionExtractionBatch | DiffGuidedExtractionBatch | StructuralExtractionBatch
-
-
 
 
 class SourceDerivationStore(DerivationWorkStore, Protocol):
@@ -284,27 +243,26 @@ class SourceDerivationStore(DerivationWorkStore, Protocol):
         reason_code: str | None = None,
     ) -> None: ...
 
-    async def supersede_incomplete_source_derivations_for_contract(
-        self,
-        *,
-        extraction_contract_version: str,
-        reason_code: str = CONTRACT_SUPERSEDED,
-    ) -> tuple[str, ...]: ...
 
 @dataclass(frozen=True, slots=True)
 class SourceUnitDerivationRequest:
     projection: SourceProjection
     context: SourceUnitDerivationContext
     extract_batch: Callable[
-        [SourceDerivationBatch],
+        [ProjectionExtractionBatch],
         Awaitable[MemoryExtractionResult],
     ]
     max_concurrent: int
-    extraction_contract_version: str = PROJECTION_EXTRACTION_CONTRACT_VERSION
     committed_base_snapshot: CommittedSourceUnitSnapshot | None = None
     access_context_hash: str | None = None
     inference_capability_hash: str | None = None
-    prepare_batches: Callable[[tuple[SourceDerivationBatch, ...]], Awaitable[tuple[SourceDerivationBatch, ...]]] | None = None
+    prepare_batches: (
+        Callable[
+            [tuple[ProjectionExtractionBatch, ...]],
+            Awaitable[tuple[ProjectionExtractionBatch, ...]],
+        ]
+        | None
+    ) = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,19 +275,9 @@ class SourceUnitDerivationResult:
 
 def _plan_source_unit_derivation_work(
     request: SourceUnitDerivationRequest,
-    *,
-    legacy_planner: Callable[
-        [SourceProjection, SourceUnitDerivationContext],
-        tuple[SourceDerivationBatch, ...],
-    ],
-) -> tuple[SourceDerivationBatch, ...] | ProjectionEvidencePlanningFailure:
-    """Select the active planner once for production and offline replay."""
+) -> tuple[ProjectionExtractionBatch, ...] | ProjectionEvidencePlanningFailure:
+    """Plan Evidence work once for production and offline replay."""
 
-    contract = projection_extraction_contract(
-        request.extraction_contract_version
-    )
-    if not contract.uses_fragment_catalog:
-        return legacy_planner(request.projection, request.context)
     if not request.access_context_hash or not request.inference_capability_hash:
         return ProjectionEvidencePlanningFailure(
             code=(
@@ -357,7 +305,6 @@ def _plan_source_unit_derivation_work(
         reprocess_all_current_observations=(
             request.context.reprocess_all_current_observations
         ),
-        extraction_contract_version=request.extraction_contract_version,
     )
 
 
@@ -383,11 +330,7 @@ def _planning_failure_extraction(
 
 def _authority_plan_identity(
     request: SourceUnitDerivationRequest,
-) -> Mapping[str, object] | None:
-    if not projection_extraction_contract(
-        request.extraction_contract_version
-    ).uses_fragment_catalog:
-        return None
+) -> Mapping[str, object]:
     delta = request.projection.deltas[0]
     transition = (
         "reprocess"
@@ -432,7 +375,7 @@ def _authority_plan_identity(
         "authority_policy_version": (
             PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION
         ),
-        "extraction_contract_version": request.extraction_contract_version,
+        "extraction_contract_version": PROJECTION_EXTRACTION_CONTRACT_VERSION,
         "reprocess_operation_id": request.context.reprocess_operation_id,
     }
 
@@ -455,16 +398,10 @@ class SourceUnitDeriver:
         self,
         store: SourceDerivationStore,
         *,
-        plan_work: Callable[
-            [SourceProjection, SourceUnitDerivationContext],
-            tuple[SourceDerivationBatch, ...],
-        ]
-        | None = None,
         runtime_event_trace_sink: RuntimeEventTraceSink | None = None,
         agent_assessment_sink: AgentAssessmentSink | None = None,
     ) -> None:
         self._store = store
-        self._plan_work = plan_work or plan_source_derivation_work
         self._runtime_event_trace_sink = runtime_event_trace_sink or NoOpRuntimeEventTraceSink()
         self._agent_assessment_sink = agent_assessment_sink or assessment_sink_for_runtime_sink(
             self._runtime_event_trace_sink
@@ -474,10 +411,7 @@ class SourceUnitDeriver:
         self,
         request: SourceUnitDerivationRequest,
     ) -> SourceUnitDerivationResult:
-        planned_work = _plan_source_unit_derivation_work(
-            request,
-            legacy_planner=self._plan_work,
-        )
+        planned_work = _plan_source_unit_derivation_work(request)
         authority_plan_identity = _authority_plan_identity(request)
         evidence_work_identity_hash = (
             None
@@ -494,7 +428,6 @@ class SourceUnitDeriver:
                 request.projection,
                 (),
                 context=request.context,
-                extraction_contract_version=request.extraction_contract_version,
                 terminal_reason_code=planned_work.code.value,
                 evidence_work_identity_hash=evidence_work_identity_hash,
                 authority_plan_identity=authority_plan_identity,
@@ -513,11 +446,7 @@ class SourceUnitDeriver:
                         outcome="failed",
                         reason_code=planned_work.code.value,
                         error_code=planned_work.code.value,
-                        operation=(
-                            str(authority_plan_identity["transition"])
-                            if authority_plan_identity is not None
-                            else None
-                        ),
+                        operation=str(authority_plan_identity["transition"]),
                         model_call_count=0,
                         mutation_count=0,
                         candidate_count=planned_work.authorized_structure_count,
@@ -537,7 +466,7 @@ class SourceUnitDeriver:
                 derivation_id=manifest.id,
                 batch_id="authority-planning",
                 batch_attempt=1,
-                extraction_contract_version=request.extraction_contract_version,
+                extraction_contract_version=PROJECTION_EXTRACTION_CONTRACT_VERSION,
                 base_unit_revision_id=manifest.base_unit_revision_id,
                 occurred_at=datetime.now().astimezone(),
                 deployment_revision=current_deployment_revision(),
@@ -567,7 +496,6 @@ class SourceUnitDeriver:
             request.projection,
             batches,
             context=request.context,
-            extraction_contract_version=request.extraction_contract_version,
             evidence_work_identity_hash=evidence_work_identity_hash,
             authority_plan_identity=authority_plan_identity,
             committed_base_unit_revision_id=(
@@ -581,28 +509,20 @@ class SourceUnitDeriver:
         pending_batches = tuple(batch for batch in batches if batch.id not in completed_results)
 
         async def extract_and_persist(
-            batch: SourceDerivationBatch,
+            batch: ProjectionExtractionBatch,
         ) -> MemoryExtractionResult:
             quality_signals = QualitySignalCollector()
-            try:
-                batch_record = next(record for record in derivation.batches if record.batch_id == batch.id)
-                with quality_signal_scope(quality_signals), failure_trace_context(
-                    source_id=request.projection.source_id, source_type=request.projection.source_type,
-                    doc_id=request.context.document.doc_id, source_unit_id=request.projection.source_unit_revisions[0].source_unit_id,
-                    target_unit_revision_id=request.projection.source_unit_revisions[0].id,
-                    projection_run_id=request.projection.run_id, derivation_id=derivation.id,
-                    batch_id=batch.id, batch_attempt=batch_record.attempt_count + 1,
-                    trace_id=runtime_trace_id(derivation_id=derivation.id, batch_id=batch.id,
-                        batch_attempt=batch_record.attempt_count + 1),
-                ):
-                    result = await request.extract_batch(batch)
-            except Exception as exc:
-                if not isinstance(batch, DiffGuidedExtractionBatch):
-                    raise
-                result = MemoryExtractionResult(
-                    error_type="diff_guided_extraction_error",
-                    metadata={"safe_error_code": type(exc).__name__},
-                )
+            batch_record = next(record for record in derivation.batches if record.batch_id == batch.id)
+            with quality_signal_scope(quality_signals), failure_trace_context(
+                source_id=request.projection.source_id, source_type=request.projection.source_type,
+                doc_id=request.context.document.doc_id, source_unit_id=request.projection.source_unit_revisions[0].source_unit_id,
+                target_unit_revision_id=request.projection.source_unit_revisions[0].id,
+                projection_run_id=request.projection.run_id, derivation_id=derivation.id,
+                batch_id=batch.id, batch_attempt=batch_record.attempt_count + 1,
+                trace_id=runtime_trace_id(derivation_id=derivation.id, batch_id=batch.id,
+                    batch_attempt=batch_record.attempt_count + 1),
+            ):
+                result = await request.extract_batch(batch)
             try:
                 quality_signals.record(
                     QualitySignal(
@@ -613,9 +533,6 @@ class SourceUnitDeriver:
                         ),
                         error_code=_safe_diagnostic_label(result.metadata.get("safe_error_code")),
                         candidate_count=len(result.memories),
-                        rejected_count=_safe_non_negative_int(
-                            result.metadata.get("invalid_evidence_block_count")
-                        ),
                     )
                 )
             except (TypeError, ValueError):
@@ -624,12 +541,6 @@ class SourceUnitDeriver:
                     derivation.id,
                     batch.id,
                 )
-            for sample in result.metadata.get(
-                "evidence_block_fallback_samples",
-                [],
-            ):
-                if isinstance(sample, dict):
-                    sample["source_derivation_batch_id"] = batch.id
             revision_by_observation = {
                 revision.observation_id: revision.id
                 for revision in request.projection.observation_revisions
@@ -701,49 +612,9 @@ class SourceUnitDeriver:
         )
         extraction.metadata = {
             **extraction.metadata,
-            "derivation_work_kinds": sorted({_derivation_batch_kind(batch) for batch in batches}),
             "reused_derivation_batch_count": len(completed_results),
             "executed_derivation_batch_count": len(pending_batches),
         }
-        if (
-            request.context.work_strategy == "auto"
-            and len(batches) == 1
-            and isinstance(batches[0], DiffGuidedExtractionBatch)
-            and extraction.error_type
-        ):
-            fallback = await self.derive(
-                replace(
-                    request,
-                    context=replace(
-                        request.context,
-                        work_strategy="structural",
-                    ),
-                )
-            )
-            fallback.extraction.metadata = {
-                **fallback.extraction.metadata,
-                "diff_guided_fallback": True,
-                "failed_diff_derivation_count": 1,
-            }
-            if not fallback.extraction.error_type:
-                await self._store.supersede_source_derivation(derivation.id)
-            return fallback
-        structural_batches = tuple(batch for batch in batches if isinstance(batch, StructuralExtractionBatch))
-        if structural_batches:
-            units = tuple(batch.context.unit for batch in structural_batches)
-            extraction.metadata.update(
-                {
-                    "unitized": True,
-                    "unit_count": len(units),
-                    "failed_unit_count": extraction.metadata.get(
-                        "failed_batch_count",
-                        0,
-                    ),
-                    "segmentation_version": units[0].segmentation_version,
-                    "partition_strategy": "recursive_fit_first",
-                    "max_unit_input_tokens": (UnitizationPolicy().max_unit_input_tokens),
-                }
-            )
         return SourceUnitDerivationResult(
             derivation=derivation,
             extraction=extraction,
@@ -762,10 +633,7 @@ async def replay_source_unit_derivation(
     events, or write Source/Memory lifecycle state.
     """
 
-    planned_work = _plan_source_unit_derivation_work(
-        request,
-        legacy_planner=plan_source_derivation_work,
-    )
+    planned_work = _plan_source_unit_derivation_work(request)
     if isinstance(planned_work, ProjectionEvidencePlanningFailure):
         return _planning_failure_extraction(
             planned_work,
@@ -783,44 +651,10 @@ async def replay_source_unit_derivation(
     )
     extraction.metadata = {
         **extraction.metadata,
-        "derivation_work_kinds": sorted({_derivation_batch_kind(batch) for batch in batches}),
         "reused_derivation_batch_count": 0,
         "executed_derivation_batch_count": len(batches),
         "offline_replay": True,
     }
-    if (
-        request.context.work_strategy == "auto"
-        and len(batches) == 1
-        and isinstance(batches[0], DiffGuidedExtractionBatch)
-        and extraction.error_type
-    ):
-        fallback = await replay_source_unit_derivation(
-            replace(
-                request,
-                context=replace(request.context, work_strategy="structural"),
-            )
-        )
-        fallback.metadata = {
-            **fallback.metadata,
-            "diff_guided_fallback": True,
-            "failed_diff_derivation_count": 1,
-        }
-        return fallback
-    structural_batches = tuple(
-        batch for batch in batches if isinstance(batch, StructuralExtractionBatch)
-    )
-    if structural_batches:
-        units = tuple(batch.context.unit for batch in structural_batches)
-        extraction.metadata.update(
-            {
-                "unitized": True,
-                "unit_count": len(units),
-                "failed_unit_count": extraction.metadata.get("failed_batch_count", 0),
-                "segmentation_version": units[0].segmentation_version,
-                "partition_strategy": "recursive_fit_first",
-                "max_unit_input_tokens": UnitizationPolicy().max_unit_input_tokens,
-            }
-        )
     return extraction
 
 
@@ -846,118 +680,11 @@ def _safe_model_identifier(value: object) -> str | None:
     return value
 
 
-def _safe_non_negative_int(value: object) -> int | None:
-    return value if isinstance(value, int) and value >= 0 else None
-
-
-def plan_source_derivation_work(
-    projection: SourceProjection,
-    context: SourceUnitDerivationContext,
-) -> tuple[SourceDerivationBatch, ...]:
-    """Plan provider-neutral extraction work for one immutable Source Unit."""
-
-    projection_batches = plan_projection_extraction_batches(
-        projection,
-        primary_observation_ids=(
-            tuple(observation.id for observation in projection.observations)
-            if context.reprocess_all_current_observations
-            else None
-        ),
-    )
-    if context.reprocess_all_current_observations:
-        return projection_batches
-    if len(projection.observations) != 1 or len(projection.observation_revisions) != 1:
-        return projection_batches
-
-    observation = projection.observations[0]
-    revision = projection.observation_revisions[0]
-    if (
-        revision.observation_id != observation.id
-        or observation.observation_type == "binary_artifact"
-        or not observation_is_inference_eligible(
-            observation.observation_type,
-            revision.metadata,
-        )
-    ):
-        return projection_batches
-
-    changed_observation_ids = {
-        anchor.observation_id for delta in projection.deltas for anchor in delta.changed_anchors
-    } | {observation_id for delta in projection.deltas for observation_id in delta.added_observation_ids}
-    if changed_observation_ids != {observation.id}:
-        return projection_batches
-
-    if (
-        context.work_strategy == "structural"
-        or context.update_mode != "diff_guided"
-        or not context.changed_hunks
-    ):
-        # Structural units are derived from the rendered Document view. They
-        # are valid selectable Evidence only when that complete view maps into
-        # the single immutable Observation authority. Conversational and
-        # issue renderers may add author, timestamp, or field labels that are
-        # intentionally absent from Observation content; those sources must
-        # use projection batches built directly from Observation revisions.
-        if not context.document_content or context.document_content not in revision.content:
-            return projection_batches
-        policy = UnitizationPolicy()
-        units = unitize_markdown(
-            context.document_content,
-            doc_id=context.document.doc_id,
-            policy=policy,
-        )
-        packer = ExtractionContextPacker(units)
-        target_revision_id = projection.source_unit_revisions[0].id
-        return tuple(
-            StructuralExtractionBatch(
-                id=(
-                    "ubatch-"
-                    + hashlib.sha256(
-                        (
-                            f"{SOURCE_DERIVATION_CONTRACT_VERSION}\x1f"
-                            f"{target_revision_id}\x1fstructural_unit\x1f"
-                            f"{unit.unit_id}\x1f{unit.content_fingerprint}"
-                        ).encode("utf-8")
-                    ).hexdigest()[:16]
-                ),
-                source_unit_id=projection.source_units[0].id,
-                primary_observation_ids=(observation.id,),
-                context=packer.pack(
-                    document_title=context.document.title,
-                    document_url=context.document.source_url,
-                    source_type=projection.source_type,
-                    unit=unit,
-                    entities=[],
-                ),
-            )
-            for unit in units
-        )
-
-    target_revision_id = projection.source_unit_revisions[0].id
-    digest = hashlib.sha256(
-        (
-            f"{SOURCE_DERIVATION_CONTRACT_VERSION}\x1f"
-            f"{target_revision_id}\x1fdiff_guided\x1f"
-            f"{hashlib.sha256(context.changed_hunks.encode('utf-8')).hexdigest()}"
-        ).encode("utf-8")
-    ).hexdigest()[:16]
-    return (
-        DiffGuidedExtractionBatch(
-            id=f"dbatch-{digest}",
-            source_unit_id=projection.source_units[0].id,
-            primary_observation_ids=(observation.id,),
-            changed_hunks=context.changed_hunks,
-            updated_document=context.document_content,
-        ),
-    )
-
-
 def source_derivation_manifest(
     projection: SourceProjection,
-    batches: tuple[SourceDerivationBatch, ...],
+    batches: tuple[ProjectionExtractionBatch, ...],
     *,
     context: SourceUnitDerivationContext,
-    extraction_contract_version: str = SOURCE_DERIVATION_CONTRACT_VERSION,
     terminal_reason_code: str | None = None,
     evidence_work_identity_hash: str | None = None,
     authority_plan_identity: Mapping[str, object] | None = None,
@@ -990,7 +717,6 @@ def source_derivation_manifest(
             batch_id=batch.id,
             input_payload_hash=_batch_input_payload_hash(
                 target_revision_id=target_revision_id,
-                extraction_contract_version=extraction_contract_version,
                 batch=batch,
                 evidence_work_identity_hash=evidence_work_identity_hash,
             ),
@@ -1005,7 +731,7 @@ def source_derivation_manifest(
         "target_unit_revision_id": target_revision_id,
         "projection_identity_hash": projection_identity_hash,
         "context_identity_hash": context_identity_hash,
-        "extraction_contract_version": extraction_contract_version,
+        "extraction_contract_version": PROJECTION_EXTRACTION_CONTRACT_VERSION,
         "batch_input_hashes": [item.input_payload_hash for item in manifest_batches],
         "terminal_reason_code": terminal_reason_code,
         "evidence_work_identity_hash": evidence_work_identity_hash,
@@ -1024,7 +750,7 @@ def source_derivation_manifest(
         context_payload=context_payload,
         context_payload_hash=context_payload_hash,
         context_identity_hash=context_identity_hash,
-        extraction_contract_version=extraction_contract_version,
+        extraction_contract_version=PROJECTION_EXTRACTION_CONTRACT_VERSION,
         batches=manifest_batches,
         terminal_reason_code=terminal_reason_code,
         authority_plan_identity=authority_plan_identity,
@@ -1051,7 +777,6 @@ def source_unit_derivation_context_to_payload(
             context.reprocess_all_current_observations
         ),
         "reprocess_operation_id": context.reprocess_operation_id,
-        "work_strategy": context.work_strategy,
     }
 
 
@@ -1172,11 +897,6 @@ def source_unit_derivation_context_from_payload(
         reprocess_operation_id=_optional_string(
             payload.get("reprocess_operation_id")
         ),
-        work_strategy=(
-            "structural"
-            if payload.get("work_strategy") == "structural"
-            else "auto"
-        ),
     )
 
 
@@ -1223,9 +943,6 @@ def memory_extraction_result_from_output_payload(
                 valid_until=_optional_string(value.get("valid_until")),
                 extraction_context=_optional_string(value.get("extraction_context")),
                 evidence_quote=_optional_string(value.get("evidence_quote")),
-                evidence_resolved_from_block=(
-                    value.get("evidence_resolved_from_block") is True
-                ),
                 evidence_range_start=_optional_int(value.get("evidence_range_start")),
                 evidence_range_end=_optional_int(value.get("evidence_range_end")),
                 evidence_anchor=_optional_string(value.get("evidence_anchor")),
@@ -1327,40 +1044,12 @@ def _evidence_work_identity_hash(
 def _batch_input_payload_hash(
     *,
     target_revision_id: str,
-    extraction_contract_version: str,
-    batch: SourceDerivationBatch,
+    batch: ProjectionExtractionBatch,
     evidence_work_identity_hash: str | None = None,
 ) -> str:
-    if isinstance(batch, DiffGuidedExtractionBatch):
-        payload = {
-            "target_unit_revision_id": target_revision_id,
-            "extraction_contract_version": extraction_contract_version,
-            "evidence_work_identity_hash": evidence_work_identity_hash,
-            "batch_id": batch.id,
-            "work_kind": batch.kind,
-            "primary_observation_ids": list(batch.primary_observation_ids),
-            "changed_hunks_sha256": hashlib.sha256(batch.changed_hunks.encode("utf-8")).hexdigest(),
-            "updated_document_sha256": hashlib.sha256(batch.updated_document.encode("utf-8")).hexdigest(),
-        }
-        return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
-    if isinstance(batch, StructuralExtractionBatch):
-        unit = batch.context.unit
-        payload = {
-            "target_unit_revision_id": target_revision_id,
-            "extraction_contract_version": extraction_contract_version,
-            "evidence_work_identity_hash": evidence_work_identity_hash,
-            "batch_id": batch.id,
-            "work_kind": batch.kind,
-            "primary_observation_ids": list(batch.primary_observation_ids),
-            "unit_id": unit.unit_id,
-            "unit_content_sha256": hashlib.sha256(unit.unit_markdown.encode("utf-8")).hexdigest(),
-            "heading_path": list(unit.heading_path),
-            "segmentation_version": unit.segmentation_version,
-        }
-        return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
     payload = {
         "target_unit_revision_id": target_revision_id,
-        "extraction_contract_version": extraction_contract_version,
+        "extraction_contract_version": PROJECTION_EXTRACTION_CONTRACT_VERSION,
         "evidence_work_identity_hash": evidence_work_identity_hash,
         "batch_id": batch.id,
         "prepared_catalog_digest": batch.prepared_catalog.digest if batch.prepared_catalog else None,
@@ -1368,7 +1057,7 @@ def _batch_input_payload_hash(
         "prepared_input_mode": batch.prepared_input_mode,
         "prepared_selection_reason": batch.prepared_selection_reason,
         "prepared_estimated_cost": dict(batch.prepared_estimated_cost or {}),
-        "authority_policy_version": batch.authority_policy_version,
+        "authority_policy_version": PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION,
         "primary_observation_ids": list(batch.primary_observation_ids),
         "primary_authority_spans": [
             {
@@ -1388,22 +1077,11 @@ def _batch_input_payload_hash(
             else batch.candidate_context_observation_ids
         ),
         "candidate_context_image_bytes": batch.candidate_context_image_bytes,
-    }
-    if projection_extraction_contract(
-        extraction_contract_version
-    ).uses_fragment_catalog:
-        payload["model_presentation_policy_version"] = (
+        "model_presentation_policy_version": (
             PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION
-        )
+        ),
+    }
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
-
-
-def _derivation_batch_kind(batch: SourceDerivationBatch) -> str:
-    if isinstance(batch, DiffGuidedExtractionBatch):
-        return batch.kind
-    if isinstance(batch, StructuralExtractionBatch):
-        return batch.kind
-    return "projection_batch"
 
 
 def _raw_memory_payload(memory: RawMemory) -> dict[str, object]:
@@ -1416,9 +1094,6 @@ def _raw_memory_payload(memory: RawMemory) -> dict[str, object]:
         "valid_until": memory.valid_until,
         "extraction_context": memory.extraction_context,
         "evidence_quote": memory.evidence_quote,
-        # evidence_block_id is deliberately absent: batch-local addresses are
-        # resolved to exact source excerpts before durable output is staged.
-        "evidence_resolved_from_block": memory.evidence_resolved_from_block,
         "evidence_range_start": memory.evidence_range_start,
         "evidence_range_end": memory.evidence_range_end,
         "evidence_anchor": memory.evidence_anchor,
@@ -1559,8 +1234,6 @@ def _derivation_context_identity_payload(
     document = context_payload.get("document")
     if not isinstance(document, Mapping):
         raise ValueError("Source derivation context has no Document snapshot")
-    # work_strategy is an operational fallback choice. Batch input hashes
-    # distinguish its manifest without changing the lifecycle context identity.
     return {
         "doc_id": document.get("doc_id"),
         "source": document.get("source"),
@@ -1696,31 +1369,12 @@ def aggregate_extraction_metrics(
         ),
         default=0,
     )
-    refinement_counts: dict[str, int] = {}
-    fallback_samples: list[dict[str, object]] = []
-    fallback_sample_truncated_count = 0
     selector_normalization_present = False
     selector_normalized_candidate_count = 0
     selector_normalization_count = 0
     selector_normalization_fingerprints: list[str] = []
     for result in results:
         telemetry = _safe_evidence_telemetry(result.metadata)
-        for refinement, count in telemetry.get(
-            "evidence_refinement_counts",
-            {},
-        ).items():
-            refinement_counts[refinement] = refinement_counts.get(refinement, 0) + count
-        for sample in telemetry.get("evidence_block_fallback_samples", []):
-            if len(fallback_samples) < _EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT:
-                fallback_samples.append(sample)
-            else:
-                fallback_sample_truncated_count += 1
-        fallback_sample_truncated_count += int(
-            telemetry.get(
-                "evidence_block_fallback_sample_truncated_count",
-                0,
-            )
-        )
         if "selector_normalization_count" in telemetry:
             selector_normalization_present = True
             selector_normalized_candidate_count += int(
@@ -1737,15 +1391,6 @@ def aggregate_extraction_metrics(
                     < _SELECTOR_NORMALIZATION_FINGERPRINT_LIMIT
                 ):
                     selector_normalization_fingerprints.append(fingerprint)
-    aggregated["evidence_refinement_counts"] = refinement_counts
-    aggregated["evidence_block_fallback_samples"] = fallback_samples
-    aggregated["evidence_block_fallback_sample_truncated_count"] = (
-        fallback_sample_truncated_count
-    )
-    aggregated["invalid_evidence_block_count"] = sum(
-        int((result.metadata or {}).get("invalid_evidence_block_count", 0) or 0)
-        for result in results
-    )
     if selector_normalization_present:
         aggregated.update(
             {
@@ -1766,41 +1411,6 @@ def _safe_evidence_telemetry(value: object) -> dict[str, object]:
 
     if not isinstance(value, Mapping):
         return {}
-    raw_counts = value.get("evidence_refinement_counts")
-    counts = (
-        {
-            str(name): max(0, int(count))
-            for name, count in raw_counts.items()
-            if isinstance(name, str) and isinstance(count, int)
-        }
-        if isinstance(raw_counts, Mapping)
-        else {}
-    )
-    raw_samples = value.get("evidence_block_fallback_samples")
-    samples: list[dict[str, object]] = []
-    if isinstance(raw_samples, list):
-        for sample in raw_samples[:_EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT]:
-            if not isinstance(sample, Mapping):
-                continue
-            samples.append(
-                {
-                    key: sample.get(key)
-                    for key in (
-                        "candidate_content_sha256",
-                        "source_derivation_batch_id",
-                        "source_observation_id",
-                        "source_observation_revision_id",
-                        "evidence_range_start",
-                        "evidence_range_end",
-                        "block_text_sha256",
-                        "block_chars",
-                        "submitted_quote_sha256",
-                        "submitted_quote_chars",
-                        "extraction_model",
-                        "prompt_sha256",
-                    )
-                }
-            )
     raw_normalization_fingerprints = value.get(
         "selector_normalization_fingerprints"
     )
@@ -1814,24 +1424,7 @@ def _safe_evidence_telemetry(value: object) -> dict[str, object]:
         if isinstance(fingerprint, str)
         and re.fullmatch(r"[0-9a-f]{64}", fingerprint) is not None
     ][:_SELECTOR_NORMALIZATION_FINGERPRINT_LIMIT]
-    telemetry = {
-        "evidence_refinement_counts": counts,
-        "evidence_block_fallback_samples": samples,
-        "evidence_block_fallback_sample_truncated_count": max(
-            0,
-            int(
-                value.get(
-                    "evidence_block_fallback_sample_truncated_count",
-                    0,
-                )
-                or 0
-            ),
-        ),
-        "invalid_evidence_block_count": max(
-            0,
-            int(value.get("invalid_evidence_block_count", 0) or 0),
-        ),
-    }
+    telemetry: dict[str, object] = {}
     if any(
         key in value
         for key in (

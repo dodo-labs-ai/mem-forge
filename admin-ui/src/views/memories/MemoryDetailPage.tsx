@@ -252,7 +252,6 @@ function EvidenceGroupCard({ group }: { group: MemoryEvidenceGroup }) {
         <Badge variant="outline">
           {group.kind === "evidence_unit" ? "Evidence Unit" : "Document Evidence"}
         </Badge>
-        {group.legacy_limited && <Badge variant="outline">Legacy limited</Badge>}
         {!group.current && <Badge variant="outline">Historical</Badge>}
         <span className="text-sm font-medium text-foreground">
           {document?.title ?? document?.doc_id ?? group.doc_id ?? group.source_id}

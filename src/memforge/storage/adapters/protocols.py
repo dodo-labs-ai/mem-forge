@@ -23,26 +23,20 @@ from memforge.models import (
     MemorySource,
     MemorySourceRef,
     Project,
-    SourceLifecycleResetResult,
 )
 from memforge.memory.evidence import (
     ActiveSupportEvidence,
     CandidateMemory,
     EvidenceReference,
     EvidenceUnit,
-    MemorySupportAssertion,
+    EVIDENCE_UNIT_SUPPORT_SCOPE,
     MemoryEvidenceUnitProjection,
     MemoryUnitSupportAssertion,
-    SupportScopeVersion,
     RelationOutcomeBundle,
 )
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.cross_document_relation import CrossDocumentRelationOutcome, CurrentCrossDocumentRelation
 from memforge.memory.lifecycle_plan import (
-    LegacyMemoryProvenance,
-    LifecycleCutoverFinding,
-    LifecycleBackfillJob,
-    CutoverFindingStatus,
     LifecycleGate,
     LifecyclePlan,
     LifecycleReview,
@@ -64,7 +58,7 @@ from memforge.source_projection import (
     SourceUnitInventoryPage,
     SourceUnitRevision,
 )
-from memforge.source_artifacts import SourceArtifactEvidence, SourceArtifactRevision
+from memforge.source_artifacts import SourceArtifactRevision
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.query_plan import MetadataLexicalQueryPlan
 from memforge.source_activity import SourceActivityLease
@@ -114,43 +108,13 @@ class RecentMemoryPage:
 
 @dataclass(frozen=True, slots=True)
 class ActiveMemorySupportState:
-    """All active assertions plus the current-revision subset."""
+    """Active Evidence Unit Support plus the current-revision subset."""
 
-    reference_ids: tuple[str, ...]
+    unit_ids: tuple[str, ...]
     support_set_hash: str
-    current_reference_ids: tuple[str, ...]
+    current_unit_ids: tuple[str, ...]
     current_support_set_hash: str
     source_ids: tuple[str, ...] = ()
-    unit_ids: tuple[str, ...] = ()
-    current_unit_ids: tuple[str, ...] = ()
-    support_scope_version: SupportScopeVersion = SupportScopeVersion.REFERENCE_SET_V1
-
-    @property
-    def support_ids(self) -> tuple[str, ...]:
-        return (
-            self.unit_ids
-            if self.support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-            else self.reference_ids
-        )
-
-    @property
-    def current_support_ids(self) -> tuple[str, ...]:
-        return (
-            self.current_unit_ids
-            if self.support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-            else self.current_reference_ids
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class ActiveMemorySupportRow:
-    """Canonical current-revision support row shared by every adapter."""
-
-    memory_id: str
-    evidence_reference_id: str
-    source_id: str
-    access_context_hash: str
-    is_current: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,49 +126,6 @@ class ActiveMemoryUnitSupportRow:
     access_context_hash: str
     part_set_digest: str
     is_current: bool
-
-
-def build_active_memory_support_states(
-    memory_ids: Sequence[str],
-    rows: Sequence[ActiveMemorySupportRow],
-) -> Mapping[str, ActiveMemorySupportState]:
-    """Build explicit empty states and one canonical support hash per Memory."""
-
-    ids = tuple(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
-    grouped: dict[str, list[tuple[str, str, str]]] = {memory_id: [] for memory_id in ids}
-    current_grouped: dict[str, list[tuple[str, str, str]]] = {memory_id: [] for memory_id in ids}
-    for row in sorted(
-        rows,
-        key=lambda item: (
-            item.memory_id,
-            item.evidence_reference_id,
-            item.source_id,
-            item.access_context_hash,
-        ),
-    ):
-        if row.memory_id in grouped:
-            value = (row.evidence_reference_id, row.source_id, row.access_context_hash)
-            grouped[row.memory_id].append(value)
-            if row.is_current:
-                current_grouped[row.memory_id].append(value)
-    return {
-        memory_id: ActiveMemorySupportState(
-            reference_ids=tuple(reference_id for reference_id, _source_id, _access_hash in state_rows),
-            support_set_hash=active_support_rows_hash(state_rows),
-            current_reference_ids=tuple(
-                reference_id for reference_id, _source_id, _access_hash in current_grouped[memory_id]
-            ),
-            current_support_set_hash=active_support_rows_hash(current_grouped[memory_id]),
-            source_ids=tuple(dict.fromkeys(source_id for _reference_id, source_id, _access_hash in state_rows)),
-        )
-        for memory_id, state_rows in grouped.items()
-    }
-
-
-def active_support_rows_hash(rows: Sequence[tuple[str, str, str]]) -> str:
-    """Hash canonical current Evidence support without adapter-specific drift."""
-
-    return hashlib.sha256(json.dumps(list(rows), separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def build_active_memory_unit_support_states(
@@ -245,26 +166,23 @@ def build_active_memory_unit_support_states(
     def digest(values: Sequence[tuple[str, str, str, str, str]]) -> str:
         return hashlib.sha256(
             json.dumps(
-                [SupportScopeVersion.EVIDENCE_UNIT_SET_V2.value, list(values)],
+                [EVIDENCE_UNIT_SUPPORT_SCOPE, list(values)],
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
 
     return {
         memory_id: ActiveMemorySupportState(
-            reference_ids=(),
-            support_set_hash=digest(values),
-            current_reference_ids=(),
-            current_support_set_hash=digest(current_grouped[memory_id]),
-            source_ids=tuple(
-                dict.fromkeys(source_id for _sid, _uid, source_id, _access, _part in values)
-            ),
             unit_ids=tuple(unit_id for _sid, unit_id, _source, _access, _part in values),
+            support_set_hash=digest(values),
             current_unit_ids=tuple(
                 unit_id
                 for _sid, unit_id, _source, _access, _part in current_grouped[memory_id]
             ),
-            support_scope_version=SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
+            current_support_set_hash=digest(current_grouped[memory_id]),
+            source_ids=tuple(
+                dict.fromkeys(source_id for _sid, _uid, source_id, _access, _part in values)
+            ),
         )
         for memory_id, values in grouped.items()
     }
@@ -453,22 +371,6 @@ class RelationalStore(Protocol):
         excluded_doc_id: str | None = None,
         limit: int,
     ) -> list[Memory]: ...
-    async def find_rebaseline_reactivation_candidate(
-        self,
-        content_hash: str,
-        *,
-        visibility: str,
-        owner_user_id: str | None,
-        repo_identifier: str | None,
-    ) -> Memory | None: ...
-    async def find_rebaseline_reactivation_candidates(
-        self,
-        content_hashes: Sequence[str],
-        *,
-        visibility: str,
-        owner_user_id: str | None,
-        repo_identifier: str | None,
-    ) -> list[Memory]: ...
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]: ...
     async def upsert_document(
         self,
@@ -484,12 +386,6 @@ class RelationalStore(Protocol):
         *,
         source_activity: SourceActivityLease | None = None,
     ) -> None: ...
-    async def rebaseline_source_lifecycle(
-        self,
-        source_id: str,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> SourceLifecycleResetResult: ...
     async def rebind_projected_document_support(
         self,
         old_doc_id: str,
@@ -524,10 +420,6 @@ class RelationalStore(Protocol):
         self,
         observation_revision_id: str,
     ) -> SourceArtifactRevision | None: ...
-    async def get_memory_source_artifacts(
-        self,
-        memory_id: str,
-    ) -> tuple[SourceArtifactEvidence, ...]: ...
     async def get_memory_evidence_units(
         self,
         memory_id: str,
@@ -594,11 +486,6 @@ class RelationalStore(Protocol):
         coverage: ProjectionCoverage,
         error: str,
     ) -> ProjectionScopeTransition: ...
-    async def list_legacy_memory_provenance(
-        self,
-        source_id: str,
-    ) -> list[LegacyMemoryProvenance]: ...
-    async def count_active_source_memories(self, source_id: str) -> int: ...
     async def count_active_source_memories_without_support(self, source_id: str) -> int: ...
     async def count_active_supported_memories_without_source_provenance(
         self,
@@ -611,55 +498,6 @@ class RelationalStore(Protocol):
         *,
         source_activity: SourceActivityLease | None = None,
     ) -> LifecycleGate: ...
-    async def gate_destructive_lifecycle(
-        self,
-        source_id: str,
-        *,
-        reason: str,
-        source_activity: SourceActivityLease | None = None,
-    ) -> LifecycleGate: ...
-    async def upsert_lifecycle_cutover_finding(
-        self,
-        finding: LifecycleCutoverFinding,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> None: ...
-    async def get_lifecycle_cutover_finding(
-        self,
-        finding_id: str,
-    ) -> LifecycleCutoverFinding | None: ...
-    async def list_lifecycle_cutover_findings(
-        self,
-        source_id: str,
-        *,
-        status: CutoverFindingStatus | None = None,
-    ) -> list[LifecycleCutoverFinding]: ...
-    async def create_lifecycle_backfill_job(
-        self,
-        job: LifecycleBackfillJob,
-    ) -> LifecycleBackfillJob: ...
-    async def create_source_rebaseline_job(
-        self,
-        job: LifecycleBackfillJob,
-    ) -> LifecycleBackfillJob: ...
-    async def start_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob: ...
-    async def complete_lifecycle_backfill_job(
-        self,
-        job_id: str,
-        *,
-        scanned_memories: int,
-        mapped_memories: int,
-        finding_count: int,
-    ) -> LifecycleBackfillJob: ...
-    async def fail_lifecycle_backfill_job(
-        self,
-        job_id: str,
-        *,
-        error: str,
-        scanned_memories: int = 0,
-        mapped_memories: int = 0,
-        finding_count: int = 0,
-    ) -> LifecycleBackfillJob: ...
     async def renew_source_activity(
         self,
         *,
@@ -667,45 +505,6 @@ class RelationalStore(Protocol):
         capability: str | None = None,
         lease_seconds: int = 900,
     ) -> SourceActivityLease: ...
-    async def recover_stale_lifecycle_backfill_job(
-        self,
-        job_id: str,
-        *,
-        error: str,
-    ) -> LifecycleBackfillJob: ...
-    async def list_stale_lifecycle_backfill_job_ids(
-        self,
-        *,
-        limit: int = 100,
-    ) -> tuple[str, ...]: ...
-    async def get_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob | None: ...
-    async def get_active_lifecycle_backfill_job(
-        self,
-        source_id: str,
-    ) -> LifecycleBackfillJob | None: ...
-    async def list_lifecycle_backfill_jobs(
-        self,
-        source_id: str,
-        *,
-        limit: int = 20,
-    ) -> list[LifecycleBackfillJob]: ...
-    async def resolve_lifecycle_cutover_finding(
-        self,
-        finding_id: str,
-        *,
-        observation_id: str,
-        source_unit_id: str,
-        source_activity: SourceActivityLease | None = None,
-    ) -> LifecycleCutoverFinding: ...
-    async def retire_unprovable_lifecycle_cutover_finding(
-        self,
-        finding_id: str,
-        *,
-        source_id: str,
-        reconstruction_attempt_id: str,
-        operator_id: str,
-        unavailable_documents: Mapping[str, str],
-    ) -> LifecycleCutoverFinding: ...
     async def record_evidence_references(
         self,
         evidence_unit_id: str,
@@ -719,39 +518,18 @@ class RelationalStore(Protocol):
         references: Sequence[EvidenceReference],
     ) -> tuple[EvidenceReference, ...]: ...
     async def get_evidence_unit(self, evidence_unit_id: str) -> EvidenceUnit | None: ...
-    async def upsert_memory_support_assertion(
-        self,
-        assertion: MemorySupportAssertion,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> None: ...
     async def upsert_memory_unit_support_assertion(
         self,
         assertion: MemoryUnitSupportAssertion,
         *,
         source_activity: SourceActivityLease | None = None,
     ) -> None: ...
-    async def get_support_scope_version(self) -> SupportScopeVersion: ...
-    async def report_support_scope_cutover(self): ...
-    async def apply_support_scope_v2_cutover(
-        self,
-        *,
-        expected_report_id: str,
-        owner_id: str,
-    ): ...
     async def get_memory_support_set_hash(self, memory_id: str) -> str: ...
-    async def get_active_memory_support_reference_ids(self, memory_id: str) -> tuple[str, ...]: ...
     async def get_active_memory_support_unit_ids(self, memory_id: str) -> tuple[str, ...]: ...
     async def get_active_memory_support_states(
         self,
         memory_ids: Sequence[str],
     ) -> Mapping[str, ActiveMemorySupportState]: ...
-    async def get_active_memory_support_evidence(
-        self,
-        memory_id: str,
-        *,
-        source_id: str | None = None,
-    ) -> tuple[ActiveSupportEvidence, ...]: ...
     async def get_active_memory_support_evidence_many(
         self,
         memory_ids: Sequence[str],
@@ -766,10 +544,6 @@ class RelationalStore(Protocol):
         memory_ids: Sequence[str],
         *,
         source_id: str,
-    ) -> Mapping[str, tuple[str, ...]]: ...
-    async def get_source_unit_support_reference_ids(
-        self,
-        source_unit_id: str,
     ) -> Mapping[str, tuple[str, ...]]: ...
     async def get_source_unit_support_unit_ids(
         self,
@@ -991,14 +765,6 @@ class RelationalStore(Protocol):
         support_kind: str = "extracted",
         source_updated_at: datetime | None,
     ) -> None: ...
-    async def remove_memory_source(
-        self,
-        memory_id: str,
-        doc_id: str,
-        *,
-        source_id: str,
-        retire_reason: str = "source_deleted",
-    ) -> bool: ...
     async def promote_to_workspace(
         self,
         memory_id: str,

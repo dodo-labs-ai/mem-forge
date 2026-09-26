@@ -27,6 +27,7 @@ from memforge.models import MemoryExtractionResult, RawMemory
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.storage.adapters.context import AccessScope
 from memforge.storage.database import Database
+from tests.llm_fixture import NoopMemoryExtractor
 
 
 U1_USER = "u-1"
@@ -72,10 +73,12 @@ class _StubDocumentStore:
         return f"file:///tmp/{source_id}/{doc_id}/{title}.md"
 
 
-class _SingleMemoryExtractor:
-    """Yields one RawMemory so the orchestrator reaches projected lifecycle."""
+class _SingleMemoryExtractor(NoopMemoryExtractor):
+    """Selects one Fragment claim so the orchestrator reaches projected lifecycle."""
 
-    async def extract_memories(self, **kwargs):
+    async def extract_projection_fragment_memories(self, catalog, **kwargs):
+        del kwargs
+        primary = next(fragment for fragment in catalog.fragments if fragment.primary_eligible)
         return MemoryExtractionResult(
             memories=[
                 RawMemory(
@@ -83,30 +86,10 @@ class _SingleMemoryExtractor:
                     content="durable design fact",
                     entity_refs=[],
                     confidence=0.9,
-                )
-            ],
-        )
-
-    async def extract_memory_changes(self, **kwargs):
-        return MemoryExtractionResult(
-            memories=[
-                RawMemory(
-                    memory_type="fact",
-                    content="durable design fact",
-                    entity_refs=[],
-                    confidence=0.9,
-                )
-            ],
-        )
-
-    async def extract_unit_memories(self, context, **kwargs):
-        return MemoryExtractionResult(
-            memories=[
-                RawMemory(
-                    memory_type="fact",
-                    content="durable design fact",
-                    entity_refs=[],
-                    confidence=0.9,
+                    source_observation_id=primary.anchor.observation_id,
+                    resolved_evidence_selection=catalog.resolve_selection(
+                        primary_ref=primary.reference,
+                    ),
                 )
             ],
         )

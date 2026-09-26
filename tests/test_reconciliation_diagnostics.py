@@ -51,7 +51,7 @@ async def test_mandatory_provider_failure_preserves_support_and_revision_without
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
     await db.enable_lifecycle_gate("src-1")
-    support_before = await db.get_active_memory_support_reference_ids(incumbent.id)
+    support_before = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _projection(
         run_id="diagnostics-after",
         body="A7 is retained.",
@@ -87,7 +87,7 @@ async def test_mandatory_provider_failure_preserves_support_and_revision_without
     assert event.error_code == "TimeoutError"
     assert event.terminal_category == "provider_error"
     assert "private provider response" not in str(caught.value)
-    assert await db.get_active_memory_support_reference_ids(incumbent.id) == support_before
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == support_before
     current = await db.get_current_source_unit_revision(first.source_units[0].id)
     assert current.id == first.source_unit_revisions[0].id
     assert (await db.db.execute_fetchall("SELECT COUNT(*) FROM lifecycle_plans"))[0][0] == 0

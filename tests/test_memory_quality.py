@@ -373,41 +373,6 @@ def test_classifier_keeps_useful_memory_with_link_list_context():
 
 
 @pytest.mark.asyncio
-async def test_store_document_delete_cleans_indexes_for_last_corroborated_source(db: Database):
-    doc = await _insert_document(db, doc_id="doc-support")
-    memory = await _insert_memory(
-        db,
-        mem_id="mem-corrob-last",
-        content="A corroborated source can be the last valid source support.",
-    )
-    await db.add_memory_source(
-        memory.id,
-        doc.doc_id,
-        "jira",
-        excerpt="A corroborated source can be the last valid source support.",
-        support_kind="corroborated",
-        source_updated_at=None,
-    )
-    collection = FakeCollection()
-    adapters = build_sqlite_adapters(db, collection)
-    store = MemoryStore(
-        relational=adapters.relational,
-        keyword=adapters.keyword,
-        vector=adapters.vector,
-        embed_cfg={},
-    )
-
-    retired_ids = await store.delete_document(doc.doc_id)
-
-    stored = await db.get_memory(memory.id)
-    assert retired_ids == [memory.id]
-    assert stored.status == "retired"
-    assert stored.corroboration_count == 0
-    assert await _fts_has_memory(db, memory.id) is False
-    assert collection.deleted == [memory.id]
-
-
-@pytest.mark.asyncio
 async def test_store_source_cascade_cleans_indexes_for_retired_memories(db: Database):
     doc = await _insert_document(db, doc_id="doc-source-delete")
     memory = await _insert_memory(
@@ -508,7 +473,7 @@ async def test_memory_detail_represents_unprojected_legacy_provenance_without_re
     assert "evidence_artifacts" not in payload
     [group] = payload["evidence"]
     assert group["kind"] == "document"
-    assert group["legacy_limited"] is True
+    assert "legacy_limited" not in group
     assert group["evidence_unit_id"] is None
     assert group["source_unit_id"] is None
     [item] = group["items"]
@@ -692,9 +657,9 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     )
     await db.db.execute(
         """INSERT INTO evidence_units
-           (id, source_id, doc_id, source_type, visibility, content, excerpt,
+           (id, source_id, doc_id, source_type, source_lineage_id, visibility, content, excerpt,
             evidence_provenance, access_context_hash, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'workspace', ?, NULL, 'extracted', ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, 'unit-image', 'workspace', ?, NULL, 'extracted', ?, ?, ?)""",
         (
             "evidence-image",
             "src-confluence",
@@ -735,25 +700,11 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
         (now, now),
     )
     await db.db.execute(
-        """INSERT INTO memory_support_assertions
-           (id, memory_id, evidence_reference_id, source_id, access_context_hash,
+        """INSERT INTO memory_unit_support_assertions
+           (id, memory_id, evidence_unit_id, source_id, access_context_hash,
             active, created_at)
            VALUES (?, ?, ?, ?, ?, 1, ?)""",
-        ("support-image", memory.id, "eref-primary", "src-confluence", "access-hash", now),
-    )
-    await db.db.execute(
-        """INSERT INTO memory_support_assertions
-           (id, memory_id, evidence_reference_id, source_id, access_context_hash,
-            active, created_at)
-           VALUES (?, ?, ?, ?, ?, 1, ?)""",
-        (
-            "support-image-required",
-            memory.id,
-            "eref-required",
-            "src-confluence",
-            "access-hash",
-            now,
-        ),
+        ("support-image", memory.id, "evidence-image", "src-confluence", "access-hash", now),
     )
     await db.db.commit()
 
@@ -1111,6 +1062,10 @@ async def test_delete_source_uses_injected_document_store(
         raw_content_uri=None,
         normalized_content_uri="mem://doc.md",
     )
+    await db.enqueue_source_artifact_cleanup_task(
+        source_id="src-confluence",
+        artifact_uri="mem://doc.md",
+    )
 
     store = RecordingDocumentStore()
     app = create_admin_app(db=db, config=_config(tmp_path), document_store=store)
@@ -1192,6 +1147,10 @@ async def test_delete_source_succeeds_and_retains_cleanup_task_when_artifact_del
         raw_content_uri=None,
         normalized_content_uri="object-store://workspace/documents/src-cleanup-failure/page.md",
     )
+    await db.enqueue_source_artifact_cleanup_task(
+        source_id="src-cleanup-failure",
+        artifact_uri="object-store://workspace/documents/src-cleanup-failure/page.md",
+    )
 
     app = create_admin_app(
         db=db,
@@ -1203,7 +1162,8 @@ async def test_delete_source_succeeds_and_retains_cleanup_task_when_artifact_del
 
     tasks = await db.list_source_artifact_cleanup_tasks(limit=10)
     assert response.status_code == 200, response.text
-    assert await db.get_source("src-cleanup-failure") is None
+    retired_source = await db.get_source("src-cleanup-failure")
+    assert retired_source is not None and retired_source["status"] == "retired"
     assert [(task.attempt_count, task.last_error) for task in tasks] == [(1, "object store unavailable")]
 
 

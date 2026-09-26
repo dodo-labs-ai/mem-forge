@@ -24,17 +24,11 @@ from memforge.memory.evidence import (
     CandidateMemory,
     EvidenceReference,
     EvidenceUnit,
-    MemorySupportAssertion,
     MemoryEvidenceUnitProjection,
     MemoryUnitSupportAssertion,
-    SupportScopeVersion,
     RelationOutcomeBundle,
 )
 from memforge.memory.lifecycle_plan import (
-    LegacyMemoryProvenance,
-    LifecycleCutoverFinding,
-    LifecycleBackfillJob,
-    CutoverFindingStatus,
     LifecycleGate,
     LifecyclePlan,
     LifecycleReview,
@@ -52,14 +46,13 @@ from memforge.models import (
     MemorySource,
     MemorySourceRef,
     Project,
-    SourceLifecycleResetResult,
     Visibility,
     canonicalize_entity_name,
 )
 from memforge.retrieval.access_predicate import visible_sql
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.source_activity import SourceActivityLease
-from memforge.source_artifacts import SourceArtifactEvidence, SourceArtifactRevision
+from memforge.source_artifacts import SourceArtifactRevision
 from memforge.source_projection import (
     SourceObservationRevision,
     SourceProjection,
@@ -598,36 +591,6 @@ class SqliteRelationalStore:
         )
         return await self._db.list_active_ordinary_claim_memories([str(row["id"]) for row in rows])
 
-    async def find_rebaseline_reactivation_candidate(
-        self,
-        content_hash: str,
-        *,
-        visibility: str,
-        owner_user_id: str | None,
-        repo_identifier: str | None,
-    ) -> Memory | None:
-        return await self._db.find_rebaseline_reactivation_candidate(
-            content_hash,
-            visibility=visibility,
-            owner_user_id=owner_user_id,
-            repo_identifier=repo_identifier,
-        )
-
-    async def find_rebaseline_reactivation_candidates(
-        self,
-        content_hashes: Sequence[str],
-        *,
-        visibility: str,
-        owner_user_id: str | None,
-        repo_identifier: str | None,
-    ) -> list[Memory]:
-        return await self._db.find_rebaseline_reactivation_candidates(
-            content_hashes,
-            visibility=visibility,
-            owner_user_id=owner_user_id,
-            repo_identifier=repo_identifier,
-        )
-
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]:
         return await self._db.get_memory_sources(memory_id)
 
@@ -655,17 +618,6 @@ class SqliteRelationalStore:
     ) -> None:
         await self._db.delete_projected_document(
             doc_id,
-            source_activity=source_activity,
-        )
-
-    async def rebaseline_source_lifecycle(
-        self,
-        source_id: str,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> SourceLifecycleResetResult:
-        return await self._db.rebaseline_source_lifecycle(
-            source_id,
             source_activity=source_activity,
         )
 
@@ -742,12 +694,6 @@ class SqliteRelationalStore:
     ) -> SourceArtifactRevision | None:
         return await self._db.get_source_artifact_revision(observation_revision_id)
 
-    async def get_memory_source_artifacts(
-        self,
-        memory_id: str,
-    ) -> tuple[SourceArtifactEvidence, ...]:
-        return await self._db.get_memory_source_artifacts(memory_id)
-
     async def get_memory_evidence_units(
         self,
         memory_id: str,
@@ -800,12 +746,6 @@ class SqliteRelationalStore:
             limit=limit,
         )
 
-    async def list_legacy_memory_provenance(
-        self,
-        source_id: str,
-    ) -> list[LegacyMemoryProvenance]:
-        return await self._db.list_legacy_memory_provenance(source_id)
-
     async def count_active_source_memories_without_support(self, source_id: str) -> int:
         return await self._db.count_active_source_memories_without_support(source_id)
 
@@ -814,9 +754,6 @@ class SqliteRelationalStore:
         source_id: str,
     ) -> int:
         return await self._db.count_active_supported_memories_without_source_provenance(source_id)
-
-    async def count_active_source_memories(self, source_id: str) -> int:
-        return await self._db.count_active_source_memories(source_id)
 
     async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate:
         return await self._db.get_lifecycle_gate(source_id)
@@ -832,91 +769,6 @@ class SqliteRelationalStore:
             source_activity=source_activity,
         )
 
-    async def gate_destructive_lifecycle(
-        self,
-        source_id: str,
-        *,
-        reason: str,
-        source_activity: SourceActivityLease | None = None,
-    ) -> LifecycleGate:
-        return await self._db.gate_destructive_lifecycle(
-            source_id,
-            reason=reason,
-            source_activity=source_activity,
-        )
-
-    async def upsert_lifecycle_cutover_finding(
-        self,
-        finding: LifecycleCutoverFinding,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> None:
-        await self._db.upsert_lifecycle_cutover_finding(
-            finding,
-            source_activity=source_activity,
-        )
-
-    async def get_lifecycle_cutover_finding(
-        self,
-        finding_id: str,
-    ) -> LifecycleCutoverFinding | None:
-        return await self._db.get_lifecycle_cutover_finding(finding_id)
-
-    async def list_lifecycle_cutover_findings(
-        self,
-        source_id: str,
-        *,
-        status: CutoverFindingStatus | None = None,
-    ) -> list[LifecycleCutoverFinding]:
-        return await self._db.list_lifecycle_cutover_findings(source_id, status=status)
-
-    async def create_lifecycle_backfill_job(
-        self,
-        job: LifecycleBackfillJob,
-    ) -> LifecycleBackfillJob:
-        return await self._db.create_lifecycle_backfill_job(job)
-
-    async def create_source_rebaseline_job(
-        self,
-        job: LifecycleBackfillJob,
-    ) -> LifecycleBackfillJob:
-        return await self._db.create_source_rebaseline_job(job)
-
-    async def start_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob:
-        return await self._db.start_lifecycle_backfill_job(job_id)
-
-    async def complete_lifecycle_backfill_job(
-        self,
-        job_id: str,
-        *,
-        scanned_memories: int,
-        mapped_memories: int,
-        finding_count: int,
-    ) -> LifecycleBackfillJob:
-        return await self._db.complete_lifecycle_backfill_job(
-            job_id,
-            scanned_memories=scanned_memories,
-            mapped_memories=mapped_memories,
-            finding_count=finding_count,
-        )
-
-    async def fail_lifecycle_backfill_job(
-        self,
-        job_id: str,
-        *,
-        error: str,
-        scanned_memories: int = 0,
-        mapped_memories: int = 0,
-        finding_count: int = 0,
-    ) -> LifecycleBackfillJob:
-        return await self._db.fail_lifecycle_backfill_job(
-            job_id,
-            error=error,
-            scanned_memories=scanned_memories,
-            mapped_memories=mapped_memories,
-            finding_count=finding_count,
-        )
-
     async def renew_source_activity(
         self,
         *,
@@ -928,73 +780,6 @@ class SqliteRelationalStore:
             activity_id=activity_id,
             capability=capability,
             lease_seconds=lease_seconds,
-        )
-
-    async def recover_stale_lifecycle_backfill_job(
-        self,
-        job_id: str,
-        *,
-        error: str,
-    ) -> LifecycleBackfillJob:
-        return await self._db.recover_stale_lifecycle_backfill_job(
-            job_id,
-            error=error,
-        )
-
-    async def list_stale_lifecycle_backfill_job_ids(
-        self,
-        *,
-        limit: int = 100,
-    ) -> tuple[str, ...]:
-        return await self._db.list_stale_lifecycle_backfill_job_ids(limit=limit)
-
-    async def get_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob | None:
-        return await self._db.get_lifecycle_backfill_job(job_id)
-
-    async def get_active_lifecycle_backfill_job(
-        self,
-        source_id: str,
-    ) -> LifecycleBackfillJob | None:
-        return await self._db.get_active_lifecycle_backfill_job(source_id)
-
-    async def list_lifecycle_backfill_jobs(
-        self,
-        source_id: str,
-        *,
-        limit: int = 20,
-    ) -> list[LifecycleBackfillJob]:
-        return await self._db.list_lifecycle_backfill_jobs(source_id, limit=limit)
-
-    async def resolve_lifecycle_cutover_finding(
-        self,
-        finding_id: str,
-        *,
-        observation_id: str,
-        source_unit_id: str,
-        source_activity: SourceActivityLease | None = None,
-    ) -> LifecycleCutoverFinding:
-        return await self._db.resolve_lifecycle_cutover_finding(
-            finding_id,
-            observation_id=observation_id,
-            source_unit_id=source_unit_id,
-            source_activity=source_activity,
-        )
-
-    async def retire_unprovable_lifecycle_cutover_finding(
-        self,
-        finding_id: str,
-        *,
-        source_id: str,
-        reconstruction_attempt_id: str,
-        operator_id: str,
-        unavailable_documents: Mapping[str, str],
-    ) -> LifecycleCutoverFinding:
-        return await self._db.retire_unprovable_lifecycle_cutover_finding(
-            finding_id,
-            source_id=source_id,
-            reconstruction_attempt_id=reconstruction_attempt_id,
-            operator_id=operator_id,
-            unavailable_documents=unavailable_documents,
         )
 
     async def record_evidence_references(
@@ -1023,17 +808,6 @@ class SqliteRelationalStore:
             references,
         )
 
-    async def upsert_memory_support_assertion(
-        self,
-        assertion: MemorySupportAssertion,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> None:
-        await self._db.upsert_memory_support_assertion(
-            assertion,
-            source_activity=source_activity,
-        )
-
     async def upsert_memory_unit_support_assertion(
         self,
         assertion: MemoryUnitSupportAssertion,
@@ -1045,28 +819,8 @@ class SqliteRelationalStore:
             source_activity=source_activity,
         )
 
-    async def get_support_scope_version(self) -> SupportScopeVersion:
-        return await self._db.get_support_scope_version()
-
-    async def report_support_scope_cutover(self):
-        return await self._db.report_support_scope_cutover()
-
-    async def apply_support_scope_v2_cutover(
-        self,
-        *,
-        expected_report_id: str,
-        owner_id: str,
-    ):
-        return await self._db.apply_support_scope_v2_cutover(
-            expected_report_id=expected_report_id,
-            owner_id=owner_id,
-        )
-
     async def get_memory_support_set_hash(self, memory_id: str) -> str:
         return await self._db.get_memory_support_set_hash(memory_id)
-
-    async def get_active_memory_support_reference_ids(self, memory_id: str) -> tuple[str, ...]:
-        return await self._db.get_active_memory_support_reference_ids(memory_id)
 
     async def get_active_memory_support_unit_ids(self, memory_id: str) -> tuple[str, ...]:
         return await self._db.get_active_memory_support_unit_ids(memory_id)
@@ -1076,17 +830,6 @@ class SqliteRelationalStore:
         memory_ids: Sequence[str],
     ) -> Mapping[str, ActiveMemorySupportState]:
         return await self._db.get_active_memory_support_states(memory_ids)
-
-    async def get_active_memory_support_evidence(
-        self,
-        memory_id: str,
-        *,
-        source_id: str | None = None,
-    ) -> tuple[ActiveSupportEvidence, ...]:
-        return await self._db.get_active_memory_support_evidence(
-            memory_id,
-            source_id=source_id,
-        )
 
     async def get_active_memory_support_evidence_many(
         self,
@@ -1109,12 +852,6 @@ class SqliteRelationalStore:
             memory_ids,
             source_id=source_id,
         )
-
-    async def get_source_unit_support_reference_ids(
-        self,
-        source_unit_id: str,
-    ) -> dict[str, tuple[str, ...]]:
-        return dict(await self._db.get_source_unit_support_reference_ids(source_unit_id))
 
     async def get_source_unit_support_unit_ids(
         self,
@@ -1448,21 +1185,6 @@ class SqliteRelationalStore:
             excerpt,
             support_kind=support_kind,
             source_updated_at=source_updated_at,
-        )
-
-    async def remove_memory_source(
-        self,
-        memory_id: str,
-        doc_id: str,
-        *,
-        source_id: str,
-        retire_reason: str = "source_deleted",
-    ) -> bool:
-        return await self._db.remove_memory_source(
-            memory_id,
-            doc_id,
-            source_id=source_id,
-            retire_reason=retire_reason,
         )
 
     async def promote_to_workspace(

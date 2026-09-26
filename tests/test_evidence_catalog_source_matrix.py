@@ -1,23 +1,18 @@
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime, timezone
 
 import pytest
 
-from memforge.llm.structured import MemoryCandidate, MemoryExtractionResponse
 from memforge.models import ContentItem, NormalizedContent, RawContent
-from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import (
     CommittedSourceUnitSnapshot,
     plan_projection_evidence_work,
-    plan_projection_extraction_batches,
 )
 from memforge.pipeline.projection_fragments import (
     compile_projection_fragment_catalog,
 )
-from memforge.pipeline.projection_evidence import build_projected_claim_evidence
 from memforge.pipeline.source_projection_adapters import (
     BUILTIN_SPECIALIZED_SOURCE_TYPES,
     project_source_item,
@@ -249,159 +244,3 @@ def _projection_inputs(
     )
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "source_type",
-    [*TEXTUAL_BUILTIN_SOURCE_TYPES, "extension_document"],
-)
-async def test_textual_source_matrix_binds_blocks_to_current_stable_observations(
-    source_type: str,
-) -> None:
-    source_id = f"src-{source_type}"
-    first_item, first_raw, first_normalized, target_type = _projection_inputs(
-        source_type,
-        OLD_RULE,
-        version="1",
-    )
-    first = project_source_item(
-        source_id=source_id,
-        source_type=source_type,
-        run_id="run-1",
-        item=first_item,
-        raw=first_raw,
-        normalized=first_normalized,
-    )
-    second_item, second_raw, second_normalized, _ = _projection_inputs(
-        source_type,
-        CURRENT_RULE,
-        version="2",
-    )
-    second = project_source_item(
-        source_id=source_id,
-        source_type=source_type,
-        run_id="run-2",
-        item=second_item,
-        raw=second_raw,
-        normalized=second_normalized,
-        prior_unit_revision=first.source_unit_revisions[0],
-        prior_observation_revisions={
-            revision.observation_id: revision
-            for revision in first.observation_revisions
-        },
-    )
-
-    [first_observation] = [
-        observation
-        for observation in first.observations
-        if observation.observation_type == target_type
-    ]
-    [second_observation] = [
-        observation
-        for observation in second.observations
-        if observation.observation_type == target_type
-    ]
-    first_revision = next(
-        revision
-        for revision in first.observation_revisions
-        if revision.observation_id == first_observation.id
-    )
-    second_revision = next(
-        revision
-        for revision in second.observation_revisions
-        if revision.observation_id == second_observation.id
-    )
-
-    assert second_observation.id == first_observation.id
-    assert second_revision.id != first_revision.id
-    assert CURRENT_RULE in second_revision.content
-
-    batches = plan_projection_extraction_batches(second)
-    batch = next(
-        batch
-        for batch in batches
-        if second_observation.id in batch.primary_observation_ids
-    )
-    class Client:
-        async def extract_projection_memories(self, prompt: str, **kwargs):
-            del kwargs
-            rendered_blocks = re.findall(
-                r'<evidence_block id="([^"]+)"[^>]*>\n(.*?)\n</evidence_block>',
-                prompt,
-                re.DOTALL,
-            )
-            block_id, _ = next(
-                (block_id, text)
-                for block_id, text in rendered_blocks
-                if CURRENT_RULE in text
-            )
-            return MemoryExtractionResponse(
-                memories=[
-                    MemoryCandidate(
-                        content="The exact current diagnostic procedure is durable.",
-                        memory_type="procedure",
-                        evidence_block_id=block_id,
-                        evidence_quote=CURRENT_RULE,
-                    ),
-                    MemoryCandidate(
-                        content="The fallback current diagnostic procedure is durable.",
-                        memory_type="procedure",
-                        evidence_block_id=block_id,
-                        evidence_quote=(
-                            "A provider-formatted paraphrase that is not source text."
-                        ),
-                    ),
-                ]
-            )
-
-    result = await MemoryExtractor(
-        structured_llm_client=Client()
-    ).extract_projection_batch_memories(
-        batch,
-        source_type=source_type,
-    )
-
-    assert len(result.memories) == 2
-    exact, fallback = result.memories
-    assert exact.evidence_quote == CURRENT_RULE
-    assert fallback.evidence_quote
-    assert CURRENT_RULE in fallback.evidence_quote
-    for memory in result.memories:
-        assert memory.evidence_block_id is None
-        assert memory.source_observation_id == second_observation.id
-        assert (
-            second_revision.content[
-                memory.evidence_range_start : memory.evidence_range_end
-            ]
-            == memory.evidence_quote
-        )
-
-    staged = build_projected_claim_evidence(
-        projection=second,
-        raw_memories=result.memories,
-        doc_id=second_item.item_id,
-        source_type=source_type,
-        project_key=None,
-        visibility="workspace",
-        owner_user_id=None,
-        repo_identifier=None,
-        access_context_hash="workspace",
-        extractor_run_id="run-2",
-    )
-    primary_references = [
-        reference
-        for reference in staged.references
-        if reference.role.value == "primary"
-    ]
-
-    assert {unit.excerpt for unit in staged.units} == {
-        exact.evidence_quote,
-        fallback.evidence_quote,
-    }
-    assert len(primary_references) == 2
-    assert all(
-        primary.anchor.observation_id == second_observation.id
-        and primary.anchor.observation_revision_id == second_revision.id
-        and primary.anchor.observation_revision_id != first_revision.id
-        and primary.anchor.kind.value == "revision_range"
-        for primary in primary_references
-    )

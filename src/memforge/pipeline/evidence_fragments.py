@@ -716,6 +716,13 @@ def build_revision_fragment_index(
                 ),
             ),
         )
+    if profile.coordinate_space is not EvidenceCoordinateSpace.WHOLE_ARTIFACT and not revision.content:
+        # An empty text body, such as the body of a binary-only file, has no range to cite.
+        return RevisionFragmentIndex(
+            observation_revision_id=revision.id,
+            fragments=(),
+            errors=(),
+        )
     authority = EvidenceCandidateRange(
         anchor=SourceAnchor(
             kind=(

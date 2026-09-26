@@ -17,7 +17,6 @@ from memforge.memory.relation_candidate_retrieval import (
 )
 from memforge.storage.adapters.protocols import (
     ActiveMemorySupportState,
-    active_support_rows_hash,
 )
 
 
@@ -232,7 +231,7 @@ async def test_selection_revalidation_fails_when_current_support_changes() -> No
     )
 
     class SupportChangingRelational:
-        support_hash = active_support_rows_hash(())
+        support_hash = "current-support"
 
         async def get_memory(self, memory_id):
             assert memory_id == challenger.id
@@ -245,9 +244,9 @@ async def test_selection_revalidation_fails_when_current_support_changes() -> No
         async def get_active_memory_support_states(self, memory_ids):
             return {
                 memory_id: ActiveMemorySupportState(
-                    reference_ids=(),
+                    unit_ids=(),
                     support_set_hash=self.support_hash,
-                    current_reference_ids=(),
+                    current_unit_ids=(),
                     current_support_set_hash=self.support_hash,
                 )
                 for memory_id in memory_ids
