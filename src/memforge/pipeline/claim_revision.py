@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from memforge.derivation_work import DerivationWorkJournal, DerivationWorkStore
 from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
 from memforge.llm.failure_trace import failure_trace_context
-from memforge.llm.structured import ClaimRevisionDecision, ClaimRevisionWireResponse, StructuredLlmError
+from memforge.llm.structured import ClaimRevisionDecision, ClaimRevisionWireResponse
 from memforge.llm.relation_catalog import RelationCoverage, RequestCatalog
 from memforge.memory.relation_classifier import MemoryPairClassificationPolicy
 from memforge.models import Memory, RawMemory
@@ -156,7 +156,8 @@ async def assess_claim_pairs(
         index, _raw = new_ids[candidate_id]
         if isinstance(outcome, ItemFailure):
             if not outcome.unjudgeable:
-                _raise_failure(outcome)
+                # A transient failure leaves the Source Unit revision uncommitted.
+                raise outcome.error
             unjudged[index] = outcome
             continue
         for row in outcome:
@@ -174,12 +175,3 @@ async def assess_claim_pairs(
     return ClaimRevisionLedger(tuple(decisions), runner.stats.prompt_chars,
         tuple(work.id for work in journal.works) if journal is not None else (),
         completed_candidate_count=len(outcomes) - len(unjudged), unjudged=unjudged)
-
-
-def _raise_failure(failure: ItemFailure):
-    """A transient execution failure leaves the Source Unit revision uncommitted."""
-    from memforge.pipeline.reconciler import ReconciliationContractError
-
-    if isinstance(failure.error, StructuredLlmError):
-        raise failure.error
-    raise ReconciliationContractError("claim_revision_failed", str(failure.error)) from failure.error

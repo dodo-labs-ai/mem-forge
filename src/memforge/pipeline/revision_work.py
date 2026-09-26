@@ -28,7 +28,6 @@ from memforge.llm.failure_trace import failure_trace_context
 from memforge.llm.structured import (
     ChangeImpactWireResponse as ImpactResponse,
     ContinueReadingWireResult,
-    StructuredLlmError,
     SupportAssessmentWireResponse as AssessmentResponse,
     SupportedWireResult,
     litellm_model_name,
@@ -380,7 +379,8 @@ class RevisionWorkExecutor:
         for item in items:
             outcome = outcomes[item.id]
             if isinstance(outcome, ItemFailure) and not outcome.unjudgeable:
-                _raise_failure(outcome)
+                # A transient failure leaves the Source Unit revision uncommitted.
+                raise outcome.error
         results = {}
         finished = []
         for support in supports:
@@ -828,17 +828,3 @@ def _unresolved_capacity(context, support: SupportPlan, part: ReadingPart, witne
         None,
         unresolved="capacity",
     )
-
-
-def _raise_failure(failure: ItemFailure):
-    """A transient execution failure leaves the Source Unit revision uncommitted."""
-    if isinstance(failure.error, StructuredLlmError):
-        raise failure.error
-    from memforge.pipeline.reconciler import ReconciliationContractError
-
-    code = (
-        "revision_support_selection_exhausted"
-        if isinstance(failure.error, FragmentSelectionError)
-        else "revision_support_response_incomplete"
-    )
-    raise ReconciliationContractError(code, f"bounded assessment correction exhausted: {failure.error}") from failure.error

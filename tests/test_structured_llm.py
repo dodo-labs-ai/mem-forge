@@ -586,7 +586,8 @@ async def test_litellm_structured_client_rejects_invalid_image_before_provider_c
     assert calls == []
     assert raised.value.error_code == "invalid_image_evidence"
     assert telemetry[0].attempt_count == 0
-    assert telemetry[0].terminal_category == "invalid_response"
+    # No model response exists, so this is a request error, not an invalid response.
+    assert telemetry[0].terminal_category == "request_error"
 
 
 @pytest.mark.asyncio
@@ -1071,8 +1072,10 @@ async def test_litellm_structured_client_rejects_ambiguous_schema_valid_json_obj
 
     with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response") as raised:
         await validate_support_verdict(client)
-    assert len(calls) == 2
-    assert raised.value.error_code == "ValueError"
+    # Native schema, the JSON-text fallback, then its one repair.
+    assert len(calls) == 3
+    assert "failed local schema validation" in calls[-1]["messages"][0]["content"]
+    assert (raised.value.terminal_category, raised.value.error_code) == ("invalid_response", "ValueError")
 
 
 @pytest.mark.asyncio
@@ -1598,9 +1601,9 @@ async def test_litellm_structured_client_fails_closed_when_litellm_rejects_schem
         )
     )
 
-    with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response") as raised:
+    with pytest.raises(StructuredLlmError, match="request failed without a response to validate") as raised:
         await client.admit_candidates("prompt", max_tokens=512)
-    assert raised.value.error_code == "Exception"
+    assert (raised.value.terminal_category, raised.value.error_code) == ("request_error", "Exception")
 
 
 @pytest.mark.asyncio
@@ -2208,3 +2211,29 @@ async def test_concurrent_lines_count_their_own_calls_and_the_enclosing_scope_co
     assert support.summary(source_unit_elapsed_ms=0).operation_counts == {"support": 2}
     assert relation.summary(source_unit_elapsed_ms=0).operation_counts == {"relation": 1}
     assert enclosing.summary(source_unit_elapsed_ms=0).operation_counts == {"support": 2, "relation": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (litellm.BadRequestError("invalid request", model="fixture", llm_provider="openai"), "BadRequestError"),
+        (KeyError("choices"), "KeyError"),
+    ],
+    ids=["provider-400", "code-bug"],
+)
+async def test_a_call_without_a_response_to_validate_is_a_request_error_not_an_invalid_response(
+    monkeypatch, error, code,
+):
+    async def fake_acompletion(**kwargs):
+        raise error
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, False)
+    client = LiteLlmStructuredClient(StructuredLlmConfig(
+        model="anthropic--claude-sonnet-latest", base_url=None, api_key=None, timeout_s=120.0,
+    ))
+
+    with pytest.raises(StructuredLlmError) as raised:
+        await validate_support_verdict(client)
+    assert (raised.value.terminal_category, raised.value.error_code) == ("request_error", code)

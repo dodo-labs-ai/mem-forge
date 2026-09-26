@@ -253,6 +253,30 @@ async def test_other_provider_errors_fail_every_item_without_splitting():
     assert runner.stats.splits == 0
 
 
+async def test_a_request_error_fails_every_item_without_splitting_or_counting_as_unjudgeable():
+    rejected = StructuredLlmError("bad request", terminal_category="request_error", error_code="BadRequestError")
+    client = FixtureBudgetClient(respond=failing(rejected, when=lambda _prompt: True))
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+
+    results = await runner.run_items(item_task(client, ids(4)))
+
+    assert results == dict.fromkeys(ids(4), ItemFailure("request_error", "BadRequestError", rejected))
+    assert not results["i00"].unjudgeable
+    assert (runner.stats.calls, runner.stats.splits) == (1, 0)
+
+
+async def test_an_unexpected_exception_from_the_call_raises_without_splitting():
+    def broken(prompt):
+        raise KeyError("choices")
+
+    client = FixtureBudgetClient(respond=broken)
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+
+    with pytest.raises(KeyError):
+        await runner.run_items(item_task(client, ids(4)))
+    assert (runner.stats.calls, runner.stats.splits) == (1, 0)
+
+
 @pytest.mark.parametrize(
     "first_reply",
     [

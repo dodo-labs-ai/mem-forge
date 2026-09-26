@@ -35,8 +35,9 @@ that enters the table again. REFINES and uncertain edges keep the local
 unresolved relationship rules. A Candidate that receives different treatments
 across old Memories, or is staged in the Reviews of more than one, leaves its
 whole related component unresolved: consumed this round, with no ADD and no
-destructive action. So does a Candidate the Relation line could not judge even
-alone.
+destructive action. A Candidate the Relation line could not judge even alone is
+consumed the same way; its missing row leaves the Relation line incomplete, so
+DestructiveValidation withholds every destructive decision of the Unit.
 """
 
 from __future__ import annotations
