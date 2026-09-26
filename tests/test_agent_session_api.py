@@ -2003,7 +2003,7 @@ def test_agent_session_window_fails_when_authority_classifier_omits_candidate(tm
             assert len(receipts) == 1
             metadata = receipts[0]["metadata"]
             assert metadata["outcome"] == "failed"
-            assert "the response omits 1 of 1 requested IDs" in metadata["reason"]
+            assert "no result was returned for E1" in metadata["reason"]
 
         asyncio.run(_check())
     finally:

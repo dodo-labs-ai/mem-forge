@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from memforge.llm.structured import StructuredLlmError
+from memforge.llm.structured import ClaimRevisionWireResponse, StructuredLlmError
 from memforge.memory.coordinator_review import coordinator_review_id
 from memforge.memory.lifecycle_plan import LifecycleReviewStatus
 from memforge.memory.lifecycle_review import (
@@ -34,6 +34,7 @@ from tests.coordination_fixture import (
     seeded_page,
     support_texts,
 )
+from tests.revision_client_fixture import catalog_payload
 from tests.test_projected_lifecycle_integration import db as db, _selected
 from tests.unit_support_fixture import active_support_evidence
 
@@ -199,6 +200,141 @@ async def test_rejecting_a_conflict_with_an_equivalent_binds_the_claim_to_that_e
     assert rejected.status is LifecycleReviewStatus.REJECTED
     assert (await db.get_memory(memory.id)).status == "active"
     assert await support_texts(db, memory.id) == {RESTATED}
+
+
+class _OmitsRow(ScriptedClient):
+    """Never returns the Relation row of one Candidate, even after the correction."""
+
+    def __init__(self, omitted: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.omitted = omitted
+
+    async def assess_claim_revisions(self, prompt, **kwargs):
+        response = await super().assess_claim_revisions(prompt, **kwargs)
+        texts = {claim["id"]: claim["text"] for claim in catalog_payload(prompt)["new_claims"]}
+        return ClaimRevisionWireResponse(results=[
+            row for row in response.results if texts[row.candidate_id] != self.omitted
+        ])
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_whose_relation_stays_invalid_is_unresolved_and_the_revision_commits(
+    db: Database, caplog,
+) -> None:
+    page, memory = await seeded_page(db, TWO, RETENTION)
+
+    revision = page.next(TWO, RETENTION, AUDIT)
+    with caplog.at_level("WARNING", logger="memforge.memory.engine"):
+        stats = await page.commit(_OmitsRow(AUDIT), revision, RETENTION, AUDIT)
+
+    current = await db.get_current_source_unit_projection(page.unit_id)
+    assert current.source_unit_revisions[0].id == revision.source_unit_revisions[0].id
+    # The old claim is kept and the independent Candidate added; the unjudged one is consumed without ADD or Review.
+    assert sorted(item.content for item in await db.list_memories()) == sorted([TWO, RETENTION])
+    assert await support_texts(db, memory.id) == {TWO}
+    assert await lifecycle_reviews(db, memory.id) == []
+    assert stats["added"] == 1 and stats["relation_unjudged_candidate_count"] == 1
+    assert stats["coordinator_unresolved_candidate_count"] == 1
+    [record] = [r.getMessage() for r in caplog.records if r.getMessage().startswith("relation_candidate_unresolved")]
+    assert f"source_unit_id={page.unit_id}" in record and "reason=invalid_response" in record
+
+
+@pytest.mark.asyncio
+async def test_an_unjudged_restatement_keeps_the_claim_it_may_restate(db: Database) -> None:
+    page, memory = await seeded_page(db, TWO, RETENTION)
+    old_support = await support_texts(db, memory.id)
+
+    # The revision rewords the claim: Support reads the whole revision without finding TWO,
+    # and Relation cannot judge the restating Candidate.
+    revision = page.next(RESTATED, RETENTION)
+    stats = await page.commit(_OmitsRow(RESTATED), revision, RESTATED)
+
+    current = await db.get_current_source_unit_projection(page.unit_id)
+    assert current.source_unit_revisions[0].id == revision.source_unit_revisions[0].id
+    kept = await db.get_memory(memory.id)
+    assert kept.status == "active" and await support_texts(db, memory.id) == old_support
+    assert [item.id for item in await db.list_memories()] == [memory.id]
+    assert stats["relation_unjudged_candidate_count"] == 1
+    assert stats["destructive_validation_kept_relation_incomplete_count"] == 1
+    assert stats["deleted"] == 0 and stats["added"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        StructuredLlmError("bad request", terminal_category="request_error", error_code="BadRequestError"),
+        KeyError("results"),
+    ],
+    ids=["provider-400", "code-bug"],
+)
+async def test_a_relation_error_without_a_response_to_validate_leaves_the_revision_uncommitted(
+    db: Database, error: Exception,
+) -> None:
+    page, memory = await seeded_page(db, TWO, RETENTION)
+    committed = page.current
+
+    class FailingRelation(ScriptedClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.relation_calls = 0
+
+        async def assess_claim_revisions(self, prompt, **kwargs):
+            self.relation_calls += 1
+            raise error
+
+    client = FailingRelation()
+    with pytest.raises(Exception):
+        await page.commit(client, page.next(TWO, RETENTION, AUDIT, ONE), AUDIT, ONE)
+
+    current = await db.get_current_source_unit_projection(committed.source_units[0].id)
+    assert current.source_unit_revisions[0].id == committed.source_unit_revisions[0].id
+    # Nothing was isolated item by item: the one request failed and the revision waits for the next sync.
+    assert client.relation_calls == 1
+    assert [item.id for item in await db.list_memories()] == [memory.id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("category", "retried_at_once"), [("request_error", False), ("provider_error", True)])
+@pytest.mark.parametrize("stage", ["relation", "support"])
+async def test_a_model_failure_yields_the_same_sync_outcome_in_every_stage(
+    db: Database, stage: str, category: str, retried_at_once: bool,
+) -> None:
+    from memforge.llm.structured import SupportAssessmentWireResponse
+    from memforge.memory.engine import SourceUnitLifecycleExecutionError
+
+    page, _memory = await seeded_page(db, TWO, RETENTION)
+    committed = page.current
+    error = StructuredLlmError("fixture failure", terminal_category=category, error_code="FixtureError")
+
+    class FailingStage(ScriptedClient):
+        async def assess_claim_revisions(self, prompt, **kwargs):
+            if stage == "relation":
+                raise error
+            return await super().assess_claim_revisions(prompt, **kwargs)
+
+        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+            if stage == "support" and response_format is SupportAssessmentWireResponse:
+                raise error
+            return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
+
+    projection = page.next(TWO, RETENTION, AUDIT)
+    with pytest.raises(SourceUnitLifecycleExecutionError) as raised:
+        await coordination_engine(db, FailingStage()).prepare_and_commit_projected_lifecycle(
+            projection=projection, doc_id=DOC_ID,
+            raw_memories=_selected(projection, [RawMemory(content=AUDIT, memory_type="fact")]),
+            doc_type="design-doc", project_key="ENG", repo_identifier=None,
+            document_content=projection.observation_revisions[-1].content, update_mode="full_document",
+            changed_hunks=None, update_plan_stats=None, source_updated_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            lifecycle_execution_owner_id=f"sync-{stage}-{category}:lease-1",
+        )
+
+    # One rule for every stage: only a transient failure is retried within the sync; a request
+    # error leaves the revision uncommitted for the next sync.
+    assert raised.value.retryable is retried_at_once
+    assert raised.value.runtime_bundle.event.terminal_category == category
+    current = await db.get_current_source_unit_projection(committed.source_units[0].id)
+    assert current.source_unit_revisions[0].id == committed.source_unit_revisions[0].id
 
 
 @pytest.mark.asyncio

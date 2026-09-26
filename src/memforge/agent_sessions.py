@@ -29,7 +29,7 @@ from memforge.agent_knowledge import (
     render_agent_knowledge_patch_prompt,
 )
 from memforge.memory.project_resolver import resolve_project_key
-from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
+from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
 from memforge.llm.structured import AgentSessionAuthorityResponse
 from memforge.models import AgentHookReceipt, AgentSessionReceipt, content_hash, slugify
 from memforge.repo_identity import normalize_repo_identifier
@@ -436,7 +436,10 @@ async def _classify_agent_session_authority(
             if isinstance(generated, AgentSessionAuthorityResponse)
             else AgentSessionAuthorityResponse.model_validate(generated)
         )
-        return ((decision.evidence_id.strip(), decision) for decision in response.decisions)
+        for decision in response.decisions:
+            evidence_id = decision.evidence_id.strip()
+            error = decision.row_error()
+            yield evidence_id, decision if error is None else RejectedRow(f"{evidence_id}: {error}")
 
     # The window client is built for this route, so its configured model applies.
     runner = LlmBatchRunner(structured_llm_client, model=None)

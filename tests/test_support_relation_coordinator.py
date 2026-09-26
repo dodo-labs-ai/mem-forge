@@ -31,6 +31,7 @@ SUPPORTED = SupportResult.SUPPORTED
 UNAFFECTED = SupportResult.UNAFFECTED
 UNSUPPORTED = SupportResult.UNSUPPORTED
 CAPACITY = SupportResult.UNRESOLVED_CAPACITY
+INVALID = SupportResult.UNRESOLVED_INVALID_RESPONSE
 PARTIAL = SupportResult.UNRESOLVED_PARTIAL_COVERAGE
 
 
@@ -63,10 +64,13 @@ def _edge(index: int, relation: MemoryRelationType | None, memory_id: str = "mem
     )
 
 
-def _coordinate(candidates, relations, supports, *, incumbents=None, proofs=(), rechecked_pairs=frozenset()):
+def _coordinate(
+    candidates, relations, supports, *, incumbents=None, proofs=(), rechecked_pairs=frozenset(),
+    unjudged_candidates=frozenset(),
+):
     return coordinate(
         candidates=candidates, incumbents=incumbents or [_old()], relations=relations,
-        proofs=proofs, supports=supports, rechecked_pairs=rechecked_pairs,
+        proofs=proofs, supports=supports, rechecked_pairs=rechecked_pairs, unjudged_candidates=unjudged_candidates,
     )
 
 
@@ -196,14 +200,15 @@ def test_a_claim_still_unsupported_after_its_recheck_gets_a_rebind_review(result
 
 
 @pytest.mark.parametrize("result", [UNSUPPORTED, PARTIAL])
-def test_a_candidate_evidence_recheck_beyond_capacity_takes_the_capacity_row(result) -> None:
+@pytest.mark.parametrize("unjudged", ["capacity", "invalid_response"])
+def test_a_candidate_evidence_recheck_that_cannot_be_judged_takes_the_unjudged_row(result, unjudged) -> None:
     equivalent, unrelated = _candidate("Two reviewers, restated."), _candidate("Retention is seven years.")
     support = _support(result).after_candidate_recheck(
-        SupportAssessment(None, "One ReadingGroup exceeds capacity.", None, unresolved="capacity"),
+        SupportAssessment(None, "One ReadingGroup cannot be judged.", None, unresolved=unjudged),
     )
     relations = [_edge(0, EQUIVALENT)]
 
-    assert support.result is CAPACITY and support.rechecked
+    assert support.result is (CAPACITY if unjudged == "capacity" else INVALID) and support.rechecked
     assert _rechecks([equivalent, unrelated], relations, {"mem-old": support}) == ()
     coordination = _coordinate([equivalent, unrelated], relations, {"mem-old": support})
     [kept] = [operation for operation in coordination.operations if operation.memory_id == "mem-old"]
@@ -228,19 +233,55 @@ def test_an_unsupported_claim_without_relation_loses_this_sources_support() -> N
     assert operation.action is ReconcileAction.DELETE
 
 
-def test_a_capacity_claim_is_kept_and_its_related_candidates_are_consumed() -> None:
+@pytest.mark.parametrize("result", [CAPACITY, INVALID])
+def test_an_unjudged_claim_is_kept_and_its_related_candidates_are_consumed(result) -> None:
     equivalent, contradicting, unrelated = (
         _candidate("Two reviewers, restated."), _candidate("One reviewer."), _candidate("Retention is seven years."),
     )
     relations = [_edge(0, EQUIVALENT), _edge(1, CONTRADICTS)]
-    supports = {"mem-old": _support(CAPACITY)}
+    supports = {"mem-old": _support(result)}
 
     assert _rechecks([equivalent, contradicting, unrelated], relations, supports) == ()
     coordination = _coordinate([equivalent, contradicting, unrelated], relations, supports)
     kept = _by_memory(coordination.operations)["mem-old"]
-    assert kept.support_revalidation_skipped and not kept.reviews and kept.reason == "unresolved_capacity reason"
+    assert kept.support_revalidation_skipped and not kept.reviews and kept.reason == f"{result.value} reason"
     assert _additions(coordination.operations) == [unrelated]
     assert coordination.unresolved_candidate_count == 2
+
+
+def test_an_unjudged_candidate_withholds_every_destructive_action_of_the_unit() -> None:
+    from memforge.memory.destructive_validation import KeptReason, validate_destructive_operations
+
+    unjudged, contradicting, unrelated = (
+        _candidate("mem-gone claim, restated."), _candidate("One reviewer."), _candidate("Retention is seven years."),
+    )
+    incumbents = [_old("mem-old"), _old("mem-gone")]
+    read_unsupported = memory_support((SupportAssessment(False, "read whole order", None, complete_read=True),))
+    supports = {"mem-old": read_unsupported, "mem-gone": read_unsupported}
+
+    coordination = _coordinate(
+        [unjudged, contradicting, unrelated], [_edge(1, CONTRADICTS)], supports,
+        incumbents=incumbents, unjudged_candidates=frozenset({0}),
+    )
+    # The table still decides every old Memory, and the unjudged Candidate is consumed.
+    decided = _by_memory(coordination.operations)
+    assert (decided["mem-old"].action, decided["mem-gone"].action) == (ReconcileAction.SUPERSEDE, ReconcileAction.DELETE)
+    assert coordination.unresolved_candidate_count == 1
+
+    # The Relation line lacks the unjudged Candidate's row, so no destructive decision is executed:
+    # the unjudged Candidate may restate mem-gone, which must not disappear with it.
+    validation = validate_destructive_operations(coordination.operations, supports=supports, relation_complete=False)
+    kept = _by_memory(validation.operations)
+    assert all(kept[memory_id].action is ReconcileAction.NOOP and kept[memory_id].support_revalidation_skipped
+               for memory_id in ("mem-old", "mem-gone"))
+    assert validation.kept == dict.fromkeys(("mem-old", "mem-gone"), KeptReason.RELATION_INCOMPLETE)
+    # The withheld SUPERSEDE was the contradicting Candidate's only effect, so it is not added either.
+    assert _additions(validation.operations) == [unrelated]
+
+
+def test_an_unjudged_candidate_outside_the_ledger_fails_closed() -> None:
+    with pytest.raises(ReconciliationContractError):
+        _coordinate([], [], {"mem-old": _support(SUPPORTED)}, unjudged_candidates=frozenset({0}))
 
 
 def test_a_partial_coverage_claim_contradicted_by_the_source_gets_a_supersession_review() -> None:
@@ -394,6 +435,9 @@ def _assessment(supported, *, unresolved=None, rebound=False):
         ([_assessment(True), _assessment(None, unresolved="capacity")], CAPACITY),
         ([_assessment(True), _assessment(None, unresolved="partial_coverage")], PARTIAL),
         ([_assessment(None, unresolved="partial_coverage"), _assessment(None, unresolved="capacity")], CAPACITY),
+        ([_assessment(True), _assessment(None, unresolved="invalid_response")], INVALID),
+        ([_assessment(None, unresolved="partial_coverage"), _assessment(None, unresolved="invalid_response")], INVALID),
+        ([_assessment(None, unresolved="invalid_response"), _assessment(None, unresolved="capacity")], CAPACITY),
         ([_assessment(True, rebound=True), _assessment(True)], SUPPORTED),
         ([_assessment(True, rebound=True), _assessment(True, rebound=True)], UNAFFECTED),
         ([_assessment(True, rebound=True), _assessment(False)], UNAFFECTED),

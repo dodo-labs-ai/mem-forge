@@ -130,11 +130,10 @@ async def test_classifier_returns_one_judgment_per_pair_by_pair_index() -> None:
         [{"pair_index": 0, "label": "none", "reason": ""}],
         [
             {"pair_index": 0, "label": "none", "reason": ""},
-            {"pair_index": 1, "label": "none", "reason": ""},
-            {"pair_index": 7, "label": "none", "reason": ""},
+            {"pair_index": 0, "label": "none", "reason": ""},
         ],
     ],
-    ids=["missing_pair", "unknown_pair"],
+    ids=["missing_pair", "duplicate_hides_missing"],
 )
 async def test_classifier_fails_when_a_pair_is_left_without_exactly_one_label(decisions) -> None:
     client = _Client(respond=lambda _prompt: CrossDocumentRelationResponse(decisions=decisions))
@@ -144,7 +143,9 @@ async def test_classifier_fails_when_a_pair_is_left_without_exactly_one_label(de
 
     assert error.value.error_code is not None
     assert error.value.pair_count == 2
-    assert len(client.prompts) == 2
+    # The accepted rows are kept and the rejected pairs re-asked once before the classifier fails.
+    assert "<correction>" in client.prompts[1]
+    assert error.value.llm_calls == len(client.prompts) == 2
 
 
 @pytest.mark.asyncio

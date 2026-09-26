@@ -1,9 +1,11 @@
 import pytest
+from pydantic import ValidationError
 
 from memforge.llm.structured import (
     ClaimRevisionDecision,
     MemoryRelationAssessment,
     RevisionAssessment,
+    StructuredLlmError,
 )
 from memforge.models import RawMemory, ReconcileAction
 from memforge.pipeline.reconciler import reconcile_memories
@@ -50,7 +52,15 @@ class Client(RevisionClientFixture):
             if self.classification == "refines" and self.direction == "challenger_to_candidate"
             else None,
         )
-        return sparse_response(prompt, [response, response] if self.duplicate else [response])
+        return schema_checked(lambda: sparse_response(prompt, [response, response] if self.duplicate else [response]))
+
+
+def schema_checked(build):
+    """Raise a response the schema rejects as the structured client does: an invalid response."""
+    try:
+        return build()
+    except ValidationError as error:
+        raise StructuredLlmError(str(error), terminal_category="invalid_response", error_code="ValidationError") from error
 
 
 def candidate():
@@ -139,13 +149,15 @@ async def test_duplicate_edge_and_missing_candidate_fail_closed():
         structured_llm_client=client,
         supports=dict([pinned("memory", True)]),
     )
-    assert (await reconcile_memories(**args)).failure is not None
-    client.invalid = True
-    client.calls = 0
-    result = await reconcile_memories(**args)
-    assert result.failure is not None and not result.operations
-    # One bounded correction with the same input, then fail closed.
-    assert client.calls == 2
+    # A repeated incumbent in the Candidate's row and a missing row are both row rules: one re-ask each.
+    for invalid, calls in ((False, 2), (True, 2)):
+        client.invalid = invalid
+        client.calls = 0
+        result = await reconcile_memories(**args)
+        # The Candidate alone stays invalid: it is consumed without ADD, and the old Memory is only kept.
+        assert result.failure is None and result.unresolved_candidate_count == 1
+        assert [(op.action, op.memory_id) for op in result.operations] == [(ReconcileAction.NOOP, "memory")]
+        assert client.calls == calls
 
 
 @pytest.mark.asyncio

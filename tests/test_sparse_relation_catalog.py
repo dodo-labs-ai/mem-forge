@@ -53,7 +53,7 @@ async def test_five_by_ten_becomes_fifteen_records_and_five_completions():
     assert result.decisions == ()
     assert result.llm_calls == 1
     assert len(data["new_claims"]) == 5 and len(data["existing_claims"]) == 10
-    assert sum(map(len, data["allowed_existing_ids"].values())) == 50
+    assert sum(len(claim["allowed_existing_ids"]) for claim in data["new_claims"]) == 50
     assert data["new_claims"][0]["id"] == "NEW-0001"
     assert data["existing_claims"][-1]["id"] == "MEM-0010"
     assert "pair_index" not in client.prompts[0]
@@ -116,26 +116,74 @@ async def test_conflicting_catalog_snapshot_is_rejected():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["missing", "duplicate_row", "unknown_new", "unknown_old", "outside_allowed", "duplicate_edge"])
 async def test_invalid_completion_never_becomes_empty_success(kind):
-    pairs = (MemoryPair(memory("n1", "A"), memory("m1", "B")),
-             MemoryPair(memory("n2", "C"), memory("m2", "D")))
+    bad, good = (MemoryPair(memory("n1", "A"), memory("m1", "B")),
+                 MemoryPair(memory("n2", "C"), memory("m2", "D")))
+
     def response(data):
+        """Every request that carries claim A answers it invalidly."""
         rows = [dict(candidate_id=c["id"], relations=[]) for c in data["new_claims"]]
+        [row] = [row for row, claim in zip(rows, data["new_claims"]) if claim["content"] == "A"] or [None]
+        if row is None:
+            return dict(results=rows)
         if kind == "missing":
-            rows.pop()
+            rows.remove(row)
         elif kind == "duplicate_row":
-            rows.append(rows[0])
+            rows.append(row)
         elif kind == "unknown_new":
-            rows[1]["candidate_id"] = "NEW-9999"
+            row["candidate_id"] = "NEW-9999"
         else:
             refs = ["MEM-9999"] if kind == "unknown_old" else ["MEM-0002"] if kind == "outside_allowed" else ["MEM-0001"] * 2
-            rows[0]["relations"] = [edge(ref) for ref in refs]
+            row["relations"] = [edge(ref) for ref in refs]
         return dict(results=rows)
+
     client = Client(response)
-    with pytest.raises(MemoryPairClassificationError) as error:
-        await SparseMemoryRelationClassifier(client=client, model="fixture").classify(pairs)
-    assert error.value.pair_count == 2 and error.value.llm_calls == 2
-    assert error.value.error_code == "output_invalid"
+    result = await SparseMemoryRelationClassifier(client=client, model="fixture").classify((bad, good))
+
+    # The pair request and its correction, then A alone with its correction, then C alone.
+    assert result.decisions == () and result.llm_calls == 5
+    [unjudged] = result.unjudged
+    assert unjudged.pair == bad
+    assert (unjudged.failure.category, unjudged.failure.error_code) == ("invalid_response", "output_invalid")
     assert "<correction>" in client.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_malformed_output_for_one_pair_leaves_only_that_pair_unjudged():
+    bad, good = (MemoryPair(memory("n1", "A"), memory("m1", "B")),
+                 MemoryPair(memory("n2", "C"), memory("m2", "D")))
+    malformed = StructuredLlmError(
+        "ambiguous structured JSON objects", terminal_category="invalid_response", error_code="ValueError",
+    )
+
+    class Malformed(Client):
+        async def discover_memory_relations(self, prompt, **kwargs):
+            if any(claim["content"] == "A" for claim in payload(prompt)["new_claims"]):
+                self.prompts.append(prompt)
+                raise malformed
+            return await super().discover_memory_relations(prompt, **kwargs)
+
+    client = Malformed(lambda data: dict(results=[
+        dict(candidate_id=c["id"], relations=[edge(c["allowed_existing_ids"][0])]) for c in data["new_claims"]]))
+    result = await SparseMemoryRelationClassifier(client=client, model="fixture").classify((bad, good))
+
+    assert [decision.pair.key for decision in result.decisions] == [good.key]
+    [unjudged] = result.unjudged
+    assert (unjudged.pair, unjudged.failure.error) == (bad, malformed)
+    assert result.llm_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_each_new_claim_carries_its_own_allowed_existing_ids():
+    shared = memory("m1", "shared old claim")
+    pairs = (MemoryPair(memory("n1", "A"), shared), MemoryPair(memory("n1", "A"), memory("m2", "B")),
+             MemoryPair(memory("n2", "C"), shared))
+    client = Client()
+    await SparseMemoryRelationClassifier(client=client, model="fixture").classify(pairs)
+    data = payload(client.prompts[0])
+    assert [(claim["id"], claim["allowed_existing_ids"]) for claim in data["new_claims"]] == [
+        ("NEW-0001", ["MEM-0001", "MEM-0002"]), ("NEW-0002", ["MEM-0001"]),
+    ]
+    assert "allowed_existing_ids" not in data
 
 
 @pytest.mark.asyncio
@@ -199,7 +247,7 @@ def test_prefixes_overflow_and_conflicting_snapshots():
 def test_uncertain_refs_share_the_same_duplicate_and_allowed_validation():
     coverage = RelationCoverage({"NEW-0001": frozenset({"MEM-0001"})})
     coverage.validate([SimpleNamespace(candidate_id="NEW-0001", relations=[], uncertain_existing_ids=["MEM-0001"])])
-    with pytest.raises(ValueError, match="duplicate"):
+    with pytest.raises(ValueError, match="names MEM-0001 more than once"):
         coverage.validate([SimpleNamespace(candidate_id="NEW-0001", relations=[SimpleNamespace(existing_id="MEM-0001")], uncertain_existing_ids=["MEM-0001"])])
 
 
@@ -208,5 +256,10 @@ def test_uncertain_refs_share_the_same_duplicate_and_allowed_validation():
 def test_sparse_schema_retains_direction_and_conflict_proofs(overrides):
     data = edge("MEM-0001")
     data.update(overrides)
-    with pytest.raises(ValueError):
-        MemoryRelationCatalogResponse.model_validate(dict(results=[dict(candidate_id="NEW-0001", relations=[data])]))
+    if overrides["classification"] == "unrelated":
+        # The shape itself has no unrelated edge.
+        with pytest.raises(ValueError):
+            MemoryRelationCatalogResponse.model_validate(dict(results=[dict(candidate_id="NEW-0001", relations=[data])]))
+        return
+    response = MemoryRelationCatalogResponse.model_validate(dict(results=[dict(candidate_id="NEW-0001", relations=[data])]))
+    assert response.results[0].relations[0].row_error() is not None

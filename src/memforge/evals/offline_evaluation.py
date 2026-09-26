@@ -2784,7 +2784,7 @@ def _pinned_supports(manifest: Mapping[str, object]) -> dict[str, MemorySupport]
             raise ValueError("support_audits supported must be a boolean")
         unresolved = item.get("unresolved")
         if unresolved is not None and unresolved not in UNRESOLVED_RESULTS:
-            raise ValueError("support_audits unresolved must be capacity or partial_coverage")
+            raise ValueError("support_audits unresolved must be one of: " + ", ".join(UNRESOLVED_RESULTS))
         incumbent_id = str(item.get("incumbent_id") or "")
         if incumbent_id in supports:
             raise ValueError("support_audits must cover every pinned incumbent exactly once")

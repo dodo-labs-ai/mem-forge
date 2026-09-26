@@ -6,7 +6,8 @@ the Relation edges that point at it. Neither line decides the other's truth.
 
 Rows are matched in precedence order and the first match wins:
 
-1. ``UNRESOLVED(capacity)``: keep unchanged; related Candidates are consumed.
+1. ``UNRESOLVED(capacity)`` or ``UNRESOLVED(invalid_response)``, a claim that
+   could not be judged: keep unchanged; related Candidates are consumed.
 2. An equivalent and a contradicts edge on the same old Memory: coordinator
    Review that stages the contradicting Candidate and proposes supersession;
    rejection rebinds the old Memory to the equivalent Candidate's Evidence.
@@ -34,7 +35,9 @@ that enters the table again. REFINES and uncertain edges keep the local
 unresolved relationship rules. A Candidate that receives different treatments
 across old Memories, or is staged in the Reviews of more than one, leaves its
 whole related component unresolved: consumed this round, with no ADD and no
-destructive action.
+destructive action. A Candidate the Relation line could not judge even alone is
+consumed the same way; its missing row leaves the Relation line incomplete, so
+DestructiveValidation withholds every destructive decision of the Unit.
 """
 
 from __future__ import annotations
@@ -76,6 +79,8 @@ __all__ = [
 class ReconciliationContractError(ValueError):
     """A bounded fail-closed reconciliation invariant violation."""
 
+    retryable = False
+
     def __init__(self, reason_code: str, message: str) -> None:
         super().__init__(message)
         self.reason_code = reason_code
@@ -92,6 +97,8 @@ class SupportResult(str, Enum):
     UNSUPPORTED = "unsupported"
     # One ReadingGroup alone exceeds the model's capacity for the claim.
     UNRESOLVED_CAPACITY = "unresolved_capacity"
+    # The model's output for one ReadingGroup alone stays invalid after its correction.
+    UNRESOLVED_INVALID_RESPONSE = "unresolved_invalid_response"
     # A prior Evidence part is UNKNOWN under partial projection coverage.
     UNRESOLVED_PARTIAL_COVERAGE = "unresolved_partial_coverage"
 
@@ -99,10 +106,16 @@ class SupportResult(str, Enum):
     def unresolved(self) -> bool:
         return self in UNRESOLVED_RESULTS.values()
 
+    @property
+    def unjudged(self) -> bool:
+        """The claim could not be judged: one ReadingGroup alone exceeds capacity or gets invalid output."""
+        return self in {SupportResult.UNRESOLVED_CAPACITY, SupportResult.UNRESOLVED_INVALID_RESPONSE}
+
 
 # A Support Assessment's unresolved reason and the Memory-level result it yields, in precedence order.
 UNRESOLVED_RESULTS: Mapping[str, SupportResult] = MappingProxyType({
     "capacity": SupportResult.UNRESOLVED_CAPACITY,
+    "invalid_response": SupportResult.UNRESOLVED_INVALID_RESPONSE,
     "partial_coverage": SupportResult.UNRESOLVED_PARTIAL_COVERAGE,
 })
 _KEEPS_SUPPORT = frozenset({SupportResult.SUPPORTED, SupportResult.UNAFFECTED})
@@ -132,10 +145,10 @@ class MemorySupport:
                 result=SupportResult.SUPPORTED, reason=assessment.reason, evidence=(assessment.memory,),
                 rechecked=True, assessments=(assessment,),
             )
-        if assessment.unresolved == "capacity":
+        unresolved = UNRESOLVED_RESULTS.get(assessment.unresolved or "")
+        if unresolved is not None and unresolved.unjudged:
             return MemorySupport(
-                result=SupportResult.UNRESOLVED_CAPACITY, reason=assessment.reason, rechecked=True,
-                assessments=(assessment,),
+                result=unresolved, reason=assessment.reason, rechecked=True, assessments=(assessment,),
             )
         return replace(self, rechecked=True)
 
@@ -144,7 +157,7 @@ def memory_support(assessments: Sequence[SupportAssessment], *, rechecked: bool 
     """Combine one old Memory's Support assessments by the table's precedence.
 
     Any ``UNRESOLVED(capacity)`` Support decides the Memory, then any
-    ``UNRESOLVED(partial_coverage)`` one. Otherwise a read that found Support
+    ``UNRESOLVED(invalid_response)`` one, then any ``UNRESOLVED(partial_coverage)`` one. Otherwise a read that found Support
     makes it SUPPORTED; Supports that were only rebound make it UNAFFECTED, so a
     contradiction re-reads those. Only when every Support was read without
     complete Support is the Memory UNSUPPORTED.
@@ -225,7 +238,7 @@ class SupportRecheckRequest:
 @dataclass(frozen=True)
 class Coordination:
     operations: tuple[ReconcileOperation, ...]
-    # Candidates consumed without a decision by an unresolved component.
+    # Candidates consumed without a decision by an unresolved component, unjudged ones included.
     unresolved_candidate_count: int = 0
 
 
@@ -244,6 +257,8 @@ class _Ledger:
     supports: Mapping[str, MemorySupport]
     # Candidate/Memory pairs whose conflict a pending Review already holds: no re-check repeats it.
     rechecked_pairs: frozenset[tuple[int, str]]
+    # Candidates the Relation line could not judge even alone.
+    unjudged_candidates: frozenset[int] = frozenset()
 
     def edges(self, memory_id: str, relation_type: MemoryRelationType) -> list[RelationLedgerEntry]:
         return [
@@ -262,12 +277,13 @@ def _ledger(
     proofs: Sequence[RevisionCompositionProof],
     supports: Mapping[str, MemorySupport],
     rechecked_pairs: frozenset[tuple[int, str]],
+    unjudged_candidates: frozenset[int],
 ) -> _Ledger:
     incumbent_ids = {memory.id for memory in incumbents}
     pairs = {(entry.candidate_index, entry.incumbent_id) for entry in relations}
     if len(pairs) != len(relations) or any(
         not 0 <= index < len(candidates) or memory_id not in incumbent_ids for index, memory_id in pairs
-    ):
+    ) or any(not 0 <= index < len(candidates) for index in unjudged_candidates):
         raise ReconciliationContractError(
             "relation_ledger_incomplete",
             "relation ledger contains duplicate or unknown candidate/incumbent references",
@@ -279,7 +295,7 @@ def _ledger(
     proofs_by_pair = {(proof.candidate_index, proof.incumbent_id): proof for proof in proofs}
     if len(proofs_by_pair) != len(proofs):
         raise ReconciliationContractError("duplicate_revision_proof", "duplicate revision composition proof")
-    return _Ledger(candidates, incumbents, relations, proofs_by_pair, supports, rechecked_pairs)
+    return _Ledger(candidates, incumbents, relations, proofs_by_pair, supports, rechecked_pairs, unjudged_candidates)
 
 
 def plan_rechecks(
@@ -290,13 +306,14 @@ def plan_rechecks(
     proofs: Sequence[RevisionCompositionProof] = (),
     supports: Mapping[str, MemorySupport],
     rechecked_pairs: frozenset[tuple[int, str]] = frozenset(),
+    unjudged_candidates: frozenset[int] = frozenset(),
 ) -> tuple[SupportRecheckRequest, ...]:
     """The single re-check each conflicting claim gets before the table decides."""
     ledger = _ledger(
         candidates=candidates, incumbents=incumbents, relations=relations, proofs=proofs, supports=supports,
-        rechecked_pairs=rechecked_pairs,
+        rechecked_pairs=rechecked_pairs, unjudged_candidates=unjudged_candidates,
     )
-    _, unresolved = _unresolved_component(ledger.relations, _seeds(ledger))
+    _, unresolved = _unresolved_component(ledger, _seeds(ledger))
     requests = []
     for memory in ledger.incumbents:
         support = ledger.supports[memory.id]
@@ -328,6 +345,7 @@ def supported_refiners(
     proofs: Sequence[RevisionCompositionProof] = (),
     supports: Mapping[str, MemorySupport],
     rechecked_pairs: frozenset[tuple[int, str]] = frozenset(),
+    unjudged_candidates: frozenset[int] = frozenset(),
 ) -> dict[str, tuple[int, ...]]:
     """Candidates that refine each old Memory whose Support keeps it; only these may revise it.
 
@@ -336,9 +354,9 @@ def supported_refiners(
     """
     ledger = _ledger(
         candidates=candidates, incumbents=incumbents, relations=relations, proofs=proofs, supports=supports,
-        rechecked_pairs=rechecked_pairs,
+        rechecked_pairs=rechecked_pairs, unjudged_candidates=unjudged_candidates,
     )
-    _, unresolved = _unresolved_component(ledger.relations, _seeds(ledger))
+    _, unresolved = _unresolved_component(ledger, _seeds(ledger))
     grouped: dict[str, list[int]] = {}
     for entry in ledger.relations:
         if (
@@ -359,14 +377,15 @@ def coordinate(
     proofs: Sequence[RevisionCompositionProof] = (),
     supports: Mapping[str, MemorySupport],
     rechecked_pairs: frozenset[tuple[int, str]] = frozenset(),
+    unjudged_candidates: frozenset[int] = frozenset(),
 ) -> Coordination:
     """Apply the combination table to final Support results and return one operation per claim."""
     ledger = _ledger(
         candidates=candidates, incumbents=incumbents, relations=relations, proofs=proofs, supports=supports,
-        rechecked_pairs=rechecked_pairs,
+        rechecked_pairs=rechecked_pairs, unjudged_candidates=unjudged_candidates,
     )
     seeds = _seeds(ledger)
-    _, unresolved = _unresolved_component(ledger.relations, seeds)
+    _, unresolved = _unresolved_component(ledger, seeds)
     decided = {memory.id: _decide(ledger, memory) for memory in ledger.incumbents if memory.id not in unresolved}
 
     # A Candidate treated differently by different old Memories, or staged in the
@@ -384,7 +403,7 @@ def coordinate(
             (entry.candidate_index, entry.incumbent_id) for entry in ledger.relations
             if entry.candidate_index in divided and entry.relation_type is not MemoryRelationType.UNRELATED
         }
-    component_candidates, unresolved = _unresolved_component(ledger.relations, seeds)
+    component_candidates, unresolved = _unresolved_component(ledger, seeds)
 
     consumed = set(component_candidates)
     operations: list[ReconcileOperation] = []
@@ -392,7 +411,7 @@ def coordinate(
         support = ledger.supports[memory.id]
         if memory.id in unresolved:
             reason = (
-                support.reason if support.result is SupportResult.UNRESOLVED_CAPACITY
+                support.reason if support.result.unjudged
                 else "Unresolved claim relationship; preserve existing Support and Evidence"
             )
             operations.append(replace(_kept_unchanged(reason), memory_id=memory.id))
@@ -425,7 +444,7 @@ def _decide(ledger: _Ledger, memory: Memory) -> _Decision:
     def candidate(index: int) -> RawMemory:
         return ledger.candidates[index]
 
-    if support.result is SupportResult.UNRESOLVED_CAPACITY:
+    if support.result.unjudged:
         # Reached only without related Candidates; related ones seed the unresolved component.
         return _Decision(_kept_unchanged(support.reason))
 
@@ -546,8 +565,8 @@ def _staged(entries: Sequence[RelationLedgerEntry]) -> tuple[tuple[int, _Treatme
 def _seeds(ledger: _Ledger) -> set[tuple[int, str]]:
     """Pairs that leave their related component unresolved.
 
-    Explicitly uncertain pairs; every related pair of an ``UNRESOLVED(capacity)``
-    old Memory; and a refinement whose proof preserves all of an UNSUPPORTED old
+    Explicitly uncertain pairs; every related pair of an old Memory whose claim
+    could not be judged (``UNRESOLVED(capacity)`` or ``UNRESOLVED(invalid_response)``); and a refinement whose proof preserves all of an UNSUPPORTED old
     Memory's truth, since the Candidate then restates knowledge Support rejected.
     """
     seeds = {(entry.candidate_index, entry.incumbent_id) for entry in ledger.relations if entry.relation_type is None}
@@ -555,7 +574,7 @@ def _seeds(ledger: _Ledger) -> set[tuple[int, str]]:
         result = ledger.supports[entry.incumbent_id].result
         if entry.relation_type is MemoryRelationType.UNRELATED:
             continue
-        if result is SupportResult.UNRESOLVED_CAPACITY:
+        if result.unjudged:
             seeds.add((entry.candidate_index, entry.incumbent_id))
         elif (
             result is SupportResult.UNSUPPORTED
@@ -568,15 +587,15 @@ def _seeds(ledger: _Ledger) -> set[tuple[int, str]]:
     return seeds
 
 
-def _unresolved_component(
-    relations: Sequence[RelationLedgerEntry], seeds: set[tuple[int, str]],
-) -> tuple[set[int], set[str]]:
+def _unresolved_component(ledger: _Ledger, seeds: set[tuple[int, str]]) -> tuple[set[int], set[str]]:
     """Keep uncertainty local without letting a shared candidate escape as ADD.
 
     A candidate can touch more than one incumbent. The related component of every
-    seed stays together; unrelated pairs never spread uncertainty to independent knowledge.
+    seed and of every unjudged Candidate stays together; unrelated pairs never
+    spread uncertainty to independent knowledge.
     """
-    candidates = {candidate_index for candidate_index, _ in seeds}
+    relations = ledger.relations
+    candidates = {candidate_index for candidate_index, _ in seeds} | ledger.unjudged_candidates
     incumbents = {incumbent_id for _, incumbent_id in seeds}
     while True:
         size = len(candidates) + len(incumbents)

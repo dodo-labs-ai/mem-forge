@@ -292,6 +292,41 @@ async def test_a_reading_group_the_provider_rejects_alone_is_skipped_and_the_oth
     ) in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_a_reading_group_whose_output_stays_invalid_is_skipped_and_the_others_are_kept(caplog):
+    projection = _projection(
+        primary_content="Rule one applies.\n\nRule two confuses the model.\n", context_content="Country: US.\n",
+    )
+    context = RevisionAssessmentContext(projection=projection, base=None, access_context_hash="scope")
+
+    class MalformedClient(Client):
+        async def extract_projection_fragment_memories(self, prompt, **kwargs):
+            payload = json.loads(prompt.split("<evidence_fragment_catalog", 1)[1].split(">", 1)[1].split(
+                "\n</evidence_fragment_catalog>", 1)[0])
+            rows = payload["primary_candidates"]
+            if any("confuses" in row[1] for row in rows):
+                raise StructuredLlmError(
+                    "ambiguous structured JSON objects", terminal_category="invalid_response", error_code="ValueError",
+                )
+            ref, text = rows[0][0], rows[0][1]
+            return ProjectionFragmentMemoryExtractionResponse.model_validate({"memories": [
+                {"content": text.strip(), "memory_type": "fact", "primary_ref": ref, "required_refs": []},
+            ]})
+
+    extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=MalformedClient(limit=40000))
+    [request] = plan(projection, ExtractionAuthority({body_id(projection): None}), extractor=extractor)
+    with caplog.at_level("WARNING", logger="memforge.pipeline.memory_extractor"):
+        result = await extractor.extract_projection_fragment_memories(
+            request.catalog, source_type="confluence", revision_context=context,
+        )
+
+    assert result.error_type is None
+    assert [memory.content for memory in result.memories] == ["Rule one applies."]
+    assert result.metadata["skipped_reading_group_count"] == 1
+    [record] = [r.getMessage() for r in caplog.records if r.getMessage().startswith("extraction_reading_group_skipped")]
+    assert f"reading_group={body_id(projection)}:" in record and record.endswith("reason=invalid_response")
+
+
 def _updated_confluence(initial, body):
     """The next revision of ``initial``'s page with this body."""
     item = ContentItem(

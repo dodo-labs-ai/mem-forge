@@ -49,6 +49,9 @@ class IdentityResolution:
     target: Memory | None
     equivalence_proof: Mapping[str, object] | None
     classification_complete: bool = True
+    # Incomplete because one of the challenger's pairs cannot be judged even alone
+    # (capacity or invalid output); otherwise an incomplete resolution is transient.
+    unjudged: bool = False
     failure_reason: str | None = None
     terminal_category: str | None = None
     error_code: str | None = None
@@ -230,6 +233,7 @@ class IdentityResolver:
                 )
         else:
             decisions_by_key = {decision.pair.key: decision for decision in decisions}
+            unjudged = {item.pair.key: item.failure for item in classification.unjudged} if classification else {}
             for index, pairs in pending.items():
                 pair_decisions = tuple(decisions_by_key[pair.key] for pair in pairs if pair.key in decisions_by_key)
                 equivalent = next(
@@ -240,6 +244,20 @@ class IdentityResolver:
                     ),
                     None,
                 )
+                failure = next((unjudged[pair.key] for pair in pairs if pair.key in unjudged), None)
+                if equivalent is None and failure is not None:
+                    # A proven equivalent attaches; without one, an unjudged pair may hide it.
+                    resolved[index] = IdentityResolution(
+                        challenger=pairs[0].challenger,
+                        target=None,
+                        equivalence_proof=None,
+                        classification_complete=False,
+                        unjudged=True,
+                        failure_reason=f"identity pair could not be judged ({failure.category})",
+                        terminal_category=failure.category,
+                        error_code=failure.error_code,
+                    )
+                    continue
                 target = equivalent.pair.candidate if equivalent is not None else None
                 resolved[index] = IdentityResolution(
                     challenger=pairs[0].challenger,

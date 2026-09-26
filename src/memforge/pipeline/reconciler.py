@@ -15,10 +15,17 @@ from time import perf_counter
 
 from memforge.derivation_work import DerivationWorkStore
 from memforge.evals.agent_evaluation import QualitySignal
-from memforge.llm.structured import StructuredLlmError, StructuredLlmMetricsCollector, structured_llm_line_scope
+from memforge.llm.batch_runner import ItemFailure
+from memforge.llm.structured import (
+    StructuredLlmError,
+    StructuredLlmMetricsCollector,
+    failure_retryable,
+    structured_llm_line_scope,
+)
 from memforge.memory.evidence import RelationDirection
 from memforge.memory.relation_classifier import (
     MemoryPair,
+    MemoryPairClassification,
     MemoryPairClassificationError,
     MemoryRelationType,
     StructuredMemoryPairClassifier,
@@ -72,6 +79,8 @@ class ReconciliationFailure:
     error_code: str | None = None
     validation_fields: tuple[tuple[str, str], ...] = ()
     diagnostic: QualitySignal | None = None
+    # Whether the sync retries at once, by the same rule as every other stage.
+    retryable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +109,8 @@ class RelationLine:
     # Candidates with a completion row, and the old Memories those rows cover.
     completed_candidate_count: int = 0
     incumbent_ids: frozenset[str] = frozenset()
+    # Candidate index -> why it could not be judged even alone; it is consumed without ADD.
+    unjudged: Mapping[int, ItemFailure] = field(default_factory=dict)
 
     def covers(self, candidate_count: int, incumbent_ids: frozenset[str]) -> bool:
         """Whether every one of ``candidate_count`` Candidates has its row over exactly these old Memories."""
@@ -136,8 +147,10 @@ async def assess_relations(
 ) -> RelationLine:
     """Judge every admitted Candidate against every same-Unit old Memory, without Support.
 
-    A model or contract failure is returned, not raised: the revision is not
-    committed, and nothing here may fall back to independent ADD.
+    A transient model failure or a contract failure is returned, not raised: the
+    revision is not committed, and nothing here may fall back to independent ADD.
+    A Candidate that cannot be judged even alone is reported as unjudged, and
+    SupportRelationCoordinator consumes it without ADD.
     """
     started = perf_counter()
     pair_count = len(new_extractions) * len(existing_memories)
@@ -196,6 +209,7 @@ async def assess_relations(
         entries=tuple(entries), proofs=tuple(proofs), work_ids=assessed.work_ids,
         metrics=_add_calls(metrics, line, started),
         completed_candidate_count=assessed.completed_candidate_count, incumbent_ids=incumbent_ids,
+        unjudged=assessed.unjudged,
     )
 
 
@@ -225,6 +239,7 @@ async def join_support_and_relation(
         "incumbents": existing_memories,
         "proofs": relation.proofs,
         "rechecked_pairs": rechecked_pairs,
+        "unjudged_candidates": frozenset(relation.unjudged),
     }
     entries = list(relation.entries)
     rechecks = plan_rechecks(relations=entries, supports=supports, **ledger)
@@ -254,7 +269,7 @@ async def join_support_and_relation(
                     relation_pair_count=metrics.relation_pair_count + len(conditional_pairs),
                     relation_prompt_chars=metrics.relation_prompt_chars + conditional.prompt_chars,
                 )
-                entries = _without_conflicting_refinements(entries, conditional.decisions, transient_candidates)
+                entries = _without_conflicting_refinements(entries, conditional, transient_candidates)
             operation = "coordinate_support_and_relation"
             coordination = coordinate(relations=entries, supports=supports, **ledger)
         except Exception as error:  # noqa: BLE001 - classified by _failure
@@ -271,14 +286,15 @@ async def join_support_and_relation(
 
 
 def _without_conflicting_refinements(
-    entries: list[RelationLedgerEntry], decisions, transient_candidates: tuple[Memory, ...],
+    entries: list[RelationLedgerEntry], classification: MemoryPairClassification,
+    transient_candidates: tuple[Memory, ...],
 ) -> list[RelationLedgerEntry]:
-    """Refinements of one old Memory that contradict each other leave their edges uncertain."""
+    """Refinements of one old Memory that contradict each other, or whose comparison cannot be judged, leave their edges uncertain."""
     conflicting_ids = {
-        memory_id for decision in decisions
+        memory_id for decision in classification.decisions
         if decision.relation_type is MemoryRelationType.CONTRADICTS
         for memory_id in decision.pair.key
-    }
+    } | {memory_id for unjudged in classification.unjudged for memory_id in unjudged.pair.key}
     conflicting_candidates = {index for index, candidate in enumerate(transient_candidates)
                               if candidate.id in conflicting_ids}
     return [
@@ -355,6 +371,7 @@ def _failure(error: Exception, operation: str) -> ReconciliationFailure:
         error_code=getattr(error, "error_code", None),
         validation_fields=getattr(error, "validation_fields", ()),
         diagnostic=getattr(error, "diagnostic", None),
+        retryable=failure_retryable(error),
     )
 
 
