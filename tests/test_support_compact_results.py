@@ -10,7 +10,7 @@ from memforge.pipeline.support_wire import SupportWireAliases
 
 SUPPORTED = {
     'work_id': 'WRK-0001', 'status': 'supported', 'primary_ref': 'PRM-0002',
-    'required_refs': ['REQ-0003'], 'omitted_matched_refs': [],
+    'required_refs': ['REQ-0003'],
 }
 CONTINUE = {
     'work_id': 'WRK-0001', 'status': 'continue',
@@ -34,9 +34,9 @@ def test_supported_row_has_no_prose_and_decodes_to_canonical_refs():
     result = SupportAssessmentWireResponse.model_validate({'results': [SUPPORTED]})
     row = wire().decode(result).results[0]
     assert row.work_id == 'w000001' and row.primary_ref == 'p000002'
-    assert row.required_refs == ['r000003'] and row.omitted_matched_refs == []
+    assert row.required_refs == ['r000003']
     success = row_schema('supported')
-    assert set(success['properties']) == {'work_id', 'status', 'primary_ref', 'required_refs', 'omitted_matched_refs'}
+    assert set(success['properties']) == {'work_id', 'status', 'primary_ref', 'required_refs'}
     assert success['additionalProperties'] is False
     with pytest.raises(ValidationError):
         SupportAssessmentWireResponse.model_validate({'results': [{**SUPPORTED, 'reason': 'A long explanation'}]})

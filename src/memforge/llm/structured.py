@@ -893,8 +893,6 @@ class SupportedWireResult(BaseModel):
     status: Literal["supported"]
     primary_ref: str
     required_refs: list[str]
-    # Current refs of the prior Evidence that this selection does not use.
-    omitted_matched_refs: list[str]
 
 
 class UnsupportedWireResult(BaseModel):

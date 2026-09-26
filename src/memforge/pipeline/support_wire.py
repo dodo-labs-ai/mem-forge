@@ -115,7 +115,6 @@ class SupportWireAliases:
                     "work_id": work_id,
                     "primary_ref": self._ref(row.primary_ref, f"{at}.primary_ref", allowed=self._primary_ids),
                     "required_refs": self._refs(row.required_refs, f"{at}.required_refs"),
-                    "omitted_matched_refs": self._refs(row.omitted_matched_refs, f"{at}.omitted_matched_refs"),
                 }))
             else:
                 rows.append(row.model_copy(update={"work_id": work_id}))

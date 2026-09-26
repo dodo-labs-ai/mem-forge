@@ -68,10 +68,10 @@ def test_aliases_preserve_text_and_role_eligibility_and_expand_four_digits():
     ])
     wire = SupportWireAliases(catalog, [], {'canonical-task': 'WRK-10000'})
     row = {'work_id': 'WRK-10000', 'status': 'supported', 'primary_ref': 'PRM-0068',
-           'required_refs': ['REQ-10000'], 'omitted_matched_refs': ['PRM-0068']}
+           'required_refs': ['REQ-10000']}
     decoded = wire.decode(SupportAssessmentWireResponse.model_validate({'results': [row]})).results[0]
     assert decoded.work_id == 'canonical-task' and decoded.primary_ref == 'p000068'
-    assert decoded.required_refs == ['r010000'] and decoded.omitted_matched_refs == ['p000068']
+    assert decoded.required_refs == ['r010000']
     # A Primary-eligible ref can also be selected as Required.
     row['required_refs'] = ['PRM-0068']
     assert wire.decode(SupportAssessmentWireResponse.model_validate({'results': [row]})).results[0].required_refs == [
@@ -111,7 +111,7 @@ async def test_valid_support_json_with_incomplete_transport_is_rejected(monkeypa
     from tests.test_structured_llm import CompletionResponse, set_native_schema_support
     response = CompletionResponse(json.dumps({'results': [{
         'work_id': 'WRK-0000', 'status': 'supported', 'primary_ref': 'PRM-0001',
-        'required_refs': [], 'omitted_matched_refs': [],
+        'required_refs': [],
     }]}))
     if signal == 'refusal':
         response.choices[0].message.refusal = 'refused'

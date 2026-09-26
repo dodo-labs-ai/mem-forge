@@ -117,7 +117,7 @@ def test_unknown_support_reference_identifies_exact_field_and_allowed_catalog(fi
     from memforge.pipeline.support_wire import SupportWireAliases
     from memforge.llm.structured import SupportAssessmentWireResponse
     aliases = SupportWireAliases(SimpleNamespace(fragments=[SimpleNamespace(reference="f2", primary_eligible=True)]), [], {"work":"WRK-0000"})
-    row = dict(work_id="WRK-0000", status="supported", primary_ref="PRM-0002", required_refs=[], omitted_matched_refs=[])
+    row = dict(work_id="WRK-0000", status="supported", primary_ref="PRM-0002", required_refs=[])
     row[field] = "PRM-0007" if field == "primary_ref" else ["PRM-0007"]
     with pytest.raises(ValueError) as error:
         aliases.decode(SupportAssessmentWireResponse.model_validate({"results":[row]}))
@@ -136,8 +136,7 @@ def test_unknown_primary_diagnostic_excludes_required_only_refs():
     aliases = SupportWireAliases(catalog, [], {"work":"WRK-0000"})
     with pytest.raises(ValueError) as error:
         aliases.decode(SupportAssessmentWireResponse.model_validate({"results":[dict(
-            work_id="WRK-0000", status="supported", primary_ref="PRM-0007", required_refs=[],
-            omitted_matched_refs=[])]}))
+            work_id="WRK-0000", status="supported", primary_ref="PRM-0007", required_refs=[])]}))
     assert error.value.allowed_refs == ["PRM-0002"]
 
 

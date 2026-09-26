@@ -9537,10 +9537,7 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
                 if primary_ref and work["may_conclude"]:
                     results.append({
                         "work_id": work["work_id"], "status": "supported", "primary_ref": primary_ref,
-                        "required_refs": [], "omitted_matched_refs": [
-                            part["current_ref"] for part in work["prior_evidence"]
-                            if part.get("current_ref") not in (None, primary_ref)
-                        ],
+                        "required_refs": [],
                     })
                 elif payload["last"]:
                     results.append({"work_id": work["work_id"], "status": "unsupported"})

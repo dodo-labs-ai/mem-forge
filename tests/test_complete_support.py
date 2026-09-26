@@ -60,8 +60,8 @@ def test_support_assessment_and_admission_share_the_one_definition_and_change_im
 
 
 def test_the_definition_raises_every_contract_whose_result_it_defines():
-    assert REVISION_SUPPORT_CONTRACT == "revision-support-v6"
-    assert SUPPORT_ASSESSMENT_CONTRACT == "support-ordered-reading-v4"
+    assert REVISION_SUPPORT_CONTRACT == "revision-support-v7"
+    assert SUPPORT_ASSESSMENT_CONTRACT == "support-ordered-reading-v5"
     assert CANDIDATE_ADMISSION_CONTRACT == "candidate-admission-v2"
 
 

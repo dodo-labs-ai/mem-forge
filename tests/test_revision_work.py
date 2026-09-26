@@ -512,8 +512,7 @@ async def test_ambiguous_part_reads_every_candidate_first_and_needs_no_accountin
             [work] = data["works"]
             rule = [ref for ref, text in readable(data) if text.strip() == RULE]
             if work["may_conclude"]:
-                # An AMBIGUOUS part has no matched ref to account for, so nothing is omitted.
-                return [{**supported(work, rule[0]), "omitted_matched_refs": []}]
+                return [supported(work, rule[0])]
             return [continued(work, rule)]
 
     client = FirstRuleClient(limit=100000)
@@ -626,8 +625,8 @@ async def test_transient_failure_raises_after_split_to_one_item():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("variant", ["omitted_after_correction", "selected", "never_accounted", "omits_other_refs"])
-async def test_multi_part_support_accounts_for_matched_parts(variant):
+@pytest.mark.parametrize("keeps_prior", [True, False])
+async def test_matched_prior_evidence_is_a_selectable_candidate_not_a_required_part(keeps_prior):
     scope_old, scope_new = "Scope: US releases only.", "Scope: US releases only!"
     base, current = revisions(f"{RULE}\n\n{scope_old}\n", f"{RULE}\n\n{scope_new}\n")
     context = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
@@ -635,38 +634,23 @@ async def test_multi_part_support_accounts_for_matched_parts(variant):
         "w0", memory(), (part(base, RULE), part(base, scope_old, role=EvidenceRole.REQUIRED)), context,
     )
 
-    class AccountingClient(Client):
+    class SelectingClient(Client):
         def judge(self, prompt):
             data = payload(prompt)
             refs = {text: ref for ref, text in readable(data)}
             [work] = data["works"]
-            [matched] = [p["current_ref"] for p in work["prior_evidence"] if "current_ref" in p]
-            assert matched == refs[RULE]
-            if variant == "selected":
+            # The exactly matched prior part is offered by its current ref.
+            assert [p["current_ref"] for p in work["prior_evidence"] if "current_ref" in p] == [refs[RULE]]
+            if keeps_prior:
                 return [supported(work, refs[RULE], [refs[scope_new]])]
-            row = supported(work, refs[scope_new])
-            if variant == "omits_other_refs":
-                # Omitting a supplied ref that is not prior Evidence changes nothing and is accepted.
-                row["omitted_matched_refs"] = [matched, refs[scope_new]]
-                return [row]
-            accounted = variant == "omitted_after_correction" and "<correction>" in prompt
-            row["omitted_matched_refs"] = [matched] if accounted else []
-            return [row]
+            return [supported(work, refs[scope_new])]
 
-    client = AccountingClient()
-    executor = RevisionWorkExecutor(client=client, model="fixture")
-    [result] = (await executor.assess_many([item])).values()
-    if variant == "never_accounted":
-        assert (result.supported, result.unresolved) == (None, "invalid_response")
-        assert len(client.prompts) == 2 and "unaccounted" in client.prompts[-1]
-        return
-    assert result.supported
-    if variant in {"selected", "omits_other_refs"}:
-        expected = [RULE, scope_new] if variant == "selected" else [scope_new]
-        assert selected_texts(result) == expected and len(client.prompts) == 1
-    else:
-        assert selected_texts(result) == [scope_new]
-        assert len(client.prompts) == 2 and "unaccounted" in client.prompts[1]
+    client = SelectingClient()
+    [result] = (await RevisionWorkExecutor(client=client, model="fixture").assess_many([item])).values()
+
+    # Either selection is accepted as it stands; whether it is complete is the model's Support judgment.
+    assert result.supported and len(client.prompts) == 1
+    assert selected_texts(result) == ([RULE, scope_new] if keeps_prior else [scope_new])
 
 
 @pytest.mark.asyncio
