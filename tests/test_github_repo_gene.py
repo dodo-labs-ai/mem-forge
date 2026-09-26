@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import pytest
+import requests
 
 from memforge.genes import GENE_REGISTRY
 from memforge.genes.github_repo_gene import GitHubRepoGene
@@ -203,6 +204,77 @@ async def test_cloud_pull_discovers_scoped_markdown_and_fetches_content(monkeypa
         "content_type": "text/markdown",
         "canonical_url": "https://github.example.test/payroll/architecture/blob/main/Payroll%20Processing/README.md",
     }
+
+
+async def _discovered_cloud_pull_item(monkeypatch, client_class) -> tuple[GitHubRepoGene, object]:
+    client_class.instances.clear()
+    monkeypatch.setattr("memforge.genes.github_repo_gene._RequestsAsyncClient", client_class)
+    gene = GitHubRepoGene(
+        config={
+            "connection_mode": "cloud_pull",
+            "repo_url": "https://github.example.test/payroll/architecture",
+            "ref": "main",
+            "include_paths": ["Payroll Processing/"],
+            "include_extensions": ["md"],
+            "max_files": 10,
+        },
+        source_id="src-github-repo",
+    )
+    await gene.authenticate()
+    [item] = [item async for item in gene.discover()]
+    return gene, item
+
+
+def _commit_time_requests(gene: GitHubRepoGene) -> list[tuple[str, str]]:
+    return [call for call in gene._client.calls if "/commits?" in call[1]]
+
+
+@pytest.mark.asyncio
+async def test_cloud_pull_keeps_the_commit_time_recorded_for_an_unchanged_blob(monkeypatch):
+    gene, item = await _discovered_cloud_pull_item(monkeypatch, RepoApiClient)
+    item.stored_extra = {"blob_sha": item.extra["blob_sha"], "last_commit_at": "2026-04-01T08:00:00+00:00"}
+
+    normalized = await gene.normalize(await gene.fetch(item))
+
+    assert _commit_time_requests(gene) == []
+    assert normalized.source_semantics["source_updated_at"] == "2026-04-01T08:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_cloud_pull_asks_again_for_a_changed_blob_or_a_missing_time(monkeypatch):
+    for recorded in ({"blob_sha": "previous-blob", "last_commit_at": "2026-04-01T08:00:00+00:00"}, {"last_commit_at": None}):
+        gene, item = await _discovered_cloud_pull_item(monkeypatch, RepoApiClient)
+        item.stored_extra = {"blob_sha": item.extra["blob_sha"], **recorded}
+
+        normalized = await gene.normalize(await gene.fetch(item))
+
+        assert len(_commit_time_requests(gene)) == 1
+        assert normalized.source_semantics["source_updated_at"] == "2026-05-01T10:00:00+00:00"
+
+
+class RefusedCommitsResponse(GithubResponse):
+    def raise_for_status(self) -> None:
+        raise requests.HTTPError(f"request failed: {self.status_code}")
+
+
+class RefusedCommitsApiClient(RepoApiClient):
+    instances: list["RepoApiClient"] = []
+
+    async def get(self, url: str):
+        if "/commits?" in url:
+            self.calls.append(("GET", url))
+            return RefusedCommitsResponse([], status_code=403, url=url)
+        return await super().get(url)
+
+
+@pytest.mark.asyncio
+async def test_cloud_pull_syncs_the_file_without_a_time_when_github_refuses_the_commit_lookup(monkeypatch):
+    gene, item = await _discovered_cloud_pull_item(monkeypatch, RefusedCommitsApiClient)
+
+    normalized = await gene.normalize(await gene.fetch(item))
+
+    assert normalized.markdown_body.startswith("# Payroll Processing")
+    assert normalized.source_semantics["source_updated_at"] is None
 
 
 @pytest.mark.asyncio

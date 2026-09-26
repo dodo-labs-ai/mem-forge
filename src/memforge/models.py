@@ -368,6 +368,10 @@ class ContentItem:
     may be the discovery or submission time, so it is never read as the
     content's source time; a Gene reports that time in ``normalize()`` under
     ``source_semantics["source_updated_at"]`` (design 0.9).
+
+    ``stored_extra`` is the ``extra`` recorded when this document was last
+    synced, empty for a new document. A Gene may reuse a provider fact it
+    recorded for an unchanged provider revision instead of asking again.
     """
 
     item_id: str  # becomes doc_id
@@ -380,6 +384,7 @@ class ContentItem:
     author: str | None = None
     labels: list[str] = field(default_factory=list)
     extra: dict = field(default_factory=dict)  # source-specific metadata
+    stored_extra: dict = field(default_factory=dict)
 
     def to_doc_ref(self, source_id: str) -> DocRef:
         return DocRef(

@@ -76,6 +76,18 @@ LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS = frozenset(
 LOCAL_AGENT_JOB_MAX_ATTEMPTS = 5
 LOCAL_AGENT_SOURCE_ACTIVITY_EPOCH_STALE = "local_agent_source_activity_epoch_stale"
 LOCAL_AGENT_SEMANTIC_INPUT_VERSION = "canonical-v1"
+LOCAL_PACKAGE_CONTRACT_VERSION = 2
+"""The package contract this local agent collects under, declared in its manifest.
+
+An agent that declares no version predates the numbered contract.
+"""
+LOCAL_PACKAGE_SOURCE_TIME_CONTRACT_VERSION = 2
+"""The first contract under which a file package carries the file's source time.
+
+A collection under this contract or a later one does not reuse a retained file
+package without a source time, so the agent uploads that file once more with
+its time (design ``source-sync-to-memory.md`` 0.9).
+"""
 TEAMS_ROLLING_RETENTION_PRESETS = (365, 730, 1095)
 TEAMS_TOMBSTONE_REASONS = frozenset(
     {
@@ -277,6 +289,46 @@ def local_agent_semantic_input_sha256(
         doc_id,
         f"{LOCAL_AGENT_SEMANTIC_INPUT_VERSION}:{semantic_hash}",
     )
+
+
+def local_file_package_semantic_hash(content_hash: str, source_updated_at: str | None) -> str:
+    """The semantic identity of a file package: its content and that content's source time.
+
+    The same content uploaded with and without its source time makes two
+    inputs, so a package that adds the time is retained and projected instead
+    of collapsing into the earlier one. A package without a time is identified
+    by its content hash alone.
+    """
+
+    if source_updated_at is None:
+        return content_hash
+    identity = json.dumps(
+        {"content_hash": content_hash, "source_updated_at": source_updated_at},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def local_package_requires_source_time(
+    source_type: object,
+    package_contract_version: int | None,
+) -> bool:
+    """Whether a collection may reuse only retained packages that carry a source time.
+
+    True for a file source collected under the source-time package contract.
+    """
+
+    from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
+
+    if package_contract_version is None or package_contract_version < LOCAL_PACKAGE_SOURCE_TIME_CONTRACT_VERSION:
+        return False
+    try:
+        adapter = get_local_source_replay_adapter(str(source_type or "").strip().lower())
+    except ValueError:
+        return False
+    return adapter.package_source_time
 
 
 def _source_config(value: object) -> Mapping[str, Any]:

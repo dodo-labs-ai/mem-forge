@@ -43,6 +43,7 @@ from memforge.local_agent.document_identity import (
     build_local_markdown_doc_id,
     build_teams_doc_id,
 )
+from memforge.local_agent.source_contract import local_file_package_semantic_hash
 from memforge.models import content_hash, slugify
 from memforge.storage.database import Database
 from memforge.storage.document_store import DocumentStore
@@ -367,6 +368,7 @@ async def submit_local_markdown_document(
                 "relative_path": relative,
                 "content_type": content_type,
                 "raw_hash": raw_hash,
+                **({SOURCE_UPDATED_AT_KEY: content_time} if content_time is not None else {}),
             },
         )
     return {
@@ -375,6 +377,7 @@ async def submit_local_markdown_document(
         "vault_id": configured_vault,
         "relative_path": relative,
         "document_hash": document_hash,
+        "semantic_hash": local_file_package_semantic_hash(document_hash, content_time),
         "package_path": package_path,
         "package_uri": package_uri,
         "package_sha256": package_sha256,
@@ -563,6 +566,7 @@ async def submit_github_repo_document(
                 **symlink_metadata,
                 "content_type": content_type,
                 "raw_hash": raw_hash,
+                **({SOURCE_UPDATED_AT_KEY: content_time} if content_time is not None else {}),
             },
         )
     return {
@@ -572,6 +576,7 @@ async def submit_github_repo_document(
         "repo_ref": ref,
         "relative_path": relative,
         "document_hash": document_hash,
+        "semantic_hash": local_file_package_semantic_hash(document_hash, content_time),
         "package_path": package_path,
         "package_uri": package_uri,
         "package_sha256": package_sha256,
@@ -696,6 +701,7 @@ async def submit_jira_package(
         "base_url": configured_base_url,
         "issue_key": normalized_issue_key,
         "document_hash": payload_hash,
+        "semantic_hash": payload_hash,
         "package_path": package_path,
         "package_uri": package_uri,
         "package_sha256": package_sha256,
@@ -844,6 +850,7 @@ async def submit_teams_window_package(
         "window_id": normalized_window_id,
         "revision_hash": normalized_revision_hash,
         "document_hash": payload_hash,
+        "semantic_hash": payload_hash,
         "package_path": package_path,
         "package_uri": package_uri,
         "package_sha256": package_sha256,

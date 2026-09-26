@@ -17,14 +17,19 @@ from memforge import main
 from memforge.agent_sessions import _primary_event_source_time
 from memforge.config import AppConfig
 from memforge.genes.github_pages_gene import _content_item_from_url
+from memforge.genes.github_repo_gene import LAST_COMMIT_AT_KEY, GitHubRepoGene
 from memforge.genes.jira_gene import JiraGene
-from memforge.genes.teams_gene import TeamsGene
+from memforge.genes.teams_gene import TeamsGene, _TeamsAPIClient
 from memforge.local_adapter import submit_local_markdown_document
-from memforge.models import ContentItem, NormalizedContent, RawContent
+from memforge.local_agent.teams_contract import MILLISECONDS_PER_SECOND
+from memforge.memory.cross_document_relation import load_relation_subjects
+from memforge.models import ContentItem, Memory, NormalizedContent, RawContent
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_artifacts import StoredSourceArtifact
+from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.source_representation import UNIT_TITLE_OBSERVATION_TYPE
 from memforge.storage.database import Database
+from tests.relation_evidence_fixture import primary_evidence_unit_fixture
 
 # The time MemForge fetched or received the content; never a source time.
 SYNC_TIME = datetime(2026, 9, 26, 8, 0, tzinfo=timezone.utc)
@@ -190,8 +195,9 @@ def test_jira_comments_and_changelog_keep_their_own_times() -> None:
     )
 
     revisions = _revisions_by_type(projection)
-    assert revisions["comment"].observed_at == "2026-02-20T09:00:00.000+0000"
-    assert revisions["changelog"].observed_at == "2026-01-10T09:00:00.000+0000"
+    # Stored in one UTC form, whatever format the provider reported.
+    assert revisions["comment"].observed_at == "2026-02-20T09:00:00+00:00"
+    assert revisions["changelog"].observed_at == "2026-01-10T09:00:00+00:00"
     # The Unit's time is the latest time of its Observations.
     assert projection.source_unit_revisions[0].observed_at == "2026-02-20T09:00:00+00:00"
 
@@ -458,7 +464,7 @@ async def test_teams_window_time_is_its_latest_message_time() -> None:
         "messages": [
             {"id": "m1", "content": "First", "time": "2026-07-30T10:00:00Z"},
             {"id": "m2", "content": "Edited", "time": "2026-07-30T10:01:00Z",
-             "lastModifiedDateTime": "2026-07-30T11:30:00Z"},
+             "edited_time": "2026-07-30T11:30:00+00:00"},
             {"id": "m3", "content": "Last", "time": "2026-07-30T10:05:00Z"},
         ]
     }
@@ -479,3 +485,184 @@ def test_pages_http_time_is_the_last_modified_header_and_never_the_fetch_time() 
 
     assert reported.extra["content_updated_at"] == "2026-05-06T07:08:00+00:00"
     assert unreported.extra["content_updated_at"] is None
+
+
+def test_an_unreadable_provider_time_is_unknown_and_the_projection_continues() -> None:
+    payload = json.loads(_jira_payload([_history("h1", "yesterday", "status")]))
+
+    projection = _project(
+        "jira",
+        _item("jira-PAY-1"),
+        json.dumps(payload).encode(),
+        {},
+        content_type="application/json",
+    )
+
+    revisions = _revisions_by_type(projection)
+    assert revisions["changelog"].observed_at is None
+    # The unreadable time of the latest core change cannot date the core either.
+    assert revisions["issue_core"].observed_at is None
+    assert revisions["comment"].observed_at == "2026-02-20T09:00:00+00:00"
+
+
+def test_teams_edit_time_is_the_chat_service_edittime() -> None:
+    client = _TeamsAPIClient(region="emea")
+    message = {
+        "id": "message-1",
+        "conversationid": "19:chat@example",
+        "imdisplayname": "Alice",
+        "content": "<p>Payroll runs on Fridays.</p>",
+        "messagetype": "RichText/Html",
+        "composetime": "2026-04-15T12:00:00Z",
+    }
+    edited_epoch_ms = int(datetime(2026, 4, 16, 8, 30, tzinfo=timezone.utc).timestamp() * MILLISECONDS_PER_SECOND)
+
+    unedited = client._parse_message(message)
+    edited = client._parse_message({**message, "properties": {"edittime": str(edited_epoch_ms)}})
+
+    assert unedited is not None and edited is not None
+    assert unedited["edited_time"] is None
+    assert edited["edited_time"] == datetime(2026, 4, 16, 8, 30, tzinfo=timezone.utc)
+    assert edited["time"] == datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
+
+
+def test_an_edited_teams_message_takes_its_edit_time() -> None:
+    payload = {
+        "conversation_id": "19:chat@example",
+        "messages": [
+            {"id": "m1", "content": "Payroll runs on Thursdays.", "time": "2026-04-15T12:00:00+00:00"},
+            {
+                "id": "m2",
+                "content": "Payroll runs on Fridays.",
+                "time": "2026-04-15T12:05:00+00:00",
+                "edited_time": "2026-04-16T08:30:00+00:00",
+            },
+        ],
+    }
+
+    projection = _project(
+        "teams",
+        _item("teams-window-1", conversation_id="19:chat@example", window_id="window-1"),
+        json.dumps(payload).encode(),
+        {},
+        content_type="application/json",
+    )
+
+    times = {
+        revision.metadata["provider_key"]: revision.observed_at
+        for revision in projection.observation_revisions
+        if revision.metadata.get("provider_key") in {"m1", "m2"}
+    }
+    assert times == {"m1": "2026-04-15T12:00:00+00:00", "m2": "2026-04-16T08:30:00+00:00"}
+
+
+def test_git_worktree_counts_both_paths_of_a_rename_as_changed(tmp_path) -> None:
+    root = tmp_path / "vault"
+    (root / "docs").mkdir(parents=True)
+    _git(root, "init", "-q")
+    (root / "docs" / "old.md").write_text("# Old\n")
+    (root / "docs" / "kept.md").write_text("# Kept\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "notes", date="2026-01-15T12:00:00+00:00")
+    _git(root, "mv", "docs/old.md", "docs/new.md")
+
+    worktree = main._git_worktree(root / "docs")
+
+    assert worktree is not None
+    assert worktree.changed_paths == frozenset({"new.md", "old.md"})
+
+
+class _GitHubSubjectStore:
+    """Relation subject reads: Evidence from the fixture, Observation Revisions from the database."""
+
+    def __init__(self, db: Database, units) -> None:
+        self._db = db
+        self._units = units
+
+    async def get_memory_evidence_units(self, memory_id):
+        return self._units.get(memory_id, ())
+
+    async def get_document(self, doc_id):
+        return None
+
+    async def get_current_source_observation_revisions(self, source_unit_id):
+        return await self._db.get_current_source_observation_revisions(source_unit_id)
+
+
+@pytest.mark.asyncio
+async def test_a_github_file_commit_time_reaches_the_relation_classifier(db: Database) -> None:
+    # A GitHub file synced without a source time gave its Memories no Evidence
+    # time, so every `updates` involving them was recorded as `contradicts`.
+    await db.upsert_source(
+        id="src-gh",
+        type="github_repo",
+        name="Architecture",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    gene = GitHubRepoGene(
+        config={"repo_url": "https://github.example.test/payroll/architecture", "ref": "main"},
+        source_id="src-gh",
+    )
+    extra = {
+        "repo_url": "https://github.example.test/payroll/architecture",
+        "relative_path": "docs/payroll.md",
+        "repo_owner": "payroll",
+        "repo_name": "architecture",
+    }
+
+    async def sync(run_id: str, item_extra: dict, prior=None):
+        item = _item("github-payroll-md", **item_extra)
+        raw = RawContent(item=item, body=b"# Payroll\n\nPayroll runs on Fridays.", content_type="text/markdown")
+        normalized = await gene.normalize(raw)
+        projection = project_source_item(
+            source_id="src-gh",
+            source_type="github_repo",
+            run_id=run_id,
+            item=item,
+            raw=raw,
+            normalized=normalized,
+            **(prior or {}),
+        )
+        await db.record_source_projection(projection)
+        return projection
+
+    untimed = await sync("run-1", extra)
+    body = _revisions_by_type(untimed)["file_content"]
+    unit_id = untimed.source_units[0].id
+    fixture = primary_evidence_unit_fixture("mem-gh")
+    evidence_unit = replace(
+        fixture,
+        source_type="github_repo",
+        source_unit_id=unit_id,
+        items=(
+            replace(
+                fixture.items[0],
+                anchor=SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id=body.observation_id,
+                    observation_revision_id=body.id,
+                ),
+            ),
+        ),
+    )
+    store = _GitHubSubjectStore(db, {"mem-gh": (evidence_unit,)})
+    memory = Memory(id="mem-gh", memory_type="fact", content="Payroll runs on Fridays.", content_hash="hash")
+
+    before = (await load_relation_subjects(store, (memory,)))["mem-gh"]
+    await sync(
+        "run-2",
+        {**extra, LAST_COMMIT_AT_KEY: "2026-05-01T10:00:00+00:00"},
+        prior={
+            "prior_unit_revision": untimed.source_unit_revisions[0],
+            "prior_observation_revisions": {
+                revision.observation_id: revision for revision in untimed.observation_revisions
+            },
+        },
+    )
+    after = (await load_relation_subjects(store, (memory,)))["mem-gh"]
+
+    assert before.evidence_time is None
+    # The next sync records the commit time on the same revision; the Evidence stays anchored.
+    assert after.evidence_time == "2026-05-01"

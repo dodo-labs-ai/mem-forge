@@ -9,8 +9,11 @@ callers keep the value absent instead of substituting another clock.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 SOURCE_UPDATED_AT_KEY = "source_updated_at"
 """``NormalizedContent.source_semantics`` key for the time of a Unit's body."""
@@ -43,8 +46,23 @@ def source_time_iso(value: object) -> str | None:
     return parsed.isoformat() if parsed is not None else None
 
 
-def latest_source_time(values: Iterable[object]) -> str | None:
-    """The latest of several source times, ignoring absent ones."""
+def reported_source_time(value: object) -> str | None:
+    """A time a provider reported for content, as UTC ISO 8601.
 
-    times = [parsed for value in values if (parsed := parse_source_time(value)) is not None]
+    ``None`` when the provider gave none, or gave one without a timezone offset
+    or in another format: such a value cannot be placed on the timeline, so the
+    content has no usable source time.
+    """
+
+    try:
+        return source_time_iso(value)
+    except ValueError:
+        logger.warning("Source time %r is not an offset-aware ISO 8601 time; treated as unknown", value)
+        return None
+
+
+def latest_source_time(values: Iterable[object]) -> str | None:
+    """The latest of several reported source times, ignoring absent and unusable ones."""
+
+    times = [parse_source_time(time) for value in values if (time := reported_source_time(value)) is not None]
     return max(times).isoformat() if times else None

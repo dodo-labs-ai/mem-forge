@@ -33,7 +33,7 @@ from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, Llm
 from memforge.llm.structured import AgentSessionAuthorityResponse
 from memforge.models import AgentHookReceipt, AgentSessionReceipt, content_hash, slugify
 from memforge.repo_identity import normalize_repo_identifier
-from memforge.source_time import parse_source_time
+from memforge.source_time import parse_source_time, reported_source_time
 from memforge.storage.database import Database
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 
@@ -493,19 +493,18 @@ def _primary_event_source_time(
 ) -> datetime | None:
     """The time of the event that authorizes a patch: the source time of what it writes.
 
-    An event without an offset-aware ISO timestamp has no source time. The
-    window's own ``source_updated_at`` marks when the window started, not when
-    this content was stated, so it is not used here.
+    An event without a timestamp, or with one that is not an offset-aware ISO
+    time, has no source time. The window's own ``source_updated_at`` marks when
+    the window started, not when this content was stated, so it is not used here.
     """
 
     primary_event_id = (proposal.primary_event_id or "").strip()
+    if not primary_event_id:
+        return None
     event = next((item for item in events if item.get("evidence_id") == primary_event_id), None)
-    if not primary_event_id or event is None:
+    if event is None:
         return None
-    try:
-        return parse_source_time(event.get("timestamp"))
-    except ValueError:
-        return None
+    return parse_source_time(reported_source_time(event.get("timestamp")))
 
 
 def _default_actor_for_kind(kind: str) -> str:
