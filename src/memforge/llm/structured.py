@@ -57,9 +57,12 @@ def failure_retryable(error: BaseException) -> bool:
     A failed model call is retried only when it was transient: a provider error
     (rate limit and 5xx included) or a timeout. A request error (a 400, an
     unexpected exception) or an invalid response fails the same way again, so
-    it is not retried within the run: the revision stays uncommitted and the
-    next sync processes it again. Any other failure states it with its
-    ``retryable`` attribute and is retried by default.
+    it is not retried within the run and the revision stays uncommitted. The
+    Unit is derived again only when a later run projects it again: the provider
+    changes the Document and an incremental sync picks it up, or an operator
+    reprocesses it. Recovery of a staged derivation ends that derivation on such
+    a failure (ADR 0040), so it is not retried either. Any other failure states
+    it with its ``retryable`` attribute and is retried by default.
     """
 
     category = getattr(error, "terminal_category", None)
