@@ -31,10 +31,12 @@ from memforge.memory.evidence import (
 )
 from memforge.models import DocumentRecord
 from memforge.pipeline.memory_extractor import MemoryExtractor
+from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.fragment_selector_correction import correct_fragment_selectors_once
 from memforge.pipeline.projection_context import (
-    ProjectionExtractionBatch,
-    plan_projection_extraction_batches,
+    ExtractionAuthority,
+    ExtractionRequest,
+    plan_projection_evidence_work,
 )
 from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
@@ -246,21 +248,21 @@ def _projection(
     )
 
 
-def _batch(projection: SourceProjection) -> ProjectionExtractionBatch:
-    primary = projection.observation_revisions[0].content
-    context = projection.observation_revisions[1].content
-    return ProjectionExtractionBatch(
-        id="batch-1",
-        source_unit_id="unit-1",
-        primary_image_bytes=0,
-        primary_observation_ids=("obs-primary",),
-        primary_content_by_observation_id=(("obs-primary", primary),),
+def _compile(projection: SourceProjection, **kwargs):
+    """obs-primary as whole Primary authority, read with obs-context as Required-only context."""
+    return compile_projection_fragment_catalog(
+        projection,
+        ExtractionAuthority({"obs-primary": None}),
+        catalog_id="catalog-1",
         context_observation_ids=("obs-context",),
-        context_observation_ids_by_primary=(("obs-primary", ("obs-context",)),),
-        primary_markdown=primary,
-        context_markdown=context,
-        primary_authority_spans=(("obs-primary", 0, primary),),
+        **kwargs,
     )
+
+
+def _whole_authority(projection: SourceProjection) -> ExtractionAuthority:
+    authority = plan_projection_evidence_work(projection, reprocess_all_current_observations=False)
+    assert isinstance(authority, ExtractionAuthority)
+    return authority
 
 
 def test_v9_candidate_rejects_legacy_authority() -> None:
@@ -761,19 +763,16 @@ def test_v9_schema_defers_primary_role_to_catalog_admission() -> None:
 
 def test_catalog_resolves_one_primary_and_canonical_required_order() -> None:
     projection = _projection()
-    catalog = compile_projection_fragment_catalog(
+    catalog = _compile(
         projection,
-        _batch(projection),
         access_context_hash="access-1",
     )
-    replay = compile_projection_fragment_catalog(
+    replay = _compile(
         projection,
-        _batch(projection),
         access_context_hash="access-1",
     )
-    changed_capability = compile_projection_fragment_catalog(
+    changed_capability = _compile(
         projection,
-        _batch(projection),
         access_context_hash="access-1",
         inference_capability_hash="b" * 64,
     )
@@ -841,19 +840,15 @@ def test_large_canonical_observation_compiles_from_whole_authority(
         content=content,
     )
 
-    [batch] = plan_projection_extraction_batches(
-        projection,
-        max_primary_chars=30_000,
-    )
+    authority = _whole_authority(projection)
     catalog = compile_projection_fragment_catalog(
         projection,
-        batch,
+        authority,
+        catalog_id="catalog-canonical",
         access_context_hash="access-canonical",
     )
 
-    assert batch.primary_authority_spans == (
-        (f"obs-{observation_type}", 0, content),
-    )
+    assert authority.ranges_by_observation_id == {f"obs-{observation_type}": None}
     assert catalog.usable
     assert catalog.fragments
     assert all(fragment.primary_eligible for fragment in catalog.fragments)
@@ -914,18 +909,14 @@ def test_v9_unknown_whole_authority_profile_fails_in_compiler_not_planner(
         )
         supplied_artifacts = (observation.id,)
 
-    [batch] = plan_projection_extraction_batches(
-        future,
-        max_primary_chars=5_000,
-    )
     catalog = compile_projection_fragment_catalog(
         future,
-        batch,
+        ExtractionAuthority({observation.id: None}),
+        catalog_id="catalog-future-profile",
         access_context_hash="access-future-profile",
         supplied_artifact_observation_ids=supplied_artifacts,
     )
 
-    assert batch.primary_authority_spans == ((observation.id, 0, content),)
     assert not catalog.usable
     assert {
         error.code.value for error in catalog.errors if error.fatal
@@ -937,12 +928,10 @@ def test_canonical_nested_markdown_preserves_escaped_raw_json_ranges() -> None:
     content = json.dumps({"body": body}, ensure_ascii=True, separators=(",", ":"))
     projection = _canonical_projection(observation_type="comment", content=content)
 
-    [batch] = plan_projection_extraction_batches(
-        projection,
-    )
     catalog = compile_projection_fragment_catalog(
         projection,
-        batch,
+        _whole_authority(projection),
+        catalog_id="catalog-escaped",
         access_context_hash="access-escaped",
     )
 
@@ -961,7 +950,7 @@ def test_canonical_nested_markdown_preserves_escaped_raw_json_ranges() -> None:
 
 
 def test_representation_policy_keeps_binary_whole_and_plain_text_range_addressable() -> None:
-    content = "paragraph text\n\n" * 2_500
+    content = "paragraph text\n\n" * 20
     base = _canonical_projection(observation_type="comment", content=content)
     [observation] = base.observations
     [revision] = base.observation_revisions
@@ -972,15 +961,17 @@ def test_representation_policy_keeps_binary_whole_and_plain_text_range_addressab
             replace(revision, evidence_profile=PLAIN_TEXT_PROFILE),
         ),
     )
-    plain_batches = plan_projection_extraction_batches(
+    plain_catalog = compile_projection_fragment_catalog(
         plain,
-        max_primary_chars=5_000,
+        _whole_authority(plain),
+        catalog_id="catalog-plain",
+        access_context_hash="access-plain",
     )
-    assert len(plain_batches) > 1
+    assert len(plain_catalog.fragments) > 1
     assert all(
-        len(span_text) < len(content)
-        for batch in plain_batches
-        for _, _, span_text in batch.primary_authority_spans
+        fragment.anchor.kind is AnchorKind.REVISION_RANGE
+        and fragment.anchor.range_end - fragment.anchor.range_start < len(content)
+        for fragment in plain_catalog.fragments
     )
 
     binary = replace(
@@ -1001,16 +992,12 @@ def test_representation_policy_keeps_binary_whole_and_plain_text_range_addressab
             ),
         ),
     )
-    [binary_batch] = plan_projection_extraction_batches(
-        binary,
-        max_primary_chars=5_000,
-    )
-    assert binary_batch.primary_authority_spans == (
-        (observation.id, 0, content),
-    )
+    binary_authority = _whole_authority(binary)
+    assert binary_authority.ranges_by_observation_id == {observation.id: None}
     binary_catalog = compile_projection_fragment_catalog(
         binary,
-        binary_batch,
+        binary_authority,
+        catalog_id="catalog-binary",
         access_context_hash="access-binary",
         supplied_artifact_observation_ids=(observation.id,),
     )
@@ -1314,18 +1301,16 @@ def test_large_canonical_fragment_fails_with_capacity_error_without_raw_slicing(
         content=content,
     )
 
-    [batch] = plan_projection_extraction_batches(
-        projection,
-        max_primary_chars=200,
-    )
+    authority = _whole_authority(projection)
     catalog = compile_projection_fragment_catalog(
         projection,
-        batch,
+        authority,
+        catalog_id="catalog-capacity",
         access_context_hash="access-capacity",
         max_presentation_chars=1_000,
     )
 
-    assert batch.primary_authority_spans == (("obs-changelog", 0, content),)
+    assert authority.ranges_by_observation_id == {"obs-changelog": None}
     assert not catalog.usable
     assert catalog.fragments == ()
     assert {
@@ -1335,9 +1320,8 @@ def test_large_canonical_fragment_fails_with_capacity_error_without_raw_slicing(
 
 def test_catalog_rejects_duplicate_unknown_and_ineligible_selectors() -> None:
     projection = _projection()
-    catalog = compile_projection_fragment_catalog(
+    catalog = _compile(
         projection,
-        _batch(projection),
         access_context_hash="access-1",
     )
     primary = next(
@@ -1365,9 +1349,8 @@ def test_catalog_rejects_duplicate_unknown_and_ineligible_selectors() -> None:
 
 def test_selection_fingerprint_distinguishes_refs_without_exposing_them() -> None:
     projection = _projection()
-    catalog = compile_projection_fragment_catalog(
+    catalog = _compile(
         projection,
-        _batch(projection),
         access_context_hash="access-1",
     )
     primary = next(fragment for fragment in catalog.fragments if fragment.primary_eligible)
@@ -1404,16 +1387,9 @@ def test_bounded_context_is_required_selectable_but_never_primary_eligible() -> 
             ),
         ),
     )
-    [batch] = plan_projection_extraction_batches(projection)
+    assert _whole_authority(projection).ranges_by_observation_id == {"obs-primary": None}
 
-    assert batch.primary_observation_ids == ("obs-primary",)
-    assert batch.context_observation_ids == ("obs-context",)
-
-    catalog = compile_projection_fragment_catalog(
-        projection,
-        batch,
-        access_context_hash="access-1",
-    )
+    catalog = _compile(projection, access_context_hash="access-1")
     model_payload = catalog.model_payload()
     payload_by_ref = {
         item[0]: item
@@ -1468,12 +1444,7 @@ def test_model_catalog_separates_primary_capable_from_required_only_refs() -> No
             ),
         ),
     )
-    [batch] = plan_projection_extraction_batches(projection)
-    catalog = compile_projection_fragment_catalog(
-        projection,
-        batch,
-        access_context_hash="access-1",
-    )
+    catalog = _compile(projection, access_context_hash="access-1")
 
     payload = catalog.model_payload()
 
@@ -1507,12 +1478,7 @@ async def test_prompt_requires_empty_output_when_only_required_only_context_has_
             ),
         ),
     )
-    [batch] = plan_projection_extraction_batches(projection)
-    catalog = compile_projection_fragment_catalog(
-        projection,
-        batch,
-        access_context_hash="access-1",
-    )
+    catalog = _compile(projection, access_context_hash="access-1")
     prompts: list[str] = []
 
     class Client(RevisionClientFixture):
@@ -1529,7 +1495,7 @@ async def test_prompt_requires_empty_output_when_only_required_only_context_has_
     ).extract_projection_fragment_memories(
         catalog,
         source_type="jira",
-        context_markdown="",
+        revision_context=RevisionAssessmentContext(projection=projection, base=None, access_context_hash="access-1"),
     )
 
     assert result.error_type is None
@@ -1579,7 +1545,14 @@ def test_v9_derivation_identity_includes_model_presentation_policy(
         user_id=None,
         source_activity_epoch=None,
     )
-    batches = plan_projection_extraction_batches(projection)
+    batches = (
+        ExtractionRequest(
+            id="request-1",
+            source_unit_id="unit-1",
+            catalog=_compile(projection, access_context_hash="access-1"),
+            prompt_sha256=hashlib.sha256(b"extraction prompt").hexdigest(),
+        ),
+    )
 
     monkeypatch.setattr(
         source_derivation_module,
@@ -1600,35 +1573,6 @@ def test_v9_derivation_identity_includes_model_presentation_policy(
     assert current.batches[0].input_payload_hash != (
         old.batches[0].input_payload_hash
     )
-
-
-def test_truncated_context_is_display_only_and_not_selectable() -> None:
-    projection = _projection(context_content="Context that does not fit. " * 20)
-    projection = replace(
-        projection,
-        deltas=(
-            replace(
-                projection.deltas[0],
-                added_observation_ids=("obs-primary",),
-            ),
-        ),
-    )
-    [batch] = plan_projection_extraction_batches(
-        projection,
-        max_context_chars=80,
-    )
-
-    assert batch.context_observation_ids == ("obs-context",)
-    assert batch.candidate_context_observation_ids == ()
-
-    catalog = compile_projection_fragment_catalog(
-        projection,
-        batch,
-        access_context_hash="access-1",
-    )
-    assert {
-        fragment.anchor.observation_id for fragment in catalog.fragments
-    } == {"obs-primary"}
 
 
 def test_agent_event_receipt_maps_authority_to_one_projected_markdown_fragment() -> None:
@@ -1696,9 +1640,8 @@ def test_agent_claim_fragment_set_rejects_uncovered_markdown_content() -> None:
 
 def test_missing_profile_makes_complete_catalog_unusable_without_widening() -> None:
     projection = _projection(context_profile=None)
-    catalog = compile_projection_fragment_catalog(
+    catalog = _compile(
         projection,
-        _batch(projection),
         access_context_hash="access-1",
     )
     assert not catalog.usable
@@ -1724,9 +1667,8 @@ def test_inspected_artifact_uses_same_ref_shape_as_text_required() -> None:
             }
         },
     )
-    catalog = compile_projection_fragment_catalog(
+    catalog = _compile(
         projection,
-        _batch(projection),
         access_context_hash="access-1",
         supplied_artifact_observation_ids=("obs-context",),
     )
@@ -1770,9 +1712,8 @@ def test_supplied_fieldless_legacy_artifact_uses_normalized_eligibility() -> Non
         },
     )
 
-    catalog = compile_projection_fragment_catalog(
+    catalog = _compile(
         projection,
-        _batch(projection),
         access_context_hash="access-1",
         supplied_artifact_observation_ids=("obs-context",),
     )
@@ -1797,9 +1738,8 @@ async def test_extractor_admits_normalized_candidates_with_candidate_local_telem
             }
         },
     )
-    catalog = compile_projection_fragment_catalog(
+    catalog = _compile(
         projection,
-        _batch(projection),
         access_context_hash="access-1",
         supplied_artifact_observation_ids=("obs-context",),
     )
@@ -1862,7 +1802,14 @@ async def test_extractor_admits_normalized_candidates_with_candidate_local_telem
         ).extract_projection_fragment_memories(
             catalog,
             source_type="github_repo",
-            context_markdown="",
+            revision_context=RevisionAssessmentContext(
+                projection=projection,
+                base=None,
+                access_context_hash="access-1",
+                images=(
+                    StructuredLlmImage(source_observation_id="obs-context", media_type="image/png", body=b"image"),
+                ),
+            ),
         )
 
     assert len(result.memories) == 1
@@ -1907,12 +1854,7 @@ async def test_extractor_admits_normalized_candidates_with_candidate_local_telem
 @pytest.mark.asyncio
 async def test_extractor_persists_only_resolved_parts_and_never_falls_back() -> None:
     projection = _projection()
-    batch = _batch(projection)
-    catalog = compile_projection_fragment_catalog(
-        projection,
-        batch,
-        access_context_hash="access-1",
-    )
+    catalog = _compile(projection, access_context_hash="access-1")
     primary = next(
         item
         for item in catalog.fragments
@@ -1949,7 +1891,7 @@ async def test_extractor_persists_only_resolved_parts_and_never_falls_back() -> 
     ).extract_projection_fragment_memories(
         catalog,
         source_type="github_repo",
-        context_markdown=batch.context_markdown,
+        revision_context=RevisionAssessmentContext(projection=projection, base=None, access_context_hash="access-1"),
     )
     assert result.error_type is None
     assert len(result.memories) == 1
@@ -1974,7 +1916,7 @@ async def test_extractor_persists_only_resolved_parts_and_never_falls_back() -> 
 ])
 async def test_selector_correction_preserves_success_and_fixed_claims(mode) -> None:
     projection = _projection()
-    catalog = compile_projection_fragment_catalog(projection, _batch(projection), access_context_hash="access-1")
+    catalog = _compile(projection, access_context_hash="access-1")
     primary = next(f.reference for f in catalog.fragments if f.primary_eligible)
     required = next(f.reference for f in catalog.fragments if not f.primary_eligible)
     stable = ProjectionFragmentMemoryCandidate(
@@ -2037,11 +1979,12 @@ async def test_selector_correction_preserves_success_and_fixed_claims(mode) -> N
 
     client = Client()
     extractor = MemoryExtractor(structured_llm_client=client)
+    context = RevisionAssessmentContext(projection=projection, base=None, access_context_hash="access-1")
     if mode == "cancelled":
         with pytest.raises(asyncio.CancelledError):
-            await extractor.extract_projection_fragment_memories(catalog, source_type="github_repo", context_markdown="")
+            await extractor.extract_projection_fragment_memories(catalog, source_type="github_repo", revision_context=context)
         return
-    result = await extractor.extract_projection_fragment_memories(catalog, source_type="github_repo", context_markdown="")
+    result = await extractor.extract_projection_fragment_memories(catalog, source_type="github_repo", revision_context=context)
     assert result.error_type is None
     assert result.memories[0].content == stable.content
     assert len(result.memories[0].resolved_evidence_selection.parts) == 1
@@ -2080,8 +2023,8 @@ async def test_selector_correction_groups_failures_and_reuses_artifact_images() 
         "source_artifact": {"inference_eligible": True, "sha256": "a" * 64,
                             "media_type": "image/png", "size_bytes": 128, "filename": "diagram.png"},
     })
-    catalog = compile_projection_fragment_catalog(
-        projection, _batch(projection), access_context_hash="access-1",
+    catalog = _compile(
+        projection, access_context_hash="access-1",
         supplied_artifact_observation_ids=("obs-context",),
     )
     primary = next(f.reference for f in catalog.fragments if f.primary_eligible)
@@ -2124,7 +2067,7 @@ async def test_selector_correction_groups_failures_and_reuses_artifact_images() 
 def test_compact_catalog_preserves_exact_text_authority_and_internal_provenance():
     import json
     projection = _projection()
-    catalog = compile_projection_fragment_catalog(projection, _batch(projection), access_context_hash="access-1")
+    catalog = _compile(projection, access_context_hash="access-1")
     payload = catalog.model_payload()
     rows = [row for group in payload.values() for row in group]
     by_ref = {row[0]: row for row in rows}
@@ -2147,7 +2090,7 @@ def test_compact_catalog_preserves_exact_text_authority_and_internal_provenance(
 @pytest.mark.parametrize("tag", ["h2", "pre", "blockquote"])
 def test_compact_catalog_retains_html_semantics_after_tag_stripping(tag):
     projection = _projection()
-    catalog = compile_projection_fragment_catalog(projection, _batch(projection), access_context_hash="access-1")
+    catalog = _compile(projection, access_context_hash="access-1")
     fragment = replace(catalog.fragments[0], fragment_type=f"html-{tag}", presentation_text="US payroll")
     catalog = replace(catalog, fragments=(fragment,))
     row = next(row for group in catalog.model_payload().values() for row in group)

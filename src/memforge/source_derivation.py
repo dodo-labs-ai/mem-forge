@@ -45,13 +45,15 @@ from memforge.pipeline.extraction_contract import (
 )
 from memforge.pipeline.projection_context import (
     CommittedSourceUnitSnapshot,
+    ExtractionAuthority,
+    ExtractionRequest,
     PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION,
     ProjectionEvidencePlanningFailure,
     ProjectionEvidencePlanningFailureCode,
-    ProjectionExtractionBatch,
     observation_is_inference_eligible,
     plan_projection_evidence_work,
 )
+from memforge.pipeline.revision_assessment import REVISION_INPUT_POLICY
 from memforge.source_artifacts import SourceArtifactSummary
 from memforge.source_projection import (
     AnchorKind,
@@ -248,21 +250,20 @@ class SourceDerivationStore(DerivationWorkStore, Protocol):
 class SourceUnitDerivationRequest:
     projection: SourceProjection
     context: SourceUnitDerivationContext
-    extract_batch: Callable[
-        [ProjectionExtractionBatch],
+    # Plans the Claim Extraction requests of the planned authority; each request
+    # is one durable derivation batch.
+    plan_requests: Callable[
+        [ExtractionAuthority],
+        Awaitable[tuple[ExtractionRequest, ...]],
+    ]
+    extract_request: Callable[
+        [ExtractionRequest],
         Awaitable[MemoryExtractionResult],
     ]
     max_concurrent: int
     committed_base_snapshot: CommittedSourceUnitSnapshot | None = None
     access_context_hash: str | None = None
     inference_capability_hash: str | None = None
-    prepare_batches: (
-        Callable[
-            [tuple[ProjectionExtractionBatch, ...]],
-            Awaitable[tuple[ProjectionExtractionBatch, ...]],
-        ]
-        | None
-    ) = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,7 +276,7 @@ class SourceUnitDerivationResult:
 
 def _plan_source_unit_derivation_work(
     request: SourceUnitDerivationRequest,
-) -> tuple[ProjectionExtractionBatch, ...] | ProjectionEvidencePlanningFailure:
+) -> ExtractionAuthority | ProjectionEvidencePlanningFailure:
     """Plan Evidence work once for production and offline replay."""
 
     if not request.access_context_hash or not request.inference_capability_hash:
@@ -371,7 +372,7 @@ def _authority_plan_identity(
         "access_context_hash": request.access_context_hash,
         "source_activity_epoch": request.context.source_activity_epoch,
         "inference_capability_hash": request.inference_capability_hash,
-        "semantic_input_policy": "revision-input-v6",
+        "semantic_input_policy": REVISION_INPUT_POLICY,
         "authority_policy_version": (
             PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION
         ),
@@ -491,7 +492,7 @@ class SourceUnitDeriver:
                 reused_batch_count=0,
                 executed_batch_count=0,
             )
-        batches = await request.prepare_batches(planned_work) if request.prepare_batches else planned_work
+        batches = await request.plan_requests(planned_work)
         manifest = source_derivation_manifest(
             request.projection,
             batches,
@@ -509,7 +510,7 @@ class SourceUnitDeriver:
         pending_batches = tuple(batch for batch in batches if batch.id not in completed_results)
 
         async def extract_and_persist(
-            batch: ProjectionExtractionBatch,
+            batch: ExtractionRequest,
         ) -> MemoryExtractionResult:
             quality_signals = QualitySignalCollector()
             batch_record = next(record for record in derivation.batches if record.batch_id == batch.id)
@@ -522,7 +523,7 @@ class SourceUnitDeriver:
                 trace_id=runtime_trace_id(derivation_id=derivation.id, batch_id=batch.id,
                     batch_attempt=batch_record.attempt_count + 1),
             ):
-                result = await request.extract_batch(batch)
+                result = await request.extract_request(batch)
             try:
                 quality_signals.record(
                     QualitySignal(
@@ -639,10 +640,10 @@ async def replay_source_unit_derivation(
             planned_work,
             offline_replay=True,
         )
-    batches = planned_work
+    batches = await request.plan_requests(planned_work)
     results = await collect_bounded(
         batches,
-        request.extract_batch,
+        request.extract_request,
         max_concurrent=request.max_concurrent,
     )
     extraction = assemble_source_derivation_results(
@@ -682,7 +683,7 @@ def _safe_model_identifier(value: object) -> str | None:
 
 def source_derivation_manifest(
     projection: SourceProjection,
-    batches: tuple[ProjectionExtractionBatch, ...],
+    batches: tuple[ExtractionRequest, ...],
     *,
     context: SourceUnitDerivationContext,
     terminal_reason_code: str | None = None,
@@ -1044,7 +1045,7 @@ def _evidence_work_identity_hash(
 def _batch_input_payload_hash(
     *,
     target_revision_id: str,
-    batch: ProjectionExtractionBatch,
+    batch: ExtractionRequest,
     evidence_work_identity_hash: str | None = None,
 ) -> str:
     payload = {
@@ -1052,31 +1053,10 @@ def _batch_input_payload_hash(
         "extraction_contract_version": PROJECTION_EXTRACTION_CONTRACT_VERSION,
         "evidence_work_identity_hash": evidence_work_identity_hash,
         "batch_id": batch.id,
-        "prepared_catalog_digest": batch.prepared_catalog.digest if batch.prepared_catalog else None,
-        "prepared_prompt_hash": hashlib.sha256(batch.prepared_prompt.encode()).hexdigest() if batch.prepared_prompt else None,
-        "prepared_input_mode": batch.prepared_input_mode,
-        "prepared_selection_reason": batch.prepared_selection_reason,
-        "prepared_estimated_cost": dict(batch.prepared_estimated_cost or {}),
+        "catalog_digest": batch.catalog.digest,
+        "prompt_sha256": batch.prompt_sha256,
         "authority_policy_version": PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION,
         "primary_observation_ids": list(batch.primary_observation_ids),
-        "primary_authority_spans": [
-            {
-                "observation_id": observation_id,
-                "range_start": start,
-                "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-            }
-            for observation_id, start, content in batch.primary_authority_spans
-        ],
-        "primary_content_sha256": hashlib.sha256(batch.primary_markdown.encode("utf-8")).hexdigest(),
-        "context_observation_ids": list(batch.context_observation_ids),
-        "context_content_sha256": hashlib.sha256(batch.context_markdown.encode("utf-8")).hexdigest(),
-        "primary_image_bytes": batch.primary_image_bytes,
-        "candidate_context_observation_ids": list(
-            batch.context_observation_ids
-            if batch.candidate_context_observation_ids is None
-            else batch.candidate_context_observation_ids
-        ),
-        "candidate_context_image_bytes": batch.candidate_context_image_bytes,
         "model_presentation_policy_version": (
             PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION
         ),

@@ -16,6 +16,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Mapping, MutableMapping
 
+from memforge.derivation_work import payload_hash
 from memforge.memory.evidence import (
     ActiveSupportEvidence,
     EvidencePartKind,
@@ -33,10 +34,11 @@ from memforge.pipeline.evidence_fragments import (
     FragmentCompilationError,
     FragmentCompilationErrorCode,
     RevisionFragmentIndex,
+    UNIT_IDENTITY_FRAGMENT_TYPE,
     build_revision_fragment_index,
     compile_fragments,
 )
-from memforge.pipeline.projection_context import ProjectionExtractionBatch
+from memforge.pipeline.projection_context import ExtractionAuthority
 from memforge.pipeline.projection_images import (
     projection_inference_capability_hash,
 )
@@ -842,6 +844,16 @@ class ProjectionFragmentCatalog:
     def usable(self) -> bool:
         return bool(self.fragments) and not any(error.fatal for error in self.errors)
 
+    def subset(self, references) -> ProjectionFragmentCatalog:
+        """The Fragments with these references, keeping each reference and its authority."""
+
+        selected = frozenset(references)
+        return replace(
+            self,
+            fragments=tuple(fragment for fragment in self.fragments if fragment.reference in selected),
+            digest=payload_hash([self.digest, sorted(selected)]),
+        )
+
     def model_payload(self) -> Mapping[str, tuple[tuple[object, ...], ...]]:
         """Present exact text and selectable refs; provenance stays in this catalog."""
 
@@ -849,7 +861,11 @@ class ProjectionFragmentCatalog:
         required: list[tuple[object, ...]] = []
         for fragment in self.fragments:
             row: tuple[object, ...] = (fragment.reference, fragment.presentation_text)
-            if (fragment.fragment_type.startswith("html-") and fragment.fragment_type != "html-p") or fragment.fragment_type.startswith("canonical-"):
+            if (
+                (fragment.fragment_type.startswith("html-") and fragment.fragment_type != "html-p")
+                or fragment.fragment_type.startswith("canonical-")
+                or fragment.fragment_type == UNIT_IDENTITY_FRAGMENT_TYPE
+            ):
                 row += ({"format": fragment.fragment_type},)
             if fragment.kind is EvidenceFragmentKind.ARTIFACT:
                 metadata = self.artifact_metadata_by_revision_id.get(fragment.anchor.observation_revision_id, {})
@@ -1022,15 +1038,21 @@ class AgentEventSourceRangeReceipt:
 
 def compile_projection_fragment_catalog(
     projection: SourceProjection,
-    batch: ProjectionExtractionBatch,
+    authority: ExtractionAuthority,
     *,
+    catalog_id: str,
     access_context_hash: str,
+    context_observation_ids: tuple[str, ...] = (),
     inference_capability_hash: str | None = None,
     supplied_artifact_observation_ids: tuple[str, ...] = (),
     max_fragments: int = DEFAULT_MAX_FRAGMENTS,
     max_presentation_chars: int = DEFAULT_MAX_PRESENTATION_CHARS,
 ) -> ProjectionFragmentCatalog:
-    """Compile one immutable, source/scope-bound v9 selection catalog."""
+    """Compile one immutable, source/scope-bound v9 selection catalog.
+
+    Authorized Observations are compiled against their exact Primary ranges;
+    context Observations are Required-only.
+    """
 
     if len(projection.source_units) != 1 or len(projection.source_unit_revisions) != 1:
         raise ValueError("projection Fragment catalog requires exactly one Source Unit revision")
@@ -1042,32 +1064,21 @@ def compile_projection_fragment_catalog(
     if max_fragments <= 0 or max_presentation_chars <= 0:
         raise ValueError("projection Fragment catalog limits must be positive")
 
-    source_unit = projection.source_units[0]
     unit_revision = projection.source_unit_revisions[0]
-    if batch.source_unit_id != source_unit.id or unit_revision.source_unit_id != source_unit.id:
-        raise ValueError("projection Fragment batch belongs to another Source Unit")
-
     revisions = {
         revision.observation_id: revision
         for revision in projection.observation_revisions
         if revision.id in set(unit_revision.observation_revision_ids)
     }
     observation_ids = {observation.id for observation in projection.observations}
-    candidate_context_ids = set(
-        batch.context_observation_ids
-        if batch.candidate_context_observation_ids is None
-        else batch.candidate_context_observation_ids
-    )
-    if not candidate_context_ids.issubset(batch.context_observation_ids):
-        raise ValueError("candidate Context must come from the bounded batch input")
-    selectable_ids = set(batch.primary_observation_ids) | candidate_context_ids
+    primary_ids = set(authority.ranges_by_observation_id)
+    selectable_ids = primary_ids | set(context_observation_ids)
     if not selectable_ids.issubset(revisions) or not selectable_ids.issubset(observation_ids):
-        raise ValueError("projection Fragment batch contains stale Observation identity")
+        raise ValueError("projection Fragment catalog contains stale Observation identity")
     supplied_artifacts = set(supplied_artifact_observation_ids)
     if not supplied_artifacts.issubset(selectable_ids):
         raise ValueError("supplied Artifact belongs to another catalog")
 
-    primary_spans = _primary_spans_by_observation(batch)
     compiled_fragments: list[EvidenceFragment] = []
     errors: list[FragmentCompilationError] = []
     component_digests: list[str] = []
@@ -1076,7 +1087,7 @@ def compile_projection_fragment_catalog(
 
     for observation_id in sorted(selectable_ids, key=lambda value: revisions[value].id):
         revision = revisions[observation_id]
-        is_primary = observation_id in set(batch.primary_observation_ids)
+        is_primary = observation_id in primary_ids
         if revision.evidence_profile is None:
             ranges = (_whole_range(revision, primary_eligible=is_primary),)
         elif revision.evidence_profile.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT:
@@ -1096,19 +1107,14 @@ def compile_projection_fragment_catalog(
                 dict(raw_artifact) if isinstance(raw_artifact, Mapping) else {}
             )
         elif is_primary:
-            spans = primary_spans.get(observation_id, ())
-            if not spans:
-                errors.append(
-                    _fatal_error(
-                        revision,
-                        FragmentCompilationErrorCode.INVALID_AUTHORITY_RANGE,
-                        "Primary Observation has no exact authority span",
-                    )
+            spans = authority.ranges_by_observation_id[observation_id]
+            ranges = (
+                (_whole_range(revision, primary_eligible=True),)
+                if spans is None
+                else tuple(
+                    _text_range(revision, start, end, primary_eligible=True)
+                    for start, end in _merged_spans(spans)
                 )
-                continue
-            ranges = tuple(
-                _text_range(revision, start, end, primary_eligible=True)
-                for start, end in spans
             )
         else:
             ranges = (_whole_range(revision, primary_eligible=False),)
@@ -1128,7 +1134,7 @@ def compile_projection_fragment_catalog(
         projection=projection,
         access_context_hash=access_context_hash,
         catalog_identity={
-            "batch_id": batch.id,
+            "catalog_id": catalog_id,
             "inference_capability_hash": (
                 resolved_inference_capability_hash
             ),
@@ -1250,8 +1256,10 @@ def resolve_projected_agent_claim_fragment(
     if len(matches) != 1:
         raise ValueError("projected agent claim must map to one unique current Markdown range")
     revision, claim_start, claim_end = matches[0]
-    batch = ProjectionExtractionBatch(
-        id=(
+    catalog = compile_projection_fragment_catalog(
+        projection,
+        ExtractionAuthority({revision.observation_id: None}),
+        catalog_id=(
             "agent-fragment-"
             + hashlib.sha256(
                 "\x1f".join(
@@ -1265,19 +1273,6 @@ def resolve_projected_agent_claim_fragment(
                 ).encode("utf-8")
             ).hexdigest()[:20]
         ),
-        source_unit_id=projection.source_units[0].id,
-        primary_image_bytes=0,
-        primary_observation_ids=(revision.observation_id,),
-        primary_content_by_observation_id=((revision.observation_id, revision.content),),
-        context_observation_ids=(),
-        context_observation_ids_by_primary=((revision.observation_id, ()),),
-        primary_markdown=revision.content,
-        context_markdown="",
-        primary_authority_spans=((revision.observation_id, 0, revision.content),),
-    )
-    catalog = compile_projection_fragment_catalog(
-        projection,
-        batch,
         access_context_hash=access_context_hash,
     )
     if not catalog.usable:
@@ -1429,28 +1424,14 @@ def _text_range(
     )
 
 
-def _primary_spans_by_observation(
-    batch: ProjectionExtractionBatch,
-) -> dict[str, tuple[tuple[int, int], ...]]:
-    raw_spans = batch.primary_authority_spans or tuple(
-        (observation_id, 0, content)
-        for observation_id, content in batch.primary_content_by_observation_id
-    )
-    grouped: dict[str, list[tuple[int, int]]] = {}
-    for observation_id, start, content in raw_spans:
-        if not content:
-            continue
-        grouped.setdefault(observation_id, []).append((start, start + len(content)))
-    merged: dict[str, tuple[tuple[int, int], ...]] = {}
-    for observation_id, spans in grouped.items():
-        output: list[tuple[int, int]] = []
-        for start, end in sorted(spans):
-            if output and start <= output[-1][1]:
-                output[-1] = (output[-1][0], max(output[-1][1], end))
-            else:
-                output.append((start, end))
-        merged[observation_id] = tuple(output)
-    return merged
+def _merged_spans(spans: tuple[tuple[int, int], ...]) -> tuple[tuple[int, int], ...]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
 
 
 def _fragment_sort_key(fragment: EvidenceFragment) -> tuple[object, ...]:

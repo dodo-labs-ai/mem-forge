@@ -112,7 +112,7 @@ from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.source_sync_manifest import SourceSyncManifestStore
 from memforge.scheduler import SOURCE_SCHEDULE_SCAN_JOB_ID, SyncScheduler
-from tests.llm_fixture import AdmittingClient, NoopMemoryExtractor
+from tests.llm_fixture import AdmittingClient, NoopMemoryExtractor, fixture_request_planner
 from tests.unit_support_fixture import active_support_evidence
 
 
@@ -3439,7 +3439,7 @@ class ProjectionFragmentCandidateExtractor(ProjectionFragmentRecordingExtractor)
 class ProjectionFragmentArtifactSummaryExtractor(ProjectionFragmentRecordingExtractor):
     async def extract_projection_fragment_memories(self, catalog, **kwargs):
         self.fragment_calls.append(catalog)
-        images = kwargs.get("images", ())
+        images = kwargs["revision_context"].images_for(catalog)
         return MemoryExtractionResult(
             memories=[],
             artifact_summaries=tuple(
@@ -4453,6 +4453,7 @@ async def _insert_document_with_metadata(
     projection_source_type: str | None = None,
     configured_source_type: str | None = None,
     source_url: str | None = None,
+    space_or_project: str = "ARCH",
 ) -> None:
     source_url = source_url or f"http://example/{doc_id}"
     await db.upsert_source(
@@ -4474,7 +4475,7 @@ async def _insert_document_with_metadata(
             source_id,
             source_url,
             title,
-            "ARCH",
+            space_or_project,
             now.isoformat(),
             version,
             content_hash(markdown),
@@ -4493,7 +4494,7 @@ async def _insert_document_with_metadata(
         source_url=source_url,
         last_modified=now,
         content_type="application/json" if projection_source_type == "jira" else "text/markdown",
-        space_or_project="ARCH",
+        space_or_project=space_or_project,
         version=version,
         extra=item_extra,
     )
@@ -4605,29 +4606,18 @@ async def _stage_completed_v9_recovery_attempt(
     async def extract(_batch):
         return MemoryExtractionResult(memories=[])
 
-    from memforge.pipeline.extraction_requests import plan_fragment_requests
-    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-    from memforge.pipeline.projection_fragments import compile_projection_fragment_catalog
     access_hash = lifecycle_access_context_hash(visibility="workspace", owner_user_id=None, project_key=None, repo_identifier=None)
-    assessment = RevisionAssessmentContext(projection=projection, base=None, access_context_hash=access_hash)
     capability = revision_inference_capability_hash(client, extraction_model="fixture", extraction_max_tokens=8192)
-    recovery_extractor = ProjectionFragmentRecordingExtractor()
-    async def prepare_batches(batches):
-        prepared = []
-        for batch in batches:
-            catalog = compile_projection_fragment_catalog(projection, batch, access_context_hash=access_hash,
-                inference_capability_hash=capability, max_fragments=len(assessment.full_fragments),
-                max_presentation_chars=sum(len(f.presentation_text) for f in assessment.full_fragments))
-            prepared.extend(plan_fragment_requests(batch, catalog, context=assessment,
-                extractor=recovery_extractor, source_type="github_repo", doc_type="document"))
-        return tuple(prepared)
+    plan_requests = fixture_request_planner(
+        projection, access_context_hash=access_hash, extractor=ProjectionFragmentRecordingExtractor(),
+    )
 
     staged = await SourceUnitDeriver(db).derive(
         SourceUnitDerivationRequest(
             projection=projection,
             context=context,
-            extract_batch=extract,
-            prepare_batches=prepare_batches,
+            plan_requests=plan_requests,
+            extract_request=extract,
             max_concurrent=1,
             access_context_hash=lifecycle_access_context_hash(
                 visibility="workspace",
@@ -5154,23 +5144,28 @@ async def test_recovered_external_blocker_does_not_stop_provider_discovery(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("changed_policy", ["model_presentation", "revision_input"])
 async def test_derivation_recovery_commits_the_current_policy_identity(
     db: Database,
     monkeypatch: pytest.MonkeyPatch,
+    changed_policy: str,
 ) -> None:
     source_id = "src-v9-policy-replacement"
-    attempt = await _stage_completed_v9_recovery_attempt(
-        db,
-        source_id=source_id,
-    )
-    monkeypatch.setattr(
-        source_derivation_module,
-        "PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION",
-        (
-            source_derivation_module.PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION
-            + 1
-        ),
-    )
+    if changed_policy == "revision_input":
+        # Work staged before an upgrade that changed the reading scope is replaced, not resumed.
+        with monkeypatch.context() as staged:
+            staged.setattr(source_derivation_module, "REVISION_INPUT_POLICY", "revision-input-v6")
+            attempt = await _stage_completed_v9_recovery_attempt(db, source_id=source_id)
+    else:
+        attempt = await _stage_completed_v9_recovery_attempt(db, source_id=source_id)
+        monkeypatch.setattr(
+            source_derivation_module,
+            "PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION",
+            (
+                source_derivation_module.PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION
+                + 1
+            ),
+        )
     extractor = ProjectionFragmentRecordingExtractor()
     recovery_engine = RecordingMemoryEngine()
     recovery = GeneSyncOrchestrator(
@@ -11237,6 +11232,8 @@ async def test_unchanged_document_backfills_pdf_uri_without_llm_reprocessing(db:
         markdown=markdown,
         version="0",
         projection_source_type="confluence",
+        # The gene reports this space, which the Unit Title names.
+        space_or_project="PAY",
     )
     release = asyncio.Event()
     release.set()
@@ -11275,6 +11272,8 @@ async def test_missing_pdf_uri_forces_full_sync_without_llm_reprocessing(db: Dat
         markdown=markdown,
         version="0",
         projection_source_type="confluence",
+        # The gene reports this space, which the Unit Title names.
+        space_or_project="PAY",
     )
     await db.upsert_sync_state(
         SyncState(
@@ -11321,6 +11320,8 @@ async def test_missing_required_confluence_pdf_fails_sync_without_hiding_gap(db:
         markdown=markdown,
         version="0",
         projection_source_type="confluence",
+        # The gene reports this space, which the Unit Title names.
+        space_or_project="PAY",
     )
     release = asyncio.Event()
     release.set()
@@ -11442,6 +11443,8 @@ async def test_confluence_pdf_storage_failure_is_not_reported_as_export_failure(
         markdown=markdown,
         version="0",
         projection_source_type="confluence",
+        # The gene reports this space, which the Unit Title names.
+        space_or_project="PAY",
     )
     release = asyncio.Event()
     release.set()
@@ -11480,6 +11483,8 @@ async def test_existing_confluence_pdf_uri_is_preserved_when_unchanged_export_is
         markdown=markdown,
         version="0",
         projection_source_type="confluence",
+        # The gene reports this space, which the Unit Title names.
+        space_or_project="PAY",
     )
     await db.db.execute(
         "UPDATE documents SET pdf_content_uri = ? WHERE doc_id = ?",
@@ -11526,6 +11531,8 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
         version="0",
         normalized_content_uri="file:///tmp/Architecture/existing.md",
         projection_source_type="confluence",
+        # The gene reports this space, which the Unit Title names.
+        space_or_project="PAY",
     )
     await db.db.execute(
         """UPDATE documents

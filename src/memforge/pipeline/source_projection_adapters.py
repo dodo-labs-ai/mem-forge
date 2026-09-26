@@ -36,6 +36,7 @@ from memforge.source_projection import (
     SourceUnitRevision,
 )
 from memforge.source_representation import (
+    UNIT_IDENTITY_OBSERVATION_TYPE,
     representation_profile_for_observation_contract,
 )
 from memforge.source_projection_config import (
@@ -115,6 +116,52 @@ class _ObservationInput:
 
 
 _REVISION_SEMANTIC_METADATA_KEYS = ("claim_evidence_scope",)
+# The Unit Title's provider key; native provider keys never start with "$".
+_UNIT_IDENTITY_PROVIDER_KEY = "$unit_identity"
+
+
+@dataclass(frozen=True, slots=True)
+class _UnitTitle:
+    """The provider's human-facing name of one Source Unit: its kind and named values.
+
+    Adapters supply only values present in the provider payload; absent values
+    are omitted, never guessed.
+    """
+
+    kind: str
+    fields: tuple[tuple[str, str], ...]
+
+    @classmethod
+    def of(cls, kind: str, *fields: tuple[str, object]) -> _UnitTitle:
+        present = tuple(
+            (name, " ".join(str(value).split()))
+            for name, value in fields
+            if value is not None and str(value).strip()
+        )
+        return cls(kind=kind, fields=present)
+
+    def observation(self) -> _ObservationInput:
+        return _ObservationInput(
+            UNIT_IDENTITY_OBSERVATION_TYPE,
+            _UNIT_IDENTITY_PROVIDER_KEY,
+            "\n".join((self.kind, *(f"{name}: {value}" for name, value in self.fields))),
+            {"kind": self.kind, "fields": [list(field) for field in self.fields]},
+            {},
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _NativeProjection:
+    """One provider payload as a Source Unit, its Observations and its Unit Title."""
+
+    unit_type: str
+    provider_key: str
+    observations: tuple[_ObservationInput, ...]
+    relations: tuple[tuple[SourceRelationType, str, str, str | None, Mapping[str, object]], ...]
+    coverage: ProjectionCoverage
+    locator: Mapping[str, object]
+    # None only when the payload tombstones the whole Unit.
+    title: _UnitTitle | None
 
 
 def _observation_semantic_hash(value: _ObservationInput) -> str:
@@ -240,13 +287,18 @@ def project_source_item(
     prior_observation_revisions = prior_observation_revisions or {}
     native = _native_payload(raw)
     projected_scope = dict(scope or {})
-    unit_type, provider_key, observations_input, relations_input, coverage, locator = _project_native(
+    native_projection = _project_native(
         source_id=source_id,
         source_type=source_type,
         item=item,
         native=native,
         normalized=normalized,
     )
+    unit_type = native_projection.unit_type
+    provider_key = native_projection.provider_key
+    relations_input = native_projection.relations
+    coverage = native_projection.coverage
+    locator = native_projection.locator
     coverage = _provider_authoritative_unit_coverage(
         source_type=source_type,
         native=native,
@@ -307,7 +359,13 @@ def project_source_item(
         )
         for artifact in artifacts
     )
-    observations_input = (*observations_input, *artifact_inputs)
+    # The Unit Title comes first and is returned by every projection of a live Unit.
+    title = native_projection.title
+    observations_input = (
+        *((title.observation(),) if title is not None else ()),
+        *native_projection.observations,
+        *artifact_inputs,
+    )
     observations: list[SourceObservation] = []
     revisions: list[SourceObservationRevision] = []
     carried_revision_ids: list[str] = []
@@ -732,14 +790,7 @@ def _project_native(
     item: ContentItem,
     native: object,
     normalized: NormalizedContent,
-) -> tuple[
-    str,
-    str,
-    tuple[_ObservationInput, ...],
-    tuple[tuple[SourceRelationType, str, str, str | None, Mapping[str, object]], ...],
-    ProjectionCoverage,
-    Mapping[str, object],
-]:
+) -> _NativeProjection:
     if source_type == "confluence":
         page_id = str(item.extra.get("page_id") or item.item_id.removeprefix("confluence-"))
         parent_id = str(item.extra.get("parent_page_id") or "")
@@ -761,10 +812,10 @@ def _project_native(
             "body": semantic_body,
         }
         semantic_content = f"# {item.title}\n\n{display_body}".strip()
-        return (
-            "confluence_page",
-            page_id,
-            (
+        return _NativeProjection(
+            unit_type="confluence_page",
+            provider_key=page_id,
+            observations=(
                 _ObservationInput(
                     "page_body",
                     f"{page_id}:body",
@@ -773,14 +824,19 @@ def _project_native(
                     {},
                 ),
             ),
-            relations,
-            ProjectionCoverage.COMPLETE_SNAPSHOT,
-            {
+            relations=relations,
+            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+            locator={
                 "page_id": page_id,
                 "space_key": item.extra.get("space_key") or item.space_or_project,
                 "parent_page_id": parent_id or None,
                 "url": item.source_url,
             },
+            title=_UnitTitle.of(
+                "Confluence page",
+                ("Space", item.extra.get("space_key") or item.space_or_project),
+                ("Title", item.title),
+            ),
         )
     if source_type == "jira":
         data = native if isinstance(native, dict) else {}
@@ -865,13 +921,19 @@ def _project_native(
             if data.get("_comments_truncated") or data.get("_changelog_truncated") or changelog_incomplete
             else ProjectionCoverage.COMPLETE_SNAPSHOT
         )
-        return (
-            "jira_issue",
-            issue_id,
-            tuple(inputs),
-            tuple(relations),
-            coverage,
-            {"issue_id": issue_id, "issue_key": issue_key, "url": item.source_url},
+        return _NativeProjection(
+            unit_type="jira_issue",
+            provider_key=issue_id,
+            observations=tuple(inputs),
+            relations=tuple(relations),
+            coverage=coverage,
+            locator={"issue_id": issue_id, "issue_key": issue_key, "url": item.source_url},
+            title=_UnitTitle.of(
+                "Jira issue",
+                ("Key", issue_key),
+                ("Type", _provider_name(fields.get("issuetype"))),
+                ("Summary", fields.get("summary")),
+            ),
         )
     if source_type == "github_repo":
         semantics = normalized.source_semantics
@@ -922,10 +984,10 @@ def _project_native(
                     ({"predecessor_document_id": str(predecessor_document_id)} if predecessor_document_id else {}),
                 ),
             )
-        return (
-            "github_file",
-            f"{repo}:{lineage}",
-            (
+        return _NativeProjection(
+            unit_type="github_file",
+            provider_key=f"{repo}:{lineage}",
+            observations=(
                 _ObservationInput(
                     "file_content",
                     "content",
@@ -934,9 +996,15 @@ def _project_native(
                     {"path": path},
                 ),
             ),
-            relations,
-            ProjectionCoverage.COMPLETE_SNAPSHOT,
-            {"repository": repo, "path": path, "ref": item.extra.get("repo_ref"), "url": item.source_url},
+            relations=relations,
+            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+            locator={"repository": repo, "path": path, "ref": item.extra.get("repo_ref"), "url": item.source_url},
+            title=_UnitTitle.of(
+                "GitHub file",
+                ("Repository", repo),
+                ("Path", path),
+                ("Ref", item.extra.get("repo_ref") or semantics.get("repo_ref")),
+            ),
         )
     if source_type == "github_pages":
         canonical_url = str(
@@ -944,13 +1012,14 @@ def _project_native(
         )
         semantic_value = native if isinstance(native, str) else normalized.markdown_body
         semantic_content = normalized.markdown_body
-        return (
-            "rendered_page",
-            canonical_url,
-            (_ObservationInput("page_content", "content", semantic_content, semantic_value, {}),),
-            (),
-            ProjectionCoverage.COMPLETE_SNAPSHOT,
-            {"canonical_url": canonical_url, "title": item.title},
+        return _NativeProjection(
+            unit_type="rendered_page",
+            provider_key=canonical_url,
+            observations=(_ObservationInput("page_content", "content", semantic_content, semantic_value, {}),),
+            relations=(),
+            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+            locator={"canonical_url": canonical_url, "title": item.title},
+            title=_UnitTitle.of("GitHub Pages page", ("Title", item.title), ("URL", canonical_url)),
         )
     if source_type == "local_markdown":
         data = native if isinstance(native, dict) else {}
@@ -958,13 +1027,18 @@ def _project_native(
         path = str(data.get("relative_path") or item.extra.get("relative_path") or item.item_id)
         lineage = str(data.get("file_lineage_id") or item.extra.get("file_lineage_id") or path)
         body = str(data.get("markdown") or normalized.markdown_body)
-        return (
-            "local_file",
-            f"{vault}:{lineage}",
-            (_ObservationInput("file_content", "content", body, body, {"path": path}),),
-            (),
-            ProjectionCoverage.COMPLETE_SNAPSHOT,
-            {"vault_id": vault, "path": path, "url": item.source_url},
+        return _NativeProjection(
+            unit_type="local_file",
+            provider_key=f"{vault}:{lineage}",
+            observations=(_ObservationInput("file_content", "content", body, body, {"path": path}),),
+            relations=(),
+            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+            locator={"vault_id": vault, "path": path, "url": item.source_url},
+            title=_UnitTitle.of(
+                "Markdown file",
+                ("Vault", data.get("vault_id") or item.space_or_project),
+                ("Path", path),
+            ),
         )
     if source_type == "teams":
         data = native if isinstance(native, dict) else {}
@@ -1035,52 +1109,76 @@ def _project_native(
             "observed_to": observed_to or None,
             "url": item.source_url,
         }
-        if data.get("_tombstone") is True:
+        tombstoned = data.get("_tombstone") is True
+        if tombstoned:
             locator["tombstone_reason"] = data.get("tombstone_reason")
-        return (
-            "teams_window",
-            window_id,
-            tuple(inputs),
-            tuple(relations),
-            coverage,
-            locator,
+        return _NativeProjection(
+            unit_type="teams_window",
+            provider_key=window_id,
+            observations=tuple(inputs),
+            relations=tuple(relations),
+            coverage=coverage,
+            locator=locator,
+            # A tombstoned window has no live Unit left to name.
+            title=None if tombstoned else _UnitTitle.of(
+                "Teams conversation",
+                ("Conversation type", data.get("conversation_type")),
+                ("Team", data.get("team_name")),
+                ("Channel", data.get("channel_name")),
+                ("Title", item.title),
+                ("From", observed_from),
+                ("To", observed_to),
+            ),
         )
     if source_type == "agent_session":
         data = native if isinstance(native, dict) else {}
         receipt = data.get("receipt") if isinstance(data.get("receipt"), dict) else {}
         window_id = str(data.get("doc_id") or item.item_id)
         body = str(data.get("markdown") or normalized.markdown_body)
-        return (
-            "agent_session_window",
-            window_id,
-            (_ObservationInput("session_summary", window_id, body, body, {}),),
-            (),
-            ProjectionCoverage.PARTIAL_PROJECTION,
-            {
+        return _NativeProjection(
+            unit_type="agent_session_window",
+            provider_key=window_id,
+            observations=(_ObservationInput("session_summary", window_id, body, body, {}),),
+            relations=(),
+            coverage=ProjectionCoverage.PARTIAL_PROJECTION,
+            locator={
                 "client": receipt.get("client"),
                 "session_id": receipt.get("session_id"),
                 "history_window_kind": receipt.get("history_window_kind"),
                 "url": item.source_url,
             },
+            title=_UnitTitle.of(
+                "Agent session",
+                ("Client", receipt.get("client")),
+                ("Window", receipt.get("history_window_kind")),
+                ("Title", item.title),
+            ),
         )
     # Extension-safe fallback for document-like genes that have not yet opted
     # into a richer native projection.  It deliberately claims only partial
     # coverage, so it can drive semantic change detection but can never prove
     # that an omitted observation or source unit was deleted.
     body = normalized.markdown_body
-    return (
-        "generic_document",
-        item.item_id,
-        (_ObservationInput("document_content", item.item_id, body, body, {}),),
-        (),
-        ProjectionCoverage.PARTIAL_PROJECTION,
-        {
+    return _NativeProjection(
+        unit_type="generic_document",
+        provider_key=item.item_id,
+        observations=(_ObservationInput("document_content", item.item_id, body, body, {}),),
+        relations=(),
+        coverage=ProjectionCoverage.PARTIAL_PROJECTION,
+        locator={
             "item_id": item.item_id,
             "url": item.source_url,
             "title": item.title,
             "source_type": source_type,
         },
+        title=_UnitTitle.of("Document", ("Title", item.title), ("Source type", source_type)),
     )
+
+
+def _provider_name(value: object) -> object:
+    """A provider object's display name, such as a Jira issue type's name."""
+
+    return value.get("name") if isinstance(value, Mapping) else value
 
 
 def _jira_changelog_semantic_class(history: Mapping[str, object]) -> str:
