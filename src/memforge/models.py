@@ -515,6 +515,8 @@ class SourceSyncRun:
     rerun_source_config_revision: str | None = None
     predecessor_activity_id: str | None = None
     rerun_predecessor_activity_id: str | None = None
+    # Documents an operator reprocess reads from storage; empty for a sync.
+    reprocess_document_ids: tuple[str, ...] = ()
     coalesced: bool = False
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None

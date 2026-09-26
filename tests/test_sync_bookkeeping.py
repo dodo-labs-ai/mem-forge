@@ -2862,6 +2862,10 @@ class NoopMemoryEngine:
                         reprocess_operation_id=kwargs.get(
                             "derivation_reprocess_operation_id"
                         ),
+                        support_without_baseline=kwargs.get(
+                            "derivation_support_without_baseline",
+                            False,
+                        ),
                     )
                 )
                 if kwargs.get("derivation_id") is not None
@@ -6110,10 +6114,11 @@ async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_
 
 
 @pytest.mark.asyncio
-async def test_targeted_recovery_skips_unchanged_documents_outside_finding_scope(
+async def test_force_resync_extracts_a_unit_whose_location_alone_changed(
     db: Database,
 ) -> None:
-    source_id = "src-targeted-recovery"
+    """Semantic work plans against the committed base, not a projection recorded ahead of it."""
+    source_id = "src-location-only-reprocess"
     markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
     doc_store = StubDocumentStore()
     normalized_content_uri = doc_store.store_normalized(
@@ -6131,7 +6136,11 @@ async def test_targeted_recovery_skips_unchanged_documents_outside_finding_scope
         version="2",
         normalized_content_uri=normalized_content_uri,
         projection_source_type="docs",
+        source_url="https://docs.example/old-location",
     )
+    unit = await db.find_source_unit_by_document_id(source_id, "doc-1", current_only=True)
+    assert unit is not None
+    committed = await db.get_current_source_unit_revision(unit.id)
     extractor = ProjectionFragmentRecordingExtractor()
     memory_engine = RecordingMemoryEngine()
     orchestrator = GeneSyncOrchestrator(
@@ -6148,65 +6157,17 @@ async def test_targeted_recovery_skips_unchanged_documents_outside_finding_scope
         source_name="Documents",
         source_id=source_id,
         force_full_sync=True,
-        reprocess_doc_ids=frozenset({"another-doc"}),
     )
 
     assert state.last_sync_status == "success"
-    assert state.docs_processed == 1
-    assert state.docs_updated == 0
-    assert extractor.fragment_calls == []
-    assert memory_engine.projected_lifecycle_calls == []
-
-
-@pytest.mark.asyncio
-async def test_targeted_reprocess_extracts_unchanged_current_projection(
-    db: Database,
-) -> None:
-    source_id = "src-targeted-current-projection"
-    markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
-    doc_store = StubDocumentStore()
-    normalized_content_uri = doc_store.store_normalized(
-        source_id=source_id,
-        doc_id="doc-1",
-        title="Design Doc",
-        markdown=markdown,
-    )
-    await _insert_document_with_metadata(
-        db,
-        source_id=source_id,
-        doc_id="doc-1",
-        title="Design Doc",
-        markdown=markdown,
-        version="2",
-        normalized_content_uri=normalized_content_uri,
-        projection_source_type="docs",
-        source_url="https://docs.example/doc-1",
-    )
-    extractor = ProjectionFragmentRecordingExtractor()
-    memory_engine = RecordingMemoryEngine()
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=doc_store,
-        memory_extractor=extractor,
-        memory_engine=memory_engine,
-        memory_store=None,
-        max_concurrent=1,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=UpdatingDocumentGene(markdown, version="2"),
-        source_name="Documents",
-        source_id=source_id,
-        force_full_sync=True,
-        reprocess_doc_ids=frozenset({"doc-1"}),
-    )
-
-    assert state.last_sync_status == "success"
-    assert state.docs_processed == 1
     assert state.docs_updated == 1
     [catalog] = extractor.fragment_calls
     assert any(fragment.primary_eligible for fragment in catalog.fragments)
-    assert len(memory_engine.projected_lifecycle_calls) == 1
+    [lifecycle] = memory_engine.projected_lifecycle_calls
+    delta = lifecycle["projection"].deltas[0]
+    assert delta.previous_unit_revision_id == committed.id
+    assert delta.current_unit_revision_id != committed.id
+    assert (await db.get_current_source_unit_revision(unit.id)).id == delta.current_unit_revision_id
 
 
 @pytest.mark.asyncio
@@ -10889,7 +10850,6 @@ async def test_external_blocker_does_not_consume_commit_attempt_budget(
         source_name="Jira",
         source_id=source_id,
         force_full_sync=True,
-        reprocess_doc_ids=frozenset(item_ids),
     )
 
     assert state.last_sync_status == "partial"

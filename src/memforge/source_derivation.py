@@ -209,6 +209,9 @@ class SourceUnitDerivationContext:
     current_changed_ranges: tuple[tuple[int, int], ...] = ()
     reprocess_all_current_observations: bool = False
     reprocess_operation_id: str | None = None
+    # An operator reprocess reads every Support over the whole Unit, as if it
+    # had no usable baseline.
+    support_without_baseline: bool = False
 
 
 class SourceDerivationStore(DerivationWorkStore, Protocol):
@@ -778,6 +781,7 @@ def source_unit_derivation_context_to_payload(
             context.reprocess_all_current_observations
         ),
         "reprocess_operation_id": context.reprocess_operation_id,
+        "support_without_baseline": context.support_without_baseline,
     }
 
 
@@ -898,6 +902,7 @@ def source_unit_derivation_context_from_payload(
         reprocess_operation_id=_optional_string(
             payload.get("reprocess_operation_id")
         ),
+        support_without_baseline=bool(payload.get("support_without_baseline", False)),
     )
 
 
@@ -1241,6 +1246,10 @@ def _derivation_context_identity_payload(
         ),
         "reprocess_operation_id": context_payload.get(
             "reprocess_operation_id"
+        ),
+        "support_without_baseline": context_payload.get(
+            "support_without_baseline",
+            False,
         ),
     }
 

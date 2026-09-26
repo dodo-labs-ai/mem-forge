@@ -9556,13 +9556,13 @@ async def _exact_support_engine(
         memory_store=_OutboxDrainer(db), structured_llm_client=client,
     )
 
-    async def advance(projection: SourceProjection, body: str, hour: int, raw_memories=(), owner_id=None):
+    async def advance(projection: SourceProjection, body: str, hour: int, raw_memories=(), owner_id=None, **options):
         return await engine.prepare_and_commit_projected_lifecycle(
             projection=projection, doc_id="confluence-123", raw_memories=list(raw_memories), doc_type="design-doc",
             project_key="ENG", repo_identifier=None, document_content=body,
             update_mode="diff_guided", changed_hunks=body, update_plan_stats=None,
             source_updated_at=datetime(2026, 9, 25, hour, tzinfo=timezone.utc),
-            lifecycle_execution_owner_id=owner_id,
+            lifecycle_execution_owner_id=owner_id, **options,
         )
 
     return incumbent, client, advance
@@ -9659,6 +9659,47 @@ async def test_unaffected_change_rebinds_and_commits_with_its_receipt(db):
     rebound = await active_support_evidence(db, incumbent.id, source_id="src-1")
     assert {part.validation_unit_revision_id for part in rebound} == {third.source_unit_revisions[0].id}
     assert {part.validation_plan_id for part in rebound}.isdisjoint({part.validation_plan_id for part in established})
+    assert (await db.get_memory(incumbent.id)).status == "active"
+
+
+class _WholeUnitReadingClient(_CountingSupportClient):
+    def judge_change_impact(self, work, payload):
+        raise AssertionError("an operator reprocess reads every Support over the whole Unit")
+
+
+@pytest.mark.asyncio
+async def test_reprocess_at_the_current_revision_reads_every_support_over_the_whole_unit(db):
+    claim = "B8 requires approval."
+    body = f"{claim}\n\nThe team reviewed dashboards."
+    first = _projection(run_id="reprocess-v1", body=body)
+    incumbent, client, advance = await _exact_support_engine(
+        db, claim=claim, first=first, memory_id="mem-reprocess", client_type=_WholeUnitReadingClient,
+    )
+    second_body = f"{body}\n\nEdition 2."
+    second = _projection(
+        run_id="reprocess-v2", body=second_body, prior=first.source_unit_revisions[0],
+        prior_observations={r.observation_id: r for r in first.observation_revisions},
+    )
+    await advance(second, second_body, 2)
+    assert (await active_support_evidence(db, incumbent.id, source_id="src-1"))[0].raw_content_sha256
+
+    # The stored Unit reprojects to the revision it is already at.
+    client.support_prompts.clear()
+    again = _projection(
+        run_id="reprocess-again", body=second_body, prior=second.source_unit_revisions[0],
+        prior_observations={r.observation_id: r for r in second.observation_revisions},
+    )
+    assert again.deltas[0].previous_unit_revision_id == again.deltas[0].current_unit_revision_id
+    stats = await advance(again, second_body, 3, derivation_support_without_baseline=True)
+
+    assert client.impact_prompts == []
+    assert stats["support_revalidation_reprocess_count"] == 1
+    assert stats["support_revalidation_unusable_baseline_count"] == 0
+    assert stats["support_revalidation_program_rebind_count"] == 0
+    [prompt] = client.support_prompts
+    assert "Confluence page" in prompt and "The team reviewed dashboards." in prompt
+    rebound = await active_support_evidence(db, incumbent.id, source_id="src-1")
+    assert {part.validation_unit_revision_id for part in rebound} == {second.source_unit_revisions[0].id}
     assert (await db.get_memory(incumbent.id)).status == "active"
 
 

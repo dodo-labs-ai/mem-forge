@@ -482,6 +482,7 @@ class MemoryEngine:
         derivation_id: str | None = None,
         derivation_reprocess_all_current_observations: bool = False,
         derivation_reprocess_operation_id: str | None = None,
+        derivation_support_without_baseline: bool = False,
         expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
         current_changed_ranges: tuple[tuple[int, int], ...] = (),
@@ -519,6 +520,7 @@ class MemoryEngine:
                     derivation_reprocess_operation_id=(
                         derivation_reprocess_operation_id
                     ),
+                    derivation_support_without_baseline=derivation_support_without_baseline,
                     expected_source_activity_epoch=expected_source_activity_epoch,
                     source_activity=source_activity,
                     current_changed_ranges=current_changed_ranges,
@@ -960,6 +962,7 @@ class MemoryEngine:
         derivation_id: str | None = None,
         derivation_reprocess_all_current_observations: bool = False,
         derivation_reprocess_operation_id: str | None = None,
+        derivation_support_without_baseline: bool = False,
         expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
         current_changed_ranges: tuple[tuple[int, int], ...] = (),
@@ -1015,6 +1018,7 @@ class MemoryEngine:
             "support_revalidation_unresolved_partial_coverage_count": 0,
             "support_revalidation_unresolved_capacity_count": 0,
             "support_revalidation_unusable_baseline_count": 0,
+            "support_revalidation_reprocess_count": 0,
         }
         filtered_memories: list[RawMemory] = []
         for raw in raw_memories:
@@ -1181,7 +1185,12 @@ class MemoryEngine:
                         raise ReconciliationContractError("revision_support_missing", "incumbent has no complete scoped support")
                     work_by_memory[memory.id] = []
                     for evidence_unit_id, support in groups.items():
-                        baseline_id, unusable = _support_validation_baseline(support)
+                        if derivation_support_without_baseline:
+                            # An operator reprocess reads the whole Unit for every Support.
+                            baseline_id, unusable = None, None
+                            stats["support_revalidation_reprocess_count"] += 1
+                        else:
+                            baseline_id, unusable = _support_validation_baseline(support)
                         context = contexts_by_revision.get(baseline_id) if unusable is None else None
                         if context is None and baseline_id is not None:
                             historical = await self.db.get_source_unit_revision_projection(
@@ -1599,6 +1608,7 @@ class MemoryEngine:
                     reprocess_operation_id=(
                         derivation_reprocess_operation_id
                     ),
+                    support_without_baseline=derivation_support_without_baseline,
                 )
             )
             if derivation_id is not None and document is not None
