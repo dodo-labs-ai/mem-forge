@@ -17,7 +17,6 @@ spy-engine assertions fail.
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -28,7 +27,7 @@ from memforge.models import MemoryExtractionResult, RawMemory
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.storage.adapters.context import AccessScope
 from memforge.storage.database import Database
-from tests.llm_fixture import FIXTURE_CONTEXT_WINDOW, fixture_budget
+from tests.llm_fixture import NoopMemoryExtractor
 
 
 U1_USER = "u-1"
@@ -74,22 +73,8 @@ class _StubDocumentStore:
         return f"file:///tmp/{source_id}/{doc_id}/{title}.md"
 
 
-class _SingleMemoryExtractor:
+class _SingleMemoryExtractor(NoopMemoryExtractor):
     """Selects one Fragment claim so the orchestrator reaches projected lifecycle."""
-
-    model = "fixture"
-    max_tokens = 8192
-    structured_llm_client = SimpleNamespace(
-        request_budget=lambda model=None: fixture_budget(
-            input_tokens=FIXTURE_CONTEXT_WINDOW, output_tokens=8192, correction_reserve=0,
-        ),
-        request_fits=lambda *args, **kwargs: True,
-        request_tokens=lambda prompt, **kwargs: max(1, len(prompt) // 4),
-    )
-
-    def fragment_output_tokens(self, catalog):
-        del catalog
-        return self.max_tokens
 
     async def extract_projection_fragment_memories(self, catalog, **kwargs):
         del kwargs

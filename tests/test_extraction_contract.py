@@ -25,7 +25,10 @@ from memforge.source_derivation import (
     SourceUnitDeriver,
     source_derivation_manifest,
 )
-from memforge.pipeline.projection_context import plan_projection_evidence_work
+from memforge.pipeline.projection_context import (
+    PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION,
+    plan_projection_evidence_work,
+)
 from memforge.storage.database import Database
 
 
@@ -401,7 +404,7 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
     assert result.derivation.authority_plan_identity == {
             "semantic_input_policy": "revision-input-v6",
         "access_context_hash": "access-unmappable-authority",
-        "authority_policy_version": 5,
+        "authority_policy_version": PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION,
         "base_unit_revision_id": initial.source_unit_revisions[0].id,
         "extraction_contract_version": PROJECTION_EXTRACTION_CONTRACT_VERSION,
         "inference_capability_hash": "inference-unmappable-authority",

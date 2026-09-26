@@ -216,14 +216,14 @@ class RawMemory:
     valid_until: str | None = None
     extraction_context: str | None = None
     evidence_quote: str | None = None
-    # Exact current-revision coordinates of the quoted Evidence. These survive
-    # derivation caching so repeated excerpts keep precise anchors.
+    # Current-revision coordinates of the Primary part of the resolved
+    # Evidence selection, kept in the derivation output payload.
     evidence_range_start: int | None = None
     evidence_range_end: int | None = None
     evidence_anchor: str | None = None
     source_observation_id: str | None = None
     required_source_observation_ids: list[str] = field(default_factory=list)
-    # v9 stores only exact application-resolved parts. Catalog-local refs never
+    # Only exact application-resolved parts are stored. Catalog-local refs never
     # survive the model call or enter derivation/lifecycle identity.
     resolved_evidence_selection: ResolvedEvidenceSelection | None = None
     support_validation: dict[str, object] = field(default_factory=dict)

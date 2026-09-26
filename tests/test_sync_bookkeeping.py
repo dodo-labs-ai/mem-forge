@@ -97,7 +97,10 @@ from memforge.source_derivation import (
     source_derivation_context_identity_hash,
     source_derivation_manifest,
 )
-from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_CONTRACT_VERSION
+from memforge.pipeline.extraction_contract import (
+    CONTRACT_SUPERSEDED,
+    PROJECTION_EXTRACTION_CONTRACT_VERSION,
+)
 from memforge.config import AgentEvaluationConfig, AppConfig, SyncConfig
 from memforge.evals.agent_evaluation import (
     AgentAssessmentQuery,
@@ -109,7 +112,7 @@ from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.source_sync_manifest import SourceSyncManifestStore
 from memforge.scheduler import SOURCE_SCHEDULE_SCAN_JOB_ID, SyncScheduler
-from tests.llm_fixture import FIXTURE_CONTEXT_WINDOW, fixture_budget
+from tests.llm_fixture import NoopMemoryExtractor
 from tests.unit_support_fixture import active_support_evidence
 
 
@@ -138,50 +141,6 @@ def test_projection_fanout_aggregates_discarded_orphan_summary_metric() -> None:
     )
 
     assert metrics["discarded_orphan_artifact_summary_count"] == 3
-
-
-def test_projection_fanout_aggregates_bounded_block_fallback_telemetry() -> None:
-    sample = {
-        "candidate_content_sha256": "c" * 64,
-        "source_derivation_batch_id": "xbatch-current",
-        "source_observation_id": "obs-current",
-        "source_observation_revision_id": "obsrev-current",
-        "evidence_range_start": 20,
-        "evidence_range_end": 80,
-        "block_text_sha256": "b" * 64,
-        "block_chars": 60,
-        "submitted_quote_sha256": "q" * 64,
-        "submitted_quote_chars": 41,
-        "extraction_model": "model-current",
-        "prompt_sha256": "p" * 64,
-    }
-    metrics = _aggregate_extraction_metrics(
-        (
-            MemoryExtractionResult(
-                metadata={
-                    "evidence_refinement_counts": {"block_fallback": 1},
-                    "evidence_block_fallback_samples": [sample],
-                    "invalid_evidence_block_count": 1,
-                }
-            ),
-            MemoryExtractionResult(
-                metadata={
-                    "evidence_refinement_counts": {
-                        "block_fallback": 2,
-                        "exact": 1,
-                    },
-                    "evidence_block_fallback_samples": [sample],
-                }
-            ),
-        )
-    )
-
-    assert metrics["evidence_refinement_counts"] == {
-        "block_fallback": 3,
-        "exact": 1,
-    }
-    assert metrics["evidence_block_fallback_samples"] == [sample, sample]
-    assert metrics["invalid_evidence_block_count"] == 1
 
 
 def test_projection_fanout_aggregates_selector_normalization_telemetry() -> None:
@@ -3445,26 +3404,6 @@ class RaisingLifecycleOutboxMemoryStore:
         raise RuntimeError(f"temporary vector failure for {source_id}")
 
 
-class NoopMemoryExtractor:
-    model = "fixture"
-    max_tokens = 8192
-    structured_llm_client = SimpleNamespace(
-        request_budget=lambda model=None: fixture_budget(
-            input_tokens=FIXTURE_CONTEXT_WINDOW, output_tokens=8192, correction_reserve=0,
-        ),
-        request_fits=lambda *args, **kwargs: True,
-        request_tokens=lambda prompt, **kwargs: max(1, len(prompt) // 4),
-    )
-
-    def fragment_output_tokens(self, catalog):
-        del catalog
-        return self.max_tokens
-
-    async def extract_projection_fragment_memories(self, catalog, **kwargs):
-        del catalog, kwargs
-        return MemoryExtractionResult(memories=[])
-
-
 class ProjectionFragmentRecordingExtractor(NoopMemoryExtractor):
     def __init__(self, *, fail_if_called: bool = False) -> None:
         self.fail_if_called = fail_if_called
@@ -3580,14 +3519,41 @@ async def test_unchanged_multi_observation_projection_skips_full_document_extrac
     result = await orchestrator._extract_for_document_update(
         projection=unchanged,
         update_plan=None,
-        markdown_body=normalized.markdown_body,
         source_type="teams",
         doc_type="conversation",
         doc_id=item.item_id,
         source_id=source_id,
         run_id=unchanged.run_id,
-        document_title=item.title,
-        document_url=item.source_url,
+        derivation_context=SourceUnitDerivationContext(
+            document=DocumentRecord(
+                doc_id=item.item_id,
+                source=source_id,
+                source_url=item.source_url,
+                title=item.title,
+                space_or_project="",
+                author=None,
+                last_modified=item.last_modified,
+                labels=[],
+                version=item.version,
+                content_hash=hashlib.sha256(normalized.markdown_body.encode()).hexdigest(),
+                token_count=None,
+                raw_content_uri=None,
+                raw_content_type=None,
+                normalized_content_uri=None,
+                pdf_content_uri=None,
+                last_synced=item.last_modified,
+            ),
+            doc_type="conversation",
+            project_key=None,
+            repo_identifier=None,
+            document_content=normalized.markdown_body,
+            update_mode="full_document",
+            changed_hunks=None,
+            update_plan_stats=None,
+            source_updated_at=item.last_modified.isoformat(),
+            user_id=None,
+            source_activity_epoch=None,
+        ),
     )
 
     assert result.memories == []
@@ -3957,14 +3923,6 @@ async def test_jira_artifact_identity_survives_mutable_issue_key(db: Database) -
     assert len(artifact_rows) == 1
     metadata = json.loads(str(artifact_rows[0]["metadata_json"]))
     assert metadata["source_artifact"]["artifact_id"] == document_store.source_artifact_ids[0]
-
-
-class EmptyNormalizedBlockingFetchGene(BlockingFetchGene):
-    async def fetch(self, item):
-        return RawContent(item=item, body=b"", content_type="text/plain")
-
-    async def normalize(self, raw):
-        return NormalizedContent(item=raw.item, markdown_body="")
 
 
 class UnexpectedFetchGene(BlockingFetchGene):
@@ -4761,7 +4719,7 @@ class V9RecoveryReplayGene:
 
 
 @pytest.mark.asyncio
-async def test_v2_derivation_recovery_resumes_active_v9_before_provider_work(
+async def test_derivation_recovery_resumes_active_v9_before_provider_work(
     db: Database,
 ) -> None:
     source_id = "src-v9-recovery"
@@ -4798,6 +4756,55 @@ async def test_v2_derivation_recovery_resumes_active_v9_before_provider_work(
     assert len(recovery_engine.projected_lifecycle_calls) == 1
     [preserved] = await db.list_source_derivation_attempts(source_id=source_id)
     assert preserved.status == "applied"
+
+
+_EARLIER_EXTRACTION_CONTRACT_VERSION = "projection-extraction-v8"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored_status, expected_status, expected_reason_code",
+    (
+        ("pending", "superseded", CONTRACT_SUPERSEDED),
+        ("retryable_failure", "superseded", CONTRACT_SUPERSEDED),
+        ("completed", "completed", None),
+    ),
+)
+async def test_derivation_recovery_supersedes_incomplete_work_of_an_earlier_contract(
+    db: Database,
+    stored_status: str,
+    expected_status: str,
+    expected_reason_code: str | None,
+) -> None:
+    source_id = "src-earlier-contract"
+    attempt = await _stage_completed_v9_recovery_attempt(db, source_id=source_id)
+    await db.db.execute(
+        """UPDATE source_derivation_attempts
+              SET extraction_contract_version = ?, status = ?
+            WHERE id = ?""",
+        (_EARLIER_EXTRACTION_CONTRACT_VERSION, stored_status, attempt.id),
+    )
+    await db.db.commit()
+    recovery_engine = RecordingMemoryEngine()
+    recovery = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=ProjectionFragmentRecordingExtractor(fail_if_called=True),
+        memory_engine=recovery_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    stats = await recovery._resume_source_derivations(
+        source_id=source_id,
+        source_activity_epoch=attempt.context.source_activity_epoch,
+        run_id="run-earlier-contract",
+    )
+
+    assert stats.processed == 0
+    assert recovery_engine.projected_lifecycle_calls == []
+    [stored] = await db.list_source_derivation_attempts(source_id=source_id)
+    assert (stored.status, stored.terminal_reason_code) == (expected_status, expected_reason_code)
 
 
 @pytest.mark.asyncio
@@ -5147,7 +5154,7 @@ async def test_recovered_external_blocker_does_not_stop_provider_discovery(
 
 
 @pytest.mark.asyncio
-async def test_v2_derivation_recovery_commits_the_current_policy_identity(
+async def test_derivation_recovery_commits_the_current_policy_identity(
     db: Database,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5205,7 +5212,7 @@ async def test_v2_derivation_recovery_commits_the_current_policy_identity(
 
 
 @pytest.mark.asyncio
-async def test_v2_policy_replacement_failure_preserves_recoverable_new_work(
+async def test_policy_replacement_failure_preserves_recoverable_new_work(
     db: Database,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

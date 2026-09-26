@@ -323,8 +323,8 @@ def _deserialize_mutation(
     try:
         mutation_type = LifecycleMutationType(raw_mutation_type)
     except ValueError as exc:
-        # A proposal for a mutation this version no longer applies can never
-        # match the current Memory state.
+        # A proposal for a mutation type this version does not apply can
+        # never match the current Memory state.
         raise ValueError(
             f"review stale guard failed: unsupported mutation {raw_mutation_type}"
         ) from exc

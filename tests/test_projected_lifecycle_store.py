@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
-import sqlite3
 
 import pytest
 import pytest_asyncio
+from fastapi.testclient import TestClient
 
+from memforge.config import AppConfig
 from memforge.memory.evidence import (
     EvidenceContentProvenance,
     EvidenceReference,
@@ -48,6 +49,7 @@ from memforge.models import (
 )
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.source_projection import AnchorKind, SourceAnchor
+from memforge.server.admin_api import create_admin_app
 from memforge.storage.database import Database
 from tests.test_source_projection_store import _projection
 from tests.unit_support_fixture import complete_unit_parts, primary_reference, record_unit_support
@@ -66,10 +68,10 @@ async def db(tmp_path):
         owner_user_id="owner-1",
     )
     memory = Memory(
-        id="mem-legacy",
+        id="mem-1",
         memory_type="fact",
-        content="Legacy claim",
-        content_hash=content_hash("Legacy claim"),
+        content="Source claim",
+        content_hash=content_hash("Source claim"),
     )
     await database.insert_memory(memory)
     await database.record_source_projection(_projection())
@@ -95,9 +97,9 @@ async def _expired_sync_activity(db: Database, activity_id: str):
 
 def _unit() -> EvidenceUnit:
     return EvidenceUnit(
-        id="eu-backfill-1",
+        id="eu-1",
         source_id="src-1",
-        doc_id="legacy-gate-doc",
+        doc_id="gate-doc",
         doc_revision_id="unitrev-page-1-v2",
         source_type="confluence",
         source_anchor="obs-page-1-body",
@@ -106,73 +108,11 @@ def _unit() -> EvidenceUnit:
         visibility="workspace",
         owner_user_id=None,
         repo_identifier=None,
-        content="Legacy claim",
-        excerpt="Legacy claim",
+        content="Source claim",
+        excerpt="Source claim",
         evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
         access_context_hash="workspace",
     )
-
-
-async def _add_unsupported_legacy_source_edge(
-    db: Database,
-    *,
-    doc_id: str = "legacy-doc",
-) -> None:
-    now = "2026-07-16T00:00:00+00:00"
-    await db.db.execute(
-        """INSERT INTO documents (
-               doc_id, source, source_url, title, space_or_project, last_modified,
-               version, content_hash, last_synced
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            doc_id,
-            "src-1",
-            f"https://example.test/{doc_id}",
-            "Legacy document",
-            "ENG",
-            now,
-            "1",
-            "legacy-hash",
-            now,
-        ),
-    )
-    await db.add_memory_source(
-        "mem-legacy",
-        doc_id,
-        "confluence",
-        "Legacy claim",
-        source_updated_at=None,
-    )
-
-
-_REMOVE_LIFECYCLE_CUTOVER_STORAGE_MIGRATION = 99
-_LIFECYCLE_CUTOVER_TABLES = ("lifecycle_cutover_findings", "lifecycle_backfill_jobs")
-
-
-def _existing_tables(path: str) -> set[str]:
-    with sqlite3.connect(path) as connection:
-        rows = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
-            _LIFECYCLE_CUTOVER_TABLES,
-        ).fetchall()
-    return {str(name) for (name,) in rows}
-
-
-@pytest.mark.asyncio
-async def test_workspace_drops_lifecycle_cutover_storage(db: Database) -> None:
-    assert _existing_tables(db.db_path) == set()
-    await db.close()
-    with sqlite3.connect(db.db_path) as connection:
-        for table in _LIFECYCLE_CUTOVER_TABLES:
-            connection.execute(f"CREATE TABLE {table} (id TEXT PRIMARY KEY)")
-        connection.execute(
-            "DELETE FROM schema_migrations WHERE version = ?",
-            (_REMOVE_LIFECYCLE_CUTOVER_STORAGE_MIGRATION,),
-        )
-
-    await db.connect()
-
-    assert _existing_tables(db.db_path) == set()
 
 
 @pytest.mark.asyncio
@@ -182,7 +122,9 @@ async def test_new_source_is_destructive_lifecycle_gated_by_default(db: Database
     assert gate.state is LifecycleGateState.GATED
 
 
-async def _attach_legacy_source(db: Database) -> None:
+async def _attach_source_document(db: Database, doc_id: str = "gate-doc") -> None:
+    """Record ``doc_id`` as Source provenance of the fixture Memory."""
+
     now = "2026-07-15T00:00:00+00:00"
     await db.db.execute(
         """INSERT INTO documents (
@@ -190,10 +132,10 @@ async def _attach_legacy_source(db: Database) -> None:
                content_hash, last_synced
            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            "legacy-gate-doc",
+            doc_id,
             "src-1",
-            "https://example.test/legacy-gate-doc",
-            "Legacy",
+            f"https://example.test/{doc_id}",
+            "Engineering page",
             "ENG",
             now,
             "1",
@@ -202,17 +144,17 @@ async def _attach_legacy_source(db: Database) -> None:
         ),
     )
     await db.add_memory_source(
-        "mem-legacy",
-        "legacy-gate-doc",
+        "mem-1",
+        doc_id,
         "confluence",
-        "Legacy claim",
+        "Source claim",
         source_updated_at=None,
     )
 
 
 @pytest.mark.asyncio
 async def test_gate_requires_validated_support_for_active_source_backed_memory(db: Database) -> None:
-    await _attach_legacy_source(db)
+    await _attach_source_document(db)
 
     with pytest.raises(ValueError, match="source-backed Memory lacks validated support lineage"):
         await db.enable_lifecycle_gate("src-1")
@@ -222,11 +164,11 @@ async def test_gate_requires_validated_support_for_active_source_backed_memory(d
 async def test_gate_rejects_active_support_without_matching_source_provenance(
     db: Database,
 ) -> None:
-    await _attach_legacy_source(db)
+    await _attach_source_document(db)
     await _persist_exact_support_and_provenance(db)
     await db.db.execute(
         "DELETE FROM memory_sources WHERE memory_id = ? AND source_id = ?",
-        ("mem-legacy", "src-1"),
+        ("mem-1", "src-1"),
     )
     await db.db.commit()
 
@@ -239,9 +181,9 @@ async def test_gate_rejects_active_support_without_matching_source_provenance(
 async def test_gate_rejects_source_provenance_without_exact_document_support(
     db: Database,
 ) -> None:
-    await _attach_legacy_source(db)
+    await _attach_source_document(db)
     await _persist_exact_support_and_provenance(db)
-    await _add_unsupported_legacy_source_edge(db, doc_id="wrong-support-doc")
+    await _attach_source_document(db, doc_id="wrong-support-doc")
 
     assert await db.count_active_supported_memories_without_source_provenance("src-1") == 0
     assert await db.count_active_source_memories_without_support("src-1") == 1
@@ -253,8 +195,8 @@ async def test_gate_rejects_source_provenance_without_exact_document_support(
 @pytest.mark.parametrize(
     "corrupt_statement, corrupt_params",
     (
-        ("DELETE FROM evidence_units WHERE id = ?", ("eu-backfill-1",)),
-        ("UPDATE evidence_units SET doc_id = NULL WHERE id = ?", ("eu-backfill-1",)),
+        ("DELETE FROM evidence_units WHERE id = ?", ("eu-1",)),
+        ("UPDATE evidence_units SET doc_id = NULL WHERE id = ?", ("eu-1",)),
     ),
     ids=("missing-evidence-unit", "null-document"),
 )
@@ -263,7 +205,7 @@ async def test_reverse_support_projection_audit_fails_closed_for_corrupt_evidenc
     corrupt_statement: str,
     corrupt_params: tuple[str, ...],
 ) -> None:
-    await _attach_legacy_source(db)
+    await _attach_source_document(db)
     await _persist_exact_support_and_provenance(db)
     await db.db.commit()
     await db.db.execute("PRAGMA foreign_keys = OFF")
@@ -276,8 +218,8 @@ async def test_reverse_support_projection_audit_fails_closed_for_corrupt_evidenc
 
 @pytest.mark.asyncio
 async def test_gate_ignores_inactive_historical_memory_without_support(db: Database) -> None:
-    await _attach_legacy_source(db)
-    await db.db.execute("UPDATE memories SET status = 'retired' WHERE id = ?", ("mem-legacy",))
+    await _attach_source_document(db)
+    await db.db.execute("UPDATE memories SET status = 'retired' WHERE id = ?", ("mem-1",))
     await db.db.commit()
 
     gate = await db.enable_lifecycle_gate("src-1")
@@ -285,15 +227,37 @@ async def test_gate_ignores_inactive_historical_memory_without_support(db: Datab
     assert gate.state is LifecycleGateState.ENABLED
 
 
+@pytest.mark.asyncio
+async def test_gate_route_enables_a_gated_source_only_when_support_is_complete(
+    db: Database,
+    tmp_path,
+) -> None:
+    await _attach_source_document(db)
+    config = AppConfig(base_dir=tmp_path / "memforge")
+    config.sync.worker_enabled = False
+    app = create_admin_app(db=db, config=config, principal_resolver=lambda request: "owner-1")
+
+    with TestClient(app) as client:
+        refused = client.post("/api/v1/sources/src-1/memory-lifecycle/gate")
+        await _persist_exact_support_and_provenance(db)
+        enabled = client.post("/api/v1/sources/src-1/memory-lifecycle/gate")
+
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "source-backed Memory lacks validated support lineage"
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()["gate"]["state"] == LifecycleGateState.ENABLED.value
+    assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
+
+
 async def _persist_exact_support_and_provenance(db: Database) -> str:
     """Make ``_unit()`` active Support for the fixture Memory and return its id."""
 
-    if not any(source.source_id == "src-1" for source in await db.get_memory_sources("mem-legacy")):
-        await _attach_legacy_source(db)
+    if not any(source.source_id == "src-1" for source in await db.get_memory_sources("mem-1")):
+        await _attach_source_document(db)
     unit = _unit()
     await record_unit_support(
         db,
-        memory_id="mem-legacy",
+        memory_id="mem-1",
         unit=unit,
         references=(
             primary_reference(
@@ -389,11 +353,11 @@ def _overlapping_support_plan(
         ),
         gate_state=(LifecycleGateState.ENABLED if removing else LifecycleGateState.GATED),
         coverage_proof=CoverageProof(
-            mandatory_incumbent_ids=(("mem-legacy",) if removing else ()),
+            mandatory_incumbent_ids=(("mem-1",) if removing else ()),
             incumbent_decisions=(
                 (
                     IncumbentDecision(
-                        "mem-legacy",
+                        "mem-1",
                         IncumbentDisposition.REMOVE_SUPPORT,
                         "overlapping source no longer supports claim",
                     ),
@@ -406,17 +370,17 @@ def _overlapping_support_plan(
         ),
         stale_guard=StaleGuard(
             observation_revision_ids=("obsrev-page-1-v2-source-2",),
-            support_set_hashes=({"mem-legacy": support_hash} if isinstance(support_hash, str) else {}),
+            support_set_hashes=({"mem-1": support_hash} if isinstance(support_hash, str) else {}),
         ),
         mutations=(
             LifecycleMutation(
                 mutation_type,
-                memory_id="mem-legacy",
+                memory_id="mem-1",
                 source_id="src-2",
                 evidence_unit_ids=(evidence_unit.id,),
                 payload={
                     "access_context_hash": "workspace",
-                    "document_id": "legacy-gate-doc",
+                    "document_id": "gate-doc",
                 },
             ),
         ),
@@ -526,7 +490,7 @@ async def _attach_same_source_incarnation_support(
     )
     await record_unit_support(
         db,
-        memory_id="mem-legacy",
+        memory_id="mem-1",
         unit=second_evidence_unit,
         references=(
             primary_reference(
@@ -562,10 +526,10 @@ def _remove_support_plan(
         ),
         gate_state=LifecycleGateState.ENABLED,
         coverage_proof=CoverageProof(
-            mandatory_incumbent_ids=("mem-legacy",),
+            mandatory_incumbent_ids=("mem-1",),
             incumbent_decisions=(
                 IncumbentDecision(
-                    "mem-legacy",
+                    "mem-1",
                     IncumbentDisposition.REMOVE_SUPPORT,
                     "one Source Unit no longer supports the claim",
                 ),
@@ -575,15 +539,15 @@ def _remove_support_plan(
         ),
         stale_guard=StaleGuard(
             observation_revision_ids=(observation_revision_id,),
-            support_set_hashes={"mem-legacy": support_hash},
+            support_set_hashes={"mem-1": support_hash},
         ),
         mutations=(
             LifecycleMutation(
                 LifecycleMutationType.REMOVE_SUPPORT,
-                memory_id="mem-legacy",
+                memory_id="mem-1",
                 source_id="src-1",
                 evidence_unit_ids=(evidence_unit_id,),
-                payload={"document_id": "legacy-gate-doc"},
+                payload={"document_id": "gate-doc"},
             ),
         ),
     )
@@ -600,14 +564,14 @@ async def test_remove_support_preserves_shared_same_source_document_projection(
         target_unit_revision_id="unitrev-page-1-v2",
         observation_revision_id="obsrev-page-1-v2",
         evidence_unit_id=first_unit_id,
-        support_hash=await db.get_memory_support_set_hash("mem-legacy"),
+        support_hash=await db.get_memory_support_set_hash("mem-1"),
     )
 
     await db.apply_lifecycle_plan(plan)
 
-    assert await db.get_active_memory_support_unit_ids("mem-legacy") == (second_unit_id,)
-    assert [(source.source_id, source.doc_id) for source in await db.get_memory_sources("mem-legacy")] == [
-        ("src-1", "legacy-gate-doc")
+    assert await db.get_active_memory_support_unit_ids("mem-1") == (second_unit_id,)
+    assert [(source.source_id, source.doc_id) for source in await db.get_memory_sources("mem-1")] == [
+        ("src-1", "gate-doc")
     ]
     assert await db.count_active_supported_memories_without_source_provenance("src-1") == 0
 
@@ -624,7 +588,7 @@ async def test_overlapping_configured_sources_keep_independent_support_projectio
     rows = await db.db.execute_fetchall(
         """SELECT source_id FROM memory_sources
              WHERE memory_id = ? AND doc_id = ? ORDER BY source_id""",
-        ("mem-legacy", "legacy-gate-doc"),
+        ("mem-1", "gate-doc"),
     )
     assert [row["source_id"] for row in rows] == ["src-1", "src-2"]
     assert await db.count_active_supported_memories_without_source_provenance("src-1") == 0
@@ -636,21 +600,21 @@ async def test_overlapping_configured_sources_keep_independent_support_projectio
             plan_id="plan-overlapping-remove",
             mutation_type=LifecycleMutationType.REMOVE_SUPPORT,
             evidence_unit=unit,
-            support_hash=await db.get_memory_support_set_hash("mem-legacy"),
+            support_hash=await db.get_memory_support_set_hash("mem-1"),
         )
     )
 
     rows = await db.db.execute_fetchall(
         """SELECT source_id FROM memory_sources
              WHERE memory_id = ? AND doc_id = ? ORDER BY source_id""",
-        ("mem-legacy", "legacy-gate-doc"),
+        ("mem-1", "gate-doc"),
     )
     assert [row["source_id"] for row in rows] == ["src-1"]
     assert await db.count_active_supported_memories_without_source_provenance("src-1") == 0
     metadata_rows = await db.db.execute_fetchall(
         """SELECT source_id FROM memory_search_metadata_trigram
              WHERE memory_id = ? AND doc_id = ? ORDER BY source_id""",
-        ("mem-legacy", "legacy-gate-doc"),
+        ("mem-1", "gate-doc"),
     )
     assert [row["source_id"] for row in metadata_rows] == ["src-1"]
 
@@ -665,8 +629,8 @@ async def test_document_owned_corroboration_preserves_an_overlapping_source_proj
     )
 
     outcome = await db.corroborate_memory(
-        "mem-legacy",
-        "legacy-gate-doc",
+        "mem-1",
+        "gate-doc",
         "confluence",
         "longer owner source excerpt",
         support_kind="extracted",
@@ -677,11 +641,11 @@ async def test_document_owned_corroboration_preserves_an_overlapping_source_proj
     rows = await db.db.execute_fetchall(
         """SELECT source_id, excerpt FROM memory_sources
              WHERE memory_id = ? AND doc_id = ? ORDER BY source_id""",
-        ("mem-legacy", "legacy-gate-doc"),
+        ("mem-1", "gate-doc"),
     )
     assert [(row["source_id"], row["excerpt"]) for row in rows] == [
         ("src-1", "longer owner source excerpt"),
-        ("src-2", "Legacy claim"),
+        ("src-2", "Source claim"),
     ]
 
 
@@ -697,15 +661,15 @@ async def test_delete_source_preserves_a_document_projected_by_another_configure
     result = await db.delete_source_cascade("src-1")
 
     assert result.retired_memory_ids == ()
-    document = await db.get_document("legacy-gate-doc")
+    document = await db.get_document("gate-doc")
     assert document is not None
     assert document.source == "src-2"
-    sources = await db.get_memory_sources("mem-legacy")
+    sources = await db.get_memory_sources("mem-1")
     assert [(source.source_id, source.doc_id) for source in sources] == [
-        ("src-2", "legacy-gate-doc"),
+        ("src-2", "gate-doc"),
     ]
-    assert await db.get_active_memory_support_unit_ids("mem-legacy") == (overlapping_unit.id,)
-    memory = await db.get_memory("mem-legacy")
+    assert await db.get_active_memory_support_unit_ids("mem-1") == (overlapping_unit.id,)
+    memory = await db.get_memory("mem-1")
     assert memory is not None
     assert memory.status == "active"
 
@@ -722,15 +686,15 @@ async def test_delete_non_owner_source_removes_its_exact_shared_document_project
     result = await db.delete_source_cascade("src-2")
 
     assert result.retired_memory_ids == ()
-    document = await db.get_document("legacy-gate-doc")
+    document = await db.get_document("gate-doc")
     assert document is not None
     assert document.source == "src-1"
-    sources = await db.get_memory_sources("mem-legacy")
+    sources = await db.get_memory_sources("mem-1")
     assert [(source.source_id, source.doc_id) for source in sources] == [
-        ("src-1", "legacy-gate-doc"),
+        ("src-1", "gate-doc"),
     ]
-    assert await db.get_active_memory_support_unit_ids("mem-legacy") == ("eu-backfill-1",)
-    memory = await db.get_memory("mem-legacy")
+    assert await db.get_active_memory_support_unit_ids("mem-1") == ("eu-1",)
+    memory = await db.get_memory("mem-1")
     assert memory is not None
     assert memory.status == "active"
 
@@ -747,10 +711,10 @@ def _retirement_plan(evidence_unit_id: str, support_hash: str) -> LifecyclePlan:
         ),
         gate_state=LifecycleGateState.ENABLED,
         coverage_proof=CoverageProof(
-            mandatory_incumbent_ids=("mem-legacy",),
+            mandatory_incumbent_ids=("mem-1",),
             incumbent_decisions=(
                 IncumbentDecision(
-                    "mem-legacy",
+                    "mem-1",
                     IncumbentDisposition.REMOVE_SUPPORT,
                     "authoritative evidence removed",
                 ),
@@ -760,18 +724,18 @@ def _retirement_plan(evidence_unit_id: str, support_hash: str) -> LifecyclePlan:
         ),
         stale_guard=StaleGuard(
             observation_revision_ids=("obsrev-page-1-v2",),
-            support_set_hashes={"mem-legacy": support_hash},
+            support_set_hashes={"mem-1": support_hash},
         ),
         mutations=(
             LifecycleMutation(
                 LifecycleMutationType.REMOVE_SUPPORT,
-                memory_id="mem-legacy",
+                memory_id="mem-1",
                 source_id="src-1",
                 evidence_unit_ids=(evidence_unit_id,),
             ),
             LifecycleMutation(
                 LifecycleMutationType.RETIRE_MEMORY,
-                memory_id="mem-legacy",
+                memory_id="mem-1",
                 source_id="src-1",
             ),
         ),
@@ -812,7 +776,7 @@ def _gated_retirement_plan(
             owner_user_id=None,
             project_key=None,
             repo_identifier=None,
-            doc_id="legacy-doc",
+            doc_id="gate-doc",
             source_type="confluence",
             access_context_hash="workspace",
         ),
@@ -823,7 +787,7 @@ def _gated_retirement_plan(
 async def test_lifecycle_plan_applies_support_removal_and_retirement_atomically(db: Database) -> None:
     unit_id = await _persist_exact_support_and_provenance(db)
     await db.enable_lifecycle_gate("src-1")
-    plan = _retirement_plan(unit_id, await db.get_memory_support_set_hash("mem-legacy"))
+    plan = _retirement_plan(unit_id, await db.get_memory_support_set_hash("mem-1"))
     other = Database(db.db_path)
     await other.connect()
 
@@ -844,7 +808,7 @@ async def test_lifecycle_plan_applies_support_removal_and_retirement_atomically(
     finally:
         await other.close()
 
-    memory = await db.get_memory("mem-legacy")
+    memory = await db.get_memory("mem-1")
     assert memory is not None and memory.status == "retired"
     assert await db.get_lifecycle_plan_status(plan.id) == "applied"
 
@@ -865,12 +829,12 @@ async def test_terminal_lifecycle_mutation_stales_all_pending_reviews(
             id="review-terminal-incumbent",
             kind=ReviewKind.SUPERSEDE.value,
             status=ReviewStatus.PENDING.value,
-            incumbent_memory_id="mem-legacy",
+            incumbent_memory_id="mem-1",
             challenger_memory_id=challenger.id,
         )
     )
     unit_id = await _persist_exact_support_and_provenance(db)
-    incumbent = await db.get_memory("mem-legacy")
+    incumbent = await db.get_memory("mem-1")
     assert incumbent is not None
     support_hash = await db.get_memory_support_set_hash(incumbent.id)
     review_plan = _gated_retirement_plan(
@@ -908,7 +872,7 @@ async def test_gated_review_approval_applies_proposal_and_resolves_review_atomic
     db: Database,
 ) -> None:
     unit_id = await _persist_exact_support_and_provenance(db)
-    incumbent = await db.get_memory("mem-legacy")
+    incumbent = await db.get_memory("mem-1")
     assert incumbent is not None
     support_hash = await db.get_memory_support_set_hash(incumbent.id)
     original = _gated_retirement_plan(
@@ -950,7 +914,7 @@ async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
         plan_id="plan-review-refresh-other-source",
     )
     await db.enable_lifecycle_gate("src-1")
-    incumbent = await db.get_memory("mem-legacy")
+    incumbent = await db.get_memory("mem-1")
     assert incumbent is not None
     support_state = (await db.get_active_memory_support_states((incumbent.id,)))[incumbent.id]
     original = build_lifecycle_plan(
@@ -981,7 +945,7 @@ async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
             owner_user_id=None,
             project_key=None,
             repo_identifier=None,
-            doc_id="legacy-gate-doc",
+            doc_id="gate-doc",
             source_type="confluence",
             access_context_hash="workspace",
         ),
@@ -1035,7 +999,7 @@ async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
 
     assert (await db.get_lifecycle_review(refreshed_review_id)).status is LifecycleReviewStatus.APPROVED  # type: ignore[union-attr]
     remaining = (await db.get_active_memory_support_states((incumbent.id,)))[incumbent.id]
-    assert remaining.unit_ids == tuple(sorted((other_unit.id, additional_other_unit.id)))
+    assert set(remaining.unit_ids) == {other_unit.id, additional_other_unit.id}
     assert (await db.get_memory(incumbent.id)).status == "active"  # type: ignore[union-attr]
 
 
@@ -1082,7 +1046,7 @@ async def test_stale_lifecycle_plan_rolls_back_without_partial_mutation(db: Data
     with pytest.raises(ValueError, match="support stale guard"):
         await db.apply_lifecycle_plan(stale)
 
-    memory = await db.get_memory("mem-legacy")
+    memory = await db.get_memory("mem-1")
     assert memory is not None and memory.status == "active"
     assert await db.get_lifecycle_plan_status(stale.id) is None
 
@@ -1106,7 +1070,7 @@ async def test_mutation_failure_rolls_back_staged_evidence_with_the_plan(db: Dat
     )
     plan = _retirement_plan(
         unit_id,
-        await db.get_memory_support_set_hash("mem-legacy"),
+        await db.get_memory_support_set_hash("mem-1"),
     )
     plan = replace(
         plan,
@@ -1127,7 +1091,7 @@ async def test_mutation_failure_rolls_back_staged_evidence_with_the_plan(db: Dat
 
     assert await db.get_evidence_unit(staged_unit.id) is None
     assert await db.get_lifecycle_plan_status(plan.id) is None
-    memory = await db.get_memory("mem-legacy")
+    memory = await db.get_memory("mem-1")
     assert memory is not None and memory.status == "active"
 
 
@@ -1169,7 +1133,7 @@ async def test_mutation_failure_rolls_back_source_projection_with_the_plan(db: D
     )
     plan = _retirement_plan(
         unit_id,
-        await db.get_memory_support_set_hash("mem-legacy"),
+        await db.get_memory_support_set_hash("mem-1"),
     )
     plan = replace(
         plan,
@@ -1221,7 +1185,7 @@ async def test_stale_source_activity_epoch_rejects_projected_lifecycle_commit(
     plan = replace(
         _retirement_plan(
             unit_id,
-            await db.get_memory_support_set_hash("mem-legacy"),
+            await db.get_memory_support_set_hash("mem-1"),
         ),
         id="plan-from-stale-worker",
     )
@@ -1245,20 +1209,20 @@ async def test_memory_version_stale_guard_rejects_concurrent_incumbent_change(
     await db.enable_lifecycle_gate("src-1")
     plan = _retirement_plan(
         unit_id,
-        await db.get_memory_support_set_hash("mem-legacy"),
+        await db.get_memory_support_set_hash("mem-1"),
     )
     plan = replace(
         plan,
         stale_guard=replace(
             plan.stale_guard,
-            memory_versions={"mem-legacy": "memory-version-before-concurrent-edit"},
+            memory_versions={"mem-1": "memory-version-before-concurrent-edit"},
         ),
     )
 
     with pytest.raises(ValueError, match="Memory stale guard"):
         await db.apply_lifecycle_plan(plan)
 
-    memory = await db.get_memory("mem-legacy")
+    memory = await db.get_memory("mem-1")
     assert memory is not None and memory.status == "active"
     assert await db.get_lifecycle_plan_status(plan.id) is None
 

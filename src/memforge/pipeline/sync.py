@@ -2648,14 +2648,11 @@ class GeneSyncOrchestrator:
         extraction_result = await self._extract_for_document_update(
             projection=projection,
             update_plan=update_plan,
-            markdown_body=markdown_body,
             source_type=source_type,
             doc_type=source_type,
             doc_id=doc_id,
             source_id=source_id,
             run_id=run_id,
-            document_title=item.title,
-            document_url=item.source_url,
             derivation_context=derivation_context,
             reprocess_current_observations=force_reprocess,
         )
@@ -2808,15 +2805,12 @@ class GeneSyncOrchestrator:
         *,
         projection: SourceProjection,
         update_plan: DocumentUpdatePlan | None,
-        markdown_body: str,
         source_type: str,
         doc_type: str,
         doc_id: str,
         source_id: str,
         run_id: str | None,
-        document_title: str,
-        document_url: str,
-        derivation_context: SourceUnitDerivationContext | None = None,
+        derivation_context: SourceUnitDerivationContext,
         reprocess_current_observations: bool = False,
     ) -> MemoryExtractionResult:
         """Run durable extraction for the changed Observations of a document."""
@@ -2839,11 +2833,8 @@ class GeneSyncOrchestrator:
                 source_type=source_type,
                 run_id=run_id,
                 result=result,
-                extraction_metadata=result.metadata,
             )
             return result
-        if derivation_context is None:
-            raise ValueError("Source derivation work requires a durable derivation context")
         result = await self._extract_source_derivation_work(
             projection=projection,
             source_type=source_type,
@@ -2859,7 +2850,6 @@ class GeneSyncOrchestrator:
             source_type=source_type,
             run_id=run_id,
             result=result,
-            extraction_metadata=result.metadata,
         )
         return result
 
@@ -3154,7 +3144,6 @@ class GeneSyncOrchestrator:
         source_type: str,
         run_id: str | None,
         result: MemoryExtractionResult,
-        extraction_metadata: dict[str, Any] | None = None,
     ) -> None:
         """Record whether a memory extraction call produced usable candidates."""
         if not self.memory_store or not hasattr(self.memory_store, "record_audit_event"):
@@ -3181,8 +3170,6 @@ class GeneSyncOrchestrator:
         }
         if result.metadata:
             payload.update(result.metadata)
-        if extraction_metadata:
-            payload.update(extraction_metadata)
         if plan:
             payload.update(
                 {

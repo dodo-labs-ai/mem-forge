@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -12,7 +13,6 @@ from tests.unit_support_fixture import (
     active_support_evidence,
     primary_reference,
     record_unit_support,
-    select_quoted_fragments,
     withdraw_lifecycle_gate,
 )
 from tests.revision_client_fixture import (
@@ -114,7 +114,9 @@ from memforge.models import (
     ReconcileOperation,
     content_hash,
 )
+from memforge.pipeline.evidence_fragments import EvidenceFragment
 from memforge.pipeline.projection_evidence import build_projected_claim_evidence
+from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge import source_derivation as source_derivation_module
 from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_CONTRACT_VERSION
 from memforge.pipeline.projection_context import (
@@ -205,19 +207,65 @@ _WORKSPACE_ACCESS_CONTEXT_HASH = lifecycle_access_context_hash(
 
 def _selected(
     projection: SourceProjection,
-    raw_memories,
+    raw_memories: Sequence[RawMemory],
     *,
     access_context_hash: str = _WORKSPACE_ACCESS_CONTEXT_HASH,
-    **kwargs,
+    base: SourceProjection | None = None,
 ) -> list[RawMemory]:
-    """Return candidates as the extractor emits them, with their quoted Fragment selected."""
+    """Resolve each candidate's quote to the current Fragments an extractor would select.
 
-    return select_quoted_fragments(
-        projection,
-        raw_memories,
+    The quote is the candidate's evidence quote, or its content when it has
+    none. A quote equal to a Fragment's text selects the first such Fragment
+    as the Primary, and a quote inside one Fragment selects that one. A
+    quote spanning several Fragments selects the first as the Primary and the
+    rest as Required parts. The Fragments of each Observation named in
+    ``required_source_observation_ids``, such as an image, are Required too.
+    """
+
+    context = RevisionAssessmentContext(
+        projection=projection,
+        base=base,
         access_context_hash=access_context_hash,
-        **kwargs,
     )
+    catalog = context.catalog(context.full_fragments)
+
+    def fragments_for(quote: str) -> list[EvidenceFragment]:
+        exact = [fragment for fragment in catalog.fragments if fragment.presentation_text == quote]
+        if exact:
+            return exact[:1]
+        containing = [fragment for fragment in catalog.fragments if quote in fragment.presentation_text]
+        if containing:
+            [fragment] = containing
+            return [fragment]
+        spanned = [
+            fragment
+            for fragment in catalog.fragments
+            if fragment.presentation_text and fragment.presentation_text in quote
+        ]
+        assert spanned, f"no current Fragment matches quote: {quote!r}"
+        return spanned
+
+    selected: list[RawMemory] = []
+    for raw in raw_memories:
+        primary, *required = fragments_for(raw.evidence_quote or raw.content)
+        required += [
+            fragment
+            for fragment in catalog.fragments
+            if fragment.anchor.observation_id in raw.required_source_observation_ids
+            and fragment not in (primary, *required)
+        ]
+        selected.append(
+            replace(
+                raw,
+                source_observation_id=primary.anchor.observation_id,
+                required_source_observation_ids=[fragment.anchor.observation_id for fragment in required],
+                resolved_evidence_selection=catalog.resolve_selection(
+                    primary_ref=primary.reference,
+                    required_refs=tuple(fragment.reference for fragment in required),
+                ),
+            )
+        )
+    return selected
 
 
 def _projection(
@@ -2211,7 +2259,7 @@ class _V2StaleCrossUnitScenario:
     alternative_current: SourceProjection
 
 
-async def _seed_v2_stale_cross_unit_scenario(
+async def _seed_stale_cross_unit_scenario(
     db: Database,
     *,
     prefix: str,
@@ -2842,10 +2890,7 @@ async def test_source_deriver_binds_provider_neutral_quality_events_to_current_l
             )
         )
         return MemoryExtractionResult(
-            metadata={
-                "extraction_model": "anthropic/claude-sonnet",
-                "invalid_evidence_block_count": 1,
-            }
+            metadata={"extraction_model": "anthropic/claude-sonnet"}
         )
 
     result = await SourceUnitDeriver(db).derive(
@@ -4104,7 +4149,7 @@ async def test_incremental_noop_rebinds_exact_unchanged_claim_without_new_extrac
 
 
 @pytest.mark.asyncio
-async def test_v2_incremental_noop_rebinds_complete_unit_to_current_revision(
+async def test_incremental_noop_rebinds_complete_unit_to_current_revision(
     db: Database,
 ) -> None:
     first = _projection(
@@ -4180,7 +4225,7 @@ async def test_v2_incremental_noop_rebinds_complete_unit_to_current_revision(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_rebind_preserves_independent_support_alternative(
+async def test_noop_rebind_preserves_independent_support_alternative(
     db: Database,
 ) -> None:
     access_context_hash = lifecycle_access_context_hash(
@@ -4262,7 +4307,7 @@ async def test_v2_noop_rebind_preserves_independent_support_alternative(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_assesses_each_same_unit_alternative(
+async def test_noop_assesses_each_same_unit_alternative(
     db: Database,
 ) -> None:
     access_context_hash = lifecycle_access_context_hash(
@@ -4334,7 +4379,7 @@ async def test_v2_noop_assesses_each_same_unit_alternative(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_postcondition_failure_rolls_back_and_is_non_retryable(
+async def test_noop_postcondition_failure_rolls_back_and_is_non_retryable(
     db: Database,
 ) -> None:
     access_context_hash = lifecycle_access_context_hash(
@@ -4523,7 +4568,7 @@ async def test_incremental_noop_repairs_one_invalid_fragment_selection_in_place(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_revalidation_uses_bounded_fragment_refs_for_large_revision(
+async def test_noop_revalidation_uses_bounded_fragment_refs_for_large_revision(
     db: Database,
 ) -> None:
     first = _projection(
@@ -5110,8 +5155,6 @@ async def test_partial_jira_projection_keeps_support_on_an_unreturned_comment_wi
 
 @pytest.mark.asyncio
 async def test_partial_jira_projection_keeps_a_validated_support_on_an_unreturned_comment(db: Database) -> None:
-    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-
     await _set_fixture_source_type(db, "jira")
     await db.enable_lifecycle_gate("src-1")
     claim, evidence = "A7 is retained for regular payroll.", "Decision: retain A7"
@@ -5488,7 +5531,7 @@ async def test_noop_duplicate_required_refs_normalize_without_retry(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_revalidates_revised_required_jira_description(
+async def test_noop_revalidates_revised_required_jira_description_in_partial_projection(
     db: Database,
 ) -> None:
     await _set_fixture_source_type(db, "jira")
@@ -5574,7 +5617,7 @@ async def test_v2_noop_revalidates_revised_required_jira_description(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_uses_canonical_field_type_to_resolve_duplicate_text(
+async def test_noop_uses_canonical_field_type_to_resolve_duplicate_text(
     db: Database,
 ) -> None:
     await _set_fixture_source_type(db, "jira")
@@ -5639,7 +5682,7 @@ async def test_v2_noop_uses_canonical_field_type_to_resolve_duplicate_text(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_model_selects_exact_ref_among_repeated_text(
+async def test_noop_model_selects_exact_ref_among_repeated_text(
     db: Database,
 ) -> None:
     claim = "A7 remains excluded."
@@ -5693,7 +5736,7 @@ async def test_v2_noop_model_selects_exact_ref_among_repeated_text(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_semantically_unsupported_current_fragment_stages_review(
+async def test_noop_semantically_unsupported_current_fragment_stages_review(
     db: Database,
 ) -> None:
     access_context_hash = lifecycle_access_context_hash(
@@ -5755,10 +5798,10 @@ async def test_v2_noop_semantically_unsupported_current_fragment_stages_review(
 
 
 @pytest.mark.asyncio
-async def test_v2_pending_review_ignores_unrelated_stale_cross_unit_support(
+async def test_pending_review_ignores_unrelated_stale_cross_unit_support(
     db: Database,
 ) -> None:
-    scenario = await _seed_v2_stale_cross_unit_scenario(
+    scenario = await _seed_stale_cross_unit_scenario(
         db,
         prefix="projection-v2-causal-review",
     )
@@ -5813,10 +5856,10 @@ async def test_v2_pending_review_ignores_unrelated_stale_cross_unit_support(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_rebind_ignores_unrelated_stale_cross_unit_support(
+async def test_noop_rebind_ignores_unrelated_stale_cross_unit_support(
     db: Database,
 ) -> None:
-    scenario = await _seed_v2_stale_cross_unit_scenario(
+    scenario = await _seed_stale_cross_unit_scenario(
         db,
         prefix="projection-v2-causal-rebind",
     )
@@ -5870,10 +5913,10 @@ async def test_v2_noop_rebind_ignores_unrelated_stale_cross_unit_support(
 
 
 @pytest.mark.asyncio
-async def test_v2_destructive_commit_defers_on_stale_cross_unit_support(
+async def test_destructive_commit_defers_on_stale_cross_unit_support(
     db: Database,
 ) -> None:
-    scenario = await _seed_v2_stale_cross_unit_scenario(
+    scenario = await _seed_stale_cross_unit_scenario(
         db,
         prefix="projection-v2-causal-deferred",
     )
@@ -5930,7 +5973,7 @@ async def test_v2_destructive_commit_defers_on_stale_cross_unit_support(
 
 
 @pytest.mark.asyncio
-async def test_v2_deferred_plan_rolls_back_every_memory_in_source_unit(
+async def test_deferred_plan_rolls_back_every_memory_in_source_unit(
     db: Database,
 ) -> None:
     access_context_hash = lifecycle_access_context_hash(
@@ -6071,10 +6114,10 @@ async def test_v2_deferred_plan_rolls_back_every_memory_in_source_unit(
 
 
 @pytest.mark.asyncio
-async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
+async def test_deferred_commit_rematerializes_without_semantic_replay(
     db: Database,
 ) -> None:
-    scenario = await _seed_v2_stale_cross_unit_scenario(
+    scenario = await _seed_stale_cross_unit_scenario(
         db,
         prefix="projection-v2-prepared",
     )
@@ -6224,10 +6267,10 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
 
 
 @pytest.mark.asyncio
-async def test_v2_prepared_commit_rejects_undeclared_support_drift(
+async def test_prepared_commit_rejects_undeclared_support_drift(
     db: Database,
 ) -> None:
-    scenario = await _seed_v2_stale_cross_unit_scenario(
+    scenario = await _seed_stale_cross_unit_scenario(
         db,
         prefix="projection-v2-prepared-drift",
     )
@@ -6286,7 +6329,7 @@ async def test_v2_prepared_commit_rejects_undeclared_support_drift(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_preserves_multiple_required_parts_in_one_observation(
+async def test_noop_preserves_multiple_required_parts_in_one_observation(
     db: Database,
 ) -> None:
     await _set_fixture_source_type(db, "jira")
@@ -6368,7 +6411,7 @@ async def test_v2_noop_preserves_multiple_required_parts_in_one_observation(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_resolves_decoded_canonical_quotes_to_raw_json_ranges(
+async def test_noop_resolves_decoded_canonical_quotes_to_raw_json_ranges(
     db: Database,
 ) -> None:
     await _set_fixture_source_type(db, "jira")
@@ -6466,7 +6509,7 @@ async def test_v2_noop_resolves_decoded_canonical_quotes_to_raw_json_ranges(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_propagates_representation_compiler_contract_failure(
+async def test_noop_propagates_representation_compiler_contract_failure(
     db: Database,
 ) -> None:
     access_context_hash = lifecycle_access_context_hash(
@@ -6566,7 +6609,7 @@ async def test_v2_noop_propagates_representation_compiler_contract_failure(
     ],
 )
 @pytest.mark.asyncio
-async def test_v2_noop_propagates_bounded_revalidation_operational_limitation(
+async def test_noop_propagates_bounded_revalidation_operational_limitation(
     db: Database,
     monkeypatch,
     limitation_code: SupportRevalidationLimitationCode,
@@ -6812,10 +6855,6 @@ async def test_lifecycle_vector_retry_respects_durable_backoff_and_completion_is
     await db.complete_lifecycle_vector_task(task.id)
     await db.complete_lifecycle_vector_task(task.id)
     assert await db.list_lifecycle_vector_tasks(source_id="src-1") == []
-
-
-async def _async_none() -> None:
-    return None
 
 
 @pytest.mark.asyncio
