@@ -25,6 +25,7 @@ from memforge.genes.atlassian_auth import (
 from memforge.genes.base import Gene
 from memforge.genes.confluence_artifacts import resolve_current_confluence_artifacts
 from memforge.genes.confluence_pdf import export_confluence_page_pdf
+from memforge.source_time import SOURCE_UPDATED_AT_KEY
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -774,6 +775,7 @@ class ConfluenceGene(Gene):
                     "labels": raw.item.labels,
                     "author": raw.item.author,
                     "version": raw.item.version,
+                    SOURCE_UPDATED_AT_KEY: raw.item.last_modified.isoformat(),
                 },
             )
 
@@ -802,6 +804,8 @@ class ConfluenceGene(Gene):
                 "labels": raw.item.labels,
                 "author": raw.item.author,
                 "version": raw.item.version,
+                # The page version time ``version.when`` is the body's source time.
+                SOURCE_UPDATED_AT_KEY: raw.item.last_modified.isoformat(),
             },
         )
 

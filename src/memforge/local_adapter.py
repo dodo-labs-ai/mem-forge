@@ -43,10 +43,12 @@ from memforge.local_agent.document_identity import (
     build_local_markdown_doc_id,
     build_teams_doc_id,
 )
+from memforge.local_agent.source_contract import local_file_package_semantic_hash
 from memforge.models import content_hash, slugify
 from memforge.storage.database import Database
 from memforge.storage.document_store import DocumentStore
 from memforge.source_artifacts import source_artifact_semantic_refs
+from memforge.source_time import SOURCE_UPDATED_AT_KEY, source_time_iso
 
 LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
 GITHUB_REPO_SOURCE_TYPE = "github_repo"
@@ -281,6 +283,7 @@ async def submit_local_markdown_document(
     content_type: str = "text/markdown",
     title: str | None = None,
     raw_hash: str | None = None,
+    source_updated_at: str | None = None,
     submitted_by: str | None = None,
     submitted_at: str | None = None,
     document_store: DocumentStore | None = None,
@@ -289,6 +292,9 @@ async def submit_local_markdown_document(
 
     ``markdown_body`` is the raw file text and ``content_type`` declares its
     format. Conversion to markdown happens later, in the gene's ``normalize``.
+    ``source_updated_at`` is the file's own time as the local agent reads it
+    (its commit time, or its modification time outside a clean Git checkout);
+    without it the file has no source time. ``submitted_at`` only orders packages.
     """
     if source.get("type") != LOCAL_MARKDOWN_SOURCE_TYPE:
         raise ValueError(f"source {source.get('id')} is type {source.get('type')!r}, not 'local_markdown'")
@@ -302,6 +308,7 @@ async def submit_local_markdown_document(
         raise ValueError("markdown_body is required")
 
     relative = _normalize_relative_path(relative_path)
+    content_time = source_time_iso(source_updated_at)
     submitted_at = submitted_at or _now_iso()
     source_id = str(source["id"])
     document_hash = content_hash(markdown_body)
@@ -329,6 +336,8 @@ async def submit_local_markdown_document(
         "submitted_by": submitted_by,
         "markdown": markdown_body,
     }
+    if content_time is not None:
+        package[SOURCE_UPDATED_AT_KEY] = content_time
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
     package_uri, package_sha256, package_path = await _persist_package(
@@ -359,6 +368,7 @@ async def submit_local_markdown_document(
                 "relative_path": relative,
                 "content_type": content_type,
                 "raw_hash": raw_hash,
+                **({SOURCE_UPDATED_AT_KEY: content_time} if content_time is not None else {}),
             },
         )
     return {
@@ -367,6 +377,7 @@ async def submit_local_markdown_document(
         "vault_id": configured_vault,
         "relative_path": relative,
         "document_hash": document_hash,
+        "semantic_hash": local_file_package_semantic_hash(document_hash, content_time),
         "package_path": package_path,
         "package_uri": package_uri,
         "package_sha256": package_sha256,
@@ -391,13 +402,19 @@ async def submit_github_repo_document(
     blob_sha: str | None = None,
     symlink_chain: list[dict[str, str]] | None = None,
     resolved_relative_path: str | None = None,
+    source_updated_at: str | None = None,
     submitted_by: str | None = None,
     submitted_at: str | None = None,
     document_store: DocumentStore | None = None,
     sync_snapshot_id: str | None = None,
     source_artifacts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Validate, package, and persist one GitHub repository file push."""
+    """Validate, package, and persist one GitHub repository file push.
+
+    ``source_updated_at`` is the file's latest commit time at the collection
+    commit as the local agent reads it; without it the file has no source
+    time. ``submitted_at`` only orders packages.
+    """
     if source.get("type") != GITHUB_REPO_SOURCE_TYPE:
         raise ValueError(f"source {source.get('id')} is type {source.get('type')!r}, not 'github_repo'")
 
@@ -413,6 +430,7 @@ async def submit_github_repo_document(
         raise ValueError("markdown_body is required")
 
     relative = normalize_github_relative_path(relative_path)
+    content_time = source_time_iso(source_updated_at)
     submitted_at = submitted_at or _now_iso()
     source_id = str(source["id"])
     source_config = dict(source.get("config") or {})
@@ -509,6 +527,8 @@ async def submit_github_repo_document(
         "markdown": markdown_body,
         "source_artifacts": source_artifacts,
     }
+    if content_time is not None:
+        package[SOURCE_UPDATED_AT_KEY] = content_time
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
     package_uri, package_sha256, package_path = await _persist_package(
@@ -546,6 +566,7 @@ async def submit_github_repo_document(
                 **symlink_metadata,
                 "content_type": content_type,
                 "raw_hash": raw_hash,
+                **({SOURCE_UPDATED_AT_KEY: content_time} if content_time is not None else {}),
             },
         )
     return {
@@ -555,6 +576,7 @@ async def submit_github_repo_document(
         "repo_ref": ref,
         "relative_path": relative,
         "document_hash": document_hash,
+        "semantic_hash": local_file_package_semantic_hash(document_hash, content_time),
         "package_path": package_path,
         "package_uri": package_uri,
         "package_sha256": package_sha256,
@@ -679,6 +701,7 @@ async def submit_jira_package(
         "base_url": configured_base_url,
         "issue_key": normalized_issue_key,
         "document_hash": payload_hash,
+        "semantic_hash": payload_hash,
         "package_path": package_path,
         "package_uri": package_uri,
         "package_sha256": package_sha256,
@@ -827,6 +850,7 @@ async def submit_teams_window_package(
         "window_id": normalized_window_id,
         "revision_hash": normalized_revision_hash,
         "document_hash": payload_hash,
+        "semantic_hash": payload_hash,
         "package_path": package_path,
         "package_uri": package_uri,
         "package_sha256": package_sha256,

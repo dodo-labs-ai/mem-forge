@@ -16,6 +16,7 @@ import pytest
 
 import memforge.tool_client as tool_client
 from memforge.api_target import build_host_target, build_target
+from memforge.local_agent.source_contract import LOCAL_PACKAGE_CONTRACT_VERSION
 from memforge.tool_client import ToolClient
 
 
@@ -226,6 +227,7 @@ def test_prepare_local_source_snapshot_posts_complete_fenced_manifest():
                 "sync_snapshot_id": "job-1:attempt:2",
                 "local_agent_job_id": "job-1",
                 "local_agent_attempt_count": 2,
+                "package_contract_version": LOCAL_PACKAGE_CONTRACT_VERSION,
             },
         )
     ]

@@ -4395,6 +4395,32 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE documents ADD COLUMN item_extra_json TEXT",
         ],
     ),
+    (
+        101,
+        "Record the page version time on current Confluence page body revisions",
+        [
+            # A Confluence document's time is its page version time, which is the
+            # source time of the current page body revision.
+            """UPDATE source_observation_revisions
+                  SET observed_at = (
+                      SELECT d.last_modified
+                        FROM source_observations so
+                        JOIN source_units su ON su.id = so.source_unit_id
+                        JOIN documents d
+                          ON d.doc_id = json_extract(su.locator_json, '$.document_id')
+                         AND d.source = su.source_id
+                       WHERE so.id = source_observation_revisions.observation_id
+                  )
+                WHERE observed_at IS NULL
+                  AND id IN (
+                      SELECT so.current_revision_id
+                        FROM source_observations so
+                        JOIN source_units su ON su.id = so.source_unit_id
+                       WHERE so.observation_type = 'page_body'
+                         AND su.unit_type = 'confluence_page'
+                  )""",
+        ],
+    ),
 ]
 
 
@@ -6631,7 +6657,9 @@ class Database:
 
         Observation and unit revisions are immutable. Stable observations and
         units may update their locator/current-revision pointers without changing
-        provider identity. Reusing a run id for a different payload is rejected.
+        provider identity. An Observation Revision recorded without a source time
+        takes the one the projection now gives; a recorded source time is never
+        replaced. Reusing a run id for a different payload is rejected.
         """
 
         incoming_payload = source_projection_to_payload(projection)
@@ -6879,6 +6907,12 @@ class Database:
                             "representation_schema_version": profile.schema_version if profile is not None else None,
                         },
                     )
+                    if revision.observed_at is not None:
+                        await self.db.execute(
+                            """UPDATE source_observation_revisions SET observed_at = ?
+                                WHERE id = ? AND observed_at IS NULL""",
+                            (revision.observed_at, revision.id),
+                        )
                     await self.db.execute(
                         "UPDATE source_observations SET current_revision_id = ?, updated_at = ? WHERE id = ?",
                         (revision.id, now, revision.observation_id),

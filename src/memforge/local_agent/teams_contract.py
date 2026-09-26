@@ -18,6 +18,9 @@ MEMORY_MESSAGE_TYPES = frozenset(
 )
 
 
+MILLISECONDS_PER_SECOND = 1000
+
+
 class TeamsMessageEvidenceError(ValueError):
     """Raised when a potentially memory-bearing message is ambiguous."""
 
@@ -32,6 +35,29 @@ def parse_teams_source_timestamp(value: object) -> datetime | None:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return None
     return parsed.astimezone(timezone.utc)
+
+
+def parse_teams_edit_time(message: Mapping[str, object]) -> datetime | None:
+    """When the chat service last edited a message; None for a message never edited.
+
+    Chatsvc reports an edit as ``properties.edittime`` in epoch milliseconds.
+    """
+
+    properties = message.get("properties")
+    value = properties.get("edittime") if isinstance(properties, Mapping) else None
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    try:
+        milliseconds = int(value)
+    except ValueError:
+        return None
+    return datetime.fromtimestamp(milliseconds / MILLISECONDS_PER_SECOND, timezone.utc)
+
+
+def teams_message_source_time(message: Mapping[str, object]) -> object:
+    """A canonical message's source time: its edit time, else its compose time."""
+
+    return message.get("edited_time") or message.get("time")
 
 
 def validate_teams_provider_message(message: Mapping[str, object]) -> bool:
@@ -74,6 +100,8 @@ def validate_teams_canonical_messages(value: object) -> tuple[Mapping[str, objec
             raise TeamsMessageEvidenceError("Teams window message is missing a stable id")
         if parse_teams_source_timestamp(message.get("time")) is None:
             raise TeamsMessageEvidenceError("Teams window message is missing a source timestamp")
+        if message.get("edited_time") is not None and parse_teams_source_timestamp(message.get("edited_time")) is None:
+            raise TeamsMessageEvidenceError("Teams window message has an invalid edit time")
         result.append(message)
     return tuple(result)
 

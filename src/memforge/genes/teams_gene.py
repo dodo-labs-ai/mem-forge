@@ -36,10 +36,13 @@ from memforge.genes.local_adapter_packages import (
 )
 from memforge.local_agent.teams_contract import (
     TeamsMessageEvidenceError,
+    parse_teams_edit_time,
     parse_teams_source_timestamp,
+    teams_message_source_time,
     validate_teams_provider_message,
 )
 from memforge.local_agent.source_contract import TEAMS_ROLLING_RETENTION_PRESETS
+from memforge.source_time import SOURCE_UPDATED_AT_KEY, latest_source_time
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -918,6 +921,7 @@ class _TeamsAPIClient:
             "from": from_display or "Unknown",
             "content": content,
             "time": source_time,
+            "edited_time": parse_teams_edit_time(m),
             "rootMessageId": root_message_id,
             "parentMessageId": m.get("properties", {}).get("parentMessageId"),
             "mentions": m.get("properties", {}).get("mentions", []),
@@ -1270,7 +1274,7 @@ class TeamsGene(Gene):
                 messages = [m for m in messages if start <= m["time"] <= end]
 
         if not messages:
-            messages = [{"id": root_msg_id, "from": "Unknown", "content": "", "time": item.last_modified}]
+            raise RuntimeError("Teams window payload is missing its discovered messages")
 
         participants = sorted({m["from"] for m in messages if m.get("from")})
         first_time = min(m["time"] for m in messages)
@@ -1288,6 +1292,8 @@ class TeamsGene(Gene):
                     "from": m["from"],
                     "content": m["content"],
                     "time": m["time"].isoformat() if isinstance(m["time"], datetime) else m["time"],
+                    # Present only for an edited message, so an unedited window keeps its payload.
+                    **({"edited_time": m["edited_time"].isoformat()} if m.get("edited_time") else {}),
                     "mentions": m.get("mentions", []),
                     "attachments": m.get("attachments", []),
                     "hosted_content_ids": m.get("hosted_content_ids", []),
@@ -1423,6 +1429,8 @@ class TeamsGene(Gene):
                 "date_range": {"start": first_time, "end": last_time},
                 "has_code_blocks": has_code_blocks,
                 "has_links": has_links,
+                # The window's time is its latest message edit or post.
+                SOURCE_UPDATED_AT_KEY: latest_source_time(teams_message_source_time(msg) for msg in messages),
             },
         )
 

@@ -21,6 +21,8 @@ from memforge.genes.atlassian_auth import require_https_base_url, resolve_pat, t
 from memforge.genes.base import Gene, SourceConfigurationError
 from memforge.github_repo_utils import (
     decode_github_contents_payload,
+    github_latest_commit_time,
+    github_path_commits_query,
     validate_github_tree_payload,
 )
 from memforge.models import (
@@ -35,6 +37,7 @@ from memforge.models import (
 )
 from memforge.pipeline.normalizer_utils import annotate_code_blocks, html_to_markdown, strip_boilerplate
 from memforge.repo_identity import normalize_repo_identifier
+from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +50,9 @@ SYNC_MODE_SUBTREE = "subtree"
 SYNC_MODE_EXPLICIT_LIST = "explicit_list"
 DEFAULT_MAX_DEPTH = 5
 DEFAULT_MAX_PAGES = 200
+# ``ContentItem.extra`` key for the page's source time: its commit time in
+# repository mode, else its sitemap ``lastmod`` or HTTP ``Last-Modified``.
+CONTENT_UPDATED_AT_KEY = "content_updated_at"
 
 
 @dataclass(frozen=True)
@@ -317,6 +323,7 @@ class GitHubPagesGene(Gene):
                 "page_url": page_url,
                 "canonical_url": page_url,
                 "title": raw.item.title.strip() or "GitHub Pages Document",
+                SOURCE_UPDATED_AT_KEY: raw.item.extra.get(CONTENT_UPDATED_AT_KEY),
             }
             if repo_identifier is not None:
                 source_semantics["repo_identifier"] = repo_identifier
@@ -355,6 +362,7 @@ class GitHubPagesGene(Gene):
             "page_url": page_url,
             "canonical_url": page_url,
             "title": title,
+            SOURCE_UPDATED_AT_KEY: raw.item.extra.get(CONTENT_UPDATED_AT_KEY),
         }
         if repo_identifier is not None:
             source_semantics["repo_identifier"] = repo_identifier
@@ -416,7 +424,8 @@ class GitHubPagesGene(Gene):
         repo_path: str,
         blob_sha: str,
     ) -> ContentItem:
-        last_modified = await self._repo_path_last_modified(ref, branch, repo_path)
+        commit_time = await self._repo_path_commit_time(ref, branch, repo_path)
+        last_modified = _discovery_time(commit_time)
         version = blob_sha or last_modified.isoformat()
         return ContentItem(
             item_id=f"github-pages-{hashlib.sha1(canonical_url.encode('utf-8')).hexdigest()}",
@@ -434,6 +443,7 @@ class GitHubPagesGene(Gene):
                 "repo_name": ref.repo,
                 "repo_branch": branch,
                 "repo_blob_sha": blob_sha,
+                CONTENT_UPDATED_AT_KEY: commit_time.isoformat() if commit_time is not None else None,
             },
         )
 
@@ -507,17 +517,14 @@ class GitHubPagesGene(Gene):
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
 
-    async def _repo_path_last_modified(self, ref: "_RepoRef", branch: str, repo_path: str) -> datetime:
-        response = await self._client.get(f"{_repo_api_url(ref)}/commits?sha={branch}&path={repo_path}&per_page=1")
+    async def _repo_path_commit_time(self, ref: "_RepoRef", branch: str, repo_path: str) -> datetime | None:
+        """The page file's latest commit time on ``branch``; None when GitHub gives none."""
+
+        query = github_path_commits_query(relative_path=repo_path, ref=branch)
+        response = await self._client.get(f"{_repo_api_url(ref)}/commits?{query}")
         if response.status_code >= 400:
-            return datetime.now(timezone.utc)
-        commits = response.json()
-        if not isinstance(commits, list) or not commits:
-            return datetime.now(timezone.utc)
-        commit = commits[0].get("commit", {}) if isinstance(commits[0], dict) else {}
-        committer = commit.get("committer", {}) if isinstance(commit, dict) else {}
-        parsed = _parse_datetime(str(committer.get("date") or ""))
-        return parsed or datetime.now(timezone.utc)
+            return None
+        return parse_source_time(github_latest_commit_time(response.json()))
 
     async def _metadata_headers(self, canonical_url: str) -> dict[str, str]:
         try:
@@ -558,6 +565,7 @@ class GitHubPagesGene(Gene):
             if lastmod:
                 item = await self._content_item_for_url(url, metadata_headers={})
                 item.last_modified = lastmod
+                item.extra[CONTENT_UPDATED_AT_KEY] = lastmod.isoformat()
             else:
                 item = await self._content_item_for_url(url)
             items.append(item)
@@ -877,8 +885,15 @@ def _path_is_under(url: str, root_url: str) -> bool:
 
 
 def _content_item_from_url(url: str, headers: dict[str, str]) -> ContentItem:
+    """A page item whose source time is the HTTP ``Last-Modified`` the site reports.
+
+    GitHub Pages reports the deployment time, so it may be later than the
+    page's own change; it is still the site's time, never the fetch time.
+    """
+
     canonical_url = _canonicalize_url(url)
-    last_modified = _last_modified_from_headers(headers) or datetime.now(timezone.utc)
+    header_time = _last_modified_from_headers(headers)
+    last_modified = _discovery_time(header_time)
     etag = headers.get("etag") or headers.get("ETag") or ""
     return ContentItem(
         item_id=f"github-pages-{hashlib.sha1(canonical_url.encode('utf-8')).hexdigest()}",
@@ -888,8 +903,17 @@ def _content_item_from_url(url: str, headers: dict[str, str]) -> ContentItem:
         content_type=headers.get("content-type", "text/html") or "text/html",
         version=etag or last_modified.isoformat(),
         space_or_project=_site_project(canonical_url),
-        extra={"canonical_url": canonical_url},
+        extra={
+            "canonical_url": canonical_url,
+            CONTENT_UPDATED_AT_KEY: header_time.isoformat() if header_time is not None else None,
+        },
     )
+
+
+def _discovery_time(source_time: datetime | None) -> datetime:
+    """``ContentItem.last_modified`` for change detection: the source time, else now."""
+
+    return source_time or datetime.now(timezone.utc)
 
 
 def _last_modified_from_headers(headers: dict[str, str]) -> datetime | None:

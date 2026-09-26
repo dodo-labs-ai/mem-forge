@@ -16,6 +16,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from memforge.api_target import MemForgeTarget
 from memforge.config import DEFAULT_SEARCH_TOP_K
+from memforge.local_agent.source_contract import LOCAL_PACKAGE_CONTRACT_VERSION
 from memforge.retrieval.intents import RankedRetrievalIntent
 from memforge.sync_progress import normalize_sync_progress_snapshot
 
@@ -211,6 +212,7 @@ class ToolClient:
         content_type: str = "text/markdown",
         title: str | None = None,
         raw_hash: str | None = None,
+        source_updated_at: str | None = None,
         sync_snapshot_id: str | None = None,
         local_agent_job_id: str | None = None,
         local_agent_attempt_count: int | None = None,
@@ -221,7 +223,8 @@ class ToolClient:
 
         ``content_type`` tells the service how to convert ``markdown_body``
         (the raw file text) during sync: Markdown/text pass through, HTML and
-        JSON are converted server-side.
+        JSON are converted server-side. ``source_updated_at`` is the file's
+        own time for this content.
         """
         source_id = source_id.strip()
         if not source_id:
@@ -236,6 +239,8 @@ class ToolClient:
             body["title"] = title
         if raw_hash is not None:
             body["raw_hash"] = raw_hash
+        if source_updated_at is not None:
+            body["source_updated_at"] = source_updated_at
         if sync_snapshot_id is not None:
             body["sync_snapshot_id"] = sync_snapshot_id
         if local_agent_job_id is not None:
@@ -266,6 +271,7 @@ class ToolClient:
         blob_sha: str | None = None,
         symlink_chain: list[dict[str, str]] | None = None,
         resolved_relative_path: str | None = None,
+        source_updated_at: str | None = None,
         sync_snapshot_id: str | None = None,
         local_agent_job_id: str | None = None,
         local_agent_attempt_count: int | None = None,
@@ -274,7 +280,10 @@ class ToolClient:
         submitted_by: str | None = None,
         submitted_at: str | None = None,
     ) -> dict[str, Any]:
-        """Push one GitHub repository file into a configured github_repo source."""
+        """Push one GitHub repository file into a configured github_repo source.
+
+        ``source_updated_at`` is the file's latest commit time at the collection commit.
+        """
         source_id = source_id.strip()
         if not source_id:
             return {"error": "source_id is required"}
@@ -295,6 +304,8 @@ class ToolClient:
             body["symlink_chain"] = [dict(item) for item in symlink_chain]
         if resolved_relative_path is not None:
             body["resolved_relative_path"] = resolved_relative_path
+        if source_updated_at is not None:
+            body["source_updated_at"] = source_updated_at
         if sync_snapshot_id is not None:
             body["sync_snapshot_id"] = sync_snapshot_id
         if local_agent_job_id is not None:
@@ -376,7 +387,11 @@ class ToolClient:
         local_agent_attempt_count: int,
         scope_attestations: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Declare covered membership and request only missing content bodies."""
+        """Declare covered membership and request only missing content bodies.
+
+        The request declares the package contract this agent collects under, so
+        the service asks again for retained packages that predate it.
+        """
         source_id = source_id.strip()
         if not source_id:
             return {"error": "source_id is required"}
@@ -386,6 +401,7 @@ class ToolClient:
             "sync_snapshot_id": sync_snapshot_id,
             "local_agent_job_id": local_agent_job_id,
             "local_agent_attempt_count": local_agent_attempt_count,
+            "package_contract_version": LOCAL_PACKAGE_CONTRACT_VERSION,
         }
         if scope_attestations is not None:
             body["scope_attestations"] = scope_attestations

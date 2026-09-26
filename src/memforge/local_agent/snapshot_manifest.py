@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from memforge.source_time import SOURCE_UPDATED_AT_KEY
+
 
 class CollectionCoverage(str, Enum):
     COMPLETE_SNAPSHOT = "complete_snapshot"
@@ -37,13 +39,16 @@ def plan_snapshot_manifest(
     retained_inputs: Iterable[Any],
     *,
     coverage: CollectionCoverage,
+    require_source_time: bool = False,
 ) -> SnapshotManifestPlan:
     """Match exact provider revisions to attested immutable package inputs.
 
     The manifest is complete source membership for one fenced collection
     attempt. An item is reusable only when both its stable document identity
     and opaque provider revision match an artifact whose own bytes were
-    attested when retained.
+    attested when retained. With ``require_source_time`` a retained upsert is
+    reusable only when it also carries the content's source time; the agent
+    uploads the others again with their time.
     """
 
     if coverage is CollectionCoverage.PARTIAL:
@@ -86,6 +91,12 @@ def plan_snapshot_manifest(
             continue
         input_id = str(getattr(retained, "input_id", "") or "").strip()
         if not doc_id or not revision or not input_id:
+            continue
+        if (
+            require_source_time
+            and change_kind is CollectionChangeKind.UPSERT
+            and not str(entry.get(SOURCE_UPDATED_AT_KEY) or "").strip()
+        ):
             continue
         retained_by_identity.setdefault((doc_id, revision, change_kind), input_id)
 

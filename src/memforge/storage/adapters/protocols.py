@@ -399,7 +399,14 @@ class RelationalStore(Protocol):
         *,
         expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Persist one projection atomically; revisions are immutable.
+
+        The one permitted change to a stored Observation Revision: when it was
+        recorded without ``observed_at`` and the projection gives one, the time
+        is written once. A stored ``observed_at`` is never replaced.
+        """
+        ...
     async def get_source_projection(self, run_id: str) -> SourceProjection | None: ...
     async def get_current_source_unit_revision(
         self,
