@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any
 
 from memforge.llm.batch_runner import BatchStats, ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
 from memforge.llm.structured import MemoryRelationResponse, StructuredLlmError
@@ -81,13 +81,6 @@ class MemoryPairClassification:
     llm_calls: int
     prompt_chars: int
     unjudged: tuple[UnjudgedPair, ...] = ()
-
-
-class MemoryPairClassifier(Protocol):
-    async def classify(
-        self,
-        pairs: tuple[MemoryPair, ...],
-    ) -> MemoryPairClassification: ...
 
 
 @dataclass(frozen=True, slots=True)

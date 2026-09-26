@@ -584,24 +584,19 @@ async def test_subjects_come_from_the_current_evidence_unit() -> None:
 
 
 class _RelationClient:
-    async def discover_memory_relations(self, prompt, **kwargs):
-        raise AssertionError("not called")
-
     async def classify_cross_document_relations(self, prompt, **kwargs):
         raise AssertionError("not called")
 
 
-class _IdentityOnlyClient:
-    async def discover_memory_relations(self, prompt, **kwargs):
-        raise AssertionError("not called")
+class _ClientWithoutDiscovery:
+    pass
 
 
 @pytest.mark.parametrize(
-    ("client", "expects_discovery"), [(_RelationClient(), True), (_IdentityOnlyClient(), False)]
+    ("client", "expects_discovery"), [(_RelationClient(), True), (_ClientWithoutDiscovery(), False)]
 )
-def test_engine_gives_discovery_and_identity_their_own_classifiers(client, expects_discovery: bool) -> None:
+def test_engine_classifies_discovery_only_with_a_capable_client(client, expects_discovery: bool) -> None:
     from memforge.memory.engine import MemoryEngine
-    from memforge.memory.sparse_relation_classifier import SparseMemoryRelationClassifier
 
     engine = MemoryEngine(
         cross_document_candidates=None,  # type: ignore[arg-type]
@@ -612,4 +607,3 @@ def test_engine_gives_discovery_and_identity_their_own_classifiers(client, expec
 
     assert isinstance(engine.pair_classifier, StructuredCrossDocumentRelationClassifier) is expects_discovery
     assert (engine.pair_classifier is None) is not expects_discovery
-    assert isinstance(engine.identity_resolver._pair_classifier, SparseMemoryRelationClassifier)  # noqa: SLF001

@@ -337,40 +337,6 @@ class RelationalStore(Protocol):
         self,
         memory_ids: Sequence[str],
     ) -> list[CandidateMemory]: ...
-    async def find_active_exact_claim_candidate(
-        self,
-        content_hash: str,
-        *,
-        visibility: str,
-        owner_user_id: str | None,
-        repo_identifier: str | None,
-        excluded_memory_ids: Sequence[str] = (),
-    ) -> Memory | None: ...
-    async def find_active_exact_claim_candidates(
-        self,
-        content_hashes: Sequence[str],
-        *,
-        visibility: str,
-        owner_user_id: str | None,
-        repo_identifier: str | None,
-        excluded_memory_ids: Sequence[str] = (),
-    ) -> list[Memory]: ...
-    async def list_active_ordinary_claim_memories(
-        self,
-        memory_ids: Sequence[str],
-    ) -> list[Memory]: ...
-    async def find_active_ordinary_claim_memories_by_entities(
-        self,
-        entity_ids: Sequence[int],
-        *,
-        visibility: str,
-        owner_user_id: str | None,
-        repo_identifier: str | None,
-        project_key: str | None,
-        excluded_memory_ids: Sequence[str] = (),
-        excluded_doc_id: str | None = None,
-        limit: int,
-    ) -> list[Memory]: ...
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]: ...
     async def upsert_document(
         self,
