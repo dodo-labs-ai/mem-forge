@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import replace
 from time import perf_counter
 
@@ -123,17 +124,16 @@ class ExtractionReading:
             doc_type=doc_type,
         )
 
-    def report_skipped(self, item_ids) -> tuple[str, ...]:
-        """Report the items that alone exceed the route's capacity; return their labels in reading order."""
+    def report_skipped(self, reasons: Mapping[str, str]) -> tuple[str, ...]:
+        """Report the items that cannot be read even alone, each with its reason; return their labels in reading order."""
         source_unit_id = self.context.projection.source_units[0].id
-        unfit = set(item_ids)
-        labels = tuple(reading_group_label(group) for item_id, group in self.items.items() if item_id in unfit)
-        for label in labels:
+        skipped = tuple((reading_group_label(group), reasons[item_id]) for item_id, group in self.items.items() if item_id in reasons)
+        for label, reason in skipped:
             logger.warning(
                 "extraction_reading_group_skipped source_unit_id=%s reading_group=%s reason=%s",
-                source_unit_id, label, INPUT_CAPACITY_EXCEEDED,
+                source_unit_id, label, reason,
             )
-        return labels
+        return tuple(label for label, _reason in skipped)
 
     def catalog_for(self, item_ids) -> ProjectionFragmentCatalog:
         """The catalog of one request that reads these items."""
@@ -232,8 +232,9 @@ class MemoryExtractor:
         """Select exact current Evidence within this work's Primary authority.
 
         Each ReadingGroup that holds authorized Primary is one runner item, so a
-        request that times out or exceeds capacity is halved and resent. A
-        ReadingGroup that alone exceeds the route's capacity is skipped with a
+        request that times out, exceeds capacity or keeps returning invalid
+        output is halved and resent. A ReadingGroup that alone exceeds the
+        route's capacity, or whose output alone stays invalid, is skipped with a
         diagnostic, and the other groups' Candidates are kept.
         """
 
@@ -293,9 +294,9 @@ class MemoryExtractor:
             return MemoryExtractionResult(
                 error_type="unexpected_error", error=str(error), metadata={**metrics, **elapsed()},
             )
-        # An item that alone exceeds the route's capacity is skipped; any other failure fails the work.
+        # An item that cannot be read even alone is skipped; a transient failure fails the work.
         failures = {item_id: outcome for item_id, outcome in outcomes.items() if isinstance(outcome, ItemFailure)}
-        failure = next((outcome for outcome in failures.values() if outcome.category != "capacity_exceeded"), None)
+        failure = next((outcome for outcome in failures.values() if not outcome.unjudgeable), None)
         if failure is not None:
             error = failure.error
             validation_fields = error.validation_fields if isinstance(error, StructuredLlmError) else ()
@@ -312,7 +313,10 @@ class MemoryExtractor:
                     ],
                 },
             )
-        skipped = reading.report_skipped(tuple(failures))
+        skipped = reading.report_skipped({
+            item_id: INPUT_CAPACITY_EXCEEDED if outcome.category == "capacity_exceeded" else outcome.category
+            for item_id, outcome in failures.items()
+        })
 
         responses = dict(chunks[0] for item_id, chunks in outcomes.items() if item_id not in failures)
         memories: list[RawMemory] = []

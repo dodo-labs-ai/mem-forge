@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from memforge.llm.structured import StructuredLlmError
+from memforge.llm.structured import ClaimRevisionWireResponse, StructuredLlmError
 from memforge.memory.coordinator_review import coordinator_review_id
 from memforge.memory.lifecycle_plan import LifecycleReviewStatus
 from memforge.memory.lifecycle_review import (
@@ -34,6 +34,7 @@ from tests.coordination_fixture import (
     seeded_page,
     support_texts,
 )
+from tests.revision_client_fixture import catalog_payload
 from tests.test_projected_lifecycle_integration import db as db, _selected
 from tests.unit_support_fixture import active_support_evidence
 
@@ -199,6 +200,38 @@ async def test_rejecting_a_conflict_with_an_equivalent_binds_the_claim_to_that_e
     assert rejected.status is LifecycleReviewStatus.REJECTED
     assert (await db.get_memory(memory.id)).status == "active"
     assert await support_texts(db, memory.id) == {RESTATED}
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_whose_relation_stays_invalid_is_unresolved_and_the_revision_commits(
+    db: Database, caplog,
+) -> None:
+    page, memory = await seeded_page(db, TWO, RETENTION)
+
+    class OmitsAudit(ScriptedClient):
+        """Never returns the Relation row of the AUDIT Candidate, even after the correction."""
+
+        async def assess_claim_revisions(self, prompt, **kwargs):
+            response = await super().assess_claim_revisions(prompt, **kwargs)
+            texts = {claim["id"]: claim["text"] for claim in catalog_payload(prompt)["new_claims"]}
+            return ClaimRevisionWireResponse(results=[
+                row for row in response.results if texts[row.candidate_id] != AUDIT
+            ])
+
+    revision = page.next(TWO, RETENTION, AUDIT)
+    with caplog.at_level("WARNING", logger="memforge.memory.engine"):
+        stats = await page.commit(OmitsAudit(), revision, RETENTION, AUDIT)
+
+    current = await db.get_current_source_unit_projection(page.unit_id)
+    assert current.source_unit_revisions[0].id == revision.source_unit_revisions[0].id
+    # The old claim is kept and the independent Candidate added; the unjudged one is consumed without ADD or Review.
+    assert sorted(item.content for item in await db.list_memories()) == sorted([TWO, RETENTION])
+    assert await support_texts(db, memory.id) == {TWO}
+    assert await lifecycle_reviews(db, memory.id) == []
+    assert stats["added"] == 1 and stats["relation_unjudged_candidate_count"] == 1
+    assert stats["coordinator_unresolved_candidate_count"] == 1
+    [record] = [r.getMessage() for r in caplog.records if r.getMessage().startswith("relation_candidate_unresolved")]
+    assert f"source_unit_id={page.unit_id}" in record and "reason=invalid_response" in record
 
 
 @pytest.mark.asyncio

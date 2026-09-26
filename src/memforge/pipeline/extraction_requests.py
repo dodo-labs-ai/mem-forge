@@ -3,6 +3,7 @@
 import hashlib
 
 from memforge.llm.batch_runner import LlmBatchRunner
+from memforge.llm.structured import INPUT_CAPACITY_EXCEEDED
 from memforge.pipeline.memory_extractor import ExtractionReading, MemoryExtractor
 from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionPlan, ExtractionRequest
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
@@ -64,4 +65,4 @@ def plan_extraction_requests(
     ]
     if len(actual) != len(set(actual)) or set(actual) != expected:
         raise ValueError("extraction request authority coverage mismatch")
-    return ExtractionPlan(tuple(requests), reading.report_skipped(planned.unfit))
+    return ExtractionPlan(tuple(requests), reading.report_skipped(dict.fromkeys(planned.unfit, INPUT_CAPACITY_EXCEEDED)))

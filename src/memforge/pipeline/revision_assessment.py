@@ -76,8 +76,9 @@ class SupportAssessment:
     reason: str
     memory: RawMemory | None
     # Why a kept claim could not be judged: an UNKNOWN Evidence part under partial
-    # coverage, or one ReadingGroup that alone exceeds the model's capacity.
-    unresolved: Literal["partial_coverage", "capacity"] | None = None
+    # coverage, one ReadingGroup that alone exceeds the model's capacity, or the
+    # model's output for the claim alone that stays invalid after its correction.
+    unresolved: Literal["partial_coverage", "capacity", "invalid_response"] | None = None
     # The Support was bound to its exactly unchanged current Evidence without a read:
     # the program rebind, or Change Impact judged it UNAFFECTED.
     rebound: bool = False

@@ -42,7 +42,7 @@ class _IdentityClient(ScriptedClient):
             dict(candidate_id=row["id"], relations=[
                 dict(existing_id=ref, classification="equivalent", direction="symmetric",
                      same_subject_and_scope=True, incompatible_assertions="", reason="fixture identity")
-                for ref in payload["allowed_existing_ids"][row["id"]] if (row["content"], old[ref]) in self.identity
+                for ref in row["allowed_existing_ids"] if (row["content"], old[ref]) in self.identity
             ])
             for row in payload["new_claims"]
         ]))

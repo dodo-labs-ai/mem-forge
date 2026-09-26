@@ -262,7 +262,7 @@ async def test_revision_response_failure_cannot_fall_back_to_add() -> None:
 
         async def prove_revisions(self, prompt: str, **kwargs):
             del prompt, kwargs
-            raise StructuredLlmError("revision proof unavailable")
+            raise StructuredLlmError("revision proof unavailable", terminal_category="provider_error")
 
     result = await reconcile_memories(
         new_extractions=[refinement],
@@ -556,20 +556,29 @@ def test_runbook_candidate_with_multiple_incumbents_falls_back_to_keep_and_add()
 
 
 @pytest.mark.asyncio
-async def test_incomplete_relation_ledger_retries_then_fails_closed() -> None:
+async def test_a_candidate_whose_relation_row_stays_invalid_is_consumed_without_add() -> None:
     class IncompleteClient(RevisionClientFixture):
+        """Never returns the row of the Candidate "Unjudged claim"."""
+
         def __init__(self) -> None:
             self.calls = 0
 
         async def assess_claim_revisions(self, prompt: str, **kwargs):
-            del prompt, kwargs
             self.calls += 1
             from memforge.llm.structured import ClaimRevisionWireResponse
-            return ClaimRevisionWireResponse(results=[])
+            from tests.revision_client_fixture import catalog_payload
+            return ClaimRevisionWireResponse.model_validate(dict(results=[
+                dict(candidate_id=claim["id"], relations=[], uncertain_existing_ids=[])
+                for claim in catalog_payload(prompt)["new_claims"] if claim["text"] != "Unjudged claim"
+            ]))
 
     client = IncompleteClient()
+    unjudged, judged = (
+        _with_selection(RawMemory(content=text, memory_type="fact", evidence_quote=text, source_observation_id="obs"))
+        for text in ("Unjudged claim", "Independent claim")
+    )
     result = await reconcile_memories(
-        new_extractions=[RawMemory(content="New claim", memory_type="fact")],
+        new_extractions=[unjudged, judged],
         existing_memories=[_memory("mem-old", "Old claim")],
         llm_model="test-model",
         structured_llm_client=client,
@@ -577,9 +586,13 @@ async def test_incomplete_relation_ledger_retries_then_fails_closed() -> None:
     )
 
     assert isinstance(result, ReconciliationResult)
-    assert result.operations == []
-    assert result.failure is not None
-    assert client.calls == 2  # the first response and its one correction
+    assert result.failure is None
+    # The unjudged Candidate is consumed without ADD; the independent one is added and the old Memory kept.
+    assert [op.memory for op in result.operations if op.action == ReconcileAction.ADD] == [judged]
+    assert [(op.memory_id, op.action) for op in result.operations if op.memory_id] == [("mem-old", ReconcileAction.NOOP)]
+    assert result.unresolved_candidate_count == 1
+    # Both Candidates with the correction, then each alone: the unjudged one with its correction.
+    assert client.calls == 5
 
 
 @pytest.mark.asyncio
@@ -587,7 +600,7 @@ async def test_relation_provider_failure_fails_closed_with_incumbents() -> None:
     class FailingClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
-            raise StructuredLlmError("structured unavailable")
+            raise StructuredLlmError("structured unavailable", terminal_category="provider_error")
 
     result = await reconcile_memories(
         new_extractions=[RawMemory(content="New claim", memory_type="fact")],
@@ -624,3 +637,37 @@ def test_unresolved_pair_preserves_related_component_and_allows_independent_work
         assert by_id[mid].action == ReconcileAction.NOOP
         assert by_id[mid].memory is None and by_id[mid].support_revalidation_skipped
     assert by_id["mem-2"].action == ReconcileAction.DELETE
+
+
+@pytest.mark.asyncio
+async def test_refinements_whose_comparison_stays_invalid_leave_their_edges_uncertain() -> None:
+    from memforge.pipeline.reconciler import RelationLine, join_support_and_relation
+
+    class InvalidComparisonClient(RevisionClientFixture):
+        async def classify_memory_relations(self, prompt: str, **kwargs):
+            return MemoryRelationResponse(decisions=[])
+
+    incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
+    refinements = [
+        RawMemory(content="The client timeout is 30 seconds for uploads.", memory_type="fact"),
+        RawMemory(content="The client timeout is 30 seconds for downloads.", memory_type="fact"),
+    ]
+    relation = RelationLine(
+        entries=tuple(
+            RelationLedgerEntry(index, incumbent.id, MemoryRelationType.REFINES, RelationDirection.CHALLENGER_TO_CANDIDATE)
+            for index in range(len(refinements))
+        ),
+        completed_candidate_count=len(refinements), incumbent_ids=frozenset({incumbent.id}),
+    )
+
+    result = await join_support_and_relation(
+        relation, new_extractions=refinements, existing_memories=[incumbent],
+        supports=dict([pinned(incumbent.id, True)]), structured_llm_client=InvalidComparisonClient(),
+        llm_model="test-model",
+    )
+
+    # Which refinement may revise the old Memory cannot be judged: nothing revises it and nothing is added.
+    assert result.failure is None
+    [operation] = result.operations
+    assert operation.action == ReconcileAction.NOOP and operation.support_revalidation_skipped
+    assert result.unresolved_candidate_count == 2

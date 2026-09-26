@@ -375,7 +375,8 @@ async def test_resolve_many_rejects_incomplete_adjudication_before_entity_writes
     with pytest.raises(RuntimeError, match="output_invalid"):
         await resolver.resolve_many(_mentions("first svc", "second svc"), scope=_SCOPE)
 
-    assert client.calls == 2
+    # The runner isolates the mention whose output stays invalid before the batch fails.
+    assert client.calls > 2
     assert "<correction>" in client.prompts[1]
     assert store.created == []
     assert store.aliases == []

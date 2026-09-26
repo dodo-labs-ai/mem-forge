@@ -8,7 +8,7 @@ from memforge.models import CoordinatorProposal, ReconcileAction
 from memforge.pipeline.claim_revision import assess_claim_pairs
 from memforge.pipeline.reconciler import reconcile_memories
 from tests.revision_client_fixture import pinned
-from tests.test_claim_revision import Client, candidate, memory
+from tests.test_claim_revision import Client, candidate, memory, schema_checked
 from tests.revision_client_fixture import catalog_payload, sparse_response
 
 
@@ -20,7 +20,9 @@ class SparseClient(Client):
     async def assess_claim_revisions(self, prompt, **kwargs):
         self.calls += 1
         self.prompts.append(prompt)
-        return ClaimRevisionWireResponse.model_validate(self.result) if self.result is not None else sparse_response(prompt, [])
+        if self.result is None:
+            return sparse_response(prompt, [])
+        return schema_checked(lambda: ClaimRevisionWireResponse.model_validate(self.result))
 
 
 @pytest.mark.asyncio
@@ -61,7 +63,9 @@ async def test_invalid_references_and_duplicates_never_apply(row):
     client = SparseClient(dict(results=[row]))
     result = await reconcile_memories(new_extractions=[candidate()], existing_memories=[memory()],
         llm_model="test-model", structured_llm_client=client, supports=dict([pinned("memory", True)]))
-    assert result.failure is not None and not result.operations
+    # The Candidate alone stays invalid: it is consumed without ADD, and the old Memory is only kept.
+    assert result.failure is None and result.unresolved_candidate_count == 1
+    assert [(op.action, op.memory_id) for op in result.operations] == [(ReconcileAction.NOOP, "memory")]
 
 
 @pytest.mark.asyncio

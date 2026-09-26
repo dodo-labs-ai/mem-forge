@@ -2,8 +2,10 @@
 
 A caller describes its work: stable item IDs, optional ordered shared context,
 a renderer, a decoder and the client method to call. The runner owns capacity
-fit, packing, splitting on request-size failures, bounded concurrency, exact
-coverage, one correction per request and typed per-item failures. It knows no
+fit, packing, bounded concurrency, exact coverage, one correction per request,
+splitting and typed per-item failures. A multi-item request that fails on its
+size, or whose output is still invalid after its correction, is split in half
+until each item stands alone, so one item never fails the others. It knows no
 business meaning: the caller decides what an ``ItemFailure`` means and merges
 the per-chunk results of an item whose shared context did not fit one request.
 """
@@ -50,6 +52,7 @@ _CORRECTION_BLOCK = (
     "</correction>"
 )
 _CAPACITY_ERROR_CODES = frozenset({INPUT_CAPACITY_EXCEEDED, PAYLOAD_TOO_LARGE})
+_UNJUDGEABLE: frozenset[FailureCategory] = frozenset({"capacity_exceeded", "invalid_response"})
 
 
 @dataclass(frozen=True)
@@ -85,14 +88,25 @@ class ItemFailure:
     """Why one item has no result.
 
     ``capacity_exceeded`` means the item alone exceeds the route's input
-    capacity. ``error`` is the exception that ended the item, when there is one.
-    For a chain item, ``part`` is the index of the first part it could not read.
+    capacity; ``invalid_response`` means the model's output for the item alone
+    stayed invalid after its correction. ``error`` is the exception that ended
+    the item, when there is one. For a chain item, ``part`` is the index of the
+    first part it could not read.
     """
 
     category: FailureCategory
     error_code: str
     error: Exception | None = None
     part: int | None = None
+
+    @property
+    def unjudgeable(self) -> bool:
+        """The item alone cannot be judged, so sending it again would fail again.
+
+        Every other failure (a timeout or a provider error) is transient.
+        """
+
+        return self.category in _UNJUDGEABLE
 
 
 @dataclass(frozen=True)
@@ -171,7 +185,7 @@ class RequestJournal(Protocol):
 class BatchStats:
     calls: int = 0  # model calls sent, corrections included
     corrections: int = 0
-    splits: int = 0  # requests halved after a request-size failure
+    splits: int = 0  # requests halved after a size failure or output still invalid
     reused: int = 0  # requests answered from the journal without a call
     prompt_chars: int = 0
     failed_requests: int = 0  # requests whose items ended as ItemFailure
@@ -345,7 +359,7 @@ class LlmBatchRunner:
             )
             if not isinstance(outcome, ItemFailure):
                 return outcome
-        if len(item_ids) > 1 and _is_size_failure(outcome):
+        if len(item_ids) > 1 and _splits_items(outcome):
             self._record_split(outcome, items=len(item_ids), parts=len(context))
             middle = len(item_ids) // 2
             results = await self._run_request(task, item_ids[:middle], context)
@@ -407,7 +421,7 @@ class LlmBatchRunner:
                 outcomes.update({item_id: outcome[item_id] for item_id in finished})
                 lane.item_ids = tuple(item_id for item_id in lane.item_ids if item_id not in finished)
                 continue
-            if _is_size_failure(outcome) and len(step.item_ids) > 1:
+            if _splits_items(outcome) and len(step.item_ids) > 1:
                 self._record_split(outcome, items=len(step.item_ids), parts=len(step.parts))
                 for half in _halve_lane(lane):
                     await self._run_lane(task, half, states, outcomes)
@@ -566,3 +580,9 @@ def _is_size_failure(failure: ItemFailure) -> bool:
     """A smaller request may succeed: time, input size or output length ran out."""
 
     return failure.category in {"deadline_exceeded", "capacity_exceeded"} or failure.error_code == OUTPUT_TRUNCATED
+
+
+def _splits_items(failure: ItemFailure) -> bool:
+    """Halving the items may help: the request was too large, or one item's output spoils the rest."""
+
+    return _is_size_failure(failure) or failure.category == "invalid_response"
