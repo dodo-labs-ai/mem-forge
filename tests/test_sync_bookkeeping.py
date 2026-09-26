@@ -5236,15 +5236,13 @@ async def test_policy_replacement_failure_preserves_recoverable_new_work(
         max_concurrent=1,
     )
 
-    recovered = await recovery._resume_source_derivations(
-        source_id=source_id,
-        source_activity_epoch=attempt.context.source_activity_epoch,
-        run_id="run-v9-policy-replacement-failure",
-    )
+    with pytest.raises(RuntimeError, match="lifecycle apply failed"):
+        await recovery._resume_source_derivations(
+            source_id=source_id,
+            source_activity_epoch=attempt.context.source_activity_epoch,
+            run_id="run-v9-policy-replacement-failure",
+        )
 
-    # A retryable failure leaves the replacement staged and does not stop recovery.
-    [failed] = recovered.failed_results
-    assert (failed["error"], failed["failure_retryable"]) == ("lifecycle apply failed", True)
     attempts = {
         item.id: item
         for item in await db.list_source_derivation_attempts(source_id=source_id)
@@ -10352,17 +10350,25 @@ async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: D
         structured_llm_client=client,
         max_concurrent=1,
     )
-    recovered = await orchestrator._resume_source_derivations(
+    recover = orchestrator._resume_source_derivations(
         source_id=source_id,
         source_activity_epoch=attempt.context.source_activity_epoch,
         run_id="run-recovery-summary",
         lifecycle_execution_owner_id="run-recovery-summary:attempt:1",
     )
-    # A model failure leaves the derivation staged for the next run.
-    [failed] = recovered.failed_results
-    assert failed["derivation_id"] == attempt.id and failed["failure_retryable"]
     [staged] = await db.list_source_derivation_attempts(source_id=source_id)
-    assert staged.status == "completed"
+    if failure_mode == "invalid_response":
+        # An invalid response repeats on every attempt: recovery ends the derivation and continues.
+        [failed] = (await recover).failed_results
+        assert failed["derivation_id"] == attempt.id
+        [ended] = await db.list_source_derivation_attempts(source_id=source_id)
+        assert (ended.status, ended.terminal_reason_code) == ("superseded", "DERIVATION_DETERMINISTIC_FAILURE")
+    else:
+        # A transient failure stops the run and leaves the derivation staged.
+        with pytest.raises(StructuredLlmError):
+            await recover
+        [kept] = await db.list_source_derivation_attempts(source_id=source_id)
+        assert kept.status == staged.status
     summaries = await db.list_memory_audit_events(event_type="source_unit_llm_summary")
     assert len(summaries) == 1
     assert summaries[0].status == "failed"

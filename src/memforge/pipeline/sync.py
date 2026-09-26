@@ -17,7 +17,6 @@ import asyncio
 import json
 import logging
 import math
-import sqlite3
 import threading
 import uuid
 from collections import defaultdict
@@ -43,6 +42,7 @@ from memforge.llm.structured import (
     StructuredLlmImage,
     structured_llm_metrics_scope,
 )
+from memforge.llm.structured import failure_retryable as retries_failure
 from memforge.models import (
     ChangelogEntry,
     DocumentRecord,
@@ -113,7 +113,7 @@ from memforge.pipeline.projection_images import (
     load_projection_images,
 )
 from memforge.source_access import memory_visibility_for_source_id
-from memforge.source_activity import SourceActivityConflict, SourceActivityLease
+from memforge.source_activity import SourceActivityLease
 from memforge.source_projection_config import canonical_projection_scope
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time, reported_source_time
 
@@ -574,16 +574,6 @@ def _fail_deferred_commits_nothing_can_unblock(
             result["deferred_lifecycle"] = None
 
 
-def _is_infrastructure_failure(exc: BaseException) -> bool:
-    """Whether a failure belongs to the run rather than to one Source Unit.
-
-    Storage and network I/O that fails, and a Source activity fence the run no
-    longer holds, affect every Unit alike, so the run stops.
-    """
-
-    return isinstance(exc, (OSError, sqlite3.OperationalError, SourceActivityConflict))
-
-
 def _retained_document_error(exc: BaseException) -> str:
     """Project an exception into bounded state without retaining its traceback."""
 
@@ -906,13 +896,9 @@ class GeneSyncOrchestrator:
                             )
                             stored_documents[doc_id] = stored
                             item = stored.item
-                    except Exception as exc:
-                        if _is_infrastructure_failure(exc):
-                            raise
+                    except StoredDocumentUnavailable as exc:
                         docs_failed += 1
-                        failed_docs.append(
-                            FailedDoc(doc_id=doc_id, title=doc_id, error=_retained_document_error(exc))
-                        )
+                        failed_docs.append(FailedDoc(doc_id=doc_id, title=doc_id, error=str(exc)))
                         continue
                     items.append(item)
                 indexed_doc_ids: set[str] = set()
@@ -1363,8 +1349,9 @@ class GeneSyncOrchestrator:
                 if r["failed"]:
                     docs_failed += 1
                 if r.get("error") is not None:
+                    # A recovery that failed deterministically; retrying the run cannot apply it.
                     failed_docs.append(FailedDoc(doc_id=str(r["doc_id"]), title=str(r["title"]), error=r["error"]))
-                    failure_retryable = failure_retryable and r["failure_retryable"]
+                    failure_retryable = False
                 memories_extracted += r["memories_extracted"]
                 if r.get("runtime_bundle") is not None:
                     runtime_bundles.append(r["runtime_bundle"])
@@ -1854,17 +1841,17 @@ class GeneSyncOrchestrator:
                     lifecycle_stats = None
                 except Exception as exc:
                     recovery_error = exc
-                    if _is_infrastructure_failure(exc):
+                    # A failure that repeats on every attempt ends this staged
+                    # derivation, and recovery continues with the next, so one
+                    # Unit never blocks the Source. Any other failure (a lost
+                    # activity fence, storage, network or provider errors)
+                    # stops the run and leaves the derivation staged.
+                    if retries_failure(exc):
                         raise
-                    # One Unit's failure never blocks the others. A failure
-                    # that repeats on every attempt ends the staged derivation;
-                    # any other failure leaves it staged for the next run.
-                    retryable = bool(getattr(exc, "retryable", True))
-                    if not retryable:
-                        await self.db.supersede_source_derivation(
-                            attempt.id,
-                            reason_code=DERIVATION_DETERMINISTIC_FAILURE,
-                        )
+                    await self.db.supersede_source_derivation(
+                        attempt.id,
+                        reason_code=DERIVATION_DETERMINISTIC_FAILURE,
+                    )
                     logger.warning(
                         "Recovery of Source derivation %s for %s failed: %s",
                         attempt.id,
@@ -1877,7 +1864,6 @@ class GeneSyncOrchestrator:
                             "updated": False,
                             "memories_extracted": 0,
                             "failed": True,
-                            "failure_retryable": retryable,
                             "error": _retained_document_error(exc),
                             "runtime_bundle": getattr(exc, "runtime_bundle", None),
                             "source_unit_id": attempt.source_unit_id,
@@ -2524,18 +2510,11 @@ class GeneSyncOrchestrator:
                 )
 
             projection_requires_extraction = projection.deltas[0].requires_extraction
+            # Location/access-only and idempotent observations carry no Memory
+            # mutation, so their lineage advances without semantic work.
+            # Semantic work plans against the committed base. Either way the
+            # projection is recorded only after its raw content is stored.
             skip_semantic_work = not projection_requires_extraction and not force_reprocess
-            if skip_semantic_work:
-                # Location/access-only and idempotent observations carry no
-                # Memory mutation, so their lineage can advance independently.
-                # Semantic work plans against the committed base, and its
-                # lifecycle commit records the projection in the same
-                # transaction.
-                await self.db.record_source_projection(
-                    projection,
-                    expected_source_activity_epoch=expected_source_activity_epoch,
-                    source_activity=source_activity,
-                )
 
             lineage_document_ids = await self.db.list_source_unit_document_ids(source_unit.id)
 
@@ -2578,10 +2557,11 @@ class GeneSyncOrchestrator:
         # The stored raw content is the input of the committed Unit revision:
         # a projection that moves the Unit to a new revision stores the raw
         # content it was projected from, even when the normalized markdown is
-        # unchanged, and the Document row that points at it commits with that
-        # revision. A reprocess from stored input reads its raw content from
-        # storage and keeps the provider exports it cannot repeat; only a
-        # changed normalization is stored again.
+        # unchanged. Every path stores it before the revision is recorded, so
+        # a failed save fails the Document before anything commits. A
+        # reprocess from stored input reads its raw content from storage and
+        # keeps the provider exports it cannot repeat; only a changed
+        # normalization is stored again.
         reuse_content_artifacts = content_unchanged and (stored_document is not None or not force_reprocess)
         unit_revision_unchanged = (
             projection.deltas[0].previous_unit_revision_id == projection.source_unit_revisions[0].id
@@ -2699,6 +2679,11 @@ class GeneSyncOrchestrator:
         if skip_semantic_work:
             stats["updated"] = not content_unchanged
             async with self._db_lock:
+                await self.db.record_source_projection(
+                    projection,
+                    expected_source_activity_epoch=expected_source_activity_epoch,
+                    source_activity=source_activity,
+                )
                 await self.db.upsert_document(
                     doc_record,
                     require_configured_source=True,

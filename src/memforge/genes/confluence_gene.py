@@ -54,6 +54,13 @@ PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY = "_memforge_preview_limit"
 __all__ = ["ConfluenceGene"]
 
 
+# The page representation every discovery mode and rediscovery reads a
+# ContentItem from.
+_PAGE_METADATA_EXPAND = "version,metadata.labels,space"
+# The only page status discovery lists; archived and trashed pages are not current.
+_CURRENT_PAGE_STATUS = "current"
+
+
 class ConfluenceGene(Gene):
     """Confluence data source gene.
 
@@ -332,14 +339,19 @@ class ConfluenceGene(Gene):
         return True
 
     async def rediscover(self, item: ContentItem) -> ContentItem | None:
-        """Read one page's current metadata as discovery does; an excluded label hides it."""
+        """Read one page as a full discovery would list it, or ``None`` when it would not.
+
+        A full discovery lists a page it would keep: in space mode a current
+        page of a configured space; in page tree mode the root page, or a
+        current page reached from the root through current pages without an
+        excluded label. A page carrying an excluded label is never listed.
+        """
         self.normalize_config(self.config)
         page_id = str(item.extra.get("page_id") or item.item_id.removeprefix("confluence-"))
+        page_tree = self._effective_sync_mode(self.config) == "page_tree"
+        expand = f"{_PAGE_METADATA_EXPAND},ancestors.metadata.labels" if page_tree else _PAGE_METADATA_EXPAND
         try:
-            resp = await self._get(
-                f"{self._api_prefix}/rest/api/content/{page_id}",
-                params={"expand": "version,metadata.labels,space"},
-            )
+            resp = await self._get(f"{self._api_prefix}/rest/api/content/{page_id}", params={"expand": expand})
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in ATLASSIAN_ABSENT_STATUS_CODES:
                 return None
@@ -347,8 +359,40 @@ class ConfluenceGene(Gene):
         page = self._json_response(resp, f"fetching page {page_id}")
         if str(page.get("id") or "").strip() != page_id:
             raise RuntimeError(f"Confluence page {page_id} response identity mismatch")
+        exclude_labels = self._exclude_labels()
+        listed = (
+            self._page_tree_lists(page, exclude_labels)
+            if page_tree
+            else self._page_status(page) == _CURRENT_PAGE_STATUS
+            and str((page.get("space") or {}).get("key") or "") in self._space_keys(self.config.get("spaces"))
+        )
+        if not listed:
+            return None
         self._discovered_page_ids = set()
-        return self._parse_page(page, None, self._exclude_labels())
+        return self._parse_page(page, None, exclude_labels)
+
+    def _page_tree_lists(self, page: dict, exclude_labels: set[str]) -> bool:
+        root_id = str(self.config.get("page_tree_root") or "").strip()
+        if str(page.get("id") or "").strip() == root_id:
+            return True
+        if not self.config.get("include_children", True) or self._page_status(page) != _CURRENT_PAGE_STATUS:
+            return False
+        ancestors = page.get("ancestors") if isinstance(page.get("ancestors"), list) else []
+        ancestor_ids = [str((ancestor or {}).get("id") or "") for ancestor in ancestors]
+        if root_id not in ancestor_ids:
+            return False
+        # Discovery lists the children of every current page below the root it
+        # reaches, and does not descend below a page with an excluded label.
+        below_root = ancestors[ancestor_ids.index(root_id) + 1:]
+        return all(
+            self._page_status(ancestor) == _CURRENT_PAGE_STATUS
+            and not self._has_excluded_label(ancestor, exclude_labels)
+            for ancestor in below_root
+        )
+
+    @staticmethod
+    def _page_status(page: dict) -> str:
+        return str(page.get("status") or _CURRENT_PAGE_STATUS)
 
     def _exclude_labels(self) -> set[str]:
         exclude_labels = self.config.get("exclude_labels", [])
@@ -389,7 +433,7 @@ class ConfluenceGene(Gene):
                 try:
                     resp = await self._get(
                         f"{self._api_prefix}/rest/api/content/{parent_id}/child/page",
-                        params={"start": start, "limit": limit, "expand": "version,metadata.labels"},
+                        params={"start": start, "limit": limit, "expand": _PAGE_METADATA_EXPAND},
                     )
                     data = self._json_response(resp, f"listing children of page {parent_id}")
                 except Exception as e:
@@ -428,7 +472,7 @@ class ConfluenceGene(Gene):
         try:
             resp = await self._get(
                 f"{self._api_prefix}/rest/api/content/{page_id}",
-                params={"expand": "version,metadata.labels,space"},
+                params={"expand": _PAGE_METADATA_EXPAND},
             )
             page = self._json_response(resp, f"fetching page {page_id}")
             item = self._parse_page(page, since, exclude_labels)
@@ -513,7 +557,7 @@ class ConfluenceGene(Gene):
                         "type": "page",
                         "start": start,
                         "limit": limit,
-                        "expand": "version,metadata.labels,space",
+                        "expand": _PAGE_METADATA_EXPAND,
                     },
                 )
                 data = self._json_response(resp, f"listing pages in space {space_key}")
