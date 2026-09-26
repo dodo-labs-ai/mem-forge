@@ -113,7 +113,7 @@ if TYPE_CHECKING:
     from memforge.genes.base import Gene
     from memforge.memory.engine import MemoryEngine
     from memforge.memory.store import MemoryStore
-    from memforge.models import ContentItem, Memory
+    from memforge.models import ContentItem
     from memforge.pipeline.memory_extractor import MemoryExtractor
     from memforge.storage.database import Database
     from memforge.storage.document_store import DocumentStore
@@ -2819,7 +2819,7 @@ class GeneSyncOrchestrator:
         derivation_context: SourceUnitDerivationContext | None = None,
         reprocess_current_observations: bool = False,
     ) -> MemoryExtractionResult:
-        """Run full extraction or diff-guided extraction for a document."""
+        """Run durable extraction for the changed Observations of a document."""
         changed_observation_ids = {
             anchor.observation_id for delta in projection.deltas for anchor in delta.changed_anchors
         }
@@ -3097,15 +3097,6 @@ class GeneSyncOrchestrator:
 
         return None
 
-    async def _get_existing_document_memories(self, doc_id: str) -> list[Memory]:
-        """Get active memories extracted from the same source document."""
-        try:
-            memories = await self.db.get_memories_by_source_doc(doc_id)
-        except Exception as e:
-            logger.warning("Failed to fetch same-document memories for %s: %s", doc_id, e)
-            return []
-        return [memory for memory in memories if memory.status == "active"][:50]
-
     async def _record_document_update_strategy(
         self,
         *,
@@ -3153,44 +3144,6 @@ class GeneSyncOrchestrator:
             payload=payload,
         )
 
-    async def _record_document_update_strategy_fallback(
-        self,
-        *,
-        plan: DocumentUpdatePlan,
-        doc_id: str,
-        source_id: str,
-        run_id: str | None,
-        reason: str,
-        error: str,
-    ) -> None:
-        """Record a runtime fallback from diff-guided to full extraction."""
-        if not self.memory_store or not hasattr(self.memory_store, "record_audit_event"):
-            return
-
-        context = self._memory_store_context(
-            run_id=run_id,
-            source_id=source_id,
-            doc_id=doc_id,
-        )
-        await self.memory_store.record_audit_event(
-            "document_update_strategy_fallback",
-            "committed",
-            context=context,
-            doc_id=doc_id,
-            source_id=source_id,
-            decision="full_document",
-            reason=reason,
-            thresholds=plan.thresholds,
-            payload={
-                "fallback_from": plan.mode,
-                "diff_line_count": plan.diff_line_count,
-                "added_lines": plan.added_lines,
-                "removed_lines": plan.removed_lines,
-                "changed_ratio": plan.changed_ratio,
-            },
-            error=error,
-        )
-
     async def _record_memory_extraction_result(
         self,
         *,
@@ -3212,13 +3165,12 @@ class GeneSyncOrchestrator:
             source_id=source_id,
             doc_id=doc_id,
         )
-        is_change_extraction = mode == "diff_guided"
         if result.error_type:
-            event_type = "memory_change_extraction_failed" if is_change_extraction else "memory_extraction_failed"
+            event_type = "memory_extraction_failed"
             status = "failed"
             reason = result.error_type
         else:
-            event_type = "memory_change_extraction_completed" if is_change_extraction else "memory_extraction_completed"
+            event_type = "memory_extraction_completed"
             status = "committed"
             reason = plan.reason if plan else "full_document"
 

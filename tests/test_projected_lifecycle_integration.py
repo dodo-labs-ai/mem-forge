@@ -8545,7 +8545,7 @@ async def test_new_projected_memory_commit_survives_vector_outbox_delivery_failu
 
 
 @pytest.mark.asyncio
-async def test_post_cutover_direct_source_memory_write_is_rejected(db: Database) -> None:
+async def test_lifecycle_gated_direct_source_memory_write_is_rejected(db: Database) -> None:
     await db.enable_lifecycle_gate("src-1")
     memory = Memory(
         id="mem-direct-bypass",
