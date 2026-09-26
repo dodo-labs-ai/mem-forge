@@ -326,7 +326,7 @@ async def test_prior_evidence_follows_exact_correspondence_and_history_stays_in_
             data = payload(prompt)
             return [unsupported(w) if data["last"] else continued(w) for w in data["works"]]
 
-    client = NeverClient(limit=4000)
+    client = NeverClient(limit=4500)
     results = await RevisionWorkExecutor(client=client, model="fixture").assess_many(items)
     assert all(result.supported is False for result in results.values())
     requests = [payload(p) for p in client.prompts]
@@ -377,7 +377,7 @@ async def test_section_deletion_is_unsupported_only_after_the_whole_order():
             # Tries to conclude UNSUPPORTED early; the program ignores it until the last group.
             return [unsupported(w) for w in payload(prompt)["works"]]
 
-    client, store = DeniedClient(limit=4000), Store()
+    client, store = DeniedClient(limit=4500), Store()
     executor = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
     [result] = (await executor.assess_many([item])).values()
     assert result.supported is False and result.unresolved is None and result.complete_read
@@ -405,7 +405,7 @@ async def test_witness_union_is_monotonic_and_rehydrated():
     [item] = work_items(f"{RULE}\n\n" + "\n\n".join(f"Routine note {i}." for i in range(120)))
     # A legacy part has no digest, so the rule is never an exact prior match: only the witness carries it.
     item = without_baseline(item, support=(replace(item.support[0], raw_content_sha256=None, presentation_sha256=None),))
-    client = OnceClient(limit=4000)
+    client = OnceClient(limit=4500)
     [result] = (await RevisionWorkExecutor(client=client, model="fixture").assess_many([item])).values()
     assert result.supported and selected_texts(result) == [RULE]
     requests = [payload(p) for p in client.prompts]

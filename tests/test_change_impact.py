@@ -238,7 +238,7 @@ async def test_chunked_bundle_is_or_merged(trigger_chunk):
     [item] = work_items(f"{RULE}\n\n" + "\n\n".join(appended) + "\n")
     # Room for a Support reading step, but not for the claim with every change at once.
     client, store = ImpactClient(
-        label=lambda work, data: "affected" if trigger in current_texts(data).values() else "unaffected", limit=4000,
+        label=lambda work, data: "affected" if trigger in current_texts(data).values() else "unaffected", limit=4500,
     ), Store()
     executor = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
     result = (await executor.assess_many([item]))["w0"]
