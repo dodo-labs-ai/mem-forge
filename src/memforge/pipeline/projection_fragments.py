@@ -34,7 +34,7 @@ from memforge.pipeline.evidence_fragments import (
     FragmentCompilationError,
     FragmentCompilationErrorCode,
     RevisionFragmentIndex,
-    UNIT_IDENTITY_FRAGMENT_TYPE,
+    UNIT_TITLE_FRAGMENT_TYPE,
     build_revision_fragment_index,
     compile_fragments,
 )
@@ -864,7 +864,7 @@ class ProjectionFragmentCatalog:
             if (
                 (fragment.fragment_type.startswith("html-") and fragment.fragment_type != "html-p")
                 or fragment.fragment_type.startswith("canonical-")
-                or fragment.fragment_type == UNIT_IDENTITY_FRAGMENT_TYPE
+                or fragment.fragment_type == UNIT_TITLE_FRAGMENT_TYPE
             ):
                 row += ({"format": fragment.fragment_type},)
             if fragment.kind is EvidenceFragmentKind.ARTIFACT:

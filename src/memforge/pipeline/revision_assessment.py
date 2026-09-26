@@ -37,7 +37,7 @@ from memforge.pipeline.projection_fragments import (
     _compose_projection_fragment_catalog,
 )
 from memforge.source_projection import SourceAnchor, SourceObservationRevision, SourceProjection
-from memforge.source_representation import UNIT_IDENTITY_PROFILE
+from memforge.source_representation import UNIT_TITLE_PROFILE
 
 # Versions how a fixed Support is revalidated against a revision: it enters the
 # reconciliation manifest and each revalidated Support's ``support_validation``.
@@ -152,10 +152,10 @@ class RevisionAssessmentContext:
         self.previous = {r.observation_id: r for r in base.observation_revisions} if base else {}
         self.full_fragments = tuple(f for revision in self.current.values() for f in self.index(revision).fragments)
         # The Unit Title is read with every reading of this Unit.
-        self.unit_identity_anchors = frozenset(
+        self.unit_title_anchors = frozenset(
             f.anchor
             for revision in self.current.values()
-            if revision.evidence_profile == UNIT_IDENTITY_PROFILE
+            if revision.evidence_profile == UNIT_TITLE_PROFILE
             for f in self.index(revision).fragments
         )
         self._delta = None
@@ -295,13 +295,18 @@ class RevisionAssessmentContext:
         return self.reading_indexes[revision.id]
 
     def reading_groups(self, fragments) -> tuple[tuple[EvidenceFragment, ...], ...]:
-        """Partition Fragments, in their order, into ReadingGroups: one outermost list, or one Fragment."""
+        """Partition Fragments, in their order, into ReadingGroups: one outermost list, or one Fragment.
+
+        The Unit Title is context of every reading, never a ReadingGroup of its own.
+        """
         list_of: dict[SourceAnchor, tuple[str, int]] = {}
         for revision in self.current.values():
             for index, group in enumerate(self.reading_index(revision).lists):
                 list_of.update(dict.fromkeys(group.trigger_anchors, (revision.id, index)))
         groups: dict[SourceAnchor | tuple[str, int], list[EvidenceFragment]] = {}
         for fragment in fragments:
+            if fragment.anchor in self.unit_title_anchors:
+                continue
             groups.setdefault(list_of.get(fragment.anchor, fragment.anchor), []).append(fragment)
         return tuple(tuple(group) for group in groups.values())
 
@@ -313,7 +318,7 @@ class RevisionAssessmentContext:
         and the Unit Title names the Unit. The read Fragments are not repeated.
         """
         selected = {fragment.anchor for fragment in fragments}
-        context = set(self.unit_identity_anchors)
+        context = set(self.unit_title_anchors)
         for revision in self.current.values():
             scoped = tuple(f for f in fragments if f.anchor.observation_revision_id == revision.id)
             if scoped:

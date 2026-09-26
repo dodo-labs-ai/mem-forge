@@ -115,7 +115,7 @@ async def test_uncertain_relation_never_becomes_add():
 
 
 @pytest.mark.asyncio
-async def test_equivalent_candidate_never_keeps_an_unsupported_incumbent():
+async def test_an_equivalent_candidate_of_an_unsupported_incumbent_stays_unresolved():
     client = Client("equivalent")
     result = await reconcile_memories(
         new_extractions=[candidate()],
@@ -127,8 +127,9 @@ async def test_equivalent_candidate_never_keeps_an_unsupported_incumbent():
     )
     assert result.failure is None
     [operation] = result.operations
-    assert operation.action == ReconcileAction.DELETE and operation.memory_id == "memory"
-    assert operation.flag_for_review
+    assert operation.action == ReconcileAction.NOOP and operation.memory_id == "memory"
+    assert operation.memory is None and not operation.flag_for_review
+    assert operation.support_revalidation_skipped
     assert client.calls == 1
 
 

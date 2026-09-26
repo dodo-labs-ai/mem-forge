@@ -336,6 +336,9 @@ class DocumentRecord:
     client: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    # The source-specific metadata of the item the Gene discovered
+    # (``ContentItem.extra``); a reprocess projects the stored input with it.
+    item_extra: dict = field(default_factory=dict)
 
 
 @dataclass

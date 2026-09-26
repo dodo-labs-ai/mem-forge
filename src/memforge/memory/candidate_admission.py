@@ -5,7 +5,9 @@ admission request covers two duties: whether the Candidate's selected Primary
 and Required Evidence completely support its claim, and whether it states the
 same knowledge as another Candidate of this round. Every request carries all of
 this round's claims as shared context, so duplicates judged in different
-requests are still found; the program merges them into one.
+requests are still found. Candidates with the same normalized claim, type and
+validity are duplicates without asking the model, but each is still judged on
+its own Evidence. Only admitted Candidates merge.
 """
 
 from __future__ import annotations
@@ -20,7 +22,12 @@ from memforge.derivation_work import DerivationWorkJournal, DerivationWorkStore
 from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
 from memforge.llm.failure_trace import failure_trace_context
 from memforge.llm.relation_catalog import RequestCatalog
-from memforge.llm.structured import CandidateAdmissionDecision, CandidateAdmissionResponse, StructuredLlmError
+from memforge.llm.structured import (
+    CANDIDATE_ADMISSION_REASON_MAX_CHARS,
+    CandidateAdmissionDecision,
+    CandidateAdmissionResponse,
+    StructuredLlmError,
+)
 from memforge.models import RawMemory
 from memforge.pipeline.candidate_evidence import (
     EvidenceArtifactUnavailable,
@@ -66,9 +73,12 @@ Never rewrite or merge claim text. Return only the decisions object required by 
 response schema.
 """
 
-# Requested output: one decision with a bounded reason per Candidate, with a
-# floor for the envelope. The runner bounds it by the route.
-_DECISION_OUTPUT_TOKENS = 320
+# Requested output: one decision per Candidate, sized for its longest reason
+# (at least one token per four characters) plus its ID, verdict and duplicate
+# list, with a floor for the envelope. The runner bounds it by the route.
+_REASON_CHARS_PER_TOKEN = 4
+_DECISION_FIELD_TOKENS = 70
+_DECISION_OUTPUT_TOKENS = CANDIDATE_ADMISSION_REASON_MAX_CHARS // _REASON_CHARS_PER_TOKEN + _DECISION_FIELD_TOKENS
 _MIN_OUTPUT_TOKENS = 1024
 
 type RejectReason = Literal["evidence_incomplete", "low_value"]
@@ -93,13 +103,18 @@ class CandidateAdmission:
 
 
 class CandidateAdmissionError(RuntimeError):
-    """Admission could not judge every Candidate; the revision is not committed."""
+    """Admission could not judge every Candidate; the revision is not committed.
+
+    ``terminal_category`` names a model outcome only when the model's response
+    was invalid; input and configuration failures have none.
+    """
 
     retryable = False
 
-    def __init__(self, reason_code: str, message: str) -> None:
+    def __init__(self, reason_code: str, message: str, *, terminal_category: str | None = None) -> None:
         super().__init__(message)
         self.reason_code = reason_code
+        self.terminal_category = terminal_category
 
 
 async def admit_candidates(
@@ -114,18 +129,15 @@ async def admit_candidates(
         raise ValueError("durable admission work requires its store and lifecycle input identity")
     if any(raw.resolved_evidence_selection is None for raw in candidates):
         raise CandidateAdmissionError("candidate_evidence_missing", "every Candidate requires its selected Evidence")
-    unique = _distinct_content(candidates)
-    exact_merged = len(candidates) - len(unique)
-    if not unique:
-        return CandidateAdmission((), (), exact_merged)
+    if not candidates:
+        return CandidateAdmission((), (), 0)
     if client is None:
         raise CandidateAdmissionError("structured_client_unavailable", "candidate admission requires a structured LLM client")
 
     catalog = RequestCatalog("CND")
-    for position, raw in _by_precedence(unique):
+    for position, raw in _by_precedence(candidates):
         catalog.add(position, raw)
     by_ref = catalog.records
-    precedence = {ref: order for order, ref in enumerate(by_ref)}
 
     def render(item_ids: tuple[str, ...], round_ids: tuple[str, ...]) -> LlmRequest:
         raws = {ref: by_ref[ref] for ref in item_ids}
@@ -172,23 +184,22 @@ async def admit_candidates(
         ))
 
     reject_reasons: dict[str, RejectReason] = {}
-    duplicates: dict[str, set[str]] = {ref: set() for ref in by_ref}
+    duplicates = _identical_claims(by_ref)
     for ref, outcome in outcomes.items():
         if isinstance(outcome, ItemFailure):
             _raise_failure(outcome)
-        reject_reasons.update(_rejection(ref, outcome))
+        if (reason := _rejection(outcome)) is not None:
+            reject_reasons[ref] = reason
         for chunk in outcome:
             for other in chunk.duplicate_of:
                 duplicates[ref].add(other)
                 duplicates[other].add(ref)
-    survivors = _merge_admitted_duplicates(
-        [ref for ref in by_ref if ref not in reject_reasons], duplicates, precedence,
-    )
-    kept = {id(by_ref[ref]) for ref in survivors}
+    survivors = _merge_admitted_duplicates([ref for ref in by_ref if ref not in reject_reasons], duplicates)
+    kept = {position for position, ref in catalog.refs.items() if ref in survivors}
     return CandidateAdmission(
-        admitted=tuple(raw for raw in unique if id(raw) in kept),
+        admitted=tuple(raw for position, raw in enumerate(candidates) if position in kept),
         rejected=tuple(CandidateRejection(by_ref[ref], reason) for ref, reason in reject_reasons.items()),
-        merged_count=exact_merged + len(by_ref) - len(reject_reasons) - len(survivors),
+        merged_count=len(by_ref) - len(reject_reasons) - len(survivors),
         llm_calls=runner.stats.calls,
         prompt_chars=runner.stats.prompt_chars,
         work_ids=tuple(work.id for work in journal.works) if journal is not None else (),
@@ -199,37 +210,32 @@ def _normalized(raw: RawMemory) -> str:
     return re.sub(r"\s+", " ", raw.content.strip())
 
 
-def _distinct_content(candidates: Sequence[RawMemory]) -> tuple[RawMemory, ...]:
-    """The first Candidate of each normalized content; identical ones merge without a model call."""
+def _identical_claims(by_ref: dict[str, RawMemory]) -> dict[str, set[str]]:
+    """Link Candidates that state the same normalized claim with the same type and validity."""
 
-    first: dict[str, RawMemory] = {}
-    for raw in candidates:
-        first.setdefault(_normalized(raw), raw)
-    return tuple(first.values())
+    groups: dict[tuple, list[str]] = {}
+    for ref, raw in by_ref.items():
+        groups.setdefault((_normalized(raw), raw.memory_type, raw.valid_from, raw.valid_until), []).append(ref)
+    return {ref: {other for other in group if other != ref} for group in groups.values() for ref in group}
 
 
-def _by_precedence(candidates: tuple[RawMemory, ...]) -> list[tuple[int, RawMemory]]:
-    """Deterministic survivor precedence: the most specific (longest) claim first."""
+def _by_precedence(candidates: Sequence[RawMemory]) -> list[tuple[int, RawMemory]]:
+    """Deterministic survivor precedence: the most specific (longest) claim first, then extraction order."""
 
     return sorted(
         enumerate(candidates),
-        key=lambda item: (-len(_normalized(item[1])), item[1].memory_type, item[1].content, item[0]),
+        key=lambda item: (-len(_normalized(item[1])), item[1].memory_type, _normalized(item[1]), item[0]),
     )
 
 
-def _rejection(ref: str, chunks: tuple[CandidateAdmissionDecision, ...]) -> dict[str, RejectReason]:
+def _rejection(chunks: tuple[CandidateAdmissionDecision, ...]) -> RejectReason | None:
     """A Candidate rejected in any context chunk is rejected, for the first such chunk's reason."""
 
-    for chunk in chunks:
-        if chunk.verdict == "REJECTED":
-            return {ref: chunk.reject_reason}
-    return {}
+    return next((chunk.reject_reason for chunk in chunks if chunk.verdict == "REJECTED"), None)
 
 
-def _merge_admitted_duplicates(
-    admitted: list[str], duplicates: dict[str, set[str]], precedence: dict[str, int],
-) -> set[str]:
-    """Keep one Candidate per connected group of admitted duplicates.
+def _merge_admitted_duplicates(admitted: list[str], duplicates: dict[str, set[str]]) -> set[str]:
+    """Keep the first Candidate, in precedence order, of each connected group of admitted duplicates.
 
     Only admitted Candidates merge: a rejected Candidate neither absorbs nor
     links others.
@@ -237,7 +243,7 @@ def _merge_admitted_duplicates(
 
     remaining = set(admitted)
     survivors: set[str] = set()
-    for ref in sorted(admitted, key=precedence.__getitem__):
+    for ref in admitted:
         if ref not in remaining:
             continue
         survivors.add(ref)
@@ -256,4 +262,6 @@ def _raise_failure(failure: ItemFailure):
         )
     if isinstance(failure.error, StructuredLlmError):
         raise failure.error
-    raise CandidateAdmissionError("candidate_admission_invalid", str(failure.error)) from failure.error
+    raise CandidateAdmissionError(
+        "candidate_admission_invalid", str(failure.error), terminal_category="invalid_response",
+    ) from failure.error

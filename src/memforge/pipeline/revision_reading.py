@@ -37,12 +37,6 @@ class ReadingGroup:
     # An outermost list: its member Fragments are read as one unit.
     is_list: bool = False
 
-    @property
-    def fragment_anchors(self) -> tuple[SourceAnchor, ...]:
-        """All atomic Fragments participating in this group, in source order."""
-
-        return _ordered_unique((*self.trigger_anchors, *self.context_anchors))
-
 
 @dataclass(frozen=True, slots=True)
 class ReadingExpansion:

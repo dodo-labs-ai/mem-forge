@@ -285,12 +285,13 @@ def _changes(
     catalog: ProjectionFragmentCatalog,
     groups: tuple[tuple[EvidenceFragment, ...], ...],
 ) -> tuple[tuple[ReadingPart, ...], frozenset[str]]:
-    """The changed current ReadingGroups, whole, then removed old text: it may have qualified a claim."""
+    """The changed Unit Title and current ReadingGroups, whole, then removed old text: it may have qualified a claim."""
     changed_fragments, removed = context.delta_fragments()
     changed_anchors = {fragment.anchor for fragment in changed_fragments}
     # A list that lost an item changed, so its remaining items are read with the removal.
     touched = changed_anchors | _remaining_list_items(context, catalog, removed)
-    changed_groups = tuple(group for group in groups if any(f.anchor in touched for f in group))
+    title = tuple(fragment for fragment in catalog.fragments if fragment.anchor in context.unit_title_anchors)
+    changed_groups = tuple(group for group in (title, *groups) if any(f.anchor in touched for f in group))
     changes = (
         *(ReadingPart(fragments=group) for group in changed_groups),
         *(

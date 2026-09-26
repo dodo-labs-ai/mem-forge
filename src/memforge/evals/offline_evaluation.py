@@ -900,21 +900,23 @@ class ProductionSourceUnitDerivationReplayExecutor:
             model=str(candidate_manifest["model"]),
             structured_llm_client=self._structured_llm_client,
         )
-        contexts: dict[int, RevisionAssessmentContext] = {}
+        context: RevisionAssessmentContext | None = None
 
         def reading_context(work: ReplayedEvidenceWork) -> RevisionAssessmentContext:
+            """The one reading context of this case, shared by its planning and extraction."""
+
             def unavailable(_observation_ids):
                 raise OfflineArtifactUnavailable("offline derivation requires pinned binary artifacts")
 
-            # One reading context per replayed case, shared by its planning and extraction.
-            if id(work) not in contexts:
-                contexts[id(work)] = RevisionAssessmentContext(
+            nonlocal context
+            if context is None or context.projection is not work.projection:
+                context = RevisionAssessmentContext(
                     projection=work.projection,
                     base=None,
                     access_context_hash=work.access_context_hash,
                     image_loader=unavailable,
                 )
-            return contexts[id(work)]
+            return context
 
         async def plan(
             authority: ExtractionAuthority,

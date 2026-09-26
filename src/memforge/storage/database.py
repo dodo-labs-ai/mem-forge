@@ -264,6 +264,7 @@ from memforge.source_representation import (
     representation_profile_for_observation_contract,
 )
 from memforge.source_artifacts import (
+    SOURCE_ARTIFACT_OBSERVATION_TYPE,
     SourceArtifactRevision,
     source_artifact_revision_from_metadata,
 )
@@ -595,6 +596,10 @@ def _assert_relation_run_retry_matches(row: Mapping[str, Any], run: RelationRunR
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _document_item_extra_json(doc: DocumentRecord) -> str | None:
+    return json.dumps(doc.item_extra, sort_keys=True) if doc.item_extra else None
 
 
 def _today_iso() -> str:
@@ -4378,8 +4383,11 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
     ),
     (
         100,
-        "Queue operator reprocessing of Source Units at their current revision",
-        ["ALTER TABLE source_sync_runs ADD COLUMN reprocess_document_ids_json TEXT"],
+        "Reprocess Source Units at their current revision from their stored input",
+        [
+            "ALTER TABLE source_sync_runs ADD COLUMN reprocess_document_ids_json TEXT",
+            "ALTER TABLE documents ADD COLUMN item_extra_json TEXT",
+        ],
     ),
 ]
 
@@ -5194,8 +5202,8 @@ class Database:
             author, last_modified, labels, version, content_hash,
             token_count, raw_content_uri, raw_content_type,
             normalized_content_uri, pdf_content_uri, last_synced,
-            client, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            client, item_extra_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(doc_id) DO UPDATE SET
             source=excluded.source, source_url=excluded.source_url,
             title=excluded.title, space_or_project=excluded.space_or_project,
@@ -5208,6 +5216,7 @@ class Database:
             pdf_content_uri=excluded.pdf_content_uri,
             last_synced=excluded.last_synced,
             client=COALESCE(excluded.client, documents.client),
+            item_extra_json=excluded.item_extra_json,
             updated_at=excluded.updated_at""",
             (
                 doc.doc_id,
@@ -5227,6 +5236,7 @@ class Database:
                 doc.pdf_content_uri,
                 doc.last_synced.isoformat(),
                 doc.client,
+                _document_item_extra_json(doc),
                 _now_iso(),
             ),
         )
@@ -5256,8 +5266,8 @@ class Database:
                     doc_id, source, source_url, title, space_or_project, author,
                     last_modified, labels, version, content_hash, token_count,
                     raw_content_uri, raw_content_type, normalized_content_uri,
-                    pdf_content_uri, last_synced, client, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pdf_content_uri, last_synced, client, item_extra_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(doc_id) DO UPDATE SET
                     source=excluded.source, source_url=excluded.source_url,
                     title=excluded.title, space_or_project=excluded.space_or_project,
@@ -5270,6 +5280,7 @@ class Database:
                     pdf_content_uri=excluded.pdf_content_uri,
                     last_synced=excluded.last_synced,
                     client=COALESCE(excluded.client, documents.client),
+                    item_extra_json=excluded.item_extra_json,
                     created_at=COALESCE(excluded.created_at, documents.created_at),
                     updated_at=excluded.updated_at""",
                 (
@@ -5290,6 +5301,7 @@ class Database:
                     doc.pdf_content_uri,
                     doc.last_synced.isoformat(),
                     doc.client,
+                    _document_item_extra_json(doc),
                     doc.created_at.isoformat() if doc.created_at else None,
                     doc.updated_at.isoformat() if doc.updated_at else None,
                 ),
@@ -7512,7 +7524,7 @@ class Database:
         is_artifact = (
             row["part_kind"] == EvidencePartKind.ARTIFACT.value
             or row["profile_name"] == "binary-artifact"
-            or row["observation_type"] == "binary_artifact"
+            or row["observation_type"] == SOURCE_ARTIFACT_OBSERVATION_TYPE
         )
         current = row["current_revision_id"] == row["observation_revision_id"]
         if is_artifact:
@@ -17500,8 +17512,9 @@ class Database:
         if existing and reprocess_document_ids:
             raise SourceSyncRunActive(f"Source {source_id} has an active sync run: {existing['run_id']}")
         if existing and existing["reprocess_document_ids_json"]:
-            # A reprocess keeps its meaning; the requested sync runs after it.
-            await self.db.execute(
+            # A reprocess keeps its meaning; the requested sync runs after it,
+            # forced when requested, as a running sync's successor is.
+            cursor = await self.db.execute(
                 """UPDATE source_sync_runs
                    SET rerun_requested = 1,
                        force_full_sync = CASE WHEN ? THEN 1 ELSE force_full_sync END,
@@ -17510,7 +17523,7 @@ class Database:
                        rerun_source_config_revision = COALESCE(?, rerun_source_config_revision),
                        rerun_predecessor_activity_id = COALESCE(?, rerun_predecessor_activity_id),
                        updated_at = ?
-                   WHERE run_id = ?""",
+                   WHERE run_id = ? AND status IN ('pending', 'running')""",
                 (
                     int(force_full_sync),
                     normalized_snapshot_id,
@@ -17521,6 +17534,8 @@ class Database:
                     existing["run_id"],
                 ),
             )
+            if not cursor.rowcount:
+                raise _ActiveSourceSyncRunChanged
             async with self.db.execute(
                 "SELECT * FROM source_sync_runs WHERE run_id = ?",
                 (existing["run_id"],),
@@ -21448,6 +21463,7 @@ class Database:
             client=d.get("client"),
             created_at=_parse_dt(d.get("created_at")),
             updated_at=_parse_dt(d.get("updated_at")),
+            item_extra=json.loads(d.get("item_extra_json") or "{}"),
         )
 
     def _row_to_memory(self, row) -> Memory:

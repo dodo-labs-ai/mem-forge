@@ -7136,7 +7136,7 @@ def create_admin_app(
 
         The run reads stored content only, so it needs neither the provider nor
         a local daemon. ``dry_run`` reports what the run would read and an
-        upper bound on its model calls without writing anything.
+        estimate of its model calls without writing anything.
         """
         source = await db.get_source(source_id)
         if not source:
@@ -7151,9 +7151,9 @@ def create_admin_app(
             raise HTTPException(status_code=409, detail="projection_scope_transition_open")
         if req.dry_run:
             response.status_code = 200
-            return await reprocess_preview(
+            return asdict(await reprocess_preview(
                 db, artifact_store, source_id=source_id, document_ids=document_ids,
-            )
+            ))
         try:
             run = await sync_service.enqueue_reprocess(source_id, document_ids)
         except SourcePausedError:

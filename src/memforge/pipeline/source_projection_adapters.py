@@ -36,14 +36,19 @@ from memforge.source_projection import (
     SourceUnitRevision,
 )
 from memforge.source_representation import (
-    UNIT_IDENTITY_OBSERVATION_TYPE,
+    UNIT_TITLE_OBSERVATION_TYPE,
     representation_profile_for_observation_contract,
 )
 from memforge.source_projection_config import (
     projection_access_fingerprint,
     projection_scope_fingerprint,
 )
-from memforge.source_artifacts import StoredSourceArtifact
+from memforge.source_artifacts import (
+    SOURCE_ARTIFACT_OBSERVATION_TYPE,
+    StoredSourceArtifact,
+    source_artifact_observation_metadata,
+    source_artifact_observation_provider_key,
+)
 
 
 BUILTIN_SPECIALIZED_SOURCE_TYPES = frozenset(
@@ -117,7 +122,7 @@ class _ObservationInput:
 
 _REVISION_SEMANTIC_METADATA_KEYS = ("claim_evidence_scope",)
 # The Unit Title's provider key; native provider keys never start with "$".
-_UNIT_IDENTITY_PROVIDER_KEY = "$unit_identity"
+_UNIT_TITLE_PROVIDER_KEY = "$unit_identity"
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,8 +147,8 @@ class _UnitTitle:
 
     def observation(self) -> _ObservationInput:
         return _ObservationInput(
-            UNIT_IDENTITY_OBSERVATION_TYPE,
-            _UNIT_IDENTITY_PROVIDER_KEY,
+            UNIT_TITLE_OBSERVATION_TYPE,
+            _UNIT_TITLE_PROVIDER_KEY,
             "\n".join((self.kind, *(f"{name}: {value}" for name, value in self.fields))),
             {"kind": self.kind, "fields": [list(field) for field in self.fields]},
             {},
@@ -329,32 +334,17 @@ def project_source_item(
     )
     artifact_inputs = tuple(
         _ObservationInput(
-            observation_type="binary_artifact",
-            provider_key=f"artifact:{artifact.provider_key}",
+            observation_type=SOURCE_ARTIFACT_OBSERVATION_TYPE,
+            provider_key=source_artifact_observation_provider_key(artifact),
             content="",
             semantic_value=artifact.sha256,
             locator=dict(artifact.locator),
-            metadata={
-                "source_artifact": {
-                    "artifact_id": artifact.id,
-                    "provider_revision": artifact.provider_revision,
-                    "filename": artifact.filename,
-                    "media_type": artifact.media_type,
-                    "size_bytes": artifact.size_bytes,
-                    "sha256": artifact.sha256,
-                    "uri": artifact.uri,
-                    "inference_eligible": artifact.inference_eligible,
-                    "inference_ineligible_reason": (
-                        artifact.inference_ineligible_reason
-                    ),
-                    "parent_observation_id": _stable_id(
-                        "obs",
-                        unit_id,
-                        artifact.parent_observation_type,
-                        artifact.parent_provider_key,
-                    ),
-                }
-            },
+            metadata=source_artifact_observation_metadata(
+                artifact,
+                parent_observation_id=_stable_id(
+                    "obs", unit_id, artifact.parent_observation_type, artifact.parent_provider_key,
+                ),
+            ),
             semantic_hash=artifact.sha256,
         )
         for artifact in artifacts

@@ -24,7 +24,7 @@ from memforge.source_artifacts import (
     SourceArtifactSummary,
     StoredSourceArtifact,
 )
-from memforge.source_representation import UNIT_IDENTITY_OBSERVATION_TYPE
+from memforge.source_representation import UNIT_TITLE_OBSERVATION_TYPE
 from tests.llm_fixture import NoopMemoryExtractor
 
 
@@ -217,7 +217,7 @@ def _primary(requests):
 def _provider_revision(projection):
     """The revision of the provider's first Observation; the Unit Title precedes it."""
     observation_id = next(
-        item.id for item in projection.observations if item.observation_type != UNIT_IDENTITY_OBSERVATION_TYPE
+        item.id for item in projection.observations if item.observation_type != UNIT_TITLE_OBSERVATION_TYPE
     )
     return next(item for item in projection.observation_revisions if item.observation_id == observation_id)
 
@@ -572,7 +572,7 @@ def test_scoped_reprocess_authorizes_every_current_observation_without_a_delta()
     primary = _primary(_requests(current, base=initial, committed=_committed_snapshot(initial), reprocess=True))
     # Every provider Observation is read; the Unit Title is never Primary.
     assert {fragment.anchor.observation_id for fragment in primary} == {
-        item.id for item in current.observations if item.observation_type != UNIT_IDENTITY_OBSERVATION_TYPE
+        item.id for item in current.observations if item.observation_type != UNIT_TITLE_OBSERVATION_TYPE
     }
 
 
@@ -659,7 +659,7 @@ def test_preceding_observation_is_the_reply_target_else_the_declared_predecessor
 
     jira = _jira_projection(2)
     core, first, second = (
-        item.id for item in jira.observations if item.observation_type != UNIT_IDENTITY_OBSERVATION_TYPE
+        item.id for item in jira.observations if item.observation_type != UNIT_TITLE_OBSERVATION_TYPE
     )
     assert preceding_observation_id(jira, first) == core
     assert preceding_observation_id(jira, second) == first

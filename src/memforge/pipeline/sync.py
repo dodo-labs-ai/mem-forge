@@ -2579,6 +2579,7 @@ class GeneSyncOrchestrator:
             pdf_content_uri=pdf_uri,
             last_synced=now,
             client=normalized.source_semantics.get("client") or None,
+            item_extra=dict(item.extra),
         )
 
         if skip_semantic_work:

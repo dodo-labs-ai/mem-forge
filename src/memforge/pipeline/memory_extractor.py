@@ -12,6 +12,7 @@ from memforge.config import DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
 from memforge.evals.agent_evaluation import QualitySignal, record_quality_signal
 from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import (
+    INPUT_CAPACITY_EXCEEDED,
     LiteLlmStructuredClient,
     ProjectionFragmentMemoryExtractionResponse,
     StructuredLlmConfig,
@@ -42,6 +43,7 @@ __all__ = ["ExtractionReading", "MemoryExtractor"]
 _FRAGMENT_OUTPUT_BASE_TOKENS = 512
 _FRAGMENT_OUTPUT_MIN_TOKENS = 768
 _FRAGMENT_OUTPUT_CHARS_PER_TOKEN = 2
+EXTRACTION_CAPACITY_EXCEEDED_MESSAGE = "one ReadingGroup alone exceeds the extraction request capacity"
 
 
 PROJECTION_FRAGMENT_EXTRACTION_PROMPT = """You are extracting durable atomic knowledge from one authorized Source Unit catalog.
@@ -130,7 +132,10 @@ class ExtractionReading:
 
     def request(self, item_ids, *, output_tokens, fits) -> LlmRequest:
         """The one request that reads these items, with the Artifact images its catalog cites."""
-        catalog = self.catalog_for(item_ids)
+        return self.request_for(self.catalog_for(item_ids), output_tokens=output_tokens, fits=fits)
+
+    def request_for(self, catalog: ProjectionFragmentCatalog, *, output_tokens, fits) -> LlmRequest:
+        """The request that reads one catalog of these items."""
         request = LlmRequest(
             MemoryExtractor.projection_fragment_prompt(
                 catalog, source_type=self.source_type, doc_type=self.doc_type, revision_context=self.context,
@@ -237,8 +242,14 @@ class MemoryExtractor:
         reading = ExtractionReading(catalog, revision_context, source_type=source_type, doc_type=doc_type)
         runner = LlmBatchRunner(self.structured_llm_client, model=self.model)
 
+        # The request last rendered for each set of items is the one sent for it.
+        rendered: dict[tuple[str, ...], tuple[LlmRequest, ProjectionFragmentCatalog]] = {}
+
         def render(item_ids, _parts) -> LlmRequest:
-            return reading.request(item_ids, output_tokens=self.fragment_output_tokens, fits=runner.fits)
+            request_catalog = reading.catalog_for(item_ids)
+            request = reading.request_for(request_catalog, output_tokens=self.fragment_output_tokens, fits=runner.fits)
+            rendered[tuple(item_ids)] = (request, request_catalog)
+            return request
 
         started = perf_counter()
         metrics: dict[str, object] = {
@@ -273,8 +284,8 @@ class MemoryExtractor:
         if failure is not None:
             if failure.category == "capacity_exceeded":
                 return MemoryExtractionResult(
-                    error_type="input_capacity_exceeded",
-                    error="one ReadingGroup alone exceeds the extraction request capacity",
+                    error_type=INPUT_CAPACITY_EXCEEDED,
+                    error=EXTRACTION_CAPACITY_EXCEEDED_MESSAGE,
                     metadata={**metrics, **elapsed()},
                 )
             error = failure.error
@@ -298,8 +309,7 @@ class MemoryExtractor:
         resolution = _SelectionResolution()
         image_count = image_bytes = 0
         for item_ids, response in responses.items():
-            request = render(item_ids, ())
-            request_catalog = reading.catalog_for(item_ids)
+            request, request_catalog = rendered[tuple(item_ids)]
             image_count += len(request.images)
             image_bytes += sum(len(image.body) for image in request.images)
             candidates, correction_metrics = await correct_fragment_selectors_once(

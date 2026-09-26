@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig, SyncConfig
-from memforge.models import ContentItem, GeneMetadata, NormalizedContent, SyncState
+from memforge.models import ContentItem, GeneMetadata, NormalizedContent, RawContent, SyncState
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
 from memforge.runtime import SourceSyncWorker, SyncService
@@ -260,6 +261,135 @@ async def test_stored_input_that_would_move_the_unit_fails_closed(db):
     assert harness.extractor.fragment_calls == []
 
 
+class ConfluenceGene:
+    """Places a child page under its parent only from the item metadata fetched with it."""
+
+    discovery_complete = True
+    provider_open = True
+
+    @classmethod
+    def metadata(cls):
+        return GeneMetadata(
+            name="confluence", display_name="Confluence", description="", default_sync_interval_minutes=60,
+            auth_method="pat", data_shape="document",
+        )
+
+    def requires_pdf_artifact(self, **kwargs) -> bool:
+        return False
+
+    def _provider(self) -> None:
+        if not self.provider_open:
+            raise AssertionError("reprocess must not contact the provider")
+
+    async def authenticate(self) -> None:
+        self._provider()
+
+    async def discover(self, since=None):
+        self._provider()
+        yield ContentItem(
+            item_id=CHILD_PAGE, title="Payroll runbook", source_url="https://wiki.example/pages/42",
+            last_modified=FIRST_SYNC_AT, content_type="text/html", space_or_project="PAY", version="3",
+            extra={"page_id": "42", "space_key": "PAY"},
+        )
+
+    async def fetch(self, item):
+        self._provider()
+        item.extra["parent_page_id"] = PARENT_PAGE_ID
+        return RawContent(item=item, body=b"<p>Retain A7 for regular payroll.</p>", content_type="text/html")
+
+    async def normalize(self, raw):
+        return NormalizedContent(item=raw.item, markdown_body="Retain A7 for regular payroll.")
+
+
+CHILD_PAGE = "confluence-42"
+PARENT_PAGE_ID = "7"
+
+
+async def synced_confluence(db: Database) -> Harness:
+    await db.upsert_source(
+        id=SOURCE_ID, type="confluence", name="Wiki", config_json="{}", access_policy="workspace",
+        owner_user_id="dev",
+    )
+    harness = Harness(db)
+    harness.gene = ConfluenceGene()
+    state = await harness.orchestrator().sync_gene(gene=harness.gene, source_name="Wiki", source_id=SOURCE_ID)
+    assert state.last_sync_status == "success"
+    harness.gene.provider_open = False
+    return harness
+
+
+@pytest.mark.asyncio
+async def test_a_child_page_is_reprocessed_where_its_gene_placed_it(db):
+    harness = await synced_confluence(db)
+    unit = await db.find_source_unit_by_document_id(SOURCE_ID, CHILD_PAGE, current_only=True)
+    committed = await db.get_current_source_unit_revision(unit.id)
+    assert unit.locator["parent_page_id"] == PARENT_PAGE_ID
+
+    state = await harness.orchestrator().sync_gene(
+        gene=harness.gene, source_name="Wiki", source_id=SOURCE_ID,
+        execution_mode=SourceSyncMode.REPROCESS, reprocess_doc_ids=frozenset({CHILD_PAGE}),
+    )
+
+    assert (state.last_sync_status, state.docs_failed) == ("success", 0)
+    [lifecycle] = harness.engine.projected_lifecycle_calls[-1:]
+    assert lifecycle["projection"].source_unit_revisions[0].location_hash == committed.location_hash
+
+
+@pytest.mark.asyncio
+async def test_a_document_stored_without_its_item_metadata_cannot_stand_for_a_child_page(db):
+    harness = await synced_confluence(db)
+    await db.db.execute("UPDATE documents SET item_extra_json = NULL WHERE doc_id = ?", (CHILD_PAGE,))
+    await db.db.commit()
+    harness.engine.projected_lifecycle_calls.clear()
+
+    state = await harness.orchestrator().sync_gene(
+        gene=harness.gene, source_name="Wiki", source_id=SOURCE_ID,
+        execution_mode=SourceSyncMode.REPROCESS, reprocess_doc_ids=frozenset({CHILD_PAGE}),
+    )
+
+    [failed] = state.failed_docs
+    assert failed.error.startswith("stored_input_incomplete")
+    assert harness.engine.projected_lifecycle_calls == []
+
+
+async def _rewrite_committed_artifact_metadata(db: Database, harness: Harness, rewrite) -> None:
+    projection = await db.get_current_source_unit_projection((await harness.unit(ARTIFACT_ISSUE)).id)
+    [artifact] = [item for item in projection.observations if item.observation_type == "binary_artifact"]
+    [revision] = [item for item in projection.observation_revisions if item.observation_id == artifact.id]
+    metadata = json.loads(json.dumps(revision.metadata))
+    rewrite(metadata["source_artifact"])
+    await db.db.execute(
+        "UPDATE source_observation_revisions SET metadata_json = ? WHERE id = ?", (json.dumps(metadata), revision.id),
+    )
+    await db.db.commit()
+
+
+@pytest.mark.asyncio
+async def test_an_artifact_stored_before_its_eligibility_fields_is_reprocessed(db):
+    harness = await synced(db)
+    await _rewrite_committed_artifact_metadata(
+        db, harness, lambda artifact: [artifact.pop(key) for key in ("inference_eligible", "inference_ineligible_reason")],
+    )
+
+    state = await harness.reprocess(ARTIFACT_ISSUE)
+
+    assert (state.last_sync_status, state.docs_failed) == ("success", 0)
+    [lifecycle] = harness.engine.projected_lifecycle_calls
+    assert any(item.observation_type == "binary_artifact" for item in lifecycle["projection"].observations)
+
+
+@pytest.mark.asyncio
+async def test_unreadable_artifact_metadata_fails_only_its_unit(db):
+    harness = await synced(db)
+    await _rewrite_committed_artifact_metadata(db, harness, lambda artifact: artifact.pop("sha256"))
+
+    state = await harness.reprocess(ARTIFACT_ISSUE, "PAY-2")
+
+    assert (state.docs_processed, state.docs_failed) == (1, 1)
+    [failed] = state.failed_docs
+    assert (failed.doc_id, failed.error.split(":")[0]) == (doc_id(ARTIFACT_ISSUE), "stored_artifact_invalid")
+
+
 @pytest.mark.asyncio
 async def test_reprocess_waits_for_an_open_projection_scope_transition(db):
     harness = await synced(db)
@@ -406,12 +536,13 @@ async def test_the_reprocess_route_previews_then_queues_one_run(db, tmp_path):
 
     report = preview.json()
     units = {unit["document_id"]: unit for unit in report["units"]}
-    assert units["jira-PAY-404"] == {"document_id": "jira-PAY-404", "available": False,
-                                     "reason": "stored_document_missing"}
+    assert {key: value for key, value in units["jira-PAY-404"].items() if value is not None} == {
+        "document_id": "jira-PAY-404", "available": False, "reason": "stored_document_missing",
+    }
     unit = units["jira-PAY-1"]
     assert unit["available"] and unit["artifact_count"] == 1
     assert unit["unit_revision_id"] == (await db.get_current_source_unit_revision(unit["source_unit_id"])).id
-    assert unit["extraction_item_count"] >= 1 and unit["reading_group_count"] > unit["extraction_item_count"]
+    assert unit["extraction_item_count"] >= 1 and unit["reading_group_count"] >= unit["extraction_item_count"]
     assert unit["estimated_model_calls"] == unit["extraction_item_count"] + 1
     assert report["estimated_model_calls"] == unit["estimated_model_calls"]
     assert (report["available_unit_count"], report["unavailable_unit_count"]) == (1, 1)

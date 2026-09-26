@@ -174,17 +174,46 @@ async def test_a_rejected_candidate_neither_absorbs_nor_links_duplicates():
     assert result.merged_count == 0
 
 
+def repeated(content: str, *, required: bool = True) -> RawMemory:
+    return replace(candidate(content, required=required), content=f"  {content.replace(' ', '   ')} ")
+
+
 @pytest.mark.asyncio
-async def test_identical_content_merges_without_being_judged_twice():
+async def test_identical_claims_are_each_judged_and_merge_once_admitted():
     client = AdmissionClient()
-    first = candidate(MOST_SPECIFIC)
-    repeated = replace(candidate(MOST_SPECIFIC), content=f"  {MOST_SPECIFIC.replace(' ', '   ')} ")
+    first, second = candidate(MOST_SPECIFIC), repeated(MOST_SPECIFIC)
 
-    result = await admit_candidates([first, repeated], client=client, model="fixture")
+    result = await admit_candidates([first, second], client=client, model="fixture")
 
-    assert result.admitted == (first,) and result.merged_count == 1
+    assert result.admitted == (first,) and result.merged_count == 1 and result.rejected == ()
     [request] = client.requests
-    assert [row["claim"] for row in request["candidates"]] == [MOST_SPECIFIC]
+    assert len(request["candidates"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_an_identical_claim_with_complete_evidence_survives_a_rejected_copy():
+    def judge(row, _round):
+        if row["evidence_refs"] and len(row["evidence_refs"]) == 1:
+            return {"candidate_id": row["id"], "verdict": "REJECTED", "reject_reason": "evidence_incomplete"}
+        return admitted(row, _round)
+
+    incomplete, complete = candidate(MOST_SPECIFIC, required=False), repeated(MOST_SPECIFIC)
+
+    result = await admit_candidates([incomplete, complete], client=AdmissionClient(judge), model="fixture")
+
+    assert result.admitted == (complete,)
+    assert [rejection.candidate for rejection in result.rejected] == [incomplete]
+    assert result.merged_count == 0
+
+
+@pytest.mark.asyncio
+async def test_identical_claims_of_different_validity_are_not_merged_by_the_program():
+    first = candidate(MOST_SPECIFIC)
+    later = replace(repeated(MOST_SPECIFIC), valid_from="2027-01-01")
+
+    result = await admit_candidates([first, later], client=AdmissionClient(), model="fixture")
+
+    assert result.admitted == (first, later) and result.merged_count == 0
 
 
 @pytest.mark.asyncio
@@ -209,7 +238,7 @@ async def test_invalid_admission_after_its_correction_is_an_execution_failure(ju
     with pytest.raises(CandidateAdmissionError) as raised:
         await admit_candidates([candidate(MOST_SPECIFIC)], client=client, model="fixture")
 
-    assert raised.value.reason_code == "candidate_admission_invalid"
+    assert (raised.value.reason_code, raised.value.terminal_category) == ("candidate_admission_invalid", "invalid_response")
     assert client.calls == 2
 
 
@@ -219,7 +248,7 @@ async def test_a_candidate_that_alone_exceeds_capacity_is_an_execution_failure()
         await admit_candidates(
             [candidate(MOST_SPECIFIC)], client=AdmissionClient(fits=lambda payload: False), model="fixture",
         )
-    assert raised.value.reason_code == "candidate_admission_capacity_exceeded"
+    assert (raised.value.reason_code, raised.value.terminal_category) == ("candidate_admission_capacity_exceeded", None)
 
 
 @pytest.mark.asyncio
@@ -227,7 +256,7 @@ async def test_a_candidate_without_selected_evidence_is_an_execution_failure():
     with pytest.raises(CandidateAdmissionError) as raised:
         await admit_candidates([RawMemory(content=MOST_SPECIFIC, memory_type="fact")],
                                client=AdmissionClient(), model="fixture")
-    assert raised.value.reason_code == "candidate_evidence_missing"
+    assert (raised.value.reason_code, raised.value.terminal_category) == ("candidate_evidence_missing", None)
 
 
 @pytest.mark.asyncio
