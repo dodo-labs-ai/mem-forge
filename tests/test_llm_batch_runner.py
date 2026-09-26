@@ -12,7 +12,6 @@ from memforge.llm.batch_runner import (
     OUTPUT_INVALID,
     ChainStep,
     ChainTask,
-    ItemCapacityExceeded,
     ItemFailure,
     ItemTask,
     LlmBatchRunner,
@@ -206,9 +205,8 @@ async def test_an_item_that_alone_exceeds_capacity_fails_without_a_call():
     assert results == {"i00": ItemFailure("capacity_exceeded", INPUT_CAPACITY_EXCEEDED)}
     assert client.prompts == []
     task = item_task(client, ids(1))
-    with pytest.raises(ItemCapacityExceeded) as raised:
-        runner.plan_items(task.item_ids, task.render)
-    assert raised.value.item_id == "i00"
+    plan = runner.plan_items(task.item_ids, task.render)
+    assert plan.requests == () and plan.unfit == ("i00",)
 
 
 async def test_a_renderer_that_cannot_build_a_slice_counts_as_not_fitting():
@@ -485,11 +483,12 @@ async def test_plans_match_the_requests_that_are_sent():
     task = item_task(client, ids(6), context=parts(2))
     planned = runner.plan_items(task.item_ids, task.render, task.context)
     await runner.run_items(task)
-    assert [entry.request.prompt for entry in planned] == client.prompts
+    assert [entry.request.prompt for entry in planned.requests] == client.prompts
+    assert planned.unfit == ()
 
-    with pytest.raises(ItemCapacityExceeded):
-        LlmBatchRunner(FixtureBudgetClient(respond=answer, input_tokens=2), model=None).plan_items(
-            ids(1), render, parts(1))
+    unfit = LlmBatchRunner(FixtureBudgetClient(respond=answer, input_tokens=2), model=None).plan_items(
+        ids(1), render, parts(1))
+    assert unfit.requests == () and unfit.unfit == ("i00",)
 
 
 async def test_journal_reuses_completed_requests_and_records_failures():

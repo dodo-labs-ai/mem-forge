@@ -22,7 +22,7 @@ from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
 from memforge.models import Memory
 from memforge.pipeline.evidence_fragments import EvidenceFragment
 from memforge.pipeline.projection_fragments import ProjectionFragmentCatalog
-from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+from memforge.pipeline.revision_assessment import RevisionAssessmentContext, reading_group_label
 from memforge.source_projection import ProjectionCoverage, SourceAnchor
 
 
@@ -115,10 +115,7 @@ class ReadingPart:
         if self.removed is not None:
             entry = self.removed
             return f"removed:{entry['observation_id']}:{entry['revision_id']}:{entry['ref']}"
-        first, last = self.fragments[0].anchor, self.fragments[-1].anchor
-        if first.range_start is None or last.range_end is None:
-            return first.observation_id
-        return f"{first.observation_id}:{first.range_start}-{last.range_end}"
+        return reading_group_label(self.fragments)
 
 
 @dataclass(frozen=True)

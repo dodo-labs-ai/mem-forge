@@ -29,6 +29,7 @@ from memforge.pipeline.extraction_requests import plan_extraction_requests
 from memforge.pipeline.projection_context import (
     PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION,
     ExtractionAuthority,
+    ExtractionPlan,
     plan_projection_evidence_work,
 )
 from memforge.pipeline.revision_assessment import REVISION_INPUT_POLICY, RevisionAssessmentContext
@@ -55,7 +56,7 @@ def _planned_requests(projection, authority):
         extractor=NoopMemoryExtractor(),
         source_type=projection.source_type,
         doc_type="document",
-    )
+    ).requests
 
 def test_extraction_contract_version_is_pinned_into_derivation_identity() -> None:
     # Stored derivations and batch ids hash this value; changing it supersedes
@@ -243,7 +244,7 @@ async def test_v9_reprocess_without_operation_identity_fails_before_llm(
     async def plan(_authority):
         nonlocal extractor_called
         extractor_called = True
-        return ()
+        return ExtractionPlan(())
 
     async def extract(_batch):
         nonlocal extractor_called
@@ -362,7 +363,7 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
     async def plan(_authority):
         nonlocal extractor_called
         extractor_called = True
-        return ()
+        return ExtractionPlan(())
 
     async def extract(_batch):
         nonlocal extractor_called

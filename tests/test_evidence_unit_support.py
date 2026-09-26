@@ -66,7 +66,7 @@ def _file_content_extraction(projection, access_hash):
         extractor=NoopMemoryExtractor(),
         source_type=projection.source_type,
         doc_type="document",
-    )
+    ).requests
     return request.catalog, context
 
 

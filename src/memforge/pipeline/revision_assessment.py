@@ -48,6 +48,14 @@ REVISION_SUPPORT_CONTRACT = "revision-support-v5"
 REVISION_INPUT_POLICY = "revision-input-v7"
 
 
+def reading_group_label(fragments) -> str:
+    """A stable diagnostic name for one ReadingGroup: its Observation and character range."""
+    first, last = fragments[0].anchor, fragments[-1].anchor
+    if first.range_start is None or last.range_end is None:
+        return first.observation_id
+    return f"{first.observation_id}:{first.range_start}-{last.range_end}"
+
+
 def revision_inference_capability_hash(client, *, extraction_model=None, extraction_max_tokens=None) -> str:
     from memforge.pipeline.projection_images import projection_inference_capability_hash
 

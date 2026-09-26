@@ -35,7 +35,7 @@ from memforge.models import Memory, MemoryExtractionResult, RawMemory, Reconcile
 from memforge.pipeline.reconciler import ReconciliationResult, SupportAuditEntry, reconcile_memories
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.extraction_requests import plan_extraction_requests
-from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionRequest
+from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionPlan, ExtractionRequest
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
@@ -830,7 +830,7 @@ class SourceUnitDerivationReplayExecutor:
         self,
         plan_requests: Callable[
             [ExtractionAuthority, ReplayedEvidenceWork, Mapping[str, object]],
-            Awaitable[tuple[ExtractionRequest, ...]],
+            Awaitable[ExtractionPlan],
         ],
         extract_request: Callable[
             [ExtractionRequest, ReplayedEvidenceWork, Mapping[str, object]],
@@ -861,7 +861,7 @@ class SourceUnitDerivationReplayExecutor:
             ),
         )
 
-        async def plan(authority: ExtractionAuthority) -> tuple[ExtractionRequest, ...]:
+        async def plan(authority: ExtractionAuthority) -> ExtractionPlan:
             return await self._plan_requests(authority, work, candidate_manifest)
 
         async def extract(request: ExtractionRequest) -> MemoryExtractionResult:
@@ -922,7 +922,7 @@ class ProductionSourceUnitDerivationReplayExecutor:
             authority: ExtractionAuthority,
             work: ReplayedEvidenceWork,
             _candidate_manifest: Mapping[str, object],
-        ) -> tuple[ExtractionRequest, ...]:
+        ) -> ExtractionPlan:
             return plan_extraction_requests(
                 reading_context(work), authority, extractor=extractor,
                 source_type=work.projection.source_type, doc_type=work.context.doc_type,
