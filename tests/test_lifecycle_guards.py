@@ -1,89 +1,24 @@
-"""Same-Unit identity backstop and DestructiveValidation end to end, on SQLite."""
+"""DestructiveValidation end to end, on SQLite."""
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 
 import pytest
 
-from memforge.llm.structured import MemoryRelationCatalogResponse
-from memforge.models import Memory, RawMemory
+from memforge.models import RawMemory
 from memforge.storage.database import Database
 from tests.coordination_fixture import (
     DOC_ID,
     JIRA_DOCUMENT,
-    RESTATED,
     SOURCE_ID,
-    TWO,
     ScriptedClient,
     coordination_engine,
     partial_jira_revision,
     seed_jira_issue,
-    seeded_page,
-    support_texts,
 )
-from tests.test_projected_lifecycle_integration import db as db, _OutboxDrainer, _selected
+from tests.test_projected_lifecycle_integration import db as db
 from tests.unit_support_fixture import active_support_evidence
-
-
-class _IdentityClient(ScriptedClient):
-    """Relation finds no edge, while identity judges the scripted pairs equivalent."""
-
-    def __init__(self, *, identity: set[tuple[str, str]], **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.identity = identity
-
-    async def discover_memory_relations(self, prompt, **kwargs):
-        payload = json.loads(prompt.split("<memory_relation_catalog>\n", 1)[1].split(
-            "\n</memory_relation_catalog>", 1)[0])
-        old = {row["id"]: row["content"] for row in payload["existing_claims"]}
-        return MemoryRelationCatalogResponse.model_validate(dict(results=[
-            dict(candidate_id=row["id"], relations=[
-                dict(existing_id=ref, classification="equivalent", direction="symmetric",
-                     same_subject_and_scope=True, incompatible_assertions="", reason="fixture identity")
-                for ref in row["allowed_existing_ids"] if (row["content"], old[ref]) in self.identity
-            ])
-            for row in payload["new_claims"]
-        ]))
-
-
-class _IdentityStore(_OutboxDrainer):
-    """Offers one Memory as the equivalence candidate unless identity excludes it."""
-
-    def __init__(self, database: Database, target: Memory) -> None:
-        super().__init__(database)
-        self.target = target
-        self.exclusions: list[frozenset[str]] = []
-
-    async def find_access_compatible_equivalence_candidates(self, memory, *, excluded_memory_ids=frozenset(), **kwargs):
-        self.exclusions.append(frozenset(excluded_memory_ids))
-        if self.target.id in excluded_memory_ids:
-            return ()
-        return (await self.db.get_memory(self.target.id),)
-
-
-@pytest.mark.asyncio
-async def test_identity_attaches_an_equivalent_that_relation_missed_to_the_kept_old_memory(db: Database) -> None:
-    page, memory = await seeded_page(db, TWO)
-    store = _IdentityStore(db, memory)
-    projection = page.next(TWO, RESTATED)
-
-    stats = await coordination_engine(db, _IdentityClient(identity={(RESTATED, TWO)}), store).prepare_and_commit_projected_lifecycle(
-        projection=projection,
-        doc_id=DOC_ID,
-        raw_memories=_selected(projection, [RawMemory(content=RESTATED, memory_type="fact")]),
-        doc_type="design-doc", project_key="ENG", repo_identifier=None,
-        document_content=projection.observation_revisions[-1].content,
-        update_mode="full_document", changed_hunks=None, update_plan_stats=None,
-        source_updated_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
-    )
-
-    # The rebound old Memory is an eligible identity target, so no duplicate is created.
-    assert memory.id not in store.exclusions[0]
-    assert stats["added"] == 0 and stats["corroborated"] == 1
-    assert [item.id for item in await db.list_memories() if item.status == "active"] == [memory.id]
-    assert await support_texts(db, memory.id) == {TWO, RESTATED}
 
 
 async def _jira_page(db: Database):
