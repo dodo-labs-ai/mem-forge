@@ -24,6 +24,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import tiktoken
@@ -98,6 +99,12 @@ from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
 )
 from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot
+from memforge.pipeline.stored_document import (
+    StoredDocumentUnavailable,
+    StoredDocumentUnavailableReason,
+    StoredSourceDocument,
+    load_stored_source_document,
+)
 from memforge.pipeline.projection_images import (
     load_projection_images,
 )
@@ -121,11 +128,26 @@ __all__ = [
     "DocumentLifecycleAdmission",
     "ExtractionWorkPool",
     "GeneSyncOrchestrator",
+    "SourceSyncMode",
     "SyncMemoryObserver",
     "get_process_document_lifecycle_admission",
 ]
 
 DEFAULT_INCREMENTAL_SYNC_OVERLAP = timedelta(minutes=10)
+
+
+class SourceSyncMode(str, Enum):
+    """What one Source sync run reads.
+
+    NORMAL discovers and fetches from the provider. REPROCESS reads named
+    Documents from storage and processes each Source Unit at its current
+    revision with the current adapter and compiler: extraction reads every
+    ReadingGroup and every Support is read over the whole Unit. It never
+    contacts the provider, advances the sync cursor or infers removals.
+    """
+
+    NORMAL = "normal"
+    REPROCESS = "reprocess"
 
 
 # ---------------------------------------------------------------------------
@@ -711,6 +733,7 @@ class GeneSyncOrchestrator:
         force_full_sync: bool = False,
         authoritative_snapshot: bool = False,
         reprocess_doc_ids: frozenset[str] | None = None,
+        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
         lifecycle_cycle_id: str | None = None,
@@ -739,8 +762,12 @@ class GeneSyncOrchestrator:
             When true, discover the complete submitted snapshot so removals can
             be reconciled, while still skipping documents whose content is unchanged.
         reprocess_doc_ids:
-            Optional document identifiers that should be re-extracted during a
-            full discovery. Other unchanged documents remain skipped.
+            The Documents a REPROCESS run reads from storage; required by and
+            only accepted with that mode.
+        execution_mode:
+            NORMAL discovers from the provider; REPROCESS processes the stored
+            ``reprocess_doc_ids`` at their current revisions (see
+            :class:`SourceSyncMode`). Discovery options do not apply to it.
         record_terminal_result:
             Persist the terminal SyncState and history here. Durable workers
             disable this so their lease-fenced completion transaction owns the
@@ -751,6 +778,9 @@ class GeneSyncOrchestrator:
         SyncState
             Final sync result with counts and error details.
         """
+        reprocessing = execution_mode is SourceSyncMode.REPROCESS
+        if reprocessing != bool(reprocess_doc_ids):
+            raise ValueError("reprocess_doc_ids name the Documents of a REPROCESS run")
         if source_activity is not None:
             if source_activity.source_id != source_id:
                 raise ValueError("source activity does not belong to the synced Source")
@@ -797,7 +827,7 @@ class GeneSyncOrchestrator:
             "owner_user_id": (configured_source or {}).get("owner_user_id"),
         }
         scope_transition = await self.db.get_open_projection_scope_transition(source_id)
-        if force_full_sync or scope_transition is not None:
+        if force_full_sync or reprocessing or scope_transition is not None:
             # Reuse is an ordinary incremental optimization only. Full syncs
             # and scope transitions require the full per-document path.
             reusable_projection_doc_ids = frozenset()
@@ -821,129 +851,151 @@ class GeneSyncOrchestrator:
             recovered_completed_results = recovered.completed_results
             recovered_deferred_results = recovered.deferred_results
 
-            # ----------------------------------------------------------
-            # Step 0: Authenticate
-            # ----------------------------------------------------------
-            await gene.authenticate()
-            logger.info("Gene %s authenticated successfully", source_name)
-            if scope_transition is not None:
-                if dict(scope_transition.target_scope) != configured_projection_scope:
-                    raise RuntimeError("open Projection Scope transition does not match configured target scope")
-                scope_transition = await self.db.start_projection_scope_transition(
-                    scope_transition.id,
-                    run_id=transition_run_id,
+            stored_documents: dict[str, StoredSourceDocument] = {}
+            if reprocessing:
+                if scope_transition is not None:
+                    raise RuntimeError(
+                        "reprocess waits for the open Projection Scope transition to complete"
+                    )
+                items = []
+                for doc_id in sorted(reprocess_doc_ids or ()):
+                    try:
+                        stored = await load_stored_source_document(
+                            self.db, self.doc_store, source_id=source_id, document_id=doc_id,
+                        )
+                    except StoredDocumentUnavailable as exc:
+                        docs_failed += 1
+                        failed_docs.append(FailedDoc(doc_id=doc_id, title=doc_id, error=str(exc)))
+                        continue
+                    stored_documents[doc_id] = stored
+                    items.append(stored.item)
+                indexed_doc_ids: set[str] = set()
+                last_sync_time = None
+                total_item_count = len(items)
+            else:
+                # ----------------------------------------------------------
+                # Step 0: Authenticate
+                # ----------------------------------------------------------
+                await gene.authenticate()
+                logger.info("Gene %s authenticated successfully", source_name)
+                if scope_transition is not None:
+                    if dict(scope_transition.target_scope) != configured_projection_scope:
+                        raise RuntimeError("open Projection Scope transition does not match configured target scope")
+                    scope_transition = await self.db.start_projection_scope_transition(
+                        scope_transition.id,
+                        run_id=transition_run_id,
+                    )
+                    transition_started = True
+
+                # ----------------------------------------------------------
+                # Step 1: Get indexed doc_ids for deletion detection
+                # ----------------------------------------------------------
+                indexed_doc_ids = await self._get_indexed_doc_ids(source_id)
+                logger.info(
+                    "Found %d previously indexed documents for %s",
+                    len(indexed_doc_ids),
+                    source_id,
                 )
-                transition_started = True
 
-            # ----------------------------------------------------------
-            # Step 1: Get indexed doc_ids for deletion detection
-            # ----------------------------------------------------------
-            indexed_doc_ids = await self._get_indexed_doc_ids(source_id)
-            logger.info(
-                "Found %d previously indexed documents for %s",
-                len(indexed_doc_ids),
-                source_id,
-            )
+                # ----------------------------------------------------------
+                # Step 2: Get last sync time for incremental discovery
+                # ----------------------------------------------------------
+                last_sync_time = (
+                    None
+                    if force_full_sync or authoritative_snapshot or scope_transition is not None
+                    else (existing_state.last_sync_at if existing_state else None)
+                )
+                if last_sync_time and hasattr(gene, "fetch_pdf"):
+                    missing_pdf_count = await self._count_missing_pdf_uris(source_id)
+                    if missing_pdf_count:
+                        logger.info(
+                            "Found %d documents missing required PDF provenance for %s; forcing full sync",
+                            missing_pdf_count,
+                            source_id,
+                        )
+                        last_sync_time = None
 
-            # ----------------------------------------------------------
-            # Step 2: Get last sync time for incremental discovery
-            # ----------------------------------------------------------
-            last_sync_time = (
-                None
-                if force_full_sync or authoritative_snapshot or scope_transition is not None
-                else (existing_state.last_sync_at if existing_state else None)
-            )
-            if last_sync_time and hasattr(gene, "fetch_pdf"):
-                missing_pdf_count = await self._count_missing_pdf_uris(source_id)
-                if missing_pdf_count:
-                    logger.info(
-                        "Found %d documents missing required PDF provenance for %s; forcing full sync",
-                        missing_pdf_count,
+                # If sync_state says "synced" but there are 0 indexed docs,
+                # force a full re-sync (handles previously broken sync stubs)
+                if last_sync_time and not indexed_doc_ids:
+                    logger.warning(
+                        "Sync state exists but 0 indexed docs for %s — forcing full re-sync",
                         source_id,
                     )
                     last_sync_time = None
+                elif last_sync_time:
+                    last_sync_time = last_sync_time - DEFAULT_INCREMENTAL_SYNC_OVERLAP
 
-            # If sync_state says "synced" but there are 0 indexed docs,
-            # force a full re-sync (handles previously broken sync stubs)
-            if last_sync_time and not indexed_doc_ids:
-                logger.warning(
-                    "Sync state exists but 0 indexed docs for %s — forcing full re-sync",
-                    source_id,
-                )
-                last_sync_time = None
-            elif last_sync_time:
-                last_sync_time = last_sync_time - DEFAULT_INCREMENTAL_SYNC_OVERLAP
-
-            # ----------------------------------------------------------
-            # Step 3: Discover content items
-            # ----------------------------------------------------------
-            items: list[ContentItem] = []
-            if progress_callback:
-                progress_callback(
-                    {
-                        "phase": "discovering",
-                        "current": 0,
-                        "total": 0,
-                        "title": None,
-                    }
-                )
-
-            begin_discovery = getattr(gene, "begin_discovery", None)
-            if callable(begin_discovery):
-                begin_discovery()
-            async for item in gene.discover(since=last_sync_time):
-                items.append(item)
-                crawled_doc_ids.add(item.item_id)
+                # ----------------------------------------------------------
+                # Step 3: Discover content items
+                # ----------------------------------------------------------
+                items: list[ContentItem] = []
                 if progress_callback:
                     progress_callback(
                         {
                             "phase": "discovering",
-                            "current": len(items),
+                            "current": 0,
                             "total": 0,
                             "title": None,
                         }
                     )
 
-            run_coverage = source_run_projection_coverage(
-                incremental=last_sync_time is not None,
-                authoritative_snapshot=authoritative_snapshot,
-                discovery_complete=bool(getattr(gene, "discovery_complete", False)),
-            )
+                begin_discovery = getattr(gene, "begin_discovery", None)
+                if callable(begin_discovery):
+                    begin_discovery()
+                async for item in gene.discover(since=last_sync_time):
+                    items.append(item)
+                    crawled_doc_ids.add(item.item_id)
+                    if progress_callback:
+                        progress_callback(
+                            {
+                                "phase": "discovering",
+                                "current": len(items),
+                                "total": 0,
+                                "title": None,
+                            }
+                        )
 
-            logger.info(
-                "Discovered %d content items from %s (since=%s)",
-                len(items),
-                source_name,
-                last_sync_time.isoformat() if last_sync_time else "full sync",
-            )
-            discovered_doc_ids = {item.item_id for item in items}
-            unexpected_reuse_ids = reusable_projection_doc_ids - discovered_doc_ids
-            if unexpected_reuse_ids and authoritative_snapshot:
-                raise ValueError(
-                    "reusable Source Projection membership is outside provider discovery: "
-                    f"{sorted(unexpected_reuse_ids)[0]}"
+                run_coverage = source_run_projection_coverage(
+                    incremental=last_sync_time is not None,
+                    authoritative_snapshot=authoritative_snapshot,
+                    discovery_complete=bool(getattr(gene, "discovery_complete", False)),
                 )
-            reusable_projection_doc_ids = reusable_projection_doc_ids & discovered_doc_ids
-            total_item_count = len(items)
-            if reusable_projection_doc_ids:
-                items = [item for item in items if item.item_id not in reusable_projection_doc_ids]
-                reused_projection_count = total_item_count - len(items)
-                docs_processed += reused_projection_count
+
                 logger.info(
-                    "Reused %d current Source Projections for %s without per-document materialization",
-                    reused_projection_count,
-                    source_id,
+                    "Discovered %d content items from %s (since=%s)",
+                    len(items),
+                    source_name,
+                    last_sync_time.isoformat() if last_sync_time else "full sync",
                 )
-            self._memory_sample(
-                "after_discovery",
-                source_id=source_id,
-                run_id=run_id,
-                item_count=total_item_count,
-                reused_projection_count=reused_projection_count,
-                indexed_doc_count=len(indexed_doc_ids),
-                full_sync=last_sync_time is None,
-                projection_coverage=run_coverage.value,
-            )
+                discovered_doc_ids = {item.item_id for item in items}
+                unexpected_reuse_ids = reusable_projection_doc_ids - discovered_doc_ids
+                if unexpected_reuse_ids and authoritative_snapshot:
+                    raise ValueError(
+                        "reusable Source Projection membership is outside provider discovery: "
+                        f"{sorted(unexpected_reuse_ids)[0]}"
+                    )
+                reusable_projection_doc_ids = reusable_projection_doc_ids & discovered_doc_ids
+                total_item_count = len(items)
+                if reusable_projection_doc_ids:
+                    items = [item for item in items if item.item_id not in reusable_projection_doc_ids]
+                    reused_projection_count = total_item_count - len(items)
+                    docs_processed += reused_projection_count
+                    logger.info(
+                        "Reused %d current Source Projections for %s without per-document materialization",
+                        reused_projection_count,
+                        source_id,
+                    )
+                self._memory_sample(
+                    "after_discovery",
+                    source_id=source_id,
+                    run_id=run_id,
+                    item_count=total_item_count,
+                    reused_projection_count=reused_projection_count,
+                    indexed_doc_count=len(indexed_doc_ids),
+                    full_sync=last_sync_time is None,
+                    projection_coverage=run_coverage.value,
+                )
 
             if progress_callback:
                 progress_callback(
@@ -1040,9 +1092,8 @@ class GeneSyncOrchestrator:
                                 source_id=source_id,
                                 run_id=run_id,
                                 progress_callback=on_item_progress,
-                                force_reprocess=(
-                                    force_full_sync and (not reprocess_doc_ids or item.item_id in reprocess_doc_ids)
-                                ),
+                                force_reprocess=force_full_sync or reprocessing,
+                                stored_document=stored_documents.get(item.item_id),
                                 projection_scope=configured_projection_scope,
                                 scope_transition=(
                                     {
@@ -1447,8 +1498,9 @@ class GeneSyncOrchestrator:
             error_message = summarize_failed_documents(docs_failed, failed_docs)
 
         # Advance the incremental watermark after a successful sync, including
-        # no-change runs where discovery returns zero items.
-        if status == "success":
+        # no-change runs where discovery returns zero items. A reprocess
+        # discovers nothing, so the cursor stays where the last sync left it.
+        if status == "success" and not reprocessing:
             sync_at = finished_at
         elif existing_state and existing_state.last_sync_at:
             sync_at = existing_state.last_sync_at
@@ -1876,6 +1928,7 @@ class GeneSyncOrchestrator:
                 context.reprocess_all_current_observations
             ),
             derivation_reprocess_operation_id=context.reprocess_operation_id,
+            derivation_support_without_baseline=context.support_without_baseline,
             expected_source_activity_epoch=source_activity_epoch,
             source_activity=source_activity,
             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
@@ -1944,6 +1997,7 @@ class GeneSyncOrchestrator:
         lifecycle_attempt_count: int = 1,
         source_unit_target_callback: Callable[[str, str], None] | None = None,
         recovered_deferred_targets: frozenset[tuple[str, str]] = frozenset(),
+        stored_document: StoredSourceDocument | None = None,
     ) -> dict:
         doc_id = item.item_id
         self._memory_sample("document_wait_start", source_id=source_id, run_id=run_id, doc_id=doc_id)
@@ -1985,6 +2039,7 @@ class GeneSyncOrchestrator:
                         source_unit_target_callback=source_unit_target_callback,
                         recovered_deferred_targets=recovered_deferred_targets,
                         source_unit_id_callback=diagnostics.bind_source_unit,
+                        stored_document=stored_document,
                     )
                     if result.get("recovered_deferred_target") is not None:
                         diagnostics.status = "prepared"
@@ -2036,8 +2091,12 @@ class GeneSyncOrchestrator:
         lifecycle_attempt_count: int = 1,
         source_unit_target_callback: Callable[[str, str], None] | None = None,
         recovered_deferred_targets: frozenset[tuple[str, str]] = frozenset(),
+        stored_document: StoredSourceDocument | None = None,
     ) -> dict:
         """Process a single content item through the full pipeline.
+
+        A ``stored_document`` replaces the provider: its stored raw content and
+        committed Artifacts are the input, and nothing is fetched or exported.
 
         Steps:
             1. Fetch raw content
@@ -2069,7 +2128,7 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         # 1. Fetch raw content
         # ------------------------------------------------------------------
-        raw = await gene.fetch(item)
+        raw = stored_document.raw if stored_document is not None else await gene.fetch(item)
         logger.debug("Fetched %s (%d bytes)", doc_id, len(raw.body))
         self._memory_sample(
             "after_fetch",
@@ -2256,6 +2315,9 @@ class GeneSyncOrchestrator:
                 store=self.doc_store,
                 open_artifact=gene.open_source_artifact,
             )
+        elif stored_document is not None:
+            stored_source_artifacts = stored_document.artifacts
+        if stored_source_artifacts:
             probe_scope.update(
                 {
                     "source_unit_id": source_unit.id,
@@ -2285,6 +2347,12 @@ class GeneSyncOrchestrator:
         if source_unit_id_callback is not None:
             source_unit_id_callback(source_unit.id)
         stats["source_unit_id"] = source_unit.id
+        if (
+            stored_document is not None
+            and projection_probe.source_unit_revisions[0].location_hash
+            != stored_document.committed.source_unit_revisions[0].location_hash
+        ):
+            raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.INPUT_INCOMPLETE, doc_id)
 
         current_target = (
             source_unit.id,
@@ -2352,9 +2420,13 @@ class GeneSyncOrchestrator:
                 )
 
             projection_requires_extraction = projection.deltas[0].requires_extraction
-            if not projection_requires_extraction:
+            skip_semantic_work = not projection_requires_extraction and not force_reprocess
+            if skip_semantic_work:
                 # Location/access-only and idempotent observations carry no
                 # Memory mutation, so their lineage can advance independently.
+                # Semantic work plans against the committed base, and its
+                # lifecycle commit records the projection in the same
+                # transaction.
                 await self.db.record_source_projection(
                     projection,
                     expected_source_activity_epoch=expected_source_activity_epoch,
@@ -2383,7 +2455,6 @@ class GeneSyncOrchestrator:
                 existing_doc = lineage_predecessor_docs[0]
                 existing_hash = existing_doc.content_hash
         content_unchanged = existing_hash == new_hash
-        skip_semantic_work = not projection_requires_extraction and not force_reprocess
         previous_markdown = (
             self._read_previous_normalized_content(existing_doc)
             if existing_hash is not None and existing_hash != new_hash
@@ -2400,11 +2471,16 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         # 3. Store raw + normalized on disk
         # ------------------------------------------------------------------
-        reuse_content_artifacts = content_unchanged and not force_reprocess
+        # A reprocess reads its raw content from storage and keeps the
+        # provider exports it cannot repeat; only a changed normalization is
+        # stored again.
+        reuse_content_artifacts = content_unchanged and (stored_document is not None or not force_reprocess)
         raw_uri = existing_doc.raw_content_uri if reuse_content_artifacts and existing_doc else None
+        if stored_document is not None:
+            raw_uri = stored_document.document.raw_content_uri
         norm_uri = existing_doc.normalized_content_uri if reuse_content_artifacts and existing_doc else None
         stored_content_artifact = False
-        if not content_unchanged or not raw_uri:
+        if not raw_uri:
             raw_uri = self.doc_store.store_raw(
                 source_id=source_id,
                 doc_id=doc_id,
@@ -2413,7 +2489,7 @@ class GeneSyncOrchestrator:
                 content_type=raw.content_type,
             )
             stored_content_artifact = True
-        if not content_unchanged or not norm_uri:
+        if not norm_uri:
             norm_uri = self.doc_store.store_normalized(
                 source_id=source_id,
                 doc_id=doc_id,
@@ -2434,9 +2510,14 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         # 3b. Export PDF (if gene supports it)
         # ------------------------------------------------------------------
-        pdf_uri = existing_doc.pdf_content_uri if reuse_content_artifacts and existing_doc else None
+        pdf_uri = (
+            existing_doc.pdf_content_uri
+            if (reuse_content_artifacts or stored_document is not None) and existing_doc
+            else None
+        )
         should_fetch_pdf = (
-            not raw.authoritative_empty
+            stored_document is None
+            and not raw.authoritative_empty
             and hasattr(gene, "fetch_pdf")
             and (force_reprocess or requires_pdf_uri or not pdf_uri)
         )
@@ -2638,6 +2719,7 @@ class GeneSyncOrchestrator:
             current_changed_ranges=(update_plan.current_changed_ranges if update_plan is not None else ()),
             reprocess_all_current_observations=force_reprocess,
             reprocess_operation_id=(run_id if force_reprocess else None),
+            support_without_baseline=stored_document is not None,
         )
         # Extraction owns the only document-content model call. Historical
         # cross-document/cross-source discovery remains post-commit Relation
@@ -2710,6 +2792,9 @@ class GeneSyncOrchestrator:
             ),
             derivation_reprocess_operation_id=(
                 derivation_context.reprocess_operation_id
+            ),
+            derivation_support_without_baseline=(
+                derivation_context.support_without_baseline
             ),
             expected_source_activity_epoch=expected_source_activity_epoch,
             source_activity=source_activity,

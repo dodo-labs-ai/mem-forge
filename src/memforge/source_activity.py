@@ -18,6 +18,10 @@ class SourceActivityConflict(ValueError):
     """Raised when a Source-scoped mutation cannot acquire admission."""
 
 
+class SourceSyncRunActive(SourceActivityConflict):
+    """Raised when an operator reprocess is requested while a sync run is pending or running."""
+
+
 @dataclass(frozen=True)
 class SourceActivityLease:
     id: str

@@ -1991,6 +1991,7 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             force_full_sync=False,
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
+            execution_mode=None,
             source_activity_epoch=None,
             source_activity=None,
             lifecycle_cycle_id=None,
@@ -2002,6 +2003,7 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             del (
                 authoritative_snapshot,
                 reprocess_doc_ids,
+                execution_mode,
                 source_activity_epoch,
                 source_activity,
                 scope_transition_run_id,
@@ -2115,6 +2117,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             force_full_sync=False,
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
+            execution_mode=None,
             source_activity_epoch=None,
             source_activity=None,
             lifecycle_cycle_id=None,
@@ -2126,6 +2129,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             del (
                 authoritative_snapshot,
                 reprocess_doc_ids,
+                execution_mode,
                 source_activity_epoch,
                 source_activity,
                 lifecycle_cycle_id,
