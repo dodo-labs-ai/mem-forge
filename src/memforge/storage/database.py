@@ -41,6 +41,7 @@ from memforge.source_activity import (
     SourceActivityConflict,
     SourceActivityKind,
     SourceActivityLease,
+    SourceSyncRunActive,
 )
 from memforge.sync_progress import normalize_sync_progress_snapshot
 from memforge.storage.adapters.protocols import (
@@ -263,6 +264,7 @@ from memforge.source_representation import (
     representation_profile_for_observation_contract,
 )
 from memforge.source_artifacts import (
+    SOURCE_ARTIFACT_OBSERVATION_TYPE,
     SourceArtifactRevision,
     source_artifact_revision_from_metadata,
 )
@@ -596,6 +598,10 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _document_item_extra_json(doc: DocumentRecord) -> str | None:
+    return json.dumps(doc.item_extra, sort_keys=True) if doc.item_extra else None
+
+
 def _today_iso() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
@@ -684,6 +690,7 @@ def _source_sync_run_from_row(
         rerun_source_config_revision=data.get("rerun_source_config_revision"),
         predecessor_activity_id=data.get("predecessor_activity_id"),
         rerun_predecessor_activity_id=data.get("rerun_predecessor_activity_id"),
+        reprocess_document_ids=tuple(json.loads(data.get("reprocess_document_ids_json") or "[]")),
         coalesced=coalesced,
         lease_owner=data.get("lease_owner"),
         lease_expires_at=_parse_dt(data.get("lease_expires_at")),
@@ -1696,6 +1703,7 @@ CREATE TABLE IF NOT EXISTS source_sync_runs (
     rerun_source_config_revision TEXT,
     predecessor_activity_id TEXT,
     rerun_predecessor_activity_id TEXT,
+    reprocess_document_ids_json TEXT,
     lease_owner             TEXT,
     lease_expires_at        TEXT,
     lease_attempt_count     INTEGER NOT NULL DEFAULT 0,
@@ -4373,6 +4381,14 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "DROP TABLE IF EXISTS lifecycle_backfill_jobs",
         ],
     ),
+    (
+        100,
+        "Reprocess Source Units at their current revision from their stored input",
+        [
+            "ALTER TABLE source_sync_runs ADD COLUMN reprocess_document_ids_json TEXT",
+            "ALTER TABLE documents ADD COLUMN item_extra_json TEXT",
+        ],
+    ),
 ]
 
 
@@ -5186,8 +5202,8 @@ class Database:
             author, last_modified, labels, version, content_hash,
             token_count, raw_content_uri, raw_content_type,
             normalized_content_uri, pdf_content_uri, last_synced,
-            client, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            client, item_extra_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(doc_id) DO UPDATE SET
             source=excluded.source, source_url=excluded.source_url,
             title=excluded.title, space_or_project=excluded.space_or_project,
@@ -5200,6 +5216,7 @@ class Database:
             pdf_content_uri=excluded.pdf_content_uri,
             last_synced=excluded.last_synced,
             client=COALESCE(excluded.client, documents.client),
+            item_extra_json=excluded.item_extra_json,
             updated_at=excluded.updated_at""",
             (
                 doc.doc_id,
@@ -5219,6 +5236,7 @@ class Database:
                 doc.pdf_content_uri,
                 doc.last_synced.isoformat(),
                 doc.client,
+                _document_item_extra_json(doc),
                 _now_iso(),
             ),
         )
@@ -5248,8 +5266,8 @@ class Database:
                     doc_id, source, source_url, title, space_or_project, author,
                     last_modified, labels, version, content_hash, token_count,
                     raw_content_uri, raw_content_type, normalized_content_uri,
-                    pdf_content_uri, last_synced, client, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pdf_content_uri, last_synced, client, item_extra_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(doc_id) DO UPDATE SET
                     source=excluded.source, source_url=excluded.source_url,
                     title=excluded.title, space_or_project=excluded.space_or_project,
@@ -5262,6 +5280,7 @@ class Database:
                     pdf_content_uri=excluded.pdf_content_uri,
                     last_synced=excluded.last_synced,
                     client=COALESCE(excluded.client, documents.client),
+                    item_extra_json=excluded.item_extra_json,
                     created_at=COALESCE(excluded.created_at, documents.created_at),
                     updated_at=excluded.updated_at""",
                 (
@@ -5282,6 +5301,7 @@ class Database:
                     doc.pdf_content_uri,
                     doc.last_synced.isoformat(),
                     doc.client,
+                    _document_item_extra_json(doc),
                     doc.created_at.isoformat() if doc.created_at else None,
                     doc.updated_at.isoformat() if doc.updated_at else None,
                 ),
@@ -7504,7 +7524,7 @@ class Database:
         is_artifact = (
             row["part_kind"] == EvidencePartKind.ARTIFACT.value
             or row["profile_name"] == "binary-artifact"
-            or row["observation_type"] == "binary_artifact"
+            or row["observation_type"] == SOURCE_ARTIFACT_OBSERVATION_TYPE
         )
         current = row["current_revision_id"] == row["observation_revision_id"]
         if is_artifact:
@@ -8725,7 +8745,7 @@ class Database:
                         if work_row is None:
                             raise ValueError("required derivation work missing at commit")
                         work = DerivationWork.from_payload(json.loads(work_row["payload_json"]))
-                        if work.status != "completed" or work.kind not in {"support_finalize", "claim_assess"}:
+                        if work.status != "completed" or work.kind not in {"support_finalize", "candidate_admission", "claim_assess"}:
                             raise ValueError("required derivation work incomplete at commit")
                     staged_context = source_unit_derivation_context_from_payload(
                         json.loads(derivation["context_payload_json"])
@@ -17371,7 +17391,15 @@ class Database:
         source_config_revision: str | None = None,
         predecessor_activity_id: str | None = None,
         retry_run_id: str | None = None,
+        reprocess_document_ids: tuple[str, ...] = (),
     ) -> SourceSyncRun:
+        """Queue one sync run, or coalesce into the Source's active run.
+
+        ``reprocess_document_ids`` queue an operator reprocess of those stored
+        Documents instead. It never coalesces: it is refused with
+        :class:`SourceSyncRunActive` while another run is pending or running.
+        A sync requested while a reprocess is active runs after it.
+        """
         for _attempt in range(3):
             async with self._write_lock:
                 try:
@@ -17384,6 +17412,7 @@ class Database:
                         source_config_revision=source_config_revision,
                         predecessor_activity_id=predecessor_activity_id,
                         retry_run_id=retry_run_id,
+                        reprocess_document_ids=reprocess_document_ids,
                     )
                     await self.db.commit()
                     return run
@@ -17406,9 +17435,14 @@ class Database:
         source_config_revision: str | None = None,
         predecessor_activity_id: str | None = None,
         retry_run_id: str | None = None,
+        reprocess_document_ids: tuple[str, ...] = (),
         now: str | None = None,
     ) -> SourceSyncRun:
         now_iso = now or _now_iso()
+        if reprocess_document_ids and (
+            trigger != "reprocess" or force_full_sync or input_snapshot_id or retry_run_id
+        ):
+            raise ValueError("a reprocess run names stored Documents only")
         normalized_snapshot_id = _non_empty_string(input_snapshot_id)
         normalized_config_revision = _non_empty_string(source_config_revision)
         normalized_predecessor_activity_id = _non_empty_string(predecessor_activity_id)
@@ -17475,6 +17509,39 @@ class Database:
             (workspace_id, source_id),
         ) as cursor:
             existing = await cursor.fetchone()
+        if existing and reprocess_document_ids:
+            raise SourceSyncRunActive(f"Source {source_id} has an active sync run: {existing['run_id']}")
+        if existing and existing["reprocess_document_ids_json"]:
+            # A reprocess keeps its meaning; the requested sync runs after it,
+            # forced when requested, as a running sync's successor is.
+            cursor = await self.db.execute(
+                """UPDATE source_sync_runs
+                   SET rerun_requested = 1,
+                       force_full_sync = CASE WHEN ? THEN 1 ELSE force_full_sync END,
+                       rerun_input_snapshot_id = COALESCE(?, rerun_input_snapshot_id),
+                       rerun_input_generation_watermark = ?,
+                       rerun_source_config_revision = COALESCE(?, rerun_source_config_revision),
+                       rerun_predecessor_activity_id = COALESCE(?, rerun_predecessor_activity_id),
+                       updated_at = ?
+                   WHERE run_id = ? AND status IN ('pending', 'running')""",
+                (
+                    int(force_full_sync),
+                    normalized_snapshot_id,
+                    input_generation_watermark,
+                    normalized_config_revision,
+                    normalized_predecessor_activity_id,
+                    now_iso,
+                    existing["run_id"],
+                ),
+            )
+            if not cursor.rowcount:
+                raise _ActiveSourceSyncRunChanged
+            async with self.db.execute(
+                "SELECT * FROM source_sync_runs WHERE run_id = ?",
+                (existing["run_id"],),
+            ) as cursor:
+                existing = await cursor.fetchone()
+            return _source_sync_run_from_row(existing, coalesced=True)
         if existing:
             existing_snapshot_id = _non_empty_string(existing["input_snapshot_id"])
             pending_snapshot_id = _non_empty_string(existing["rerun_input_snapshot_id"])
@@ -17575,8 +17642,8 @@ class Database:
                 run_id, workspace_id, source_id, trigger, status,
                 force_full_sync, input_snapshot_id, input_generation_watermark,
                 source_config_revision, predecessor_activity_id,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
+                reprocess_document_ids_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id,
                 workspace_id,
@@ -17587,6 +17654,7 @@ class Database:
                 input_generation_watermark,
                 normalized_config_revision,
                 normalized_predecessor_activity_id,
+                (json.dumps(sorted(set(reprocess_document_ids))) if reprocess_document_ids else None),
                 now_iso,
                 now_iso,
             ),
@@ -21395,6 +21463,7 @@ class Database:
             client=d.get("client"),
             created_at=_parse_dt(d.get("created_at")),
             updated_at=_parse_dt(d.get("updated_at")),
+            item_extra=json.loads(d.get("item_extra_json") or "{}"),
         )
 
     def _row_to_memory(self, row) -> Memory:

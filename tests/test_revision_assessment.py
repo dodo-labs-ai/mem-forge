@@ -186,7 +186,7 @@ def test_partial_projection_keeps_exact_carried_member():
     )
     ctx = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
     assert "obs-context" in ctx.current
-    assert not any(item["observation_id"] == "obs-context" for item in ctx.delta()[1])
+    assert not any(fragment.anchor.observation_id == "obs-context" for fragment in ctx.delta_fragments()[1])
 
 
 @pytest.mark.asyncio
@@ -284,29 +284,6 @@ def test_processing_limitation_cannot_retry_whole_document():
     assert error.retryable is False
 
 
-@pytest.mark.parametrize("mode", ["full", "delta"])
-def test_extraction_context_expansion_preserves_exact_changed_primary_authority(mode):
-    from dataclasses import replace
-    from memforge.pipeline.revision_input import ExtractionInputTask, RevisionInputPlanner
-
-    base, target = revisions(
-        "Two reviewers approve US releases.\n", "Two reviewers approve US releases.\n\nNew deployment owner: Alex.\n"
-    )
-    ctx = RevisionAssessmentContext(projection=target, base=base, access_context_hash="scope")
-    changed = next(f for f in ctx.full_fragments if "New deployment owner" in f.presentation_text)
-    authorized = ctx.catalog((replace(changed, primary_eligible=True),))
-    expanded = next(
-        candidate.catalog
-        for candidate in RevisionInputPlanner._extraction_candidates(
-            ctx, ExtractionInputTask(authorized)
-        )
-        if candidate.mode.value == mode
-    )
-    assert {f.anchor for f in expanded.fragments if f.primary_eligible} == {changed.anchor}
-    if mode == "full":
-        assert any("Two reviewers" in f.presentation_text and not f.primary_eligible for f in expanded.fragments)
-
-
 def test_actual_extraction_allowance_is_part_of_reuse_identity():
     from memforge.pipeline.revision_assessment import revision_inference_capability_hash
 
@@ -331,7 +308,8 @@ def test_changelog_delta_keeps_before_after_field_identity_and_event_context():
         return replace(projection, observation_revisions=(revision, *projection.observation_revisions[1:]))
     old, new = canonical(old, "Three approvers."), canonical(new, "One approver.")
     context = RevisionAssessmentContext(projection=new, base=old, access_context_hash="scope")
-    current, removed = context.delta()
+    current, removed_fragments = context.delta_fragments()
+    removed = [context.removed_entry(fragment) for fragment in removed_fragments]
     removed_claim = next(f for f in removed if f["text"] == "Three approvers.")
     assert removed_claim["field"] == "/items/0/toString"
     assert removed_claim["context"] == {"/created": "2026-09-08", "/items/0/field": "description"}

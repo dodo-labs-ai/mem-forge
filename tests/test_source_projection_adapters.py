@@ -28,6 +28,7 @@ from memforge.source_projection import (
 )
 from memforge.source_projection_config import projection_scope_fingerprint
 from memforge.source_representation import (
+    UNIT_TITLE_OBSERVATION_TYPE,
     representation_contract_for_profile,
     representation_profile_for_observation_contract,
 )
@@ -37,6 +38,16 @@ from memforge.storage.database import Database
 
 NOW = datetime(2026, 7, 15, tzinfo=timezone.utc)
 
+
+
+def _provider_revisions(projection):
+    """The revisions of the provider's own Observations, in order; the Unit Title precedes them."""
+    by_observation = {revision.observation_id: revision for revision in projection.observation_revisions}
+    return [
+        by_observation[observation.id]
+        for observation in projection.observations
+        if observation.observation_type != UNIT_TITLE_OBSERVATION_TYPE
+    ]
 
 def _item(**overrides) -> ContentItem:
     values = dict(
@@ -155,9 +166,7 @@ def test_confluence_page_id_is_unit_and_parent_is_location_only() -> None:
         raw=moved_raw,
         normalized=moved_normalized,
         prior_unit_revision=first.source_unit_revisions[0],
-        prior_observation_revisions={
-            first.observations[0].id: first.observation_revisions[0],
-        },
+        prior_observation_revisions={revision.observation_id: revision for revision in first.observation_revisions},
     )
 
     assert first.source_units[0].provider_key == "123"
@@ -393,9 +402,7 @@ def test_confluence_title_change_is_semantic_not_location() -> None:
         raw=renamed_raw,
         normalized=renamed_normalized,
         prior_unit_revision=first.source_unit_revisions[0],
-        prior_observation_revisions={
-            first.observations[0].id: first.observation_revisions[0],
-        },
+        prior_observation_revisions={revision.observation_id: revision for revision in first.observation_revisions},
     )
 
     assert changed.deltas[0].axes == frozenset({DeltaAxis.SEMANTIC})
@@ -431,10 +438,10 @@ def test_confluence_operational_display_header_does_not_trigger_extraction() -> 
         raw=raw,
         normalized=later_normalized,
         prior_unit_revision=first.source_unit_revisions[0],
-        prior_observation_revisions={first.observations[0].id: first.observation_revisions[0]},
+        prior_observation_revisions={revision.observation_id: revision for revision in first.observation_revisions},
     )
 
-    assert later.observation_revisions[0].content == "# Title\n\nKeep A7."
+    assert _provider_revisions(later)[0].content == "# Title\n\nKeep A7."
     assert later.deltas[0].axes == frozenset()
     assert later.deltas[0].requires_extraction is False
 
@@ -460,7 +467,7 @@ def test_access_change_revises_unit_without_semantic_extraction() -> None:
         normalized=normalized,
         access_context={"access_policy": "workspace", "owner_user_id": "user-a"},
         prior_unit_revision=first.source_unit_revisions[0],
-        prior_observation_revisions={first.observations[0].id: first.observation_revisions[0]},
+        prior_observation_revisions={revision.observation_id: revision for revision in first.observation_revisions},
     )
 
     assert changed.source_unit_revisions[0].id != first.source_unit_revisions[0].id
@@ -492,6 +499,7 @@ def test_jira_numeric_issue_id_is_unit_and_comments_are_observations() -> None:
 
     assert projection.source_units[0].provider_key == "10012"
     assert [item.observation_type for item in projection.observations] == [
+        "unit_identity",
         "issue_core",
         "comment",
         "comment",
@@ -583,7 +591,7 @@ def test_partial_jira_projection_carries_unreturned_prior_observations() -> None
     )
 
     prior_comment = next(
-        revision for revision in first.observation_revisions if revision.observation_id != first.observations[0].id
+        revision for revision in _provider_revisions(first)[1:]
     )
     carried = next(
         revision
@@ -643,7 +651,7 @@ async def test_partial_jira_projection_reuses_immutable_carried_revision_in_stor
         await database.record_source_projection(partial)
 
         prior_comment = next(
-            revision for revision in first.observation_revisions if revision.observation_id != first.observations[0].id
+            revision for revision in _provider_revisions(first)[1:]
         )
         stored = await database.get_source_projection(partial.run_id)
         assert stored is not None
@@ -1097,7 +1105,8 @@ def test_document_and_append_sources_use_stable_provider_units(
     )
 
     assert projection.source_units[0].unit_type == expected_unit_type
-    assert projection.observations[0].observation_type == expected_observation_type
+    assert projection.observations[0].observation_type == "unit_identity"
+    assert projection.observations[1].observation_type == expected_observation_type
 
 
 @pytest.mark.parametrize("source_type", ["github_repo", "local_markdown"])
@@ -1151,15 +1160,15 @@ def test_file_move_with_provider_lineage_preserves_observation_identity(source_t
         raw=moved_raw,
         normalized=moved_normalized,
         prior_unit_revision=first.source_unit_revisions[0],
-        prior_observation_revisions={
-            first.observations[0].id: first.observation_revisions[0],
-        },
+        prior_observation_revisions={revision.observation_id: revision for revision in first.observation_revisions},
     )
 
     assert moved.source_units[0].id == first.source_units[0].id
-    assert moved.observations[0].id == first.observations[0].id
-    assert moved.deltas[0].axes == frozenset({DeltaAxis.LOCATION})
-    assert moved.deltas[0].requires_extraction is False
+    assert [item.id for item in moved.observations] == [item.id for item in first.observations]
+    # The content Observation keeps its revision; only the Unit Title, which names the path, changed.
+    assert _provider_revisions(moved) == _provider_revisions(first)
+    assert moved.deltas[0].axes == frozenset({DeltaAxis.LOCATION, DeltaAxis.SEMANTIC})
+    assert [anchor.observation_id for anchor in moved.deltas[0].changed_anchors] == [moved.observations[0].id]
 
 
 def test_attested_github_compare_previous_filename_preserves_unit_without_daemon_lineage() -> None:
@@ -1202,11 +1211,12 @@ def test_attested_github_compare_previous_filename_preserves_unit_without_daemon
         raw=moved_raw,
         normalized=moved_normalized,
         prior_unit_revision=first.source_unit_revisions[0],
-        prior_observation_revisions={first.observations[0].id: first.observation_revisions[0]},
+        prior_observation_revisions={revision.observation_id: revision for revision in first.observation_revisions},
     )
 
     assert moved.source_units[0].id == first.source_units[0].id
-    assert moved.deltas[0].axes == frozenset({DeltaAxis.LOCATION})
+    assert moved.deltas[0].axes == frozenset({DeltaAxis.LOCATION, DeltaAxis.SEMANTIC})
+    assert [anchor.observation_id for anchor in moved.deltas[0].changed_anchors] == [moved.observations[0].id]
 
     ordinary_item = _item(
         item_id="file-new",
@@ -1234,7 +1244,7 @@ def test_attested_github_compare_previous_filename_preserves_unit_without_daemon
             "source_unit_provider_key": moved.source_units[0].provider_key,
         },
         prior_unit_revision=moved.source_unit_revisions[0],
-        prior_observation_revisions={moved.observations[0].id: moved.observation_revisions[0]},
+        prior_observation_revisions={revision.observation_id: revision for revision in moved.observation_revisions},
     )
 
     assert ordinary.source_units[0].id == first.source_units[0].id
@@ -1294,7 +1304,7 @@ def test_teams_window_is_unit_and_native_messages_are_observations() -> None:
     assert projection.source_units[0].provider_key == "window-1"
     assert projection.source_units[0].locator["observed_from"] == "2026-07-14T10:00:00+00:00"
     assert projection.source_units[0].locator["observed_to"] == "2026-07-14T10:01:00+00:00"
-    assert [item.provider_key for item in projection.observations] == ["msg-1", "msg-2"]
+    assert [item.provider_key for item in projection.observations] == ["$unit_identity", "msg-1", "msg-2"]
     assert projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION
 
 
@@ -1439,9 +1449,7 @@ def test_teams_rolling_retention_tombstone_requires_same_attempt_scope_attestati
         "normalized": normalized,
         "scope": {"configured_scope": configured_scope},
         "prior_unit_revision": first.source_unit_revisions[0],
-        "prior_observation_revisions": {
-            first.observations[0].id: first.observation_revisions[0],
-        },
+        "prior_observation_revisions": {revision.observation_id: revision for revision in first.observation_revisions},
     }
     with pytest.raises(ValueError, match="run-scoped coverage evidence"):
         project_source_item(**kwargs)
@@ -1465,7 +1473,7 @@ def test_teams_rolling_retention_tombstone_requires_same_attempt_scope_attestati
         },
     )
     tombstone = project_source_item(**kwargs, scope_attestations=(attestation,))
-    assert tombstone.deltas[0].removed_observation_ids == (first.observations[0].id,)
+    assert set(tombstone.deltas[0].removed_observation_ids) == {item.id for item in first.observations}
     assert tombstone.source_units[0].locator["observed_to"] == "2024-01-01T00:00:00+00:00"
     assert tombstone.source_units[0].locator["tombstone_reason"] == "outside_rolling_retention"
 
@@ -1867,7 +1875,7 @@ def test_projected_revision_carries_the_adapter_declared_profile() -> None:
         normalized=normalized,
     )
 
-    profile = projection.observation_revisions[0].evidence_profile
+    profile = _provider_revisions(projection)[0].evidence_profile
     assert profile is not None
     assert profile.name == "markdown-structural"
     assert profile.version == 1

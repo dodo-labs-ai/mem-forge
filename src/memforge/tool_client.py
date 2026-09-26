@@ -731,6 +731,25 @@ class ToolClient:
             body,
         )
 
+    def reprocess_source_documents(
+        self,
+        *,
+        source_id: str,
+        document_ids: list[str],
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Reprocess stored Documents at their current revisions, or preview it."""
+        source_id = source_id.strip()
+        if not source_id:
+            return {"error": "source_id is required"}
+        if not document_ids:
+            return {"error": "at least one document id is required"}
+        return self._resource_json(
+            "POST",
+            f"/sources/{quote(source_id, safe='')}/reprocess",
+            {"document_ids": document_ids, "dry_run": dry_run},
+        )
+
     def update_source_schedule(
         self,
         *,

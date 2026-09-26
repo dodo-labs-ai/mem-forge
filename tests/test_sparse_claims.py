@@ -27,7 +27,7 @@ async def test_eight_by_183_uses_one_catalog_and_eight_empty_rows():
     client = SparseClient()
     olds = [replace(memory(), id=f"old-{i}", content=f"existing claim {i}") for i in range(183)]
     result = await assess_claim_pairs(candidates=[replace(candidate(), content=f"new claim {i}") for i in range(8)],
-        incumbents=olds, support_audits=[SupportAuditEntry(m.id, True) for m in olds], client=client, model="fixture")
+        incumbents=olds, client=client, model="fixture")
     assert client.calls == 1 and result.decisions == ()
     payload = catalog_payload(client.prompts[0])
     assert len(payload["existing_claims"]) == 183
@@ -42,22 +42,19 @@ async def test_eight_by_183_uses_one_catalog_and_eight_empty_rows():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status,expected", [("entailed", [ReconcileAction.ADD, ReconcileAction.NOOP]),
-                                            ("insufficient", [ReconcileAction.NOOP])])
-async def test_empty_relationships_and_insufficient_evidence_are_distinct(status, expected):
-    client = SparseClient(dict(results=[dict(candidate_id="NEW-0001", evidence_status=status,
-        relations=[], uncertain_existing_ids=[])]))
+async def test_empty_relationships_propose_no_action():
+    client = SparseClient(dict(results=[dict(candidate_id="NEW-0001", relations=[], uncertain_existing_ids=[])]))
     result = await reconcile_memories(new_extractions=[candidate()], existing_memories=[memory()],
         doc_type="policy", structured_llm_client=client, support_audits=[SupportAuditEntry("memory", True)], include_metadata=True)
     assert result.failure is None
-    assert [op.action for op in result.operations] == expected
+    assert [op.action for op in result.operations] == [ReconcileAction.ADD, ReconcileAction.NOOP]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("row", [
-    dict(candidate_id="NEW-0010", evidence_status="entailed", relations=[], uncertain_existing_ids=[]),
-    dict(candidate_id="NEW-0001", evidence_status="entailed", relations=[], uncertain_existing_ids=["MEM-0010"]),
-    dict(candidate_id="NEW-0001", evidence_status="entailed", relations=[dict(existing_id="MEM-0001", relation="equivalent")], uncertain_existing_ids=["MEM-0001"]),
+    dict(candidate_id="NEW-0010", relations=[], uncertain_existing_ids=[]),
+    dict(candidate_id="NEW-0001", relations=[], uncertain_existing_ids=["MEM-0010"]),
+    dict(candidate_id="NEW-0001", relations=[dict(existing_id="MEM-0001", relation="equivalent")], uncertain_existing_ids=["MEM-0001"]),
 ])
 async def test_invalid_references_and_duplicates_never_apply(row):
     client = SparseClient(dict(results=[row]))
@@ -76,7 +73,7 @@ async def test_omission_does_not_skip_unsupported_incumbent_audit():
 
 @pytest.mark.asyncio
 async def test_explicit_uncertainty_preserves_incumbent_and_consumes_candidate():
-    client = SparseClient(dict(results=[dict(candidate_id="NEW-0001", evidence_status="entailed", relations=[], uncertain_existing_ids=["MEM-0001"])]))
+    client = SparseClient(dict(results=[dict(candidate_id="NEW-0001", relations=[], uncertain_existing_ids=["MEM-0001"])]))
     result = await reconcile_memories(new_extractions=[candidate()], existing_memories=[memory()],
         doc_type="policy", structured_llm_client=client, support_audits=[SupportAuditEntry("memory", False)], include_metadata=True)
     assert result.failure is None
@@ -109,8 +106,8 @@ async def test_competing_replacements_expose_the_accepted_omission_tradeoff(omit
     edges = [dict(existing_id="MEM-0001", relation="contradicts", contradiction=dict(
         same_subject_and_scope=True, incompatible_assertions="ten/fifteen minutes versus five minutes"))]
     client = SparseClient(dict(results=[
-        dict(candidate_id="NEW-0001", evidence_status="entailed", relations=edges, uncertain_existing_ids=[]),
-        dict(candidate_id="NEW-0002", evidence_status="entailed", relations=[] if omit_second else edges, uncertain_existing_ids=[]),
+        dict(candidate_id="NEW-0001", relations=edges, uncertain_existing_ids=[]),
+        dict(candidate_id="NEW-0002", relations=[] if omit_second else edges, uncertain_existing_ids=[]),
     ]))
     result = await reconcile_memories(new_extractions=[candidate(), candidate()], existing_memories=[memory()],
         doc_type="policy", structured_llm_client=client, support_audits=[SupportAuditEntry("memory", True)], include_metadata=True)
@@ -124,15 +121,16 @@ async def test_competing_replacements_expose_the_accepted_omission_tradeoff(omit
 
 
 @pytest.mark.asyncio
-async def test_candidate_block_from_one_capacity_partition_applies_to_all_its_edges():
+async def test_uncertainty_in_one_capacity_partition_applies_to_all_its_edges():
     class Partitioned(SparseClient):
         def request_fits(self, prompt, **kwargs):
             return len(catalog_payload(prompt)["existing_claims"]) == 1
         async def assess_claim_revisions(self, prompt, **kwargs):
             ref = catalog_payload(prompt)["existing_claims"][0]["id"]
+            second = ref == "MEM-0002"
             return ClaimRevisionWireResponse.model_validate(dict(results=[dict(candidate_id="NEW-0001",
-                evidence_status="insufficient" if ref == "MEM-0002" else "entailed",
-                relations=[] if ref == "MEM-0002" else [dict(existing_id=ref, relation="equivalent")], uncertain_existing_ids=[])]))
+                relations=[] if second else [dict(existing_id=ref, relation="equivalent")],
+                uncertain_existing_ids=[ref] if second else [])]))
     olds = [memory(), replace(memory(), id="second")]
     result = await reconcile_memories(new_extractions=[candidate()], existing_memories=olds,
         doc_type="policy", structured_llm_client=Partitioned(), support_audits=[SupportAuditEntry(m.id, True) for m in olds], include_metadata=True)

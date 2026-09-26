@@ -7,6 +7,7 @@ number of item and part words a renderer writes into the prompt.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from types import SimpleNamespace
 from pydantic import BaseModel
 
 from memforge.llm.request_budget import RequestBudget
+from memforge.llm.structured import CandidateAdmissionResponse
 from memforge.models import MemoryExtractionResult
 
 # Large enough that the context window never binds before the input limit.
@@ -72,6 +74,44 @@ class FixtureBudgetClient:
             self._in_flight -= 1
 
 
+def admission_payload(prompt: str) -> dict:
+    """The request payload of one candidate admission prompt."""
+
+    return json.loads(prompt.split("<admission>\n", 1)[1].split("\n</admission>", 1)[0])
+
+
+def admit_every_candidate(prompt: str) -> CandidateAdmissionResponse:
+    """Admit every requested Candidate with no duplicates."""
+
+    return CandidateAdmissionResponse.model_validate({"decisions": [
+        {"candidate_id": candidate["id"], "verdict": "ADMITTED"} for candidate in admission_payload(prompt)["candidates"]
+    ]})
+
+
+class AdmittingClient:
+    """Structured client stand-in with unbounded capacity that admits every Candidate."""
+
+    input_policy_identity = "fixture-input-policy"
+
+    def __init__(self) -> None:
+        self.admission_prompts: list[str] = []
+
+    def request_budget(self, model: str | None = None) -> RequestBudget:
+        return fixture_budget(
+            input_tokens=FIXTURE_CONTEXT_WINDOW, output_tokens=FIXTURE_EXTRACTION_OUTPUT_TOKENS, correction_reserve=0,
+        )
+
+    def request_fits(self, *args, **kwargs) -> bool:
+        return True
+
+    def input_policy_identity_for(self, model: str | None = None) -> str:
+        return f"{self.input_policy_identity}:{model}"
+
+    async def admit_candidates(self, prompt: str, **kwargs) -> CandidateAdmissionResponse:
+        self.admission_prompts.append(prompt)
+        return admit_every_candidate(prompt)
+
+
 class NoopMemoryExtractor:
     """Fragment extractor stand-in with unbounded capacity and no candidates."""
 
@@ -94,3 +134,20 @@ class NoopMemoryExtractor:
     async def extract_projection_fragment_memories(self, catalog, **kwargs):
         del catalog, kwargs
         return MemoryExtractionResult(memories=[])
+
+
+def fixture_request_planner(projection, *, access_context_hash: str, extractor=None, doc_type: str = "document"):
+    """The production extraction request planner for one projection, with unbounded fixture capacity."""
+    from memforge.pipeline.extraction_requests import plan_extraction_requests
+    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+
+    async def plan(authority):
+        return plan_extraction_requests(
+            RevisionAssessmentContext(projection=projection, base=None, access_context_hash=access_context_hash),
+            authority,
+            extractor=extractor or NoopMemoryExtractor(),
+            source_type=projection.source_type,
+            doc_type=doc_type,
+        )
+
+    return plan

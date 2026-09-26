@@ -32,6 +32,7 @@ from memforge.source_projection import (
 from memforge.source_representation import (
     MARKDOWN_STRUCTURAL_PROFILE,
     PLAIN_TEXT_PROFILE,
+    UNIT_TITLE_PROFILE,
     CanonicalRecordField,
     CanonicalRecordSchema,
     EvidenceRepresentationContract,
@@ -44,6 +45,7 @@ COMPILER_CONTRACT_VERSION = 4
 DEFAULT_MAX_FRAGMENTS = 2_048
 DEFAULT_MAX_PRESENTATION_CHARS = 120_000
 _SUPPORTING_ROLES = frozenset({EvidenceRole.PRIMARY, EvidenceRole.REQUIRED})
+UNIT_TITLE_FRAGMENT_TYPE = UNIT_TITLE_PROFILE.name
 
 
 def _record_html_inline_source_range(state, silent: bool) -> bool:
@@ -99,48 +101,10 @@ class CanonicalFieldRange:
     string_boundaries: tuple[int, ...] | None = None
 
 
-def plan_revision_structural_units(
-    revision: SourceObservationRevision,
-    *,
-    max_content_chars: int,
-) -> tuple[StructuralUnit, ...]:
-    """Group complete structures using a soft character target.
-
-    A larger structure occupies its own group. Only the actual model request
-    budget can determine whether it fits; grouping never clips or rejects it.
-    """
-
-    if max_content_chars < 1:
-        raise ValueError("structural planning budget must be positive")
-    protected = tuple(
-        (unit.start, unit.end) for unit in revision_structural_ranges(revision)
-    )
-    packed: list[StructuralUnit] = []
-    current_start: int | None = None
-    current_end: int | None = None
-    for start, end in protected:
-        if current_start is None:
-            current_start, current_end = start, end
-            continue
-        assert current_end is not None
-        if end - current_start <= max_content_chars:
-            current_end = end
-            continue
-        packed.append(StructuralUnit(current_start, current_end))
-        current_start, current_end = start, end
-    if current_start is not None and current_end is not None:
-        packed.append(StructuralUnit(current_start, current_end))
-    return tuple(packed)
-
-
 def revision_structural_ranges(
     revision: SourceObservationRevision,
 ) -> tuple[StructuralUnit, ...]:
-    """Return the smallest representation-owned ranges safe for authority.
-
-    Presentation packing may combine adjacent units later, but it must never
-    use that packing decision to widen Primary authority.
-    """
+    """Return the smallest representation-owned ranges safe for authority."""
 
     profile = revision.evidence_profile
     if (
@@ -683,6 +647,40 @@ def _compile_canonical_record_profile(
     )
 
 
+def _compile_unit_title_profile(
+    revision: SourceObservationRevision,
+    contract: EvidenceRepresentationContract,
+    authority_ranges: tuple[EvidenceCandidateRange, ...],
+) -> tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]]:
+    """The Unit Title is one Fragment that is never Primary, whatever the work authorizes."""
+
+    del contract
+    start, end = _trim_range(revision.content, 0, len(revision.content))
+    if start >= end:
+        return (), ()
+    bound, errors = _bind_candidates_to_authority(
+        revision,
+        (
+            _text_candidate(
+                revision.content,
+                UNIT_TITLE_FRAGMENT_TYPE,
+                start,
+                end,
+                _SUPPORTING_ROLES,
+                revision.content[start:end],
+            ),
+        ),
+        authority_ranges,
+    )
+    return (
+        tuple(
+            replace(candidate, eligible_roles=candidate.eligible_roles - {EvidenceRole.PRIMARY})
+            for candidate in bound
+        ),
+        errors,
+    )
+
+
 _ProfileCompiler = Callable[
     [SourceObservationRevision, EvidenceRepresentationContract, tuple[EvidenceCandidateRange, ...]],
     tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]],
@@ -693,6 +691,7 @@ _PROFILE_COMPILERS: Mapping[tuple[str, int], _ProfileCompiler] = {
     ("canonical-record", 1): _compile_canonical_record_profile,
     ("plain-text", 1): _compile_plain_text_profile,
     ("binary-artifact", 1): _compile_binary_artifact_profile,
+    (UNIT_TITLE_PROFILE.name, UNIT_TITLE_PROFILE.version): _compile_unit_title_profile,
 }
 
 

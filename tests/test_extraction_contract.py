@@ -25,11 +25,15 @@ from memforge.source_derivation import (
     SourceUnitDeriver,
     source_derivation_manifest,
 )
+from memforge.pipeline.extraction_requests import plan_extraction_requests
 from memforge.pipeline.projection_context import (
     PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION,
+    ExtractionAuthority,
     plan_projection_evidence_work,
 )
+from memforge.pipeline.revision_assessment import REVISION_INPUT_POLICY, RevisionAssessmentContext
 from memforge.storage.database import Database
+from tests.llm_fixture import NoopMemoryExtractor
 
 
 @pytest.fixture
@@ -41,6 +45,17 @@ async def db(tmp_path) -> Database:
     finally:
         await database.close()
 
+
+
+def _planned_requests(projection, authority):
+    assert isinstance(authority, ExtractionAuthority)
+    return plan_extraction_requests(
+        RevisionAssessmentContext(projection=projection, base=None, access_context_hash="workspace"),
+        authority,
+        extractor=NoopMemoryExtractor(),
+        source_type=projection.source_type,
+        doc_type="document",
+    )
 
 def test_extraction_contract_version_is_pinned_into_derivation_identity() -> None:
     # Stored derivations and batch ids hash this value; changing it supersedes
@@ -123,11 +138,10 @@ def test_v9_derivation_identity_binds_access_and_inference_capability() -> None:
         user_id=None,
         source_activity_epoch=1,
     )
-    batches = plan_projection_evidence_work(
+    batches = _planned_requests(
         projection,
-        reprocess_all_current_observations=False,
+        plan_projection_evidence_work(projection, reprocess_all_current_observations=False),
     )
-    assert isinstance(batches, tuple)
 
     first = source_derivation_manifest(
         projection,
@@ -147,11 +161,10 @@ def test_v9_derivation_identity_binds_access_and_inference_capability() -> None:
         changed.batches[0].input_payload_hash
     )
 
-    reprocess_batches = plan_projection_evidence_work(
+    reprocess_batches = _planned_requests(
         projection,
-        reprocess_all_current_observations=True,
+        plan_projection_evidence_work(projection, reprocess_all_current_observations=True),
     )
-    assert isinstance(reprocess_batches, tuple)
     first_operation = source_derivation_manifest(
         projection,
         reprocess_batches,
@@ -227,6 +240,11 @@ async def test_v9_reprocess_without_operation_identity_fails_before_llm(
     )
     extractor_called = False
 
+    async def plan(_authority):
+        nonlocal extractor_called
+        extractor_called = True
+        return ()
+
     async def extract(_batch):
         nonlocal extractor_called
         extractor_called = True
@@ -249,7 +267,8 @@ async def test_v9_reprocess_without_operation_identity_fails_before_llm(
                 source_activity_epoch=1,
                 reprocess_all_current_observations=True,
             ),
-            extract_batch=extract,
+            plan_requests=plan,
+            extract_request=extract,
             max_concurrent=1,
             access_context_hash="access-reprocess",
             inference_capability_hash="inference-reprocess",
@@ -340,6 +359,11 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
     )
     extractor_called = False
 
+    async def plan(_authority):
+        nonlocal extractor_called
+        extractor_called = True
+        return ()
+
     async def extract(_batch):
         nonlocal extractor_called
         extractor_called = True
@@ -361,7 +385,8 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
             source_activity_epoch=1,
             current_changed_ranges=((0, 7),),
         ),
-        extract_batch=extract,
+        plan_requests=plan,
+        extract_request=extract,
         max_concurrent=1,
         access_context_hash="access-unmappable-authority",
         inference_capability_hash="inference-unmappable-authority",
@@ -402,7 +427,7 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
         == "INCREMENTAL_BASE_UNAVAILABLE"
     )
     assert result.derivation.authority_plan_identity == {
-            "semantic_input_policy": "revision-input-v6",
+        "semantic_input_policy": REVISION_INPUT_POLICY,
         "access_context_hash": "access-unmappable-authority",
         "authority_policy_version": PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION,
         "base_unit_revision_id": initial.source_unit_revisions[0].id,
@@ -411,12 +436,14 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
         "representation_profiles": [
             {
                 "coordinate_space": "unicode-scalar",
-                "name": "markdown-structural",
-                "observation_id": target.observations[0].id,
+                "name": revision.evidence_profile.name,
+                "observation_id": revision.observation_id,
                 "schema_name": None,
                 "schema_version": None,
                 "version": 1,
             }
+            # The Unit Title and the file content.
+            for revision in sorted(target.observation_revisions, key=lambda item: (item.observation_id, item.id))
         ],
         "reprocess_operation_id": None,
         "source_activity_epoch": 1,

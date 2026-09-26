@@ -2264,6 +2264,32 @@ def sources_schedule_show(ctx, source_id: str, workspace_id: str | None):
     _emit_tool_payload(ctx, payload)
 
 
+@sources.command("reprocess")
+@click.argument("source_id")
+@click.option(
+    "--document",
+    "document_ids",
+    multiple=True,
+    required=True,
+    help="Document to reprocess at its current revision (repeatable).",
+)
+@click.option("--dry-run", is_flag=True, help="Report what would be read and the model calls, without writing.")
+@_workspace_id_option
+@click.pass_context
+def sources_reprocess(ctx, source_id: str, document_ids: tuple[str, ...], dry_run: bool, workspace_id: str | None):
+    """Reprocess stored Documents of one source at their current revisions.
+
+    Reads stored content only, with the current adapter and compiler: every
+    ReadingGroup is extracted and every Support is read over the whole Unit.
+    """
+    payload = _tool_client(ctx, workspace_id).reprocess_source_documents(
+        source_id=source_id,
+        document_ids=list(document_ids),
+        dry_run=dry_run,
+    )
+    _emit_tool_payload(ctx, payload)
+
+
 # ---------------------------------------------------------------------------
 # memories group
 # ---------------------------------------------------------------------------

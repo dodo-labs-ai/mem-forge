@@ -147,11 +147,13 @@ from memforge.runtime import (
     DefaultRuntimeProvider,
     RuntimeHealthComponent,
     RuntimeProvider,
+    SourceSyncBoundaryError,
     SourceSyncWorker,
     SourceSyncUnsupportedError,
     SyncService,
     SourcePausedError,
 )
+from memforge.pipeline.stored_document import reprocess_preview
 from memforge.scheduler import SyncScheduler
 from memforge.source_secrets import (
     decrypt_source_config_for_runtime,
@@ -1548,6 +1550,11 @@ class SourceSyncRequest(BaseModel):
     local_agent_job_id: str | None = None
     local_agent_attempt_count: int | None = Field(default=None, ge=1)
     retry_target: SourceSyncRetryTarget | None = None
+
+
+class SourceReprocessRequest(BaseModel):
+    document_ids: list[str] = Field(min_length=1)
+    dry_run: bool = False
 
 
 class LocalAgentJobCreateRequest(BaseModel):
@@ -7113,6 +7120,58 @@ def create_admin_app(
             "status": run.status,
             "created_at": run.created_at.isoformat(),
             "coalesced": run.coalesced,
+        }
+
+    @source_router.post("/{source_id}/reprocess", status_code=202)
+    async def reprocess_source_documents(
+        request: Request,
+        source_id: str,
+        req: SourceReprocessRequest,
+        response: Response,
+        db: Database = Depends(get_db),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
+        sync_service: SyncService = Depends(get_sync_service),
+    ):
+        """Reprocess stored Documents at their current Source Unit revisions.
+
+        The run reads stored content only, so it needs neither the provider nor
+        a local daemon. ``dry_run`` reports what the run would read and an
+        estimate of its model calls without writing anything.
+        """
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
+        _require_source_management(request, source)
+        _require_source_sync_support(source)
+        document_ids = tuple(dict.fromkeys(document_id.strip() for document_id in req.document_ids if document_id.strip()))
+        if not document_ids:
+            raise HTTPException(status_code=400, detail="document_ids_required")
+        if await db.get_open_projection_scope_transition(source_id) is not None:
+            raise HTTPException(status_code=409, detail="projection_scope_transition_open")
+        if req.dry_run:
+            response.status_code = 200
+            return asdict(await reprocess_preview(
+                db, artifact_store, source_id=source_id, document_ids=document_ids,
+            ))
+        try:
+            run = await sync_service.enqueue_reprocess(source_id, document_ids)
+        except SourcePausedError:
+            raise _source_paused_http_error()
+        except (
+            SourceActivityConflict,
+            SourceSyncBoundaryError,
+            ValueError,
+        ) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "ok": True,
+            "message": "Reprocess enqueued",
+            "source_id": source_id,
+            "run_id": run.run_id,
+            "status": run.status,
+            "created_at": run.created_at.isoformat(),
+            "document_ids": list(run.reprocess_document_ids),
         }
 
     @source_router.get("/{source_id}/schedule", response_model=SourceSyncScheduleResponse)

@@ -112,7 +112,7 @@ from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.source_sync_manifest import SourceSyncManifestStore
 from memforge.scheduler import SOURCE_SCHEDULE_SCAN_JOB_ID, SyncScheduler
-from tests.llm_fixture import NoopMemoryExtractor
+from tests.llm_fixture import AdmittingClient, NoopMemoryExtractor, fixture_request_planner
 from tests.unit_support_fixture import active_support_evidence
 
 
@@ -2862,6 +2862,10 @@ class NoopMemoryEngine:
                         reprocess_operation_id=kwargs.get(
                             "derivation_reprocess_operation_id"
                         ),
+                        support_without_baseline=kwargs.get(
+                            "derivation_support_without_baseline",
+                            False,
+                        ),
                     )
                 )
                 if kwargs.get("derivation_id") is not None
@@ -3439,7 +3443,7 @@ class ProjectionFragmentCandidateExtractor(ProjectionFragmentRecordingExtractor)
 class ProjectionFragmentArtifactSummaryExtractor(ProjectionFragmentRecordingExtractor):
     async def extract_projection_fragment_memories(self, catalog, **kwargs):
         self.fragment_calls.append(catalog)
-        images = kwargs.get("images", ())
+        images = kwargs["revision_context"].images_for(catalog)
         return MemoryExtractionResult(
             memories=[],
             artifact_summaries=tuple(
@@ -4453,6 +4457,7 @@ async def _insert_document_with_metadata(
     projection_source_type: str | None = None,
     configured_source_type: str | None = None,
     source_url: str | None = None,
+    space_or_project: str = "ARCH",
 ) -> None:
     source_url = source_url or f"http://example/{doc_id}"
     await db.upsert_source(
@@ -4474,7 +4479,7 @@ async def _insert_document_with_metadata(
             source_id,
             source_url,
             title,
-            "ARCH",
+            space_or_project,
             now.isoformat(),
             version,
             content_hash(markdown),
@@ -4493,7 +4498,7 @@ async def _insert_document_with_metadata(
         source_url=source_url,
         last_modified=now,
         content_type="application/json" if projection_source_type == "jira" else "text/markdown",
-        space_or_project="ARCH",
+        space_or_project=space_or_project,
         version=version,
         extra=item_extra,
     )
@@ -4605,29 +4610,18 @@ async def _stage_completed_v9_recovery_attempt(
     async def extract(_batch):
         return MemoryExtractionResult(memories=[])
 
-    from memforge.pipeline.extraction_requests import plan_fragment_requests
-    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-    from memforge.pipeline.projection_fragments import compile_projection_fragment_catalog
     access_hash = lifecycle_access_context_hash(visibility="workspace", owner_user_id=None, project_key=None, repo_identifier=None)
-    assessment = RevisionAssessmentContext(projection=projection, base=None, access_context_hash=access_hash)
     capability = revision_inference_capability_hash(client, extraction_model="fixture", extraction_max_tokens=8192)
-    recovery_extractor = ProjectionFragmentRecordingExtractor()
-    async def prepare_batches(batches):
-        prepared = []
-        for batch in batches:
-            catalog = compile_projection_fragment_catalog(projection, batch, access_context_hash=access_hash,
-                inference_capability_hash=capability, max_fragments=len(assessment.full_fragments),
-                max_presentation_chars=sum(len(f.presentation_text) for f in assessment.full_fragments))
-            prepared.extend(plan_fragment_requests(batch, catalog, context=assessment,
-                extractor=recovery_extractor, source_type="github_repo", doc_type="document"))
-        return tuple(prepared)
+    plan_requests = fixture_request_planner(
+        projection, access_context_hash=access_hash, extractor=ProjectionFragmentRecordingExtractor(),
+    )
 
     staged = await SourceUnitDeriver(db).derive(
         SourceUnitDerivationRequest(
             projection=projection,
             context=context,
-            extract_batch=extract,
-            prepare_batches=prepare_batches,
+            plan_requests=plan_requests,
+            extract_request=extract,
             max_concurrent=1,
             access_context_hash=lifecycle_access_context_hash(
                 visibility="workspace",
@@ -5154,23 +5148,28 @@ async def test_recovered_external_blocker_does_not_stop_provider_discovery(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("changed_policy", ["model_presentation", "revision_input"])
 async def test_derivation_recovery_commits_the_current_policy_identity(
     db: Database,
     monkeypatch: pytest.MonkeyPatch,
+    changed_policy: str,
 ) -> None:
     source_id = "src-v9-policy-replacement"
-    attempt = await _stage_completed_v9_recovery_attempt(
-        db,
-        source_id=source_id,
-    )
-    monkeypatch.setattr(
-        source_derivation_module,
-        "PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION",
-        (
-            source_derivation_module.PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION
-            + 1
-        ),
-    )
+    if changed_policy == "revision_input":
+        # Work staged before an upgrade that changed the reading scope is replaced, not resumed.
+        with monkeypatch.context() as staged:
+            staged.setattr(source_derivation_module, "REVISION_INPUT_POLICY", "revision-input-v6")
+            attempt = await _stage_completed_v9_recovery_attempt(db, source_id=source_id)
+    else:
+        attempt = await _stage_completed_v9_recovery_attempt(db, source_id=source_id)
+        monkeypatch.setattr(
+            source_derivation_module,
+            "PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION",
+            (
+                source_derivation_module.PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION
+                + 1
+            ),
+        )
     extractor = ProjectionFragmentRecordingExtractor()
     recovery_engine = RecordingMemoryEngine()
     recovery = GeneSyncOrchestrator(
@@ -6115,10 +6114,11 @@ async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_
 
 
 @pytest.mark.asyncio
-async def test_targeted_recovery_skips_unchanged_documents_outside_finding_scope(
+async def test_force_resync_extracts_a_unit_whose_location_alone_changed(
     db: Database,
 ) -> None:
-    source_id = "src-targeted-recovery"
+    """Semantic work plans against the committed base, not a projection recorded ahead of it."""
+    source_id = "src-location-only-reprocess"
     markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
     doc_store = StubDocumentStore()
     normalized_content_uri = doc_store.store_normalized(
@@ -6136,7 +6136,11 @@ async def test_targeted_recovery_skips_unchanged_documents_outside_finding_scope
         version="2",
         normalized_content_uri=normalized_content_uri,
         projection_source_type="docs",
+        source_url="https://docs.example/old-location",
     )
+    unit = await db.find_source_unit_by_document_id(source_id, "doc-1", current_only=True)
+    assert unit is not None
+    committed = await db.get_current_source_unit_revision(unit.id)
     extractor = ProjectionFragmentRecordingExtractor()
     memory_engine = RecordingMemoryEngine()
     orchestrator = GeneSyncOrchestrator(
@@ -6153,65 +6157,17 @@ async def test_targeted_recovery_skips_unchanged_documents_outside_finding_scope
         source_name="Documents",
         source_id=source_id,
         force_full_sync=True,
-        reprocess_doc_ids=frozenset({"another-doc"}),
     )
 
     assert state.last_sync_status == "success"
-    assert state.docs_processed == 1
-    assert state.docs_updated == 0
-    assert extractor.fragment_calls == []
-    assert memory_engine.projected_lifecycle_calls == []
-
-
-@pytest.mark.asyncio
-async def test_targeted_reprocess_extracts_unchanged_current_projection(
-    db: Database,
-) -> None:
-    source_id = "src-targeted-current-projection"
-    markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
-    doc_store = StubDocumentStore()
-    normalized_content_uri = doc_store.store_normalized(
-        source_id=source_id,
-        doc_id="doc-1",
-        title="Design Doc",
-        markdown=markdown,
-    )
-    await _insert_document_with_metadata(
-        db,
-        source_id=source_id,
-        doc_id="doc-1",
-        title="Design Doc",
-        markdown=markdown,
-        version="2",
-        normalized_content_uri=normalized_content_uri,
-        projection_source_type="docs",
-        source_url="https://docs.example/doc-1",
-    )
-    extractor = ProjectionFragmentRecordingExtractor()
-    memory_engine = RecordingMemoryEngine()
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=doc_store,
-        memory_extractor=extractor,
-        memory_engine=memory_engine,
-        memory_store=None,
-        max_concurrent=1,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=UpdatingDocumentGene(markdown, version="2"),
-        source_name="Documents",
-        source_id=source_id,
-        force_full_sync=True,
-        reprocess_doc_ids=frozenset({"doc-1"}),
-    )
-
-    assert state.last_sync_status == "success"
-    assert state.docs_processed == 1
     assert state.docs_updated == 1
     [catalog] = extractor.fragment_calls
     assert any(fragment.primary_eligible for fragment in catalog.fragments)
-    assert len(memory_engine.projected_lifecycle_calls) == 1
+    [lifecycle] = memory_engine.projected_lifecycle_calls
+    delta = lifecycle["projection"].deltas[0]
+    assert delta.previous_unit_revision_id == committed.id
+    assert delta.current_unit_revision_id != committed.id
+    assert (await db.get_current_source_unit_revision(unit.id)).id == delta.current_unit_revision_id
 
 
 @pytest.mark.asyncio
@@ -9991,6 +9947,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
             ),
             db=db,
             memory_store=memory_store,
+            structured_llm_client=AdmittingClient(),
         ),
         memory_store=memory_store,
         max_concurrent=1,
@@ -10893,7 +10850,6 @@ async def test_external_blocker_does_not_consume_commit_attempt_budget(
         source_name="Jira",
         source_id=source_id,
         force_full_sync=True,
-        reprocess_doc_ids=frozenset(item_ids),
     )
 
     assert state.last_sync_status == "partial"
@@ -11236,6 +11192,8 @@ async def test_unchanged_document_backfills_pdf_uri_without_llm_reprocessing(db:
         markdown=markdown,
         version="0",
         projection_source_type="confluence",
+        # The gene reports this space, which the Unit Title names.
+        space_or_project="PAY",
     )
     release = asyncio.Event()
     release.set()
@@ -11274,6 +11232,8 @@ async def test_missing_pdf_uri_forces_full_sync_without_llm_reprocessing(db: Dat
         markdown=markdown,
         version="0",
         projection_source_type="confluence",
+        # The gene reports this space, which the Unit Title names.
+        space_or_project="PAY",
     )
     await db.upsert_sync_state(
         SyncState(
@@ -11320,6 +11280,8 @@ async def test_missing_required_confluence_pdf_fails_sync_without_hiding_gap(db:
         markdown=markdown,
         version="0",
         projection_source_type="confluence",
+        # The gene reports this space, which the Unit Title names.
+        space_or_project="PAY",
     )
     release = asyncio.Event()
     release.set()
@@ -11441,6 +11403,8 @@ async def test_confluence_pdf_storage_failure_is_not_reported_as_export_failure(
         markdown=markdown,
         version="0",
         projection_source_type="confluence",
+        # The gene reports this space, which the Unit Title names.
+        space_or_project="PAY",
     )
     release = asyncio.Event()
     release.set()
@@ -11479,6 +11443,8 @@ async def test_existing_confluence_pdf_uri_is_preserved_when_unchanged_export_is
         markdown=markdown,
         version="0",
         projection_source_type="confluence",
+        # The gene reports this space, which the Unit Title names.
+        space_or_project="PAY",
     )
     await db.db.execute(
         "UPDATE documents SET pdf_content_uri = ? WHERE doc_id = ?",
@@ -11525,6 +11491,8 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
         version="0",
         normalized_content_uri="file:///tmp/Architecture/existing.md",
         projection_source_type="confluence",
+        # The gene reports this space, which the Unit Title names.
+        space_or_project="PAY",
     )
     await db.db.execute(
         """UPDATE documents
