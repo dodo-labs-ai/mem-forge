@@ -395,6 +395,64 @@ def source_artifact_revision_from_metadata(
     return artifact
 
 
+# A Source Artifact is projected as one Observation of this type, keyed by its
+# provider key under this prefix; its metadata is written and read back here.
+SOURCE_ARTIFACT_OBSERVATION_TYPE = "binary_artifact"
+_SOURCE_ARTIFACT_PROVIDER_KEY_PREFIX = "artifact:"
+
+
+def source_artifact_observation_provider_key(artifact: StoredSourceArtifact) -> str:
+    return f"{_SOURCE_ARTIFACT_PROVIDER_KEY_PREFIX}{artifact.provider_key}"
+
+
+def source_artifact_observation_metadata(
+    artifact: StoredSourceArtifact, *, parent_observation_id: str,
+) -> dict[str, object]:
+    """The Observation metadata that pins one Artifact revision to its parent Observation."""
+
+    return {
+        "source_artifact": {
+            "artifact_id": artifact.id,
+            "provider_revision": artifact.provider_revision,
+            "filename": artifact.filename,
+            "media_type": artifact.media_type,
+            "size_bytes": artifact.size_bytes,
+            "sha256": artifact.sha256,
+            "uri": artifact.uri,
+            "inference_eligible": artifact.inference_eligible,
+            "inference_ineligible_reason": artifact.inference_ineligible_reason,
+            "parent_observation_id": parent_observation_id,
+        }
+    }
+
+
+def stored_source_artifact_from_observation(
+    *,
+    revision: SourceArtifactRevision,
+    observation_provider_key: str,
+    locator: Mapping[str, object],
+    parent_observation_type: str,
+    parent_provider_key: str,
+) -> StoredSourceArtifact:
+    """Rebuild the projection input of one Artifact from its committed Observation."""
+
+    return StoredSourceArtifact(
+        id=revision.artifact_id,
+        provider_key=observation_provider_key.removeprefix(_SOURCE_ARTIFACT_PROVIDER_KEY_PREFIX),
+        parent_observation_type=parent_observation_type,
+        parent_provider_key=parent_provider_key,
+        provider_revision=revision.provider_revision,
+        filename=revision.filename,
+        media_type=revision.media_type,
+        size_bytes=revision.size_bytes,
+        sha256=revision.sha256,
+        uri=revision.uri,
+        inference_eligible=revision.inference_eligible,
+        inference_ineligible_reason=revision.inference_ineligible_reason,
+        locator=dict(locator),
+    )
+
+
 def source_artifact_identity(
     *,
     source_id: str,

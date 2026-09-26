@@ -118,7 +118,7 @@ from memforge.models import (
 from memforge.pipeline.evidence_fragments import EvidenceFragment
 from memforge.pipeline.projection_evidence import build_projected_claim_evidence
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-from memforge.source_representation import UNIT_IDENTITY_OBSERVATION_TYPE
+from memforge.source_representation import UNIT_TITLE_OBSERVATION_TYPE
 from memforge import source_derivation as source_derivation_module
 from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_CONTRACT_VERSION
 from memforge.pipeline.projection_context import (
@@ -276,7 +276,7 @@ def _body_observation(projection):
     return next(
         observation
         for observation in projection.observations
-        if observation.observation_type != UNIT_IDENTITY_OBSERVATION_TYPE
+        if observation.observation_type != UNIT_TITLE_OBSERVATION_TYPE
     )
 
 
@@ -1558,11 +1558,11 @@ class _EquivalentMemoryStore(_OutboxDrainer):
 
 
 @pytest.mark.asyncio
-async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
+async def test_identical_admitted_candidates_merge_before_lifecycle_writes(
     db: Database,
 ) -> None:
     projection = _projection(
-        run_id="projection-candidate-ledger-1",
+        run_id="projection-identical-candidates",
         body="The payroll trigger remained OPEN and was not processed.",
     )
     observation_id = _body_observation(projection).id
@@ -1612,8 +1612,7 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
     assert stats["candidate_admission_rejected_count"] == 0
     assert stats["candidate_admission_llm_calls"] == 1
     [request] = [admission_payload(prompt) for prompt in client.admission_prompts]
-    assert [candidate["claim"] for candidate in request["candidates"]] == [canonical.content]
-    assert [row["claim"] for row in request["round_claims"]] == [canonical.content]
+    assert [candidate["claim"] for candidate in request["candidates"]] == [canonical.content, duplicate.content]
     assert [row["content"] for row in rows] == [canonical.content]
     assert events == []
 
@@ -1621,6 +1620,7 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
 @pytest.mark.asyncio
 async def test_projected_lifecycle_records_low_value_admission_without_content(
     db: Database,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     durable_content = "Enable the reduction toggle only after the compatibility suite passes."
     instance_content = "Test case 17 returned 204 rows in this run."
@@ -1658,7 +1658,7 @@ async def test_projected_lifecycle_records_low_value_admission_without_content(
         structured_llm_client=client,
     )
 
-    stats = await engine.prepare_and_commit_projected_lifecycle(
+    lifecycle_input = dict(
         projection=projection,
         doc_id="confluence-123",
         raw_memories=_selected(projection, [durable, instance_output]),
@@ -1671,6 +1671,18 @@ async def test_projected_lifecycle_records_low_value_admission_without_content(
         update_plan_stats=None,
         source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
     )
+    apply_lifecycle = db.apply_source_projection_lifecycle
+
+    async def fail_commit(*args, **kwargs):
+        raise RuntimeError("commit interrupted")
+
+    # A revision that does not commit records no rejection; its retry records each once.
+    monkeypatch.setattr(db, "apply_source_projection_lifecycle", fail_commit)
+    with pytest.raises(RuntimeError, match="commit interrupted"):
+        await engine.prepare_and_commit_projected_lifecycle(**lifecycle_input)
+    assert await db.list_memory_audit_events(event_type="candidate_admission_rejected") == []
+    monkeypatch.setattr(db, "apply_source_projection_lifecycle", apply_lifecycle)
+    stats = await engine.prepare_and_commit_projected_lifecycle(**lifecycle_input)
 
     memories = await db.list_memories()
     [event] = await db.list_memory_audit_events(event_type="candidate_admission_rejected")
@@ -2097,7 +2109,7 @@ async def _seed_incumbent_support(
     )
     # Index among the provider's Observations; the Unit Title precedes them.
     observation = [
-        item for item in projection.observations if item.observation_type != UNIT_IDENTITY_OBSERVATION_TYPE
+        item for item in projection.observations if item.observation_type != UNIT_TITLE_OBSERVATION_TYPE
     ][observation_index]
     revisions_by_observation = {item.observation_id: item for item in projection.observation_revisions}
     revision = revisions_by_observation[observation.id]
@@ -2674,6 +2686,83 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
     )
     assert events == [runtime_bundle.event]
     assert assessments == [runtime_bundle.assessment]
+
+
+@pytest.mark.asyncio
+async def test_the_commit_gate_requires_the_revisions_candidate_admission_work(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projection = _projection(run_id="projection-admission-gate", body="A7 is removed.")
+    document = await db.get_document("confluence-123")
+    assert document is not None
+    source_updated_at = datetime(2026, 7, 17, tzinfo=timezone.utc)
+    lifecycle_input = dict(
+        doc_type="document",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=_body_revision(projection).content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+    )
+    attempt = (
+        await db.stage_source_derivation(
+            source_derivation_manifest(
+                projection,
+                (),
+                context=SourceUnitDerivationContext(
+                    document=document,
+                    source_updated_at=source_updated_at.isoformat(),
+                    user_id=None,
+                    source_activity_epoch=None,
+                    **lifecycle_input,
+                ),
+            )
+        )
+    ).attempt
+    raw = RawMemory(
+        content="A7 is removed.",
+        memory_type="fact",
+        evidence_quote="A7 is removed.",
+        source_observation_id=_body_observation(projection).id,
+    )
+    gate_work_ids: list[tuple[str, ...]] = []
+    apply_lifecycle = db.apply_source_projection_lifecycle
+
+    async def record_gate(*args, **kwargs):
+        gate_work_ids.append(kwargs["required_derivation_work_ids"])
+        return await apply_lifecycle(*args, **kwargs)
+
+    monkeypatch.setattr(db, "apply_source_projection_lifecycle", record_gate)
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_AuditedOutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
+    )
+
+    await engine.prepare_and_commit_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=_selected(projection, [raw]),
+        source_updated_at=source_updated_at,
+        document=document,
+        derivation_id=attempt.id,
+        **lifecycle_input,
+    )
+
+    [required] = gate_work_ids
+    async with db.db.execute(
+        "SELECT work_id, json_extract(payload_json, '$.kind') AS kind FROM source_derivation_work WHERE derivation_id = ?",
+        (attempt.id,),
+    ) as cursor:
+        kinds = {row["work_id"]: row["kind"] for row in await cursor.fetchall()}
+    assert required
+    assert {kinds[work_id] for work_id in required} == {"candidate_admission"}
+    [committed] = await db.list_source_derivation_attempts(source_id="src-1")
+    assert committed.status == "applied"
 
 
 @pytest.mark.asyncio
@@ -4938,7 +5027,7 @@ async def _seed_jira_required_incumbent(
         source_updated_at=None,
     )
     # The provider's second Observation (a comment or an Artifact) is Primary; its first is Required.
-    primary = [item for item in first.observations if item.observation_type != UNIT_IDENTITY_OBSERVATION_TYPE][1]
+    primary = [item for item in first.observations if item.observation_type != UNIT_TITLE_OBSERVATION_TYPE][1]
     required = _body_observation(first)
     revisions = {item.observation_id: item for item in first.observation_revisions}
     unit = EvidenceUnit(

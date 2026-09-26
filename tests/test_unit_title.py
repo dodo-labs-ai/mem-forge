@@ -28,7 +28,7 @@ from memforge.pipeline.support_reading import (
     plan_support_revision,
 )
 from memforge.source_projection import ProjectionCoverage
-from memforge.source_representation import UNIT_IDENTITY_OBSERVATION_TYPE
+from memforge.source_representation import UNIT_TITLE_OBSERVATION_TYPE
 from tests.llm_fixture import NoopMemoryExtractor
 from tests.revision_client_fixture import change_impact_response, continued, supported
 from tests.test_candidate_admission import AdmissionClient
@@ -70,7 +70,7 @@ def jira(summary="Payroll run fails", *, issue_type=None, description="Payroll c
 
 
 def title_revision(projection):
-    [observation] = [item for item in projection.observations if item.observation_type == UNIT_IDENTITY_OBSERVATION_TYPE]
+    [observation] = [item for item in projection.observations if item.observation_type == UNIT_TITLE_OBSERVATION_TYPE]
     return next(item for item in projection.observation_revisions if item.observation_id == observation.id)
 
 
@@ -118,8 +118,8 @@ def test_every_adapter_projects_its_unit_title_first(source_type):
     first = projection.observations[0]
     title = title_revision(projection).content
 
-    assert first.observation_type == UNIT_IDENTITY_OBSERVATION_TYPE
-    assert [item.observation_type for item in projection.observations].count(UNIT_IDENTITY_OBSERVATION_TYPE) == 1
+    assert first.observation_type == UNIT_TITLE_OBSERVATION_TYPE
+    assert [item.observation_type for item in projection.observations].count(UNIT_TITLE_OBSERVATION_TYPE) == 1
     kind, *fields = title.split("\n")
     assert kind and all(": " in field and field.split(": ", 1)[1] for field in fields)
     assert "None" not in title
@@ -336,3 +336,24 @@ async def test_the_unit_title_is_read_in_every_support_step_and_change_impact_re
     assert result.supported
     assert client.impact_prompts and client.prompts
     assert all(json.dumps(title)[1:-1] in prompt for prompt in (*client.impact_prompts, *client.prompts))
+
+
+@pytest.mark.parametrize("with_base", [True, False], ids=["update", "no-baseline"])
+def test_the_unit_title_is_never_a_support_reading_step(with_base):
+    first = jira()
+    changed = jira(summary="Payroll run fails on A7", description="Payroll context changed.", prior=first, run_id="run-2")
+    context = RevisionAssessmentContext(projection=changed, base=first if with_base else None, access_context_hash="scope")
+    title = fragment(changed, "Jira issue", base=first if with_base else None)
+
+    plan = plan_supports(context, (support_part(first, COMMENT),))
+    order = plan.reading_order(plan.supports)
+
+    def reads_title(fragments):
+        return any(f.anchor == title.anchor for f in fragments)
+
+    assert not any(reads_title(group) for group in plan.groups)
+    assert title.anchor in context.reading_context(plan.groups[0])
+    title_steps = [part for part in order.parts if reads_title(part.fragments)]
+    # A changed Unit Title is one of the changes read first; it is never a step of the document order.
+    assert len(title_steps) == (1 if with_base else 0)
+    assert all(part in plan.changes for part in title_steps)

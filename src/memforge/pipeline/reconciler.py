@@ -227,7 +227,7 @@ async def reconcile_memories(
             revision_proof_count = len(proofs)
 
             _, unresolved_incumbents = _unresolved_component(
-                relation_entries, _support_conflicting_refinements(relation_entries, support_audits, proofs),
+                relation_entries, _support_conflicting_pairs(relation_entries, support_audits, proofs),
             )
             refiners_by_incumbent = _supported_revision_candidates(
                 [entry for entry in relation_entries if entry.incumbent_id not in unresolved_incumbents], support_audits,
@@ -329,8 +329,9 @@ def reduce_relation_ledger(
     """Reduce explicit relationships and complete Support; omitted edges propose no action.
 
     Program code alone combines relations with Support. An unsupported incumbent
-    whose truth an admitted candidate preserves while refining it cannot lose its
-    Support: the two judgments conflict, so the pair stays unresolved locally.
+    whose knowledge an admitted candidate states again, or preserves while
+    refining it, cannot lose its Support: the two judgments conflict, so the pair
+    stays unresolved locally.
     """
 
     incumbent_ids = {memory.id for memory in existing_memories}
@@ -361,7 +362,7 @@ def reduce_relation_ledger(
         by_incumbent[entry.incumbent_id].append(entry)
 
     skipped_candidates, skipped_incumbents = _unresolved_component(
-        relations, _support_conflicting_refinements(relations, support_audits, proofs),
+        relations, _support_conflicting_pairs(relations, support_audits, proofs),
     )
     consumed_candidates: set[int] = set(skipped_candidates)
     incumbent_operations: list[ReconcileOperation] = []
@@ -399,21 +400,6 @@ def reduce_relation_ledger(
             )
             continue
 
-        if equivalents and not audit.supported:
-            consumed_candidates.update(entry.candidate_index for entry in equivalents)
-            incumbent_operations.append(
-                ReconcileOperation(
-                    action=ReconcileAction.DELETE,
-                    memory_id=incumbent.id,
-                    reason=(
-                        "semantic equivalence conflicts with unsupported audit: "
-                        f"{audit.reason or equivalents[0].reason}"
-                    ),
-                    flag_for_review=True,
-                )
-            )
-            continue
-
         if audit.supported and len(refiners) == 1:
             refiner = refiners[0]
             proof = proofs_by_pair.get((refiner.candidate_index, incumbent.id))
@@ -430,7 +416,7 @@ def reduce_relation_ledger(
                 )
                 continue
 
-        if equivalents and audit.supported:
+        if equivalents:
             consumed_candidates.update(entry.candidate_index for entry in equivalents)
             selected = equivalents[0]
             incumbent_operations.append(
@@ -459,12 +445,17 @@ def reduce_relation_ledger(
     return [*candidate_operations, *incumbent_operations]
 
 
-def _support_conflicting_refinements(
+def _support_conflicting_pairs(
     relations: list[RelationLedgerEntry],
     audits: list[SupportAuditEntry],
     proofs: list[RevisionCompositionProof],
 ) -> set[tuple[int, str]]:
-    """Refinement pairs whose candidate preserves the truth of an incumbent Support rejected."""
+    """Pairs whose admitted candidate states or preserves the truth of an incumbent Support rejected.
+
+    An equivalent candidate, or a refinement whose proof preserves the incumbent's
+    truth, says the current revision still holds that knowledge while Support
+    found it unsupported.
+    """
 
     unsupported = {entry.incumbent_id for entry in audits if not entry.supported}
     preserving = {(proof.candidate_index, proof.incumbent_id) for proof in proofs if proof.preserves_incumbent_truth}
@@ -472,9 +463,14 @@ def _support_conflicting_refinements(
         (entry.candidate_index, entry.incumbent_id)
         for entry in relations
         if entry.incumbent_id in unsupported
-        and entry.relation_type is MemoryRelationType.REFINES
-        and entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
-        and (entry.candidate_index, entry.incumbent_id) in preserving
+        and (
+            entry.relation_type is MemoryRelationType.EQUIVALENT
+            or (
+                entry.relation_type is MemoryRelationType.REFINES
+                and entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
+                and (entry.candidate_index, entry.incumbent_id) in preserving
+            )
+        )
     }
 
 

@@ -28,7 +28,7 @@ from memforge.source_projection import (
 )
 from memforge.source_projection_config import projection_scope_fingerprint
 from memforge.source_representation import (
-    UNIT_IDENTITY_OBSERVATION_TYPE,
+    UNIT_TITLE_OBSERVATION_TYPE,
     representation_contract_for_profile,
     representation_profile_for_observation_contract,
 )
@@ -46,7 +46,7 @@ def _provider_revisions(projection):
     return [
         by_observation[observation.id]
         for observation in projection.observations
-        if observation.observation_type != UNIT_IDENTITY_OBSERVATION_TYPE
+        if observation.observation_type != UNIT_TITLE_OBSERVATION_TYPE
     ]
 
 def _item(**overrides) -> ContentItem:

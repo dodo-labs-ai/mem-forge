@@ -32,7 +32,6 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.memory.candidate_admission import (
     CANDIDATE_ADMISSION_CONTRACT,
-    CandidateAdmission,
     CandidateAdmissionError,
     CandidateRejection,
     admit_candidates,
@@ -170,6 +169,7 @@ class _PreparedProjectedLifecycleCommit:
     relation_pair_count: int
     model_call_count: int
     prepared_at_attempt_count: int
+    admission_rejections: tuple[CandidateRejection, ...] = ()
     retry_attempt_count: int = 0
     applied_stats: dict[str, int] | None = field(
         default=None,
@@ -594,8 +594,8 @@ class MemoryEngine:
                 operation="assess_revision_support" if runtime_context.stage == "support_revalidation" else None,
                 terminal_category=(
                     "invalid_response"
-                    if isinstance(exc, (ReconciliationContractError, CandidateAdmissionError))
-                    else (exc.terminal_category if isinstance(exc, StructuredLlmError) else None)
+                    if isinstance(exc, ReconciliationContractError)
+                    else (exc.terminal_category if isinstance(exc, (StructuredLlmError, CandidateAdmissionError)) else None)
                 ),
                 error_code=(
                     (exc.reason_code if isinstance(exc, (ReconciliationContractError, CandidateAdmissionError)) else
@@ -862,6 +862,7 @@ class MemoryEngine:
                 runtime_bundle.assessments,
                 runtime_bundle.events,
             )
+        await self._record_admission_rejections(prepared)
         delivery = await self.memory_store.attempt_lifecycle_vector_delivery(
             plan.id
         )
@@ -1066,11 +1067,13 @@ class MemoryEngine:
                 operation_input_hash=operation_input_hash, execution_owner_id=lifecycle_execution_owner_id))
         _runtime_context.incumbent_count = len(incumbents)
         _runtime_context.stage = "candidate_admission"
-        admission = await self._admit_projected_candidates(
-            projection=projection,
-            doc_id=doc_id,
-            candidates=filtered_memories,
-            image_loader=_projection_evidence_image_loader(projection, self.document_store),
+        evidence_image_loader = _projection_evidence_image_loader(projection, self.document_store)
+        admission = await admit_candidates(
+            filtered_memories,
+            client=self.structured_llm_client,
+            model=self.llm_model,
+            image_loader=evidence_image_loader,
+            store=self.db,
             derivation_id=derivation_id,
             operation_input_hash=operation_input_hash,
         )
@@ -1110,8 +1113,7 @@ class MemoryEngine:
         support_audits = []
         skipped_revalidation: dict[str, str] = {}
         assessed_evidence: dict[str, list[RawMemory]] = {}
-        assessment_image_loader = None
-        required_derivation_work_ids = ()
+        required_derivation_work_ids = admission.work_ids
         model_incumbent_count = 0
         model_batch_count = 0
         structured_llm_call_count = 0
@@ -1139,23 +1141,13 @@ class MemoryEngine:
                 raise RuntimeError("complete lifecycle reconciliation requires an LLM client")
             if model_incumbents:
                 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-                from memforge.pipeline.projection_images import load_projection_images, projection_inference_image_observation_ids
                 from memforge.pipeline.reconciler import SupportAuditEntry, ReconciliationContractError
 
-                def assessment_image_loader(ids):
-                    if self.document_store is None:
-                        raise SupportRevalidationLimitation(
-                            SupportRevalidationLimitationCode.UNSUPPORTED_REPRESENTATION,
-                            "revision assessment requires the Artifact store",
-                        )
-                    return load_projection_images(
-                        projection=projection, observation_ids=ids, document_store=self.document_store,
-                    )
                 base = await self.db.get_current_source_unit_projection(scope.source_unit_id)
                 if base is not None and base.source_unit_revisions[0].id not in {scope.base_unit_revision_id, scope.target_unit_revision_id}:
                     raise AuthorityPlanStaleError("revision assessment base changed")
                 assessment_context = RevisionAssessmentContext(
-                    projection=projection, base=base, access_context_hash=access_context_hash, image_loader=assessment_image_loader,
+                    projection=projection, base=base, access_context_hash=access_context_hash, image_loader=evidence_image_loader,
                 )
 
                 def assessment_context_for(baseline):
@@ -1165,7 +1157,7 @@ class MemoryEngine:
                     """
                     return RevisionAssessmentContext(
                         projection=projection, base=baseline, access_context_hash=access_context_hash,
-                        image_loader=assessment_image_loader, indexes=assessment_context.indexes,
+                        image_loader=evidence_image_loader, indexes=assessment_context.indexes,
                         known_observations=base.observations if base is not None else (),
                     )
                 contexts_by_revision = {base.source_unit_revisions[0].id: assessment_context} if base else {}
@@ -1247,7 +1239,8 @@ class MemoryEngine:
                     stats["support_revalidation_change_impact_failed_count"] = impact_counts["failed"]
                     _runtime_context.model_call_count += evaluator.calls
                 stats["support_revalidation_completion_count"] = len(evaluator.final_work_ids)
-                required_derivation_work_ids = tuple(evaluator.final_work_ids) if derivation_id else ()
+                if derivation_id:
+                    required_derivation_work_ids += tuple(evaluator.final_work_ids)
                 unresolved_stats = {
                     "partial_coverage": "support_revalidation_unresolved_partial_coverage_count",
                     "capacity": "support_revalidation_unresolved_capacity_count",
@@ -1279,7 +1272,7 @@ class MemoryEngine:
                 llm_model=self.llm_model,
                 include_metadata=True,
                 support_audits=support_audits,
-                image_loader=assessment_image_loader,
+                image_loader=evidence_image_loader,
                 work_store=self.db,
                 derivation_id=derivation_id,
                 operation_input_hash=operation_input_hash,
@@ -1662,6 +1655,7 @@ class MemoryEngine:
                 + identity_resolution.metrics.llm_calls
             ),
             prepared_at_attempt_count=lifecycle_attempt_count,
+            admission_rejections=admission.rejected,
         )
         _runtime_context.stage = "lifecycle_commit"
         return await self._commit_prepared_projected_lifecycle(
@@ -1669,42 +1663,24 @@ class MemoryEngine:
             lifecycle_attempt_count=lifecycle_attempt_count,
         )
 
-    async def _admit_projected_candidates(
-        self,
-        *,
-        projection: SourceProjection,
-        doc_id: str,
-        candidates: list[RawMemory],
-        image_loader,
-        derivation_id: str | None,
-        operation_input_hash: str,
-    ) -> CandidateAdmission:
-        """Admit this revision's Candidates and record one event per rejection."""
+    async def _record_admission_rejections(self, prepared: _PreparedProjectedLifecycleCommit) -> None:
+        """Record one event per Candidate the committed revision rejected."""
 
-        admission = await admit_candidates(
-            candidates,
-            client=self.structured_llm_client,
-            model=self.llm_model,
-            image_loader=image_loader,
-            store=self.db,
-            derivation_id=derivation_id,
-            operation_input_hash=operation_input_hash,
-        )
+        projection = prepared.projection
         revision = projection.source_unit_revisions[0]
-        for rejection in admission.rejected:
+        for rejection in prepared.admission_rejections:
             await self.memory_store.record_audit_event(
                 "candidate_admission_rejected",
                 "committed",
                 context=self.memory_store.operation_context(
-                    run_id=projection.run_id, source_id=projection.source_id, doc_id=doc_id,
+                    run_id=projection.run_id, source_id=projection.source_id, doc_id=prepared.doc_id,
                 ),
-                doc_id=doc_id,
+                doc_id=prepared.doc_id,
                 source_id=projection.source_id,
                 decision="reject_candidate",
                 reason=rejection.reject_reason,
                 payload=_candidate_rejection_payload(rejection, revision),
             )
-        return admission
 
     async def apply_projected_tombstone(
         self,
@@ -1919,7 +1895,10 @@ def _support_validation_baseline(support) -> tuple[str | None, str | None]:
 
 
 def _projection_evidence_image_loader(projection: SourceProjection, document_store):
-    """Load current Artifact Evidence bytes; without an Artifact store none can be supplied."""
+    """Load current Artifact Evidence bytes; without an Artifact store none can be supplied.
+
+    Each reader maps missing bytes to its own failure.
+    """
 
     if document_store is None:
         return None

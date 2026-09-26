@@ -16,7 +16,7 @@ from memforge.pipeline.evidence_fragments import (
     canonical_record_is_tombstoned,
     revision_changed_structural_ranges,
 )
-from memforge.source_artifacts import source_artifact_inference_eligibility
+from memforge.source_artifacts import SOURCE_ARTIFACT_OBSERVATION_TYPE, source_artifact_inference_eligibility
 from memforge.source_projection import (
     RevisionDelta,
     SourceObservationRevision,
@@ -148,10 +148,7 @@ def plan_projection_evidence_work(
             )
         ):
             return _incremental_base_failure(delta, revisions)
-        return _authority_or_failure(
-            projection,
-            dict.fromkeys(observation.id for observation in projection.observations),
-        )
+        return whole_revision_extraction_authority(projection)
 
     changed_ids = [anchor.observation_id for anchor in delta.changed_anchors]
     changed_ids.extend(delta.added_observation_ids)
@@ -282,6 +279,17 @@ def plan_projection_evidence_work(
     return _authority_or_failure(projection, authority)
 
 
+def whole_revision_extraction_authority(
+    projection: SourceProjection,
+) -> ExtractionAuthority | ProjectionEvidencePlanningFailure:
+    """Authorize every current Observation, as a reprocess of the current revision does."""
+
+    return _authority_or_failure(
+        projection,
+        dict.fromkeys(observation.id for observation in projection.observations),
+    )
+
+
 def _authority_or_failure(
     projection: SourceProjection,
     authority: Mapping[str, tuple[tuple[int, int], ...] | None],
@@ -346,7 +354,7 @@ def observation_is_inference_eligible(
     observation_type: str,
     metadata: dict,
 ) -> bool:
-    if observation_type != "binary_artifact":
+    if observation_type != SOURCE_ARTIFACT_OBSERVATION_TYPE:
         return True
     return source_artifact_inference_eligibility(metadata) is True
 

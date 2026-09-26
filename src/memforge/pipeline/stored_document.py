@@ -1,13 +1,17 @@
 """Stored input of one Source Unit, for reprocessing it at its current revision.
 
-Reprocessing never contacts the provider. It reads the Document row, the raw
-content the last sync stored, and the Artifacts the committed Unit revision
-cites, and hands them to the same projection path an ordinary sync uses. The
-Artifacts come back with the Unit so a complete snapshot does not mistake
-them for removals. The descriptor a Gene attaches to a discovered item is not
-stored, so adapters read the Unit from the stored payload; a stored input that
-no longer places the Unit where its committed revision does cannot stand for
-that revision.
+Reprocessing never contacts the provider. It reads the Document row with the
+item metadata its Gene discovered, the raw content the last sync stored, and
+the Artifacts the committed Unit revision cites, and hands them to the same
+projection path an ordinary sync uses. The Artifacts come back with the Unit
+so a complete snapshot does not mistake them for removals. A Document stored
+before its item metadata was kept may not place the Unit where its committed
+revision does; such a stored input cannot stand for that revision until an
+ordinary sync stores the Document again.
+
+A reprocess reads the latest stored input. When a sync stored newer raw
+content whose revision never committed, reprocessing projects and commits that
+content, as the next ordinary sync would.
 """
 
 from __future__ import annotations
@@ -17,15 +21,23 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from memforge.models import ContentItem, DocumentRecord, RawContent
-from memforge.source_artifacts import StoredSourceArtifact
+from memforge.source_artifacts import (
+    SOURCE_ARTIFACT_OBSERVATION_TYPE,
+    StoredSourceArtifact,
+    source_artifact_revision_from_metadata,
+    stored_source_artifact_from_observation,
+)
 from memforge.source_projection import SourceProjection
 
 if TYPE_CHECKING:
     from memforge.storage.adapters.protocols import RelationalStore
     from memforge.storage.document_store import DocumentStore
 
-ARTIFACT_OBSERVATION_TYPE = "binary_artifact"
-ARTIFACT_PROVIDER_KEY_PREFIX = "artifact:"
+# Model requests a reprocessed Unit needs besides extraction and Support
+# reading, when nothing has to be split: one Candidate admission request, and
+# one Relation request when the Unit has active Supports.
+_ADMISSION_REQUESTS_PER_UNIT = 1
+_RELATION_REQUESTS_PER_SUPPORTED_UNIT = 1
 
 
 class StoredDocumentUnavailableReason(str, Enum):
@@ -34,8 +46,12 @@ class StoredDocumentUnavailableReason(str, Enum):
     RAW_CONTENT_MISSING = "stored_raw_content_missing"
     CONTENT_EMPTY = "stored_content_empty"
     ARTIFACT_MISSING = "stored_artifact_missing"
+    # The committed Artifact metadata cannot be read as an Artifact revision.
+    ARTIFACT_INVALID = "stored_artifact_invalid"
     # The stored input does not place the Unit where its committed revision does.
     INPUT_INCOMPLETE = "stored_input_incomplete"
+    # The committed revision's current Observations cannot be authorized for extraction.
+    EXTRACTION_UNPLANNABLE = "stored_extraction_unplannable"
 
 
 class StoredDocumentUnavailable(RuntimeError):
@@ -85,10 +101,8 @@ async def load_stored_source_document(
     body = document_store.read_artifact(str(document.raw_content_uri))
     if not body.strip():
         raise unavailable(StoredDocumentUnavailableReason.CONTENT_EMPTY)
-    artifacts = _committed_artifacts(committed)
-    if artifacts is None or not all(
-        _stored(document_store, artifact.uri, artifact.media_type) for artifact in artifacts
-    ):
+    artifacts = _committed_artifacts(committed, unavailable)
+    if not all(_stored(document_store, artifact.uri, artifact.media_type) for artifact in artifacts):
         raise unavailable(StoredDocumentUnavailableReason.ARTIFACT_MISSING)
     item = ContentItem(
         item_id=document.doc_id,
@@ -100,6 +114,7 @@ async def load_stored_source_document(
         version=document.version,
         author=document.author,
         labels=list(document.labels),
+        extra=dict(document.item_extra),
     )
     return StoredSourceDocument(
         document=document,
@@ -117,36 +132,65 @@ def _stored(document_store: DocumentStore, uri: str | None, media_type: str) -> 
         return False
 
 
-def _committed_artifacts(committed: SourceProjection) -> tuple[StoredSourceArtifact, ...] | None:
-    """The committed Artifacts, or None when one no longer has its parent Observation."""
+def _committed_artifacts(committed: SourceProjection, unavailable) -> tuple[StoredSourceArtifact, ...]:
+    """The projection input of every Artifact the committed revision cites."""
+
+    unit_revision = committed.source_unit_revisions[0]
     observations = {observation.id: observation for observation in committed.observations}
     artifacts = []
     for revision in committed.observation_revisions:
         observation = observations[revision.observation_id]
-        if observation.observation_type != ARTIFACT_OBSERVATION_TYPE:
+        if observation.observation_type != SOURCE_ARTIFACT_OBSERVATION_TYPE:
             continue
-        metadata = revision.metadata["source_artifact"]
-        parent = observations.get(str(metadata["parent_observation_id"]))
+        artifact = source_artifact_revision_from_metadata(
+            observation_id=observation.id,
+            observation_revision_id=revision.id,
+            source_id=committed.source_id,
+            source_unit_id=unit_revision.source_unit_id,
+            metadata=revision.metadata,
+        )
+        if artifact is None:
+            raise unavailable(StoredDocumentUnavailableReason.ARTIFACT_INVALID)
+        parent = observations.get(artifact.parent_observation_id)
         if parent is None:
-            return None
+            raise unavailable(StoredDocumentUnavailableReason.ARTIFACT_MISSING)
         artifacts.append(
-            StoredSourceArtifact(
-                id=str(metadata["artifact_id"]),
-                provider_key=observation.provider_key.removeprefix(ARTIFACT_PROVIDER_KEY_PREFIX),
+            stored_source_artifact_from_observation(
+                revision=artifact,
+                observation_provider_key=observation.provider_key,
+                locator=observation.locator,
                 parent_observation_type=parent.observation_type,
                 parent_provider_key=parent.provider_key,
-                provider_revision=str(metadata["provider_revision"]),
-                filename=str(metadata["filename"]),
-                media_type=str(metadata["media_type"]),
-                size_bytes=int(metadata["size_bytes"]),
-                sha256=str(metadata["sha256"]),
-                uri=str(metadata["uri"]),
-                inference_eligible=bool(metadata["inference_eligible"]),
-                inference_ineligible_reason=metadata.get("inference_ineligible_reason"),
-                locator=dict(observation.locator),
             )
         )
     return tuple(artifacts)
+
+
+@dataclass(frozen=True, slots=True)
+class ReprocessUnitPreview:
+    """What reprocessing one Document would read; an unavailable Unit has only its reason."""
+
+    document_id: str
+    available: bool
+    reason: str | None = None
+    source_unit_id: str | None = None
+    unit_revision_id: str | None = None
+    artifact_count: int | None = None
+    active_memory_count: int | None = None
+    support_reading_count: int | None = None
+    reading_group_count: int | None = None
+    extraction_item_count: int | None = None
+    reading_chars: int | None = None
+    estimated_model_calls: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReprocessPreview:
+    source_id: str
+    units: tuple[ReprocessUnitPreview, ...]
+    available_unit_count: int
+    unavailable_unit_count: int
+    estimated_model_calls: int
 
 
 async def reprocess_preview(
@@ -155,54 +199,69 @@ async def reprocess_preview(
     *,
     source_id: str,
     document_ids: tuple[str, ...],
-) -> dict[str, object]:
+) -> ReprocessPreview:
     """Report what reprocessing these Documents would read, without writing anything.
 
     Counts come from each Unit's committed revision. ``estimated_model_calls``
-    is an upper bound: one extraction item per ReadingGroup that holds Primary
-    content (the runner packs items into fewer requests), one Candidate
-    admission, one Relation request when the Unit has Supports, and one
-    whole-Unit Support reading per Support (Supports can share a request).
+    is an estimate for approval, not a bound: one extraction item per
+    ReadingGroup that holds authorized Primary content (the runner packs items
+    into fewer requests), one Candidate admission request, one Relation request
+    when the Unit has Supports, and one whole-Unit reading per Support
+    (Supports can share a request). It leaves out requests split for capacity,
+    Support readings that take several steps, selector corrections, entity
+    resolution and cross-document relation classification.
     """
 
+    from memforge.pipeline.memory_extractor import ExtractionReading
+    from memforge.pipeline.projection_context import (
+        ProjectionEvidencePlanningFailure,
+        whole_revision_extraction_authority,
+    )
     from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 
-    units: list[dict[str, object]] = []
+    units: list[ReprocessUnitPreview] = []
     for document_id in sorted(set(document_ids)):
         try:
             stored = await load_stored_source_document(
                 db, document_store, source_id=source_id, document_id=document_id,
             )
+            authority = whole_revision_extraction_authority(stored.committed)
+            if isinstance(authority, ProjectionEvidencePlanningFailure):
+                raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.EXTRACTION_UNPLANNABLE, document_id)
         except StoredDocumentUnavailable as exc:
-            units.append({"document_id": document_id, "available": False, "reason": exc.reason.value})
+            units.append(ReprocessUnitPreview(document_id=document_id, available=False, reason=exc.reason.value))
             continue
         unit_revision = stored.committed.source_unit_revisions[0]
-        context = RevisionAssessmentContext(projection=stored.committed, base=None, access_context_hash="")
-        groups = context.reading_groups(context.full_fragments)
-        extraction_items = sum(any(fragment.primary_eligible for fragment in group) for group in groups)
+        context = RevisionAssessmentContext(projection=stored.committed, base=None, access_context_hash=source_id)
+        extraction = ExtractionReading.of_authority(
+            context, authority, source_type=stored.committed.source_type, doc_type=stored.committed.source_type,
+        )
         support_units = await db.get_source_unit_support_unit_ids(unit_revision.source_unit_id)
         active_ids = {memory.id for memory in await db.list_active_memories(tuple(sorted(support_units)))}
         support_readings = sum(len(support_units[memory_id]) for memory_id in active_ids)
+        relation_requests = _RELATION_REQUESTS_PER_SUPPORTED_UNIT if support_readings else 0
         units.append(
-            {
-                "document_id": document_id,
-                "available": True,
-                "source_unit_id": unit_revision.source_unit_id,
-                "unit_revision_id": unit_revision.id,
-                "artifact_count": len(stored.artifacts),
-                "active_memory_count": len(active_ids),
-                "support_reading_count": support_readings,
-                "reading_group_count": len(groups),
-                "extraction_item_count": extraction_items,
-                "reading_chars": sum(len(fragment.presentation_text) for fragment in context.full_fragments),
-                "estimated_model_calls": extraction_items + 1 + int(support_readings > 0) + support_readings,
-            }
+            ReprocessUnitPreview(
+                document_id=document_id,
+                available=True,
+                source_unit_id=unit_revision.source_unit_id,
+                unit_revision_id=unit_revision.id,
+                artifact_count=len(stored.artifacts),
+                active_memory_count=len(active_ids),
+                support_reading_count=support_readings,
+                reading_group_count=len(context.reading_groups(context.full_fragments)),
+                extraction_item_count=len(extraction.items),
+                reading_chars=sum(len(fragment.presentation_text) for fragment in context.full_fragments),
+                estimated_model_calls=(
+                    len(extraction.items) + _ADMISSION_REQUESTS_PER_UNIT + relation_requests + support_readings
+                ),
+            )
         )
-    available = [unit for unit in units if unit["available"]]
-    return {
-        "source_id": source_id,
-        "units": units,
-        "available_unit_count": len(available),
-        "unavailable_unit_count": len(units) - len(available),
-        "estimated_model_calls": sum(int(unit["estimated_model_calls"]) for unit in available),
-    }
+    available = [unit for unit in units if unit.available]
+    return ReprocessPreview(
+        source_id=source_id,
+        units=tuple(units),
+        available_unit_count=len(available),
+        unavailable_unit_count=len(units) - len(available),
+        estimated_model_calls=sum(unit.estimated_model_calls or 0 for unit in available),
+    )

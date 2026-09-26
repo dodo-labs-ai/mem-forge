@@ -54,7 +54,7 @@ from memforge.pipeline.projection_context import (
     plan_projection_evidence_work,
 )
 from memforge.pipeline.revision_assessment import REVISION_INPUT_POLICY
-from memforge.source_artifacts import SourceArtifactSummary
+from memforge.source_artifacts import SOURCE_ARTIFACT_OBSERVATION_TYPE, SourceArtifactSummary
 from memforge.source_projection import (
     AnchorKind,
     SourceAnchor,
@@ -835,6 +835,7 @@ def _document_record_payload(
         "pdf_content_uri": document.pdf_content_uri,
         "last_synced": document.last_synced.isoformat(),
         "client": document.client,
+        "item_extra": dict(document.item_extra),
         "created_at": (document.created_at.isoformat() if document.created_at is not None else None),
         "updated_at": (document.updated_at.isoformat() if document.updated_at is not None else None),
     }
@@ -866,6 +867,7 @@ def source_unit_derivation_context_from_payload(
             pdf_content_uri=_optional_string(raw_document.get("pdf_content_uri")),
             last_synced=datetime.fromisoformat(str(raw_document["last_synced"])),
             client=_optional_string(raw_document.get("client")),
+            item_extra=dict(raw_document.get("item_extra") or {}),
             created_at=(
                 datetime.fromisoformat(str(raw_document["created_at"]))
                 if raw_document.get("created_at") is not None
@@ -1264,7 +1266,7 @@ def assemble_source_derivation_results(
     protected_observation_ids = tuple(
         observation.id
         for observation in projection.observations
-        if observation.observation_type == "binary_artifact"
+        if observation.observation_type == SOURCE_ARTIFACT_OBSERVATION_TYPE
         and observation.id in revisions_by_observation_id
         and not observation_is_inference_eligible(
             observation.observation_type,

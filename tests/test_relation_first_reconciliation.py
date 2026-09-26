@@ -354,7 +354,7 @@ def test_refinement_without_revision_proof_falls_back_to_keep_and_add() -> None:
         (True, MemoryRelationType.CONTRADICTS, [ReconcileAction.SUPERSEDE], True),
         (False, MemoryRelationType.UNRELATED, [ReconcileAction.ADD, ReconcileAction.DELETE], False),
         (False, MemoryRelationType.CONTRADICTS, [ReconcileAction.SUPERSEDE], False),
-        (False, MemoryRelationType.EQUIVALENT, [ReconcileAction.DELETE], True),
+        (False, MemoryRelationType.EQUIVALENT, [ReconcileAction.NOOP], False),
     ],
 )
 def test_relation_support_matrix(
@@ -467,7 +467,7 @@ def test_partial_projection_contradiction_stays_in_review() -> None:
     assert operation.flag_for_review is True
 
 
-def test_unsupported_equivalent_does_not_drop_sibling_refinement() -> None:
+def test_an_unsupported_equivalent_keeps_its_related_component_unresolved() -> None:
     incumbent = _memory("mem-current", "The client timeout is 30 seconds.")
     equivalent = RawMemory(content="Client timeout: 30 seconds.", memory_type="fact")
     refinement = RawMemory(content="Upload timeout is 30 seconds.", memory_type="fact")
@@ -492,9 +492,9 @@ def test_unsupported_equivalent_does_not_drop_sibling_refinement() -> None:
         support_audits=[SupportAuditEntry(incumbent_id=incumbent.id, supported=False)],
     )
 
-    assert [operation.action for operation in operations] == [ReconcileAction.ADD, ReconcileAction.DELETE]
-    assert operations[0].memory is refinement
-    assert operations[1].flag_for_review is True
+    [operation] = operations
+    assert operation.action is ReconcileAction.NOOP and operation.memory is None
+    assert operation.support_revalidation_skipped and not operation.flag_for_review
 
 
 def test_equivalent_candidate_rebinds_each_supported_incumbent() -> None:

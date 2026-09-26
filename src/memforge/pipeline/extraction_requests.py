@@ -3,13 +3,28 @@
 import hashlib
 
 from memforge.llm.batch_runner import ItemCapacityExceeded, LlmBatchRunner
-from memforge.pipeline.memory_extractor import ExtractionReading, MemoryExtractor
-from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionRequest
-from memforge.pipeline.projection_fragments import (
-    SupportRevalidationLimitation,
-    SupportRevalidationLimitationCode,
+from memforge.llm.structured import INPUT_CAPACITY_EXCEEDED
+from memforge.pipeline.memory_extractor import (
+    EXTRACTION_CAPACITY_EXCEEDED_MESSAGE,
+    ExtractionReading,
+    MemoryExtractor,
 )
+from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionRequest
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+
+
+class ExtractionCapacityExceeded(RuntimeError):
+    """One ReadingGroup with its reading context alone exceeds the extraction route's capacity.
+
+    Planning the same input again fails the same way, so the revision stays
+    uncommitted until the route or the Unit changes.
+    """
+
+    retryable = False
+    reason_code = INPUT_CAPACITY_EXCEEDED
+
+    def __init__(self) -> None:
+        super().__init__(f"{INPUT_CAPACITY_EXCEEDED}: {EXTRACTION_CAPACITY_EXCEEDED_MESSAGE}")
 
 
 def plan_extraction_requests(
@@ -25,7 +40,7 @@ def plan_extraction_requests(
     An update authorizes only its changed structures, so it reads those
     ReadingGroups; a first import or reprocess reads every ReadingGroup. There is
     no cost comparison with another reading scope and no truncation: a
-    ReadingGroup that alone exceeds the route's capacity is a typed limitation.
+    ReadingGroup that alone exceeds the route's capacity is a typed failure.
     """
 
     reading = ExtractionReading.of_authority(context, authority, source_type=source_type, doc_type=doc_type)
@@ -40,10 +55,7 @@ def plan_extraction_requests(
             ),
         )
     except ItemCapacityExceeded as error:
-        raise SupportRevalidationLimitation(
-            SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
-            "one ReadingGroup alone exceeds the extraction request capacity",
-        ) from error
+        raise ExtractionCapacityExceeded() from error
     source_unit_id = context.projection.source_units[0].id
     requests = []
     for entry in planned:
