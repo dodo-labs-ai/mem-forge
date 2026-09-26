@@ -7,7 +7,8 @@ same knowledge as another Candidate of this round. Every request carries all of
 this round's claims as shared context, so duplicates judged in different
 requests are still found. Candidates with the same normalized claim, type and
 validity are duplicates without asking the model, but each is still judged on
-its own Evidence. Only admitted Candidates merge. A Candidate whose admission
+its own Evidence. Only admitted Candidates merge, so a duplicate link to a
+Candidate that is rejected, or that could not be judged, is ignored. A Candidate whose admission
 cannot be judged even alone (capacity or invalid output) is rejected for this
 round with that reason; a transient failure raises.
 """
@@ -22,7 +23,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from memforge.derivation_work import DerivationWorkJournal, DerivationWorkStore
-from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
+from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
 from memforge.llm.failure_trace import failure_trace_context
 from memforge.llm.relation_catalog import RequestCatalog
 from memforge.llm.structured import (
@@ -162,15 +163,16 @@ async def admit_candidates(
         max_tokens = max(_MIN_OUTPUT_TOKENS, _DECISION_OUTPUT_TOKENS * len(item_ids))
         return LlmRequest(prompt, CandidateAdmissionResponse, max_tokens, request_images)
 
-    def decode(response: CandidateAdmissionResponse, item_ids: tuple[str, ...], round_ids: tuple[str, ...]):
-        judged = [decision.candidate_id for decision in response.decisions]
-        if len(judged) != len(set(judged)) or set(judged) != set(item_ids):
-            raise ValueError("admission must judge every requested Candidate exactly once")
+    def decode(response: CandidateAdmissionResponse, _item_ids: tuple[str, ...], round_ids: tuple[str, ...]):
+        """Each decision is validated alone: every duplicate it names must be a supplied round claim."""
         visible = set(round_ids)
         for decision in response.decisions:
-            if not visible.issuperset(decision.duplicate_of):
-                raise ValueError(f"{decision.candidate_id} names a duplicate outside round_claims")
-        return ((decision.candidate_id, decision) for decision in response.decisions)
+            outside = sorted(set(decision.duplicate_of) - visible)
+            yield decision.candidate_id, (
+                RejectedRow(
+                    f"{decision.candidate_id} names duplicate {', '.join(outside)}, which is not in round_claims"
+                ) if outside else decision
+            )
 
     journal = None
     if derivation_id is not None:

@@ -244,7 +244,7 @@ async def test_optional_selector_correction_keeps_rejected_extraction_trace(monk
 
 
 @pytest.mark.asyncio
-async def test_actual_executor_correction_marks_failed_attempt_recovered(monkeypatch):
+async def test_actual_executor_traces_a_rejected_row_with_its_location(monkeypatch):
     from memforge.pipeline.revision_work import RevisionWorkExecutor
     from tests.test_revision_work import Client, work_items, payload
     sink = Sink()
@@ -266,10 +266,10 @@ async def test_actual_executor_correction_marks_failed_attempt_recovered(monkeyp
             return await actual.evaluate_revision_work(prompt, **kwargs)
     executor = RevisionWorkExecutor(client=ExecutorClient(limit=100000), model="openai/gpt-4o")
     await executor.assess_many(work_items("Two reviewers approve US releases.\nRoutine note."))
-    # The first request is corrected once; the reading then continues to its last group.
+    # The rejected row is re-asked once; the reading then continues to its last group.
     assert calls == 3
     record = next(iter(sink.records.values()))
-    assert record["outcome"] == "recovered"
+    assert record["outcome"] == "failed"
     assert record["failures"][-1]["location"] == "results[0].support_witness_refs[0]"
     assert "PRM-9999" in record["attempts"][0]["response"]["choices"][0]["message"]["content"]
 

@@ -247,8 +247,8 @@ async def test_a_candidate_whose_admission_stays_invalid_is_rejected_for_this_ro
     assert [(rejection.candidate, rejection.reject_reason) for rejection in result.rejected] == [
         (unjudged, "invalid_response"),
     ]
-    # Both Candidates with the correction, then each alone: the invalid one with its correction.
-    assert client.calls == 5
+    # Both Candidates, then the invalid one's re-ask.
+    assert client.calls == 2
 
 
 @pytest.mark.asyncio

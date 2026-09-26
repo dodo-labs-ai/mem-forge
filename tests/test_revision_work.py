@@ -252,10 +252,11 @@ async def test_one_claim_whose_selection_stays_invalid_leaves_the_others_judged(
 
     assert results["w0"].supported is True
     assert (results["w1"].supported, results["w1"].unresolved) == (None, "invalid_response")
-    # Both claims with the correction, then each claim alone; the invalid one with its correction.
+    # WRK-0000's row is accepted; WRK-0001 is re-asked once on the same step, naming its error.
     assert [sorted(work["work_id"] for work in payload(prompt)["works"]) for prompt in client.prompts] == [
-        ["WRK-0000", "WRK-0001"], ["WRK-0000", "WRK-0001"], ["WRK-0000"], ["WRK-0001"], ["WRK-0001"],
+        ["WRK-0000", "WRK-0001"], ["WRK-0001"],
     ]
+    assert "WRK-0001: unknown supplied Evidence ID: not-supplied" in client.prompts[1]
 
 
 @pytest.mark.asyncio

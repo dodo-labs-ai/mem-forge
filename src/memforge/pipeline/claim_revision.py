@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from memforge.derivation_work import DerivationWorkJournal, DerivationWorkStore
-from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
+from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
 from memforge.llm.failure_trace import failure_trace_context
 from memforge.llm.structured import ClaimRevisionDecision, ClaimRevisionWireResponse
 from memforge.llm.relation_catalog import RelationCoverage, RequestCatalog
@@ -132,8 +132,12 @@ async def assess_claim_pairs(
         return LlmRequest(prompt, ClaimRevisionWireResponse, requested_output, request_images)
 
     def decode(response, candidate_ids, incumbent_ids):
-        RelationCoverage({ref: frozenset(incumbent_ids) for ref in candidate_ids}).validate(response.results)
-        return [(row.candidate_id, row) for row in response.results]
+        """Each candidate's row is validated alone against the incumbents of this request."""
+        coverage = RelationCoverage({ref: frozenset(incumbent_ids) for ref in candidate_ids})
+        for row in response.results:
+            if row.candidate_id in coverage.allowed:
+                error = coverage.row_error(row)
+                yield row.candidate_id, row if error is None else RejectedRow(error)
 
     journal = None
     if derivation_id is not None:

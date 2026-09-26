@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
 
-from memforge.llm.batch_runner import BatchStats, ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
+from memforge.llm.batch_runner import BatchStats, ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
 from memforge.llm.structured import MemoryRelationResponse, StructuredLlmError
 from memforge.memory.evidence import RelationDirection
 from memforge.models import Memory
@@ -300,20 +300,24 @@ class StructuredMemoryPairClassifier:
             return LlmRequest(prompt, MemoryRelationResponse, relation_output_tokens(self._policy, len(item_ids)))
 
         def decode(response: MemoryRelationResponse, _item_ids: tuple[str, ...], _context: tuple):
+            """Each decision is validated alone; a decision for an unknown pair_index is not an answer."""
             for decision in response.decisions:
                 pair_index = int(decision.pair_index)
                 if not 0 <= pair_index < len(pairs):
-                    raise ValueError(f"unknown pair_index {pair_index}")
-                yield str(pair_index), MemoryPairDecision(
-                    pair=pairs[pair_index],
-                    relation_type=MemoryRelationType(decision.classification),
-                    direction=RelationDirection(decision.direction),
-                    reason=_auditable_relation_reason(decision),
-                )
+                    continue
+                try:
+                    yield str(pair_index), MemoryPairDecision(
+                        pair=pairs[pair_index],
+                        relation_type=MemoryRelationType(decision.classification),
+                        direction=RelationDirection(decision.direction),
+                        reason=_auditable_relation_reason(decision),
+                    )
+                except ValueError as error:
+                    yield str(pair_index), RejectedRow(f"pair_index {pair_index}: {error}")
 
         decisions, unjudged = await judge_pair_items(runner, ItemTask(
             item_ids=tuple(str(index) for index in range(len(pairs))), render=render, decode=decode,
-            call=self._client.classify_memory_relations,
+            call=self._client.classify_memory_relations, label=lambda item_id: f"pair_index {item_id}",
         ), pairs, label="memory relation classification")
         return MemoryPairClassification(
             decisions=tuple(decisions), llm_calls=runner.stats.calls, prompt_chars=runner.stats.prompt_chars,

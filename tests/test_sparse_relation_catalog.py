@@ -247,7 +247,7 @@ def test_prefixes_overflow_and_conflicting_snapshots():
 def test_uncertain_refs_share_the_same_duplicate_and_allowed_validation():
     coverage = RelationCoverage({"NEW-0001": frozenset({"MEM-0001"})})
     coverage.validate([SimpleNamespace(candidate_id="NEW-0001", relations=[], uncertain_existing_ids=["MEM-0001"])])
-    with pytest.raises(ValueError, match="duplicate"):
+    with pytest.raises(ValueError, match="names MEM-0001 more than once"):
         coverage.validate([SimpleNamespace(candidate_id="NEW-0001", relations=[SimpleNamespace(existing_id="MEM-0001")], uncertain_existing_ids=["MEM-0001"])])
 
 

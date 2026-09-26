@@ -251,7 +251,7 @@ class EntityResolver:
             runner = LlmBatchRunner(self.structured_llm_client, model=self.llm_model)
             decisions = await self._adjudicate(runner, ambiguous, texts_by_canonical)
             structured_llm_calls = runner.stats.calls
-            validation_retries = runner.stats.corrections
+            validation_retries = runner.stats.corrections + runner.stats.reasks
             for mention, candidates in ambiguous.items():
                 decision = decisions[mention]
                 candidate_ids = {candidate.id for candidate in candidates}

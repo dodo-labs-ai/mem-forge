@@ -591,8 +591,8 @@ async def test_a_candidate_whose_relation_row_stays_invalid_is_consumed_without_
     assert [op.memory for op in result.operations if op.action == ReconcileAction.ADD] == [judged]
     assert [(op.memory_id, op.action) for op in result.operations if op.memory_id] == [("mem-old", ReconcileAction.NOOP)]
     assert result.unresolved_candidate_count == 1
-    # Both Candidates with the correction, then each alone: the unjudged one with its correction.
-    assert client.calls == 5
+    # Both Candidates, then the unjudged one's re-ask.
+    assert client.calls == 2
 
 
 @pytest.mark.asyncio

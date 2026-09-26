@@ -2,12 +2,18 @@
 
 A caller describes its work: stable item IDs, optional ordered shared context,
 a renderer, a decoder and the client method to call. The runner owns capacity
-fit, packing, bounded concurrency, exact coverage, one correction per request,
-splitting and typed per-item failures. A multi-item request that fails on its
-size, or whose output is still invalid after its correction, is split in half
-until each item stands alone, so one item never fails the others. It knows no
-business meaning: the caller decides what an ``ItemFailure`` means and merges
-the per-chunk results of an item whose shared context did not fit one request.
+fit, packing, bounded concurrency, exact coverage, per-row acceptance, one
+correction per item and typed per-item failures.
+
+The model returns one row per item, and the decoder validates each row on its
+own. Valid rows are accepted at once and never sent again. The rejected items
+are re-asked once, together, in one request that holds only them and names each
+item's exact error; an item still rejected after that is an ``invalid_response``
+failure. A request is split in half only when the failing item cannot be named:
+when it fails on its size, or when its output cannot be read into rows even after
+one correction of the whole request. It knows no business meaning: the caller
+decides what an ``ItemFailure`` means and merges the per-chunk results of an item
+whose shared context did not fit one request.
 """
 
 from __future__ import annotations
@@ -44,12 +50,22 @@ type FailureCategory = Literal[
 ]
 
 OUTPUT_INVALID = "output_invalid"
-# Contract: one bounded correction per request, with the same input and refs.
+# Contract: one bounded correction, with the same input and refs.
 _MAX_CORRECTIONS = 1
+# The one correction of a response that cannot be read into rows.
 _CORRECTION_BLOCK = (
     "\n\n<correction>\n"
     "The previous response was rejected: {error}\n"
     "Return exactly one result for every requested ID. "
+    "Use only the IDs and refs supplied above.\n"
+    "</correction>"
+)
+# The one re-ask of the rejected items, each listed with its own error.
+_REASK_BLOCK = (
+    "\n\n<correction>\n"
+    "The previous response was rejected for the IDs requested here:\n"
+    "{errors}\n"
+    "Return exactly one corrected result for every requested ID. "
     "Use only the IDs and refs supplied above.\n"
     "</correction>"
 )
@@ -81,6 +97,19 @@ class BudgetedClient(Protocol):
     ) -> bool: ...
 
 
+class RejectedRow(ValueError):
+    """One item's row that fails the task's validation.
+
+    A decoder yields it in place of the item's result. Its message names the item
+    by the ID the model sees and states the exact error, for the item's re-ask;
+    ``cause`` keeps the validation error it came from, for the failure trace.
+    """
+
+    def __init__(self, message: str, *, cause: Exception | None = None) -> None:
+        super().__init__(message)
+        self.__cause__ = cause
+
+
 class RequestTooLarge(Exception):
     """Raised by a renderer that cannot assemble a request for this slice of work."""
 
@@ -90,8 +119,9 @@ class ItemFailure:
     """Why one item has no result.
 
     ``capacity_exceeded`` means the item alone exceeds the route's input
-    capacity; ``invalid_response`` means a model response for the item alone was
-    received and stayed invalid after its correction; the caller's stage records
+    capacity; ``invalid_response`` means the item's row stayed rejected after its
+    re-ask, or a response that holds only this item could not be read into rows
+    after its correction; the caller's stage records
     these two, and its Unit commits. The rest leave the Source Unit revision
     uncommitted: ``deadline_exceeded`` and ``provider_error`` are transient and
     the sync retries them at once, while ``request_error``, a request that failed
@@ -119,14 +149,23 @@ class ItemFailure:
 
 @dataclass(frozen=True)
 class ItemTask(Generic[Part, Result]):
-    """Independent items, optionally sharing ordered, separable context parts."""
+    """Independent items, optionally sharing ordered, separable context parts.
+
+    ``decode`` yields one ``(item_id, result)`` per row, or ``(item_id,
+    RejectedRow)`` for a row that fails validation, and raises ``ValueError``
+    only when the response cannot be read into rows. ``label`` names an item
+    as the model sees it.
+    """
 
     item_ids: Sequence[ItemId]
     render: Callable[[tuple[ItemId, ...], tuple[Part, ...]], LlmRequest]
-    decode: Callable[[BaseModel, tuple[ItemId, ...], tuple[Part, ...]], Iterable[tuple[ItemId, Result]]]
+    decode: Callable[
+        [BaseModel, tuple[ItemId, ...], tuple[Part, ...]], Iterable[tuple[ItemId, Result | RejectedRow]],
+    ]
     call: StructuredCall
     context: Sequence[Part] = ()
     journal: RequestJournal | None = None
+    label: Callable[[ItemId], str] = str
 
 
 @dataclass(frozen=True)
@@ -151,7 +190,8 @@ class ChainTask(Generic[Part, State]):
     together, by capacity alone, ahead of the rest. An item may finish only at a
     step that completes its own first part (``may_finish``); it leaves the chain
     at the first step whose decoded state is ``finished``. The step that reads
-    the last part must finish every item still reading.
+    the last part must finish every item still reading. ``decode`` and ``label``
+    follow ``ItemTask``; a row that breaks these rules is rejected alone.
     """
 
     initial_states: Mapping[ItemId, State]
@@ -160,9 +200,10 @@ class ChainTask(Generic[Part, State]):
     first_part_end: Mapping[ItemId, int]
     finished: Callable[[State], bool]
     render: Callable[[ChainStep[Part, State]], LlmRequest]
-    decode: Callable[[BaseModel, ChainStep[Part, State]], Iterable[tuple[ItemId, State]]]
+    decode: Callable[[BaseModel, ChainStep[Part, State]], Iterable[tuple[ItemId, State | RejectedRow]]]
     call: StructuredCall
     journal: RequestJournal | None = None
+    label: Callable[[ItemId], str] = str
 
 
 @dataclass(frozen=True)
@@ -191,9 +232,10 @@ class RequestJournal(Protocol):
 
 @dataclass
 class BatchStats:
-    calls: int = 0  # model calls sent, corrections included
-    corrections: int = 0
-    splits: int = 0  # requests halved after a size failure or output still invalid
+    calls: int = 0  # model calls sent, corrections and re-asks included
+    corrections: int = 0  # whole requests resent because their output could not be read into rows
+    reasks: int = 0  # requests that re-asked rejected rows
+    splits: int = 0  # requests halved after a size failure or output that could not be read into rows
     reused: int = 0  # requests answered from the journal without a call
     prompt_chars: int = 0
     failed_requests: int = 0  # requests whose items ended as ItemFailure
@@ -355,18 +397,25 @@ class LlmBatchRunner:
         self, task: ItemTask[Part, Result], item_ids: tuple[ItemId, ...], context: tuple[Part, ...],
         request: LlmRequest | None = None,
     ) -> dict[ItemId, Result | ItemFailure]:
-        """Send one packed request; halves run in this worker, so fan-out stays bounded."""
+        """Send one packed request, accept its valid rows and re-ask the rest once; halves run in this worker."""
 
         if request is None:
             request = self.fit(lambda: task.render(item_ids, context))
         if request is None:
-            outcome: dict[ItemId, Result] | ItemFailure = ItemFailure("capacity_exceeded", INPUT_CAPACITY_EXCEEDED)
+            outcome: dict[ItemId, Result | RejectedRow] | ItemFailure = ItemFailure(
+                "capacity_exceeded", INPUT_CAPACITY_EXCEEDED,
+            )
         else:
             outcome = await self._send(
-                request, item_ids, task.call, lambda response: task.decode(response, item_ids, context), task.journal,
+                request, item_ids, task.call, lambda response: task.decode(response, item_ids, context),
+                task.journal, task.label,
             )
             if not isinstance(outcome, ItemFailure):
-                return outcome
+                return await self._with_reask(
+                    outcome, render=lambda ids: task.render(ids, context),
+                    decode=lambda response, ids: task.decode(response, ids, context),
+                    call=task.call, journal=task.journal, label=task.label,
+                )
         if len(item_ids) > 1 and _splits_items(outcome):
             self._record_split(outcome, items=len(item_ids), parts=len(context))
             middle = len(item_ids) // 2
@@ -375,6 +424,92 @@ class LlmBatchRunner:
             return results
         self.stats.failed_requests += 1
         return dict.fromkeys(item_ids, outcome)
+
+    async def _with_reask(
+        self, rows: dict[ItemId, Result | RejectedRow], *,
+        render: Callable[[tuple[ItemId, ...]], LlmRequest],
+        decode: Callable[[BaseModel, tuple[ItemId, ...]], Iterable[tuple[ItemId, Result | RejectedRow]]],
+        call: StructuredCall, journal: RequestJournal | None, label: Callable[[ItemId], str],
+    ) -> dict[ItemId, Result | ItemFailure]:
+        """Keep the accepted rows and re-ask the rejected items once, together, naming each item's error.
+
+        The re-ask renders only the rejected items with the request's own context,
+        packed by capacity; an item whose re-ask cannot fit, or whose row is still
+        rejected, is an invalid response.
+        """
+
+        rejected = {item_id: row for item_id, row in rows.items() if isinstance(row, RejectedRow)}
+        results: dict[ItemId, Result | ItemFailure] = {
+            item_id: row for item_id, row in rows.items() if not isinstance(row, RejectedRow)
+        }
+        if not rejected:
+            return results
+        logger.warning(
+            "llm_batch_rows_rejected items=%d rejected=%d error_classes=%s", len(rows), len(rejected),
+            ",".join(sorted({type(row.__cause__ or row).__name__ for row in rejected.values()})),
+        )
+
+        def corrected(ids: tuple[ItemId, ...]) -> LlmRequest:
+            request = render(ids)
+            errors = "\n".join(f"- {rejected[item_id]}" for item_id in ids)
+            return replace(request, prompt=request.prompt + _REASK_BLOCK.format(errors=errors))
+
+        ids = tuple(rejected)
+        start = 0
+        while start < len(ids):
+            remaining = ids[start:]
+            found = _longest(len(remaining), lambda count: self._fit_reask(remaining[:count], corrected))
+            if found is None:
+                results[remaining[0]] = _invalid(rejected[remaining[0]])
+                start += 1
+                continue
+            sub, request = found
+            results.update(await self._send_reask(sub, request, rejected, corrected, decode, call, journal, label))
+            start += len(sub)
+        return results
+
+    def _fit_reask(
+        self, ids: tuple[ItemId, ...], corrected: Callable[[tuple[ItemId, ...]], LlmRequest],
+    ) -> tuple[tuple[ItemId, ...], LlmRequest] | None:
+        """A re-ask is the correction itself, so it keeps no room for another one."""
+
+        try:
+            request = self._bounded(corrected(ids))
+        except RequestTooLarge:
+            return None
+        return (ids, request) if self.fits(request, correction=True) else None
+
+    async def _send_reask(
+        self, ids: tuple[ItemId, ...], request: LlmRequest, rejected: Mapping[ItemId, RejectedRow],
+        corrected: Callable[[tuple[ItemId, ...]], LlmRequest],
+        decode: Callable[[BaseModel, tuple[ItemId, ...]], Iterable[tuple[ItemId, Result | RejectedRow]]],
+        call: StructuredCall, journal: RequestJournal | None, label: Callable[[ItemId], str],
+    ) -> dict[ItemId, Result | ItemFailure]:
+        """Send one re-ask; a re-ask that fails on its size or cannot be read into rows is halved."""
+
+        self.stats.reasks += 1
+        outcome = await self._send(
+            request, ids, call, lambda response: decode(response, ids), journal, label, correct=False,
+        )
+        if not isinstance(outcome, ItemFailure):
+            return {
+                item_id: _invalid(row) if isinstance(row, RejectedRow) else row for item_id, row in outcome.items()
+            }
+        if len(ids) > 1 and _splits_items(outcome):
+            self._record_split(outcome, items=len(ids), parts=0)
+            middle = len(ids) // 2
+            results: dict[ItemId, Result | ItemFailure] = {}
+            for half in (ids[:middle], ids[middle:]):
+                found = self._fit_reask(half, corrected)
+                if found is None:
+                    results.update({item_id: _invalid(rejected[item_id]) for item_id in half})
+                    continue
+                results.update(
+                    await self._send_reask(half, found[1], rejected, corrected, decode, call, journal, label),
+                )
+            return results
+        self.stats.failed_requests += 1
+        return dict.fromkeys(ids, outcome)
 
     def _next_step(
         self, task: ChainTask[Part, State], lane: _Lane, states: Mapping[ItemId, State],
@@ -420,14 +555,30 @@ class LlmBatchRunner:
             step, request = found
             outcome = await self._send(
                 request, step.item_ids, task.call,
-                lambda response, step=step: _chain_states(task, step, task.decode(response, step)), task.journal,
+                lambda response, step=step: _chain_rows(task, step, task.decode(response, step)),
+                task.journal, task.label,
             )
             if not isinstance(outcome, ItemFailure):
-                states.update(outcome)
+                # A re-asked item reads the same parts from the same position with its unchanged state.
+                read = await self._with_reask(
+                    outcome, render=lambda ids, step=step: task.render(_substep(step, ids)),
+                    decode=lambda response, ids, step=step: _chain_rows(
+                        task, _substep(step, ids), task.decode(response, _substep(step, ids)),
+                    ),
+                    call=task.call, journal=task.journal, label=task.label,
+                )
+                ended = set()
+                for item_id, row in read.items():
+                    if isinstance(row, ItemFailure):
+                        outcomes[item_id] = replace(row, part=step.position)
+                        ended.add(item_id)
+                        continue
+                    states[item_id] = row
+                    if task.finished(row):
+                        outcomes[item_id] = row
+                        ended.add(item_id)
                 lane.position += len(step.parts)
-                finished = {item_id for item_id, state in outcome.items() if task.finished(state)}
-                outcomes.update({item_id: outcome[item_id] for item_id in finished})
-                lane.item_ids = tuple(item_id for item_id in lane.item_ids if item_id not in finished)
+                lane.item_ids = tuple(item_id for item_id in lane.item_ids if item_id not in ended)
                 continue
             if _splits_items(outcome) and len(step.item_ids) > 1:
                 self._record_split(outcome, items=len(step.item_ids), parts=len(step.parts))
@@ -446,9 +597,14 @@ class LlmBatchRunner:
 
     async def _send(
         self, request: LlmRequest, item_ids: tuple[ItemId, ...], call: StructuredCall,
-        decode: Callable[[BaseModel], Iterable[tuple[ItemId, Result]]], journal: RequestJournal | None,
-    ) -> dict[ItemId, Result] | ItemFailure:
-        """Send one request, or reuse its journaled response, which was validated when recorded."""
+        decode: Callable[[BaseModel], Iterable[tuple[ItemId, Result | RejectedRow]]],
+        journal: RequestJournal | None, label: Callable[[ItemId], str], *, correct: bool = True,
+    ) -> dict[ItemId, Result | RejectedRow] | ItemFailure:
+        """Send one request, or reuse its journaled response, and read it into one row per item.
+
+        A response that reads into rows is journaled even when some rows are
+        rejected, so a retried run reuses its accepted rows without a call.
+        """
 
         work_id = None
         if journal is not None:
@@ -456,24 +612,27 @@ class LlmBatchRunner:
             if stored is not None:
                 self.stats.reused += 1
                 try:
-                    return _covered(decode(stored), item_ids)
+                    return _rows(decode(stored), item_ids, label)
                 except ValueError as error:
-                    # The stored response no longer decodes under this task's rules.
+                    # The stored response no longer reads into rows under this task's rules.
                     return ItemFailure("invalid_response", OUTPUT_INVALID, error)
-        outcome = await self._call_with_correction(request, item_ids, call, decode, work_id)
+        outcome = await self._call_with_correction(request, item_ids, call, decode, work_id, label, correct)
         if isinstance(outcome, ItemFailure):
             if journal is not None:
                 await journal.record(work_id, outcome)
             return outcome
-        response, results = outcome
+        response, rows = outcome
         if journal is not None:
             await journal.record(work_id, response)
-        return results
+        return rows
 
     async def _call_with_correction(
         self, request: LlmRequest, item_ids: tuple[ItemId, ...], call: StructuredCall,
-        decode: Callable[[BaseModel], Iterable[tuple[ItemId, Result]]], work_id: str | None,
-    ) -> tuple[BaseModel, dict[ItemId, Result]] | ItemFailure:
+        decode: Callable[[BaseModel], Iterable[tuple[ItemId, Result | RejectedRow]]], work_id: str | None,
+        label: Callable[[ItemId], str], correct: bool,
+    ) -> tuple[BaseModel, dict[ItemId, Result | RejectedRow]] | ItemFailure:
+        """Call once; a response that cannot be read into rows gets one correction of the whole request."""
+
         lineage = {} if work_id is None else {"work_id": work_id}
         image_kwargs = {"images": request.images} if request.images else {}
         prompt = request.prompt
@@ -490,7 +649,13 @@ class LlmBatchRunner:
             capture = None
             try:
                 async with validation_trace(response, **lineage) as capture:
-                    results = _covered(decode(response), item_ids)
+                    rows = _rows(decode(response), item_ids, label)
+                    rejected_rows = [row for row in rows.values() if isinstance(row, RejectedRow)]
+                    if capture is not None and rejected_rows:
+                        # The response is kept, so its rejected rows are traced here; each is re-asked.
+                        for row in rejected_rows:
+                            capture.failed(row.__cause__ or row, stage="business_validation")
+                        await capture.persist()
             except ValueError as error:
                 if capture is not None:
                     rejected_captures.append(capture)
@@ -499,7 +664,7 @@ class LlmBatchRunner:
                     len(item_ids), corrections + 1, type(error).__name__,
                 )
                 corrected = replace(request, prompt=request.prompt + _CORRECTION_BLOCK.format(error=error))
-                if corrections == _MAX_CORRECTIONS or not self.fits(corrected, correction=True):
+                if not correct or corrections == _MAX_CORRECTIONS or not self.fits(corrected, correction=True):
                     return ItemFailure("invalid_response", OUTPUT_INVALID, error)
                 corrections += 1
                 self.stats.corrections += 1
@@ -507,7 +672,7 @@ class LlmBatchRunner:
                 continue
             for rejected in rejected_captures:
                 await rejected.recovered()
-            return response, results
+            return response, rows
 
     def _record_split(self, failure: ItemFailure, *, items: int, parts: int) -> None:
         self.stats.splits += 1
@@ -539,37 +704,62 @@ def _halve_lane(lane: _Lane) -> list[_Lane]:
     ]
 
 
-def _chain_states(
-    task: ChainTask[Part, State], step: ChainStep[Part, State], pairs: Iterable[tuple[ItemId, State]],
-) -> list[tuple[ItemId, State]]:
-    """Hold a decoded step to the chain contract, so a violation gets the one correction."""
+def _substep(step: ChainStep[Part, State], item_ids: tuple[ItemId, ...]) -> ChainStep[Part, State]:
+    """The same step for some of its items: same parts and position, their own states."""
 
-    states = _covered(pairs, step.item_ids)
-    early = sorted(item_id for item_id, state in states.items() if task.finished(state) and item_id not in step.may_finish)
-    if early:
-        raise ValueError(f"items finished before reading their first part: {', '.join(early)}")
-    if step.position + len(step.parts) == step.total:
-        unfinished = sorted(item_id for item_id, state in states.items() if not task.finished(state))
-        if unfinished:
-            raise ValueError(f"items did not finish at the last part: {', '.join(unfinished)}")
-    return list(states.items())
+    return ChainStep(
+        item_ids, step.parts, {item_id: step.states[item_id] for item_id in item_ids}, step.position, step.total,
+        step.may_finish & frozenset(item_ids),
+    )
 
 
-def _covered(pairs: Iterable[tuple[ItemId, Result]], item_ids: tuple[ItemId, ...]) -> dict[ItemId, Result]:
-    """Require exactly one result for every requested item and nothing else."""
+def _chain_rows(
+    task: ChainTask[Part, State], step: ChainStep[Part, State], pairs: Iterable[tuple[ItemId, State | RejectedRow]],
+) -> Iterable[tuple[ItemId, State | RejectedRow]]:
+    """Hold each decoded row to the chain contract; a row that breaks it is rejected alone."""
 
-    expected = set(item_ids)
-    results: dict[ItemId, Result] = {}
-    for item_id, result in pairs:
-        if item_id not in expected:
-            raise ValueError("the response names an ID that was not requested")
-        if item_id in results:
-            raise ValueError("the response returns an ID more than once")
-        results[item_id] = result
-    missing = len(expected) - len(results)
-    if missing:
-        raise ValueError(f"the response omits {missing} of {len(expected)} requested IDs")
-    return {item_id: results[item_id] for item_id in item_ids}
+    last = step.position + len(step.parts) == step.total
+    for item_id, row in pairs:
+        if isinstance(row, RejectedRow) or item_id not in step.states:
+            yield item_id, row
+        elif task.finished(row) and item_id not in step.may_finish:
+            yield item_id, RejectedRow(f"{task.label(item_id)} finished before reading its first part")
+        elif last and not task.finished(row):
+            yield item_id, RejectedRow(f"{task.label(item_id)} did not finish at the last part")
+        else:
+            yield item_id, row
+
+
+def _rows(
+    pairs: Iterable[tuple[ItemId, Result | RejectedRow]], item_ids: tuple[ItemId, ...], label: Callable[[ItemId], str],
+) -> dict[ItemId, Result | RejectedRow]:
+    """One row per requested item: its decoded result, or why it has none.
+
+    A row for an ID that was not requested is ignored; an item with no row or
+    with several rows is rejected.
+    """
+
+    requested = set(item_ids)
+    found: dict[ItemId, list[Result | RejectedRow]] = {}
+    for item_id, row in pairs:
+        if item_id in requested:
+            found.setdefault(item_id, []).append(row)
+    rows: dict[ItemId, Result | RejectedRow] = {}
+    for item_id in item_ids:
+        answers = found.get(item_id, [])
+        if not answers:
+            rows[item_id] = RejectedRow(f"no result was returned for {label(item_id)}")
+        elif len(answers) > 1:
+            rows[item_id] = RejectedRow(f"{label(item_id)} was returned more than once")
+        else:
+            rows[item_id] = answers[0]
+    return rows
+
+
+def _invalid(row: RejectedRow) -> ItemFailure:
+    """An item whose row is still rejected after its one re-ask."""
+
+    return ItemFailure("invalid_response", OUTPUT_INVALID, row)
 
 
 def _failure_from_error(error: StructuredLlmError) -> ItemFailure:
@@ -591,6 +781,10 @@ def _is_size_failure(failure: ItemFailure) -> bool:
 
 
 def _splits_items(failure: ItemFailure) -> bool:
-    """Halving the items may help: the request was too large, or one item's output spoils the rest."""
+    """Halving the items may help: the request was too large, or its output could not be read into rows.
+
+    A request-level ``invalid_response`` means the response could not be read
+    into per-item rows, so the failing item cannot be named.
+    """
 
     return _is_size_failure(failure) or failure.category == "invalid_response"
