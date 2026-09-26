@@ -26,6 +26,8 @@ ATLASSIAN_MAX_RETRY_DELAY_SECONDS = 60.0
 # succeeds on the next try, so a transient transport failure is retried after a
 # short, fixed pause rather than the rate-limit backoff.
 ATLASSIAN_TRANSPORT_RETRY_DELAY_SECONDS = 1.0
+# Responses that say the requested record does not exist (any longer).
+ATLASSIAN_ABSENT_STATUS_CODES = frozenset({httpx.codes.NOT_FOUND, httpx.codes.GONE})
 _ATLASSIAN_LIMITERS_LOCK = Lock()
 _ATLASSIAN_REQUEST_LIMITERS: dict[str, "AtlassianRequestLimiter"] = {}
 

@@ -10350,13 +10350,25 @@ async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: D
         structured_llm_client=client,
         max_concurrent=1,
     )
-    with pytest.raises(StructuredLlmError) as raised:
-        await orchestrator._resume_source_derivations(
-            source_id=source_id,
-            source_activity_epoch=attempt.context.source_activity_epoch,
-            run_id="run-recovery-summary",
-            lifecycle_execution_owner_id="run-recovery-summary:attempt:1",
-        )
+    recover = orchestrator._resume_source_derivations(
+        source_id=source_id,
+        source_activity_epoch=attempt.context.source_activity_epoch,
+        run_id="run-recovery-summary",
+        lifecycle_execution_owner_id="run-recovery-summary:attempt:1",
+    )
+    [staged] = await db.list_source_derivation_attempts(source_id=source_id)
+    if failure_mode == "invalid_response":
+        # An invalid response repeats on every attempt: recovery ends the derivation and continues.
+        [failed] = (await recover).failed_results
+        assert failed["derivation_id"] == attempt.id
+        [ended] = await db.list_source_derivation_attempts(source_id=source_id)
+        assert (ended.status, ended.terminal_reason_code) == ("superseded", "DERIVATION_DETERMINISTIC_FAILURE")
+    else:
+        # A transient failure stops the run and leaves the derivation staged.
+        with pytest.raises(StructuredLlmError):
+            await recover
+        [kept] = await db.list_source_derivation_attempts(source_id=source_id)
+        assert kept.status == staged.status
     summaries = await db.list_memory_audit_events(event_type="source_unit_llm_summary")
     assert len(summaries) == 1
     assert summaries[0].status == "failed"
@@ -10364,7 +10376,7 @@ async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: D
     assert summaries[0].payload["logical_calls"] == 1
     assert summaries[0].payload["provider_attempts"] == 1
     assert summaries[0].payload["terminal_category_counts"] == {failure_mode: 1}
-    assert summaries[0].payload["error_code_counts"] == {raised.value.error_code: 1}
+    assert sum(summaries[0].payload["error_code_counts"].values()) == 1
 
 
 @pytest.mark.asyncio
@@ -11591,7 +11603,8 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
         version="0",
         normalized_content_uri="file:///tmp/Architecture/existing.md",
         projection_source_type="confluence",
-        # The gene reports this space, which the Unit Title names.
+        # The gene reports this space and URL, so the committed revision is the one it projects.
+        source_url="https://jira.example/browse/0",
         space_or_project="PAY",
     )
     await db.db.execute(

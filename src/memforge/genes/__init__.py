@@ -13,7 +13,8 @@ with a debug-level log message so the rest of the system keeps working.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 from memforge.genes.base import Gene
 from memforge.models import GeneMetadata, SourceExecutionKind
@@ -26,6 +27,7 @@ __all__ = [
     "register_gene",
     "create_gene",
     "list_available_genes",
+    "source_rediscovers_documents",
     "source_type_execution_kinds",
     "source_type_supports_sync",
     "Gene",
@@ -135,6 +137,12 @@ def source_type_execution_kinds(source_type: str) -> tuple[SourceExecutionKind, 
 def source_type_supports_sync(source_type: str) -> bool:
     """Whether the source type participates in the ordinary sync lifecycle."""
     return bool(source_type_execution_kinds(source_type))
+
+
+def source_rediscovers_documents(source_type: str, config: Mapping[str, Any]) -> bool:
+    """Whether a configured Source can ask its provider for one Document by id."""
+    gene_cls = GENE_REGISTRY.get(str(source_type or "").strip())
+    return gene_cls is not None and gene_cls.rediscovers_documents(config)
 
 
 # ---------------------------------------------------------------------------

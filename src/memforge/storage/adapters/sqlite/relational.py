@@ -12,7 +12,7 @@ import logging
 import math
 import sqlite3
 from datetime import datetime
-from typing import Any, Mapping, Sequence
+from typing import Any, Collection, Mapping, Sequence
 
 import aiosqlite
 
@@ -582,6 +582,12 @@ class SqliteRelationalStore:
         source_unit_id: str,
     ) -> dict[str, SourceObservationRevision]:
         return dict(await self._db.get_current_source_observation_revisions(source_unit_id))
+
+    async def get_source_observation_revisions(
+        self,
+        revision_ids: Collection[str],
+    ) -> dict[str, SourceObservationRevision]:
+        return dict(await self._db.get_source_observation_revisions(revision_ids))
 
     async def get_current_source_unit_projection(self, source_unit_id: str):
         return await self._db.get_current_source_unit_projection(source_unit_id)

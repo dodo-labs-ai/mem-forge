@@ -219,6 +219,7 @@ from memforge.retrieval.access_predicate import readable_source_sql, visible_sql
 from memforge.retrieval.metadata_text import metadata_alias_text, metadata_compact_text
 from memforge.source_access import infer_legacy_source_access
 from memforge.source_derivation import (
+    DERIVATION_INPUT_SUPERSEDED,
     SOURCE_DERIVATION_BATCH_COMPLETED,
     SOURCE_DERIVATION_BATCH_RETRYABLE_FAILURE,
     SOURCE_DERIVATION_COMPLETED,
@@ -242,6 +243,7 @@ from memforge.source_projection import (
     EvidenceCoordinateSpace,
     EvidenceRepresentationProfile,
     ProjectionCoverage,
+    ProjectionIdentityConflict,
     ProjectionScopeAttestation,
     ProjectionScopeTransition,
     ProjectionScopeTransitionStatus,
@@ -4420,6 +4422,23 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                   )""",
         ],
     ),
+    (
+        102,
+        "Classify every stored Jira changelog revision",
+        # Observation Revisions are content-addressed, so a stored row is reused
+        # whenever its content is projected again; the classification is
+        # computed from that content (see _classify_jira_changelog_revisions_unlocked).
+        [],
+    ),
+    (
+        103,
+        "Supersede unapplied reprocess derivations staged from stored input",
+        # Only a reprocess stages a derivation without a Support baseline.
+        # Before stored input was kept current, a reprocess could stage one from
+        # raw content older than the committed revision; applying it would
+        # regress the Unit (see _supersede_stored_input_reprocess_derivations_unlocked).
+        [],
+    ),
 ]
 
 
@@ -4716,6 +4735,12 @@ class Database:
                     )
             if version == 90:
                 await self._backfill_evidence_context_associations_unlocked()
+            if version == 102:
+                classified = await self._classify_jira_changelog_revisions_unlocked()
+                logger.info("Classified %d stored Jira changelog revisions", classified)
+            if version == 103:
+                superseded = await self._supersede_stored_input_reprocess_derivations_unlocked()
+                logger.info("Superseded %d unapplied reprocess derivations staged from stored input", superseded)
             await self.db.execute(
                 "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, _now_iso()),
@@ -4733,6 +4758,43 @@ class Database:
                     raise RuntimeError("failed to restore SQLite foreign key enforcement")
             logger.info("Applied migration %d: %s", version, description)
         await self._assert_memory_source_ids_resolved()
+
+    async def _classify_jira_changelog_revisions_unlocked(self) -> int:
+        """Give every stored Jira changelog revision the semantic class its content has."""
+
+        from memforge.pipeline.source_projection_adapters import jira_changelog_semantic_class
+
+        rows = await self.db.execute_fetchall(
+            """SELECT sor.id, sor.content, sor.metadata_json
+                 FROM source_observation_revisions sor
+                 JOIN source_observations so ON so.id = sor.observation_id
+                 JOIN source_units su ON su.id = so.source_unit_id
+                WHERE so.observation_type = 'changelog'
+                  AND su.unit_type = 'jira_issue'
+                  AND json_extract(sor.metadata_json, '$.semantic_class') IS NULL
+                ORDER BY sor.id"""
+        )
+        for row in rows:
+            history = json.loads(str(row["content"]))
+            metadata = json.loads(str(row["metadata_json"] or "{}"))
+            metadata["semantic_class"] = jira_changelog_semantic_class(history)
+            await self.db.execute(
+                "UPDATE source_observation_revisions SET metadata_json = ? WHERE id = ?",
+                (json.dumps(metadata, sort_keys=True), row["id"]),
+            )
+        return len(rows)
+
+    async def _supersede_stored_input_reprocess_derivations_unlocked(self) -> int:
+        """End unapplied derivations that a reprocess staged; their input may predate the committed revision."""
+
+        cursor = await self.db.execute(
+            """UPDATE source_derivation_attempts
+                  SET status = 'superseded', terminal_reason_code = ?, updated_at = ?
+                WHERE status IN ('pending', 'retryable_failure', 'completed')
+                  AND json_extract(context_payload_json, '$.support_without_baseline') = 1""",
+            (DERIVATION_INPUT_SUPERSEDED, _now_iso()),
+        )
+        return cursor.rowcount
 
     async def _backfill_evidence_context_associations_unlocked(self) -> None:
         rows = await self.db.execute_fetchall(
@@ -6891,14 +6953,14 @@ class Database:
                             now,
                         ),
                     )
+                    # Content-addressed: a stored row with this identity is
+                    # kept as it is, whatever metadata this projection carries.
                     await self._assert_projection_identity_unlocked(
                         table="source_observation_revisions",
                         row_id=revision.id,
                         expected={
                             "observation_id": revision.observation_id,
                             "semantic_hash": revision.semantic_hash,
-                            "content": revision.content,
-                            "metadata_json": metadata_json,
                             "profile_name": profile.name if profile is not None else None,
                             "profile_version": profile.version if profile is not None else None,
                             "coordinate_space": profile.coordinate_space.value if profile is not None else None,
@@ -7021,7 +7083,7 @@ class Database:
         async with self.db.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)) as cursor:
             row = await cursor.fetchone()
         if row is None or any(row[key] != value for key, value in expected.items()):
-            raise ValueError(f"immutable projection identity mismatch: {table}:{row_id}")
+            raise ProjectionIdentityConflict(table, row_id)
 
     async def get_source_projection(self, run_id: str) -> SourceProjection | None:
         async with self.db.execute(
@@ -7235,6 +7297,24 @@ class Database:
                     metadata=json.loads(row["metadata_json"] or "{}"),
                     evidence_profile=_evidence_profile_from_storage_row(row),
                 )
+        return revisions
+
+    async def get_source_observation_revisions(
+        self,
+        revision_ids: Collection[str],
+    ) -> Mapping[str, SourceObservationRevision]:
+        """Read the stored Observation Revisions among these ids, keyed by id."""
+
+        ids = sorted(set(revision_ids))
+        revisions: dict[str, SourceObservationRevision] = {}
+        for offset in range(0, len(ids), STORAGE_BIND_CHUNK_SIZE):
+            chunk = ids[offset:offset + STORAGE_BIND_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            for row in await self.db.execute_fetchall(
+                f"SELECT * FROM source_observation_revisions WHERE id IN ({placeholders})",
+                tuple(chunk),
+            ):
+                revisions[str(row["id"])] = _source_observation_revision_from_storage_row(row)
         return revisions
 
     async def get_current_source_unit_projection(
@@ -17313,7 +17393,7 @@ class Database:
     ) -> SourceSyncRun:
         """Queue one sync run, or coalesce into the Source's active run.
 
-        ``reprocess_document_ids`` queue an operator reprocess of those stored
+        ``reprocess_document_ids`` queue an operator reprocess of those
         Documents instead. It never coalesces: it is refused with
         :class:`SourceSyncRunActive` while another run is pending or running.
         A sync requested while a reprocess is active runs after it.
@@ -17360,7 +17440,7 @@ class Database:
         if reprocess_document_ids and (
             trigger != "reprocess" or force_full_sync or input_snapshot_id or retry_run_id
         ):
-            raise ValueError("a reprocess run names stored Documents only")
+            raise ValueError("a reprocess run names its Documents only")
         normalized_snapshot_id = _non_empty_string(input_snapshot_id)
         normalized_config_revision = _non_empty_string(source_config_revision)
         normalized_predecessor_activity_id = _non_empty_string(predecessor_activity_id)

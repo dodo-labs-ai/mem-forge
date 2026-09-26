@@ -337,7 +337,7 @@ class DocumentRecord:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     # The source-specific metadata of the item the Gene discovered
-    # (``ContentItem.extra``); a reprocess projects the stored input with it.
+    # (``ContentItem.extra``); a reprocess rebuilds the item from it.
     item_extra: dict = field(default_factory=dict)
 
 
@@ -533,7 +533,7 @@ class SourceSyncRun:
     rerun_source_config_revision: str | None = None
     predecessor_activity_id: str | None = None
     rerun_predecessor_activity_id: str | None = None
-    # Documents an operator reprocess reads from storage; empty for a sync.
+    # Documents an operator reprocess processes; empty for a sync.
     reprocess_document_ids: tuple[str, ...] = ()
     coalesced: bool = False
     lease_owner: str | None = None
