@@ -5236,13 +5236,15 @@ async def test_policy_replacement_failure_preserves_recoverable_new_work(
         max_concurrent=1,
     )
 
-    with pytest.raises(RuntimeError, match="lifecycle apply failed"):
-        await recovery._resume_source_derivations(
-            source_id=source_id,
-            source_activity_epoch=attempt.context.source_activity_epoch,
-            run_id="run-v9-policy-replacement-failure",
-        )
+    recovered = await recovery._resume_source_derivations(
+        source_id=source_id,
+        source_activity_epoch=attempt.context.source_activity_epoch,
+        run_id="run-v9-policy-replacement-failure",
+    )
 
+    # A retryable failure leaves the replacement staged and does not stop recovery.
+    [failed] = recovered.failed_results
+    assert (failed["error"], failed["failure_retryable"]) == ("lifecycle apply failed", True)
     attempts = {
         item.id: item
         for item in await db.list_source_derivation_attempts(source_id=source_id)
@@ -10350,13 +10352,17 @@ async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: D
         structured_llm_client=client,
         max_concurrent=1,
     )
-    with pytest.raises(StructuredLlmError) as raised:
-        await orchestrator._resume_source_derivations(
-            source_id=source_id,
-            source_activity_epoch=attempt.context.source_activity_epoch,
-            run_id="run-recovery-summary",
-            lifecycle_execution_owner_id="run-recovery-summary:attempt:1",
-        )
+    recovered = await orchestrator._resume_source_derivations(
+        source_id=source_id,
+        source_activity_epoch=attempt.context.source_activity_epoch,
+        run_id="run-recovery-summary",
+        lifecycle_execution_owner_id="run-recovery-summary:attempt:1",
+    )
+    # A model failure leaves the derivation staged for the next run.
+    [failed] = recovered.failed_results
+    assert failed["derivation_id"] == attempt.id and failed["failure_retryable"]
+    [staged] = await db.list_source_derivation_attempts(source_id=source_id)
+    assert staged.status == "completed"
     summaries = await db.list_memory_audit_events(event_type="source_unit_llm_summary")
     assert len(summaries) == 1
     assert summaries[0].status == "failed"
@@ -10364,7 +10370,7 @@ async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: D
     assert summaries[0].payload["logical_calls"] == 1
     assert summaries[0].payload["provider_attempts"] == 1
     assert summaries[0].payload["terminal_category_counts"] == {failure_mode: 1}
-    assert summaries[0].payload["error_code_counts"] == {raised.value.error_code: 1}
+    assert sum(summaries[0].payload["error_code_counts"].values()) == 1
 
 
 @pytest.mark.asyncio
@@ -11591,7 +11597,8 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
         version="0",
         normalized_content_uri="file:///tmp/Architecture/existing.md",
         projection_source_type="confluence",
-        # The gene reports this space, which the Unit Title names.
+        # The gene reports this space and URL, so the committed revision is the one it projects.
+        source_url="https://jira.example/browse/0",
         space_or_project="PAY",
     )
     await db.db.execute(

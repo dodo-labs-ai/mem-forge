@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import math
+import sqlite3
 import threading
 import uuid
 from collections import defaultdict
@@ -34,6 +35,7 @@ from memforge.evals.agent_evaluation import (
     publish_agent_assessments,
     publish_runtime_events,
 )
+from memforge.genes import source_rediscovers_documents
 from memforge.genes.base import SourceConfigurationError
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
@@ -86,6 +88,7 @@ from memforge.source_artifacts import (
     materialize_source_artifacts,
 )
 from memforge.source_derivation import (
+    DERIVATION_DETERMINISTIC_FAILURE,
     DERIVATION_INPUT_SUPERSEDED,
     SourceDerivationAttempt,
     SourceUnitDerivationContext,
@@ -104,12 +107,13 @@ from memforge.pipeline.stored_document import (
     StoredDocumentUnavailableReason,
     StoredSourceDocument,
     load_stored_source_document,
+    rediscover_source_document,
 )
 from memforge.pipeline.projection_images import (
     load_projection_images,
 )
 from memforge.source_access import memory_visibility_for_source_id
-from memforge.source_activity import SourceActivityLease
+from memforge.source_activity import SourceActivityConflict, SourceActivityLease
 from memforge.source_projection_config import canonical_projection_scope
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time, reported_source_time
 
@@ -140,11 +144,13 @@ DEFAULT_INCREMENTAL_SYNC_OVERLAP = timedelta(minutes=10)
 class SourceSyncMode(str, Enum):
     """What one Source sync run reads.
 
-    NORMAL discovers and fetches from the provider. REPROCESS reads named
-    Documents from storage and processes each Source Unit at its current
-    revision with the current adapter and compiler: extraction reads every
-    ReadingGroup and every Support is read over the whole Unit. It never
-    contacts the provider, advances the sync cursor or infers removals.
+    NORMAL discovers and fetches from the provider. REPROCESS processes the
+    Source Units of named Documents with the current adapter and compiler:
+    extraction reads every ReadingGroup and every Support is read over the
+    whole Unit. It reads each Document's current state from the provider when
+    the Source can ask for one Document by id, and its stored input otherwise
+    (see :mod:`memforge.pipeline.stored_document`). It never advances the sync
+    cursor or infers removals.
     """
 
     NORMAL = "normal"
@@ -184,8 +190,12 @@ class _SourceDerivationRecovery:
         return tuple(
             result
             for result in self.results
-            if result.get("deferred_lifecycle") is None
+            if result.get("deferred_lifecycle") is None and not result["failed"]
         )
+
+    @property
+    def failed_results(self) -> tuple[dict[str, Any], ...]:
+        return tuple(result for result in self.results if result["failed"])
 
     @property
     def deferred_results(self) -> tuple[dict[str, Any], ...]:
@@ -564,6 +574,16 @@ def _fail_deferred_commits_nothing_can_unblock(
             result["deferred_lifecycle"] = None
 
 
+def _is_infrastructure_failure(exc: BaseException) -> bool:
+    """Whether a failure belongs to the run rather than to one Source Unit.
+
+    Storage and network I/O that fails, and a Source activity fence the run no
+    longer holds, affect every Unit alike, so the run stops.
+    """
+
+    return isinstance(exc, (OSError, sqlite3.OperationalError, SourceActivityConflict))
+
+
 def _retained_document_error(exc: BaseException) -> str:
     """Project an exception into bounded state without retaining its traceback."""
 
@@ -771,12 +791,12 @@ class GeneSyncOrchestrator:
             When true, discover the complete submitted snapshot so removals can
             be reconciled, while still skipping documents whose content is unchanged.
         reprocess_doc_ids:
-            The Documents a REPROCESS run reads from storage; required by and
-            only accepted with that mode.
+            The Documents a REPROCESS run processes; required by and only
+            accepted with that mode.
         execution_mode:
-            NORMAL discovers from the provider; REPROCESS processes the stored
-            ``reprocess_doc_ids`` at their current revisions (see
-            :class:`SourceSyncMode`). Discovery options do not apply to it.
+            NORMAL discovers from the provider; REPROCESS processes
+            ``reprocess_doc_ids`` (see :class:`SourceSyncMode`). Discovery
+            options do not apply to it.
         record_terminal_result:
             Persist the terminal SyncState and history here. Durable workers
             disable this so their lease-fenced completion transaction owns the
@@ -846,6 +866,7 @@ class GeneSyncOrchestrator:
         failure_retryable = True
         recovered_completed_results: tuple[dict[str, Any], ...] = ()
         recovered_deferred_results: tuple[dict[str, Any], ...] = ()
+        recovered_failed_results: tuple[dict[str, Any], ...] = ()
 
         try:
             recovered = await self._resume_source_derivations(
@@ -858,6 +879,7 @@ class GeneSyncOrchestrator:
             )
             recovered_completed_results = recovered.completed_results
             recovered_deferred_results = recovered.deferred_results
+            recovered_failed_results = recovered.failed_results
 
             stored_documents: dict[str, StoredSourceDocument] = {}
             if reprocessing:
@@ -865,18 +887,34 @@ class GeneSyncOrchestrator:
                     raise RuntimeError(
                         "reprocess waits for the open Projection Scope transition to complete"
                     )
+                rediscovering = source_rediscovers_documents(
+                    configured_source_type,
+                    (configured_source or {}).get("config") or {},
+                )
+                if rediscovering:
+                    await gene.authenticate()
                 items = []
                 for doc_id in sorted(reprocess_doc_ids or ()):
                     try:
-                        stored = await load_stored_source_document(
-                            self.db, self.doc_store, source_id=source_id, document_id=doc_id,
-                        )
-                    except StoredDocumentUnavailable as exc:
+                        if rediscovering:
+                            item = await rediscover_source_document(
+                                self.db, gene, source_id=source_id, document_id=doc_id,
+                            )
+                        else:
+                            stored = await load_stored_source_document(
+                                self.db, self.doc_store, source_id=source_id, document_id=doc_id,
+                            )
+                            stored_documents[doc_id] = stored
+                            item = stored.item
+                    except Exception as exc:
+                        if _is_infrastructure_failure(exc):
+                            raise
                         docs_failed += 1
-                        failed_docs.append(FailedDoc(doc_id=doc_id, title=doc_id, error=str(exc)))
+                        failed_docs.append(
+                            FailedDoc(doc_id=doc_id, title=doc_id, error=_retained_document_error(exc))
+                        )
                         continue
-                    stored_documents[doc_id] = stored
-                    items.append(stored.item)
+                    items.append(item)
                 indexed_doc_ids: set[str] = set()
                 last_sync_time = None
                 total_item_count = len(items)
@@ -1100,6 +1138,7 @@ class GeneSyncOrchestrator:
                                 run_id=run_id,
                                 progress_callback=on_item_progress,
                                 force_reprocess=force_full_sync or reprocessing,
+                                reprocessing=reprocessing,
                                 stored_document=stored_documents.get(item.item_id),
                                 projection_scope=configured_projection_scope,
                                 scope_transition=(
@@ -1277,9 +1316,12 @@ class GeneSyncOrchestrator:
                 for result in provider_results
                 if result.get("source_unit_id")
             }
+            # A recovery that failed counts only when this run's provider
+            # pass did not process the same Unit again.
             recovered_results = [
                 *recovered_completed_results,
                 *recovered_deferred_results,
+                *recovered_failed_results,
             ]
             recovered_results_for_run = [
                 result
@@ -1320,6 +1362,9 @@ class GeneSyncOrchestrator:
                     docs_updated += 1
                 if r["failed"]:
                     docs_failed += 1
+                if r.get("error") is not None:
+                    failed_docs.append(FailedDoc(doc_id=str(r["doc_id"]), title=str(r["title"]), error=r["error"]))
+                    failure_retryable = failure_retryable and r["failure_retryable"]
                 memories_extracted += r["memories_extracted"]
                 if r.get("runtime_bundle") is not None:
                     runtime_bundles.append(r["runtime_bundle"])
@@ -1809,7 +1854,41 @@ class GeneSyncOrchestrator:
                     lifecycle_stats = None
                 except Exception as exc:
                     recovery_error = exc
-                    raise
+                    if _is_infrastructure_failure(exc):
+                        raise
+                    # One Unit's failure never blocks the others. A failure
+                    # that repeats on every attempt ends the staged derivation;
+                    # any other failure leaves it staged for the next run.
+                    retryable = bool(getattr(exc, "retryable", True))
+                    if not retryable:
+                        await self.db.supersede_source_derivation(
+                            attempt.id,
+                            reason_code=DERIVATION_DETERMINISTIC_FAILURE,
+                        )
+                    logger.warning(
+                        "Recovery of Source derivation %s for %s failed: %s",
+                        attempt.id,
+                        doc_id,
+                        exc,
+                    )
+                    results.append(
+                        {
+                            "processed": False,
+                            "updated": False,
+                            "memories_extracted": 0,
+                            "failed": True,
+                            "failure_retryable": retryable,
+                            "error": _retained_document_error(exc),
+                            "runtime_bundle": getattr(exc, "runtime_bundle", None),
+                            "source_unit_id": attempt.source_unit_id,
+                            "target_unit_revision_id": attempt.target_unit_revision_id,
+                            "derivation_id": attempt.id,
+                            "deferred_lifecycle": None,
+                            "doc_id": doc_id,
+                            "title": attempt.context.document.title,
+                        }
+                    )
+                    lifecycle_stats = None
                 finally:
                     self._memory_sample(
                         "derivation_recovery_lifecycle_exit",
@@ -2011,6 +2090,7 @@ class GeneSyncOrchestrator:
         lifecycle_attempt_count: int = 1,
         source_unit_target_callback: Callable[[str, str], None] | None = None,
         recovered_deferred_targets: frozenset[tuple[str, str]] = frozenset(),
+        reprocessing: bool = False,
         stored_document: StoredSourceDocument | None = None,
     ) -> dict:
         doc_id = item.item_id
@@ -2053,6 +2133,7 @@ class GeneSyncOrchestrator:
                         source_unit_target_callback=source_unit_target_callback,
                         recovered_deferred_targets=recovered_deferred_targets,
                         source_unit_id_callback=diagnostics.bind_source_unit,
+                        reprocessing=reprocessing,
                         stored_document=stored_document,
                     )
                     if result.get("recovered_deferred_target") is not None:
@@ -2105,12 +2186,15 @@ class GeneSyncOrchestrator:
         lifecycle_attempt_count: int = 1,
         source_unit_target_callback: Callable[[str, str], None] | None = None,
         recovered_deferred_targets: frozenset[tuple[str, str]] = frozenset(),
+        reprocessing: bool = False,
         stored_document: StoredSourceDocument | None = None,
     ) -> dict:
         """Process a single content item through the full pipeline.
 
-        A ``stored_document`` replaces the provider: its stored raw content and
-        committed Artifacts are the input, and nothing is fetched or exported.
+        ``reprocessing`` processes the Unit as an operator reprocess (see
+        :class:`SourceSyncMode`). A ``stored_document`` replaces the provider:
+        its stored raw content and committed Artifacts are the input, and
+        nothing is fetched or exported.
 
         Steps:
             1. Fetch raw content
@@ -2405,6 +2489,9 @@ class GeneSyncOrchestrator:
             if projection is None:
                 prior_unit_revision = await self.db.get_current_source_unit_revision(source_unit.id)
                 prior_observation_revisions = await self.db.get_current_source_observation_revisions(source_unit.id)
+                stored_observation_revisions = await self.db.get_source_observation_revisions(
+                    tuple(revision.id for revision in projection_probe.observation_revisions)
+                )
                 projection = await self.source_projection_adapter.project(
                     ProjectionEnvelope(
                         request=ProjectionRequest(
@@ -2432,6 +2519,7 @@ class GeneSyncOrchestrator:
                         artifacts=stored_source_artifacts,
                         prior_unit_revision=prior_unit_revision,
                         prior_observation_revisions=prior_observation_revisions,
+                        stored_observation_revisions=stored_observation_revisions,
                     )
                 )
 
@@ -2487,15 +2575,27 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         # 3. Store raw + normalized on disk
         # ------------------------------------------------------------------
-        # A reprocess reads its raw content from storage and keeps the
-        # provider exports it cannot repeat; only a changed normalization is
-        # stored again.
+        # The stored raw content is the input of the committed Unit revision:
+        # a projection that moves the Unit to a new revision stores the raw
+        # content it was projected from, even when the normalized markdown is
+        # unchanged, and the Document row that points at it commits with that
+        # revision. A reprocess from stored input reads its raw content from
+        # storage and keeps the provider exports it cannot repeat; only a
+        # changed normalization is stored again.
         reuse_content_artifacts = content_unchanged and (stored_document is not None or not force_reprocess)
-        raw_uri = existing_doc.raw_content_uri if reuse_content_artifacts and existing_doc else None
+        unit_revision_unchanged = (
+            projection.deltas[0].previous_unit_revision_id == projection.source_unit_revisions[0].id
+        )
+        raw_uri = (
+            existing_doc.raw_content_uri
+            if reuse_content_artifacts and unit_revision_unchanged and existing_doc
+            else None
+        )
         if stored_document is not None:
             raw_uri = stored_document.document.raw_content_uri
         norm_uri = existing_doc.normalized_content_uri if reuse_content_artifacts and existing_doc else None
         stored_content_artifact = False
+        raw_content_type = existing_doc.raw_content_type if raw_uri and existing_doc else raw.content_type
         if not raw_uri:
             raw_uri = self.doc_store.store_raw(
                 source_id=source_id,
@@ -2588,9 +2688,7 @@ class GeneSyncOrchestrator:
             content_hash=new_hash,
             token_count=token_count,
             raw_content_uri=raw_uri,
-            raw_content_type=(
-                existing_doc.raw_content_type if content_unchanged and existing_doc else raw.content_type
-            ),
+            raw_content_type=raw_content_type,
             normalized_content_uri=norm_uri,
             pdf_content_uri=pdf_uri,
             last_synced=now,
@@ -2729,7 +2827,7 @@ class GeneSyncOrchestrator:
             current_changed_ranges=(update_plan.current_changed_ranges if update_plan is not None else ()),
             reprocess_all_current_observations=force_reprocess,
             reprocess_operation_id=(run_id if force_reprocess else None),
-            support_without_baseline=stored_document is not None,
+            support_without_baseline=reprocessing,
         )
         # Extraction owns the only document-content model call. Historical
         # cross-document/cross-source discovery remains post-commit Relation

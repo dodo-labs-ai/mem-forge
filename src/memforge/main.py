@@ -2315,9 +2315,10 @@ def sources_schedule_show(ctx, source_id: str, workspace_id: str | None):
 @_workspace_id_option
 @click.pass_context
 def sources_reprocess(ctx, source_id: str, document_ids: tuple[str, ...], dry_run: bool, workspace_id: str | None):
-    """Reprocess stored Documents of one source at their current revisions.
+    """Reprocess Documents of one source with the current adapter and compiler.
 
-    Reads stored content only, with the current adapter and compiler: every
+    Reads each Document's current state from the provider when the source can
+    ask for one Document by id, and its stored input otherwise: every
     ReadingGroup is extracted and every Support is read over the whole Unit.
     """
     payload = _tool_client(ctx, workspace_id).reprocess_source_documents(

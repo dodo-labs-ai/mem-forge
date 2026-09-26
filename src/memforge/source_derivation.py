@@ -6,7 +6,7 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
@@ -59,7 +59,9 @@ from memforge.source_artifacts import SOURCE_ARTIFACT_OBSERVATION_TYPE, SourceAr
 from memforge.source_projection import (
     AnchorKind,
     SourceAnchor,
+    SourceObservationRevision,
     SourceProjection,
+    require_stored_revision_identity,
     source_projection_to_payload,
 )
 
@@ -70,6 +72,8 @@ SOURCE_DERIVATION_COMPLETED = "completed"
 SOURCE_DERIVATION_APPLIED = "applied"
 SOURCE_DERIVATION_SUPERSEDED = "superseded"
 DERIVATION_INPUT_SUPERSEDED = "DERIVATION_INPUT_SUPERSEDED"
+# The staged derivation failed in a way that repeats on every attempt.
+DERIVATION_DETERMINISTIC_FAILURE = "DERIVATION_DETERMINISTIC_FAILURE"
 
 SOURCE_DERIVATION_BATCH_PENDING = "pending"
 SOURCE_DERIVATION_BATCH_COMPLETED = "completed"
@@ -249,6 +253,11 @@ class SourceDerivationStore(DerivationWorkStore, Protocol):
         reason_code: str | None = None,
     ) -> None: ...
 
+    async def get_source_observation_revisions(
+        self,
+        revision_ids: Collection[str],
+    ) -> Mapping[str, SourceObservationRevision]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class SourceUnitDerivationRequest:
@@ -416,6 +425,12 @@ class SourceUnitDeriver:
         self,
         request: SourceUnitDerivationRequest,
     ) -> SourceUnitDerivationResult:
+        # A projection that cannot be recorded is refused before it is staged,
+        # so it costs no model call.
+        stored_revisions = await self._store.get_source_observation_revisions(
+            tuple(revision.id for revision in request.projection.observation_revisions)
+        )
+        require_stored_revision_identity(request.projection, stored_revisions)
         planned_work = _plan_source_unit_derivation_work(request)
         authority_plan_identity = _authority_plan_identity(request)
         evidence_work_identity_hash = (

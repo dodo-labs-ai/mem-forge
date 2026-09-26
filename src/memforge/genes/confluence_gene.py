@@ -7,14 +7,16 @@ wiki pages into comprehensive markdown for memory extraction.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import Any
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 
 from memforge.genes.atlassian_auth import (
+    ATLASSIAN_ABSENT_STATUS_CODES,
     atlassian_request_limiter,
     bearer_headers,
     get_with_rate_limit_retry,
@@ -325,11 +327,40 @@ class ConfluenceGene(Gene):
         if self._preview_discovery_limit() is None:
             self.attest_discovery_complete("confluence_spaces_exhausted")
 
+    @classmethod
+    def rediscovers_documents(cls, config: Mapping[str, Any]) -> bool:
+        return True
+
+    async def rediscover(self, item: ContentItem) -> ContentItem | None:
+        """Read one page's current metadata as discovery does; an excluded label hides it."""
+        self.normalize_config(self.config)
+        page_id = str(item.extra.get("page_id") or item.item_id.removeprefix("confluence-"))
+        try:
+            resp = await self._get(
+                f"{self._api_prefix}/rest/api/content/{page_id}",
+                params={"expand": "version,metadata.labels,space"},
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in ATLASSIAN_ABSENT_STATUS_CODES:
+                return None
+            raise
+        page = self._json_response(resp, f"fetching page {page_id}")
+        if str(page.get("id") or "").strip() != page_id:
+            raise RuntimeError(f"Confluence page {page_id} response identity mismatch")
+        self._discovered_page_ids = set()
+        return self._parse_page(page, None, self._exclude_labels())
+
+    def _exclude_labels(self) -> set[str]:
+        exclude_labels = self.config.get("exclude_labels", [])
+        if isinstance(exclude_labels, str):
+            return {label.strip() for label in exclude_labels.split(",") if label.strip()}
+        return set(exclude_labels)
+
     async def _discover_page_tree(
         self, root_id: str, include_children: bool, since: datetime | None
     ) -> AsyncIterator[ContentItem]:
         """Discover pages by traversing the child tree of a root page."""
-        exclude_labels = set(self.config.get("exclude_labels", []))
+        exclude_labels = self._exclude_labels()
         preview_limit = self._preview_discovery_limit()
         emitted = 0
 
@@ -465,9 +496,7 @@ class ConfluenceGene(Gene):
 
     async def _discover_space(self, space_key: str, since: datetime | None) -> AsyncIterator[ContentItem]:
         """Discover all pages in a Confluence space."""
-        exclude_labels = set(self.config.get("exclude_labels", []))
-        if isinstance(exclude_labels, str):
-            exclude_labels = {label.strip() for label in exclude_labels.split(",") if label.strip()}
+        exclude_labels = self._exclude_labels()
         preview_limit = self._preview_discovery_limit()
         emitted = 0
 

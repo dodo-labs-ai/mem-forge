@@ -160,9 +160,10 @@ class Harness:
 
 
 async def synced(db: Database) -> Harness:
-    """A Jira Source whose issues were synced once; the provider is then closed."""
+    """A Jira Source a local agent collects, synced once; its only copy is then the stored input."""
     await db.upsert_source(
-        id=SOURCE_ID, type="jira", name="Jira", config_json="{}", access_policy="workspace", owner_user_id="dev",
+        id=SOURCE_ID, type="jira", name="Jira", config_json=json.dumps({"sync_mode": "local_agent"}),
+        access_policy="workspace", owner_user_id="dev",
     )
     harness = Harness(db)
     state = await harness.orchestrator().sync_gene(gene=harness.gene, source_name="Jira", source_id=SOURCE_ID)
@@ -265,7 +266,6 @@ class ConfluenceGene:
     """Places a child page under its parent only from the item metadata fetched with it."""
 
     discovery_complete = True
-    provider_open = True
 
     @classmethod
     def metadata(cls):
@@ -277,23 +277,25 @@ class ConfluenceGene:
     def requires_pdf_artifact(self, **kwargs) -> bool:
         return False
 
-    def _provider(self) -> None:
-        if not self.provider_open:
-            raise AssertionError("reprocess must not contact the provider")
-
     async def authenticate(self) -> None:
-        self._provider()
+        return None
 
     async def discover(self, since=None):
-        self._provider()
-        yield ContentItem(
+        yield self._page()
+
+    async def rediscover(self, item):
+        assert item.item_id == CHILD_PAGE
+        return self._page()
+
+    @staticmethod
+    def _page() -> ContentItem:
+        return ContentItem(
             item_id=CHILD_PAGE, title="Payroll runbook", source_url="https://wiki.example/pages/42",
             last_modified=FIRST_SYNC_AT, content_type="text/html", space_or_project="PAY", version="3",
             extra={"page_id": "42", "space_key": "PAY"},
         )
 
     async def fetch(self, item):
-        self._provider()
         item.extra["parent_page_id"] = PARENT_PAGE_ID
         return RawContent(item=item, body=b"<p>Retain A7 for regular payroll.</p>", content_type="text/html")
 
@@ -314,12 +316,11 @@ async def synced_confluence(db: Database) -> Harness:
     harness.gene = ConfluenceGene()
     state = await harness.orchestrator().sync_gene(gene=harness.gene, source_name="Wiki", source_id=SOURCE_ID)
     assert state.last_sync_status == "success"
-    harness.gene.provider_open = False
     return harness
 
 
 @pytest.mark.asyncio
-async def test_a_child_page_is_reprocessed_where_its_gene_placed_it(db):
+async def test_a_child_page_is_reprocessed_from_the_provider_where_its_gene_placed_it(db):
     harness = await synced_confluence(db)
     unit = await db.find_source_unit_by_document_id(SOURCE_ID, CHILD_PAGE, current_only=True)
     committed = await db.get_current_source_unit_revision(unit.id)
@@ -333,23 +334,6 @@ async def test_a_child_page_is_reprocessed_where_its_gene_placed_it(db):
     assert (state.last_sync_status, state.docs_failed) == ("success", 0)
     [lifecycle] = harness.engine.projected_lifecycle_calls[-1:]
     assert lifecycle["projection"].source_unit_revisions[0].location_hash == committed.location_hash
-
-
-@pytest.mark.asyncio
-async def test_a_document_stored_without_its_item_metadata_cannot_stand_for_a_child_page(db):
-    harness = await synced_confluence(db)
-    await db.db.execute("UPDATE documents SET item_extra_json = NULL WHERE doc_id = ?", (CHILD_PAGE,))
-    await db.db.commit()
-    harness.engine.projected_lifecycle_calls.clear()
-
-    state = await harness.orchestrator().sync_gene(
-        gene=harness.gene, source_name="Wiki", source_id=SOURCE_ID,
-        execution_mode=SourceSyncMode.REPROCESS, reprocess_doc_ids=frozenset({CHILD_PAGE}),
-    )
-
-    [failed] = state.failed_docs
-    assert failed.error.startswith("stored_input_incomplete")
-    assert harness.engine.projected_lifecycle_calls == []
 
 
 async def _rewrite_committed_artifact_metadata(db: Database, harness: Harness, rewrite) -> None:

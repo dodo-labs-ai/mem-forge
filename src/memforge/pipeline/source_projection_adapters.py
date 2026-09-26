@@ -23,6 +23,7 @@ from memforge.source_projection import (
     DeltaAxis,
     ProjectionCoverage,
     ProjectionEnvelope,
+    ProjectionIdentityConflict,
     ProjectionScopeAttestation,
     RevisionDelta,
     SourceAnchor,
@@ -225,6 +226,7 @@ class GeneSourceProjectionAdapter:
             access_context=request.access_context,
             prior_unit_revision=envelope.prior_unit_revision,
             prior_observation_revisions=envelope.prior_observation_revisions,
+            stored_observation_revisions=envelope.stored_observation_revisions,
             scope_attestations=request.scope_attestations,
         )
 
@@ -301,6 +303,7 @@ def project_source_item(
     access_context: Mapping[str, object] | None = None,
     prior_unit_revision: SourceUnitRevision | None = None,
     prior_observation_revisions: Mapping[str, SourceObservationRevision] | None = None,
+    stored_observation_revisions: Mapping[str, SourceObservationRevision] | None = None,
     scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
 ) -> SourceProjection:
     """Project one completely fetched Source Unit.
@@ -308,9 +311,18 @@ def project_source_item(
     The run scope is exactly this unit. Source-wide absence is handled by the
     enclosing manifest projection; a unit projection never claims another unit
     was deleted merely because it was not part of this call.
+
+    Observation Revisions are content-addressed by Observation and semantic
+    hash. A projected revision whose id is already stored, as a current
+    revision in ``prior_observation_revisions`` or any other revision in
+    ``stored_observation_revisions`` (keyed by revision id), is that stored row.
     """
 
     prior_observation_revisions = prior_observation_revisions or {}
+    stored_by_id = {
+        **dict(stored_observation_revisions or {}),
+        **{revision.id: revision for revision in prior_observation_revisions.values()},
+    }
     native = _native_payload(raw)
     projected_scope = dict(scope or {})
     native_projection = _project_native(
@@ -420,19 +432,19 @@ def project_source_item(
             metadata={**dict(value.metadata), "provider_key": value.provider_key},
             evidence_profile=evidence_profile,
         )
-        prior_revision = prior_observation_revisions.get(observation_id)
-        # Revision identity is semantic. Operational metadata enrichment under
-        # an unchanged semantic hash must preserve the exact immutable row; a
-        # revision recorded without a source time takes the one the source now
-        # gives, and a recorded source time is never replaced.
-        if (
-            prior_revision is not None
-            and prior_revision.observation_id == observation_id
-            and prior_revision.semantic_hash == semantic_hash
-        ):
-            if prior_revision.evidence_profile not in {None, evidence_profile}:
-                raise ValueError("immutable Observation Revision changed representation profile")
-            reused = prior_revision
+        stored_revision = stored_by_id.get(revision_id)
+        # Revision identity is semantic. A stored revision with this id is
+        # reused exactly, whatever metadata this projection derived; a revision
+        # recorded without a source time takes the one the source now gives,
+        # and a recorded source time is never replaced.
+        if stored_revision is not None:
+            if (
+                stored_revision.observation_id != observation_id
+                or stored_revision.semantic_hash != semantic_hash
+                or stored_revision.evidence_profile not in {None, evidence_profile}
+            ):
+                raise ProjectionIdentityConflict("source_observation_revisions", revision_id)
+            reused = stored_revision
             if reused.evidence_profile is None:
                 reused = replace(reused, evidence_profile=evidence_profile)
             if reused.observed_at is None and value.observed_at is not None:
@@ -934,7 +946,7 @@ def _project_native(
                     {"issue_key": issue_key},
                     str(history.get("created") or "") or None,
                     {
-                        "semantic_class": _jira_changelog_semantic_class(
+                        "semantic_class": jira_changelog_semantic_class(
                             history
                         )
                     },
@@ -1244,7 +1256,9 @@ def _jira_core_revised_at(
     return reported_source_time(fields.get("created"))
 
 
-def _jira_changelog_semantic_class(history: Mapping[str, object]) -> str:
+def jira_changelog_semantic_class(history: Mapping[str, object]) -> str:
+    """Classify one Jira changelog entry from its fields; stored revisions carry the result."""
+
     items = history.get("items")
     history_items = items if isinstance(items, list) else []
     fields = {
