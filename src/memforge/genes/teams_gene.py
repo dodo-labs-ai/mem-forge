@@ -40,6 +40,7 @@ from memforge.local_agent.teams_contract import (
     validate_teams_provider_message,
 )
 from memforge.local_agent.source_contract import TEAMS_ROLLING_RETENTION_PRESETS
+from memforge.source_time import SOURCE_UPDATED_AT_KEY, latest_source_time
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -1423,6 +1424,10 @@ class TeamsGene(Gene):
                 "date_range": {"start": first_time, "end": last_time},
                 "has_code_blocks": has_code_blocks,
                 "has_links": has_links,
+                # The window's time is its latest message edit or post.
+                SOURCE_UPDATED_AT_KEY: latest_source_time(
+                    msg.get("lastModifiedDateTime") or msg.get("time") for msg in messages
+                ),
             },
         )
 

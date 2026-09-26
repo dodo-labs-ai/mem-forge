@@ -210,6 +210,38 @@ async def test_upsert_agent_concept_rolls_back_after_cancellation(bundle_stack, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_time", "observed_at"),
+    [(datetime(2026, 6, 18, 11, 5, tzinfo=timezone.utc), "2026-06-18T11:05:00+00:00"), (None, None)],
+)
+async def test_concept_revision_time_is_the_authorizing_event_time(bundle_stack, event_time, observed_at):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+
+    result = await service.apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        submitted_at=datetime(2026, 6, 18, 12, 0, tzinfo=timezone.utc),
+        source_updated_at=event_time,
+    )
+
+    unit = await db.find_source_unit_by_document_id("src-agent-sessions-codex", result.concept_id)
+    revisions = (await db.get_current_source_observation_revisions(unit.id)).values()
+    [body] = [revision for revision in revisions if revision.metadata.get("provider_key") != "$unit_identity"]
+    # The submission time is when the window arrived, never the content's source time.
+    assert body.observed_at == observed_at
+    [relation_run] = await _relation_runs_for_memory(db, result.memory_id)
+    evidence_unit = await db.get_evidence_unit(relation_run["evidence_unit_id"])
+    assert evidence_unit.observed_at == observed_at
+
+
+@pytest.mark.asyncio
 async def test_create_private_concept_claim_and_memory(bundle_stack):
     db, store, collection = bundle_stack
     service = AgentKnowledgeBundleService(db=db, memory_store=store)

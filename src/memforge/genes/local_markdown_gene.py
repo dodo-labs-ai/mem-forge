@@ -20,6 +20,7 @@ from memforge.genes.local_adapter_packages import (
     package_manifest,
     read_package_body,
 )
+from memforge.source_time import SOURCE_UPDATED_AT_KEY
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -198,6 +199,7 @@ class LocalMarkdownGene(Gene):
                 "raw_hash": package.get("raw_hash"),
                 "submitted_at": package.get("submitted_at"),
                 "submitted_by": package.get("submitted_by"),
+                SOURCE_UPDATED_AT_KEY: package.get(SOURCE_UPDATED_AT_KEY),
             },
         )
 

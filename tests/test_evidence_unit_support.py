@@ -739,7 +739,6 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
         repo_identifier=None,
         access_context_hash=access_hash,
         extractor_run_id="run-v9",
-        observed_at=now.isoformat(),
     )
     claim_hash = content_hash(raw.content.strip())
     scope = ReconciliationScope(
@@ -867,7 +866,6 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
         repo_identifier=None,
         access_context_hash=access_hash,
         extractor_run_id="run-v9-update",
-        observed_at=updated_item.last_modified.isoformat(),
     )
     old_memory = created[0]
     old_state = (

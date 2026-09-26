@@ -255,6 +255,7 @@ async def test_single_page_discovery_uses_canonical_url_metadata(monkeypatch):
     assert item.title == "process tracking"
     assert item.source_url == "https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking"
     assert item.last_modified == datetime(2026, 5, 26, 14, 51, 21, tzinfo=timezone.utc)
+    assert item.extra["content_updated_at"] == "2026-05-26T14:51:21+00:00"
     assert item.version == "sha256:" + hashlib.sha256(
         b"<main><h1>Process Tracking</h1><p>Body</p></main>"
     ).hexdigest()
@@ -614,6 +615,7 @@ async def test_subtree_discovery_prefers_sitemap_and_filters_to_root(monkeypatch
     assert [item.title for item in items] == ["locking", "process tracking"]
     assert all("/cloud-native-platform/" in item.source_url for item in items)
     assert items[0].last_modified == datetime(2026, 5, 25, 0, 0, tzinfo=timezone.utc)
+    assert items[0].extra["content_updated_at"] == "2026-05-25T00:00:00+00:00"
     assert items[0].version.startswith("sha256:")
     assert gene.discovery_complete is False
 

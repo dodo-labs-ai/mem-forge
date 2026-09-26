@@ -1678,6 +1678,9 @@ class LocalSourcePackageRequest(BaseModel):
     File-like sources use ``markdown_body`` as raw file text for the declared
     ``content_type``. Structured sources such as Jira and Teams use
     ``raw_payload`` and defer canonical markdown rendering to the source gene.
+    ``source_updated_at`` is a file-like source's own time for this content
+    (an offset-aware ISO time); structured sources carry their times in
+    ``raw_payload``.
     """
 
     vault_id: str | None = None
@@ -1700,6 +1703,7 @@ class LocalSourcePackageRequest(BaseModel):
     source_url: str | None = None
     title: str | None = None
     raw_hash: str | None = None
+    source_updated_at: str | None = None
     provider_revision: str | None = None
     sync_snapshot_id: str | None = None
     local_agent_job_id: str | None = None
@@ -7485,6 +7489,7 @@ def create_admin_app(
                     blob_sha=req.blob_sha,
                     symlink_chain=req.symlink_chain,
                     resolved_relative_path=req.resolved_relative_path,
+                    source_updated_at=req.source_updated_at,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
                     document_store=artifact_store,
@@ -7539,6 +7544,7 @@ def create_admin_app(
                     content_type=req.content_type,
                     title=req.title,
                     raw_hash=req.raw_hash,
+                    source_updated_at=req.source_updated_at,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
                     document_store=artifact_store,

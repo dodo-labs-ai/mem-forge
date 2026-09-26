@@ -1201,12 +1201,22 @@ def _github_raw_process_transport(monkeypatch):
     monkeypatch.setattr(main.subprocess, "Popen", raw_popen)
 
 
+GITHUB_FILE_COMMIT_DATE = "2026-05-01T10:00:00Z"
+
+
+def _github_file_commits_listing():
+    """The commits listing GitHub returns for one file's latest commit."""
+    return [{"sha": "file-commit", "commit": {"committer": {"date": GITHUB_FILE_COMMIT_DATE}}}]
+
+
 def _fake_github_remote_run(cmd, *args, **kwargs):
     assert cmd[:2] == ["gh", "api"]
     assert kwargs["env"]["GH_HOST"] == "github.wdf.sap.corp"
     endpoint = cmd[2]
     if endpoint.endswith("/commits/main"):
         payload = {"sha": "commit-main", "commit": {"tree": {"sha": "tree-main"}}}
+    elif "/commits?" in endpoint:
+        payload = _github_file_commits_listing()
     elif "/git/trees/tree-main" in endpoint:
         payload = {
             "truncated": False,
@@ -1329,6 +1339,8 @@ def test_local_agent_cloud_github_sync_streams_selected_image_as_artifact(monkey
         endpoint = cmd[2]
         if endpoint.endswith("/commits/main"):
             payload = {"sha": "commit-main", "commit": {"tree": {"sha": "tree-main"}}}
+        elif "/commits?" in endpoint:
+            payload = _github_file_commits_listing()
         elif "/git/trees/tree-main" in endpoint:
             payload = {
                 "truncated": False,
@@ -1391,6 +1403,8 @@ def test_local_agent_cloud_github_rejects_oversized_image_before_blob_download(m
         endpoint = cmd[2]
         if endpoint.endswith("/commits/main"):
             payload = {"sha": "commit-main", "commit": {"tree": {"sha": "tree-main"}}}
+        elif "/commits?" in endpoint:
+            payload = _github_file_commits_listing()
         elif "/git/trees/tree-main" in endpoint:
             payload = {
                 "truncated": False,
@@ -1507,6 +1521,8 @@ def test_local_agent_cloud_github_sync_pins_tree_and_body_to_one_commit(monkeypa
         endpoints.append(endpoint)
         if endpoint.endswith("/commits/main"):
             payload = {"sha": "commit-1", "commit": {"tree": {"sha": "tree-1"}}}
+        elif "/commits?" in endpoint:
+            payload = _github_file_commits_listing()
         elif "/git/trees/tree-1?recursive=1" in endpoint:
             payload = {
                 "truncated": False,
@@ -1549,9 +1565,12 @@ def test_local_agent_cloud_github_sync_pins_tree_and_body_to_one_commit(monkeypa
         "repos/example/public-howtos/commits/main",
         "repos/example/public-howtos/git/trees/tree-1?recursive=1",
         "repos/example/public-howtos/git/blobs/" + _git_blob_sha(b"# Pinned body"),
+        "repos/example/public-howtos/commits?sha=commit-1&path=README.md&per_page=1",
     ]
     [push_call] = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
     assert push_call[1]["blob_sha"] == _git_blob_sha(b"# Pinned body")
+    # The file's source time is its latest commit at the pinned collection commit.
+    assert push_call[1]["source_updated_at"] == "2026-05-01T10:00:00+00:00"
 
 
 @pytest.mark.parametrize("failure", [None, "decode", "upload", "lease"])
@@ -1588,6 +1607,8 @@ def test_local_agent_github_uploads_each_body_before_fetching_the_next(monkeypat
         endpoint = cmd[2]
         if endpoint.endswith("/commits/main"):
             data = {"sha": "commit-1", "commit": {"tree": {"sha": "tree-1"}}}
+        elif "/commits?" in endpoint:
+            data = _github_file_commits_listing()
         elif "/git/trees/tree-1" in endpoint:
             data = {
                 "truncated": False,
@@ -1660,6 +1681,8 @@ def test_github_transfer_body_memory_does_not_grow_with_file_count(monkeypatch):
         endpoint = cmd[2]
         if endpoint.endswith("/commits/main"):
             data = {"sha": "commit-1", "commit": {"tree": {"sha": "tree-1"}}}
+        elif "/commits?" in endpoint:
+            data = _github_file_commits_listing()
         elif "/git/trees/tree-1" in endpoint:
             data = {
                 "truncated": False,
@@ -1713,6 +1736,8 @@ def test_local_agent_cloud_github_sync_rejects_unproven_tree_completeness(monkey
         endpoint = cmd[2]
         if endpoint.endswith("/commits/main"):
             payload = {"sha": "commit-1", "commit": {"tree": {"sha": "tree-1"}}}
+        elif "/commits?" in endpoint:
+            payload = _github_file_commits_listing()
         elif "/git/trees/tree-1?recursive=1" in endpoint:
             payload = {"tree": []}
         else:

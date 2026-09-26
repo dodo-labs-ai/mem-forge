@@ -111,6 +111,7 @@ from memforge.pipeline.projection_images import (
 from memforge.source_access import memory_visibility_for_source_id
 from memforge.source_activity import SourceActivityLease
 from memforge.source_projection_config import canonical_projection_scope
+from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time
 
 if TYPE_CHECKING:
     from memforge.evals.agent_evaluation import RuntimeEventTraceSink
@@ -425,27 +426,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _parse_source_updated_at(value: Any) -> datetime | None:
-    if value in (None, ""):
-        return None
-    if not isinstance(value, str):
-        raise ValueError("source_updated_at must be an ISO datetime string")
-    normalized = value.strip()
-    if normalized.endswith("Z"):
-        normalized = normalized[:-1] + "+00:00"
-    parsed = datetime.fromisoformat(normalized)
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("source_updated_at must include an explicit timezone offset")
-    return parsed.astimezone(timezone.utc)
+def _source_updated_at(source_semantics: dict[str, Any]) -> datetime | None:
+    """The source time of a Unit's content as its Gene reports it (design 0.9).
 
+    ``ContentItem.last_modified`` is a discovery marker and may be a fetch or
+    submission time, so it is never read as the content's time.
+    """
 
-def _source_updated_at_for_item(item: ContentItem, source_semantics: dict[str, Any]) -> datetime:
-    explicit = _parse_source_updated_at(source_semantics.get("source_updated_at"))
-    if explicit is not None:
-        return explicit
-    if item.last_modified.tzinfo is None or item.last_modified.utcoffset() is None:
-        raise ValueError("ContentItem.last_modified must include an explicit timezone offset")
-    return item.last_modified.astimezone(timezone.utc)
+    return parse_source_time(source_semantics.get(SOURCE_UPDATED_AT_KEY))
 
 
 def _plural(count: int, singular: str, plural: str | None = None) -> str:
@@ -2695,10 +2683,7 @@ class GeneSyncOrchestrator:
                 update_mode=(update_plan.mode if update_plan else "full_document"),
                 changed_hunks=(update_plan.changed_hunks if update_plan else None),
                 update_plan_stats=self._document_update_plan_stats(update_plan),
-                source_updated_at=_source_updated_at_for_item(
-                    item,
-                    normalized.source_semantics,
-                ),
+                source_updated_at=_source_updated_at(normalized.source_semantics),
                 user_id=(
                     str(normalized.source_semantics.get("uploader_user_id")).strip()
                     if normalized.source_semantics.get("uploader_user_id")
@@ -2749,10 +2734,7 @@ class GeneSyncOrchestrator:
             return stats
 
         repo_identifier = normalized.source_semantics.get("repo_identifier")
-        source_updated_at = _source_updated_at_for_item(
-            item,
-            normalized.source_semantics,
-        )
+        source_updated_at = _source_updated_at(normalized.source_semantics)
         uploader_user_id = normalized.source_semantics.get("uploader_user_id")
         actor_user_id = (
             str(uploader_user_id).strip() if isinstance(uploader_user_id, str) and uploader_user_id.strip() else None
@@ -2766,7 +2748,7 @@ class GeneSyncOrchestrator:
             update_mode=(update_plan.mode if update_plan else "full_document"),
             changed_hunks=(update_plan.changed_hunks if update_plan else None),
             update_plan_stats=self._document_update_plan_stats(update_plan),
-            source_updated_at=source_updated_at.isoformat(),
+            source_updated_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
             user_id=actor_user_id,
             source_activity_epoch=expected_source_activity_epoch,
             current_changed_ranges=(update_plan.current_changed_ranges if update_plan is not None else ()),

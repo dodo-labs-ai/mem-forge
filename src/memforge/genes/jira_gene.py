@@ -35,6 +35,7 @@ from memforge.genes.local_adapter_packages import (
     source_artifacts_from_package,
 )
 from memforge.local_agent.jira_contract import validate_jira_observation_identities
+from memforge.source_time import SOURCE_UPDATED_AT_KEY, source_time_iso
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -994,6 +995,9 @@ class JiraGene(Gene):
         # Source semantics (structured data for filtering)
         source_semantics = {
             **package_semantics,
+            # The issue's own last-change time; each Observation carries its own
+            # narrower time in the projection.
+            SOURCE_UPDATED_AT_KEY: source_time_iso(fields.get("updated")),
             "issue_key": key,
             "status": status,
             "priority": priority,

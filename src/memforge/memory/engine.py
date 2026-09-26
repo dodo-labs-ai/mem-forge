@@ -1453,7 +1453,6 @@ class MemoryEngine:
             repo_identifier=repo_identifier,
             access_context_hash=access_context_hash,
             extractor_run_id=projection.run_id,
-            observed_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
         )
         def canonical(raw: RawMemory) -> RawMemory:
             return projected_evidence.canonical_memories_by_claim_hash[content_hash(raw.content.strip())]

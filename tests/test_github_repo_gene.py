@@ -32,6 +32,9 @@ class GithubResponse:
             raise RuntimeError(f"request failed: {self.status_code}")
 
 
+FILE_COMMIT_LISTING = [{"sha": "file-commit", "commit": {"committer": {"date": "2026-05-01T10:00:00Z"}}}]
+
+
 class RepoApiClient:
     instances: list["RepoApiClient"] = []
 
@@ -46,6 +49,8 @@ class RepoApiClient:
             return GithubResponse({"default_branch": "main"}, url=url)
         if url.endswith("/commits/main"):
             return GithubResponse({"sha": "commit-main", "commit": {"tree": {"sha": "tree-main"}}}, url=url)
+        if "/commits?" in url:
+            return GithubResponse(FILE_COMMIT_LISTING, url=url)
         if url.endswith("/api/v3/repos/payroll/architecture/git/trees/tree-main?recursive=1"):
             return GithubResponse(
                 {
@@ -178,7 +183,13 @@ async def test_cloud_pull_discovers_scoped_markdown_and_fetches_content(monkeypa
 
     assert raw.content_type == "text/markdown"
     assert normalized.markdown_body.startswith("# Payroll Processing")
+    assert (
+        "GET",
+        "https://github.example.test/api/v3/repos/payroll/architecture/commits"
+        "?sha=commit-main&path=Payroll%20Processing/README.md&per_page=1",
+    ) in gene._client.calls
     assert normalized.source_semantics == {
+        "source_updated_at": "2026-05-01T10:00:00+00:00",
         "source_type": "github_repo",
         "connection_mode": "cloud_pull",
         "repo_url": "https://github.example.test/payroll/architecture",
@@ -203,6 +214,8 @@ async def test_cloud_pull_materializes_explicitly_selected_image_blob(monkeypatc
             self.calls.append(("GET", url))
             if url.endswith("/commits/main"):
                 return GithubResponse({"sha": "commit-main", "commit": {"tree": {"sha": "tree-main"}}}, url=url)
+            if "/commits?" in url:
+                return GithubResponse(FILE_COMMIT_LISTING, url=url)
             if url.endswith("/api/v3/repos/payroll/architecture/git/trees/tree-main?recursive=1"):
                 return GithubResponse(
                     {
@@ -247,6 +260,7 @@ async def test_cloud_pull_materializes_explicitly_selected_image_blob(monkeypatc
     assert raw.body == b""
     assert raw.authoritative_empty is True
     assert normalized.markdown_body == ""
+    assert normalized.source_semantics["source_updated_at"] == "2026-05-01T10:00:00+00:00"
     assert len(raw.artifacts) == 1
     artifact = raw.artifacts[0]
     assert artifact.provider_key == "docs/architecture.png"

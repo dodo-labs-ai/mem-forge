@@ -174,7 +174,7 @@ def test_unit_title_is_selectable_as_required_and_persisted_as_evidence():
     evidence = build_projected_claim_evidence(
         projection=projection, raw_memories=(raw,), doc_id="jira-SFPAY-180000", source_type="jira",
         project_key=None, visibility="workspace", owner_user_id=None, repo_identifier=None,
-        access_context_hash="scope", extractor_run_id="run-1", observed_at=NOW.isoformat(),
+        access_context_hash="scope", extractor_run_id="run-1",
     )
 
     required = [item for item in evidence.references if item.role is EvidenceRole.REQUIRED]
