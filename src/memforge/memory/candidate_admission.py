@@ -164,15 +164,18 @@ async def admit_candidates(
         return LlmRequest(prompt, CandidateAdmissionResponse, max_tokens, request_images)
 
     def decode(response: CandidateAdmissionResponse, _item_ids: tuple[str, ...], round_ids: tuple[str, ...]):
-        """Each decision is validated alone: every duplicate it names must be a supplied round claim."""
+        """Each decision is validated alone: its own rule, and every duplicate it names is a supplied round claim."""
         visible = set(round_ids)
         for decision in response.decisions:
             outside = sorted(set(decision.duplicate_of) - visible)
-            yield decision.candidate_id, (
-                RejectedRow(
+            if (error := decision.row_error()) is not None:
+                yield decision.candidate_id, RejectedRow(f"{decision.candidate_id}: {error}")
+            elif outside:
+                yield decision.candidate_id, RejectedRow(
                     f"{decision.candidate_id} names duplicate {', '.join(outside)}, which is not in round_claims"
-                ) if outside else decision
-            )
+                )
+            else:
+                yield decision.candidate_id, decision
 
     journal = None
     if derivation_id is not None:

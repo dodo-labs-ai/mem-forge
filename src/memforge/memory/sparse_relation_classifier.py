@@ -101,6 +101,11 @@ class SparseMemoryRelationClassifier:
             )
             _prompt, coverage, by_refs = catalog(item_ids)
             coverage.validate(response.results)
+            # The catalog is validated as a whole: any invalid relationship rejects the response.
+            for row in response.results:
+                for edge in row.relations:
+                    if (error := edge.row_error()) is not None:
+                        raise ValueError(f"{row.candidate_id}: {edge.existing_id}: {error}")
             discovered = {
                 by_refs[row.candidate_id, edge.existing_id].key: MemoryPairDecision(
                     pair=by_refs[row.candidate_id, edge.existing_id],

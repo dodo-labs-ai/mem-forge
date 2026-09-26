@@ -473,9 +473,11 @@ class RevisionWorkExecutor:
             allowed = _refs(step_catalog) | _refs(carried)
             decoded = []
             for work_id, row in wire.decode_rows(response):
-                alias = wire.works[work_id]
                 if work_id not in step.states:
+                    # A work this step did not request: the runner rejects the whole response.
+                    decoded.append((work_id, RejectedRow(f"{wire.works.get(work_id, work_id)} was not requested")))
                     continue
+                alias = wire.works[work_id]
                 try:
                     if isinstance(row, FragmentSelectionError):
                         raise row

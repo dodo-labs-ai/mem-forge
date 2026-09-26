@@ -92,8 +92,8 @@ class SupportWireAliases:
         return self._work_ids[alias]
 
     def decode_impacts(self, response: ChangeImpactWireResponse) -> list[tuple[str, str]]:
-        """Each row's canonical work id with its impact label; a row for an unknown work is not an answer."""
-        return [(self._work_ids[row.work_id], row.impact) for row in response.results if row.work_id in self._work_ids]
+        """Each row's canonical work id with its impact label; an unknown work keeps its alias for the runner to reject."""
+        return [(self._work_ids.get(row.work_id, row.work_id), row.impact) for row in response.results]
 
     def decode(self, response):
         """Return the same response with canonical work ids and catalog refs; any invalid row raises."""
@@ -102,9 +102,15 @@ class SupportWireAliases:
         )
 
     def decode_rows(self, response):
-        """Each row of a known work, decoded alone: its canonical work id and the decoded row or its error."""
+        """Each row decoded alone: its canonical work id and the decoded row or its error.
+
+        A row for an unknown work keeps its alias, so the runner rejects the response.
+        """
         for index, row in enumerate(response.results):
             if row.work_id not in self._work_ids:
+                yield row.work_id, FragmentSelectionError(
+                    FragmentSelectionErrorCode.UNKNOWN_REF, f"unknown supplied task ID: {row.work_id}",
+                )
                 continue
             try:
                 yield self._work_ids[row.work_id], self._decode_row(row, f"results[{index}]")

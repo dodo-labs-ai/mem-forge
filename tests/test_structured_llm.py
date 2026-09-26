@@ -288,34 +288,19 @@ def test_agent_session_authority_response_accepts_typed_decisions():
     assert response.decisions[1].authority_kind == "not_authoritative"
 
 
-def test_agent_session_authority_response_rejects_contradictory_decisions():
-    with pytest.raises(ValidationError):
-        AgentSessionAuthorityResponse.model_validate(
-            {
-                "decisions": [
-                    {
-                        "evidence_id": "E1",
-                        "is_authoritative": True,
-                        "authority_kind": "not_authoritative",
-                        "reason": "contradictory",
-                    }
-                ]
-            }
-        )
-
-    with pytest.raises(ValidationError):
-        AgentSessionAuthorityResponse.model_validate(
-            {
-                "decisions": [
-                    {
-                        "evidence_id": "E2",
-                        "is_authoritative": False,
-                        "authority_kind": "design_decision",
-                        "reason": "contradictory",
-                    }
-                ]
-            }
-        )
+def test_agent_session_authority_row_rule_rejects_contradictory_decisions():
+    response = AgentSessionAuthorityResponse.model_validate(
+        {
+            "decisions": [
+                {"evidence_id": "E1", "is_authoritative": True, "authority_kind": "not_authoritative",
+                 "reason": "contradictory"},
+                {"evidence_id": "E2", "is_authoritative": False, "authority_kind": "design_decision",
+                 "reason": "contradictory"},
+            ]
+        }
+    )
+    # The shape parses; each row's meaning rule rejects that row alone.
+    assert all(decision.row_error() is not None for decision in response.decisions)
 
 
 def test_memory_extraction_response_rejects_top_level_array():
@@ -1163,22 +1148,22 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     ]
 
 
-def test_memory_relation_schema_requires_scope_proof_for_contradiction() -> None:
-    with pytest.raises(ValidationError, match="same subject and scope"):
-        MemoryRelationResponse.model_validate(
-            {
-                "decisions": [
-                    {
-                        "pair_index": 0,
-                        "classification": "contradicts",
-                        "direction": "symmetric",
-                        "same_subject_and_scope": False,
-                        "incompatible_assertions": "enabled versus disabled",
-                        "reason": "Different deployment environments.",
-                    }
-                ]
-            }
-        )
+def test_memory_relation_row_rule_requires_scope_proof_for_contradiction() -> None:
+    rejected = MemoryRelationResponse.model_validate(
+        {
+            "decisions": [
+                {
+                    "pair_index": 0,
+                    "classification": "contradicts",
+                    "direction": "symmetric",
+                    "same_subject_and_scope": False,
+                    "incompatible_assertions": "enabled versus disabled",
+                    "reason": "Different deployment environments.",
+                }
+            ]
+        }
+    )
+    assert "same subject and scope" in rejected.decisions[0].row_error()
 
     accepted = MemoryRelationResponse.model_validate(
         {

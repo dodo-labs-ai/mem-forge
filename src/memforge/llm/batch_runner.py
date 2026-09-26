@@ -9,7 +9,9 @@ The model returns one row per item, and the decoder validates each row on its
 own. Valid rows are accepted at once and never sent again. The rejected items
 are re-asked once, together, in one request that holds only them and names each
 item's exact error; an item still rejected after that is an ``invalid_response``
-failure. A request is split in half only when the failing item cannot be named:
+failure. A row that names an ID the request did not supply makes the whole
+response unreadable, because its IDs can no longer be trusted to match their
+rows. A request is split in half only when the failing item cannot be named:
 when it fails on its size, or when its output cannot be read into rows even after
 one correction of the whole request. It knows no business meaning: the caller
 decides what an ``ItemFailure`` means and merges the per-chunk results of an item
@@ -152,9 +154,10 @@ class ItemTask(Generic[Part, Result]):
     """Independent items, optionally sharing ordered, separable context parts.
 
     ``decode`` yields one ``(item_id, result)`` per row, or ``(item_id,
-    RejectedRow)`` for a row that fails validation, and raises ``ValueError``
-    only when the response cannot be read into rows. ``label`` names an item
-    as the model sees it.
+    RejectedRow)`` for a row whose meaning is invalid, and raises ``ValueError``
+    only when the response cannot be read into rows. A row whose ID the task
+    does not know is still yielded, under that ID, so the runner can reject the
+    response. ``label`` names an item as the model sees it.
     """
 
     item_ids: Sequence[ItemId]
@@ -735,15 +738,25 @@ def _rows(
 ) -> dict[ItemId, Result | RejectedRow]:
     """One row per requested item: its decoded result, or why it has none.
 
-    A row for an ID that was not requested is ignored; an item with no row or
-    with several rows is rejected.
+    A row that names an ID this request did not supply means the response's IDs
+    cannot be trusted to match their rows (an answer may sit under its neighbour's
+    ID), so the whole response is unreadable and ``ValueError`` is raised. An
+    item with no row or with several rows is rejected by itself.
     """
 
     requested = set(item_ids)
     found: dict[ItemId, list[Result | RejectedRow]] = {}
+    unknown: list[str] = []
     for item_id, row in pairs:
         if item_id in requested:
             found.setdefault(item_id, []).append(row)
+        else:
+            unknown.append(_named(label, item_id))
+    if unknown:
+        raise ValueError(
+            "the response names IDs this request did not supply, so its rows cannot be matched to the "
+            f"requested IDs: {', '.join(sorted(set(unknown)))}"
+        )
     rows: dict[ItemId, Result | RejectedRow] = {}
     for item_id in item_ids:
         answers = found.get(item_id, [])
@@ -754,6 +767,15 @@ def _rows(
         else:
             rows[item_id] = answers[0]
     return rows
+
+
+def _named(label: Callable[[ItemId], str], item_id: ItemId) -> str:
+    """The item as the model sees it; an ID the task does not know is shown as returned."""
+
+    try:
+        return label(item_id)
+    except KeyError:
+        return item_id
 
 
 def _invalid(row: RejectedRow) -> ItemFailure:

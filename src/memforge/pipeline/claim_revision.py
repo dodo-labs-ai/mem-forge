@@ -132,12 +132,18 @@ async def assess_claim_pairs(
         return LlmRequest(prompt, ClaimRevisionWireResponse, requested_output, request_images)
 
     def decode(response, candidate_ids, incumbent_ids):
-        """Each candidate's row is validated alone against the incumbents of this request."""
+        """Each candidate's row is validated alone: its incumbents and each relationship's own rule."""
         coverage = RelationCoverage({ref: frozenset(incumbent_ids) for ref in candidate_ids})
         for row in response.results:
-            if row.candidate_id in coverage.allowed:
-                error = coverage.row_error(row)
-                yield row.candidate_id, row if error is None else RejectedRow(error)
+            if row.candidate_id not in coverage.allowed:
+                yield row.candidate_id, RejectedRow(f"{row.candidate_id} was not requested")
+                continue
+            error = coverage.row_error(row) or next(
+                (f"{row.candidate_id}: {edge.existing_id}: {edge_error}"
+                 for edge in row.relations if (edge_error := edge.row_error()) is not None),
+                None,
+            )
+            yield row.candidate_id, row if error is None else RejectedRow(error)
 
     journal = None
     if derivation_id is not None:

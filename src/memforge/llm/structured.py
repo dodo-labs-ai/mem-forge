@@ -210,13 +210,19 @@ class AgentSessionAuthorityDecision(StructuredResponseModel):
     ]
     reason: str = Field(min_length=1)
 
-    @model_validator(mode="after")
-    def _authority_kind_matches_decision(self):
+    def row_error(self) -> str | None:
+        """This row's meaning rule; None when it holds.
+
+        Response models validate only the JSON shape of a row. A rule about one
+        row's meaning is ``row_error``, which the task checks on that row alone,
+        so a row that breaks it is rejected by itself.
+        """
+
         if self.is_authoritative and self.authority_kind == "not_authoritative":
-            raise ValueError("authoritative decisions require an authoritative authority_kind")
+            return "an authoritative decision requires an authoritative authority_kind"
         if not self.is_authoritative and self.authority_kind != "not_authoritative":
-            raise ValueError("non-authoritative decisions require authority_kind='not_authoritative'")
-        return self
+            return "a non-authoritative decision requires authority_kind='not_authoritative'"
+        return None
 
 
 class AgentSessionAuthorityResponse(StructuredResponseModel):
@@ -314,13 +320,14 @@ class CandidateAdmissionDecision(StructuredResponseModel):
             "IDs from round_claims, other than this Candidate, that state the same knowledge."))
     reason: str = Field(default="", max_length=CANDIDATE_ADMISSION_REASON_MAX_CHARS)
 
-    @model_validator(mode="after")
-    def _verdict_reason(self):
+    def row_error(self) -> str | None:
+        """This decision's meaning rule; None when it holds."""
+
         if (self.verdict == "REJECTED") != (self.reject_reason is not None):
-            raise ValueError("REJECTED requires reject_reason and ADMITTED must not have one")
+            return "REJECTED requires reject_reason and ADMITTED must not have one"
         if self.candidate_id in self.duplicate_of or len(set(self.duplicate_of)) != len(self.duplicate_of):
-            raise ValueError("duplicate_of must name other Candidates once each")
-        return self
+            return "duplicate_of must name other Candidates once each"
+        return None
 
 
 class CandidateAdmissionResponse(StructuredResponseModel):
@@ -346,20 +353,21 @@ class MemoryRelationAssessment(StructuredResponseModel):
     incompatible_assertions: str = Field(max_length=1000)
     reason: str = Field(default="", max_length=1000)
 
-    @model_validator(mode="after")
-    def _validate_direction(self) -> MemoryRelationAssessment:
+    def row_error(self) -> str | None:
+        """This relationship's meaning rule, its direction and its conflict proof; None when it holds."""
+
         directional = self.classification == "refines"
         if directional == (self.direction == "symmetric"):
-            raise ValueError("REFINES must be directional and other relations symmetric")
+            return "REFINES must be directional and other relations symmetric"
         incompatible = self.incompatible_assertions.strip()
         if self.classification == "contradicts":
             if not self.same_subject_and_scope:
-                raise ValueError("CONTRADICTS requires the same subject and scope")
+                return "CONTRADICTS requires the same subject and scope"
             if not incompatible:
-                raise ValueError("CONTRADICTS requires the incompatible assertions")
+                return "CONTRADICTS requires the incompatible assertions"
         elif incompatible:
-            raise ValueError("only CONTRADICTS may provide incompatible assertions")
-        return self
+            return "only CONTRADICTS may provide incompatible assertions"
+        return None
 
 
 class MemoryRelationDecision(MemoryRelationAssessment):
@@ -473,17 +481,18 @@ class ClaimRevisionWireDecision(StructuredResponseModel):
         "refines_candidate_to_challenger this field must be null, even if its conditions "
         "could all be true. Field presence is not a request to fill it."))
 
-    @model_validator(mode="after")
-    def _applicable_proofs(self):
+    def row_error(self) -> str | None:
+        """This relationship's meaning rule: only its relation carries its proof; None when it holds."""
+
         if self.relation == "contradicts":
             if (self.contradiction is None or not self.contradiction.same_subject_and_scope
                     or not self.contradiction.incompatible_assertions.strip()):
-                raise ValueError("CONTRADICTS requires overlapping scope and incompatible assertions")
+                return "CONTRADICTS requires overlapping scope and incompatible assertions"
         elif self.contradiction is not None:
-            raise ValueError("only CONTRADICTS may provide a contradiction proof")
+            return "only CONTRADICTS may provide a contradiction proof"
         if self.revision_assessment is not None and self.relation != "refines_challenger_to_candidate":
-            raise ValueError("revision proof applies only to challenger-to-candidate refinement")
-        return self
+            return "a revision proof applies only to challenger-to-candidate refinement"
+        return None
 
     def decision(self) -> ClaimRevisionDecision:
         refinement = self.relation.startswith("refines_")
@@ -507,23 +516,9 @@ class ClaimCandidateResult(StructuredResponseModel):
     relations: list[ClaimRevisionWireDecision]
     uncertain_existing_ids: list[Annotated[str, Field(pattern=r"^MEM-[0-9]{4}$")]]
 
-    @model_validator(mode="after")
-    def _unique_relationships(self):
-        ids = [edge.existing_id for edge in self.relations] + self.uncertain_existing_ids
-        if len(ids) != len(set(ids)):
-            raise ValueError("each incumbent may occur only once per candidate")
-        return self
-
 
 class ClaimRevisionWireResponse(StructuredResponseModel):
     results: list[ClaimCandidateResult]
-
-    @model_validator(mode="after")
-    def _unique_candidates(self):
-        ids = [row.candidate_id for row in self.results]
-        if len(ids) != len(set(ids)):
-            raise ValueError("each candidate must occur exactly once")
-        return self
 
 
 class EntityBatchValidationDecision(StructuredResponseModel):

@@ -24,7 +24,18 @@ from memforge.memory.relation_classifier import (
     MEMORY_RELATION_PROMPT,
     StructuredMemoryPairClassifier,
 )
+from memforge.llm.structured import MemoryRelationDecision
 from memforge.models import Memory, content_hash
+
+
+def _decision(**fields) -> MemoryRelationDecision:
+    """One pair decision as the structured client returns it; a contradiction carries its proof."""
+    contradicts = fields["classification"] == "contradicts"
+    return MemoryRelationDecision(**{
+        "same_subject_and_scope": contradicts,
+        "incompatible_assertions": "the two claims conflict" if contradicts else "",
+        **fields,
+    })
 
 
 def _memory(memory_id: str, content: str) -> Memory:
@@ -59,7 +70,7 @@ async def test_contradiction_scope_proof_is_preserved_in_auditable_reason() -> N
         async def classify_memory_relations(self, _prompt: str, **_kwargs):
             return SimpleNamespace(
                 decisions=[
-                    SimpleNamespace(
+                    _decision(
                         pair_index=0,
                         classification="contradicts",
                         direction="symmetric",
@@ -111,7 +122,7 @@ async def test_structured_classifier_runs_independent_batches_with_bounded_concu
                 )
                 return SimpleNamespace(
                     decisions=[
-                        SimpleNamespace(
+                        _decision(
                             pair_index=item["pair_index"],
                             classification="unrelated",
                             direction="symmetric",
@@ -151,7 +162,7 @@ async def test_structured_classifier_reports_usage_when_a_later_batch_fails() ->
                 raise RuntimeError("provider timeout")
             return SimpleNamespace(
                 decisions=[
-                    SimpleNamespace(
+                    _decision(
                         pair_index=0,
                         classification="unrelated",
                         direction="symmetric",
@@ -369,7 +380,7 @@ class _IncompleteStructuredClient(RevisionClientFixture):
         self.calls.append((prompt, max_tokens, model))
         return SimpleNamespace(
             decisions=[
-                SimpleNamespace(
+                _decision(
                     pair_index=0,
                     classification=self.label,
                     direction="symmetric",
@@ -429,10 +440,11 @@ async def test_structured_classifier_corrects_a_duplicate_pair_decision_once() -
             **_kwargs,
         ):
             self.calls.append(prompt)
-            indices = [0, 0, 1] if len(self.calls) == 1 else [0, 1]
+            # The first answer repeats pair 0; its re-ask holds pair 0 alone.
+            indices = [0, 0, 1] if len(self.calls) == 1 else [0]
             return SimpleNamespace(
                 decisions=[
-                    SimpleNamespace(
+                    _decision(
                         pair_index=index,
                         classification=(
                             "equivalent"
@@ -456,10 +468,11 @@ async def test_structured_classifier_corrects_a_duplicate_pair_decision_once() -
 
     result = await classifier.classify(pairs)
 
-    assert tuple(decision.pair for decision in result.decisions) == pairs
-    assert result.decisions[0].relation_type is MemoryRelationType.EQUIVALENT
+    assert sorted(decision.pair.key for decision in result.decisions) == sorted(pair.key for pair in pairs)
+    [equivalent] = [decision for decision in result.decisions if decision.pair == pairs[0]]
+    assert equivalent.relation_type is MemoryRelationType.EQUIVALENT
     assert result.llm_calls == 2
-    assert "more than once" in client.calls[1]
+    assert "pair_index 0 was returned more than once" in client.calls[1]
 
 
 class _CompleteStructuredClient(_PairsPerRequest):
@@ -481,7 +494,7 @@ class _CompleteStructuredClient(_PairsPerRequest):
                 candidate_id = item["candidate"]["id"]
                 equivalent = candidate_id == "mem-equivalent"
                 decisions.append(
-                    SimpleNamespace(
+                    _decision(
                         pair_index=item["pair_index"],
                         classification="equivalent" if equivalent else "refines",
                         direction="symmetric" if equivalent else "challenger_to_candidate",

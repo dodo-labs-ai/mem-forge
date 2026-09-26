@@ -395,10 +395,8 @@ async def test_resolve_many_retries_incomplete_adjudication_once(monkeypatch):
     client = _sequenced_client(
         [
             [EntityBatchValidationDecision(mention="first svc", matched_id=1, confidence=0.99)],
-            [
-                EntityBatchValidationDecision(mention="first svc", matched_id=1, confidence=0.99),
-                EntityBatchValidationDecision(mention="second svc", matched_id=2, confidence=0.99),
-            ],
+            # The re-ask holds only the missing mention.
+            [EntityBatchValidationDecision(mention="second svc", matched_id=2, confidence=0.99)],
         ]
     )
     monkeypatch.setattr(
