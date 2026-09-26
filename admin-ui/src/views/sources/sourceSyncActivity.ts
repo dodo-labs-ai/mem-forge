@@ -178,13 +178,16 @@ function isWaitingForRetry(activity: SourceSyncActivity): boolean {
     && new Date(activity.nextAttemptAt!).getTime() > Date.now();
 }
 
+// A finished sync stays on screen briefly so its result is readable.
+export const COMPLETED_SYNC_VISIBLE_MS = 30_000;
+
 export function sourceSyncActivityIsVisible(
   activity: SourceSyncActivity,
   nowMs = Date.now(),
 ): boolean {
   if (activity.state !== "success" || !activity.finishedAt) return true;
   const finishedAtMs = new Date(activity.finishedAt).getTime();
-  return !Number.isFinite(finishedAtMs) || nowMs - finishedAtMs <= 30_000;
+  return !Number.isFinite(finishedAtMs) || nowMs - finishedAtMs <= COMPLETED_SYNC_VISIBLE_MS;
 }
 
 export function presentSourceSyncActivity(

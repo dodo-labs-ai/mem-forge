@@ -7,6 +7,7 @@ import {
   sourceSyncActivityFromLocalJob,
   sourceSyncActivityIsActionable,
   sourceSyncActivityIsVisible,
+  COMPLETED_SYNC_VISIBLE_MS,
 } from "../src/views/sources/sourceSyncActivity.js";
 import { teamsConversationCount } from "../src/views/sources/teamsSourceConfig.js";
 import type { LocalAgentJobStatusResponse, SyncStatus } from "../src/api/types.js";
@@ -345,3 +346,16 @@ assert.equal(
 assert.equal(teamsConversationCount({}), null);
 
 console.log("source sync activity tests passed");
+
+const completedSyncFinishedAt = "2026-07-08T11:02:00Z";
+const completedSync = { state: "success" as const, finishedAt: completedSyncFinishedAt };
+const completedSyncFinishedMs = new Date(completedSyncFinishedAt).getTime();
+assert.equal(
+  sourceSyncActivityIsVisible(completedSync, completedSyncFinishedMs + COMPLETED_SYNC_VISIBLE_MS),
+  true,
+);
+assert.equal(
+  sourceSyncActivityIsVisible(completedSync, completedSyncFinishedMs + COMPLETED_SYNC_VISIBLE_MS + 1),
+  false,
+);
+assert.equal(sourceSyncActivityIsVisible({ state: "failed" }), true);
