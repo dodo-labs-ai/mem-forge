@@ -3987,12 +3987,10 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
                             "kind": "document",
                             "evidence_unit_id": None,
                             "support_ids": [],
-                            "support_scope_version": None,
                             "source_id": "src-jira",
                             "source_type": "jira",
                             "doc_id": "jira-SFPAY-179397",
                             "current": True,
-                            "legacy_limited": False,
                             "document": {
                                 "doc_id": "jira-SFPAY-179397",
                                 "title": "SFPAY-179397: Create Blocker Hint",
@@ -4038,12 +4036,10 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
             {
                 "kind": "document",
                 "evidence_unit_id": None,
-                "support_scope_version": None,
                 "source_id": "src-jira",
                 "source_type": "jira",
                 "doc_id": "jira-SFPAY-179397",
                 "current": True,
-                "legacy_limited": False,
                 "document": {
                     "doc_id": "jira-SFPAY-179397",
                     "title": "SFPAY-179397: Create Blocker Hint",
@@ -4325,12 +4321,10 @@ def test_mcp_proxy_preserves_claim_local_evidence_on_get_memory(monkeypatch):
                 {
                     "kind": "evidence_unit",
                     "evidence_unit_id": "evidence-1",
-                    "support_scope_version": "evidence-unit-set-v2",
                     "source_id": "src-github",
                     "source_type": "github",
                     "doc_id": "doc-1",
                     "current": True,
-                    "legacy_limited": False,
                     "document": {
                         "doc_id": "doc-1",
                         "title": "Architecture",

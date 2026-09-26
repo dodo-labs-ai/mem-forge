@@ -5,7 +5,6 @@ import type { SourceSyncActivity } from "@/views/sources/sourceSyncActivity";
 import {
   presentSourceSyncActivity,
   sourceSyncActivityIsVisible,
-  sourceSyncActivityPolicy,
 } from "@/views/sources/sourceSyncActivity";
 
 export function SourceSyncStatusCard({
@@ -32,7 +31,6 @@ export function SourceSyncStatusCard({
   if (!sourceSyncActivityIsVisible(activity, nowMs)) return null;
 
   const presentation = presentSourceSyncActivity(activity, sourceName, itemLabel);
-  const policy = sourceSyncActivityPolicy(activity);
   const active = ["active", "recovering"].includes(activity.state);
   const queued = activity.state === "queued";
   const failed = activity.state === "failed" || activity.state === "partial";
@@ -64,7 +62,7 @@ export function SourceSyncStatusCard({
             Configure file scope
           </button>
         )}
-        {(failed || (queued && activity.retryTarget)) && policy.canRetry && onRetry && (
+        {(failed || (queued && activity.retryTarget)) && onRetry && (
           <button type="button" onClick={onRetry} className="ml-auto flex items-center gap-1" aria-label={queued ? "Retry now" : "Retry sync"}>
             <RotateCw className="size-3.5" />
             {queued && "Retry now"}

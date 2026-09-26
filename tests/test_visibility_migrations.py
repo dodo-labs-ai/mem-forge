@@ -101,7 +101,8 @@ async def test_agent_concept_rebuild_restores_foreign_key_enforcement(tmp_path):
                 last_sync_status="success",
             ),
         )
-        await db.delete_source_cascade("src-cascade")
+        await db.db.execute("DELETE FROM sources WHERE id = ?", ("src-cascade",))
+        await db.db.commit()
         assert await db.get_source_sync_run(run.run_id) is None
     finally:
         await db.close()

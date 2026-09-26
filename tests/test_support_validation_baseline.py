@@ -2,12 +2,13 @@ from dataclasses import replace
 
 import pytest
 
-from tests.test_support_scope_v2 import db as db, _seed_complete_legacy_support
+from tests.test_evidence_unit_support import db as db, _seed_complete_unit_support
+from tests.unit_support_fixture import active_support_evidence, withdraw_lifecycle_gate
 
 
 @pytest.mark.asyncio
 async def test_reused_evidence_preserves_creation_run(db):
-    _, unit_id, _, _ = await _seed_complete_legacy_support(db)
+    _, unit_id, _, _ = await _seed_complete_unit_support(db)
     unit = await db.get_evidence_unit(unit_id)
     await db.db.execute(
         "UPDATE evidence_units SET extractor_run_id = 'run-v1' WHERE id = ?", (unit_id,)
@@ -21,7 +22,7 @@ async def test_reused_evidence_preserves_creation_run(db):
 
 @pytest.mark.asyncio
 async def test_historical_projection_uses_manifest_not_current_observation_pointer(db):
-    await _seed_complete_legacy_support(db)
+    await _seed_complete_unit_support(db)
     await db.db.execute(
         "UPDATE source_observations SET current_revision_id = NULL WHERE id = 'obs-primary'"
     )
@@ -35,9 +36,7 @@ async def test_historical_projection_uses_manifest_not_current_observation_point
 
 @pytest.mark.asyncio
 async def test_schema_upgrade_leaves_legacy_validation_unknown(db):
-    await _seed_complete_legacy_support(db)
-    report = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(expected_report_id=report.id, owner_id="test")
+    await _seed_complete_unit_support(db)
     rows = await db.db.execute_fetchall("SELECT validation_plan_id FROM memory_unit_support_assertions")
     assert rows and all(row["validation_plan_id"] is None for row in rows)
 
@@ -46,9 +45,7 @@ async def test_schema_upgrade_leaves_legacy_validation_unknown(db):
 async def test_existing_database_upgrade_preserves_support_and_evidence(db):
     import sqlite3
 
-    await _seed_complete_legacy_support(db)
-    report = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(expected_report_id=report.id, owner_id="test-upgrade")
+    await _seed_complete_unit_support(db)
     before = [tuple(row) for row in await db.db.execute_fetchall("SELECT * FROM evidence_units")]
     await db.close()
     with sqlite3.connect(db.db_path) as connection:
@@ -66,7 +63,6 @@ async def test_existing_database_upgrade_preserves_support_and_evidence(db):
 async def _support_plan(db, memory_id, unit_id, *, plan_id, action):
     from memforge.memory.lifecycle_plan import ReconciliationScope
     from memforge.memory.lifecycle_planner import NewMemoryDefaults, build_lifecycle_plan
-    from memforge.memory.evidence import SupportScopeVersion
     from memforge.models import RawMemory, ReconcileAction, ReconcileOperation, content_hash
 
     memory = await db.get_memory(memory_id)
@@ -85,10 +81,9 @@ async def _support_plan(db, memory_id, unit_id, *, plan_id, action):
                 if action is ReconcileAction.NOOP else None,
             reason="test validation" if action is ReconcileAction.NOOP else "source withdrew claim",
         ),),
-        incumbents={memory_id: memory}, source_support_reference_ids={}, all_active_support_reference_ids={},
+        incumbents={memory_id: memory},
         support_set_hashes={memory_id: state.support_set_hash},
-        observation_revision_ids=("obsrev-primary", "obsrev-required"), new_evidence_reference_ids=(),
-        support_scope_version=SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
+        observation_revision_ids=("obsrev-primary", "obsrev-required"),
         source_support_unit_ids={memory_id: (unit_id,)}, all_active_support_unit_ids={memory_id: (unit_id,)},
         evidence_unit_ids_by_claim_hash={content_hash(memory.content): (unit_id,)},
         defaults=NewMemoryDefaults(
@@ -102,16 +97,14 @@ async def _support_plan(db, memory_id, unit_id, *, plan_id, action):
 async def test_gated_review_retains_last_successful_support_plan(db):
     from memforge.models import ReconcileAction
 
-    memory_id, unit_id, source_id, _ = await _seed_complete_legacy_support(db)
-    report = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(expected_report_id=report.id, owner_id="test-review")
+    memory_id, unit_id, source_id, _ = await _seed_complete_unit_support(db)
     await db.enable_lifecycle_gate(source_id)
     for plan_id, action in (("verified-plan", ReconcileAction.NOOP), ("review-plan", ReconcileAction.DELETE)):
         if action is ReconcileAction.DELETE:
-            await db.gate_destructive_lifecycle(source_id, reason="unresolved historical provenance")
+            await withdraw_lifecycle_gate(db, source_id)
         plan = await _support_plan(db, memory_id, unit_id, plan_id=plan_id, action=action)
         await db.apply_lifecycle_plan(plan)
-        support = await db.get_active_memory_support_evidence(memory_id, source_id=source_id)
+        support = await active_support_evidence(db, memory_id, source_id=source_id)
         assert {item.validation_plan_id for item in support} == {"verified-plan"}
         assert {item.validation_unit_revision_id for item in support} == {"unitrev-1"}
     assert len(await db.list_lifecycle_reviews(source_id)) == 1
@@ -123,9 +116,7 @@ async def test_shared_evidence_keeps_each_memory_validation_baseline_independent
     from memforge.memory.evidence import MemoryUnitSupportAssertion, memory_unit_support_assertion_id
     from memforge.models import MemorySource, ReconcileAction, content_hash
 
-    memory_id, unit_id, source_id, access_hash = await _seed_complete_legacy_support(db)
-    report = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(expected_report_id=report.id, owner_id="test-shared")
+    memory_id, unit_id, source_id, access_hash = await _seed_complete_unit_support(db)
     await db.enable_lifecycle_gate(source_id)
     memory = await db.get_memory(memory_id)
     unit = await db.get_evidence_unit(unit_id)
@@ -145,7 +136,7 @@ async def test_shared_evidence_keeps_each_memory_validation_baseline_independent
         await db.apply_lifecycle_plan(await _support_plan(
             db, other.id, unit_id, plan_id="other-verified-plan", action=ReconcileAction.NOOP,
         ))
-    before = await db.get_active_memory_support_evidence(other.id, source_id=source_id)
+    before = await active_support_evidence(db, other.id, source_id=source_id)
     assert before
     assert {item.validation_plan_id for item in before} == {"other-verified-plan" if other_has_baseline else None}
     assert {item.validation_unit_revision_id for item in before} == {"unitrev-1" if other_has_baseline else None}

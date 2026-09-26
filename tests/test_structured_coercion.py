@@ -4,8 +4,8 @@ decode those before validation so a stringified container still parses.
 """
 
 from memforge.llm.structured import (
-    MemoryCandidate,
-    MemoryExtractionResponse,
+    ProjectionFragmentMemoryCandidate,
+    ProjectionFragmentMemoryExtractionResponse,
     RerankResponse,
 )
 
@@ -14,10 +14,10 @@ def test_memories_stringified_array_is_decoded():
     payload = {
         "memories": (
             '[{"content": "pay-api uses PostgreSQL 15", "memory_type": "fact", '
-            '"evidence_block_id": "EB-001"}]'
+            '"primary_ref": "P1"}]'
         )
     }
-    parsed = MemoryExtractionResponse.model_validate(payload)
+    parsed = ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
     assert len(parsed.memories) == 1
     assert parsed.memories[0].memory_type == "fact"
 
@@ -28,11 +28,11 @@ def test_native_array_is_unchanged():
             {
                 "content": "x",
                 "memory_type": "fact",
-                "evidence_block_id": "EB-001",
+                "primary_ref": "P1",
             }
         ]
     }
-    parsed = MemoryExtractionResponse.model_validate(payload)
+    parsed = ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
     assert parsed.memories[0].content == "x"
 
 
@@ -42,21 +42,21 @@ def test_nested_stringified_list_field_is_decoded():
             {
                 "content": "x",
                 "memory_type": "fact",
-                "evidence_block_id": "EB-001",
+                "primary_ref": "P1",
                 "entity_refs": '["pay-api", "postgresql"]',
             }
         ]
     }
-    parsed = MemoryExtractionResponse.model_validate(payload)
+    parsed = ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
     assert parsed.memories[0].entity_refs == ["pay-api", "postgresql"]
 
 
 def test_string_scalar_field_is_not_decoded():
-    cand = MemoryCandidate.model_validate(
+    cand = ProjectionFragmentMemoryCandidate.model_validate(
         {
             "content": "[brackets] in text",
             "memory_type": "fact",
-            "evidence_block_id": "EB-001",
+            "primary_ref": "P1",
         }
     )
     assert cand.content == "[brackets] in text"

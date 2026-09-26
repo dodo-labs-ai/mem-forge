@@ -12,7 +12,6 @@ if TYPE_CHECKING:
 
 from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
-    projection_extraction_contract,
 )
 from memforge.pipeline.evidence_fragments import (
     StructuralUnit,
@@ -35,7 +34,6 @@ from memforge.source_projection import (
 )
 
 
-LEGACY_PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 2
 PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 5
 
 
@@ -52,9 +50,8 @@ class ProjectionExtractionBatch:
     context_observation_ids_by_primary: tuple[tuple[str, tuple[str, ...]], ...]
     primary_markdown: str
     context_markdown: str
-    authority_policy_version: int = PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION
-    # Exact segment coordinates in immutable Observation revisions. Kept
-    # transient so EvidenceCatalog never creates a block across overlap seams.
+    # Exact primary segment coordinates in immutable Observation revisions.
+    # Fragment planning treats only these ranges as primary authority.
     primary_authority_spans: tuple[tuple[str, int, str], ...] = ()
     candidate_context_observation_ids: tuple[str, ...] | None = None
     candidate_context_image_bytes: int = 0
@@ -121,7 +118,6 @@ def plan_projection_evidence_work(
     *,
     committed_base_snapshot: CommittedSourceUnitSnapshot | None = None,
     reprocess_all_current_observations: bool,
-    extraction_contract_version: str = PROJECTION_EXTRACTION_CONTRACT_VERSION,
 ) -> tuple[ProjectionExtractionBatch, ...] | ProjectionEvidencePlanningFailure:
     """Plan current-work authority before presentation batching.
 
@@ -130,7 +126,6 @@ def plan_projection_evidence_work(
     representation-owned structure; Context and batch packing cannot widen it.
     """
 
-    contract = projection_extraction_contract(extraction_contract_version)
     delta = projection.deltas[0]
     revisions = {
         revision.observation_id: revision
@@ -141,13 +136,7 @@ def plan_projection_evidence_work(
         if reprocess_all_current_observations
         else None
     )
-    if not contract.uses_fragment_catalog or reprocess_all_current_observations:
-        if not contract.uses_fragment_catalog:
-            return plan_projection_extraction_batches(
-                projection,
-                primary_observation_ids=selected_primary_ids,
-                extraction_contract_version=extraction_contract_version,
-            )
+    if reprocess_all_current_observations:
         if (
             delta.previous_unit_revision_id is not None
             and (
@@ -163,13 +152,11 @@ def plan_projection_evidence_work(
             projection,
             primary_observation_ids=selected_primary_ids,
             primary_authority_ranges_by_observation_id=None,
-            extraction_contract_version=extraction_contract_version,
         )
 
     if delta.previous_unit_revision_id is None:
         return _plan_projection_extraction_batches_or_failure(
             projection, primary_authority_ranges_by_observation_id=None,
-            extraction_contract_version=extraction_contract_version,
         )
 
     added_ids = set(delta.added_observation_ids)
@@ -297,7 +284,6 @@ def plan_projection_evidence_work(
     return _plan_projection_extraction_batches_or_failure(
         projection,
         primary_authority_ranges_by_observation_id=exact_authority_ranges,
-        extraction_contract_version=extraction_contract_version,
     )
 
 
@@ -309,7 +295,6 @@ def _plan_projection_extraction_batches_or_failure(
         str, tuple[tuple[int, int], ...]
     ]
     | None,
-    extraction_contract_version: str,
 ) -> tuple[ProjectionExtractionBatch, ...] | ProjectionEvidencePlanningFailure:
     """Validate canonical fields before grouping exact extraction authority."""
 
@@ -333,7 +318,6 @@ def _plan_projection_extraction_batches_or_failure(
         projection,
         primary_observation_ids=primary_observation_ids,
         primary_authority_ranges_by_observation_id=primary_authority_ranges_by_observation_id,
-        extraction_contract_version=extraction_contract_version,
     )
 
 
@@ -377,9 +361,7 @@ def plan_projection_extraction_batches(
     max_primary_observations: int = 8,
     max_primary_chars: int = 30_000,
     max_context_chars: int = 20_000,
-    primary_overlap_chars: int = 2_000,
     max_primary_binary_bytes: int = MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
-    extraction_contract_version: str = PROJECTION_EXTRACTION_CONTRACT_VERSION,
 ) -> tuple[ProjectionExtractionBatch, ...]:
     """Build bounded batches using only generic deltas and relations.
 
@@ -388,12 +370,10 @@ def plan_projection_extraction_batches(
     Source Projection truth. Directly related observations, immediate sequence
     neighbors, and the first observation in a unit are bounded Context. Exact
     candidate Context may be selected as Required, but relations never make it
-    Primary-eligible. Compiler-backed v9 planning segments only range-addressable
-    text profiles; canonical records and binary Artifacts retain whole-Observation
-    authority until compilation. Character counts are grouping targets, not
-    capacity gates for v9: a larger structure is passed intact to the actual
-    request planner. Legacy projection extraction keeps its bounded
-    character segmentation because it presents batch Markdown directly.
+    Primary-eligible. Planning segments only range-addressable text profiles;
+    canonical records and binary Artifacts retain whole-Observation authority
+    until compilation. Character counts are grouping targets, not capacity
+    gates: a larger structure is passed intact to the actual request planner.
     """
 
     if len(projection.source_units) != 1:
@@ -448,16 +428,7 @@ def plan_projection_extraction_batches(
         or max_primary_binary_bytes < 1
     ):
         raise ValueError("projection extraction budgets must be positive")
-    if primary_overlap_chars < 0:
-        raise ValueError("primary overlap cannot be negative")
 
-    compiler_backed = projection_extraction_contract(
-        extraction_contract_version
-    ).uses_fragment_catalog
-    if primary_authority_ranges_by_observation_id is not None and not compiler_backed:
-        raise ValueError(
-            "exact Primary authority ranges require a fragment-catalog extraction contract"
-        )
     if primary_authority_ranges_by_observation_id is not None:
         unknown_authority_ids = set(primary_authority_ranges_by_observation_id) - set(
             primary_ids
@@ -466,12 +437,6 @@ def plan_projection_extraction_batches(
             raise ValueError(
                 "Primary authority ranges must belong to selected current observations"
             )
-    authority_policy_version = (
-        PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION
-        if compiler_backed
-        else LEGACY_PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION
-    )
-
     segments = [
         segment
         for observation_id in primary_ids
@@ -479,14 +444,12 @@ def plan_projection_extraction_batches(
             observation_id,
             observations[observation_id].observation_type,
             revisions[observation_id],
-            preserve_whole_authority=compiler_backed,
             authorized_ranges=(
                 primary_authority_ranges_by_observation_id.get(observation_id)
                 if primary_authority_ranges_by_observation_id is not None
                 else None
             ),
             max_chars=max_primary_chars,
-            overlap_chars=primary_overlap_chars,
         )
     ]
     groups: list[list[_PrimarySegment]] = []
@@ -599,8 +562,8 @@ def plan_projection_extraction_batches(
         )
         digest = hashlib.sha256(
             (
-                f"{extraction_contract_version}\x1f"
-                f"authority-policy:{authority_policy_version}\x1f"
+                f"{PROJECTION_EXTRACTION_CONTRACT_VERSION}\x1f"
+                f"authority-policy:{PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION}\x1f"
                 f"{target_unit_revision_id}\x1f{unit.id}\x1f"
                 f"{index}\x1f{segment_identity}"
             ).encode()
@@ -641,7 +604,6 @@ def plan_projection_extraction_batches(
                 context_observation_ids_by_primary=context_by_primary,
                 primary_markdown=primary_markdown,
                 context_markdown=context_markdown,
-                authority_policy_version=authority_policy_version,
                 primary_authority_spans=tuple(
                     (
                         segment.observation_id,
@@ -737,10 +699,8 @@ def _primary_segments(
     observation_type: str,
     revision: SourceObservationRevision,
     *,
-    preserve_whole_authority: bool,
     authorized_ranges: tuple[tuple[int, int], ...] | None,
     max_chars: int,
-    overlap_chars: int,
 ) -> tuple[_PrimarySegment, ...]:
     """Plan exact authority without violating the Revision's representation."""
 
@@ -789,8 +749,7 @@ def _primary_segments(
             )
         return tuple(segments)
     if (
-        preserve_whole_authority
-        and evidence_profile is not None
+        evidence_profile is not None
         and evidence_profile.requires_whole_observation_authority
     ):
         return (_PrimarySegment(observation_id, 0, len(content), plain_header + content),)
@@ -802,50 +761,23 @@ def _primary_segments(
         f"### Observation {observation_id} ({observation_type}) "
         f"[characters {'9' * max_digits}:{'9' * max_digits}]\n"
     )
-    content_budget = max_chars - len(ranged_header)
-    if preserve_whole_authority:
-        content_budget = max(1, content_budget)
-    if content_budget < 1:
-        raise ValueError("primary character budget is too small for the Observation header")
-    if preserve_whole_authority:
-        return tuple(
-            _PrimarySegment(
-                observation_id=observation_id,
-                start=unit.start,
-                end=unit.end,
-                markdown=(
-                    f"### Observation {observation_id} ({observation_type}) "
-                    f"[characters {unit.start}:{unit.end}]\n"
-                    f"{content[unit.start:unit.end]}"
-                ),
-            )
-            for unit in plan_revision_structural_units(
-                revision,
-                max_content_chars=content_budget,
-            )
+    content_budget = max(1, max_chars - len(ranged_header))
+    return tuple(
+        _PrimarySegment(
+            observation_id=observation_id,
+            start=unit.start,
+            end=unit.end,
+            markdown=(
+                f"### Observation {observation_id} ({observation_type}) "
+                f"[characters {unit.start}:{unit.end}]\n"
+                f"{content[unit.start:unit.end]}"
+            ),
         )
-    overlap = min(overlap_chars, content_budget // 4)
-    step = content_budget - overlap
-    segments = []
-    start = 0
-    while start < len(content):
-        end = min(len(content), start + content_budget)
-        header = (
-            f"### Observation {observation_id} ({observation_type}) "
-            f"[characters {start}:{end}]\n"
+        for unit in plan_revision_structural_units(
+            revision,
+            max_content_chars=content_budget,
         )
-        segments.append(
-            _PrimarySegment(
-                observation_id=observation_id,
-                start=start,
-                end=end,
-                markdown=header + content[start:end],
-            )
-        )
-        if end == len(content):
-            break
-        start += step
-    return tuple(segments)
+    )
 
 
 def _observation_markdown(observation_ids, observations, revisions) -> str:

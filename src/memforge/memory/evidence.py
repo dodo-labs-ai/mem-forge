@@ -64,6 +64,8 @@ class CandidateBucket(str, Enum):
 class EvidenceContentProvenance(str, Enum):
     SOURCE_EXCERPT = "source_excerpt"
     SOURCE_ARTIFACT = "source_artifact"
+    # Stored on Evidence Units recovered from pre-Fragment lineage. It stays
+    # readable; nothing records new Units with it.
     LEGACY_LIMITED = "legacy_limited"
     NO_EXCERPT = "no_excerpt"
 
@@ -76,9 +78,12 @@ class EvidenceRole(str, Enum):
     CONTEXT = "context"
 
 
-class SupportScopeVersion(str, Enum):
-    REFERENCE_SET_V1 = "reference-set-v1"
-    EVIDENCE_UNIT_SET_V2 = "evidence-unit-set-v2"
+EVIDENCE_UNIT_SUPPORT_SCOPE = "evidence-unit-set-v2"
+"""Support scope hashed into Evidence Unit and Support-set identities.
+
+Every workspace records this value in its Support scope marker; storage refuses
+to open a workspace whose marker names any other scope.
+"""
 
 
 class EvidencePartKind(str, Enum):
@@ -183,20 +188,6 @@ class EvidenceReference:
 
 
 @dataclass(frozen=True, slots=True)
-class MemorySupportAssertion:
-    """Legacy reference-scoped Support retained as immutable v1 history."""
-
-    id: str
-    memory_id: str
-    evidence_reference_id: str
-    source_id: str
-    access_context_hash: str
-    active: bool = True
-    created_at: str | None = None
-    removed_at: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class MemoryUnitSupportAssertion:
     id: str
     memory_id: str
@@ -217,28 +208,6 @@ class EvidenceContextAssociation:
     created_at: str | None = None
     updated_at: str | None = None
     removed_at: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class SupportCutoverFinding:
-    memory_id: str
-    evidence_unit_id: str
-    source_id: str
-    access_context_hash: str
-    reason_codes: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class SupportCutoverReport:
-    id: str
-    support_scope_version: SupportScopeVersion
-    legacy_group_count: int
-    eligible_group_count: int
-    ineligible_group_count: int
-    active_eligible_group_count: int
-    inactive_eligible_group_count: int
-    findings: tuple[SupportCutoverFinding, ...]
-    created_at: str
 
 
 def evidence_unit_revision_lineage_is_valid(
@@ -298,14 +267,12 @@ class MemoryEvidenceItemProjection:
 class MemoryEvidenceUnitProjection:
     evidence_unit_id: str
     support_ids: tuple[str, ...]
-    support_scope_version: SupportScopeVersion
     source_id: str
     source_type: str
     source_unit_id: str
     source_unit_revision_id: str | None
     doc_id: str | None
     current: bool
-    legacy_limited: bool
     items: tuple[MemoryEvidenceItemProjection, ...]
 
 
@@ -420,7 +387,7 @@ def evidence_unit_id_v2(
     digest = sha256(
         "\x1f".join(
             (
-                SupportScopeVersion.EVIDENCE_UNIT_SET_V2.value,
+                EVIDENCE_UNIT_SUPPORT_SCOPE,
                 source_unit_id,
                 sha256(claim_content.strip().encode("utf-8")).hexdigest(),
                 part_set_digest,
@@ -471,6 +438,7 @@ class LifecycleAction(str, Enum):
 
 
 class ReviewCase(str, Enum):
+    # May appear on stored relation runs; never produced.
     LEGACY_LIMITED_EVIDENCE = "legacy_limited_evidence"
     MISSING_CONTENT_PROVENANCE = "missing_content_provenance"
     MULTI_DESTRUCTIVE_MATCH = "multi_destructive_match"
@@ -1074,8 +1042,6 @@ class MemoryRelationApplyService:
             return ReviewCase.CROSS_SCOPE_BLOCKED
 
         if any(self._is_destructive_candidate(decision) for decision in decisions):
-            if unit.evidence_provenance is EvidenceContentProvenance.LEGACY_LIMITED:
-                return ReviewCase.LEGACY_LIMITED_EVIDENCE
             if unit.evidence_provenance is not EvidenceContentProvenance.SOURCE_EXCERPT or not unit.excerpt:
                 return ReviewCase.MISSING_CONTENT_PROVENANCE
             destructive_decisions = [decision for decision in decisions if self._is_destructive_candidate(decision)]

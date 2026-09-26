@@ -32,10 +32,6 @@ from memforge.memory.evidence import (
 from memforge.models import DocumentRecord
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.fragment_selector_correction import correct_fragment_selectors_once
-from memforge.pipeline.extraction_contract import (
-    PROJECTION_EXTRACTION_V8,
-    PROJECTION_EXTRACTION_V9,
-)
 from memforge.pipeline.projection_context import (
     ProjectionExtractionBatch,
     plan_projection_extraction_batches,
@@ -848,7 +844,6 @@ def test_large_canonical_observation_compiles_from_whole_authority(
     [batch] = plan_projection_extraction_batches(
         projection,
         max_primary_chars=30_000,
-        extraction_contract_version=PROJECTION_EXTRACTION_V9,
     )
     catalog = compile_projection_fragment_catalog(
         projection,
@@ -865,29 +860,6 @@ def test_large_canonical_observation_compiles_from_whole_authority(
     assert not any(
         error.code.value == "invalid_authority_range"
         for error in catalog.errors
-    )
-
-
-def test_legacy_v8_large_canonical_observation_keeps_bounded_text_segments() -> None:
-    content = json.dumps(
-        {"body": "Legacy projection prompt. " * 2_000},
-        separators=(",", ":"),
-    )
-    assert len(content) > 30_000
-    projection = _canonical_projection(observation_type="comment", content=content)
-
-    batches = plan_projection_extraction_batches(
-        projection,
-        max_primary_chars=30_000,
-        extraction_contract_version=PROJECTION_EXTRACTION_V8,
-    )
-
-    assert len(batches) > 1
-    assert all(len(batch.primary_markdown) <= 30_000 for batch in batches)
-    assert all(
-        len(span_text) < len(content)
-        for batch in batches
-        for _, _, span_text in batch.primary_authority_spans
     )
 
 
@@ -945,7 +917,6 @@ def test_v9_unknown_whole_authority_profile_fails_in_compiler_not_planner(
     [batch] = plan_projection_extraction_batches(
         future,
         max_primary_chars=5_000,
-        extraction_contract_version=PROJECTION_EXTRACTION_V9,
     )
     catalog = compile_projection_fragment_catalog(
         future,
@@ -968,7 +939,6 @@ def test_canonical_nested_markdown_preserves_escaped_raw_json_ranges() -> None:
 
     [batch] = plan_projection_extraction_batches(
         projection,
-        extraction_contract_version=PROJECTION_EXTRACTION_V9,
     )
     catalog = compile_projection_fragment_catalog(
         projection,
@@ -1005,8 +975,6 @@ def test_representation_policy_keeps_binary_whole_and_plain_text_range_addressab
     plain_batches = plan_projection_extraction_batches(
         plain,
         max_primary_chars=5_000,
-        primary_overlap_chars=0,
-        extraction_contract_version=PROJECTION_EXTRACTION_V9,
     )
     assert len(plain_batches) > 1
     assert all(
@@ -1036,7 +1004,6 @@ def test_representation_policy_keeps_binary_whole_and_plain_text_range_addressab
     [binary_batch] = plan_projection_extraction_batches(
         binary,
         max_primary_chars=5_000,
-        extraction_contract_version=PROJECTION_EXTRACTION_V9,
     )
     assert binary_batch.primary_authority_spans == (
         (observation.id, 0, content),
@@ -1350,7 +1317,6 @@ def test_large_canonical_fragment_fails_with_capacity_error_without_raw_slicing(
     [batch] = plan_projection_extraction_batches(
         projection,
         max_primary_chars=200,
-        extraction_contract_version=PROJECTION_EXTRACTION_V9,
     )
     catalog = compile_projection_fragment_catalog(
         projection,
@@ -1613,14 +1579,7 @@ def test_v9_derivation_identity_includes_model_presentation_policy(
         user_id=None,
         source_activity_epoch=None,
     )
-    v9_batches = plan_projection_extraction_batches(
-        projection,
-        extraction_contract_version=PROJECTION_EXTRACTION_V9,
-    )
-    v8_batches = plan_projection_extraction_batches(
-        projection,
-        extraction_contract_version=PROJECTION_EXTRACTION_V8,
-    )
+    batches = plan_projection_extraction_batches(projection)
 
     monkeypatch.setattr(
         source_derivation_module,
@@ -1628,44 +1587,18 @@ def test_v9_derivation_identity_includes_model_presentation_policy(
         1,
         raising=False,
     )
-    old_v9 = source_derivation_manifest(
-        projection,
-        v9_batches,
-        context=context,
-        extraction_contract_version=PROJECTION_EXTRACTION_V9,
-    )
-    old_v8 = source_derivation_manifest(
-        projection,
-        v8_batches,
-        context=context,
-        extraction_contract_version=PROJECTION_EXTRACTION_V8,
-    )
+    old = source_derivation_manifest(projection, batches, context=context)
     monkeypatch.setattr(
         source_derivation_module,
         "PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION",
         2,
         raising=False,
     )
-    current_v9 = source_derivation_manifest(
-        projection,
-        v9_batches,
-        context=context,
-        extraction_contract_version=PROJECTION_EXTRACTION_V9,
-    )
-    current_v8 = source_derivation_manifest(
-        projection,
-        v8_batches,
-        context=context,
-        extraction_contract_version=PROJECTION_EXTRACTION_V8,
-    )
+    current = source_derivation_manifest(projection, batches, context=context)
 
-    assert current_v9.id != old_v9.id
-    assert current_v9.batches[0].input_payload_hash != (
-        old_v9.batches[0].input_payload_hash
-    )
-    assert current_v8.id == old_v8.id
-    assert current_v8.batches[0].input_payload_hash == (
-        old_v8.batches[0].input_payload_hash
+    assert current.id != old.id
+    assert current.batches[0].input_payload_hash != (
+        old.batches[0].input_payload_hash
     )
 
 
@@ -2022,10 +1955,8 @@ async def test_extractor_persists_only_resolved_parts_and_never_falls_back() -> 
     assert len(result.memories) == 1
     memory = result.memories[0]
     assert memory.evidence_quote is None
-    assert memory.evidence_block_id is None
     assert memory.resolved_evidence_selection is not None
     assert len(memory.resolved_evidence_selection.parts) == 2
-    assert "evidence_block_fallback_samples" not in result.metadata
 
     restored = memory_extraction_result_from_output_payload(
         memory_extraction_output_payload(result)
@@ -2188,45 +2119,6 @@ async def test_selector_correction_groups_failures_and_reuses_artifact_images() 
     assert metrics["selector_correction_recovered_count"] == 1
     assert corrected[0].required_refs == [artifact]
     assert corrected[1] is candidates[1]
-
-
-@pytest.mark.asyncio
-async def test_contract_cutover_supersedes_only_incomplete_v8_derivations(db) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    for derivation_id, status in (
-        ("sdrv-pending", "pending"),
-        ("sdrv-retry", "retryable_failure"),
-        ("sdrv-complete", "completed"),
-    ):
-        await db.db.execute(
-            """INSERT INTO source_derivation_attempts (
-                   id, source_id, source_unit_id, target_unit_revision_id,
-                   projection_payload_json, projection_payload_hash,
-                   projection_identity_hash, context_payload_json,
-                   context_payload_hash, context_identity_hash,
-                   extraction_contract_version, status, created_at, updated_at
-               ) VALUES (?, 'source-1', 'unit-1', 'unitrev-1',
-                         '{}', 'projection-hash', 'projection-identity',
-                         '{}', 'context-hash', 'context-identity',
-                         'projection-extraction-v8', ?, ?, ?)""",
-            (derivation_id, status, now, now),
-        )
-    await db.db.commit()
-
-    superseded = await db.supersede_incomplete_source_derivations_for_contract(
-        extraction_contract_version="projection-extraction-v8",
-    )
-    assert superseded == ("sdrv-pending", "sdrv-retry")
-    rows = await db.db.execute_fetchall(
-        """SELECT id, status, terminal_reason_code
-           FROM source_derivation_attempts ORDER BY id"""
-    )
-    by_id = {str(row["id"]): row for row in rows}
-    assert by_id["sdrv-pending"]["status"] == "superseded"
-    assert by_id["sdrv-retry"]["status"] == "superseded"
-    assert by_id["sdrv-pending"]["terminal_reason_code"] == "CONTRACT_SUPERSEDED"
-    assert by_id["sdrv-complete"]["status"] == "completed"
-    assert by_id["sdrv-complete"]["terminal_reason_code"] is None
 
 
 def test_compact_catalog_preserves_exact_text_authority_and_internal_provenance():

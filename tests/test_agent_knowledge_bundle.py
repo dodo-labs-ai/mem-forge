@@ -132,21 +132,16 @@ async def _relation_runs_for_memory(db: Database, memory_id: str) -> list[dict]:
 
 
 async def _support_evidence_unit_ids(db: Database, memory_id: str) -> set[str]:
-    async with db.db.execute(
-        """SELECT DISTINCT er.evidence_unit_id
-             FROM memory_support_assertions msa
-             JOIN evidence_references er ON er.id = msa.evidence_reference_id
-            WHERE msa.memory_id = ? AND msa.active = 1""",
-        (memory_id,),
-    ) as cursor:
-        return {str(row[0]) async for row in cursor}
+    return set(await db.get_active_memory_support_unit_ids(memory_id))
 
 
-async def _stale_support_reference_count(db: Database, memory_id: str) -> int:
+async def _stale_support_part_count(db: Database, memory_id: str) -> int:
     async with db.db.execute(
         """SELECT COUNT(*)
-             FROM memory_support_assertions msa
-             JOIN evidence_references er ON er.id = msa.evidence_reference_id
+             FROM memory_unit_support_assertions msa
+             JOIN evidence_references er
+               ON er.evidence_unit_id = msa.evidence_unit_id
+              AND er.role IN ('primary', 'required')
              JOIN source_observations so ON so.id = er.observation_id
             WHERE msa.memory_id = ?
               AND msa.active = 1
@@ -277,7 +272,7 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
         (result.memory_id, RelationType.SUPPORTS)
     ]
     assert await _support_evidence_unit_ids(db, result.memory_id) == {evidence_unit.id}
-    assert await _stale_support_reference_count(db, result.memory_id) == 0
+    assert await _stale_support_part_count(db, result.memory_id) == 0
 
 
 @pytest.mark.asyncio
@@ -328,40 +323,6 @@ async def test_agent_claim_identity_does_not_merge_with_ordinary_exact_memory(bu
         ordinary.id,
         result.memory_id,
     }
-
-
-@pytest.mark.asyncio
-async def test_post_cutover_agent_claim_write_commits_source_projection_lineage(bundle_stack):
-    db, store, _collection = bundle_stack
-    source_id = "src-agent-sessions-codex"
-    await db.enable_lifecycle_gate(source_id)
-    service = AgentKnowledgeBundleService(db=db, memory_store=store)
-
-    result = await service.apply_patch_proposal(
-        proposal=_proposal(
-            concept_id="akb_concept_post_cutover",
-            claim_id="akb_claim_post_cutover",
-        ),
-        owner_user_id="u-andrew",
-        source_id=source_id,
-        client="codex",
-        session_id="sess-post-cutover",
-        workspace="/workspace/memforge-cloud",
-        repo_identifier="github.tools.sap/hcm/memforge-cloud",
-        project_key="UNSORTED",
-        submitted_at=datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc),
-        source_updated_at=datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc),
-    )
-
-    assert result.outcome == "applied"
-    assert result.memory_id is not None
-    assert result.concept_id is not None
-    source_unit = await db.find_source_unit_by_document_id(source_id, result.concept_id)
-    assert source_unit is not None
-    support_reference_ids = await db.get_active_memory_support_reference_ids(result.memory_id)
-    assert support_reference_ids
-    support_by_memory = await db.get_source_unit_support_reference_ids(source_unit.id)
-    assert support_by_memory[result.memory_id] == support_reference_ids
 
 
 @pytest.mark.asyncio
@@ -580,12 +541,6 @@ async def test_correction_rebinds_unchanged_multi_fragment_claim_in_one_v2_unit(
     bundle_stack,
 ):
     db, store, _ = bundle_stack
-    await db.db.execute(
-        """UPDATE system_contract_markers
-              SET marker_value = 'evidence-unit-set-v2'
-            WHERE marker_key = 'support_scope_version'"""
-    )
-    await db.db.commit()
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     multi_block_claim = (
         "MemForge Cloud uses two database tiers.\n\n"
@@ -899,7 +854,7 @@ async def test_retired_claim_backed_memory_is_removed_from_active_claim_projecti
     assert lineage_claim is not None
     assert lineage_claim["memory_id"] == created.memory_id
     assert active_claims == []
-    assert await db.get_active_memory_support_reference_ids(created.memory_id) == ()
+    assert await db.get_active_memory_support_unit_ids(created.memory_id) == ()
     assert (await db.get_memory(created.memory_id)).status == "retired"
     assert concept is not None
     assert "Workspace source schedulers must start during app startup" not in concept["markdown_body"]
@@ -1066,14 +1021,14 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
     assert old_memory.superseded_by == updated.memory_id
     assert old_memory.replacement_reason == "New evidence refines the scheduler lifecycle claim."
     assert old_memory.replacement_kind == "revision"
-    assert await db.get_active_memory_support_reference_ids(created.memory_id) == ()
+    assert await db.get_active_memory_support_unit_ids(created.memory_id) == ()
 
-    updated_support = await db.get_active_memory_support_reference_ids(updated.memory_id)
+    updated_support = await db.get_active_memory_support_unit_ids(updated.memory_id)
     assert updated_support
     current_revision = await db.get_current_source_unit_revision(source_unit.id)
     assert current_revision is not None
     assert current_revision.id != initial_revision.id
-    support_by_memory = await db.get_source_unit_support_reference_ids(source_unit.id)
+    support_by_memory = await db.get_source_unit_support_unit_ids(source_unit.id)
     assert support_by_memory == {updated.memory_id: updated_support}
 
     claim = await db.get_agent_claim(created.claim_id)
@@ -1105,7 +1060,7 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
     ]
     assert evidence_unit.client == "codex"
     assert await _support_evidence_unit_ids(db, updated.memory_id) == {evidence_unit.id}
-    assert await _stale_support_reference_count(db, updated.memory_id) == 0
+    assert await _stale_support_part_count(db, updated.memory_id) == 0
 
 
 @pytest.mark.asyncio

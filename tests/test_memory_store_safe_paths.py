@@ -26,7 +26,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleVectorTask,
     LifecycleVectorTaskStatus,
 )
-from memforge.models import DocumentRecord, Memory, MemoryReview, MemorySource, content_hash
+from memforge.models import Memory, MemoryReview, MemorySource, content_hash
 from memforge.memory.review_service import ReviewKind, ReviewStatus
 from memforge.memory.store import MemoryStore
 from memforge.storage.database import Database
@@ -285,18 +285,6 @@ async def _insert_doc_side_tables(db: Database, doc_id: str, source: str = "src-
         ),
     )
     await db.db.commit()
-
-
-async def _doc_side_counts(db: Database, doc_id: str) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    queries = {
-        "changelog": ("SELECT COUNT(*) FROM changelog WHERE doc_id = ?", (doc_id,)),
-        "receipts": ("SELECT COUNT(*) FROM agent_session_receipts WHERE doc_id = ?", (doc_id,)),
-    }
-    for key, (sql, params) in queries.items():
-        async with db.db.execute(sql, params) as cursor:
-            counts[key] = (await cursor.fetchone())[0]
-    return counts
 
 
 async def _source_bookkeeping_counts(db: Database, source: str) -> dict[str, int]:
@@ -1356,164 +1344,6 @@ async def test_purge_memory_redacts_existing_audit_payloads(db: Database):
 
 
 @pytest.mark.asyncio
-async def test_delete_document_audit_records_source_absence_context(db: Database):
-    await _insert_doc(db, "doc-source-absence")
-    memory = _memory("mem-source-absence", "Only supported by source absence doc")
-    await db.insert_memory(memory)
-    await db.add_memory_source(memory.id, "doc-source-absence", "jira", source_updated_at=None)
-    store = _store(db, RecordingCollection())
-
-    await store.delete_document(
-        "doc-source-absence",
-        deletion_context={
-            "deletion_kind": "source_absence",
-            "reason": "not_returned_by_latest_successful_crawl",
-            "source_filter_summary": "updated >= -90d",
-        },
-    )
-
-    audit_rows = await db.list_memory_audit_events(event_type="document_delete_committed")
-    assert len(audit_rows) == 1
-    assert audit_rows[0].payload == {
-        "deletion_kind": "source_absence",
-        "reason": "not_returned_by_latest_successful_crawl",
-        "source_filter_summary": "updated >= -90d",
-        "retired_memory_ids": [memory.id],
-    }
-
-
-@pytest.mark.asyncio
-async def test_remove_source_support_keeps_retirement_committed_when_vector_delivery_fails(db: Database):
-    await _insert_doc(db)
-    memory = _memory("mem-source-rollback", "Last sourced fact")
-    await db.insert_memory(memory)
-    await db.add_memory_source(memory.id, "doc-1", "confluence", "source excerpt", source_updated_at=None)
-    store = _store(db, FailingDeleteCollection())
-
-    retired = await store.remove_source_support(memory.id, "doc-1", source_id="src-1", reason="no_support")
-
-    stored = await db.get_memory(memory.id)
-    sources = await db.get_memory_sources(memory.id)
-    async with db.db.execute("SELECT COUNT(*) FROM memories_fts WHERE memory_id = ?", (memory.id,)) as cursor:
-        fts_count = (await cursor.fetchone())[0]
-    tasks = await db.list_lifecycle_vector_tasks(source_id="src-1", limit=10)
-    assert retired is True
-    assert stored.status == "retired"
-    assert sources == []
-    assert fts_count == 0
-    assert [(task.memory_id, task.operation.value, task.status) for task in tasks] == [
-        (memory.id, "delete", "failed")
-    ]
-
-
-@pytest.mark.asyncio
-async def test_delete_document_restores_db_when_retired_memory_index_delete_fails(db: Database):
-    await _insert_doc(db, "doc-delete-rollback")
-    await _insert_doc_side_tables(db, "doc-delete-rollback")
-    memory = _memory("mem-doc-rollback", "Only supported by deleted doc")
-    await db.insert_memory(memory)
-    await db.add_memory_source(
-        memory.id,
-        "doc-delete-rollback",
-        "confluence",
-        "source excerpt",
-        source_updated_at=None,
-    )
-    store = _store(db, FailingDeleteCollection())
-
-    with pytest.raises(RuntimeError, match="delete failed"):
-        await store.delete_document("doc-delete-rollback")
-
-    stored_doc = await db.get_document("doc-delete-rollback")
-    stored_memory = await db.get_memory(memory.id)
-    sources = await db.get_memory_sources(memory.id)
-    assert stored_doc is not None
-    assert stored_memory.status == "active"
-    assert [(source.doc_id, source.excerpt) for source in sources] == [("doc-delete-rollback", "source excerpt")]
-    assert await _doc_side_counts(db, "doc-delete-rollback") == {
-        "changelog": 1,
-        "receipts": 1,
-    }
-@pytest.mark.asyncio
-async def test_delete_virtual_document_restores_without_configured_source_on_index_failure(
-    db: Database,
-):
-    now = datetime.now(timezone.utc)
-    document = DocumentRecord(
-        doc_id="user-memory-rollback",
-        source="user_memory",
-        source_url="memforge://user-memory/user-memory-rollback",
-        title="User memory",
-        space_or_project="UNSORTED",
-        author="owner-1",
-        last_modified=now,
-        labels=["user_memory"],
-        version="1",
-        content_hash="user-memory-hash",
-        token_count=3,
-        raw_content_uri=None,
-        raw_content_type=None,
-        normalized_content_uri=None,
-        pdf_content_uri=None,
-        last_synced=now,
-    )
-    await db.upsert_document(document)
-    memory = _memory("mem-user-rollback", "User supplied fact")
-    await db.insert_memory(memory)
-    await db.add_memory_source(
-        memory.id,
-        document.doc_id,
-        "user_memory",
-        "User supplied fact",
-        source_updated_at=now,
-    )
-    store = _store(db, FailingDeleteCollection())
-
-    with pytest.raises(RuntimeError, match="delete failed"):
-        await store.delete_document(document.doc_id)
-
-    assert await db.get_document(document.doc_id) is not None
-    restored = await db.get_memory(memory.id)
-    assert restored is not None and restored.status == "active"
-    assert [source.doc_id for source in await db.get_memory_sources(memory.id)] == [
-        document.doc_id
-    ]
-
-
-@pytest.mark.asyncio
-async def test_delete_document_rolls_back_sqlite_when_db_delete_fails_mid_transaction(db: Database, monkeypatch):
-    await _insert_doc(db, "doc-mid-db-fail")
-    await _insert_doc_side_tables(db, "doc-mid-db-fail")
-    memory = _memory("mem-mid-db-fail", "Only supported by failing doc")
-    await db.insert_memory(memory)
-    await db.add_memory_source(
-        memory.id,
-        "doc-mid-db-fail",
-        "confluence",
-        "source excerpt",
-        source_updated_at=None,
-    )
-    store = _store(db, RecordingCollection())
-
-    async def fail_refresh(memory_ids, *, retire_reason="source_deleted"):
-        raise RuntimeError("refresh failed")
-
-    monkeypatch.setattr(db, "_refresh_support_after_source_removal_unlocked", fail_refresh)
-
-    with pytest.raises(RuntimeError, match="refresh failed"):
-        await store.delete_document("doc-mid-db-fail")
-
-    stored_doc = await db.get_document("doc-mid-db-fail")
-    sources = await db.get_memory_sources(memory.id)
-    assert stored_doc is not None
-    assert [(source.doc_id, source.excerpt) for source in sources] == [("doc-mid-db-fail", "source excerpt")]
-    assert await _doc_side_counts(db, "doc-mid-db-fail") == {
-        "changelog": 1,
-        "receipts": 1,
-    }
-
-
-@pytest.mark.asyncio
 async def test_lifecycle_vector_delivery_attempt_is_bounded() -> None:
     class Relational:
         def __init__(self) -> None:
@@ -1849,17 +1679,13 @@ async def test_delete_source_cascade_keeps_durable_cleanup_when_memory_vector_de
     stored_memory = await db.get_memory(memory.id)
     sources = await db.get_memory_sources(memory.id)
     assert retired == [memory.id]
-    assert stored_source is None
-    assert stored_doc is None
+    assert stored_source is not None and stored_source["status"] == "retired"
+    assert stored_doc is not None
     assert stored_memory.status == "retired"
     assert sources == []
-    assert await _doc_side_counts(db, "doc-source-rollback") == {
-        "changelog": 0,
-        "receipts": 0,
-    }
     assert await _source_bookkeeping_counts(db, "src-rollback") == {
         "sync_state": 0,
-        "sync_history": 0,
+        "sync_history": 1,
     }
     [cleanup] = await db.list_lifecycle_vector_tasks(source_id="src-rollback")
     assert cleanup.memory_id == memory.id

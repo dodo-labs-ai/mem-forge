@@ -34,7 +34,7 @@ it("shows eligible but unclaimed work as waiting for device, not syncing", () =>
 it.each(["discovery", "Internal network / VPN sync"])("shows bounded file-limit details and configuration action for %s", (mode) => {
   const onConfigureScope = vi.fn();
   const onRetry = vi.fn();
-  render(<SourceSyncStatusCard activity={{ kind: "sync", state: "failed", error: {
+  render(<SourceSyncStatusCard activity={{ state: "failed", error: {
     message: `GitHub Repository ${mode} matched 571 files, exceeding max_files=500`,
   } }} sourceName="Cookbook" itemLabel="files" onConfigureScope={onConfigureScope} onRetry={onRetry} />);
   expect(screen.getByText("Sync scope exceeds file limit")).toBeTruthy();
@@ -45,7 +45,7 @@ it.each(["discovery", "Internal network / VPN sync"])("shows bounded file-limit 
 });
 
 it("does not expose arbitrary raw errors or offer unavailable configuration", () => {
-  render(<SourceSyncStatusCard activity={{ kind: "sync", state: "failed", error: {
+  render(<SourceSyncStatusCard activity={{ state: "failed", error: {
     message: "private credentials: secret",
   } }} sourceName="Cookbook" itemLabel="files" />);
   expect(screen.getByText("Sync failed. Retry when ready.")).toBeTruthy();

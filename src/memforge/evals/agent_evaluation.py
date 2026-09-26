@@ -1180,7 +1180,6 @@ def evidence_selection_outcome_bucket(
         return "unselectable"
     if reason in {
         "review_required",
-        "legacy_limited",
         "mandatory_incomplete",
     }:
         return "review"

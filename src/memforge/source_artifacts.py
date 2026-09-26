@@ -334,25 +334,6 @@ class SourceArtifactRevision:
         }
 
 
-@dataclass(frozen=True, slots=True)
-class SourceArtifactEvidence:
-    """Active Support linkage for one exact Artifact revision."""
-
-    memory_id: str
-    evidence_reference_id: str
-    evidence_unit_id: str
-    role: str
-    artifact: SourceArtifactRevision
-
-    def metadata(self) -> dict[str, object]:
-        return {
-            **self.artifact.metadata(),
-            "evidence_reference_id": self.evidence_reference_id,
-            "evidence_unit_id": self.evidence_unit_id,
-            "evidence_role": self.role,
-        }
-
-
 def source_artifact_revision_from_metadata(
     *,
     observation_id: str,

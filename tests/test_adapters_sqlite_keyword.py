@@ -768,7 +768,7 @@ async def test_rebuild_metadata_index_backfills_existing_sources(db):
 
 
 @pytest.mark.asyncio
-async def test_metadata_index_drops_deleted_document_support(db):
+async def test_metadata_index_drops_support_of_a_removed_source(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
     await db.upsert_source("src-jira", "jira", "MountTai Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
@@ -787,7 +787,7 @@ async def test_metadata_index_drops_deleted_document_support(db):
         hit.memory_id for hit in await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=10)
     ] == ["m-blocker"]
 
-    await db.delete_document("SFPAY-179397")
+    await db.delete_source_cascade("src-jira")
 
     assert await keyword.search_metadata('"create" "blocker" "hint"', _scope(), None, limit=10) == []
 

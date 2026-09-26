@@ -249,7 +249,7 @@ async def test_sqlite_active_support_states_chunk_large_bind_sets(
 
     async def execute_fetchall(sql, parameters=None):
         nonlocal calls
-        if "FROM memory_support_assertions msa" in sql:
+        if "FROM memory_unit_support_assertions msa" in sql:
             calls += 1
             support_queries.append(sql)
         return await original(sql, parameters)
@@ -260,11 +260,10 @@ async def test_sqlite_active_support_states_chunk_large_bind_sets(
     states = await db.get_active_memory_support_states(memory_ids)
 
     assert calls == 2
-    assert all("LEFT JOIN evidence_references" in sql for sql in support_queries)
-    assert all("LEFT JOIN source_observations" in sql for sql in support_queries)
+    assert all("JOIN evidence_units eu" in sql for sql in support_queries)
     assert tuple(states) == memory_ids
-    assert all(state.reference_ids == () for state in states.values())
-    assert all(state.current_reference_ids == () for state in states.values())
+    assert all(state.unit_ids == () for state in states.values())
+    assert all(state.current_unit_ids == () for state in states.values())
 
 
 @pytest.mark.asyncio
@@ -309,7 +308,7 @@ async def test_sqlite_active_support_evidence_chunks_and_preserves_empty_memory_
 
     async def execute_fetchall(sql, parameters=None):
         nonlocal calls
-        if "FROM memory_support_assertions msa" in sql and "JOIN evidence_units eu" in sql:
+        if "FROM memory_unit_support_assertions msa" in sql and "JOIN evidence_units eu" in sql:
             calls += 1
         return await original(sql, parameters)
 
@@ -336,7 +335,7 @@ async def test_sqlite_active_support_observations_are_bounded(
 
     async def execute_fetchall(sql, parameters=None):
         nonlocal calls
-        if "FROM memory_support_assertions msa" in sql and "JOIN evidence_references supported_er" in sql:
+        if "FROM memory_unit_support_assertions msa" in sql and "JOIN evidence_references er" in sql:
             calls += 1
         return await original(sql, parameters)
 

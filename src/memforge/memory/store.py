@@ -52,7 +52,6 @@ from memforge.models import (
     MemoryStatus,
     ReplacementKind,
     UNSORTED_PROJECT_KEY,
-    VIRTUAL_DOCUMENT_SOURCE_IDS,
     Visibility,
 )
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
@@ -801,35 +800,6 @@ class MemoryStore:
         if len(vector_hit_batches) != len(queries):
             raise RuntimeError("vector query batch did not cover every identity query")
 
-        reactivation_candidates: list[Memory | None] = [None] * len(queries)
-        reactivation_groups: dict[
-            tuple[str, str | None, str | None],
-            list[int],
-        ] = {}
-        for index, query in enumerate(queries):
-            memory = query.memory
-            reactivation_groups.setdefault(
-                (
-                    memory.visibility,
-                    memory.owner_user_id,
-                    memory.repo_identifier,
-                ),
-                [],
-            ).append(index)
-        for (
-            visibility,
-            owner_user_id,
-            repo_identifier,
-        ), indices in reactivation_groups.items():
-            candidates = await self.relational.find_rebaseline_reactivation_candidates(
-                tuple(queries[index].memory.content_hash for index in indices),
-                visibility=visibility,
-                owner_user_id=owner_user_id,
-                repo_identifier=repo_identifier,
-            )
-            by_hash = {candidate.content_hash: candidate for candidate in candidates}
-            for index in indices:
-                reactivation_candidates[index] = by_hash.get(queries[index].memory.content_hash)
         vector_candidate_ids = tuple(
             dict.fromkeys(
                 memory_id
@@ -862,9 +832,8 @@ class MemoryStore:
                 entity_candidate_batches.append(())
 
         output: list[tuple[Memory, ...]] = []
-        for query, reactivation, vector_hits, entity_candidates in zip(
+        for query, vector_hits, entity_candidates in zip(
             queries,
-            reactivation_candidates,
             vector_hit_batches,
             entity_candidate_batches,
             strict=True,
@@ -897,7 +866,6 @@ class MemoryStore:
                 compatible.append(candidate)
                 compatible_ids.add(candidate.id)
 
-            add_candidate(reactivation)
             vector_candidates = (
                 ordinary_by_id.get(memory_id)
                 for memory_id, score in vector_hits
@@ -949,14 +917,6 @@ class MemoryStore:
                 return
             compatible.append(candidate)
             compatible_ids.add(candidate.id)
-
-        reactivation_candidate = await self.relational.find_rebaseline_reactivation_candidate(
-            memory.content_hash,
-            visibility=memory.visibility,
-            owner_user_id=memory.owner_user_id,
-            repo_identifier=memory.repo_identifier,
-        )
-        add_candidate(reactivation_candidate)
 
         vector_hits = await self.vector.query(
             embedding,
@@ -2082,92 +2042,6 @@ class MemoryStore:
         )
         return outcome
 
-    async def remove_source_support(
-        self,
-        memory_id: str,
-        doc_id: str,
-        *,
-        source_id: str,
-        reason: str = "no_support",
-        context: AuditContext | None = None,
-    ) -> bool:
-        """Remove one source link and retire/hide the memory if support reaches zero."""
-        context = context or self._operation_context(doc_id=doc_id)
-        retired = await self.db.remove_memory_source(
-            memory_id,
-            doc_id,
-            source_id=source_id,
-            retire_reason=reason,
-        )
-        if retired:
-            vector_delivery = await self.attempt_lifecycle_vector_delivery(source_id=source_id)
-            await self._emit(
-                "source_support_removal_retired_memory",
-                "committed",
-                context=context,
-                memory_id=memory_id,
-                doc_id=doc_id,
-                reason=reason,
-                payload={"vector_delivery": vector_delivery.state.value},
-            )
-        await self._emit(
-            "source_support_removed",
-            "committed",
-            context=context,
-            memory_id=memory_id,
-            doc_id=doc_id,
-            reason=reason,
-            payload={"retired": retired},
-        )
-        return retired
-
-    async def delete_document(
-        self,
-        doc_id: str,
-        *,
-        deletion_context: dict[str, Any] | None = None,
-    ) -> list[str]:
-        """Delete a document and remove newly retired memories from search indexes."""
-        context = self._operation_context(doc_id=doc_id)
-        document_snapshot = await self.db.get_document(doc_id)
-        document_side_snapshot = await self.db.get_document_side_table_snapshots([doc_id])
-        memory_ids = await self._memory_ids_for_doc(doc_id)
-        memory_snapshots = await self._memory_snapshots(memory_ids)
-        source_snapshots = await self._source_snapshots(memory_ids)
-        try:
-            retired_ids = await self.db.delete_document(doc_id)
-        except Exception:
-            await self._restore_deleted_document_state(
-                document_snapshot=document_snapshot,
-                document_side_snapshot=document_side_snapshot,
-                memory_snapshots=memory_snapshots,
-                source_snapshots=source_snapshots,
-                context=context,
-            )
-            raise
-        try:
-            await self._remove_retired_from_search_indexes(retired_ids, context=context)
-        except Exception:
-            await self._restore_deleted_document_state(
-                document_snapshot=document_snapshot,
-                document_side_snapshot=document_side_snapshot,
-                memory_snapshots=memory_snapshots,
-                source_snapshots=source_snapshots,
-                context=context,
-            )
-            raise
-        await self._emit(
-            "document_delete_committed",
-            "committed",
-            context=context,
-            doc_id=doc_id,
-            payload={
-                **(deletion_context or {}),
-                "retired_memory_ids": retired_ids,
-            },
-        )
-        return retired_ids
-
     async def delete_projected_document(
         self,
         doc_id: str,
@@ -2266,35 +2140,6 @@ class MemoryStore:
                 )
         await self._emit(
             "source_delete_cascade_committed",
-            "committed",
-            context=context,
-            source_id=source_id,
-            payload={"retired_memory_ids": retired_ids},
-        )
-        return retired_ids
-
-    async def rebaseline_source_lifecycle(
-        self,
-        source_id: str,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> list[str]:
-        """Reset replayable source derivations and remove retired vectors."""
-
-        context = self._operation_context(source_id=source_id)
-        result = await self.relational.rebaseline_source_lifecycle(
-            source_id,
-            source_activity=source_activity,
-        )
-        retired_ids = list(result.retired_memory_ids)
-        if result.retired_search_cleanup_required:
-            # SQLite records these external vector deletes in the durable
-            # lifecycle outbox as part of the relational reset.  Retry earlier
-            # failures for this source without coupling its job to another
-            # source's pending vector work.
-            await self.attempt_lifecycle_vector_delivery(source_id=source_id)
-        await self._emit(
-            "source_rebaseline_committed",
             "committed",
             context=context,
             source_id=source_id,
@@ -2610,15 +2455,6 @@ class MemoryStore:
             reason=reason,
         )
 
-    async def _remove_retired_from_search_indexes(
-        self,
-        memory_ids: list[str],
-        *,
-        context: AuditContext,
-    ) -> None:
-        for memory_id in dict.fromkeys(memory_ids):
-            await self._remove_from_search_indexes(memory_id, label="retired", context=context)
-
     async def _remove_from_search_indexes(
         self,
         memory_id: str,
@@ -2780,29 +2616,6 @@ class MemoryStore:
             "document": None,
             "metadata": record.get("metadata") or {},
         }
-
-    async def _restore_deleted_document_state(
-        self,
-        *,
-        document_snapshot,
-        document_side_snapshot,
-        memory_snapshots: list[Memory],
-        source_snapshots,
-        context: AuditContext,
-    ) -> None:
-        if document_snapshot:
-            await self.db.restore_document_snapshot(
-                document_snapshot,
-                require_configured_source=(
-                    document_snapshot.source not in VIRTUAL_DOCUMENT_SOURCE_IDS
-                ),
-            )
-            await self.db.restore_document_side_table_snapshots(document_side_snapshot)
-        for memory in memory_snapshots:
-            await self._restore_memory_row(memory)
-            await self._restore_search_indexes(memory, context=context, label="document_delete_rollback")
-        for source in source_snapshots:
-            await self.db.restore_memory_source_snapshot(source)
 
     async def _restore_deleted_source_state(
         self,

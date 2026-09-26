@@ -79,30 +79,18 @@ class ClaimRevisionLedger:
 
 def candidate_evidence(raw: RawMemory) -> tuple[list[dict], bool]:
     selection = raw.resolved_evidence_selection
-    if selection is not None:
-        return [
-            {
-                "role": part.role.value,
-                "excerpt": part.excerpt,
-                "observation_id": part.anchor.observation_id,
-                "revision_id": part.anchor.observation_revision_id,
-                "kind": part.kind.value,
-            }
-            for part in selection.parts
-        ], True
-    # Reference-set v1 extraction proves a localized Primary block. A declared
-    # Required Observation without its actual content is not a complete proof.
-    complete = bool(
-        raw.source_observation_id
-        and raw.evidence_resolved_from_block
-        and (raw.evidence_quote or "").strip()
-        and not raw.required_source_observation_ids
-    )
-    return (
-        [{"role": "primary", "excerpt": raw.evidence_quote, "observation_id": raw.source_observation_id}]
-        if complete
-        else []
-    ), complete
+    if selection is None:
+        return [], False
+    return [
+        {
+            "role": part.role.value,
+            "excerpt": part.excerpt,
+            "observation_id": part.anchor.observation_id,
+            "revision_id": part.anchor.observation_revision_id,
+            "kind": part.kind.value,
+        }
+        for part in selection.parts
+    ], True
 
 
 async def assess_claim_pairs(

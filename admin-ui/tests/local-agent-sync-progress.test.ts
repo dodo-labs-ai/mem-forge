@@ -7,7 +7,7 @@ import {
   sourceSyncActivityFromLocalJob,
   sourceSyncActivityIsActionable,
   sourceSyncActivityIsVisible,
-  sourceSyncActivityPolicy,
+  COMPLETED_SYNC_VISIBLE_MS,
 } from "../src/views/sources/sourceSyncActivity.js";
 import { teamsConversationCount } from "../src/views/sources/teamsSourceConfig.js";
 import type { LocalAgentJobStatusResponse, SyncStatus } from "../src/api/types.js";
@@ -43,7 +43,6 @@ assert.deepEqual(
 assert.deepEqual(
   presentSourceSyncActivity(
     {
-      kind: "sync",
       state: "active",
       progress: {
         schema_version: 1,
@@ -60,7 +59,6 @@ assert.deepEqual(
 assert.deepEqual(
   presentSourceSyncActivity(
     {
-      kind: "sync",
       state: "active",
       progress: {
         schema_version: 1,
@@ -82,7 +80,6 @@ assert.deepEqual(
 assert.deepEqual(
   presentSourceSyncActivity(
     {
-      kind: "sync",
       state: "active",
       progress: {
         schema_version: 1,
@@ -105,7 +102,6 @@ assert.deepEqual(
 assert.deepEqual(
   presentSourceSyncActivity(
     {
-      kind: "sync",
       state: "active",
       progress: {
         schema_version: 1,
@@ -125,7 +121,6 @@ assert.deepEqual(
 assert.deepEqual(
   presentSourceSyncActivity(
     {
-      kind: "sync",
       state: "active",
       progress: {
         schema_version: 1,
@@ -211,7 +206,7 @@ assert.deepEqual(
     },
     pending: true,
   }),
-  { kind: "sync", state: "queued" },
+  { state: "queued" },
 );
 
 assert.equal(
@@ -234,76 +229,9 @@ assert.equal(
   "failed",
 );
 
-const activeMaintenance = selectSourceSyncActivity({
-  sync: {
-    ...activeServerRun,
-    status: "partial",
-    finished_at: "2026-07-08T10:00:00Z",
-  },
-  lifecycleMaintenance: {
-    status: "running",
-    created_at: "2026-07-08T11:00:00Z",
-    started_at: "2026-07-08T11:01:00Z",
-  },
-});
-assert.deepEqual(
-  presentSourceSyncActivity(activeMaintenance!, "GitHub", "files"),
-  { message: "Updating memories", detail: "Working" },
-);
-assert.equal(activeMaintenance?.kind, "memory_maintenance");
-assert.equal(sourceSyncActivityBlocksActions(activeMaintenance), true);
-assert.deepEqual(sourceSyncActivityPolicy(activeMaintenance!), {
-  activeRowLabel: "Updating memories",
-  busyActionLabel: "Updating",
-  busyAriaLabel: "Memory maintenance in progress",
-  canRetry: false,
-});
-
-const completedMaintenance = selectSourceSyncActivity({
-  lifecycleMaintenance: {
-    status: "completed",
-    created_at: "2026-07-08T11:00:00Z",
-    started_at: "2026-07-08T11:01:00Z",
-    finished_at: "2026-07-08T11:02:00Z",
-  },
-});
-assert.equal(
-  sourceSyncActivityIsVisible(
-    completedMaintenance!,
-    new Date("2026-07-08T11:02:29Z").getTime(),
-  ),
-  true,
-);
-assert.equal(
-  sourceSyncActivityIsVisible(
-    completedMaintenance!,
-    new Date("2026-07-08T11:02:31Z").getTime(),
-  ),
-  false,
-);
-
-const failedMaintenance = selectSourceSyncActivity({
-  lifecycleMaintenance: {
-    status: "failed",
-    created_at: "2026-07-08T11:00:00Z",
-    finished_at: "2026-07-08T11:02:00Z",
-  },
-});
-assert.deepEqual(
-  presentSourceSyncActivity(failedMaintenance!, "GitHub", "files"),
-  {
-    message: "Memory update needs attention",
-    detail: "Memory maintenance failed. Review the maintenance details.",
-  },
-);
-assert.equal(sourceSyncActivityBlocksActions(failedMaintenance), false);
-assert.equal(sourceSyncActivityPolicy(failedMaintenance!).canRetry, false);
-assert.equal(sourceSyncActivityIsActionable(failedMaintenance!, false), true);
-
 assert.equal(
   sourceSyncActivityIsActionable(
     {
-      kind: "sync",
       state: "failed",
     },
     false,
@@ -313,7 +241,6 @@ assert.equal(
 assert.equal(
   sourceSyncActivityIsActionable(
     {
-      kind: "sync",
       state: "failed",
     },
     true,
@@ -323,7 +250,6 @@ assert.equal(
 assert.equal(
   sourceSyncActivityIsActionable(
     {
-      kind: "sync",
       state: "active",
     },
     false,
@@ -342,7 +268,6 @@ assert.equal(
 assert.deepEqual(
   presentSourceSyncActivity(
     {
-      kind: "sync",
       state: "failed",
       error: {
         message: "request failed for /Users/alice/private?token=secret",
@@ -374,7 +299,6 @@ assert.deepEqual(
 assert.deepEqual(
   presentSourceSyncActivity(
     {
-      kind: "sync",
       state: "failed",
       error: {
         message: (
@@ -399,7 +323,6 @@ assert.deepEqual(
 assert.deepEqual(
   presentSourceSyncActivity(
     {
-      kind: "sync",
       state: "failed",
       error: { message: "Embedding provider unreachable: connection refused" },
     },
@@ -423,3 +346,16 @@ assert.equal(
 assert.equal(teamsConversationCount({}), null);
 
 console.log("source sync activity tests passed");
+
+const completedSyncFinishedAt = "2026-07-08T11:02:00Z";
+const completedSync = { state: "success" as const, finishedAt: completedSyncFinishedAt };
+const completedSyncFinishedMs = new Date(completedSyncFinishedAt).getTime();
+assert.equal(
+  sourceSyncActivityIsVisible(completedSync, completedSyncFinishedMs + COMPLETED_SYNC_VISIBLE_MS),
+  true,
+);
+assert.equal(
+  sourceSyncActivityIsVisible(completedSync, completedSyncFinishedMs + COMPLETED_SYNC_VISIBLE_MS + 1),
+  false,
+);
+assert.equal(sourceSyncActivityIsVisible({ state: "failed" }), true);
