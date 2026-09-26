@@ -2173,3 +2173,38 @@ def test_cross_document_relation_schema_accepts_only_the_closed_labels(decision)
     assert CrossDocumentRelationResponse.model_validate(
         {"decisions": [{"pair_index": 0, "label": "updates", "reason": "a later decision"}]}
     ).decisions[0].label == "updates"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_lines_count_their_own_calls_and_the_enclosing_scope_counts_all() -> None:
+    from memforge.llm.structured import (
+        StructuredLlmCallTelemetry,
+        StructuredLlmMetricsCollector,
+        structured_llm_line_scope,
+        structured_llm_metrics_scope,
+    )
+
+    def telemetry(operation: str) -> StructuredLlmCallTelemetry:
+        return StructuredLlmCallTelemetry(
+            operation=operation, attempt_count=1, retry_count=0, fallback_count=0, final_mode="native_schema",
+            elapsed_ms=1, terminal_category="success", error_code=None,
+            prompt_tokens=None, completion_tokens=None, total_tokens=None,
+        )
+
+    both_started = asyncio.Barrier(2)
+
+    async def line(operation: str, calls: int):
+        with structured_llm_line_scope() as own:
+            await both_started.wait()
+            for _ in range(calls):
+                # A call records into whatever collector its own task's context holds.
+                with structured_llm_metrics_scope() as current:
+                    current.record(telemetry(operation))
+            return own
+
+    with structured_llm_metrics_scope(StructuredLlmMetricsCollector()) as enclosing:
+        support, relation = await asyncio.gather(line("support", 2), line("relation", 1))
+
+    assert support.summary(source_unit_elapsed_ms=0).operation_counts == {"support": 2}
+    assert relation.summary(source_unit_elapsed_ms=0).operation_counts == {"relation": 1}
+    assert enclosing.summary(source_unit_elapsed_ms=0).operation_counts == {"support": 2, "relation": 1}

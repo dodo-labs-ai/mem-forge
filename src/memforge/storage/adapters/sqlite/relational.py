@@ -963,6 +963,7 @@ class SqliteRelationalStore:
         source_id: str | None = None,
         *,
         status: LifecycleReviewStatus | None = None,
+        incumbent_memory_ids: Sequence[str] | None = None,
         limit: int | None = None,
         offset: int = 0,
         newest_first: bool = False,
@@ -970,6 +971,7 @@ class SqliteRelationalStore:
         return await self._db.list_lifecycle_reviews(
             source_id,
             status=status,
+            incumbent_memory_ids=incumbent_memory_ids,
             limit=limit,
             offset=offset,
             newest_first=newest_first,

@@ -15,7 +15,7 @@ from memforge.llm.structured import (
     StructuredLlmConfig,
     StructuredLlmError,
 )
-from memforge.pipeline.extraction_requests import ExtractionCapacityExceeded, plan_extraction_requests
+from memforge.pipeline.extraction_requests import plan_extraction_requests
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import ExtractionAuthority, plan_projection_evidence_work
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
@@ -35,11 +35,17 @@ def bounded_output(extractor, catalog):
     return budget.output_reserve(extractor.fragment_output_tokens(catalog))
 
 
-def plan(projection, authority, *, extractor, base=None):
+def extraction_plan(projection, authority, *, extractor, base=None):
     context = RevisionAssessmentContext(projection=projection, base=base, access_context_hash="scope")
     return plan_extraction_requests(
         context, authority, extractor=extractor, source_type="confluence", doc_type="document",
     )
+
+
+def plan(projection, authority, *, extractor, base=None):
+    extraction = extraction_plan(projection, authority, extractor=extractor, base=base)
+    assert extraction.skipped_reading_groups == ()
+    return extraction.requests
 
 
 def whole(projection):
@@ -61,7 +67,7 @@ def texts(request):
 
 
 @pytest.mark.parametrize(("representation", "rows"), [("markdown", 1_200), ("html", 1_200), ("html", 3_000)])
-def test_large_complete_table_reaches_actual_request_budget(representation, rows):
+def test_large_complete_table_reaches_actual_request_budget(representation, rows, caplog):
     if representation == "markdown":
         table = "| Rule | Sandbox | Small Box |\n| --- | --- | --- |\n" + "\n".join(
             f"| Approval {row} | Yes | No |" for row in range(rows))
@@ -76,10 +82,20 @@ def test_large_complete_table_reaches_actual_request_budget(representation, rows
             max_input_tokens=window, context_window_tokens=window, max_output_tokens=1024))
         extractor = MemoryExtractor(model=client.config.model, structured_llm_client=client)
         if window == 8_000:
-            # One ReadingGroup that alone exceeds the route is a typed limitation, never truncated.
-            with pytest.raises(ExtractionCapacityExceeded) as error:
-                plan(projection, whole(projection), extractor=extractor)
-            assert error.value.reason_code == "input_capacity_exceeded" and not error.value.retryable
+            # A ReadingGroup that alone exceeds the route is skipped with a diagnostic, never truncated;
+            # the other groups are still planned.
+            with caplog.at_level("WARNING", logger="memforge.pipeline.memory_extractor"):
+                extraction = extraction_plan(projection, whole(projection), extractor=extractor)
+            [skipped] = extraction.skipped_reading_groups
+            assert skipped.startswith(body_id(projection) + ":")
+            planned = [f.presentation_text.strip() for f in primary(extraction.requests)]
+            assert {"Before the table.", "After the table."} <= set(planned)
+            assert not any("table" in f.fragment_type for f in primary(extraction.requests))
+            source_unit_id = projection.source_units[0].id
+            assert (
+                f"extraction_reading_group_skipped source_unit_id={source_unit_id} reading_group={skipped} "
+                f"reason={INPUT_CAPACITY_EXCEEDED}"
+            ) in caplog.text
             continue
         requests = plan(projection, whole(projection), extractor=extractor)
         tables = [f for f in primary(requests) if "table" in f.fragment_type]
@@ -240,22 +256,40 @@ async def test_a_multi_item_request_that_times_out_is_halved_and_every_item_comp
 
 
 @pytest.mark.asyncio
-async def test_a_single_reading_group_beyond_capacity_fails_the_extraction():
-    projection = _projection(primary_content="Rule one applies.\n", context_content="Country: US.\n")
+async def test_a_reading_group_the_provider_rejects_alone_is_skipped_and_the_others_are_kept(caplog):
+    projection = _projection(
+        primary_content="Rule one applies.\n\nRule two is far too large.\n", context_content="Country: US.\n",
+    )
     context = RevisionAssessmentContext(projection=projection, base=None, access_context_hash="scope")
 
     class OverflowingClient(Client):
         async def extract_projection_fragment_memories(self, prompt, **kwargs):
-            raise StructuredLlmError("too large", terminal_category="provider_error", error_code=INPUT_CAPACITY_EXCEEDED)
+            payload = json.loads(prompt.split("<evidence_fragment_catalog", 1)[1].split(">", 1)[1].split(
+                "\n</evidence_fragment_catalog>", 1)[0])
+            rows = payload["primary_candidates"]
+            if any("too large" in row[1] for row in rows):
+                raise StructuredLlmError(
+                    "too large", terminal_category="provider_error", error_code=INPUT_CAPACITY_EXCEEDED,
+                )
+            ref, text = rows[0][0], rows[0][1]
+            return ProjectionFragmentMemoryExtractionResponse.model_validate({"memories": [
+                {"content": text.strip(), "memory_type": "fact", "primary_ref": ref, "required_refs": []},
+            ]})
 
     extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=OverflowingClient(limit=40000))
     [request] = plan(projection, ExtractionAuthority({body_id(projection): None}), extractor=extractor)
-    result = await extractor.extract_projection_fragment_memories(
-        request.catalog, source_type="confluence", revision_context=context,
-    )
+    with caplog.at_level("WARNING", logger="memforge.pipeline.memory_extractor"):
+        result = await extractor.extract_projection_fragment_memories(
+            request.catalog, source_type="confluence", revision_context=context,
+        )
 
-    assert result.error_type == "input_capacity_exceeded"
-    assert result.memories == []
+    assert result.error_type is None
+    assert [memory.content for memory in result.memories] == ["Rule one applies."]
+    assert result.metadata["skipped_reading_group_count"] == 1
+    assert (
+        f"extraction_reading_group_skipped source_unit_id={projection.source_units[0].id} "
+        f"reading_group={body_id(projection)}:"
+    ) in caplog.text
 
 
 def _updated_confluence(initial, body):

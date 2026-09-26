@@ -4,9 +4,10 @@ from dataclasses import replace
 import pytest
 
 from memforge.llm.structured import ClaimRevisionWireResponse
-from memforge.models import ReconcileAction
+from memforge.models import CoordinatorProposal, ReconcileAction
 from memforge.pipeline.claim_revision import assess_claim_pairs
-from memforge.pipeline.reconciler import SupportAuditEntry, reconcile_memories
+from memforge.pipeline.reconciler import reconcile_memories
+from tests.revision_client_fixture import pinned
 from tests.test_claim_revision import Client, candidate, memory
 from tests.revision_client_fixture import catalog_payload, sparse_response
 
@@ -45,7 +46,7 @@ async def test_eight_by_183_uses_one_catalog_and_eight_empty_rows():
 async def test_empty_relationships_propose_no_action():
     client = SparseClient(dict(results=[dict(candidate_id="NEW-0001", relations=[], uncertain_existing_ids=[])]))
     result = await reconcile_memories(new_extractions=[candidate()], existing_memories=[memory()],
-        doc_type="policy", structured_llm_client=client, support_audits=[SupportAuditEntry("memory", True)], include_metadata=True)
+        llm_model="test-model", structured_llm_client=client, supports=dict([pinned("memory", True)]))
     assert result.failure is None
     assert [op.action for op in result.operations] == [ReconcileAction.ADD, ReconcileAction.NOOP]
 
@@ -59,14 +60,14 @@ async def test_empty_relationships_propose_no_action():
 async def test_invalid_references_and_duplicates_never_apply(row):
     client = SparseClient(dict(results=[row]))
     result = await reconcile_memories(new_extractions=[candidate()], existing_memories=[memory()],
-        doc_type="policy", structured_llm_client=client, support_audits=[SupportAuditEntry("memory", True)], include_metadata=True)
+        llm_model="test-model", structured_llm_client=client, supports=dict([pinned("memory", True)]))
     assert result.failure is not None and not result.operations
 
 
 @pytest.mark.asyncio
 async def test_omission_does_not_skip_unsupported_incumbent_audit():
     result = await reconcile_memories(new_extractions=[candidate()], existing_memories=[memory()],
-        doc_type="policy", structured_llm_client=SparseClient(), support_audits=[SupportAuditEntry("memory", False)], include_metadata=True)
+        llm_model="test-model", structured_llm_client=SparseClient(), supports=dict([pinned("memory", False)]))
     assert result.failure is None
     assert [op.action for op in result.operations] == [ReconcileAction.ADD, ReconcileAction.DELETE]
 
@@ -75,7 +76,7 @@ async def test_omission_does_not_skip_unsupported_incumbent_audit():
 async def test_explicit_uncertainty_preserves_incumbent_and_consumes_candidate():
     client = SparseClient(dict(results=[dict(candidate_id="NEW-0001", relations=[], uncertain_existing_ids=["MEM-0001"])]))
     result = await reconcile_memories(new_extractions=[candidate()], existing_memories=[memory()],
-        doc_type="policy", structured_llm_client=client, support_audits=[SupportAuditEntry("memory", False)], include_metadata=True)
+        llm_model="test-model", structured_llm_client=client, supports=dict([pinned("memory", False)]))
     assert result.failure is None
     assert len(result.operations) == 1 and result.operations[0].support_revalidation_skipped
 
@@ -110,14 +111,16 @@ async def test_competing_replacements_expose_the_accepted_omission_tradeoff(omit
         dict(candidate_id="NEW-0002", relations=[] if omit_second else edges, uncertain_existing_ids=[]),
     ]))
     result = await reconcile_memories(new_extractions=[candidate(), candidate()], existing_memories=[memory()],
-        doc_type="policy", structured_llm_client=client, support_audits=[SupportAuditEntry("memory", True)], include_metadata=True)
+        llm_model="test-model", structured_llm_client=client, supports=dict([pinned("memory", True)]))
     assert result.failure is None
     assert client.calls == 1
-    replacements = [op for op in result.operations if op.action == ReconcileAction.SUPERSEDE]
-    if omit_second:
-        assert len(replacements) == 1 and replacements[0].flag_for_review
-    else:
-        assert replacements == []
+    # A supported old Memory is kept; each contradicting Candidate is staged in its own Review.
+    [kept] = [op for op in result.operations if op.memory_id == "memory"]
+    assert kept.action == ReconcileAction.NOOP
+    assert [review.proposal for review in kept.reviews] == [CoordinatorProposal.SUPERSEDE] * (1 if omit_second else 2)
+    assert [op.action for op in result.operations if op.memory_id is None] == (
+        [ReconcileAction.ADD] if omit_second else []
+    )
 
 
 @pytest.mark.asyncio
@@ -133,7 +136,7 @@ async def test_uncertainty_in_one_capacity_partition_applies_to_all_its_edges():
                 uncertain_existing_ids=[ref] if second else [])]))
     olds = [memory(), replace(memory(), id="second")]
     result = await reconcile_memories(new_extractions=[candidate()], existing_memories=olds,
-        doc_type="policy", structured_llm_client=Partitioned(), support_audits=[SupportAuditEntry(m.id, True) for m in olds], include_metadata=True)
+        llm_model="test-model", structured_llm_client=Partitioned(), supports=dict([pinned(m.id, True) for m in olds]))
     assert result.failure is None
     assert all(op.action == ReconcileAction.NOOP and op.memory is None for op in result.operations)
     assert result.operations[0].support_revalidation_skipped

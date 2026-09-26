@@ -28,17 +28,29 @@ from memforge.memory.evidence import (
     ResolvedEvidenceSelection,
 )
 from memforge.source_projection import AnchorKind, SourceAnchor
-from memforge.memory.engine import MemoryEngine
 from memforge.memory.relation_classifier import MemoryRelationType
-from memforge.models import Memory, RawMemory, ReconcileAction, ReconcileOperation, content_hash
-from memforge.pipeline.reconciler import (
-    ReconciliationResult,
+from memforge.models import (
+    CoordinatorProposal,
+    Memory,
+    RawMemory,
+    ReconcileAction,
+    content_hash,
+)
+from memforge.pipeline.reconciler import ReconciliationResult, reconcile_memories
+from memforge.pipeline.support_relation_coordinator import (
     RelationLedgerEntry,
     RevisionCompositionProof,
-    SupportAuditEntry,
-    reconcile_memories,
-    reduce_relation_ledger,
+    coordinate,
 )
+from tests.revision_client_fixture import pinned
+
+
+def coordinated_operations(*, new_extractions, existing_memories, relations, supports, revision_proofs=()):
+    """Final coordinator operations for completed Support reads."""
+    return list(coordinate(
+        candidates=new_extractions, incumbents=existing_memories, relations=relations,
+        proofs=revision_proofs, supports=supports,
+    ).operations)
 
 
 def _memory(memory_id: str, content: str) -> Memory:
@@ -154,10 +166,9 @@ async def test_supported_incumbent_and_unrelated_case25_keep_and_add() -> None:
     result = await reconcile_memories(
         new_extractions=[case25],
         existing_memories=[incumbent],
-        support_audits=[SupportAuditEntry(incumbent.id, True)],
-        doc_type="component_test",
+        supports=dict([pinned(incumbent.id, True)]),
+        llm_model="test-model",
         structured_llm_client=RelationFirstClient(),
-        include_metadata=True,
     )
 
     assert isinstance(result, ReconciliationResult)
@@ -218,10 +229,9 @@ async def test_additive_refinement_with_complete_current_evidence_is_revision() 
     result = await reconcile_memories(
         new_extractions=[refinement],
         existing_memories=[incumbent],
-        support_audits=[SupportAuditEntry(incumbent.id, True)],
-        doc_type="design",
+        supports=dict([pinned(incumbent.id, True)]),
+        llm_model="test-model",
         structured_llm_client=RevisionClient(),
-        include_metadata=True,
     )
 
     assert isinstance(result, ReconciliationResult)
@@ -257,10 +267,9 @@ async def test_revision_response_failure_cannot_fall_back_to_add() -> None:
     result = await reconcile_memories(
         new_extractions=[refinement],
         existing_memories=[incumbent],
-        support_audits=[SupportAuditEntry(incumbent.id, True)],
-        doc_type="design",
+        supports=dict([pinned(incumbent.id, True)]),
+        llm_model="test-model",
         structured_llm_client=ProofFailureClient(),
-        include_metadata=True,
     )
 
     assert isinstance(result, ReconciliationResult)
@@ -297,10 +306,9 @@ async def test_missing_conditional_assessment_preserves_incumbent() -> None:
     result = await reconcile_memories(
         new_extractions=[refinement],
         existing_memories=[incumbent],
-        support_audits=[SupportAuditEntry(incumbent.id, True)],
-        doc_type="design",
+        supports=dict([pinned(incumbent.id, True)]),
+        llm_model="test-model",
         structured_llm_client=client,
-        include_metadata=True,
     )
 
     assert isinstance(result, ReconciliationResult)
@@ -320,7 +328,7 @@ def test_refinement_without_revision_proof_falls_back_to_keep_and_add() -> None:
         evidence_anchor="projection_batch",
     )
 
-    operations = reduce_relation_ledger(
+    operations = coordinated_operations(
         new_extractions=[narrower],
         existing_memories=[incumbent],
         relations=[
@@ -331,7 +339,7 @@ def test_refinement_without_revision_proof_falls_back_to_keep_and_add() -> None:
                 direction=RelationDirection.CHALLENGER_TO_CANDIDATE,
             )
         ],
-        support_audits=[SupportAuditEntry(incumbent_id=incumbent.id, supported=True)],
+        supports=dict([pinned(incumbent.id, True)]),
         revision_proofs=[
             RevisionCompositionProof(
                 candidate_index=0,
@@ -349,19 +357,20 @@ def test_refinement_without_revision_proof_falls_back_to_keep_and_add() -> None:
 @pytest.mark.parametrize(
     ("supported", "relation_type", "expected_actions", "review"),
     [
-        (True, MemoryRelationType.EQUIVALENT, [ReconcileAction.NOOP], False),
-        (True, MemoryRelationType.UNRELATED, [ReconcileAction.ADD, ReconcileAction.NOOP], False),
-        (True, MemoryRelationType.CONTRADICTS, [ReconcileAction.SUPERSEDE], True),
-        (False, MemoryRelationType.UNRELATED, [ReconcileAction.ADD, ReconcileAction.DELETE], False),
-        (False, MemoryRelationType.CONTRADICTS, [ReconcileAction.SUPERSEDE], False),
-        (False, MemoryRelationType.EQUIVALENT, [ReconcileAction.NOOP], False),
+        (True, MemoryRelationType.EQUIVALENT, [ReconcileAction.NOOP], None),
+        (True, MemoryRelationType.UNRELATED, [ReconcileAction.ADD, ReconcileAction.NOOP], None),
+        (True, MemoryRelationType.CONTRADICTS, [ReconcileAction.NOOP], CoordinatorProposal.SUPERSEDE),
+        (False, MemoryRelationType.UNRELATED, [ReconcileAction.ADD, ReconcileAction.DELETE], None),
+        (False, MemoryRelationType.CONTRADICTS, [ReconcileAction.SUPERSEDE], None),
+        # Still unsupported after its one re-check.
+        (False, MemoryRelationType.EQUIVALENT, [ReconcileAction.NOOP], CoordinatorProposal.REBIND),
     ],
 )
 def test_relation_support_matrix(
     supported: bool,
     relation_type: MemoryRelationType,
     expected_actions: list[ReconcileAction],
-    review: bool,
+    review: CoordinatorProposal | None,
 ) -> None:
     incumbent = _memory("mem-current", "The service uses PostgreSQL 15.")
     candidate = RawMemory(
@@ -370,7 +379,7 @@ def test_relation_support_matrix(
         source_observation_id="obs-db",
         evidence_anchor="projection_batch",
     )
-    operations = reduce_relation_ledger(
+    operations = coordinated_operations(
         new_extractions=[candidate],
         existing_memories=[incumbent],
         relations=[
@@ -381,32 +390,24 @@ def test_relation_support_matrix(
                 direction=RelationDirection.SYMMETRIC,
             )
         ],
-        support_audits=[SupportAuditEntry(incumbent_id=incumbent.id, supported=supported)],
+        supports=dict([pinned(incumbent.id, supported)]),
     )
 
     assert [operation.action for operation in operations] == expected_actions
     incumbent_operation = operations[-1]
-    assert incumbent_operation.flag_for_review is review
+    assert not incumbent_operation.flag_for_review
+    assert [item.proposal for item in incumbent_operation.reviews] == ([review] if review else [])
 
 
-@pytest.mark.parametrize(
-    ("supported", "expected_incumbent_action"),
-    [
-        (True, ReconcileAction.NOOP),
-        (False, ReconcileAction.DELETE),
-    ],
-)
-def test_multiple_contradiction_candidates_remain_independent_without_guessing_a_successor(
-    supported: bool,
-    expected_incumbent_action: ReconcileAction,
-) -> None:
+@pytest.mark.parametrize("supported", [True, False])
+def test_multiple_contradiction_candidates_never_guess_a_successor(supported: bool) -> None:
     incumbent = _memory("mem-current", "The service uses one legacy database configuration.")
     candidates = [
         RawMemory(content="The primary database uses PostgreSQL 16.", memory_type="fact"),
         RawMemory(content="The analytics database uses ClickHouse.", memory_type="fact"),
     ]
 
-    operations = reduce_relation_ledger(
+    operations = coordinated_operations(
         new_extractions=candidates,
         existing_memories=[incumbent],
         relations=[
@@ -418,61 +419,31 @@ def test_multiple_contradiction_candidates_remain_independent_without_guessing_a
             )
             for index in range(len(candidates))
         ],
-        support_audits=[SupportAuditEntry(incumbent_id=incumbent.id, supported=supported)],
+        supports=dict([pinned(incumbent.id, supported)]),
     )
 
+    if supported:
+        # Each contradicting Candidate is staged in its own Review of the kept old Memory.
+        [operation] = operations
+        assert operation.action is ReconcileAction.NOOP and operation.memory_id == incumbent.id
+        assert [review.candidate for review in operation.reviews] == candidates
+        return
+    # A read without Support removes it; the Candidates stand on their own.
     assert [operation.action for operation in operations] == [
         ReconcileAction.ADD,
         ReconcileAction.ADD,
-        expected_incumbent_action,
+        ReconcileAction.DELETE,
     ]
     assert [operation.memory for operation in operations[:2]] == candidates
     assert operations[-1].memory_id == incumbent.id
 
 
-def test_partial_projection_keep_does_not_drop_replacement_candidate() -> None:
-    candidate = RawMemory(content="The service uses PostgreSQL 16.", memory_type="fact")
-
-    operations = MemoryEngine._enforce_partial_projection_keep(
-        (
-            ReconcileOperation(
-                action=ReconcileAction.UPDATE,
-                memory_id="mem-current",
-                memory=candidate,
-            ),
-        ),
-        frozenset({"mem-current"}),
-    )
-
-    assert [operation.action for operation in operations] == [ReconcileAction.ADD, ReconcileAction.NOOP]
-    assert operations[0].memory is candidate
-
-
-def test_partial_projection_contradiction_stays_in_review() -> None:
-    candidate = RawMemory(content="The service uses PostgreSQL 16.", memory_type="fact")
-
-    [operation] = MemoryEngine._enforce_partial_projection_keep(
-        (
-            ReconcileOperation(
-                action=ReconcileAction.SUPERSEDE,
-                memory_id="mem-current",
-                memory=candidate,
-            ),
-        ),
-        frozenset({"mem-current"}),
-    )
-
-    assert operation.action is ReconcileAction.SUPERSEDE
-    assert operation.memory is candidate
-    assert operation.flag_for_review is True
-
-
-def test_an_unsupported_equivalent_keeps_its_related_component_unresolved() -> None:
+def test_an_unsupported_equivalent_is_held_in_a_rebind_review() -> None:
     incumbent = _memory("mem-current", "The client timeout is 30 seconds.")
     equivalent = RawMemory(content="Client timeout: 30 seconds.", memory_type="fact")
     refinement = RawMemory(content="Upload timeout is 30 seconds.", memory_type="fact")
 
-    operations = reduce_relation_ledger(
+    operations = coordinated_operations(
         new_extractions=[equivalent, refinement],
         existing_memories=[incumbent],
         relations=[
@@ -489,12 +460,16 @@ def test_an_unsupported_equivalent_keeps_its_related_component_unresolved() -> N
                 direction=RelationDirection.CHALLENGER_TO_CANDIDATE,
             ),
         ],
-        support_audits=[SupportAuditEntry(incumbent_id=incumbent.id, supported=False)],
+        supports=dict([pinned(incumbent.id, False)]),
     )
 
-    [operation] = operations
+    # The refinement proves nothing about the old Memory's truth, so it stands on its own.
+    add, operation = operations
+    assert add.action is ReconcileAction.ADD and add.memory is refinement
     assert operation.action is ReconcileAction.NOOP and operation.memory is None
     assert operation.support_revalidation_skipped and not operation.flag_for_review
+    [review] = operation.reviews
+    assert review.proposal is CoordinatorProposal.REBIND and review.candidate is equivalent
 
 
 def test_equivalent_candidate_rebinds_each_supported_incumbent() -> None:
@@ -502,7 +477,7 @@ def test_equivalent_candidate_rebinds_each_supported_incumbent() -> None:
     second = _memory("mem-second", "Retry delays increase exponentially.")
     candidate = RawMemory(content="Retries back off exponentially.", memory_type="fact")
 
-    operations = reduce_relation_ledger(
+    operations = coordinated_operations(
         new_extractions=[candidate],
         existing_memories=[first, second],
         relations=[
@@ -514,7 +489,7 @@ def test_equivalent_candidate_rebinds_each_supported_incumbent() -> None:
             )
             for memory in (first, second)
         ],
-        support_audits=[SupportAuditEntry(incumbent_id=memory.id, supported=True) for memory in (first, second)],
+        supports=dict([pinned(memory.id, True) for memory in (first, second)]),
     )
 
     assert [operation.action for operation in operations] == [
@@ -522,7 +497,7 @@ def test_equivalent_candidate_rebinds_each_supported_incumbent() -> None:
         ReconcileAction.NOOP,
     ]
     assert [operation.memory_id for operation in operations] == [first.id, second.id]
-    assert all(operation.memory is candidate for operation in operations)
+    assert all(not operation.reviews and not operation.support_revalidation_skipped for operation in operations)
 
 
 def test_runbook_candidate_with_multiple_incumbents_falls_back_to_keep_and_add() -> None:
@@ -547,7 +522,7 @@ def test_runbook_candidate_with_multiple_incumbents_falls_back_to_keep_and_add()
         memory_type="procedure",
     )
 
-    operations = reduce_relation_ledger(
+    operations = coordinated_operations(
         new_extractions=[current_procedure],
         existing_memories=incumbents,
         relations=[
@@ -560,14 +535,14 @@ def test_runbook_candidate_with_multiple_incumbents_falls_back_to_keep_and_add()
             )
             for incumbent in incumbents
         ],
-        support_audits=[
-            SupportAuditEntry(
-                incumbent_id=incumbent.id,
-                supported=True,
-                reason="The branch remains supported in the current runbook.",
+        supports=dict([
+            pinned(
+                incumbent.id,
+                True,
+                "The branch remains supported in the current runbook.",
             )
             for incumbent in incumbents
-        ],
+        ]),
     )
 
     assert [operation.action for operation in operations] == [
@@ -596,10 +571,9 @@ async def test_incomplete_relation_ledger_retries_then_fails_closed() -> None:
     result = await reconcile_memories(
         new_extractions=[RawMemory(content="New claim", memory_type="fact")],
         existing_memories=[_memory("mem-old", "Old claim")],
-        doc_type="design",
+        llm_model="test-model",
         structured_llm_client=client,
-        include_metadata=True,
-        support_audits=[SupportAuditEntry(incumbent_id="mem-old", supported=True)],
+        supports=dict([pinned("mem-old", True)]),
     )
 
     assert isinstance(result, ReconciliationResult)
@@ -618,10 +592,9 @@ async def test_relation_provider_failure_fails_closed_with_incumbents() -> None:
     result = await reconcile_memories(
         new_extractions=[RawMemory(content="New claim", memory_type="fact")],
         existing_memories=[_memory("mem-old", "Old claim")],
-        doc_type="design",
+        llm_model="test-model",
         structured_llm_client=FailingClient(),
-        include_metadata=True,
-        support_audits=[SupportAuditEntry(incumbent_id="mem-old", supported=True)],
+        supports=dict([pinned("mem-old", True)]),
     )
 
     assert isinstance(result, ReconciliationResult)
@@ -641,9 +614,9 @@ def test_unresolved_pair_preserves_related_component_and_allows_independent_work
              (1, "mem-1"): MemoryRelationType.CONTRADICTS}
     relations = [replace(r, relation_type=types.get((r.candidate_index, r.incumbent_id), r.relation_type))
                  for r in relations]
-    operations = reduce_relation_ledger(
+    operations = coordinated_operations(
         new_extractions=candidates, existing_memories=old, relations=relations,
-        support_audits=[SupportAuditEntry(m.id, False) for m in old],
+        supports=dict([pinned(m.id, False) for m in old]),
     )
     assert [op.memory for op in operations if op.action == ReconcileAction.ADD] == [candidates[2]]
     by_id = {op.memory_id: op for op in operations if op.memory_id}

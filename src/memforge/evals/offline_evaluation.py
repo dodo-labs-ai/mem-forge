@@ -32,10 +32,11 @@ from memforge.memory.cross_document_relation import (
     StructuredCrossDocumentRelationClassifier,
 )
 from memforge.models import Memory, MemoryExtractionResult, RawMemory, ReconcileOperation
-from memforge.pipeline.reconciler import ReconciliationResult, SupportAuditEntry, reconcile_memories
+from memforge.pipeline.reconciler import reconcile_memories
+from memforge.pipeline.support_relation_coordinator import UNRESOLVED_RESULTS, MemorySupport, SupportResult
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.extraction_requests import plan_extraction_requests
-from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionRequest
+from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionPlan, ExtractionRequest
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
@@ -830,7 +831,7 @@ class SourceUnitDerivationReplayExecutor:
         self,
         plan_requests: Callable[
             [ExtractionAuthority, ReplayedEvidenceWork, Mapping[str, object]],
-            Awaitable[tuple[ExtractionRequest, ...]],
+            Awaitable[ExtractionPlan],
         ],
         extract_request: Callable[
             [ExtractionRequest, ReplayedEvidenceWork, Mapping[str, object]],
@@ -861,7 +862,7 @@ class SourceUnitDerivationReplayExecutor:
             ),
         )
 
-        async def plan(authority: ExtractionAuthority) -> tuple[ExtractionRequest, ...]:
+        async def plan(authority: ExtractionAuthority) -> ExtractionPlan:
             return await self._plan_requests(authority, work, candidate_manifest)
 
         async def extract(request: ExtractionRequest) -> MemoryExtractionResult:
@@ -922,7 +923,7 @@ class ProductionSourceUnitDerivationReplayExecutor:
             authority: ExtractionAuthority,
             work: ReplayedEvidenceWork,
             _candidate_manifest: Mapping[str, object],
-        ) -> tuple[ExtractionRequest, ...]:
+        ) -> ExtractionPlan:
             return plan_extraction_requests(
                 reading_context(work), authority, extractor=extractor,
                 source_type=work.projection.source_type, doc_type=work.context.doc_type,
@@ -947,11 +948,12 @@ class ProductionSourceUnitDerivationReplayExecutor:
 
 
 class SourceUnitReconciliationReplayExecutor:
-    """Replay claim assessment and reduction against the case's pinned Support ledger.
+    """Replay Relation and SupportRelationCoordinator against the case's pinned Support ledger.
 
-    Production reconciliation receives the Support results of the same sync;
-    a case pins them as ``support_audits`` so replay judges the same inputs
-    without applying a lifecycle plan.
+    Production joins the Support results of the same sync; a case pins them as
+    ``support_audits`` so replay judges the same inputs without applying a
+    lifecycle plan. Replay has no revision to read, so the coordinator's
+    re-checks are reported and the pinned results stand.
     """
 
     def __init__(self, structured_llm_client: object) -> None:
@@ -973,17 +975,16 @@ class SourceUnitReconciliationReplayExecutor:
         result = await reconcile_memories(
             new_extractions=new_extractions,
             existing_memories=incumbents,
-            doc_type=str(manifest.get("doc_type") or "document"),
             structured_llm_client=self._structured_llm_client,
             llm_model=str(candidate_manifest.get("model") or manifest.get("model") or ""),
-            include_metadata=True,
-            support_audits=_pinned_support_audits(manifest),
+            supports=_pinned_supports(manifest),
         )
-        if not isinstance(result, ReconciliationResult):
-            raise TypeError("offline reconciliation requires metadata result")
         return {
             "case_kind": case.case_kind.value,
             "operations": [_reconcile_operation_payload(operation) for operation in result.operations],
+            "rechecks": [
+                {"memory_id": recheck.memory_id, "reading": recheck.reading.value} for recheck in result.rechecks
+            ],
             "failure": (
                 {
                     "error_type": result.failure.error_type,
@@ -2755,7 +2756,7 @@ def _validate_case_manifest(
         incumbents = _mapping_list(manifest, "incumbents")
         if not incumbents:
             raise ValueError("reconciliation case requires pinned incumbents")
-        _pinned_support_audits(manifest)
+        _pinned_supports(manifest)
 
 
 def _require_current_relation_contract(manifest: Mapping[str, object]) -> None:
@@ -2767,27 +2768,35 @@ def _require_current_relation_contract(manifest: Mapping[str, object]) -> None:
         )
 
 
-def _pinned_support_audits(manifest: Mapping[str, object]) -> list[SupportAuditEntry]:
-    """Read the pinned Support ledger: exactly one judgment for every incumbent."""
+def _pinned_supports(manifest: Mapping[str, object]) -> dict[str, MemorySupport]:
+    """Read the pinned Support ledger: exactly one read result for every incumbent.
+
+    ``supported`` pins a completed read; an optional ``unresolved`` reason pins a
+    claim that could not be judged.
+    """
 
     if "support_audits" not in manifest:
         raise ValueError("reconciliation case requires pinned support_audits")
-    audits = []
+    supports: dict[str, MemorySupport] = {}
     for item in _mapping_list(manifest, "support_audits"):
         supported = item.get("supported")
         if not isinstance(supported, bool):
             raise ValueError("support_audits supported must be a boolean")
-        audits.append(
-            SupportAuditEntry(
-                incumbent_id=str(item.get("incumbent_id") or ""),
-                supported=supported,
-                reason=str(item.get("reason") or ""),
-            )
+        unresolved = item.get("unresolved")
+        if unresolved is not None and unresolved not in UNRESOLVED_RESULTS:
+            raise ValueError("support_audits unresolved must be capacity or partial_coverage")
+        incumbent_id = str(item.get("incumbent_id") or "")
+        if incumbent_id in supports:
+            raise ValueError("support_audits must cover every pinned incumbent exactly once")
+        supports[incumbent_id] = MemorySupport(
+            UNRESOLVED_RESULTS[unresolved] if unresolved is not None
+            else SupportResult.SUPPORTED if supported else SupportResult.UNSUPPORTED,
+            str(item.get("reason") or ""),
         )
     incumbent_ids = sorted(str(item.get("id") or "") for item in _mapping_list(manifest, "incumbents"))
-    if sorted(audit.incumbent_id for audit in audits) != incumbent_ids:
+    if sorted(supports) != incumbent_ids:
         raise ValueError("support_audits must cover every pinned incumbent exactly once")
-    return audits
+    return supports
 
 
 def _validate_candidate_manifest(manifest: Mapping[str, object]) -> None:
@@ -2872,6 +2881,15 @@ def _reconcile_operation_payload(operation: ReconcileOperation) -> dict[str, obj
         ),
         "reason_code": _bounded_reason(operation.reason),
         "flag_for_review": operation.flag_for_review,
+        "reviews": [
+            {
+                "proposal": review.proposal.value,
+                "candidate": memory_extraction_output_payload(MemoryExtractionResult(memories=[review.candidate]))[
+                    "memories"
+                ][0],
+            }
+            for review in operation.reviews
+        ],
     }
 
 

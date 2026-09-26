@@ -8,7 +8,13 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from tests.llm_fixture import AdmittingClient, FixtureBudgetClient, admission_payload, fixture_request_planner
+from tests.llm_fixture import (
+    AdmittingClient,
+    FixtureBudgetClient,
+    NoopMemoryExtractor,
+    admission_payload,
+    fixture_request_planner,
+)
 from tests.unit_support_fixture import (
     active_support_evidence,
     primary_reference,
@@ -48,6 +54,7 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.candidate_admission import CandidateAdmissionError
+from memforge.memory.destructive_validation import KeptReason
 from memforge.memory.engine import (
     DeferredProjectedLifecycleHandle,
     MemoryEngine,
@@ -123,6 +130,7 @@ from memforge import source_derivation as source_derivation_module
 from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_CONTRACT_VERSION
 from memforge.pipeline.projection_context import (
     ExtractionAuthority,
+    ExtractionPlan,
     ExtractionRequest,
     plan_projection_evidence_work,
 )
@@ -2920,7 +2928,7 @@ async def test_source_deriver_persists_completed_batch_before_later_worker_failu
         return MemoryExtractionResult()
 
     async def plan_requests(_authority):
-        return batches
+        return ExtractionPlan(batches)
 
     with pytest.raises(RuntimeError, match="worker interrupted"):
         await SourceUnitDeriver(db).derive(
@@ -2952,6 +2960,72 @@ async def test_source_deriver_persists_completed_batch_before_later_worker_failu
         "batch-first": "completed",
         "batch-second": "pending",
     }
+
+
+class _OversizedGroupExtractor(NoopMemoryExtractor):
+    """An extraction route on which any request that reads the oversized group does not fit."""
+
+    OVERSIZED = "This rule is far larger than the route allows."
+    structured_llm_client = SimpleNamespace(
+        **{
+            **vars(NoopMemoryExtractor.structured_llm_client),
+            "request_fits": lambda prompt, **kwargs: _OversizedGroupExtractor.OVERSIZED not in prompt,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_reading_group_beyond_capacity_is_skipped_and_the_derivation_completes(db: Database) -> None:
+    body = f"Rule one applies.\n\n{_OversizedGroupExtractor.OVERSIZED}\n\nRule three applies.\n"
+    projection = _projection(run_id="projection-extraction-capacity", body=body)
+    document = await db.get_document("confluence-123")
+    assert document is not None
+    read: list[str] = []
+
+    async def extract(batch):
+        read.extend(f.presentation_text.strip() for f in batch.catalog.fragments if f.primary_eligible)
+        return MemoryExtractionResult(memories=[])
+
+    def request():
+        return SourceUnitDerivationRequest(
+            projection=projection,
+            context=SourceUnitDerivationContext(
+                document=document,
+                doc_type="confluence",
+                project_key="ENG",
+                repo_identifier=None,
+                document_content=body,
+                update_mode="full_document",
+                changed_hunks=None,
+                update_plan_stats=None,
+                source_updated_at=None,
+                user_id=None,
+                source_activity_epoch=None,
+            ),
+            plan_requests=fixture_request_planner(
+                projection, access_context_hash="access-extraction-capacity", extractor=_OversizedGroupExtractor(),
+            ),
+            extract_request=extract,
+            max_concurrent=1,
+            access_context_hash="access-extraction-capacity",
+            inference_capability_hash="inference-extraction-capacity",
+        )
+
+    first = await SourceUnitDeriver(db).derive(request())
+
+    assert first.extraction.error_type is None
+    assert first.derivation.status == "completed"
+    assert first.extraction.metadata["skipped_reading_group_count"] == 1
+    assert "Rule one applies." in read and "Rule three applies." in read
+    assert _OversizedGroupExtractor.OVERSIZED not in read
+
+    # Recovering the derivation plans the same skip and reuses every completed batch.
+    read.clear()
+    again = await SourceUnitDeriver(db).derive(request())
+
+    assert again.derivation.id == first.derivation.id
+    assert again.executed_batch_count == 0 and read == []
+    assert again.extraction.metadata["skipped_reading_group_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -3354,7 +3428,7 @@ async def test_projection_extraction_contract_change_invalidates_staged_derivati
     )
     assert isinstance(authority, ExtractionAuthority)
     plan_requests = fixture_request_planner(projection, access_context_hash="access-contract-change")
-    current_batches = await plan_requests(authority)
+    current_batches = (await plan_requests(authority)).requests
     assert current_batches
     previous_batches = tuple(replace(batch, id=f"{batch.id}-v2") for batch in current_batches)
     with monkeypatch.context() as previous_contract:
@@ -3431,7 +3505,7 @@ async def test_batch_result_and_runtime_events_rollback_together(db: Database) -
         reprocess_all_current_observations=False,
     )
     assert isinstance(authority, ExtractionAuthority)
-    batches = await fixture_request_planner(projection, access_context_hash="access-runtime-transaction")(authority)
+    batches = (await fixture_request_planner(projection, access_context_hash="access-runtime-transaction")(authority)).requests
     manifest = source_derivation_manifest(projection, batches, context=context)
     await db.stage_source_derivation(manifest)
     [event] = bind_quality_signals(
@@ -5481,12 +5555,6 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
         memory_store=_OutboxDrainer(db),
         structured_llm_client=client,
     )
-
-    async def unexpected_impact_scan(**kwargs):
-        del kwargs
-        raise AssertionError("new-candidate reconciliation must not pre-scan impacts")
-
-    monkeypatch.setattr(engine, "_projected_incumbent_impacts", unexpected_impact_scan)
 
     stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
@@ -9790,6 +9858,66 @@ async def test_reprocess_at_the_current_revision_reads_every_support_over_the_wh
     rebound = await active_support_evidence(db, incumbent.id, source_id="src-1")
     assert {part.validation_unit_revision_id for part in rebound} == {second.source_unit_revisions[0].id}
     assert (await db.get_memory(incumbent.id)).status == "active"
+
+
+class _CorrectingReprocessClient(_WholeUnitReadingClient):
+    """A later reading of the same revision no longer supports the old claim and relates its correction."""
+
+    supported = True
+
+    async def judge_support(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return _audit_response(SupportJudgment(
+            supported=self.supported, reason="The page states the claim." if self.supported else "Another issue.",
+        ))
+
+    async def classify_memory_relations(self, prompt: str, **kwargs):
+        del kwargs
+        return _uniform_relation_response(prompt, classification="contradicts", reason="The Candidate names PAY-1.")
+
+
+@pytest.mark.asyncio
+async def test_a_reprocess_that_no_longer_supports_a_claim_supersedes_it_with_the_contradicting_candidate(db):
+    claim = "PAY-9 requires approval."
+    body = f"{claim}\n\nThe team reviewed dashboards."
+    first = _projection(run_id="correct-v1", body=body)
+    incumbent, client, advance = await _exact_support_engine(
+        db, claim=claim, first=first, memory_id="mem-wrong-key", client_type=_CorrectingReprocessClient,
+    )
+    second_body = f"{body}\n\nEdition 2."
+    second = _projection(
+        run_id="correct-v2", body=second_body, prior=first.source_unit_revisions[0],
+        prior_observations={r.observation_id: r for r in first.observation_revisions},
+    )
+    await advance(second, second_body, 2)
+
+    client.supported = False
+    again = _projection(
+        run_id="correct-again", body=second_body, prior=second.source_unit_revisions[0],
+        prior_observations={r.observation_id: r for r in second.observation_revisions},
+    )
+    context = RevisionAssessmentContext(
+        projection=again, base=second,
+        access_context_hash=lifecycle_access_context_hash(
+            visibility="workspace", owner_user_id=None, project_key="ENG", repo_identifier=None,
+        ),
+    )
+    catalog = context.catalog(context.full_fragments)
+    ref = next(fragment.reference for fragment in catalog.fragments if fragment.presentation_text == claim)
+    correction = RawMemory(
+        content="PAY-1 requires approval.", memory_type="decision", evidence_quote=claim,
+        source_observation_id=_body_observation(again).id,
+        resolved_evidence_selection=catalog.resolve_selection(primary_ref=ref),
+    )
+    stats = await advance(again, second_body, 3, [correction], derivation_support_without_baseline=True)
+
+    # The whole-Unit read is a complete read, so DestructiveValidation lets the supersession through.
+    assert all(stats[f"destructive_validation_kept_{reason.value}_count"] == 0 for reason in KeptReason)
+    assert stats["superseded"] == 1
+    old = await db.get_memory(incumbent.id)
+    assert old is not None and old.status == "superseded"
+    replacement = await db.get_memory(old.superseded_by)
+    assert replacement is not None and replacement.content == correction.content and replacement.status == "active"
 
 
 @pytest.mark.asyncio

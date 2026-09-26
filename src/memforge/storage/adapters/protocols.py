@@ -596,6 +596,7 @@ class RelationalStore(Protocol):
         source_id: str | None = None,
         *,
         status: LifecycleReviewStatus | None = None,
+        incumbent_memory_ids: Sequence[str] | None = None,
         limit: int | None = None,
         offset: int = 0,
         newest_first: bool = False,

@@ -97,7 +97,7 @@ def extraction_requests(projection, authority, *, base=None):
     return plan_extraction_requests(
         RevisionAssessmentContext(projection=projection, base=base, access_context_hash="scope"),
         authority, extractor=NoopMemoryExtractor(), source_type=projection.source_type, doc_type="ticket",
-    )
+    ).requests
 
 
 def test_jira_unit_title_names_the_issue_from_payload_values_only():

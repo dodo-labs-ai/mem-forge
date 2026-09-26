@@ -555,6 +555,34 @@ class MemoryExtractionFailure(RuntimeError):
     """Extraction exhausted its own retry policy; do not replay the document."""
 
 
+def _fail_deferred_commits_nothing_can_unblock(
+    results: list[dict[str, Any]], run_source_unit_ids: set[str],
+) -> None:
+    """Fail every deferred intent that no Unit outside ``run_source_unit_ids`` holds up.
+
+    Such an intent already had every chance to commit; an intent that waits on
+    an outside Unit, directly or through another deferred intent, stays deferred.
+    """
+    deferred = {
+        str(result["source_unit_id"]): result
+        for result in results
+        if result.get("deferred_lifecycle") is not None and result.get("source_unit_id")
+    }
+    blockers = {
+        unit_id: set(result["deferred_lifecycle"].handle.blocking_source_unit_ids)
+        for unit_id, result in deferred.items()
+    }
+    waiting = {unit_id for unit_id, blocked_by in blockers.items() if not blocked_by <= run_source_unit_ids}
+    while newly_waiting := {
+        unit_id for unit_id, blocked_by in blockers.items() if unit_id not in waiting and blocked_by & waiting
+    }:
+        waiting |= newly_waiting
+    for unit_id, result in deferred.items():
+        if unit_id not in waiting:
+            result["terminal_error"] = _retained_document_error(result["deferred_lifecycle"])
+            result["deferred_lifecycle"] = None
+
+
 def _retained_document_error(exc: BaseException) -> str:
     """Project an exception into bounded state without retaining its traceback."""
 
@@ -1328,9 +1356,17 @@ class GeneSyncOrchestrator:
             # When since= is set, the gene only returns CHANGED pages.
             # Pages not returned aren't deleted — they're just unchanged.
             # Only run deletion detection on full syncs (since=None).
+            #
+            # A new Unit commits before an old one is removed: when a Unit's
+            # identity changes, the new Unit's identity attach must find the old
+            # Unit's Memories still Active. Deferred commits blocked only by this
+            # run's Units converge first; a commit that fails for good counts as
+            # a failed document and keeps absence unproven.
+            await self._converge_deferred_projected_lifecycle(effective_results)
+            deferred_failures = sum(result.get("terminal_error") is not None for result in deferred_results)
             deleted_count = 0
             tombstoned_source_unit_ids: set[str] = set()
-            absence_is_authoritative = run_coverage.proves_absence and docs_failed == 0
+            absence_is_authoritative = run_coverage.proves_absence and docs_failed + deferred_failures == 0
 
             if absence_is_authoritative:
                 if progress_callback:
@@ -1377,11 +1413,15 @@ class GeneSyncOrchestrator:
                     len(indexed_doc_ids),
                 )
 
-            await self._converge_deferred_projected_lifecycle(
-                effective_results,
-                additional_source_unit_ids=tombstoned_source_unit_ids,
-            )
+            # A removed Unit may have blocked a deferred commit of this run.
+            if tombstoned_source_unit_ids:
+                await self._converge_deferred_projected_lifecycle(
+                    effective_results,
+                    additional_source_unit_ids=tombstoned_source_unit_ids,
+                )
             for result in deferred_results:
+                if result.get("deferred_lifecycle") is not None:
+                    result["terminal_error"] = _retained_document_error(result["deferred_lifecycle"])
                 terminal_error = result.get("terminal_error")
                 if terminal_error is not None:
                     result["failed"] = True
@@ -1589,7 +1629,14 @@ class GeneSyncOrchestrator:
         *,
         additional_source_unit_ids: set[str] | frozenset[str] = frozenset(),
     ) -> None:
-        """Commit same-run deferred intents without repeating semantic work."""
+        """Commit same-run deferred intents without repeating semantic work.
+
+        Only an intent whose blockers are all Units of this run, or Units this
+        run removed, is retried. An intent still deferred afterwards has failed
+        for good unless it waits, directly or through another deferred intent,
+        on a Unit outside that set: only the caller's later removal of such a
+        Unit can still unblock it, so that intent is left pending.
+        """
 
         run_source_unit_ids = {
             str(result["source_unit_id"])
@@ -1601,10 +1648,18 @@ class GeneSyncOrchestrator:
             for result in results
             if result.get("deferred_lifecycle") is not None
             and result.get("source_unit_id")
+            and set(result["deferred_lifecycle"].handle.blocking_source_unit_ids).issubset(run_source_unit_ids)
         }
         if not pending:
             return
 
+        await self._retry_deferred_projected_lifecycle(pending, run_source_unit_ids)
+        _fail_deferred_commits_nothing_can_unblock(results, run_source_unit_ids)
+
+    async def _retry_deferred_projected_lifecycle(
+        self, pending: dict[str, dict[str, Any]], run_source_unit_ids: set[str],
+    ) -> None:
+        """Retry eligible intents in rounds while each round commits at least one."""
         attempt_budget = min(
             MAX_LIFECYCLE_CONVERGENCE_ROUNDS * len(pending),
             MAX_LIFECYCLE_CONVERGENCE_ATTEMPTS,
@@ -1634,6 +1689,7 @@ class GeneSyncOrchestrator:
                 except Exception as exc:
                     if bool(getattr(exc, "commit_attempted", True)):
                         attempts += 1
+                    result["deferred_lifecycle"] = None
                     result["terminal_error"] = _retained_document_error(exc)
                     result["runtime_bundle"] = getattr(
                         exc,
@@ -1659,10 +1715,6 @@ class GeneSyncOrchestrator:
                 successful += 1
             if successful == 0:
                 break
-
-        for result in pending.values():
-            deferred = result["deferred_lifecycle"]
-            result["terminal_error"] = _retained_document_error(deferred)
 
     async def _resume_source_derivations(
         self,

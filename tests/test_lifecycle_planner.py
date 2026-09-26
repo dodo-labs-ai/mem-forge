@@ -586,3 +586,110 @@ def test_skipped_corroboration_reuses_identity_without_reattaching_preserved_sup
         assert attachment.memory_id == old.id
         assert attachment.evidence_unit_ids == expected_attached
     assert plan.relation_discovery_requests == ()
+
+
+def _identity_plan(operation: ReconcileOperation, *, gate: LifecycleGateState = LifecycleGateState.ENABLED):
+    """One old Memory decided by ``operation``, plus an ADD that identity matched to it."""
+    old = _memory()
+    candidate = RawMemory(content="A7 was removed from the plan.", memory_type="decision", evidence_quote="A7")
+    return build_lifecycle_plan(
+        plan_id="plan-identity",
+        scope=_scope(),
+        gate_state=gate,
+        operations=(ReconcileOperation(action=ReconcileAction.ADD, memory=candidate), operation),
+        incumbents={old.id: old},
+        source_support_unit_ids={old.id: ("eu-old",)},
+        all_active_support_unit_ids={old.id: ("eu-old",)},
+        support_set_hashes={old.id: "support-hash"},
+        observation_revision_ids=("obsrev-2",),
+        evidence_unit_ids_by_claim_hash={
+            content_hash(candidate.content): ("eu-candidate",),
+            content_hash(old.content): ("eu-rebound",),
+            content_hash(_replacement().content): ("eu-replacement",),
+        },
+        corroboration_targets_by_claim_hash={content_hash(candidate.content): old},
+        corroboration_proofs_by_claim_hash={content_hash(candidate.content): {"method": "semantic"}},
+        defaults=_defaults(),
+    )
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        ReconcileOperation(action=ReconcileAction.DELETE, memory_id="mem-old", reason="support removed"),
+        ReconcileOperation(action=ReconcileAction.SUPERSEDE, memory_id="mem-old", memory=_replacement()),
+        ReconcileOperation(action=ReconcileAction.UPDATE, memory_id="mem-old", memory=_replacement()),
+        ReconcileOperation(
+            action=ReconcileAction.DELETE, memory_id="mem-old", reason="protected", flag_for_review=True,
+        ),
+    ],
+    ids=["delete", "supersede", "update", "review"],
+)
+def test_planner_rejects_an_identity_attach_to_an_old_memory_it_removes_replaces_or_reviews(operation) -> None:
+    with pytest.raises(ValueError, match="identity attach targets an old Memory"):
+        _identity_plan(operation)
+
+
+def test_one_plan_rebinds_a_kept_old_memory_and_attaches_its_identity_match() -> None:
+    rebound = RawMemory(content=_memory().content, memory_type="decision", evidence_quote="A7 is removed.")
+
+    plan = _identity_plan(ReconcileOperation(action=ReconcileAction.NOOP, memory_id="mem-old", memory=rebound))
+
+    [decision] = plan.coverage_proof.incumbent_decisions
+    assert decision.disposition.value == "keep"
+    assert [(item.mutation_type, item.evidence_unit_ids) for item in plan.mutations if item.memory_id == "mem-old"] == [
+        (LifecycleMutationType.ATTACH_SUPPORT, ("eu-candidate",)),
+        (LifecycleMutationType.REFRESH_MEMORY_INDEX, ()),
+        (LifecycleMutationType.REMOVE_SUPPORT, ("eu-old",)),
+        (LifecycleMutationType.ATTACH_SUPPORT, ("eu-rebound",)),
+    ]
+
+
+def test_identity_excludes_exactly_the_old_memories_the_plan_does_not_keep() -> None:
+    from memforge.memory.coordinator_review import coordinator_review_id
+    from memforge.memory.lifecycle_planner import identity_excluded_incumbent_ids
+    from memforge.models import CoordinatorProposal, CoordinatorReview
+
+    rebound = RawMemory(content="Kept claim.", memory_type="fact")
+    unchanged = RawMemory(content="Unchanged claim.", memory_type="fact")
+    pending = CoordinatorReview(
+        candidate=RawMemory(content="Pending conflict.", memory_type="fact"),
+        proposal=CoordinatorProposal.SUPERSEDE, reason="contradicts",
+    )
+    decided = CoordinatorReview(
+        candidate=RawMemory(content="Decided conflict.", memory_type="fact"),
+        proposal=CoordinatorProposal.SUPERSEDE, reason="contradicts",
+    )
+    operations = (
+        ReconcileOperation(action=ReconcileAction.DELETE, memory_id="deleted"),
+        ReconcileOperation(action=ReconcileAction.SUPERSEDE, memory_id="superseded", memory=_replacement()),
+        ReconcileOperation(action=ReconcileAction.UPDATE, memory_id="updated", memory=_replacement()),
+        ReconcileOperation(action=ReconcileAction.NOOP, memory_id="reviewed", reviews=(pending,)),
+        ReconcileOperation(action=ReconcileAction.NOOP, memory_id="decided", reviews=(decided,)),
+        ReconcileOperation(action=ReconcileAction.NOOP, memory_id="rebound", memory=rebound),
+        ReconcileOperation(action=ReconcileAction.NOOP, memory_id="unchanged", memory=unchanged),
+        ReconcileOperation(action=ReconcileAction.NOOP, memory_id="unresolved", support_revalidation_skipped=True),
+        ReconcileOperation(action=ReconcileAction.ADD, memory=_replacement()),
+    )
+    rejected = LifecycleReview(
+        id=coordinator_review_id("unit-1", "decided", decided.proposal, decided.candidate.content),
+        lifecycle_plan_id="plan-0", incumbent_memory_id="decided", status=LifecycleReviewStatus.REJECTED,
+        staged_evidence={}, reason="contradicts",
+    )
+
+    def excluded(gate: LifecycleGateState) -> frozenset[str]:
+        return identity_excluded_incumbent_ids(
+            operations,
+            source_unit_id="unit-1",
+            gate_state=gate,
+            source_support_unit_ids={"rebound": ("eu-old",), "unchanged": ("eu-same",)},
+            evidence_unit_ids_by_claim_hash={
+                content_hash(rebound.content): ("eu-new",), content_hash(unchanged.content): ("eu-same",),
+            },
+            coordinator_reviews=(rejected,),
+        )
+
+    kept_out = {"deleted", "superseded", "updated", "reviewed"}
+    assert excluded(LifecycleGateState.ENABLED) == kept_out
+    # Under the gate a rebind that removes Support waits for Review; one that keeps the same Evidence does not.
+    assert excluded(LifecycleGateState.GATED) == kept_out | {"rebound"}

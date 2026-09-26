@@ -664,6 +664,30 @@ class SearchResult:
     retrieval_evidence: dict[str, Any] | None = None
 
 
+class CoordinatorProposal(str, Enum):
+    """The action a coordinator Review proposes for its old Memory."""
+
+    # Create a Memory from the staged contradicting Candidate and supersede the old Memory.
+    SUPERSEDE = "supersede"
+    # Keep the old Memory and bind it to the staged equivalent Candidate's Evidence.
+    REBIND = "rebind"
+
+
+@dataclass(frozen=True)
+class CoordinatorReview:
+    """A conflict SupportRelationCoordinator leaves to a human for one old Memory.
+
+    The Candidate stays staged in the Review; no Memory is created for it.
+    """
+
+    candidate: RawMemory
+    proposal: CoordinatorProposal
+    reason: str
+    # The equivalent Candidate whose Evidence the old Memory is bound to on rejection,
+    # when the old Memory also has an equivalent edge.
+    rejection_rebind: RawMemory | None = None
+
+
 @dataclass
 class ReconcileOperation:
     """A single reconciliation operation from the LLM."""
@@ -672,9 +696,12 @@ class ReconcileOperation:
     memory_id: str | None = None  # existing memory ID (for UPDATE/SUPERSEDE/DELETE/NOOP)
     memory: RawMemory | None = None  # new or updated memory (for ADD/UPDATE/SUPERSEDE)
     reason: str | None = None
+    # Source Authority Review of the proposed action.
     flag_for_review: bool = False
     # Program-owned outcome of L3; never parsed from an LLM reconciliation action.
     support_revalidation_skipped: bool = False
+    # Coordinator Reviews that hold this kept old Memory's decision.
+    reviews: tuple[CoordinatorReview, ...] = ()
 
 
 # ---------------------------------------------------------------------------

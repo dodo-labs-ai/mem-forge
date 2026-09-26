@@ -207,7 +207,7 @@ def _requests(projection, *, base=None, committed=None, reprocess=False, images=
         extractor=NoopMemoryExtractor(),
         source_type=projection.source_type,
         doc_type="document",
-    )
+    ).requests
 
 
 def _primary(requests):

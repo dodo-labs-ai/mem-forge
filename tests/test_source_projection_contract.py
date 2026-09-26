@@ -8,8 +8,6 @@ from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.source_projection import (
     AnchorKind,
     DeltaAxis,
-    FragmentMapping,
-    ImpactResult,
     ProjectionCoverage,
     ProjectionEnvelope,
     ProjectionRequest,
@@ -24,38 +22,7 @@ from memforge.source_projection import (
     SourceRelationType,
     SourceUnit,
     SourceUnitRevision,
-    resolve_anchor_impact,
 )
-
-
-def _anchor(
-    *,
-    observation_id: str = "obs-page-1-body",
-    revision_id: str = "obsrev-2",
-    fragment_id: str | None = None,
-    start: int | None = None,
-    end: int | None = None,
-) -> SourceAnchor:
-    if fragment_id is not None:
-        return SourceAnchor(
-            kind=AnchorKind.STABLE_FRAGMENT,
-            observation_id=observation_id,
-            observation_revision_id=revision_id,
-            fragment_id=fragment_id,
-        )
-    if start is not None:
-        return SourceAnchor(
-            kind=AnchorKind.REVISION_RANGE,
-            observation_id=observation_id,
-            observation_revision_id=revision_id,
-            range_start=start,
-            range_end=end,
-        )
-    return SourceAnchor(
-        kind=AnchorKind.WHOLE_OBSERVATION,
-        observation_id=observation_id,
-        observation_revision_id=revision_id,
-    )
 
 
 def test_anchor_shape_is_controlled() -> None:
@@ -88,86 +55,7 @@ def test_partial_projection_cannot_claim_absence() -> None:
         )
 
 
-def test_whole_observation_anchor_is_affected_by_same_observation_change() -> None:
-    delta = RevisionDelta(
-        source_unit_id="unit-1",
-        previous_unit_revision_id="unitrev-1",
-        current_unit_revision_id="unitrev-2",
-        axes=frozenset({DeltaAxis.SEMANTIC}),
-        coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
-        changed_anchors=(_anchor(fragment_id="section-new"),),
-    )
-
-    assert resolve_anchor_impact(_anchor(), delta) is ImpactResult.AFFECTED
-
-
-def test_fragment_mapping_can_prove_affected_or_disjoint() -> None:
-    delta = RevisionDelta(
-        source_unit_id="unit-1",
-        previous_unit_revision_id="unitrev-1",
-        current_unit_revision_id="unitrev-2",
-        axes=frozenset({DeltaAxis.SEMANTIC}),
-        coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
-        changed_anchors=(_anchor(fragment_id="section-b"),),
-        fragment_mappings=(
-            FragmentMapping(
-                observation_id="obs-page-1-body",
-                previous_revision_id="obsrev-1",
-                current_revision_id="obsrev-2",
-                previous_fragment_id="section-a-old",
-                current_fragment_id="section-a",
-            ),
-        ),
-    )
-
-    assert (
-        resolve_anchor_impact(
-            _anchor(revision_id="obsrev-1", fragment_id="section-a-old"),
-            delta,
-        )
-        is ImpactResult.DISJOINT
-    )
-    assert resolve_anchor_impact(_anchor(fragment_id="section-b"), delta) is ImpactResult.AFFECTED
-
-
-def test_range_overlap_is_generic() -> None:
-    delta = RevisionDelta(
-        source_unit_id="unit-1",
-        previous_unit_revision_id="unitrev-1",
-        current_unit_revision_id="unitrev-2",
-        axes=frozenset({DeltaAxis.SEMANTIC}),
-        coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
-        changed_anchors=(_anchor(start=20, end=30),),
-    )
-
-    assert resolve_anchor_impact(_anchor(start=25, end=35), delta) is ImpactResult.AFFECTED
-    assert resolve_anchor_impact(_anchor(start=0, end=10), delta) is ImpactResult.DISJOINT
-
-
-def test_range_impact_is_unknown_without_same_revision_range_mapping() -> None:
-    whole_observation_delta = RevisionDelta(
-        source_unit_id="unit-1",
-        previous_unit_revision_id="unitrev-1",
-        current_unit_revision_id="unitrev-2",
-        axes=frozenset({DeltaAxis.SEMANTIC}),
-        coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
-        changed_anchors=(_anchor(),),
-    )
-    next_revision_range_delta = RevisionDelta(
-        source_unit_id="unit-1",
-        previous_unit_revision_id="unitrev-1",
-        current_unit_revision_id="unitrev-2",
-        axes=frozenset({DeltaAxis.SEMANTIC}),
-        coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
-        changed_anchors=(_anchor(revision_id="obsrev-3", start=20, end=30),),
-    )
-
-    anchor = _anchor(revision_id="obsrev-2", start=0, end=10)
-    assert resolve_anchor_impact(anchor, whole_observation_delta) is ImpactResult.UNKNOWN
-    assert resolve_anchor_impact(anchor, next_revision_range_delta) is ImpactResult.UNKNOWN
-
-
-def test_location_only_delta_does_not_affect_semantic_evidence() -> None:
+def test_location_only_delta_requires_no_extraction() -> None:
     delta = RevisionDelta(
         source_unit_id="unit-page-1",
         previous_unit_revision_id="unitrev-1",
@@ -176,7 +64,6 @@ def test_location_only_delta_does_not_affect_semantic_evidence() -> None:
         coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
     )
 
-    assert resolve_anchor_impact(_anchor(), delta) is ImpactResult.DISJOINT
     assert delta.requires_extraction is False
 
 

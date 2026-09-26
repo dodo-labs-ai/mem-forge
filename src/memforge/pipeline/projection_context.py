@@ -75,6 +75,21 @@ class ExtractionRequest:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ExtractionPlan:
+    """The Claim Extraction requests of one authority, and the ReadingGroups no request can read.
+
+    A ReadingGroup that with its reading context alone exceeds the route's
+    capacity is skipped with a diagnostic; the other groups are extracted and
+    the revision commits. Its knowledge is extracted again only when its
+    structure changes again.
+    """
+
+    requests: tuple[ExtractionRequest, ...]
+    # Diagnostic labels of the skipped ReadingGroups, in reading order.
+    skipped_reading_groups: tuple[str, ...] = ()
+
+
 class ProjectionEvidencePlanningFailureCode(str, Enum):
     INCREMENTAL_BASE_UNAVAILABLE = "INCREMENTAL_BASE_UNAVAILABLE"
     INCREMENTAL_AUTHORITY_UNMAPPABLE = "INCREMENTAL_AUTHORITY_UNMAPPABLE"

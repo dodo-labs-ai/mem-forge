@@ -15,7 +15,8 @@ from memforge.llm.structured import (
     StructuredLlmMetricsCollector,
 )
 from memforge.models import RawMemory
-from memforge.pipeline.reconciler import reconcile_memories, SupportAuditEntry
+from memforge.pipeline.reconciler import reconcile_memories
+from tests.revision_client_fixture import pinned
 from tests.revision_client_fixture import catalog_payload, sparse_response
 from tests.test_relation_first_reconciliation import _memory
 from tests.test_projected_lifecycle_integration import (
@@ -137,10 +138,8 @@ async def test_failed_second_call_is_counted_without_losing_unit_totals(monkeypa
         result = await reconcile_memories(
             new_extractions=[RawMemory(content="New claim", memory_type="fact")],
             existing_memories=[_memory(f"mem-{i}", f"Claim {i}") for i in range(65)],
-            doc_type="design",
-            structured_llm_client=client,
-            include_metadata=True,
-            support_audits=[SupportAuditEntry(f"mem-{i}", True) for i in range(65)],
+            llm_model="test-model", structured_llm_client=client,
+            supports=dict([pinned(f"mem-{i}", True) for i in range(65)]),
         )
     assert len(calls) == 2
     assert result.operations == []
@@ -234,10 +233,8 @@ async def test_failed_parallel_batch_counts_every_provider_sibling(monkeypatch):
         result = await reconcile_memories(
             new_extractions=[RawMemory(content="New claim", memory_type="fact")],
             existing_memories=[_memory(f"mem-{i}", f"Claim {i}") for i in range(65)],
-            doc_type="design",
-            structured_llm_client=client,
-            include_metadata=True,
-            support_audits=[SupportAuditEntry(f"mem-{i}", True) for i in range(65)],
+            llm_model="test-model", structured_llm_client=client,
+            supports=dict([pinned(f"mem-{i}", True) for i in range(65)]),
         )
     summary = unit.summary(source_unit_elapsed_ms=1)
     assert started == 2

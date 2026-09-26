@@ -5142,7 +5142,8 @@ async def test_recovered_external_blocker_does_not_stop_provider_discovery(
     assert state.docs_failed == 1
     assert state.failure_retryable is False
     assert engine.semantic_calls == 1
-    assert engine.commit_only_calls == 1
+    # A blocker outside this run can never clear, so the intent is not retried.
+    assert engine.commit_only_calls == 0
     [preserved] = await db.list_source_derivation_attempts(source_id=source_id)
     assert preserved.status == "completed"
 
@@ -10781,6 +10782,140 @@ async def test_deferred_lifecycle_converges_after_same_run_tombstone(
     assert await db.get_document("jira-1") is None
 
 
+class _IssueGene(BlockingFetchGene):
+    """A Jira project whose issues are exactly the given numbers."""
+
+    def __init__(self, *issues: int) -> None:
+        release = asyncio.Event()
+        release.set()
+        super().__init__(item_count=len(issues), release=release)
+        self.issues = issues
+
+    async def discover(self, since=None):
+        del since
+        for idx in self.issues:
+            yield ContentItem(
+                item_id=f"jira-{idx}",
+                title=f"Jira {idx}",
+                source_url=f"https://jira.example/browse/{idx}",
+                last_modified=datetime.now(timezone.utc),
+                content_type="application/json",
+                space_or_project="PAY",
+                version=str(idx),
+                extra={"issue_id": str(100000 + idx), "issue_key": f"PAY-{idx}"},
+            )
+
+
+class _OrderRecordingMemoryEngine(DeferredOnceMemoryEngine):
+    """Records every committed Unit and removed Unit by document; ``jira-1`` may defer once."""
+
+    def __init__(self, *, defer: bool) -> None:
+        super().__init__()
+        # A deferral is raised only for the first ``jira-1`` commit that is not already deferred.
+        self.deferred = not defer
+        self.events: list[tuple[str, str]] = []
+
+    async def prepare_and_commit_projected_lifecycle(self, **kwargs):
+        result = await super().prepare_and_commit_projected_lifecycle(**kwargs)
+        self.events.append(("commit", kwargs["doc_id"]))
+        return result
+
+    async def retry_deferred_projected_lifecycle(self, handle, *, eligible_same_run_source_unit_ids):
+        result = await super().retry_deferred_projected_lifecycle(
+            handle, eligible_same_run_source_unit_ids=eligible_same_run_source_unit_ids,
+        )
+        self.events.append(("commit", handle._prepared.kwargs["doc_id"]))
+        return result
+
+    async def apply_projected_tombstone(self, **kwargs):
+        self.events.append(("tombstone", kwargs["doc_id"]))
+        return await super().apply_projected_tombstone(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defer", [False, True], ids=["committed", "deferred-by-this-run"])
+async def test_a_new_unit_commits_before_the_unit_it_replaces_is_removed(db: Database, defer: bool) -> None:
+    source_id = "src-unit-identity-change"
+    await db.upsert_source(
+        id=source_id, type="jira", name="Jira", config_json="{}", access_policy="workspace", owner_user_id="dev",
+    )
+    first = await GeneSyncOrchestrator(
+        db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=NoopMemoryEngine(), memory_store=None, max_concurrent=1,
+    ).sync_gene(gene=_IssueGene(0, 2), source_name="Jira", source_id=source_id, force_full_sync=True)
+    assert first.last_sync_status == "success"
+    engine = _OrderRecordingMemoryEngine(defer=defer)
+
+    # jira-2 lost its identity and returns as jira-1; a deferred jira-1 waits only on jira-0 of this run.
+    state = await GeneSyncOrchestrator(
+        db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=engine, memory_store=RecordingDocumentDeleteMemoryStore(db), max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(gene=_IssueGene(0, 1), source_name="Jira", source_id=source_id, force_full_sync=True)
+
+    assert state.last_sync_status == "success" and state.docs_failed == 0
+    assert engine.events == [("commit", "jira-0"), ("commit", "jira-1"), ("tombstone", "jira-2")]
+    assert await db.get_document("jira-2") is None
+
+
+@pytest.mark.asyncio
+async def test_a_new_unit_that_fails_for_good_keeps_the_old_unit(db: Database) -> None:
+    source_id = "src-unit-identity-change-failed"
+    await db.upsert_source(
+        id=source_id, type="jira", name="Jira", config_json="{}", access_policy="workspace", owner_user_id="dev",
+    )
+    await GeneSyncOrchestrator(
+        db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=NoopMemoryEngine(), memory_store=None, max_concurrent=1,
+    ).sync_gene(gene=_IssueGene(0, 2), source_name="Jira", source_id=source_id, force_full_sync=True)
+    engine = _OrderRecordingMemoryEngine(defer=True)
+
+    async def fail_retry(handle, *, eligible_same_run_source_unit_ids):
+        raise RuntimeError("the deferred commit failed")
+
+    engine.retry_deferred_projected_lifecycle = fail_retry
+
+    state = await GeneSyncOrchestrator(
+        db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=engine, memory_store=RecordingDocumentDeleteMemoryStore(db), max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(gene=_IssueGene(0, 1), source_name="Jira", source_id=source_id, force_full_sync=True)
+
+    # Absence is proven only when every returned document committed.
+    assert state.docs_failed == 1
+    assert ("tombstone", "jira-2") not in engine.events
+    assert await db.get_document("jira-2") is not None
+
+
+@pytest.mark.asyncio
+async def test_a_new_unit_still_deferred_by_this_run_keeps_the_old_unit(db: Database) -> None:
+    source_id = "src-unit-identity-change-stuck"
+    await db.upsert_source(
+        id=source_id, type="jira", name="Jira", config_json="{}", access_policy="workspace", owner_user_id="dev",
+    )
+    await GeneSyncOrchestrator(
+        db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=NoopMemoryEngine(), memory_store=None, max_concurrent=1,
+    ).sync_gene(gene=_IssueGene(0, 2), source_name="Jira", source_id=source_id, force_full_sync=True)
+    engine = _OrderRecordingMemoryEngine(defer=True)
+
+    async def defer_again(handle, *, eligible_same_run_source_unit_ids):
+        raise SourceUnitLifecycleDeferred("same-run cross-Unit Support is stale", handle._runtime_bundle, handle=handle)
+
+    engine.retry_deferred_projected_lifecycle = defer_again
+
+    state = await GeneSyncOrchestrator(
+        db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=engine, memory_store=RecordingDocumentDeleteMemoryStore(db), max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(gene=_IssueGene(0, 1), source_name="Jira", source_id=source_id, force_full_sync=True)
+
+    # jira-1 waits only on a Unit of this run, so no removal can unblock it: it has failed.
+    assert state.docs_failed == 1
+    assert ("tombstone", "jira-2") not in engine.events
+    assert await db.get_document("jira-2") is not None
+
+
 @pytest.mark.asyncio
 async def test_external_blocker_does_not_consume_commit_attempt_budget(
     db: Database,
@@ -10854,7 +10989,8 @@ async def test_external_blocker_does_not_consume_commit_attempt_budget(
 
     assert state.last_sync_status == "partial"
     assert state.docs_failed == 1
-    assert engine.retry_doc_ids == [external_doc_id, eligible_doc_id]
+    # Only the intent whose blocker is in this run is retried.
+    assert engine.retry_doc_ids == [eligible_doc_id]
 
 
 @pytest.mark.asyncio

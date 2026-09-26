@@ -18,6 +18,7 @@ from memforge.memory.lifecycle_plan import (
     ReconciliationScope,
     StaleGuard,
 )
+from memforge.memory.coordinator_review import is_coordinator_review
 from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryRequest,
     relation_discovery_request_id,
@@ -31,97 +32,186 @@ def build_lifecycle_review_approval_plan(
     reviewer: str | None = None,
     review_note: str | None = None,
 ) -> LifecyclePlan:
-    """Turn a pending proposal into a fresh atomic plan with original stale guards.
+    """Turn a pending proposal into a fresh atomic plan with the Review's stale guards.
 
-    Approval never mutates from the review row alone. The original complete plan
-    supplies the source-unit revision and incumbent snapshots, while the review
-    carries only the mutations proposed for its one incumbent.
+    Approval never mutates from the review row alone. The creating plan supplies
+    the source-unit revision, while the review carries only the mutations
+    proposed for its one incumbent. A coordinator Review is guarded by the
+    incumbent state its creating plan left behind; any other Review by the
+    creating plan's own incumbent snapshot.
     """
 
-    if review.status is not LifecycleReviewStatus.PENDING:
-        raise ValueError(f"lifecycle review is already {review.status.value}")
-    scope_payload = _mapping(original_plan_payload.get("scope"), "scope")
-    source_id = _text(scope_payload.get("source_id"), "scope.source_id")
-    stale_payload = _mapping(original_plan_payload.get("stale_guard"), "stale_guard")
-    support_hashes = _string_mapping(stale_payload.get("support_set_hashes"), "support_set_hashes")
-    memory_versions = _string_mapping(stale_payload.get("memory_versions"), "memory_versions")
-    incumbent_id = review.incumbent_memory_id
-    if incumbent_id not in support_hashes or incumbent_id not in memory_versions:
-        raise ValueError("review incumbent is absent from original stale guard")
-
+    _require_pending(review)
+    source_id = _review_source_id(original_plan_payload)
     disposition = IncumbentDisposition(
         _text(review.staged_evidence.get("proposed_disposition"), "proposed_disposition")
     )
     replacement_id = review.staged_evidence.get("replacement_memory_id")
     if replacement_id is not None and not isinstance(replacement_id, str):
         raise ValueError("replacement_memory_id must be a string")
-    raw_mutations = review.staged_evidence.get("proposed_mutations")
-    if not isinstance(raw_mutations, Sequence) or isinstance(raw_mutations, (str, bytes)):
-        raise ValueError("lifecycle review lacks proposed mutations")
-    proposed = tuple(_deserialize_mutation(value, source_id, incumbent_id) for value in raw_mutations)
-    if not proposed:
-        raise ValueError("lifecycle review has no proposed mutations")
-
+    proposed = _staged_mutations(review, "proposed_mutations", source_id)
     plan_id = f"lifecycle-review-approval-{review.id}"
-    relation_discovery_requests = _relation_discovery_requests(
+    scope_payload = _mapping(original_plan_payload.get("scope"), "scope")
+    return _review_decision_plan(
         review,
-        proposed=proposed,
+        original_plan_payload,
         plan_id=plan_id,
-        source_id=source_id,
-        source_unit_id=_text(scope_payload.get("source_unit_id"), "scope.source_unit_id"),
-        source_unit_revision_id=_optional_text(scope_payload.get("target_unit_revision_id")),
+        scope_kind="review",
+        status=LifecycleReviewStatus.APPROVED,
+        decision=IncumbentDecision(
+            memory_id=review.incumbent_memory_id,
+            disposition=disposition,
+            reason=review.reason or "approved lifecycle review",
+            replacement_memory_id=(replacement_id if disposition is IncumbentDisposition.SUPERSEDE else None),
+        ),
+        mutations=proposed,
+        reviewer=reviewer,
+        review_note=review_note,
+        relation_discovery_requests=_relation_discovery_requests(
+            review,
+            proposed=proposed,
+            plan_id=plan_id,
+            source_id=source_id,
+            source_unit_id=_text(scope_payload.get("source_unit_id"), "scope.source_unit_id"),
+            source_unit_revision_id=_optional_text(scope_payload.get("target_unit_revision_id")),
+        ),
     )
 
-    resolution = LifecycleMutation(
-        mutation_type=LifecycleMutationType.RESOLVE_REVIEW,
-        memory_id=incumbent_id,
-        source_id=source_id,
-        payload={
-            "review_id": review.id,
-            "status": LifecycleReviewStatus.APPROVED.value,
-            "reviewer": reviewer,
-            "review_note": review_note,
-        },
+
+def build_lifecycle_review_rejection_plan(
+    review: LifecycleReview,
+    original_plan_payload: Mapping[str, object],
+    *,
+    reviewer: str | None = None,
+    review_note: str | None = None,
+) -> LifecyclePlan | None:
+    """Plan a rejection that must change state, or None when rejection keeps the status quo.
+
+    A coordinator Review of an old Memory that also has an equivalent Candidate
+    records how rejection keeps it: bound to that Candidate's Evidence. The
+    rebind is guarded exactly like approval.
+    """
+
+    _require_pending(review)
+    if review.staged_evidence.get("rejection_mutations") is None:
+        return None
+    source_id = _review_source_id(original_plan_payload)
+    return _review_decision_plan(
+        review,
+        original_plan_payload,
+        plan_id=f"lifecycle-review-rejection-{review.id}",
+        scope_kind="review-rejection",
+        status=LifecycleReviewStatus.REJECTED,
+        decision=IncumbentDecision(
+            memory_id=review.incumbent_memory_id,
+            disposition=IncumbentDisposition.KEEP,
+            reason=review_note or "rejected lifecycle review",
+        ),
+        mutations=_staged_mutations(review, "rejection_mutations", source_id),
+        reviewer=reviewer,
+        review_note=review_note,
     )
+
+
+def _review_decision_plan(
+    review: LifecycleReview,
+    original_plan_payload: Mapping[str, object],
+    *,
+    plan_id: str,
+    scope_kind: str,
+    status: LifecycleReviewStatus,
+    decision: IncumbentDecision,
+    mutations: tuple[LifecycleMutation, ...],
+    reviewer: str | None,
+    review_note: str | None,
+    relation_discovery_requests: tuple[RelationDiscoveryRequest, ...] = (),
+) -> LifecyclePlan:
+    """One human decision on one Review as an atomic plan over its single incumbent."""
+    scope_payload = _mapping(original_plan_payload.get("scope"), "scope")
+    source_id = _review_source_id(original_plan_payload)
     scope = ReconciliationScope(
-        id=f"{_text(scope_payload.get('id'), 'scope.id')}:review:{review.id}",
+        id=f"{_text(scope_payload.get('id'), 'scope.id')}:{scope_kind}:{review.id}",
         source_id=source_id,
         source_unit_id=_text(scope_payload.get("source_unit_id"), "scope.source_unit_id"),
         base_unit_revision_id=_optional_text(scope_payload.get("base_unit_revision_id")),
         target_unit_revision_id=_optional_text(scope_payload.get("target_unit_revision_id")),
         dependency_unit_ids=tuple(str(value) for value in _sequence(scope_payload.get("dependency_unit_ids", ()))),
     )
+    resolution = LifecycleMutation(
+        mutation_type=LifecycleMutationType.RESOLVE_REVIEW,
+        memory_id=review.incumbent_memory_id,
+        source_id=source_id,
+        payload={
+            "review_id": review.id,
+            "status": status.value,
+            "reviewer": reviewer,
+            "review_note": review_note,
+        },
+    )
     plan = LifecyclePlan(
         id=plan_id,
         scope=scope,
         gate_state=LifecycleGateState.ENABLED,
         coverage_proof=CoverageProof(
-            mandatory_incumbent_ids=(incumbent_id,),
-            incumbent_decisions=(
-                IncumbentDecision(
-                    memory_id=incumbent_id,
-                    disposition=disposition,
-                    reason=review.reason or "approved lifecycle review",
-                    replacement_memory_id=(replacement_id if disposition is IncumbentDisposition.SUPERSEDE else None),
-                ),
-            ),
+            mandatory_incumbent_ids=(review.incumbent_memory_id,),
+            incumbent_decisions=(decision,),
             batch_ids=(f"{scope.id}:batch:0",),
             completed_batch_ids=(f"{scope.id}:batch:0",),
         ),
-        stale_guard=StaleGuard(
-            observation_revision_ids=tuple(
-                str(value) for value in _sequence(stale_payload.get("observation_revision_ids", ()))
-            ),
-            support_set_hashes={incumbent_id: support_hashes[incumbent_id]},
-            memory_versions={incumbent_id: memory_versions[incumbent_id]},
-        ),
+        stale_guard=_review_stale_guard(review, original_plan_payload),
         # Resolve first inside the same transaction so terminal mutations stale
-        # only other pending review work. Any later failure rolls approval back.
-        mutations=(resolution, *proposed),
+        # only other pending review work. Any later failure rolls the decision back.
+        mutations=(resolution, *mutations),
         relation_discovery_requests=relation_discovery_requests,
     )
     plan.validate()
     return plan
+
+
+def _require_pending(review: LifecycleReview) -> None:
+    if review.status is not LifecycleReviewStatus.PENDING:
+        raise ValueError(f"lifecycle review is already {review.status.value}")
+
+
+def _review_source_id(original_plan_payload: Mapping[str, object]) -> str:
+    return _text(_mapping(original_plan_payload.get("scope"), "scope").get("source_id"), "scope.source_id")
+
+
+def _staged_mutations(review: LifecycleReview, key: str, source_id: str) -> tuple[LifecycleMutation, ...]:
+    """The non-empty mutation list a Review staged under ``key`` for its one incumbent."""
+    raw_mutations = review.staged_evidence.get(key)
+    if not isinstance(raw_mutations, Sequence) or isinstance(raw_mutations, (str, bytes)):
+        raise ValueError(f"lifecycle review lacks {key}")
+    mutations = tuple(
+        _deserialize_mutation(value, source_id, review.incumbent_memory_id) for value in raw_mutations
+    )
+    if not mutations:
+        raise ValueError(f"lifecycle review has no {key}")
+    return mutations
+
+
+def _review_stale_guard(review: LifecycleReview, original_plan_payload: Mapping[str, object]) -> StaleGuard:
+    stale_payload = _mapping(original_plan_payload.get("stale_guard"), "stale_guard")
+    observation_revision_ids = tuple(
+        str(value) for value in _sequence(stale_payload.get("observation_revision_ids", ()))
+    )
+    incumbent_id = review.incumbent_memory_id
+    if is_coordinator_review(review):
+        own = _mapping(review.staged_evidence.get("stale_guard"), "staged_evidence.stale_guard")
+        return StaleGuard(
+            observation_revision_ids=observation_revision_ids,
+            support_set_hashes={incumbent_id: _text(own.get("support_set_hash"), "stale_guard.support_set_hash")},
+            memory_versions={incumbent_id: _text(own.get("memory_version"), "stale_guard.memory_version")},
+        )
+    support_hashes = _string_mapping(stale_payload.get("support_set_hashes"), "support_set_hashes")
+    memory_versions = _string_mapping(stale_payload.get("memory_versions"), "memory_versions")
+    if incumbent_id not in support_hashes or incumbent_id not in memory_versions:
+        raise ValueError("review incumbent is absent from original stale guard")
+    return StaleGuard(
+        observation_revision_ids=observation_revision_ids,
+        support_set_hashes={incumbent_id: support_hashes[incumbent_id]},
+        memory_versions={incumbent_id: memory_versions[incumbent_id]},
+    )
 
 
 def build_lifecycle_review_refresh_plan(
@@ -141,6 +231,10 @@ def build_lifecycle_review_refresh_plan(
 
     if review.status is not LifecycleReviewStatus.STALE:
         raise ValueError("only a stale lifecycle review can be refreshed")
+    if is_coordinator_review(review):
+        raise ValueError(
+            "a coordinator Review is refreshed by the next revision of its Source Unit, which raises its conflict again"
+        )
     if not current_support_set_hash or not current_memory_version:
         raise ValueError("lifecycle review refresh requires a current incumbent snapshot")
 
@@ -160,12 +254,7 @@ def build_lifecycle_review_refresh_plan(
     )
     if incumbent_id not in original_support_hashes or incumbent_id not in original_memory_versions:
         raise ValueError("review incumbent is absent from original stale guard")
-    raw_mutations = review.staged_evidence.get("proposed_mutations")
-    if not isinstance(raw_mutations, Sequence) or isinstance(raw_mutations, (str, bytes)):
-        raise ValueError("lifecycle review lacks proposed mutations")
-    proposed = tuple(_deserialize_mutation(value, source_id, incumbent_id) for value in raw_mutations)
-    if not proposed:
-        raise ValueError("lifecycle review has no proposed mutations")
+    proposed = _staged_mutations(review, "proposed_mutations", source_id)
     if any(
         mutation.mutation_type
         in {

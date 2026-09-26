@@ -1,48 +1,63 @@
-"""Derive lifecycle operations from semantic relations and Source Unit support.
+"""The Relation line of one Source Unit revision, and its join with the Support line.
 
-The model classifies facts only: exact candidate/incumbent relations, current
-support, and (only for REFINES) revision eligibility. This module owns the
-deterministic action matrix and never mutates durable lifecycle state.
+The model classifies facts only: candidate/incumbent relations and, only for
+REFINES, revision eligibility. The Relation line never sees a Support result;
+SupportRelationCoordinator combines the two lines in program code. Nothing here
+mutates durable lifecycle state.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from time import perf_counter
 
 from memforge.derivation_work import DerivationWorkStore
 from memforge.evals.agent_evaluation import QualitySignal
-from memforge.llm.structured import StructuredLlmError, structured_llm_metrics_scope
+from memforge.llm.structured import StructuredLlmError, StructuredLlmMetricsCollector, structured_llm_line_scope
 from memforge.memory.evidence import RelationDirection
 from memforge.memory.relation_classifier import (
     MemoryPair,
     MemoryPairClassificationError,
-    MemoryPairDecision,
     MemoryRelationType,
     StructuredMemoryPairClassifier,
 )
 from memforge.models import (
     Memory,
     RawMemory,
-    ReconcileAction,
     ReconcileOperation,
     content_hash,
     parse_memory_validity_date,
+)
+from memforge.pipeline.support_relation_coordinator import (
+    Coordination,
+    MemorySupport,
+    ReconciliationContractError,
+    RelationLedgerEntry,
+    RevisionCompositionProof,
+    SupportRecheckRequest,
+    coordinate,
+    plan_rechecks,
+    supported_refiners,
 )
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "ReconciliationContractError",
+    "RelationLine",
     "ReconciliationFailure",
     "ReconciliationMetrics",
     "ReconciliationResult",
-    "RelationLedgerEntry",
-    "RevisionCompositionProof",
-    "SupportAuditEntry",
+    "RecheckSupports",
+    "assess_relations",
+    "join_support_and_relation",
     "reconcile_memories",
-    "reduce_relation_ledger",
 ]
+
+# Runs SupportRelationCoordinator's re-checks and returns each claim's new Memory-level result.
+RecheckSupports = Callable[[tuple[SupportRecheckRequest, ...]], Awaitable[Mapping[str, MemorySupport]]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,17 +74,9 @@ class ReconciliationFailure:
     diagnostic: QualitySignal | None = None
 
 
-class ReconciliationContractError(ValueError):
-    """A bounded fail-closed reconciliation invariant violation."""
-
-    def __init__(self, reason_code: str, message: str) -> None:
-        super().__init__(message)
-        self.reason_code = reason_code
-
-
 @dataclass(frozen=True, slots=True)
 class ReconciliationMetrics:
-    """Transport and latency measurements for one bounded reconciliation."""
+    """Model work and latency of the Relation line and its join; Support's calls are counted apart."""
 
     structured_llm_calls: int = 0
     model_batch_count: int = 0
@@ -82,6 +89,24 @@ class ReconciliationMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class RelationLine:
+    """The Relation line's complete ledger for one revision, or the failure that left none."""
+
+    entries: tuple[RelationLedgerEntry, ...] = ()
+    proofs: tuple[RevisionCompositionProof, ...] = ()
+    failure: ReconciliationFailure | None = None
+    metrics: ReconciliationMetrics = ReconciliationMetrics()
+    work_ids: tuple[str, ...] = ()
+    # Candidates with a completion row, and the old Memories those rows cover.
+    completed_candidate_count: int = 0
+    incumbent_ids: frozenset[str] = frozenset()
+
+    def covers(self, candidate_count: int, incumbent_ids: frozenset[str]) -> bool:
+        """Whether every one of ``candidate_count`` Candidates has its row over exactly these old Memories."""
+        return self.failure is None and self.completed_candidate_count == candidate_count and self.incumbent_ids == incumbent_ids
+
+
+@dataclass(frozen=True, slots=True)
 class ReconciliationResult:
     """Reconciliation result with operations and optional failure metadata."""
 
@@ -89,414 +114,252 @@ class ReconciliationResult:
     failure: ReconciliationFailure | None = None
     metrics: ReconciliationMetrics = ReconciliationMetrics()
     work_ids: tuple[str, ...] = ()
+    # SupportRelationCoordinator's re-checks; not executed when the caller supplies no re-check.
+    rechecks: tuple[SupportRecheckRequest, ...] = ()
+    # Candidates consumed without a decision by an unresolved component.
+    unresolved_candidate_count: int = 0
+    # Each old Memory's final Support result, after its re-check.
+    supports: Mapping[str, MemorySupport] = field(default_factory=dict)
 
 
-@dataclass(frozen=True, slots=True)
-class RelationLedgerEntry:
-    """One complete, datastore-bound candidate/incumbent relation."""
-
-    candidate_index: int
-    incumbent_id: str
-    relation_type: MemoryRelationType | None
-    direction: RelationDirection
-    reason: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class SupportAuditEntry:
-    """One current Source Unit support judgment for an incumbent."""
-
-    incumbent_id: str
-    supported: bool
-    reason: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class RevisionCompositionProof:
-    """Transient proof that one candidate may revise one incumbent losslessly."""
-
-    candidate_index: int
-    incumbent_id: str
-    same_memory_identity: bool
-    preserves_incumbent_truth: bool
-    candidate_is_canonical_composite: bool
-    reason: str = ""
-
-    @property
-    def eligible(self) -> bool:
-        """Candidate admission already proved the candidate's current Evidence complete."""
-
-        return (
-            self.same_memory_identity
-            and self.preserves_incumbent_truth
-            and self.candidate_is_canonical_composite
-        )
-
-
-async def reconcile_memories(
+async def assess_relations(
     new_extractions: list[RawMemory],
     existing_memories: list[Memory],
-    doc_type: str,
-    structured_llm_client,
-    llm_model: str = "claude-sonnet-4-20250514",
     *,
-    support_audits: list[SupportAuditEntry],
-    include_metadata: bool = False,
+    structured_llm_client,
+    llm_model: str,
     images: tuple = (),
     image_loader=None,
     work_store: DerivationWorkStore | None = None,
     derivation_id: str | None = None,
     operation_input_hash: str | None = None,
-) -> list[ReconcileOperation] | ReconciliationResult:
-    """Classify a complete relation/support ledger and reduce it deterministically."""
+) -> RelationLine:
+    """Judge every admitted Candidate against every same-Unit old Memory, without Support.
 
-    with structured_llm_metrics_scope() as collector:
-        checkpoint = collector.checkpoint()
-        started = perf_counter()
-        relation_pair_count = 0
-        relation_prompt_chars = 0
-        revision_proof_count = 0
-        revision_proof_failure_count = 0
+    A model or contract failure is returned, not raised: the revision is not
+    committed, and nothing here may fall back to independent ADD.
+    """
+    started = perf_counter()
+    pair_count = len(new_extractions) * len(existing_memories)
+    incumbent_ids = frozenset(memory.id for memory in existing_memories)
+    if not new_extractions or not existing_memories:
+        # Nothing to relate: every Candidate's row is empty by definition.
+        return RelationLine(
+            metrics=ReconciliationMetrics(relation_pair_count=pair_count),
+            completed_candidate_count=len(new_extractions), incumbent_ids=incumbent_ids,
+        )
+    from memforge.pipeline.claim_revision import assess_claim_pairs
 
-        def metrics() -> ReconciliationMetrics:
-            actual = collector.summary(source_unit_elapsed_ms=0, since=checkpoint)
-            return ReconciliationMetrics(
-                structured_llm_calls=actual.logical_calls,
-                model_batch_count=actual.logical_calls,
-                structured_llm_elapsed_ms=actual.llm_elapsed_ms,
-                reconciliation_elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
-                relation_pair_count=relation_pair_count,
-                relation_prompt_chars=relation_prompt_chars,
-                revision_proof_count=revision_proof_count,
-                revision_proof_failure_count=revision_proof_failure_count,
-            )
-
-        if not new_extractions and not existing_memories:
-            return _return_result([], metrics=metrics(), include_metadata=include_metadata)
-        if not existing_memories:
-            return _return_result(
-                [ReconcileOperation(action=ReconcileAction.ADD, memory=raw) for raw in new_extractions],
-                metrics=metrics(),
-                include_metadata=include_metadata,
-            )
-
-        operation = "classify_memory_relations"
+    with structured_llm_line_scope() as line:
         try:
-            classifier = StructuredMemoryPairClassifier(client=structured_llm_client, model=llm_model)
-            transient_candidates = tuple(_transient_candidate(index, raw) for index, raw in enumerate(new_extractions))
-            from memforge.pipeline.claim_revision import assess_claim_pairs
-
-            operation = "assess_revision_support"
-            if {entry.incumbent_id for entry in support_audits} != {old.id for old in existing_memories}:
-                raise ReconciliationContractError("support_ledger_incomplete", "missing exact incumbent assessment")
-            operation = "assess_claim_revisions"
-            relation_pair_count += len(new_extractions) * len(existing_memories)
             assessed = await assess_claim_pairs(
                 candidates=new_extractions, incumbents=existing_memories, client=structured_llm_client,
                 model=llm_model, images=images, image_loader=image_loader,
                 store=work_store, derivation_id=derivation_id, operation_input_hash=operation_input_hash,
             )
-            relation_prompt_chars += assessed.prompt_chars
-            relation_entries = []
-            proofs = []
-            for index, incumbent_id, decision in assessed.decisions:
-                relation = decision.relation
-                if decision.status == "insufficient":
-                    relation_entries.append(RelationLedgerEntry(
-                        candidate_index=index, incumbent_id=incumbent_id, relation_type=None,
-                        direction=RelationDirection.SYMMETRIC, reason=decision.reason,
-                    ))
-                    continue
-                assert relation is not None
-                relation_entries.append(RelationLedgerEntry(
-                    candidate_index=index, incumbent_id=incumbent_id,
-                    relation_type=MemoryRelationType(relation.classification),
-                    direction=RelationDirection(relation.direction), reason=relation.reason,
-                ))
-                assessment = decision.revision_assessment
-                if (relation.classification == "refines"
-                        and relation.direction == "challenger_to_candidate"
-                        and assessment is not None):
-                    proofs.append(RevisionCompositionProof(
-                        candidate_index=index, incumbent_id=incumbent_id,
-                        same_memory_identity=assessment.same_knowledge_item,
-                        preserves_incumbent_truth=assessment.preserves_incumbent_truth,
-                        candidate_is_canonical_composite=assessment.challenger_is_complete_current_claim,
-                        reason=decision.reason,
-                    ))
-            revision_proof_count = len(proofs)
-
-            _, unresolved_incumbents = _unresolved_component(
-                relation_entries, _support_conflicting_pairs(relation_entries, support_audits, proofs),
+        except Exception as error:  # noqa: BLE001 - classified by _failure
+            return RelationLine(
+                failure=_failure(error, "assess_claim_revisions"),
+                metrics=_add_calls(ReconciliationMetrics(relation_pair_count=pair_count), line, started),
             )
-            refiners_by_incumbent = _supported_revision_candidates(
-                [entry for entry in relation_entries if entry.incumbent_id not in unresolved_incumbents], support_audits,
-            )
-            conditional_pairs = tuple(
-                MemoryPair(challenger=transient_candidates[left], candidate=transient_candidates[right])
-                for indices in refiners_by_incumbent.values()
-                if len(indices) > 1
-                for offset, left in enumerate(indices)
-                for right in indices[offset + 1 :]
-            )
-            if conditional_pairs:
-                operation = "classify_memory_relations"
-                conditional = await classifier.classify(conditional_pairs)
-                relation_pair_count += len(conditional_pairs)
-                relation_prompt_chars += conditional.prompt_chars
-                conflicting_ids = {
-                    memory_id for decision in conditional.decisions
-                    if decision.relation_type is MemoryRelationType.CONTRADICTS
-                    for memory_id in decision.pair.key
-                }
-                conflicting_candidates = {index for index, candidate in enumerate(transient_candidates)
-                                          if candidate.id in conflicting_ids}
-                relation_entries = [
-                    replace(entry, relation_type=None, reason="Current refinement candidates conflict")
-                    if entry.candidate_index in conflicting_candidates
-                    and entry.relation_type is not MemoryRelationType.UNRELATED else entry
-                    for entry in relation_entries
-                ]
-
-            operation = "reduce_relation_ledger"
-            operations = reduce_relation_ledger(
-                new_extractions=new_extractions,
-                existing_memories=existing_memories,
-                relations=relation_entries,
-                support_audits=support_audits,
-                revision_proofs=proofs,
-            )
-            return _return_result(operations, metrics=metrics(), include_metadata=include_metadata, work_ids=assessed.work_ids)
-        except ReconciliationContractError as error:
-            logger.warning("Relation-first reconciliation failed closed: %s", error)
-            return _return_result(
-                [],
-                failure=ReconciliationFailure(
-                    error_type="relation_first_error",
-                    reason_code=error.reason_code,
-                    error=str(error),
-                    operation=operation,
-                    terminal_category=getattr(error, "terminal_category", None),
-                    error_code=getattr(error, "error_code", None),
-                    validation_fields=getattr(error, "validation_fields", ()),
-                    diagnostic=getattr(error, "diagnostic", None),
-                ),
-                metrics=metrics(),
-                include_metadata=include_metadata,
-            )
-        except (StructuredLlmError, MemoryPairClassificationError, KeyError, ValueError) as error:
-            logger.warning("Relation-first reconciliation failed closed: %s", error)
-            return _return_result(
-                [],
-                failure=ReconciliationFailure(
-                    error_type="relation_first_error",
-                    reason_code="relation_first_failed",
-                    error=str(error),
-                    operation=operation,
-                    terminal_category=getattr(error, "terminal_category", None),
-                    error_code=getattr(error, "error_code", None),
-                    validation_fields=getattr(error, "validation_fields", ()),
-                    diagnostic=getattr(error, "diagnostic", None),
-                ),
-                metrics=metrics(),
-                include_metadata=include_metadata,
-            )
-        except Exception as error:  # pragma: no cover - defensive provider boundary
-            logger.exception("Unexpected relation-first reconciliation failure")
-            return _return_result(
-                [],
-                failure=ReconciliationFailure(
-                    error_type="unexpected_error",
-                    reason_code="unexpected_reconciliation_failure",
-                    error=str(error),
-                    operation=operation,
-                    terminal_category=getattr(error, "terminal_category", None),
-                    error_code=getattr(error, "error_code", None),
-                ),
-                metrics=metrics(),
-                include_metadata=include_metadata,
-            )
-
-
-def reduce_relation_ledger(
-    *,
-    new_extractions: list[RawMemory],
-    existing_memories: list[Memory],
-    relations: list[RelationLedgerEntry],
-    support_audits: list[SupportAuditEntry],
-    revision_proofs: list[RevisionCompositionProof] | None = None,
-) -> list[ReconcileOperation]:
-    """Reduce explicit relationships and complete Support; omitted edges propose no action.
-
-    Program code alone combines relations with Support. An unsupported incumbent
-    whose knowledge an admitted candidate states again, or preserves while
-    refining it, cannot lose its Support: the two judgments conflict, so the pair
-    stays unresolved locally.
-    """
-
-    incumbent_ids = {memory.id for memory in existing_memories}
-    candidate_indices = set(range(len(new_extractions)))
-    actual_pairs = {(entry.candidate_index, entry.incumbent_id) for entry in relations}
-    if (len(actual_pairs) != len(relations)
-            or any(index not in candidate_indices or old_id not in incumbent_ids for index, old_id in actual_pairs)):
-        raise ReconciliationContractError(
-            "relation_ledger_incomplete",
-            "relation ledger contains duplicate or unknown candidate/incumbent references",
-        )
-    audits_by_id = {entry.incumbent_id: entry for entry in support_audits}
-    if len(audits_by_id) != len(support_audits) or set(audits_by_id) != incumbent_ids:
-        raise ReconciliationContractError(
-            "support_ledger_incomplete",
-            "support audit does not cover every incumbent exactly once",
-        )
-    proofs = revision_proofs or []
-    proofs_by_pair = {(proof.candidate_index, proof.incumbent_id): proof for proof in proofs}
-    if len(proofs_by_pair) != len(proofs):
-        raise ReconciliationContractError(
-            "duplicate_revision_proof",
-            "duplicate revision composition proof",
-        )
-
-    by_incumbent: dict[str, list[RelationLedgerEntry]] = {memory_id: [] for memory_id in incumbent_ids}
-    for entry in relations:
-        by_incumbent[entry.incumbent_id].append(entry)
-
-    skipped_candidates, skipped_incumbents = _unresolved_component(
-        relations, _support_conflicting_pairs(relations, support_audits, proofs),
-    )
-    consumed_candidates: set[int] = set(skipped_candidates)
-    incumbent_operations: list[ReconcileOperation] = []
-    for incumbent in existing_memories:
-        if incumbent.id in skipped_incumbents:
-            incumbent_operations.append(ReconcileOperation(
-                action=ReconcileAction.NOOP, memory_id=incumbent.id,
-                reason="Unresolved claim relationship; preserve existing Support and Evidence",
-                support_revalidation_skipped=True,
+    entries = []
+    proofs = []
+    for index, incumbent_id, decision in assessed.decisions:
+        relation = decision.relation
+        if decision.status == "insufficient":
+            entries.append(RelationLedgerEntry(
+                candidate_index=index, incumbent_id=incumbent_id, relation_type=None,
+                direction=RelationDirection.SYMMETRIC, reason=decision.reason,
             ))
             continue
-        audit = audits_by_id[incumbent.id]
-        entries = by_incumbent[incumbent.id]
-        equivalents = [entry for entry in entries if entry.relation_type is MemoryRelationType.EQUIVALENT]
-        contradictions = [entry for entry in entries if entry.relation_type is MemoryRelationType.CONTRADICTS]
-        refiners = [
-            entry
-            for entry in entries
-            if entry.relation_type is MemoryRelationType.REFINES
-            and entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
-        ]
-        related = [entry for entry in entries if entry.relation_type is not MemoryRelationType.UNRELATED]
-
-        if len(contradictions) == 1 and len(related) == 1:
-            challenger = contradictions[0]
-            consumed_candidates.add(challenger.candidate_index)
-            incumbent_operations.append(
-                ReconcileOperation(
-                    action=ReconcileAction.SUPERSEDE,
-                    memory_id=incumbent.id,
-                    memory=new_extractions[challenger.candidate_index],
-                    reason=challenger.reason or audit.reason or "current claim contradicts incumbent",
-                    flag_for_review=audit.supported,
-                )
-            )
-            continue
-
-        if audit.supported and len(refiners) == 1:
-            refiner = refiners[0]
-            proof = proofs_by_pair.get((refiner.candidate_index, incumbent.id))
-            if proof is not None and proof.eligible:
-                consumed_candidates.update(entry.candidate_index for entry in equivalents)
-                consumed_candidates.add(refiner.candidate_index)
-                incumbent_operations.append(
-                    ReconcileOperation(
-                        action=ReconcileAction.UPDATE,
-                        memory_id=incumbent.id,
-                        memory=new_extractions[refiner.candidate_index],
-                        reason=proof.reason or refiner.reason or "lossless additive revision",
-                    )
-                )
-                continue
-
-        if equivalents:
-            consumed_candidates.update(entry.candidate_index for entry in equivalents)
-            selected = equivalents[0]
-            incumbent_operations.append(
-                ReconcileOperation(
-                    action=ReconcileAction.NOOP,
-                    memory_id=incumbent.id,
-                    memory=new_extractions[selected.candidate_index],
-                    reason=selected.reason or audit.reason or "equivalent current claim",
-                )
-            )
-            continue
-
-        incumbent_operations.append(
-            ReconcileOperation(
-                action=ReconcileAction.NOOP if audit.supported else ReconcileAction.DELETE,
-                memory_id=incumbent.id,
-                reason=audit.reason or ("current Source Unit support retained" if audit.supported else "support removed"),
-            )
-        )
-
-    candidate_operations = [
-        ReconcileOperation(action=ReconcileAction.ADD, memory=raw, reason="independent current claim")
-        for index, raw in enumerate(new_extractions)
-        if index not in consumed_candidates
-    ]
-    return [*candidate_operations, *incumbent_operations]
+        assert relation is not None
+        entries.append(RelationLedgerEntry(
+            candidate_index=index, incumbent_id=incumbent_id,
+            relation_type=MemoryRelationType(relation.classification),
+            direction=RelationDirection(relation.direction), reason=relation.reason,
+        ))
+        assessment = decision.revision_assessment
+        if (relation.classification == "refines"
+                and relation.direction == "challenger_to_candidate"
+                and assessment is not None):
+            proofs.append(RevisionCompositionProof(
+                candidate_index=index, incumbent_id=incumbent_id,
+                same_memory_identity=assessment.same_knowledge_item,
+                preserves_incumbent_truth=assessment.preserves_incumbent_truth,
+                candidate_is_canonical_composite=assessment.challenger_is_complete_current_claim,
+                reason=decision.reason,
+            ))
+    metrics = ReconciliationMetrics(
+        relation_pair_count=pair_count, relation_prompt_chars=assessed.prompt_chars, revision_proof_count=len(proofs),
+    )
+    return RelationLine(
+        entries=tuple(entries), proofs=tuple(proofs), work_ids=assessed.work_ids,
+        metrics=_add_calls(metrics, line, started),
+        completed_candidate_count=assessed.completed_candidate_count, incumbent_ids=incumbent_ids,
+    )
 
 
-def _support_conflicting_pairs(
-    relations: list[RelationLedgerEntry],
-    audits: list[SupportAuditEntry],
-    proofs: list[RevisionCompositionProof],
-) -> set[tuple[int, str]]:
-    """Pairs whose admitted candidate states or preserves the truth of an incumbent Support rejected.
+async def join_support_and_relation(
+    relation: RelationLine,
+    *,
+    new_extractions: Sequence[RawMemory],
+    existing_memories: Sequence[Memory],
+    supports: Mapping[str, MemorySupport],
+    structured_llm_client,
+    llm_model: str,
+    recheck: RecheckSupports | None = None,
+    rechecked_pairs: frozenset[tuple[int, str]] = frozenset(),
+) -> ReconciliationResult:
+    """Run SupportRelationCoordinator over both finished lines of a complete Relation ledger.
 
-    An equivalent candidate, or a refinement whose proof preserves the incumbent's
-    truth, says the current revision still holds that knowledge while Support
-    found it unsupported.
+    Each conflicting claim's single re-check runs first; a re-check execution
+    failure raises like any Support failure. Several refinements of one kept old
+    Memory are then compared pairwise, because only one of them may revise it.
+    Without ``recheck`` the re-checks are reported and the claims keep their results.
+    The result carries the final Memory-level Support results the table used.
     """
-
-    unsupported = {entry.incumbent_id for entry in audits if not entry.supported}
-    preserving = {(proof.candidate_index, proof.incumbent_id) for proof in proofs if proof.preserves_incumbent_truth}
-    return {
-        (entry.candidate_index, entry.incumbent_id)
-        for entry in relations
-        if entry.incumbent_id in unsupported
-        and (
-            entry.relation_type is MemoryRelationType.EQUIVALENT
-            or (
-                entry.relation_type is MemoryRelationType.REFINES
-                and entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
-                and (entry.candidate_index, entry.incumbent_id) in preserving
-            )
-        )
+    if relation.failure is not None:
+        raise ValueError("SupportRelationCoordinator joins only a complete Relation ledger")
+    ledger = {
+        "candidates": new_extractions,
+        "incumbents": existing_memories,
+        "proofs": relation.proofs,
+        "rechecked_pairs": rechecked_pairs,
     }
+    entries = list(relation.entries)
+    rechecks = plan_rechecks(relations=entries, supports=supports, **ledger)
+    if rechecks and recheck is not None:
+        supports = {**supports, **await recheck(rechecks)}
+    # Re-check calls count on the Support line; the join's own time starts here.
+    started = perf_counter()
+    metrics = relation.metrics
+    transient_candidates = tuple(_transient_candidate(index, raw) for index, raw in enumerate(new_extractions))
+    conditional_pairs = tuple(
+        MemoryPair(challenger=transient_candidates[left], candidate=transient_candidates[right])
+        for indices in supported_refiners(relations=entries, supports=supports, **ledger).values()
+        if len(indices) > 1
+        for offset, left in enumerate(indices)
+        for right in indices[offset + 1 :]
+    )
+    operation = "classify_memory_relations"
+    coordination: Coordination | None = None
+    failure: ReconciliationFailure | None = None
+    with structured_llm_line_scope() as line:
+        try:
+            if conditional_pairs:
+                classifier = StructuredMemoryPairClassifier(client=structured_llm_client, model=llm_model)
+                conditional = await classifier.classify(conditional_pairs)
+                metrics = replace(
+                    metrics,
+                    relation_pair_count=metrics.relation_pair_count + len(conditional_pairs),
+                    relation_prompt_chars=metrics.relation_prompt_chars + conditional.prompt_chars,
+                )
+                entries = _without_conflicting_refinements(entries, conditional.decisions, transient_candidates)
+            operation = "coordinate_support_and_relation"
+            coordination = coordinate(relations=entries, supports=supports, **ledger)
+        except Exception as error:  # noqa: BLE001 - classified by _failure
+            failure = _failure(error, operation)
+    return ReconciliationResult(
+        operations=list(coordination.operations) if coordination is not None else [],
+        failure=failure,
+        metrics=_add_calls(metrics, line, started),
+        work_ids=relation.work_ids,
+        rechecks=rechecks,
+        unresolved_candidate_count=coordination.unresolved_candidate_count if coordination is not None else 0,
+        supports=supports,
+    )
 
 
-def _unresolved_component(
-    relations: list[RelationLedgerEntry], conflicting_pairs: set[tuple[int, str]],
-) -> tuple[set[int], set[str]]:
-    """Keep uncertainty local without letting a shared candidate escape as ADD.
+def _without_conflicting_refinements(
+    entries: list[RelationLedgerEntry], decisions, transient_candidates: tuple[Memory, ...],
+) -> list[RelationLedgerEntry]:
+    """Refinements of one old Memory that contradict each other leave their edges uncertain."""
+    conflicting_ids = {
+        memory_id for decision in decisions
+        if decision.relation_type is MemoryRelationType.CONTRADICTS
+        for memory_id in decision.pair.key
+    }
+    conflicting_candidates = {index for index, candidate in enumerate(transient_candidates)
+                              if candidate.id in conflicting_ids}
+    return [
+        replace(entry, relation_type=None, reason="Current refinement candidates conflict")
+        if entry.candidate_index in conflicting_candidates
+        and entry.relation_type is not MemoryRelationType.UNRELATED else entry
+        for entry in entries
+    ]
 
-    Unresolved pairs and pairs whose relation conflicts with Support seed the
-    component. A candidate can touch more than one incumbent. Preserve the related
-    component together; unrelated pairs never spread uncertainty to independent knowledge.
+
+def _add_calls(
+    metrics: ReconciliationMetrics, line: StructuredLlmMetricsCollector, started: float,
+) -> ReconciliationMetrics:
+    """Add one line's own model calls and elapsed time."""
+    summary = line.summary(source_unit_elapsed_ms=0)
+    return replace(
+        metrics,
+        structured_llm_calls=metrics.structured_llm_calls + summary.logical_calls,
+        model_batch_count=metrics.model_batch_count + summary.logical_calls,
+        structured_llm_elapsed_ms=metrics.structured_llm_elapsed_ms + summary.llm_elapsed_ms,
+        reconciliation_elapsed_ms=metrics.reconciliation_elapsed_ms + _elapsed_ms(started),
+    )
+
+
+async def reconcile_memories(
+    new_extractions: list[RawMemory],
+    existing_memories: list[Memory],
+    structured_llm_client,
+    llm_model: str,
+    *,
+    supports: Mapping[str, MemorySupport],
+    recheck: RecheckSupports | None = None,
+    images: tuple = (),
+    image_loader=None,
+    work_store: DerivationWorkStore | None = None,
+    derivation_id: str | None = None,
+    operation_input_hash: str | None = None,
+) -> ReconciliationResult:
+    """Run the Relation line against Support results that are already known, then join them.
+
+    Production runs the two lines concurrently; this sequential form serves
+    callers whose Support results are pinned, such as offline replay.
     """
-    seeds = {(entry.candidate_index, entry.incumbent_id) for entry in relations if entry.relation_type is None}
-    seeds |= conflicting_pairs
-    candidates = {candidate_index for candidate_index, _ in seeds}
-    incumbents = {incumbent_id for _, incumbent_id in seeds}
-    while True:
-        size = len(candidates) + len(incumbents)
-        for entry in relations:
-            if entry.relation_type is not MemoryRelationType.UNRELATED and (
-                entry.candidate_index in candidates or entry.incumbent_id in incumbents
-            ):
-                candidates.add(entry.candidate_index)
-                incumbents.add(entry.incumbent_id)
-        if len(candidates) + len(incumbents) == size:
-            return candidates, incumbents
+    relation = await assess_relations(
+        new_extractions, existing_memories, structured_llm_client=structured_llm_client, llm_model=llm_model,
+        images=images, image_loader=image_loader, work_store=work_store, derivation_id=derivation_id,
+        operation_input_hash=operation_input_hash,
+    )
+    if relation.failure is not None:
+        return ReconciliationResult(operations=[], failure=relation.failure, metrics=relation.metrics)
+    return await join_support_and_relation(
+        relation, new_extractions=new_extractions, existing_memories=existing_memories, supports=supports,
+        structured_llm_client=structured_llm_client, llm_model=llm_model, recheck=recheck,
+    )
+
+
+def _failure(error: Exception, operation: str) -> ReconciliationFailure:
+    """Fail closed: the revision is not committed and no Candidate falls back to ADD."""
+    if isinstance(error, ReconciliationContractError):
+        logger.warning("Relation-first reconciliation failed closed: %s", error)
+        error_type, reason_code = "relation_first_error", error.reason_code
+    elif isinstance(error, (StructuredLlmError, MemoryPairClassificationError, KeyError, ValueError)):
+        logger.warning("Relation-first reconciliation failed closed: %s", error)
+        error_type, reason_code = "relation_first_error", "relation_first_failed"
+    else:
+        logger.exception("Unexpected relation-first reconciliation failure")
+        error_type, reason_code = "unexpected_error", "unexpected_reconciliation_failure"
+    return ReconciliationFailure(
+        error_type=error_type,
+        reason_code=reason_code,
+        error=str(error),
+        operation=operation,
+        terminal_category=getattr(error, "terminal_category", None),
+        error_code=getattr(error, "error_code", None),
+        validation_fields=getattr(error, "validation_fields", ()),
+        diagnostic=getattr(error, "diagnostic", None),
+    )
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, round((perf_counter() - started) * 1000))
 
 
 def _transient_candidate(index: int, raw: RawMemory) -> Memory:
@@ -510,65 +373,3 @@ def _transient_candidate(index: int, raw: RawMemory) -> Memory:
         valid_from=parse_memory_validity_date(raw.valid_from),
         valid_until=parse_memory_validity_date(raw.valid_until),
     )
-
-
-def _bind_relation_entries(
-    decisions: tuple[MemoryPairDecision, ...],
-    *,
-    candidate_count: int,
-    incumbents: list[Memory],
-) -> list[RelationLedgerEntry]:
-    incumbent_ids = {memory.id for memory in incumbents}
-    entries: list[RelationLedgerEntry] = []
-    for decision in decisions:
-        challenger_id = decision.pair.challenger.id
-        if not challenger_id.startswith("candidate:"):
-            raise ReconciliationContractError(
-                "relation_response_unknown_challenger",
-                "relation classifier returned an unknown challenger",
-            )
-        candidate_index = int(challenger_id.split(":", 1)[1])
-        if not 0 <= candidate_index < candidate_count or decision.pair.candidate.id not in incumbent_ids:
-            raise ReconciliationContractError(
-                "relation_response_out_of_scope",
-                "relation classifier returned an out-of-scope pair",
-            )
-        entries.append(
-            RelationLedgerEntry(
-                candidate_index=candidate_index,
-                incumbent_id=decision.pair.candidate.id,
-                relation_type=decision.relation_type,
-                direction=decision.direction,
-                reason=decision.reason,
-            )
-        )
-    return entries
-
-
-def _supported_revision_candidates(
-    relations: list[RelationLedgerEntry],
-    audits: list[SupportAuditEntry],
-) -> dict[str, tuple[int, ...]]:
-    supported = {entry.incumbent_id for entry in audits if entry.supported}
-    grouped: dict[str, list[int]] = {}
-    for entry in relations:
-        if (
-            entry.incumbent_id in supported
-            and entry.relation_type is MemoryRelationType.REFINES
-            and entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
-        ):
-            grouped.setdefault(entry.incumbent_id, []).append(entry.candidate_index)
-    return {memory_id: tuple(sorted(indices)) for memory_id, indices in grouped.items()}
-
-
-def _return_result(
-    operations: list[ReconcileOperation],
-    *,
-    failure: ReconciliationFailure | None = None,
-    metrics: ReconciliationMetrics,
-    include_metadata: bool,
-    work_ids: tuple[str, ...] = (),
-) -> list[ReconcileOperation] | ReconciliationResult:
-    if include_metadata:
-        return ReconciliationResult(operations=operations, failure=failure, metrics=metrics, work_ids=work_ids)
-    return operations
