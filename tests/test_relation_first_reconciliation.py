@@ -45,7 +45,7 @@ from memforge.pipeline.support_relation_coordinator import (
 from tests.revision_client_fixture import pinned
 
 
-def reduce_relation_ledger(*, new_extractions, existing_memories, relations, supports, revision_proofs=()):
+def coordinated_operations(*, new_extractions, existing_memories, relations, supports, revision_proofs=()):
     """Final coordinator operations for completed Support reads."""
     return list(coordinate(
         candidates=new_extractions, incumbents=existing_memories, relations=relations,
@@ -328,7 +328,7 @@ def test_refinement_without_revision_proof_falls_back_to_keep_and_add() -> None:
         evidence_anchor="projection_batch",
     )
 
-    operations = reduce_relation_ledger(
+    operations = coordinated_operations(
         new_extractions=[narrower],
         existing_memories=[incumbent],
         relations=[
@@ -379,7 +379,7 @@ def test_relation_support_matrix(
         source_observation_id="obs-db",
         evidence_anchor="projection_batch",
     )
-    operations = reduce_relation_ledger(
+    operations = coordinated_operations(
         new_extractions=[candidate],
         existing_memories=[incumbent],
         relations=[
@@ -407,7 +407,7 @@ def test_multiple_contradiction_candidates_never_guess_a_successor(supported: bo
         RawMemory(content="The analytics database uses ClickHouse.", memory_type="fact"),
     ]
 
-    operations = reduce_relation_ledger(
+    operations = coordinated_operations(
         new_extractions=candidates,
         existing_memories=[incumbent],
         relations=[
@@ -443,7 +443,7 @@ def test_an_unsupported_equivalent_is_held_in_a_rebind_review() -> None:
     equivalent = RawMemory(content="Client timeout: 30 seconds.", memory_type="fact")
     refinement = RawMemory(content="Upload timeout is 30 seconds.", memory_type="fact")
 
-    operations = reduce_relation_ledger(
+    operations = coordinated_operations(
         new_extractions=[equivalent, refinement],
         existing_memories=[incumbent],
         relations=[
@@ -477,7 +477,7 @@ def test_equivalent_candidate_rebinds_each_supported_incumbent() -> None:
     second = _memory("mem-second", "Retry delays increase exponentially.")
     candidate = RawMemory(content="Retries back off exponentially.", memory_type="fact")
 
-    operations = reduce_relation_ledger(
+    operations = coordinated_operations(
         new_extractions=[candidate],
         existing_memories=[first, second],
         relations=[
@@ -522,7 +522,7 @@ def test_runbook_candidate_with_multiple_incumbents_falls_back_to_keep_and_add()
         memory_type="procedure",
     )
 
-    operations = reduce_relation_ledger(
+    operations = coordinated_operations(
         new_extractions=[current_procedure],
         existing_memories=incumbents,
         relations=[
@@ -614,7 +614,7 @@ def test_unresolved_pair_preserves_related_component_and_allows_independent_work
              (1, "mem-1"): MemoryRelationType.CONTRADICTS}
     relations = [replace(r, relation_type=types.get((r.candidate_index, r.incumbent_id), r.relation_type))
                  for r in relations]
-    operations = reduce_relation_ledger(
+    operations = coordinated_operations(
         new_extractions=candidates, existing_memories=old, relations=relations,
         supports=dict([pinned(m.id, False) for m in old]),
     )

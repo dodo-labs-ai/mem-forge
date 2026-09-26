@@ -54,6 +54,7 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.candidate_admission import CandidateAdmissionError
+from memforge.memory.destructive_validation import KeptReason
 from memforge.memory.engine import (
     DeferredProjectedLifecycleHandle,
     MemoryEngine,
@@ -9857,6 +9858,66 @@ async def test_reprocess_at_the_current_revision_reads_every_support_over_the_wh
     rebound = await active_support_evidence(db, incumbent.id, source_id="src-1")
     assert {part.validation_unit_revision_id for part in rebound} == {second.source_unit_revisions[0].id}
     assert (await db.get_memory(incumbent.id)).status == "active"
+
+
+class _CorrectingReprocessClient(_WholeUnitReadingClient):
+    """A later reading of the same revision no longer supports the old claim and relates its correction."""
+
+    supported = True
+
+    async def judge_support(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return _audit_response(SupportJudgment(
+            supported=self.supported, reason="The page states the claim." if self.supported else "Another issue.",
+        ))
+
+    async def classify_memory_relations(self, prompt: str, **kwargs):
+        del kwargs
+        return _uniform_relation_response(prompt, classification="contradicts", reason="The Candidate names PAY-1.")
+
+
+@pytest.mark.asyncio
+async def test_a_reprocess_that_no_longer_supports_a_claim_supersedes_it_with_the_contradicting_candidate(db):
+    claim = "PAY-9 requires approval."
+    body = f"{claim}\n\nThe team reviewed dashboards."
+    first = _projection(run_id="correct-v1", body=body)
+    incumbent, client, advance = await _exact_support_engine(
+        db, claim=claim, first=first, memory_id="mem-wrong-key", client_type=_CorrectingReprocessClient,
+    )
+    second_body = f"{body}\n\nEdition 2."
+    second = _projection(
+        run_id="correct-v2", body=second_body, prior=first.source_unit_revisions[0],
+        prior_observations={r.observation_id: r for r in first.observation_revisions},
+    )
+    await advance(second, second_body, 2)
+
+    client.supported = False
+    again = _projection(
+        run_id="correct-again", body=second_body, prior=second.source_unit_revisions[0],
+        prior_observations={r.observation_id: r for r in second.observation_revisions},
+    )
+    context = RevisionAssessmentContext(
+        projection=again, base=second,
+        access_context_hash=lifecycle_access_context_hash(
+            visibility="workspace", owner_user_id=None, project_key="ENG", repo_identifier=None,
+        ),
+    )
+    catalog = context.catalog(context.full_fragments)
+    ref = next(fragment.reference for fragment in catalog.fragments if fragment.presentation_text == claim)
+    correction = RawMemory(
+        content="PAY-1 requires approval.", memory_type="decision", evidence_quote=claim,
+        source_observation_id=_body_observation(again).id,
+        resolved_evidence_selection=catalog.resolve_selection(primary_ref=ref),
+    )
+    stats = await advance(again, second_body, 3, [correction], derivation_support_without_baseline=True)
+
+    # The whole-Unit read is a complete read, so DestructiveValidation lets the supersession through.
+    assert all(stats[f"destructive_validation_kept_{reason.value}_count"] == 0 for reason in KeptReason)
+    assert stats["superseded"] == 1
+    old = await db.get_memory(incumbent.id)
+    assert old is not None and old.status == "superseded"
+    replacement = await db.get_memory(old.superseded_by)
+    assert replacement is not None and replacement.content == correction.content and replacement.status == "active"
 
 
 @pytest.mark.asyncio
