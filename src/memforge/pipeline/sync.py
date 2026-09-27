@@ -98,6 +98,7 @@ from memforge.source_derivation import (
     SourceUnitDeriver,
     aggregate_extraction_metrics,
     plan_source_derivation_recovery_commit,
+    safe_derivation_error,
 )
 from memforge.pipeline.extraction_contract import (
     CONTRACT_SUPERSEDED,
@@ -545,7 +546,15 @@ _MAX_RETAINED_DOCUMENT_ERROR_CHARS = 512
 
 
 class MemoryExtractionFailure(RuntimeError):
-    """Extraction exhausted its own retry policy; do not replay the document."""
+    """Extraction exhausted its own retry policy; do not replay the document.
+
+    ``error_code`` is the content-free code of the failure, when extraction
+    reported one.
+    """
+
+    def __init__(self, message: str, *, error_code: str | None = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 def _fail_deferred_commits_nothing_can_unblock(
@@ -591,15 +600,16 @@ def _retained_document_error(exc: BaseException) -> str:
 def _memory_extraction_error(
     *,
     doc_id: str,
-    error_type: str,
-    detail: str | None,
+    extraction: MemoryExtractionResult,
 ) -> MemoryExtractionFailure:
-    message = f"memory extraction failed for {doc_id}: {error_type}"
+    _error_type, error_code, _fields = safe_derivation_error(extraction)
+    message = f"memory extraction failed for {doc_id}: {extraction.error_type}"
+    detail = extraction.error or ""
     if detail and len(detail) <= _MAX_RETAINED_DOCUMENT_ERROR_CHARS:
         stripped = detail.strip()
         if stripped:
             message = f"{message}: {stripped}"
-    return MemoryExtractionFailure(message)
+    return MemoryExtractionFailure(message, error_code=error_code)
 
 
 def _source_filter_summary(gene: Gene, since: datetime | None) -> str | None:
@@ -629,6 +639,8 @@ class _SourceUnitExecutionDiagnostics:
     source_unit_id: str | None = None
     status: str = "failed"
     error_class: str | None = None
+    # The content-free code of the failure, when the failing step reported one.
+    error_code: str | None = None
 
     def bind_source_unit(self, source_unit_id: str) -> None:
         if self.source_unit_id is not None and self.source_unit_id != source_unit_id:
@@ -1971,6 +1983,14 @@ class GeneSyncOrchestrator:
         )
         if extraction.error_type:
             diagnostics.error_class = extraction.error_type
+            _error_type, diagnostics.error_code, _fields = safe_derivation_error(extraction)
+            logger.warning(
+                "Recovery of Source derivation %s for %s failed: %s: %s",
+                attempt.id,
+                context.document.doc_id,
+                diagnostics.error_class,
+                extraction.error,
+            )
             return None
         recovery_commit = plan_source_derivation_recovery_commit(
             stored_derivation_id=attempt.id,
@@ -2041,6 +2061,8 @@ class GeneSyncOrchestrator:
         except BaseException as exc:
             diagnostics.status = "failed"
             diagnostics.error_class = type(exc).__name__
+            error_code = getattr(exc, "error_code", None)
+            diagnostics.error_code = error_code if isinstance(error_code, str) else None
             raise
         finally:
             if diagnostics.source_unit_id is not None:
@@ -2054,6 +2076,7 @@ class GeneSyncOrchestrator:
                         source_unit_elapsed_ms=max(0, round((asyncio.get_running_loop().time() - started) * 1000)),
                         ok=diagnostics.status != "failed",
                         error_class=diagnostics.error_class,
+                        error_code=diagnostics.error_code,
                         status=diagnostics.status,
                     )
                 except Exception:
@@ -2852,12 +2875,7 @@ class GeneSyncOrchestrator:
 
         raw_memories = extraction_result.memories
         if extraction_result.error_type:
-            error_detail = extraction_result.error or ""
-            raise _memory_extraction_error(
-                doc_id=doc_id,
-                error_type=extraction_result.error_type,
-                detail=error_detail,
-            )
+            raise _memory_extraction_error(doc_id=doc_id, extraction=extraction_result)
         projection = with_source_artifact_summaries(
             projection,
             extraction_result.artifact_summaries,
@@ -3345,6 +3363,7 @@ class GeneSyncOrchestrator:
         source_unit_elapsed_ms: int,
         ok: bool,
         error_class: str | None,
+        error_code: str | None = None,
         status: str | None = None,
     ) -> None:
         """Emit one content-free LLM aggregate for a completed Source Unit scope."""
@@ -3362,6 +3381,7 @@ class GeneSyncOrchestrator:
             "ok": ok,
             "status": outcome,
             "error_class": error_class,
+            "error_code": error_code,
             **summary.to_payload(),
         }
         logger.info(
@@ -3393,6 +3413,7 @@ class GeneSyncOrchestrator:
             payload={
                 "source_unit_id": source_unit_id,
                 "error_class": error_class,
+                "error_code": error_code,
                 **summary.to_payload(),
             },
         )

@@ -40,6 +40,7 @@ REVIEWED_AT = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
 OPERATOR = "operator@example.test"
 REVIEWER = "reviewer@example.test"
 UPDATED = "2026-07-23T00:00:00+00:00"
+RETRY_SCHEDULED_AT = "2026-07-23T00:05:00+00:00"
 
 
 @pytest.fixture
@@ -114,6 +115,7 @@ async def _work(
     error_code: str | None = None,
     classifier_version: str | None = None,
     updated_at: str = UPDATED,
+    next_attempt_at: str | None = None,
 ) -> str:
     work_id = f"work-{memory.id}"
     await db._enqueue_relation_discovery_work_unlocked(  # noqa: SLF001
@@ -133,7 +135,7 @@ async def _work(
     await db.db.execute(
         """UPDATE relation_discovery_work
               SET status = ?, attempts = ?, error = ?, error_code = ?,
-                  classifier_version = ?, updated_at = ?
+                  classifier_version = ?, updated_at = ?, next_attempt_at = ?
             WHERE id = ?""",
         (
             status,
@@ -142,6 +144,7 @@ async def _work(
             error_code,
             classifier_version,
             updated_at,
+            next_attempt_at,
             work_id,
         ),
     )
@@ -234,7 +237,12 @@ async def _seed_work_states(db: Database) -> dict[str, str]:
             updated_at="2026-07-25T00:00:00+00:00",
         ),
         "retrying": await _work(
-            db, await _memory(db, "mem-w3"), status="failed", attempts=1, error_code="TimeoutError"
+            db,
+            await _memory(db, "mem-w3"),
+            status="failed",
+            attempts=1,
+            error_code="TimeoutError",
+            next_attempt_at=RETRY_SCHEDULED_AT,
         ),
         "completed_old": await _work(
             db,

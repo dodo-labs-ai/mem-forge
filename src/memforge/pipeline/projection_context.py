@@ -108,6 +108,24 @@ class ProjectionEvidencePlanningFailure:
     changed_structure_count: int = 0
     authorized_structure_count: int = 0
 
+    @property
+    def diagnostic(self) -> str:
+        """The failure code with its identifiers and counts; never source content."""
+
+        details = [
+            f"{name}={value}"
+            for name, value in (
+                ("observation", self.observation_id),
+                ("observation_revision", self.observation_revision_id),
+                ("representation_profile", self.representation_profile),
+            )
+            if value is not None
+        ]
+        if self.changed_structure_count or self.authorized_structure_count:
+            details.append(f"changed_structures={self.changed_structure_count}")
+            details.append(f"authorized_structures={self.authorized_structure_count}")
+        return f"{self.code.value} ({', '.join(details)})" if details else self.code.value
+
 
 @dataclass(frozen=True, slots=True)
 class CommittedSourceUnitSnapshot:
