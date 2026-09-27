@@ -17,6 +17,7 @@ from memforge.pipeline.stored_document import (
     load_stored_source_document,
 )
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
+from memforge.source_activity import SourceActivityKind
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.source_cleanup import SourceArtifactCleanupService
@@ -24,7 +25,9 @@ from tests.test_stored_input_currency import SPRINT_HISTORY, JiraProvider, autho
 from tests.test_sync_bookkeeping import (
     NoopMemoryEngine,
     ProjectionFragmentRecordingExtractor,
+    RecordingDocumentDeleteMemoryStore,
     RecordingMemoryEngine,
+    _hold_document,
     _release_document,
     _unit_input,
 )
@@ -41,15 +44,20 @@ LEGACY_STORED_INPUT_COLUMNS = {
 
 
 class ReadRecordingDocumentStore(LocalDocumentStore):
-    """A filesystem store that records which raw objects a run reads."""
+    """A filesystem store that records which raw objects a run reads and deletes."""
 
     def __init__(self, root: str) -> None:
         super().__init__(root)
         self.reads: list[str] = []
+        self.deletions: list[str] = []
 
     def read_artifact(self, uri: str) -> bytes:
         self.reads.append(uri)
         return super().read_artifact(uri)
+
+    def delete_artifact(self, uri: str) -> None:
+        self.deletions.append(uri)
+        super().delete_artifact(uri)
 
 
 @dataclass
@@ -62,7 +70,16 @@ class Workspace:
     def orchestrator(self) -> GeneSyncOrchestrator:
         return GeneSyncOrchestrator(
             db=self.db, doc_store=self.store, memory_extractor=ProjectionFragmentRecordingExtractor(),
-            memory_engine=self.engine, memory_store=None, max_concurrent=1,
+            memory_engine=self.engine, memory_store=RecordingDocumentDeleteMemoryStore(self.db), max_concurrent=1,
+        )
+
+    async def cleanup(self) -> int:
+        return await SourceArtifactCleanupService(self.db, self.store).run_pending(limit=100)
+
+    def stored(self, unit_input) -> bool:
+        return all(
+            self.store.get_artifact(uri, "application/octet-stream") is not None
+            for uri in (unit_input.raw_content_uri, unit_input.normalized_content_uri)
         )
 
     async def add_source(self, source_id: str, *, collected_locally: bool) -> None:
@@ -72,8 +89,10 @@ class Workspace:
             access_policy="workspace", owner_user_id="dev",
         )
 
-    async def sync(self, source_id: str):
-        state = await self.orchestrator().sync_gene(gene=self.provider, source_name="Jira", source_id=source_id)
+    async def sync(self, source_id: str, *, force_full_sync: bool = False):
+        state = await self.orchestrator().sync_gene(
+            gene=self.provider, source_name="Jira", source_id=source_id, force_full_sync=force_full_sync,
+        )
         assert state.last_sync_status == "success"
         return state
 
@@ -328,3 +347,134 @@ async def test_a_renamed_document_releases_the_objects_its_previous_input_named(
     assert workspace.store.get_artifact(after.raw_content_uri, after.raw_content_type) is not None
     assert workspace.store.get_artifact(before.raw_content_uri, before.raw_content_type) is None
     assert workspace.store.get_artifact(before.normalized_content_uri, "text/markdown") is None
+
+
+def _renamed(provider: JiraProvider, suffix: str):
+    discovered_item = provider._item
+
+    def renamed(issue_key):
+        item = discovered_item(issue_key)
+        item.title = f"{issue_key}: Payroll run {suffix}"
+        return item
+
+    return renamed
+
+
+@pytest.mark.asyncio
+async def test_a_document_renamed_back_before_cleanup_keeps_its_current_objects(workspace):
+    await workspace.add_source(TEAM, collected_locally=False)
+    await workspace.sync(TEAM)
+    original = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
+    discovered_item = workspace.provider._item
+    workspace.provider._item = _renamed(workspace.provider, "renamed")
+    await workspace.sync(TEAM)
+    renamed = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
+    workspace.provider._item = discovered_item
+    # The original keys are written again and named by the current input
+    # while their release from the rename is still queued.
+    await workspace.sync(TEAM)
+
+    await workspace.cleanup()
+
+    current = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
+    assert current.raw_content_uri == original.raw_content_uri
+    assert workspace.stored(current)
+    assert not workspace.store.get_artifact(renamed.raw_content_uri, renamed.raw_content_type)
+    assert await workspace.db.list_source_artifact_cleanup_tasks(limit=10) == []
+
+
+@pytest.mark.asyncio
+async def test_a_removed_document_that_returns_before_cleanup_keeps_its_objects(workspace):
+    await workspace.add_source(TEAM, collected_locally=False)
+    await workspace.sync(TEAM)
+    workspace.provider.removed.add(ISSUE)
+    await workspace.sync(TEAM, force_full_sync=True)
+    assert await _unit_input(workspace.db, TEAM, doc_id(ISSUE)) is None
+    assert await workspace.db.list_source_artifact_cleanup_tasks(limit=10)
+    workspace.provider.removed.clear()
+    await workspace.sync(TEAM)
+
+    await workspace.cleanup()
+
+    returned = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
+    assert workspace.stored(returned)
+    assert workspace.store.deletions == []
+
+
+@pytest.mark.asyncio
+async def test_cleanup_waits_while_the_source_has_an_active_activity(workspace):
+    await overlapping(workspace, collected_locally=False)
+    release = await _unit_input(workspace.db, RELEASE, doc_id(ISSUE))
+    await _release_document(workspace.db, source_id=RELEASE, source_type="jira", doc_id=doc_id(ISSUE))
+    await workspace.db.delete_projected_document(doc_id(ISSUE), source_id=RELEASE)
+    await workspace.db.acquire_source_activity(
+        activity_id="sync-in-progress", source_id=RELEASE, kind=SourceActivityKind.SYNC,
+    )
+
+    assert await workspace.cleanup() == 0
+    assert workspace.stored(release)
+
+    await workspace.db.release_source_activity(activity_id="sync-in-progress")
+    await workspace.cleanup()
+    assert not workspace.store.get_artifact(release.raw_content_uri, release.raw_content_type)
+
+
+@pytest.mark.asyncio
+async def test_released_inputs_sharing_an_object_delete_it_once(workspace):
+    await workspace.add_source(TEAM, collected_locally=False)
+    shared = workspace.store.store_raw(
+        source_id=TEAM, doc_id=doc_id(ISSUE), title="Shared", content=b"{}", content_type="application/json",
+    )
+    held = await _hold_document(
+        workspace.db, source_id=TEAM, source_type="jira", doc_id=doc_id(ISSUE), title=f"{ISSUE}: Payroll run",
+        markdown="# Payroll run", version="1", source_url="https://jira.example/browse/PAY-1",
+        space_or_project="PAY", raw_content_uri=shared, item_extra={"issue_id": "400001", "issue_key": ISSUE},
+    )
+    # A second Unit of the Source that once held the Document through the same object.
+    await workspace.db.db.execute(
+        """INSERT INTO source_units (id, source_id, unit_type, provider_key, locator_json, current_revision_id, updated_at)
+           VALUES ('unit-previous', ?, 'jira_issue', 'issue:previous', '{}', 'revision-previous', ?)""",
+        (TEAM, "2026-09-27T00:00:00+00:00"),
+    )
+    await workspace.db.db.execute(
+        """INSERT INTO source_unit_inputs (source_unit_id, source_id, document_id, unit_revision_id, item_json,
+               raw_content_uri, raw_content_type, recorded_at)
+           SELECT 'unit-previous', source_id, document_id, 'revision-previous', item_json,
+               raw_content_uri, raw_content_type, recorded_at
+             FROM source_unit_inputs WHERE source_unit_id = ?""",
+        (held.source_unit_id,),
+    )
+    await workspace.db.db.commit()
+    await _release_document(workspace.db, source_id=TEAM, source_type="jira", doc_id=doc_id(ISSUE))
+
+    await workspace.db.delete_projected_document(doc_id(ISSUE), source_id=TEAM)
+    await workspace.cleanup()
+
+    assert workspace.store.deletions == [shared]
+    assert not workspace.store.get_artifact(shared, "application/json")
+    assert await workspace.db.list_source_artifact_cleanup_tasks(limit=10) == []
+
+
+@pytest.mark.asyncio
+async def test_a_document_link_falls_back_to_the_next_copy_when_the_newest_is_missing(workspace, tmp_path):
+    await overlapping(workspace, collected_locally=False)
+    team = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
+    release = await _unit_input(workspace.db, RELEASE, doc_id(ISSUE))
+    newest = await workspace.db.list_document_source_unit_inputs(doc_id(ISSUE))
+    assert newest[0].source_unit_id == release.source_unit_id
+    workspace.store.delete_artifact(release.raw_content_uri)
+    config = AppConfig(base_dir=tmp_path / "mem")
+    config.server.jwt_secret = "test-secret"
+    config.sync.scheduler_enabled = False
+    config.sync.worker_enabled = False
+    from memforge.server.admin_api import create_admin_app
+
+    app = create_admin_app(db=workspace.db, config=config, document_store=workspace.store)
+    with TestClient(app) as client:
+        document_raw = client.get(f"/api/v1/documents/{doc_id(ISSUE)}/artifacts/raw_source")
+        document_content = client.get(f"/api/v1/documents/{doc_id(ISSUE)}/content")
+
+    assert [history["id"] for history in document_raw.json()["changelog"]["histories"]] == ["9001"]
+    assert workspace.stored_histories(team.raw_content_uri) == ["9001"]
+    # The release copy's normalized markdown is still stored, so content keeps the newest copy.
+    assert document_content.text == workspace.store.read_artifact(release.normalized_content_uri).decode("utf-8")

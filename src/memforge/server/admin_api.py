@@ -4184,16 +4184,34 @@ def create_admin_app(
     # 1b. Source Document Artifacts
     # ===================================================================
 
-    async def _readable_document_input(request: Request, db: Database, doc_id: str) -> SourceUnitInput:
-        """The newest stored copy of the Document among the Sources the caller can read."""
+    async def _readable_document_inputs(request: Request, db: Database, doc_id: str) -> list[SourceUnitInput]:
+        """The stored copies of the Document from Sources the caller can read, most recently recorded first."""
         if await db.get_document(doc_id) is None:
             raise HTTPException(status_code=404, detail="Document not found")
         principal = resolve_request_principal(request)
+        readable: list[SourceUnitInput] = []
         for unit_input in await db.list_document_source_unit_inputs(doc_id):
             source = await db.get_source(unit_input.source_id)
             if source is not None and source_is_discoverable(source, viewer_id=principal):
+                readable.append(unit_input)
+        return readable
+
+    async def _document_artifact_input(
+        request: Request,
+        db: Database,
+        doc_id: str,
+        kind: str,
+        artifact_store: DocumentArtifactStore,
+        *,
+        missing_detail: str,
+    ) -> SourceUnitInput:
+        """The most recently recorded readable copy whose object of this kind is still stored."""
+        for unit_input in await _readable_document_inputs(request, db, doc_id):
+            if select_stored_input_artifact(
+                unit_input, kind, config, artifact_store, resource_path=document_resource_path(doc_id),
+            ) is not None:
                 return unit_input
-        raise HTTPException(status_code=404, detail="Document artifact not found")
+        raise HTTPException(status_code=404, detail=missing_detail)
 
     async def _readable_source_unit_input(request: Request, db: Database, source_unit_id: str) -> SourceUnitInput:
         """The stored input of the Unit's current revision, when the caller can read its Source."""
@@ -4254,8 +4272,19 @@ def create_admin_app(
         db: Database = Depends(get_db),
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
-        """List service-readable artifacts of the newest stored copy of a Document."""
-        unit_input = await _readable_document_input(request, db, doc_id)
+        """List service-readable artifacts of the newest readable copy of a Document that still has any."""
+        resource_path = document_resource_path(doc_id)
+        readable = await _readable_document_inputs(request, db, doc_id)
+        if not readable:
+            raise HTTPException(status_code=404, detail="Document artifact not found")
+        unit_input = next(
+            (
+                candidate
+                for candidate in readable
+                if list_stored_input_artifacts(candidate, config, artifact_store, resource_path=resource_path)
+            ),
+            readable[0],
+        )
         return _artifact_manifest(
             unit_input,
             await db.get_document(doc_id),
@@ -4271,8 +4300,10 @@ def create_admin_app(
         db: Database = Depends(get_db),
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
-        """Serve an explicit artifact kind of the newest stored copy of a Document."""
-        unit_input = await _readable_document_input(request, db, doc_id)
+        """Serve an explicit artifact kind of the newest stored copy of a Document that has it."""
+        unit_input = await _document_artifact_input(
+            request, db, doc_id, kind, artifact_store, missing_detail="Document artifact not found",
+        )
         return _stored_input_artifact_response(
             request, unit_input, kind,
             resource_path=document_resource_path(doc_id),
@@ -4333,7 +4364,9 @@ def create_admin_app(
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         """Serve normalized source content through the API for Docker/SaaS clients."""
-        unit_input = await _readable_document_input(request, db, doc_id)
+        unit_input = await _document_artifact_input(
+            request, db, doc_id, "content", artifact_store, missing_detail="Document content artifact not found",
+        )
         return _stored_input_artifact_response(
             request, unit_input, "content",
             resource_path=document_resource_path(doc_id),
@@ -4349,7 +4382,9 @@ def create_admin_app(
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         """Serve a stored source PDF through the API for Docker/SaaS clients."""
-        unit_input = await _readable_document_input(request, db, doc_id)
+        unit_input = await _document_artifact_input(
+            request, db, doc_id, "pdf", artifact_store, missing_detail="Document PDF artifact not found",
+        )
         return _stored_input_artifact_response(
             request, unit_input, "pdf",
             resource_path=document_resource_path(doc_id),

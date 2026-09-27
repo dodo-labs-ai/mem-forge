@@ -1082,9 +1082,10 @@ async def test_delete_source_uses_injected_document_store(
         raw_content_uri=None,
         normalized_content_uri="mem://doc.md",
     )
+    # An object the Source released earlier; no stored input names it.
     await db.enqueue_source_artifact_cleanup_task(
         source_id="src-confluence",
-        artifact_uri="mem://doc.md",
+        artifact_uri="mem://released.md",
     )
 
     store = RecordingDocumentStore()
@@ -1093,7 +1094,7 @@ async def test_delete_source_uses_injected_document_store(
         response = client.delete("/api/v1/sources/src-confluence")
 
     assert response.status_code == 200, response.text
-    assert store.deleted == ["mem://doc.md"]
+    assert store.deleted == ["mem://released.md"]
 
 
 @pytest.mark.asyncio
@@ -1169,7 +1170,7 @@ async def test_delete_source_succeeds_and_retains_cleanup_task_when_artifact_del
     )
     await db.enqueue_source_artifact_cleanup_task(
         source_id="src-cleanup-failure",
-        artifact_uri="object-store://workspace/documents/src-cleanup-failure/page.md",
+        artifact_uri="object-store://workspace/documents/src-cleanup-failure/released-page.md",
     )
 
     app = create_admin_app(

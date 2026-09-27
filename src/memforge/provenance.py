@@ -5,8 +5,9 @@ input of its Source Unit (:class:`memforge.models.SourceUnitInput`). A Unit
 link (``/api/v1/source-units/{source_unit_id}/...``) serves the copy stored
 with that Unit's current revision; Memory Evidence names the Unit that supports
 the Memory, so its links read that Source's copy. A Document link
-(``/api/v1/documents/{doc_id}/...``) serves the copy of a Source that holds the
-Document and that the caller can read, the most recently stored first.
+(``/api/v1/documents/{doc_id}/...``) serves, among the Sources that hold the
+Document and that the caller can read, the most recently recorded copy whose
+requested object is still stored.
 """
 
 from __future__ import annotations
