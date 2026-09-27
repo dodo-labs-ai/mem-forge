@@ -127,6 +127,7 @@ from memforge.models import (
     Project,
     ReviewKind,
     SourceSyncInput,
+    SourceUnitInput,
     SourceExecutionKind,
     UNSORTED_PROJECT_KEY,
     VIRTUAL_DOCUMENT_SOURCE_IDS,
@@ -142,12 +143,12 @@ from memforge.source_artifacts import (
 )
 from memforge.provenance import (
     DocumentArtifactStore,
-    document_content_url,
-    document_content_url_for_store,
-    document_pdf_url,
-    document_pdf_url_for_store,
-    list_document_artifacts,
-    select_document_artifact,
+    document_resource_path,
+    list_stored_input_artifacts,
+    select_stored_input_artifact,
+    source_unit_content_url,
+    source_unit_pdf_url,
+    source_unit_resource_path,
 )
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.intents import RankedRetrievalIntent
@@ -2914,17 +2915,13 @@ def _memory_evidence_document_detail(
     doc_id: str,
     doc: Any | None,
     source_row: Any | None,
+    unit_input: SourceUnitInput | None,
     config: AppConfig | None = None,
     artifact_store: DocumentArtifactStore | None = None,
 ) -> MemoryEvidenceDocumentDetail:
-    content_url = None
-    pdf_url = None
-    if doc is not None and config is not None:
-        content_url = document_content_url_for_store(doc, config, artifact_store)
-        pdf_url = document_pdf_url_for_store(doc, config, artifact_store)
-    elif doc is not None:
-        content_url = document_content_url(doc, config)
-        pdf_url = document_pdf_url(doc, config)
+    """Describe the Document of one Evidence group; its links read the supporting Unit's stored input."""
+    content_url = source_unit_content_url(unit_input, config, artifact_store)
+    pdf_url = source_unit_pdf_url(unit_input, config, artifact_store)
     return MemoryEvidenceDocumentDetail(
         doc_id=doc_id,
         title=doc.title if doc else None,
@@ -3078,6 +3075,7 @@ async def _memory_evidence_details(
                 group.doc_id,
                 doc,
                 source_row,
+                await db.get_source_unit_input(group.source_unit_id),
                 config,
                 artifact_store,
             )
@@ -3099,10 +3097,16 @@ async def _memory_evidence_details(
             except HTTPException:
                 continue
         doc = await db.get_document(source_row.doc_id)
+        source_unit = (
+            await db.find_source_unit_by_document_id(source_id, source_row.doc_id, current_only=True)
+            if source_id not in VIRTUAL_DOCUMENT_SOURCE_IDS
+            else None
+        )
         document = _memory_evidence_document_detail(
             source_row.doc_id,
             doc,
             source_row,
+            await db.get_source_unit_input(source_unit.id) if source_unit is not None else None,
             config,
             artifact_store,
         )
@@ -3772,7 +3776,11 @@ def create_admin_app(
         )
         app.state.sync_scheduler = None
         if config.sync.scheduler_enabled:
-            app.state.sync_scheduler = SyncScheduler(app.state.db, app.state.sync_service)
+            app.state.sync_scheduler = SyncScheduler(
+                app.state.db,
+                app.state.sync_service,
+                document_store=app.state.document_store,
+            )
             await app.state.sync_scheduler.start()
         app.state.sync_worker = None
         app.state.evaluation_worker = None
@@ -3853,7 +3861,15 @@ def create_admin_app(
             runtime_provider=runtime_provider,
             workspace_id=workspace_id,
         )
-        app.state.sync_scheduler = SyncScheduler(db, app.state.sync_service) if config.sync.scheduler_enabled else None
+        app.state.sync_scheduler = (
+            SyncScheduler(
+                db,
+                app.state.sync_service,
+                document_store=document_store or LocalDocumentStore(config.storage.docs_path),
+            )
+            if config.sync.scheduler_enabled
+            else None
+        )
         app.state.sync_worker = None
         app.state.evaluation_worker = None
         app.state.sync_worker_task = None
@@ -4059,6 +4075,7 @@ def create_admin_app(
     health_router = APIRouter(tags=["health"])
     document_router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
     source_artifact_router = APIRouter(prefix="/api/v1/source-artifacts", tags=["source-artifacts"])
+    source_unit_router = APIRouter(prefix="/api/v1/source-units", tags=["source-units"])
     memory_router = APIRouter(prefix="/api/v1/memories", tags=["memories"])
     relation_discovery_router = APIRouter(prefix="/api/v1/relation-discovery", tags=["relation-discovery"])
     review_router = APIRouter(prefix="/api/v1/memory-reviews", tags=["memory-reviews"])
@@ -4179,26 +4196,113 @@ def create_admin_app(
     # 1b. Source Document Artifacts
     # ===================================================================
 
+    async def _readable_document_inputs(request: Request, db: Database, doc_id: str) -> list[SourceUnitInput]:
+        """The stored copies of the Document from Sources the caller can read, most recently recorded first."""
+        if await db.get_document(doc_id) is None:
+            raise HTTPException(status_code=404, detail="Document not found")
+        principal = resolve_request_principal(request)
+        readable: list[SourceUnitInput] = []
+        for unit_input in await db.list_document_source_unit_inputs(doc_id):
+            source = await db.get_source(unit_input.source_id)
+            if source is not None and source_is_discoverable(source, viewer_id=principal):
+                readable.append(unit_input)
+        return readable
+
+    async def _document_artifact_input(
+        request: Request,
+        db: Database,
+        doc_id: str,
+        kind: str,
+        artifact_store: DocumentArtifactStore,
+        *,
+        missing_detail: str,
+    ) -> SourceUnitInput:
+        """The most recently recorded readable copy whose object of this kind is still stored."""
+        for unit_input in await _readable_document_inputs(request, db, doc_id):
+            if select_stored_input_artifact(
+                unit_input, kind, config, artifact_store, resource_path=document_resource_path(doc_id),
+            ) is not None:
+                return unit_input
+        raise HTTPException(status_code=404, detail=missing_detail)
+
+    async def _readable_source_unit_input(request: Request, db: Database, source_unit_id: str) -> SourceUnitInput:
+        """The stored input of the Unit's current revision, when the caller can read its Source."""
+        unit_input = await db.get_source_unit_input(source_unit_id)
+        source = await db.get_source(unit_input.source_id) if unit_input is not None else None
+        if (
+            unit_input is None
+            or source is None
+            or not source_is_discoverable(source, viewer_id=resolve_request_principal(request))
+        ):
+            raise HTTPException(status_code=404, detail="Source Unit content not found")
+        return unit_input
+
+    def _artifact_manifest(
+        unit_input: SourceUnitInput,
+        doc: Any | None,
+        *,
+        resource_path: str,
+        artifact_store: DocumentArtifactStore,
+    ) -> dict[str, Any]:
+        artifacts = list_stored_input_artifacts(
+            unit_input, config, artifact_store, resource_path=resource_path,
+        )
+        return {
+            "doc_id": unit_input.document_id,
+            "source_id": unit_input.source_id,
+            "source_unit_id": unit_input.source_unit_id,
+            "title": doc.title if doc is not None else unit_input.item.title,
+            "source_url": doc.source_url if doc is not None else unit_input.item.source_url,
+            "artifacts": {kind: artifact.metadata() for kind, artifact in artifacts.items()},
+        }
+
+    def _stored_input_artifact_response(
+        request: Request,
+        unit_input: SourceUnitInput,
+        kind: str,
+        *,
+        resource_path: str,
+        artifact_store: DocumentArtifactStore,
+        missing_detail: str,
+    ) -> Response:
+        artifact = select_stored_input_artifact(
+            unit_input, kind, config, artifact_store, resource_path=resource_path,
+        )
+        if artifact is None:
+            raise HTTPException(status_code=404, detail=missing_detail)
+        content = b"" if request.method == "HEAD" else artifact_store.read_artifact(artifact.uri)
+        return Response(
+            content=content,
+            media_type=artifact.media_type,
+            headers={"Content-Disposition": _inline_content_disposition(artifact.filename)},
+        )
+
     @document_router.get("/{doc_id}/artifacts")
     async def list_document_artifact_manifest(
         doc_id: str,
+        request: Request,
         db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
-        """List service-readable artifacts for a stored source document."""
-        doc = await db.get_document(doc_id)
-        if doc is None:
-            raise HTTPException(status_code=404, detail="Document not found")
-
-        artifacts = list_document_artifacts(doc, config, artifact_store)
-        return {
-            "doc_id": doc.doc_id,
-            "title": doc.title,
-            "source_type": doc.source,
-            "source_url": doc.source_url,
-            "artifacts": {kind: artifact.metadata() for kind, artifact in artifacts.items()},
-        }
+        """List service-readable artifacts of the newest readable copy of a Document that still has any."""
+        resource_path = document_resource_path(doc_id)
+        readable = await _readable_document_inputs(request, db, doc_id)
+        if not readable:
+            raise HTTPException(status_code=404, detail="Document artifact not found")
+        unit_input = next(
+            (
+                candidate
+                for candidate in readable
+                if list_stored_input_artifacts(candidate, config, artifact_store, resource_path=resource_path)
+            ),
+            readable[0],
+        )
+        return _artifact_manifest(
+            unit_input,
+            await db.get_document(doc_id),
+            resource_path=document_resource_path(doc_id),
+            artifact_store=artifact_store,
+        )
 
     @document_router.api_route("/{doc_id}/artifacts/{kind}", methods=["GET", "HEAD"])
     async def get_document_artifact(
@@ -4206,23 +4310,17 @@ def create_admin_app(
         kind: str,
         request: Request,
         db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
-        """Serve an explicit source artifact kind through the API."""
-        doc = await db.get_document(doc_id)
-        if doc is None:
-            raise HTTPException(status_code=404, detail="Document not found")
-
-        artifact = select_document_artifact(doc, kind, config, artifact_store)
-        if artifact is None:
-            raise HTTPException(status_code=404, detail="Document artifact not found")
-
-        content = b"" if request.method == "HEAD" else artifact_store.read_artifact(artifact.uri)
-        return Response(
-            content=content,
-            media_type=artifact.media_type,
-            headers={"Content-Disposition": _inline_content_disposition(artifact.filename)},
+        """Serve an explicit artifact kind of the newest stored copy of a Document that has it."""
+        unit_input = await _document_artifact_input(
+            request, db, doc_id, kind, artifact_store, missing_detail="Document artifact not found",
+        )
+        return _stored_input_artifact_response(
+            request, unit_input, kind,
+            resource_path=document_resource_path(doc_id),
+            artifact_store=artifact_store,
+            missing_detail="Document artifact not found",
         )
 
     @source_artifact_router.api_route(
@@ -4275,23 +4373,17 @@ def create_admin_app(
         doc_id: str,
         request: Request,
         db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         """Serve normalized source content through the API for Docker/SaaS clients."""
-        doc = await db.get_document(doc_id)
-        if doc is None:
-            raise HTTPException(status_code=404, detail="Document not found")
-
-        artifact = select_document_artifact(doc, "content", config, artifact_store)
-        if artifact is None:
-            raise HTTPException(status_code=404, detail="Document content artifact not found")
-
-        content = b"" if request.method == "HEAD" else artifact_store.read_artifact(artifact.uri)
-        return Response(
-            content=content,
-            media_type=artifact.media_type,
-            headers={"Content-Disposition": _inline_content_disposition(artifact.filename)},
+        unit_input = await _document_artifact_input(
+            request, db, doc_id, "content", artifact_store, missing_detail="Document content artifact not found",
+        )
+        return _stored_input_artifact_response(
+            request, unit_input, "content",
+            resource_path=document_resource_path(doc_id),
+            artifact_store=artifact_store,
+            missing_detail="Document content artifact not found",
         )
 
     @document_router.api_route("/{doc_id}/pdf", methods=["GET", "HEAD"])
@@ -4299,23 +4391,82 @@ def create_admin_app(
         doc_id: str,
         request: Request,
         db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         """Serve a stored source PDF through the API for Docker/SaaS clients."""
-        doc = await db.get_document(doc_id)
-        if doc is None:
-            raise HTTPException(status_code=404, detail="Document not found")
+        unit_input = await _document_artifact_input(
+            request, db, doc_id, "pdf", artifact_store, missing_detail="Document PDF artifact not found",
+        )
+        return _stored_input_artifact_response(
+            request, unit_input, "pdf",
+            resource_path=document_resource_path(doc_id),
+            artifact_store=artifact_store,
+            missing_detail="Document PDF artifact not found",
+        )
 
-        artifact = select_document_artifact(doc, "pdf", config, artifact_store)
-        if artifact is None:
-            raise HTTPException(status_code=404, detail="Document PDF artifact not found")
+    @source_unit_router.get("/{source_unit_id}/artifacts")
+    async def list_source_unit_artifact_manifest(
+        source_unit_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
+    ):
+        """List service-readable artifacts of the stored input of one Source Unit."""
+        unit_input = await _readable_source_unit_input(request, db, source_unit_id)
+        return _artifact_manifest(
+            unit_input,
+            await db.get_document(unit_input.document_id),
+            resource_path=source_unit_resource_path(source_unit_id),
+            artifact_store=artifact_store,
+        )
 
-        content = b"" if request.method == "HEAD" else artifact_store.read_artifact(artifact.uri)
-        return Response(
-            content=content,
-            media_type=artifact.media_type,
-            headers={"Content-Disposition": _inline_content_disposition(artifact.filename)},
+    @source_unit_router.api_route("/{source_unit_id}/artifacts/{kind}", methods=["GET", "HEAD"])
+    async def get_source_unit_artifact(
+        source_unit_id: str,
+        kind: str,
+        request: Request,
+        db: Database = Depends(get_db),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
+    ):
+        """Serve an explicit artifact kind of the stored input of one Source Unit."""
+        unit_input = await _readable_source_unit_input(request, db, source_unit_id)
+        return _stored_input_artifact_response(
+            request, unit_input, kind,
+            resource_path=source_unit_resource_path(source_unit_id),
+            artifact_store=artifact_store,
+            missing_detail="Source Unit artifact not found",
+        )
+
+    @source_unit_router.api_route("/{source_unit_id}/content", methods=["GET", "HEAD"])
+    async def get_source_unit_content(
+        source_unit_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
+    ):
+        """Serve the normalized content one Source stored for its Unit."""
+        unit_input = await _readable_source_unit_input(request, db, source_unit_id)
+        return _stored_input_artifact_response(
+            request, unit_input, "content",
+            resource_path=source_unit_resource_path(source_unit_id),
+            artifact_store=artifact_store,
+            missing_detail="Source Unit content artifact not found",
+        )
+
+    @source_unit_router.api_route("/{source_unit_id}/pdf", methods=["GET", "HEAD"])
+    async def get_source_unit_pdf(
+        source_unit_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
+    ):
+        """Serve the PDF one Source stored for its Unit."""
+        unit_input = await _readable_source_unit_input(request, db, source_unit_id)
+        return _stored_input_artifact_response(
+            request, unit_input, "pdf",
+            resource_path=source_unit_resource_path(source_unit_id),
+            artifact_store=artifact_store,
+            missing_detail="Source Unit PDF artifact not found",
         )
 
     # ===================================================================
@@ -6618,8 +6769,7 @@ def create_admin_app(
                     mem_query = (
                         "SELECT DISTINCT m.* FROM memories m "
                         "JOIN memory_sources ms ON m.id = ms.memory_id "
-                        "JOIN documents d ON ms.doc_id = d.doc_id "
-                        "WHERE m.updated_at >= ? AND d.source = ?"
+                        "WHERE m.updated_at >= ? AND ms.source_id = ?"
                     )
                     mem_params = [since_iso, source]
                     mem_query += " ORDER BY m.updated_at DESC LIMIT 50"
@@ -7367,10 +7517,13 @@ def create_admin_app(
                     "size_bytes": observed_size,
                 }
             content.seek(0)
+            # This write does not hold the Source activity lease, so the
+            # attempt writes a key of its own: a cleanup task queued by an
+            # earlier failed attempt can never name the object written here.
             artifact_uri = await asyncio.to_thread(
                 artifact_store.store_source_artifact,
                 source_id=source_id,
-                artifact_id=f"local-input-{input_sha256[:24]}",
+                artifact_id=f"local-input-{input_sha256[:24]}-{uuid.uuid4().hex}",
                 filename=str(filename).strip(),
                 content=content,
                 content_type=normalized_media_type,
@@ -7398,10 +7551,6 @@ def create_admin_app(
                         source_id=source_id,
                         artifact_uri=artifact_uri,
                     )
-                    await SourceArtifactCleanupService(
-                        db,
-                        artifact_store,
-                    ).run_pending(limit=1)
                 raise
             return {
                 "input_sha256": retained.raw_sha256,
@@ -7573,10 +7722,6 @@ def create_admin_app(
                     source_id=source_id,
                     artifact_uri=package_uri,
                 )
-                await SourceArtifactCleanupService(
-                    db,
-                    artifact_store,
-                ).run_pending(limit=100)
 
             try:
                 current_source = await db.get_source(source_id)
@@ -9379,6 +9524,7 @@ def create_admin_app(
     app.include_router(health_router)
     app.include_router(document_router)
     app.include_router(source_artifact_router)
+    app.include_router(source_unit_router)
     app.include_router(memory_router)
     app.include_router(relation_discovery_router)
     app.include_router(review_router)

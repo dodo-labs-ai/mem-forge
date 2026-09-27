@@ -253,13 +253,16 @@ class MemoryIndexHealthChecker:
     async def _confluence_documents_missing_pdf(self) -> set[str]:
         doc_ids: set[str] = set()
         async with self.db.db.execute(
-            """SELECT d.doc_id
-               FROM documents d
-               JOIN sources s ON s.id = d.source
+            """SELECT DISTINCT input.document_id
+               FROM source_unit_inputs input
+               JOIN source_units unit
+                 ON unit.id = input.source_unit_id
+                AND unit.current_revision_id = input.unit_revision_id
+               JOIN sources s ON s.id = input.source_id
                WHERE s.type = 'confluence'
-                 AND d.normalized_content_uri IS NOT NULL
-                 AND d.normalized_content_uri <> ''
-                 AND (d.pdf_content_uri IS NULL OR d.pdf_content_uri = '')"""
+                 AND input.normalized_content_uri IS NOT NULL
+                 AND input.normalized_content_uri <> ''
+                 AND (input.pdf_content_uri IS NULL OR input.pdf_content_uri = '')"""
         ) as cursor:
             async for row in cursor:
                 doc_ids.add(row[0])

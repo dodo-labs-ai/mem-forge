@@ -46,6 +46,7 @@ from memforge.models import (
     MemorySource,
     MemorySourceRef,
     Project,
+    SourceUnitInput,
     Visibility,
     canonicalize_entity_name,
 )
@@ -515,10 +516,12 @@ class SqliteRelationalStore:
         self,
         doc_id: str,
         *,
+        source_id: str,
         source_activity: SourceActivityLease | None = None,
     ) -> None:
         await self._db.delete_projected_document(
             doc_id,
+            source_id=source_id,
             source_activity=source_activity,
         )
 
@@ -527,11 +530,13 @@ class SqliteRelationalStore:
         old_doc_id: str,
         new_doc_id: str,
         *,
+        source_id: str,
         source_activity: SourceActivityLease | None = None,
     ) -> None:
         await self._db.rebind_projected_document_support(
             old_doc_id,
             new_doc_id,
+            source_id=source_id,
             source_activity=source_activity,
         )
 
@@ -539,11 +544,13 @@ class SqliteRelationalStore:
         self,
         projection: SourceProjection,
         *,
+        unit_input: SourceUnitInput | None = None,
         expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
     ) -> None:
         await self._db.record_source_projection(
             projection,
+            unit_input=unit_input,
             expected_source_activity_epoch=expected_source_activity_epoch,
             source_activity=source_activity,
         )
@@ -619,6 +626,12 @@ class SqliteRelationalStore:
             document_id,
             current_only=current_only,
         )
+
+    async def get_source_unit_input(self, source_unit_id: str) -> SourceUnitInput | None:
+        return await self._db.get_source_unit_input(source_unit_id)
+
+    async def list_document_source_unit_inputs(self, document_id: str) -> list[SourceUnitInput]:
+        return await self._db.list_document_source_unit_inputs(document_id)
 
     async def list_source_unit_document_ids(
         self,
@@ -778,6 +791,7 @@ class SqliteRelationalStore:
         plan: LifecyclePlan,
         *,
         document: DocumentRecord | None = None,
+        unit_input: SourceUnitInput | None = None,
         derivation_id: str | None = None,
         derivation_context_identity_hash: str | None = None,
         required_derivation_work_ids: tuple[str, ...] = (),
@@ -789,6 +803,7 @@ class SqliteRelationalStore:
             projection,
             plan,
             document=document,
+            unit_input=unit_input,
             derivation_id=derivation_id,
             derivation_context_identity_hash=(derivation_context_identity_hash),
             required_derivation_work_ids=required_derivation_work_ids,

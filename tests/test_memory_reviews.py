@@ -36,6 +36,7 @@ from memforge.models import (
     generate_review_id,
 )
 from memforge.storage.database import Database
+from tests.test_sync_bookkeeping import _hold_document
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
 
@@ -196,12 +197,21 @@ async def _upsert_doc_with_artifacts(
             version="1",
             content_hash=f"hash-{doc_id}",
             token_count=100,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=normalized_content_uri,
-            pdf_content_uri=pdf_content_uri,
             last_synced=now,
         )
+    )
+    await _hold_document(
+        db,
+        source_id="src-confluence",
+        source_type="confluence",
+        doc_id=doc_id,
+        title=doc_id,
+        markdown=f"# {doc_id}",
+        version="1",
+        source_url=f"http://test/{doc_id}",
+        space_or_project="TEST",
+        normalized_content_uri=normalized_content_uri,
+        pdf_content_uri=pdf_content_uri,
     )
 
 
@@ -622,7 +632,8 @@ class TestReviewCrud:
         payload = response.json()
         incumbent_document = payload["incumbent"]["evidence"][0]["document"]
         challenger_document = payload["challenger"]["evidence"][0]["document"]
-        assert incumbent_document["content_url"] == "/api/v1/documents/doc-review-incumbent/content"
+        unit = await db.find_source_unit_by_document_id("src-confluence", "doc-review-incumbent")
+        assert incumbent_document["content_url"] == f"/api/v1/source-units/{unit.id}/content"
         assert challenger_document["content_url"] is None
         assert "file_uri" not in incumbent_document
         assert "pdf_uri" not in incumbent_document
@@ -693,9 +704,8 @@ class TestReviewCrud:
 
         assert detail.status_code == 200
         incumbent_document = detail.json()["incumbent"]["evidence"][0]["document"]
-        assert incumbent_document["content_url"] == (
-            "/api/v1/documents/doc-review-object-incumbent/content"
-        )
+        unit = await db.find_source_unit_by_document_id("src-confluence", "doc-review-object-incumbent")
+        assert incumbent_document["content_url"] == f"/api/v1/source-units/{unit.id}/content"
         assert content.status_code == 200
         assert content.text == "# Incumbent object evidence"
 

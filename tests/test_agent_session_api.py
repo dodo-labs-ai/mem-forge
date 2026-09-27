@@ -25,6 +25,7 @@ from memforge.config import AppConfig
 from memforge.llm.structured import AgentSessionAuthorityResponse, StructuredLlmError
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.storage.database import Database
+from tests.test_sync_bookkeeping import _hold_document
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from tests.llm_fixture import fixture_budget
 
@@ -410,13 +411,20 @@ async def _seed_source_project(
             version=f"version-{doc_id}",
             content_hash=f"hash-{doc_id}",
             token_count=100,
-            raw_content_uri=None,
-            raw_content_type="application/json",
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=last_modified,
             client=client,
         )
+    )
+    await _hold_document(
+        db,
+        source_id=source_id,
+        source_type="agent_session",
+        doc_id=doc_id,
+        title=f"Agent Session {doc_id}",
+        markdown=f"# Agent Session {doc_id}",
+        version=f"version-{doc_id}",
+        source_url=f"agent-session://codex/sess/{doc_id}",
+        space_or_project=project,
     )
     for memory_id in memory_ids:
         memory = Memory(
@@ -2924,10 +2932,6 @@ def test_memories_endpoint_exposes_origin_client_for_agent_session_memories(tmp_
                 version="v1",
                 content_hash="hash-jira",
                 token_count=50,
-                raw_content_uri=None,
-                raw_content_type="text/plain",
-                normalized_content_uri=None,
-                pdf_content_uri=None,
                 last_synced=base_time,
             )
         )

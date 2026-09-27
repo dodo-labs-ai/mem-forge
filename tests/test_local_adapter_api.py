@@ -116,6 +116,13 @@ def _connect_database(tmp_path: Path) -> Database:
     return database
 
 
+def _run_artifact_cleanup(database: Database, cfg: AppConfig) -> None:
+    """Run the periodic artifact cleanup the scheduler drives."""
+    from memforge.storage.source_cleanup import SourceArtifactCleanupService
+
+    asyncio.run(SourceArtifactCleanupService(database, LocalDocumentStore(cfg.storage.docs_path)).run_pending())
+
+
 def _project_source_inputs(database: Database, source: dict) -> dict:
     inputs = asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source["id"]))
     return source_with_sync_inputs(source, inputs)
@@ -475,6 +482,7 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
         assert repeated_payload["package_uri"] == payload["package_uri"]
         first_package = json.loads(Path(payload["package_uri"]).read_text(encoding="utf-8"))
         assert first_package["submitted_at"] == "2026-07-10T08:00:00+00:00"
+        _run_artifact_cleanup(database, cfg)
         package_artifacts = list(Path(cfg.storage.docs_path).rglob("*package*.json"))
         assert package_artifacts == [Path(payload["package_uri"])]
         row = asyncio.run(database.get_source(source_id))
@@ -833,6 +841,7 @@ def test_duplicate_local_package_attests_the_retained_artifact_not_the_new_uploa
         assert attested.metadata["package_sha256"] == retained_sha
         assert attested.metadata["manifest_entry"]["package_sha256"] == retained_sha
         assert Path(retained_uri).exists()
+        _run_artifact_cleanup(database, cfg)
         assert list(Path(cfg.storage.docs_path).rglob("*package*.json")) == [
             Path(retained_uri)
         ]
@@ -908,6 +917,7 @@ def test_duplicate_local_package_does_not_attest_an_invalid_retained_artifact(
         [unchanged] = asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id))
         assert "package_sha256" not in unchanged.metadata
         assert "package_sha256" not in unchanged.metadata["manifest_entry"]
+        _run_artifact_cleanup(database, cfg)
         if retained_failure == "corrupt":
             assert Path(retained_uri).read_bytes() == b"{}"
             assert list(Path(cfg.storage.docs_path).rglob("*package*.json")) == [
@@ -2639,6 +2649,7 @@ def test_local_adapter_push_cleans_artifact_when_lease_expires_after_write(
 
         assert response.status_code == 409
         assert response.json()["detail"] == "local_agent_lease_not_current"
+        _run_artifact_cleanup(database, cfg)
         assert list(Path(cfg.storage.docs_path).rglob("*package*.json")) == []
         assert asyncio.run(database.list_source_artifact_cleanup_tasks()) == []
         assert asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id)) == []
@@ -2807,3 +2818,116 @@ class LeaseAwareTestClient(TestClient):
             body.setdefault("local_agent_attempt_count", 1)
             kwargs["json"] = body
         return super().post(url, *args, **kwargs)
+
+
+class _FailOnceThenCleanUp:
+    """Fails the first sync-input record; runs artifact cleanup right before the next one.
+
+    The second call lands in the window between writing an object and recording
+    the reference to it, where cleanup must not be able to delete that object.
+    """
+
+    def __init__(self, database: Database, document_store: LocalDocumentStore) -> None:
+        self.database = database
+        self.document_store = document_store
+        self.record = database.create_source_sync_input
+        self.calls = 0
+        self.cleaned = 0
+
+    async def __call__(self, **kwargs):
+        from memforge.storage.source_cleanup import SourceArtifactCleanupService
+
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("sync input store unavailable")
+        self.cleaned += await SourceArtifactCleanupService(self.database, self.document_store).run_pending()
+        return await self.record(**kwargs)
+
+
+def _cleanup_uris(database: Database) -> list[str]:
+    return [task.artifact_uri for task in asyncio.run(database.list_source_artifact_cleanup_tasks(limit=10))]
+
+
+def test_a_retried_artifact_upload_survives_cleanup_of_the_failed_attempt(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    document_store = LocalDocumentStore(cfg.storage.docs_path)
+    image_bytes = b"\x89PNG\r\n\x1a\nretried-upload"
+    params = {
+        "source_unit_key": "Payroll Processing/architecture.png",
+        "provider_key": "Payroll Processing/architecture.png",
+        "provider_revision": "blob-image-sha",
+        "parent_observation_type": "file_content",
+        "parent_provider_key": "content",
+        "filename": "architecture.png",
+        "media_type": "image/png",
+        "local_agent_job_id": "test-local-agent-job",
+        "local_agent_attempt_count": 1,
+    }
+    try:
+        app = create_admin_app(
+            db=database, config=cfg, document_store=document_store,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        record = _FailOnceThenCleanUp(database, document_store)
+        database.create_source_sync_input = record
+        with LeaseAwareTestClient(app, raise_server_exceptions=False) as client:
+            source_id = _create_github_repo_source(client, include_extensions=["png"])["id"]
+            route = f"/api/v1/sources/{source_id}/adapter/artifacts"
+            failed = client.post(route, params=params, content=image_bytes, headers={"content-type": "image/png"})
+            [abandoned] = _cleanup_uris(database)
+            retried = client.post(route, params=params, content=image_bytes, headers={"content-type": "image/png"})
+
+        assert failed.status_code == 500
+        assert retried.status_code == 200, retried.text
+        assert record.cleaned == 1
+        [retained] = asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id))
+        assert retained.raw_uri != abandoned
+        assert document_store.read_artifact(retained.raw_uri) == image_bytes
+        assert document_store.get_artifact(abandoned, "image/png") is None
+    finally:
+        asyncio.run(database.close())
+
+
+def test_a_retried_package_push_survives_cleanup_of_the_failed_attempt(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    document_store = LocalDocumentStore(cfg.storage.docs_path)
+    package = {
+        "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+        "repo_ref": "main",
+        "relative_path": "Payroll Processing/overview.md",
+        "markdown_body": "# Overview\n\nPayroll runs nightly.",
+        "content_type": "text/markdown",
+        "blob_sha": "blob-overview-sha",
+        # A retry of the same push carries the same payload, so its bytes are identical.
+        "submitted_at": "2026-09-27T08:00:00+00:00",
+        "submitted_by": "local-agent",
+    }
+    try:
+        app = create_admin_app(
+            db=database, config=cfg, document_store=document_store,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        record = _FailOnceThenCleanUp(database, document_store)
+        database.create_source_sync_input = record
+        with LeaseAwareTestClient(app, raise_server_exceptions=False) as client:
+            source_id = _create_github_repo_source(client)["id"]
+            route = f"/api/v1/sources/{source_id}/adapter/packages"
+            failed = client.post(route, json=package)
+            [abandoned] = _cleanup_uris(database)
+            retried = client.post(route, json=package)
+
+        assert failed.status_code == 500
+        assert retried.status_code == 200, retried.text
+        assert record.cleaned == 1
+        [retained] = asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id))
+        assert retained.raw_uri == retried.json()["package_uri"] != abandoned
+        assert document_store.get_artifact(retained.raw_uri, "application/json") is not None
+        assert document_store.get_artifact(abandoned, "application/json") is None
+    finally:
+        asyncio.run(database.close())

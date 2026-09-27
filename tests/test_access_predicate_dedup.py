@@ -163,10 +163,6 @@ async def test_workspace_write_does_not_corroborate_other_users_private(store_fi
             version="1",
             content_hash="h-team",
             token_count=1,
-            raw_content_uri=None,
-            raw_content_type="text/markdown",
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=now,
         )
     )

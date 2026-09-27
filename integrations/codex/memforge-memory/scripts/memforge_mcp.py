@@ -530,8 +530,10 @@ TOOLS: list[dict[str, Any]] = [
                     "description": (
                         "A MemForge URL from get_memory.evidence[].document or "
                         "get_memory.evidence[].items[].artifact.url, such as "
-                        "/api/v1/documents/{doc_id}/content, /api/v1/documents/{doc_id}/pdf, "
-                        "/api/v1/documents/{doc_id}/artifacts/{kind}, or "
+                        "/api/v1/source-units/{source_unit_id}/content, "
+                        "/api/v1/source-units/{source_unit_id}/pdf, "
+                        "/api/v1/source-units/{source_unit_id}/artifacts/{kind}, the same "
+                        "paths under /api/v1/documents/{doc_id}, or "
                         "/api/v1/source-artifacts/{observation_revision_id}."
                     ),
                 },
@@ -2025,7 +2027,8 @@ def _handle_get_resource(
         return {
             "error": "unsupported resource URL",
             "hint": (
-                "Use a relative MemForge /api/v1/documents/{doc_id}/content, /pdf, "
+                "Use a relative MemForge /api/v1/source-units/{source_unit_id} or "
+                "/api/v1/documents/{doc_id} URL ending in /content, /pdf or "
                 "/artifacts/{kind}, or /api/v1/source-artifacts/{observation_revision_id} "
                 "URL, or an absolute URL under MEMFORGE_API_URL."
             ),
@@ -2184,6 +2187,14 @@ def _verify_resource_integrity(
         raise OSError("resource SHA-256 does not match X-Content-SHA256")
 
 
+# Stored Document content is read by Document (the newest copy a readable
+# Source stored) or by Source Unit (the copy that Unit's Source stored).
+_STORED_CONTENT_RESOURCE_IDENTITY = {
+    ("api", "v1", "documents"): "doc_id",
+    ("api", "v1", "source-units"): "source_unit_id",
+}
+
+
 def _parse_resource_url(
     url: str,
     target: Any,
@@ -2223,38 +2234,20 @@ def _parse_resource_url(
     relative_url = path
     if locator_workspace_id:
         relative_url += "?" + urlencode({"workspace_id": locator_workspace_id})
-    if len(parts) == 5 and parts[:3] == ["api", "v1", "documents"] and parts[4] == "content":
+    stored_content_identity = _STORED_CONTENT_RESOURCE_IDENTITY.get(tuple(parts[:3]))
+    if stored_content_identity is not None and (
+        (len(parts) == 5 and parts[4] in {"content", "pdf"}) or (len(parts) == 6 and parts[4] == "artifacts")
+    ):
         return ResourceTarget(
             parts[3],
-            "content",
+            parts[4] if len(parts) == 5 else parts[5],
             relative_url,
             _resource_url(
                 path[len("/api/v1") :],
                 target=target,
                 workspace_id=effective_workspace_id,
             ),
-        )
-    if len(parts) == 5 and parts[:3] == ["api", "v1", "documents"] and parts[4] == "pdf":
-        return ResourceTarget(
-            parts[3],
-            "pdf",
-            relative_url,
-            _resource_url(
-                path[len("/api/v1") :],
-                target=target,
-                workspace_id=effective_workspace_id,
-            ),
-        )
-    if len(parts) == 6 and parts[:3] == ["api", "v1", "documents"] and parts[4] == "artifacts":
-        return ResourceTarget(
-            parts[3],
-            parts[5],
-            relative_url,
-            _resource_url(
-                path[len("/api/v1") :],
-                target=target,
-                workspace_id=effective_workspace_id,
-            ),
+            identity_key=stored_content_identity,
         )
     if len(parts) == 4 and parts[:3] == ["api", "v1", "source-artifacts"]:
         return ResourceTarget(

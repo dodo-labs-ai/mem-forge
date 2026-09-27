@@ -110,10 +110,6 @@ async def _document(
             version="1",
             content_hash=f"h-{doc_id}",
             token_count=1,
-            raw_content_uri=None,
-            raw_content_type="text/html",
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=now,
             client=client,
         )

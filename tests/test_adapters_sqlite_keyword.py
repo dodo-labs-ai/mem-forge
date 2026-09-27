@@ -680,10 +680,6 @@ async def _upsert_doc(
             version="1",
             content_hash=f"hash-{doc_id}-{title}",
             token_count=1,
-            raw_content_uri=None,
-            raw_content_type="text/html",
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=now,
             client=client,
         )

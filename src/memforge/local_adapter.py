@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -130,10 +131,15 @@ def _store_package_artifact(
     package_sha256 = _hash_bytes(payload_bytes)
     if document_store is None:
         return None, package_sha256
+    # A push does not hold the Source activity lease, so each attempt writes a
+    # key of its own: a cleanup task queued by an earlier failed push can never
+    # name the object written here.
     package_uri = document_store.store_raw(
         source_id,
         doc_id,
-        f"{doc_id}-{package_sha256}-package",
+        # The Document namespace is already in the key; the stem stays within
+        # the slug length limit so the attempt part is never cut off.
+        f"package-{uuid.uuid4().hex}-{package_sha256}",
         payload_bytes,
         "application/json",
         extension=extension,

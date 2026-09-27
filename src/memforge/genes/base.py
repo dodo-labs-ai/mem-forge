@@ -28,6 +28,7 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+    SourceUnitInput,
 )
 from memforge.source_artifacts import (
     RawSourceArtifact,
@@ -119,11 +120,15 @@ class Gene(ABC):
         self,
         *,
         item: ContentItem,
-        existing_doc: object | None,
+        stored_input: SourceUnitInput | None,
         existing_hash: str | None,
         new_hash: str,
     ) -> bool:
-        """Return whether sync should fail if a PDF artifact cannot be stored."""
+        """Return whether sync should fail if a PDF artifact cannot be stored.
+
+        ``stored_input`` is the stored input of this Source's Unit for the
+        Document, ``None`` when the Unit has recorded none.
+        """
         return False
 
     # ------------------------------------------------------------------

@@ -13,8 +13,9 @@ from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
 from memforge.memory.store import MemoryStore
-from memforge.models import DocumentRecord, Memory, RawMemory, content_hash
+from memforge.models import ContentItem, DocumentRecord, Memory, RawMemory, SourceUnitInput, content_hash
 from memforge.storage.database import Database
+from tests.test_sync_bookkeeping import _hold_document
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
 
@@ -122,13 +123,24 @@ async def _insert_document(
         version="1",
         content_hash=f"hash-{doc_id}",
         token_count=100,
+        last_synced=now,
+    )
+    await db.upsert_document(doc)
+    await _hold_document(
+        db,
+        source_id=source,
+        source_type="confluence",
+        doc_id=doc_id,
+        title=doc.title,
+        markdown=f"# {doc.title}",
+        version=doc.version,
+        source_url=doc.source_url,
+        space_or_project=doc.space_or_project,
         raw_content_uri=raw_content_uri,
         raw_content_type="text/html",
         normalized_content_uri=normalized_content_uri,
         pdf_content_uri=pdf_content_uri,
-        last_synced=now,
     )
-    await db.upsert_document(doc)
     return doc
 
 
@@ -419,6 +431,7 @@ async def test_admin_memory_detail_exposes_service_artifact_urls_only(db: Databa
         doc_id="doc-pdf-uri",
         pdf_content_uri=str(source_pdf),
     )
+    unit = await db.find_source_unit_by_document_id(doc.source, doc.doc_id)
     memory = await _insert_memory(
         db,
         mem_id="mem-pdfuri1",
@@ -435,7 +448,7 @@ async def test_admin_memory_detail_exposes_service_artifact_urls_only(db: Databa
     assert evidence["kind"] == "document"
     document = evidence["document"]
     assert document["content_url"] is None
-    assert document["pdf_url"] == "/api/v1/documents/doc-pdf-uri/pdf"
+    assert document["pdf_url"] == f"/api/v1/source-units/{unit.id}/pdf"
     assert "file_uri" not in document
     assert "pdf_uri" not in document
     assert evidence["items"][0]["excerpt"] == "source excerpt"
@@ -500,6 +513,7 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
         normalized_content_uri=str(source_md),
         pdf_content_uri=str(source_pdf),
     )
+    unit = await db.find_source_unit_by_document_id(doc.source, doc.doc_id)
     memory = await _insert_memory(
         db,
         mem_id="mem-artifact-url",
@@ -518,13 +532,16 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
         missing_document = client.get("/api/v1/documents/missing-doc/artifacts")
         content = client.get("/api/v1/documents/doc-artifact-url/content")
         pdf = client.get("/api/v1/documents/doc-artifact-url/pdf")
+        unit_content = client.get(f"/api/v1/source-units/{unit.id}/content")
+        unit_pdf = client.get(f"/api/v1/source-units/{unit.id}/pdf")
+        unit_manifest = client.get(f"/api/v1/source-units/{unit.id}/artifacts")
 
     assert detail.status_code == 200
     evidence = detail.json()["evidence"][0]
     assert evidence["kind"] == "document"
     document = evidence["document"]
-    assert document["content_url"] == "/api/v1/documents/doc-artifact-url/content"
-    assert document["pdf_url"] == "/api/v1/documents/doc-artifact-url/pdf"
+    assert document["content_url"] == f"/api/v1/source-units/{unit.id}/content"
+    assert document["pdf_url"] == f"/api/v1/source-units/{unit.id}/pdf"
     assert "file_uri" not in document
     assert "pdf_uri" not in document
     assert manifest.status_code == 200
@@ -544,6 +561,10 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
     assert content.text == "# Source\n\nDurable memory evidence."
     assert pdf.status_code == 200
     assert pdf.content == b"%PDF-1.4\n%memforge\n"
+    assert unit_content.text == content.text
+    assert unit_pdf.content == pdf.content
+    assert unit_manifest.json()["source_unit_id"] == unit.id
+    assert unit_manifest.json()["artifacts"]["pdf"]["url"] == f"/api/v1/source-units/{unit.id}/artifacts/pdf"
 
 
 @pytest.mark.asyncio
@@ -968,9 +989,8 @@ async def test_admin_document_artifacts_can_use_non_filesystem_store(db: Databas
 
     assert detail.status_code == 200
     evidence = detail.json()["evidence"][0]
-    assert evidence["document"]["content_url"] == (
-        "/api/v1/documents/doc-object-artifact-url/content"
-    )
+    unit = await db.find_source_unit_by_document_id("src-confluence", "doc-object-artifact-url")
+    assert evidence["document"]["content_url"] == f"/api/v1/source-units/{unit.id}/content"
     assert manifest.status_code == 200
     assert manifest.json()["artifacts"]["normalized_markdown"]["size_bytes"] == 55
     assert content.status_code == 200
@@ -1062,9 +1082,10 @@ async def test_delete_source_uses_injected_document_store(
         raw_content_uri=None,
         normalized_content_uri="mem://doc.md",
     )
+    # An object the Source released earlier; no stored input names it.
     await db.enqueue_source_artifact_cleanup_task(
         source_id="src-confluence",
-        artifact_uri="mem://doc.md",
+        artifact_uri="mem://released.md",
     )
 
     store = RecordingDocumentStore()
@@ -1073,7 +1094,7 @@ async def test_delete_source_uses_injected_document_store(
         response = client.delete("/api/v1/sources/src-confluence")
 
     assert response.status_code == 200, response.text
-    assert store.deleted == ["mem://doc.md"]
+    assert store.deleted == ["mem://released.md"]
 
 
 @pytest.mark.asyncio
@@ -1149,7 +1170,7 @@ async def test_delete_source_succeeds_and_retains_cleanup_task_when_artifact_del
     )
     await db.enqueue_source_artifact_cleanup_task(
         source_id="src-cleanup-failure",
-        artifact_uri="object-store://workspace/documents/src-cleanup-failure/page.md",
+        artifact_uri="object-store://workspace/documents/src-cleanup-failure/released-page.md",
     )
 
     app = create_admin_app(
@@ -1222,31 +1243,45 @@ def test_sync_previous_content_read_does_not_bypass_document_store(tmp_path: Pat
         memory_engine=object(),
         memory_store=object(),
     )
-    doc = DocumentRecord(
-        doc_id="doc-previous-outside-root",
-        source="src-confluence",
-        source_url="https://confluence.example/doc-previous-outside-root",
-        title="Previous Source",
-        space_or_project="PAY",
-        author="Sun, Youpeng",
-        last_modified=datetime.now(timezone.utc),
-        labels=[],
-        version="1",
-        content_hash="hash-doc-previous-outside-root",
-        token_count=100,
-        raw_content_uri=None,
-        raw_content_type="text/html",
+    stored_input = _confluence_stored_input(
+        "doc-previous-outside-root",
         normalized_content_uri=str(outside),
         pdf_content_uri=None,
-        last_synced=datetime.now(timezone.utc),
     )
 
-    assert orchestrator._read_previous_normalized_content(doc) is None
+    assert orchestrator._read_previous_normalized_content(stored_input) is None
+
+
+def _confluence_stored_input(
+    doc_id: str,
+    *,
+    normalized_content_uri: str | None,
+    pdf_content_uri: str | None,
+) -> SourceUnitInput:
+    item = ContentItem(
+        item_id=doc_id,
+        title="Source Page",
+        source_url=f"https://confluence.example/{doc_id}",
+        last_modified=datetime.now(timezone.utc),
+        version="1",
+    )
+    return SourceUnitInput(
+        source_unit_id=f"unit-{doc_id}",
+        unit_revision_id=f"unit-revision-{doc_id}",
+        source_id="src-confluence",
+        document_id=doc_id,
+        item=item,
+        raw_content_uri=None,
+        raw_content_type="text/html",
+        raw_content_sha256=None,
+        normalized_content_uri=normalized_content_uri,
+        normalized_content_hash="old-hash",
+        pdf_content_uri=pdf_content_uri,
+    )
 
 
 def test_confluence_gene_declares_pdf_artifact_requirement() -> None:
     from memforge.genes.confluence_gene import ConfluenceGene
-    from memforge.models import ContentItem
 
     item = ContentItem(
         item_id="confluence-1",
@@ -1255,36 +1290,23 @@ def test_confluence_gene_declares_pdf_artifact_requirement() -> None:
         last_modified=datetime.now(timezone.utc),
         version="1",
     )
-    existing = DocumentRecord(
-        doc_id="confluence-1",
-        source="src-confluence",
-        source_url="https://confluence.example/1",
-        title="Source Page",
-        space_or_project="PAY",
-        author="Sun, Youpeng",
-        last_modified=datetime.now(timezone.utc),
-        labels=[],
-        version="1",
-        content_hash="old-hash",
-        token_count=100,
-        raw_content_uri=None,
-        raw_content_type="text/html",
-        normalized_content_uri="mem://doc.md",
-        pdf_content_uri="mem://doc.pdf",
-        last_synced=datetime.now(timezone.utc),
+    existing = _confluence_stored_input(
+        "confluence-1",
+        normalized_content_uri="/tmp/source.md",
+        pdf_content_uri="/tmp/source.pdf",
     )
 
     assert ConfluenceGene.requires_pdf_artifact(
         object(),
         item=item,
-        existing_doc=None,
+        stored_input=None,
         existing_hash=None,
         new_hash="new-hash",
     )
     assert not ConfluenceGene.requires_pdf_artifact(
         object(),
         item=item,
-        existing_doc=existing,
+        stored_input=existing,
         existing_hash="old-hash",
         new_hash="old-hash",
     )

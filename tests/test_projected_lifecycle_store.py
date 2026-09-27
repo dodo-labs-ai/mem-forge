@@ -1270,10 +1270,6 @@ async def test_document_write_rejects_an_expired_activity_lease(
         version="1",
         content_hash="stale-fence-hash",
         token_count=3,
-        raw_content_uri=None,
-        raw_content_type="text/plain",
-        normalized_content_uri=None,
-        pdf_content_uri=None,
         last_synced=now,
     )
 

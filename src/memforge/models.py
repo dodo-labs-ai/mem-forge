@@ -315,7 +315,18 @@ class RawDocument:
 
 @dataclass
 class DocumentRecord:
-    """Full document record stored in the database."""
+    """The shared description of one provider Document in a workspace.
+
+    A workspace keeps one row per ``doc_id``. Several Sources can include the
+    same provider Document (overlapping Jira JQLs, overlapping Confluence page
+    trees), and each keeps its own Source Unit and stored input
+    (:class:`SourceUnitInput`). This row holds only what describes the
+    Document itself, as the Source that synced it last saw it: title, links,
+    labels, version and times. ``source`` names that Source, or the built-in
+    writer of a Document no Source syncs (``user_correction``,
+    ``user_memory``); it is not ownership. The Sources that hold a Document
+    are the Sources with a current Source Unit for it.
+    """
 
     doc_id: str
     source: str
@@ -328,17 +339,45 @@ class DocumentRecord:
     version: str
     content_hash: str
     token_count: int | None
-    raw_content_uri: str | None
-    raw_content_type: str | None
-    normalized_content_uri: str | None
-    pdf_content_uri: str | None
     last_synced: datetime
     client: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     # The source-specific metadata of the item the Gene discovered
-    # (``ContentItem.extra``); a reprocess rebuilds the item from it.
+    # (``ContentItem.extra``).
     item_extra: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SourceUnitInput:
+    """The stored input of one Source Unit revision.
+
+    A sync stores the raw provider content it projected (with the normalized
+    markdown and any PDF export) under its own Source's object keys, then
+    records the Unit revision together with this input in one transaction.
+    ``unit_revision_id`` is that revision. A Unit keeps the input of its
+    latest recorded revision only: objects are written in place per Source and
+    Document, so an older revision's input is no longer readable.
+
+    ``item`` is the item the Gene discovered, which a reprocess from stored
+    input projects again. ``raw_content_sha256`` identifies the raw bytes the
+    revision was projected from; it is unknown for input carried over from a
+    workspace that did not record it. ``normalized_content_hash`` is the hash
+    of the normalized markdown the sync compares to detect a content change.
+    """
+
+    source_unit_id: str
+    unit_revision_id: str
+    source_id: str
+    document_id: str
+    item: ContentItem
+    raw_content_uri: str | None
+    raw_content_type: str
+    raw_content_sha256: str | None
+    normalized_content_uri: str | None
+    normalized_content_hash: str | None
+    pdf_content_uri: str | None
+    recorded_at: datetime | None = None
 
 
 @dataclass
@@ -369,9 +408,10 @@ class ContentItem:
     content's source time; a Gene reports that time in ``normalize()`` under
     ``source_semantics["source_updated_at"]`` (design 0.9).
 
-    ``stored_extra`` is the ``extra`` recorded when this document was last
-    synced, empty for a new document. A Gene may reuse a provider fact it
-    recorded for an unchanged provider revision instead of asking again.
+    ``stored_extra`` is the ``extra`` this Source recorded with the stored
+    input of the Document's Source Unit, empty for a Document the Source has
+    not stored. A Gene may reuse a provider fact it recorded for an unchanged
+    provider revision instead of asking again.
     """
 
     item_id: str  # becomes doc_id
@@ -395,6 +435,40 @@ class ContentItem:
             space_or_project=self.space_or_project,
             last_modified=self.last_modified,
             version=self.version,
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        """The item as discovery produced it, for storing with a Unit's input."""
+
+        return {
+            "item_id": self.item_id,
+            "title": self.title,
+            "source_url": self.source_url,
+            "last_modified": self.last_modified.isoformat(),
+            "content_type": self.content_type,
+            "space_or_project": self.space_or_project,
+            "version": self.version,
+            "author": self.author,
+            "labels": list(self.labels),
+            "extra": dict(self.extra),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> ContentItem:
+        author = payload.get("author")
+        labels = payload.get("labels")
+        extra = payload.get("extra")
+        return cls(
+            item_id=str(payload["item_id"]),
+            title=str(payload.get("title") or ""),
+            source_url=str(payload.get("source_url") or ""),
+            last_modified=datetime.fromisoformat(str(payload["last_modified"])),
+            content_type=str(payload.get("content_type") or "application/octet-stream"),
+            space_or_project=str(payload.get("space_or_project") or ""),
+            version=str(payload.get("version") or ""),
+            author=str(author) if author is not None else None,
+            labels=[str(label) for label in labels] if isinstance(labels, list) else [],
+            extra=dict(extra) if isinstance(extra, dict) else {},
         )
 
 

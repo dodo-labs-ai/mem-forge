@@ -719,7 +719,6 @@ class AgentKnowledgeBundleService:
             or document.source_url
             != f"agent-knowledge://{slugify(str(concept['owner_user_id']))}/{concept['id']}"
             or document.author != document.client
-            or document.raw_content_type != "text/markdown"
             or not any(
                 edge.source_id == source_id
                 and edge.doc_id == str(concept["id"])
@@ -1743,10 +1742,6 @@ class AgentKnowledgeBundleService:
                 version=content_hash(markdown_body),
                 content_hash=content_hash(markdown_body),
                 token_count=None,
-                raw_content_uri=None,
-                raw_content_type="text/markdown",
-                normalized_content_uri=None,
-                pdf_content_uri=None,
                 last_synced=submitted_at,
                 client=client,
             ),

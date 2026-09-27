@@ -76,10 +76,6 @@ async def _document(db: Database, doc_id: str) -> None:
             version="1",
             content_hash="h",
             token_count=1,
-            raw_content_uri=None,
-            raw_content_type="text/html",
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=now,
         )
     )
