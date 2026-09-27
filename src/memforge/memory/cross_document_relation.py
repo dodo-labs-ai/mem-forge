@@ -777,10 +777,13 @@ async def load_relation_subjects(
     Memory whose Evidence the caller already chose: discovery shows its
     challenger from the Evidence Unit it records the run against.
 
-    Discovery and the evaluation set both build subjects here, so an evaluated
-    pair shows the model the same statements, titles, Evidence times and
-    Evidence text that discovery shows it. Discovery groups a challenger's pairs
-    into one request; the evaluation sends each pinned pair on its own.
+    Discovery and the evaluation set both build subjects here with the same
+    rendering. Discovery chooses its challenger's Evidence Unit within the
+    work's Source Unit; the evaluation set chooses among all of the
+    challenger's current Units, so the two show the same Evidence unless the
+    challenger has current Evidence in several Source Units. Discovery groups a
+    challenger's pairs into one request; the evaluation sends each pinned pair
+    on its own.
     """
 
     reader = _RelationEvidenceReader(store)
