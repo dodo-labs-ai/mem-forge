@@ -899,7 +899,8 @@ class ToolClient:
             return {
                 "error": "unsupported resource URL",
                 "hint": (
-                    "Use a relative MemForge /api/v1/documents/{doc_id}/content, /pdf, "
+                    "Use a relative MemForge /api/v1/source-units/{source_unit_id} or "
+                    "/api/v1/documents/{doc_id} URL ending in /content, /pdf or "
                     "/artifacts/{kind}, or /api/v1/source-artifacts/{observation_revision_id} "
                     "URL, or an absolute URL under MEMFORGE_API_URL."
                 ),
@@ -1072,6 +1073,14 @@ def http_error_payload(exc: HTTPError, error: str) -> dict[str, Any]:
     }
 
 
+# Stored Document content is read by Document (the newest copy a readable
+# Source stored) or by Source Unit (the copy that Unit's Source stored).
+_STORED_CONTENT_RESOURCE_IDENTITY = {
+    ("api", "v1", "documents"): "doc_id",
+    ("api", "v1", "source-units"): "source_unit_id",
+}
+
+
 def _parse_resource_url(
     url: str,
     api_base_url: str,
@@ -1097,12 +1106,13 @@ def _parse_resource_url(
     parts = [unquote(part) for part in path.strip("/").split("/") if part]
     if any(part in {".", ".."} or "/" in part or "\\" in part for part in parts):
         return None
-    if len(parts) == 5 and parts[:3] == ["api", "v1", "documents"] and parts[4] == "content":
-        return ResourceTarget(parts[3], "content", path, request_url_for_path(path[len("/api/v1") :]))
-    if len(parts) == 5 and parts[:3] == ["api", "v1", "documents"] and parts[4] == "pdf":
-        return ResourceTarget(parts[3], "pdf", path, request_url_for_path(path[len("/api/v1") :]))
-    if len(parts) == 6 and parts[:3] == ["api", "v1", "documents"] and parts[4] == "artifacts":
-        return ResourceTarget(parts[3], parts[5], path, request_url_for_path(path[len("/api/v1") :]))
+    stored_content_identity = _STORED_CONTENT_RESOURCE_IDENTITY.get(tuple(parts[:3]))
+    if stored_content_identity is not None:
+        request_url = request_url_for_path(path[len("/api/v1") :])
+        if len(parts) == 5 and parts[4] in {"content", "pdf"}:
+            return ResourceTarget(parts[3], parts[4], path, request_url, identity_key=stored_content_identity)
+        if len(parts) == 6 and parts[4] == "artifacts":
+            return ResourceTarget(parts[3], parts[5], path, request_url, identity_key=stored_content_identity)
     if len(parts) == 4 and parts[:3] == ["api", "v1", "source-artifacts"]:
         return ResourceTarget(
             parts[3],

@@ -205,10 +205,6 @@ class _Store:
             version="1",
             content_hash="",
             token_count=None,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=None,  # type: ignore[arg-type]
         )
 

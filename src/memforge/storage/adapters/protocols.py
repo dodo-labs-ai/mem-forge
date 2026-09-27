@@ -23,6 +23,7 @@ from memforge.models import (
     MemorySource,
     MemorySourceRef,
     Project,
+    SourceUnitInput,
 )
 from memforge.memory.evidence import (
     ActiveSupportEvidence,
@@ -350,23 +351,38 @@ class RelationalStore(Protocol):
         self,
         doc_id: str,
         *,
+        source_id: str,
         source_activity: SourceActivityLease | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Remove one Source's copy of a Document it no longer holds.
+
+        The stored input of the Source's Units that no longer hold the
+        Document is removed and its objects queued for cleanup. The shared
+        Document row stays while another Source holds it or names it as
+        Memory provenance.
+        """
+        ...
     async def rebind_projected_document_support(
         self,
         old_doc_id: str,
         new_doc_id: str,
         *,
+        source_id: str,
         source_activity: SourceActivityLease | None = None,
     ) -> None: ...
     async def record_source_projection(
         self,
         projection: SourceProjection,
         *,
+        unit_input: SourceUnitInput | None = None,
         expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
     ) -> None:
         """Persist one projection atomically; revisions are immutable.
+
+        ``unit_input`` is recorded as the stored input of the projected Unit
+        revision in the same transaction, unless a later revision of the Unit
+        is already current.
 
         Observation Revisions are content-addressed: a projected revision whose
         id is stored keeps the stored row, and only its identity (Observation,
@@ -414,6 +430,12 @@ class RelationalStore(Protocol):
         *,
         current_only: bool = False,
     ) -> SourceUnit | None: ...
+    async def get_source_unit_input(self, source_unit_id: str) -> SourceUnitInput | None:
+        """The stored input of the Unit's current revision, or ``None`` when that revision has none."""
+        ...
+    async def list_document_source_unit_inputs(self, document_id: str) -> list[SourceUnitInput]:
+        """The current stored input of every Source Unit that holds the Document, newest first."""
+        ...
     async def list_source_unit_document_ids(
         self,
         source_unit_id: str,
@@ -542,6 +564,7 @@ class RelationalStore(Protocol):
         plan: LifecyclePlan,
         *,
         document: DocumentRecord | None = None,
+        unit_input: SourceUnitInput | None = None,
         derivation_id: str | None = None,
         derivation_context_identity_hash: str | None = None,
         required_derivation_work_ids: tuple[str, ...] = (),

@@ -77,10 +77,6 @@ def _document(doc_id: str) -> DocumentRecord:
         version=f"v-{doc_id}",
         content_hash=f"hash-{doc_id}",
         token_count=None,
-        raw_content_uri=None,
-        raw_content_type=None,
-        normalized_content_uri=None,
-        pdf_content_uri=None,
         last_synced=datetime.fromisoformat("2026-06-22T12:00:00+00:00"),
     )
 

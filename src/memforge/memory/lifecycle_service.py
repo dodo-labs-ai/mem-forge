@@ -691,10 +691,6 @@ class MemoryLifecycleService:
             version=content_hash(document_body),
             content_hash=content_hash(document_body),
             token_count=len(document_body.split()),
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=observed_at,
         )
 
@@ -713,7 +709,7 @@ class MemoryLifecycleService:
         """
 
         try:
-            await self.db.delete_projected_document(doc_id)
+            await self.db.delete_projected_document(doc_id, source_id="user_correction")
         except Exception:
             logger.exception("Failed to discard uncommitted correction document %s", doc_id)
 
@@ -750,10 +746,6 @@ class MemoryLifecycleService:
                 version=content_hash(document_body),
                 content_hash=content_hash(document_body),
                 token_count=len(document_body.split()),
-                raw_content_uri=None,
-                raw_content_type=None,
-                normalized_content_uri=None,
-                pdf_content_uri=None,
                 last_synced=observed_at,
                 client=client,
             )

@@ -139,10 +139,6 @@ def make_document(
         version="1",
         content_hash=f"hash-{doc_id}",
         token_count=1,
-        raw_content_uri=None,
-        raw_content_type="text/plain",
-        normalized_content_uri=None,
-        pdf_content_uri=None,
         last_synced=now,
         client=client,
     )

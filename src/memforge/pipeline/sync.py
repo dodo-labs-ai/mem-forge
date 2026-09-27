@@ -14,6 +14,7 @@ independently with retry logic and per-item error isolation.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -48,6 +49,7 @@ from memforge.models import (
     DocumentRecord,
     FailedDoc,
     MemoryExtractionResult,
+    SourceUnitInput,
     SyncState,
     content_hash as compute_content_hash,
 )
@@ -2002,6 +2004,7 @@ class GeneSyncOrchestrator:
             user_id=context.user_id,
             protected_source_observation_ids=(extraction.protected_source_observation_ids),
             document=context.document,
+            unit_input=context.unit_input,
             derivation_id=recovery_commit.applied_derivation_id,
             derivation_reprocess_all_current_observations=(
                 context.reprocess_all_current_observations
@@ -2212,8 +2215,8 @@ class GeneSyncOrchestrator:
         # 1. Fetch raw content
         # ------------------------------------------------------------------
         if stored_document is None:
-            previous_document = await self.db.get_document(doc_id)
-            item.stored_extra = dict(previous_document.item_extra) if previous_document is not None else {}
+            previous_input = await self._stored_unit_input(source_id, doc_id)
+            item.stored_extra = dict(previous_input.item.extra) if previous_input is not None else {}
         raw = stored_document.raw if stored_document is not None else await gene.fetch(item)
         logger.debug("Fetched %s (%d bytes)", doc_id, len(raw.body))
         self._memory_sample(
@@ -2526,27 +2529,25 @@ class GeneSyncOrchestrator:
             if predecessor is not None:
                 lineage_predecessor_docs.append(predecessor)
 
-        # Document artifacts retain their existing normalized-content hash
-        # contract. The projection delta independently controls semantic work.
-        # This keeps vector/document freshness compatible while ensuring a
+        # The Unit's stored input is what this Source stored when it recorded
+        # the committed revision, wherever the Unit's Document was then. Its
+        # normalized-content hash decides whether the content changed; the
+        # projection delta independently controls semantic work, so a
         # provider revision or location-only move does not trigger extraction.
         new_hash = compute_content_hash(markdown_body)
         async with self._db_lock:
-            existing_hash = await self.db.get_content_hash(doc_id)
-            existing_doc = await self.db.get_document(doc_id)
-            if existing_doc is None and lineage_predecessor_docs:
-                existing_doc = lineage_predecessor_docs[0]
-                existing_hash = existing_doc.content_hash
+            stored_input = await self.db.get_source_unit_input(source_unit.id)
+        existing_hash = stored_input.normalized_content_hash if stored_input is not None else None
         content_unchanged = existing_hash == new_hash
         previous_markdown = (
-            self._read_previous_normalized_content(existing_doc)
+            self._read_previous_normalized_content(stored_input)
             if existing_hash is not None and existing_hash != new_hash
             else None
         )
 
         requires_pdf_uri = not raw.authoritative_empty and gene.requires_pdf_artifact(
             item=item,
-            existing_doc=existing_doc,
+            stored_input=stored_input,
             existing_hash=existing_hash,
             new_hash=(existing_hash if not projection_requires_extraction else new_hash),
         )
@@ -2557,26 +2558,32 @@ class GeneSyncOrchestrator:
         # The stored raw content is the input of the committed Unit revision:
         # a projection that moves the Unit to a new revision stores the raw
         # content it was projected from, even when the normalized markdown is
-        # unchanged. Every path stores it before the revision is recorded, so
-        # a failed save fails the Document before anything commits. A
-        # reprocess from stored input reads its raw content from storage and
-        # keeps the provider exports it cannot repeat; only a changed
-        # normalization is stored again.
+        # unchanged. Every path stores it under this Source's object keys
+        # before the revision is recorded with it, so a failed save fails the
+        # Document before anything commits. A reprocess from stored input
+        # reads its raw content from storage and keeps the provider exports it
+        # cannot repeat; only a changed normalization is stored again.
         reuse_content_artifacts = content_unchanged and (stored_document is not None or not force_reprocess)
         unit_revision_unchanged = (
             projection.deltas[0].previous_unit_revision_id == projection.source_unit_revisions[0].id
         )
-        raw_uri = (
-            existing_doc.raw_content_uri
-            if reuse_content_artifacts and unit_revision_unchanged and existing_doc
-            else None
-        )
+        reused_raw: SourceUnitInput | None = None
+        raw_sha256: str | None = None
         if stored_document is not None:
-            raw_uri = stored_document.document.raw_content_uri
-        norm_uri = existing_doc.normalized_content_uri if reuse_content_artifacts and existing_doc else None
+            # A reprocess read these bytes from the stored object.
+            reused_raw = stored_document.unit_input
+            raw_sha256 = hashlib.sha256(raw.body).hexdigest()
+        elif reuse_content_artifacts and unit_revision_unchanged and stored_input is not None:
+            reused_raw = stored_input
+            raw_sha256 = stored_input.raw_content_sha256
+        raw_uri = reused_raw.raw_content_uri if reused_raw is not None else None
+        raw_content_type = reused_raw.raw_content_type if raw_uri and reused_raw is not None else raw.content_type
+        norm_uri = (
+            stored_input.normalized_content_uri if reuse_content_artifacts and stored_input is not None else None
+        )
         stored_content_artifact = False
-        raw_content_type = existing_doc.raw_content_type if raw_uri and existing_doc else raw.content_type
         if not raw_uri:
+            raw_sha256 = hashlib.sha256(raw.body).hexdigest()
             raw_uri = self.doc_store.store_raw(
                 source_id=source_id,
                 doc_id=doc_id,
@@ -2607,8 +2614,8 @@ class GeneSyncOrchestrator:
         # 3b. Export PDF (if gene supports it)
         # ------------------------------------------------------------------
         pdf_uri = (
-            existing_doc.pdf_content_uri
-            if (reuse_content_artifacts or stored_document is not None) and existing_doc
+            stored_input.pdf_content_uri
+            if (reuse_content_artifacts or stored_document is not None) and stored_input is not None
             else None
         )
         should_fetch_pdf = (
@@ -2667,13 +2674,22 @@ class GeneSyncOrchestrator:
             version=item.version,
             content_hash=new_hash,
             token_count=token_count,
-            raw_content_uri=raw_uri,
-            raw_content_type=raw_content_type,
-            normalized_content_uri=norm_uri,
-            pdf_content_uri=pdf_uri,
             last_synced=now,
             client=normalized.source_semantics.get("client") or None,
             item_extra=dict(item.extra),
+        )
+        unit_input = SourceUnitInput(
+            source_unit_id=source_unit.id,
+            unit_revision_id=projection.source_unit_revisions[0].id,
+            source_id=source_id,
+            document_id=doc_id,
+            item=item,
+            raw_content_uri=raw_uri,
+            raw_content_type=raw_content_type,
+            raw_content_sha256=raw_sha256,
+            normalized_content_uri=norm_uri,
+            normalized_content_hash=new_hash,
+            pdf_content_uri=pdf_uri,
         )
 
         if skip_semantic_work:
@@ -2681,6 +2697,7 @@ class GeneSyncOrchestrator:
             async with self._db_lock:
                 await self.db.record_source_projection(
                     projection,
+                    unit_input=unit_input,
                     expected_source_activity_epoch=expected_source_activity_epoch,
                     source_activity=source_activity,
                 )
@@ -2692,6 +2709,7 @@ class GeneSyncOrchestrator:
             await self._finalize_projected_document_moves(
                 predecessor_docs=lineage_predecessor_docs,
                 current_doc_id=doc_id,
+                source_id=source_id,
                 source_unit_id=source_unit.id,
                 source_activity=source_activity,
             )
@@ -2711,7 +2729,7 @@ class GeneSyncOrchestrator:
 
         # Determine change type for changelog
         change_type = "updated" if existing_hash is not None else "created"
-        previous_version = existing_doc.version if existing_doc else None
+        previous_version = stored_input.item.version if stored_input is not None else None
         update_plan: DocumentUpdatePlan | None = None
         if change_type == "updated":
             update_plan = plan_document_update(
@@ -2749,6 +2767,7 @@ class GeneSyncOrchestrator:
                     else None
                 ),
                 document=doc_record,
+                unit_input=unit_input,
                 expected_source_activity_epoch=expected_source_activity_epoch,
                 source_activity=source_activity,
                 lifecycle_execution_owner_id=lifecycle_execution_owner_id,
@@ -2773,6 +2792,7 @@ class GeneSyncOrchestrator:
             await self._finalize_projected_document_moves(
                 predecessor_docs=lineage_predecessor_docs,
                 current_doc_id=doc_id,
+                source_id=source_id,
                 source_unit_id=source_unit.id,
                 source_activity=source_activity,
             )
@@ -2813,6 +2833,7 @@ class GeneSyncOrchestrator:
             reprocess_all_current_observations=force_reprocess,
             reprocess_operation_id=(run_id if force_reprocess else None),
             support_without_baseline=reprocessing,
+            unit_input=unit_input,
         )
         # Extraction owns the only document-content model call. Historical
         # cross-document/cross-source discovery remains post-commit Relation
@@ -2879,6 +2900,7 @@ class GeneSyncOrchestrator:
             user_id=actor_user_id,
             protected_source_observation_ids=(extraction_result.protected_source_observation_ids),
             document=doc_record,
+            unit_input=unit_input,
             derivation_id=extraction_result.derivation_id,
             derivation_reprocess_all_current_observations=(
                 derivation_context.reprocess_all_current_observations
@@ -2944,6 +2966,7 @@ class GeneSyncOrchestrator:
         await self._finalize_projected_document_moves(
             predecessor_docs=lineage_predecessor_docs,
             current_doc_id=doc_id,
+            source_id=source_id,
             source_unit_id=source_unit.id,
             source_activity=source_activity,
         )
@@ -3189,12 +3212,12 @@ class GeneSyncOrchestrator:
             "changed_ratio": plan.changed_ratio,
         }
 
-    def _read_previous_normalized_content(self, existing_doc: DocumentRecord | None) -> str | None:
-        """Read the previous normalized markdown before the current sync overwrites it."""
-        if not existing_doc or not existing_doc.normalized_content_uri:
+    def _read_previous_normalized_content(self, stored_input: SourceUnitInput | None) -> str | None:
+        """Read the normalized markdown of the Unit's stored input before this sync overwrites it."""
+        if stored_input is None or not stored_input.normalized_content_uri:
             return None
 
-        uri = existing_doc.normalized_content_uri
+        uri = stored_input.normalized_content_uri
         if self.doc_store and hasattr(self.doc_store, "read_normalized"):
             try:
                 content = self.doc_store.read_normalized(uri)
@@ -3394,10 +3417,11 @@ class GeneSyncOrchestrator:
         *,
         predecessor_docs: list[DocumentRecord],
         current_doc_id: str,
+        source_id: str,
         source_unit_id: str,
         source_activity: SourceActivityLease | None = None,
     ) -> None:
-        """Atomically rebind provenance, then remove obsolete document aliases."""
+        """Atomically rebind this Source's provenance, then remove its obsolete document aliases."""
         if not predecessor_docs:
             return
         for predecessor in predecessor_docs:
@@ -3406,6 +3430,7 @@ class GeneSyncOrchestrator:
             await self.db.rebind_projected_document_support(
                 predecessor.doc_id,
                 current_doc_id,
+                source_id=source_id,
                 source_activity=source_activity,
             )
             deletion_context = {
@@ -3417,12 +3442,14 @@ class GeneSyncOrchestrator:
             if self.memory_store is not None:
                 await self.memory_store.delete_projected_document(
                     predecessor.doc_id,
+                    source_id=source_id,
                     deletion_context=deletion_context,
                     source_activity=source_activity,
                 )
             else:
                 await self.db.delete_projected_document(
                     predecessor.doc_id,
+                    source_id=source_id,
                     source_activity=source_activity,
                 )
 
@@ -3488,10 +3515,12 @@ class GeneSyncOrchestrator:
                         await self.db.rebind_projected_document_support(
                             doc_id,
                             current_document_id,
+                            source_id=source_id,
                             source_activity=source_activity,
                         )
                         await self.memory_store.delete_projected_document(
                             doc_id,
+                            source_id=source_id,
                             deletion_context={
                                 "deletion_kind": "source_unit_move",
                                 "reason": "historical document locator is no longer current",
@@ -3556,6 +3585,7 @@ class GeneSyncOrchestrator:
                 if lifecycle_result["can_delete_document"]:
                     await self.memory_store.delete_projected_document(
                         doc_id,
+                        source_id=source_id,
                         deletion_context={
                             "deletion_kind": "source_absence",
                             "reason": "not_returned_by_latest_successful_crawl",
@@ -3597,39 +3627,17 @@ class GeneSyncOrchestrator:
     # ==================================================================
 
     async def _get_indexed_doc_ids(self, source_id: str) -> set[str]:
-        """Get all doc_ids currently indexed for a source."""
-        doc_ids: set[str] = set()
-        try:
-            async with self.db.db.execute(
-                "SELECT doc_id FROM documents WHERE source = ?",
-                (source_id,),
-            ) as cursor:
-                async for row in cursor:
-                    doc_ids.add(row[0])
-        except Exception as e:
-            logger.error(
-                "Failed to fetch indexed doc_ids for %s: %s",
-                source_id,
-                e,
-            )
-        return doc_ids
+        """The Documents the Source holds: those with a current Source Unit."""
+        return await self.db.list_indexed_doc_ids(source_id)
 
     async def _count_missing_pdf_uris(self, source_id: str) -> int:
-        """Count non-empty Confluence documents that still require PDF provenance."""
-        async with self.db.db.execute(
-            """SELECT COUNT(*)
-               FROM documents d
-               JOIN sources s ON s.id = d.source
-               WHERE d.source = ?
-                 AND s.type = 'confluence'
-                 AND d.normalized_content_uri IS NOT NULL
-                 AND d.normalized_content_uri <> ''
-                 AND (d.content_hash IS NULL OR d.content_hash <> ?)
-                 AND (d.pdf_content_uri IS NULL OR d.pdf_content_uri = '')""",
-            (source_id, compute_content_hash("")),
-        ) as cursor:
-            row = await cursor.fetchone()
-            return int(row[0] if row else 0)
+        """Count non-empty Confluence Units whose stored input still lacks PDF provenance."""
+        return await self.db.count_missing_pdf_uris(source_id)
+
+    async def _stored_unit_input(self, source_id: str, doc_id: str) -> SourceUnitInput | None:
+        """The stored input of the Source's current Unit for this Document, if it recorded one."""
+        source_unit = await self.db.find_source_unit_by_document_id(source_id, doc_id, current_only=True)
+        return await self.db.get_source_unit_input(source_unit.id) if source_unit is not None else None
 
     async def _insert_changelog(self, entry: ChangelogEntry) -> None:
         """Insert a changelog entry into the database.

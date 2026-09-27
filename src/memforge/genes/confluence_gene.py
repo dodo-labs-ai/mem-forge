@@ -37,6 +37,7 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+    SourceUnitInput,
 )
 from memforge.pipeline.normalizer_utils import html_to_markdown, strip_boilerplate
 from memforge.source_artifacts import (
@@ -818,16 +819,16 @@ class ConfluenceGene(Gene):
         self,
         *,
         item: ContentItem,
-        existing_doc: object | None,
+        stored_input: SourceUnitInput | None,
         existing_hash: str | None,
         new_hash: str,
     ) -> bool:
         """Confluence pages require PDF provenance for user-facing source review."""
         del item
         return (
-            existing_doc is None
+            stored_input is None
             or existing_hash != new_hash
-            or not getattr(existing_doc, "pdf_content_uri", None)
+            or not stored_input.pdf_content_uri
         )
 
     async def normalize(self, raw: RawContent) -> NormalizedContent:

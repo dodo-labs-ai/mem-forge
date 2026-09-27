@@ -687,10 +687,6 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
             version="1",
             content_hash=hashlib.sha256(body.encode()).hexdigest(),
             token_count=10,
-            raw_content_uri=None,
-            raw_content_type="text/markdown",
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=now,
         )
     )
@@ -1061,10 +1057,6 @@ async def test_deriver_stages_projection_extraction_v9_without_ingestion_replay(
         version="1",
         content_hash=hashlib.sha256(body.encode()).hexdigest(),
         token_count=10,
-        raw_content_uri=None,
-        raw_content_type="text/markdown",
-        normalized_content_uri=None,
-        pdf_content_uri=None,
         last_synced=now,
     )
     seen_batches = []
