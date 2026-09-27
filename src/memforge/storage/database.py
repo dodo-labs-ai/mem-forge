@@ -148,7 +148,9 @@ from memforge.memory.cross_document_relation import (
     CrossDocumentRelationOutcome,
     CurrentCrossDocumentRelation,
     RelationDismissalConflict,
+    newest_evidence_unit_id,
     pair_key,
+    source_evidence_time,
 )
 from memforge.memory.cross_source_conflict_reviews import CROSS_SOURCE_CONFLICT_REVIEW_KIND
 from memforge.memory.cross_source_review_conversion import (
@@ -10627,7 +10629,7 @@ class Database:
             """SELECT 1 AS ready FROM relation_discovery_work
                WHERE attempts < ? AND (
                      status = 'pending'
-                  OR (status = 'failed' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+                  OR (status = 'failed' AND next_attempt_at <= ?)
                   OR (status = 'running' AND lease_until < ?)
                )
                LIMIT 1""",
@@ -10661,7 +10663,7 @@ class Database:
                        WHERE attempts < ?
                          AND (
                            status = 'pending'
-                           OR (status = 'failed' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+                           OR (status = 'failed' AND next_attempt_at <= ?)
                            OR (status = 'running' AND lease_until < ?)
                          )
                          {source_clause}
@@ -10679,7 +10681,7 @@ class Database:
                             WHERE id = ? AND attempts = ?
                               AND (
                                 status = 'pending'
-                                OR (status = 'failed' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+                                OR (status = 'failed' AND next_attempt_at <= ?)
                                 OR (status = 'running' AND lease_until < ?)
                               )""",
                         (
@@ -10851,6 +10853,10 @@ class Database:
         next_attempt_at: str | None,
         exhausted: bool,
     ) -> None:
+        """Record a failure; exhausted work is not retried, other work is retried at ``next_attempt_at``."""
+
+        if not exhausted and next_attempt_at is None:
+            raise ValueError("retried relation discovery work requires its next attempt time")
         await self._finish_relation_discovery_work(
             work_id,
             worker_id=worker_id,
@@ -11592,11 +11598,21 @@ class Database:
         source_id: str,
         source_unit_id: str,
     ) -> EvidenceUnit | None:
+        """The Memory's current Evidence Unit in one Source Unit that relation discovery reads.
+
+        A Memory can hold several active Supports in one Source Unit, so this
+        is the Unit ``newest_evidence_unit_id`` chooses by its Primary
+        Evidence's time.
+        """
         rows = await self.db.execute_fetchall(
-            """SELECT DISTINCT eu.id
+            """SELECT DISTINCT eu.id, primary_revision.observed_at
                FROM memory_unit_support_assertions msa
                JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
                JOIN source_units su ON su.id = eu.source_lineage_id
+               JOIN evidence_references primary_reference
+                 ON primary_reference.evidence_unit_id = eu.id AND primary_reference.role = 'primary'
+               JOIN source_observation_revisions primary_revision
+                 ON primary_revision.id = primary_reference.observation_revision_id
               WHERE msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1
                 AND eu.source_id = ? AND eu.source_lineage_id = ?
                 AND (
@@ -11610,15 +11626,13 @@ class Database:
                     WHERE er.evidence_unit_id = eu.id
                       AND er.role IN ('primary', 'required')
                       AND er.observation_revision_id != so.current_revision_id
-                )
-              ORDER BY eu.id""",
+                )""",
             (memory_id, source_id, source_id, source_unit_id),
         )
-        if not rows:
-            return None
-        if len(rows) != 1:
-            raise ValueError("current relation evidence is ambiguous")
-        return await self.get_evidence_unit(str(rows[0]["id"]))
+        chosen = newest_evidence_unit_id(
+            {str(row["id"]): source_evidence_time(row["observed_at"]) for row in rows}
+        )
+        return await self.get_evidence_unit(chosen) if chosen is not None else None
 
     async def replace_evidence_relations(
         self,

@@ -23,7 +23,12 @@ class RelationDiscoveryWorkStatus(str, Enum):
 
 
 class RelationDiscoveryWorkState(str, Enum):
-    """Operator-facing states; exhausted is failed work that used every attempt."""
+    """Operator-facing states.
+
+    Exhausted is failed work that is not retried: it used every attempt, or its
+    failure repeats on every attempt and so has no retry scheduled. Failed is
+    work waiting for its scheduled retry.
+    """
 
     EXHAUSTED = "exhausted"
     COMPLETED = "completed"
@@ -68,9 +73,11 @@ def relation_discovery_work_selection_sql(
     clauses: list[str]
     params: list[object]
     if selection.state is RelationDiscoveryWorkState.EXHAUSTED:
-        clauses, params = ["status = 'failed'", "attempts >= ?"], [selection.max_attempts]
+        clauses = ["status = 'failed'", "(attempts >= ? OR next_attempt_at IS NULL)"]
+        params = [selection.max_attempts]
     elif selection.state is RelationDiscoveryWorkState.FAILED:
-        clauses, params = ["status = 'failed'", "attempts < ?"], [selection.max_attempts]
+        clauses = ["status = 'failed'", "attempts < ?", "next_attempt_at IS NOT NULL"]
+        params = [selection.max_attempts]
     else:
         clauses, params = ["status = 'completed'"], []
     for column, operator, value in (
@@ -101,7 +108,8 @@ def relation_discovery_work_rerunnable(work: RelationDiscoveryWork, *, max_attem
     """The same rule as ``rerunnable_relation_discovery_work_sql``, for one loaded item."""
 
     return work.status is RelationDiscoveryWorkStatus.COMPLETED or (
-        work.status is RelationDiscoveryWorkStatus.FAILED and work.attempts >= max_attempts
+        work.status is RelationDiscoveryWorkStatus.FAILED
+        and (work.attempts >= max_attempts or work.next_attempt_at is None)
     )
 
 

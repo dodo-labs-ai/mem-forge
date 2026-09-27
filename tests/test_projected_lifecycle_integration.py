@@ -108,6 +108,7 @@ from memforge.memory.cross_document_relation import (
     CrossDocumentRelationOutcome,
 )
 from memforge.memory.relation_discovery import RelationDiscovery
+from memforge.memory.relation_discovery_contract import RelationDiscoveryWorkSelection, RelationDiscoveryWorkState
 from memforge.models import (
     ContentItem,
     DocumentRecord,
@@ -7512,6 +7513,170 @@ async def _create_relation_discovery_fixture(
     )
     [memory] = await db.list_memories(source="src-1", status="active")
     return projection, memory
+
+
+async def _attach_current_evidence_unit(
+    db: Database,
+    memory: Memory,
+    *,
+    original_unit_id: str,
+    evidence_unit_id: str,
+    observed_at: str,
+) -> None:
+    """Give ``memory`` another current Evidence Unit in its Source Unit, on its own Observation.
+
+    This is what an ``equivalent`` Sparse Relation does when it attaches a
+    Candidate's Evidence Unit to an existing Memory.
+    """
+
+    [support] = await db.db.execute_fetchall(
+        "SELECT * FROM memory_unit_support_assertions WHERE memory_id = ? AND evidence_unit_id = ?",
+        (memory.id, original_unit_id),
+    )
+    [primary] = await db.db.execute_fetchall(
+        "SELECT * FROM evidence_references WHERE evidence_unit_id = ? AND role = 'primary'", (original_unit_id,)
+    )
+    observation_id = f"obs-{evidence_unit_id}"
+    revision_id = f"rev-{evidence_unit_id}"
+    await db.db.execute(
+        """INSERT INTO source_observations (
+               id, source_id, source_unit_id, observation_type, provider_key, locator_json,
+               current_revision_id, updated_at
+           ) SELECT ?, source_id, source_unit_id, observation_type, ?, locator_json, ?, updated_at
+               FROM source_observations WHERE id = ?""",
+        (observation_id, observation_id, revision_id, primary["observation_id"]),
+    )
+    await db.db.execute(
+        """INSERT INTO source_observation_revisions (
+               id, observation_id, semantic_hash, content, metadata_json, observed_at, profile_name,
+               profile_version, coordinate_space, representation_schema_name,
+               representation_schema_version, created_at
+           ) SELECT ?, ?, semantic_hash, content, metadata_json, ?, profile_name, profile_version,
+                    coordinate_space, representation_schema_name, representation_schema_version, created_at
+               FROM source_observation_revisions WHERE id = ?""",
+        (revision_id, observation_id, observed_at, primary["observation_revision_id"]),
+    )
+    unit_columns = [row["name"] for row in await db.db.execute_fetchall("PRAGMA table_info(evidence_units)")]
+    copied = ", ".join("?" if column == "id" else column for column in unit_columns)
+    await db.db.execute(
+        f"INSERT INTO evidence_units ({', '.join(unit_columns)}) SELECT {copied} FROM evidence_units WHERE id = ?",
+        (evidence_unit_id, original_unit_id),
+    )
+    await db.db.execute(
+        """INSERT INTO evidence_references (
+               id, evidence_unit_id, role, part_kind, anchor_kind, observation_id, observation_revision_id,
+               fragment_id, range_start, range_end, raw_content_sha256, presentation_sha256, excerpt,
+               artifact_metadata_json, created_at
+           ) SELECT ?, ?, role, part_kind, anchor_kind, ?, ?, fragment_id, range_start, range_end,
+                    raw_content_sha256, presentation_sha256, excerpt, artifact_metadata_json, created_at
+               FROM evidence_references WHERE id = ?""",
+        (f"ref-{evidence_unit_id}", evidence_unit_id, observation_id, revision_id, primary["id"]),
+    )
+    await db.db.execute(
+        """INSERT INTO memory_unit_support_assertions (
+               id, memory_id, evidence_unit_id, source_id, access_context_hash, active, created_at
+           ) VALUES (?, ?, ?, ?, ?, 1, ?)""",
+        (
+            f"support-{evidence_unit_id}",
+            memory.id,
+            evidence_unit_id,
+            support["source_id"],
+            support["access_context_hash"],
+            support["created_at"],
+        ),
+    )
+    await db.db.commit()
+
+
+async def _primary_observed_at(db: Database, evidence_unit_id: str) -> str:
+    [row] = await db.db.execute_fetchall(
+        """SELECT sor.observed_at FROM evidence_references er
+             JOIN source_observation_revisions sor ON sor.id = er.observation_revision_id
+            WHERE er.evidence_unit_id = ? AND er.role = 'primary'""",
+        (evidence_unit_id,),
+    )
+    return row["observed_at"]
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_reads_the_newest_of_several_current_evidence_units_in_the_source_unit(
+    db: Database,
+) -> None:
+    projection, memory = await _create_relation_discovery_fixture(db, run_id="projection-several-relation-evidence")
+    source_unit_id = projection.source_units[0].id
+    original = await db.get_current_relation_evidence_unit(memory.id, source_id="src-1", source_unit_id=source_unit_id)
+    assert original is not None
+    original_observed_at = await _primary_observed_at(db, original.id)
+    # Same Evidence time with a higher id, then a newer Evidence time with a higher id still.
+    await _attach_current_evidence_unit(
+        db,
+        memory,
+        original_unit_id=original.id,
+        evidence_unit_id=f"{original.id}~same-time",
+        observed_at=original_observed_at,
+    )
+    same_time = await db.get_current_relation_evidence_unit(memory.id, source_id="src-1", source_unit_id=source_unit_id)
+    await _attach_current_evidence_unit(
+        db,
+        memory,
+        original_unit_id=original.id,
+        evidence_unit_id=f"{original.id}~newer",
+        observed_at="2999-01-01T00:00:00+00:00",
+    )
+
+    result = await RelationDiscovery(
+        store=db,
+        candidate_retriever=_EmptyRelationCandidates(),
+        pair_classifier=_DeterministicRelationClassifier(),
+    ).process_slice(worker_id="relation-worker")
+
+    assert same_time is not None and same_time.id == original.id
+    assert result.completed_work == 1
+    [run] = await db.db.execute_fetchall("SELECT evidence_unit_id FROM relation_runs")
+    assert run["evidence_unit_id"] == f"{original.id}~newer"
+
+
+@pytest.mark.asyncio
+async def test_relation_work_failed_without_a_scheduled_retry_is_exhausted_before_its_last_attempt(
+    db: Database,
+) -> None:
+    await _create_relation_discovery_fixture(db, run_id="projection-deterministic-relation-failure")
+    [work] = await db.lease_relation_discovery_work(
+        worker_id="relation-worker", limit=1, lease_seconds=60, max_attempts=5
+    )
+    with pytest.raises(ValueError, match="requires its next attempt time"):
+        await db.fail_relation_discovery_work(
+            work.request.id,
+            worker_id="relation-worker",
+            lease_token=work.lease_token or "",
+            error="MemoryPairClassificationError: rejected request",
+            error_code="request_error",
+            next_attempt_at=None,
+            exhausted=False,
+        )
+
+    await db.fail_relation_discovery_work(
+        work.request.id,
+        worker_id="relation-worker",
+        lease_token=work.lease_token or "",
+        error="MemoryPairClassificationError: rejected request",
+        error_code="request_error",
+        next_attempt_at=None,
+        exhausted=True,
+    )
+
+    assert work.attempts == 1
+    assert await db.has_ready_relation_discovery_work(max_attempts=5) is False
+    assert await db.lease_relation_discovery_work(
+        worker_id="relation-worker", limit=1, lease_seconds=60, max_attempts=5
+    ) == []
+    [exhausted] = await db.list_relation_discovery_work(
+        RelationDiscoveryWorkSelection(state=RelationDiscoveryWorkState.EXHAUSTED, max_attempts=5), limit=10
+    )
+    assert (exhausted.request.id, exhausted.error_code) == (work.request.id, "request_error")
+    assert await db.count_relation_discovery_work(
+        RelationDiscoveryWorkSelection(state=RelationDiscoveryWorkState.FAILED, max_attempts=5)
+    ) == 0
 
 
 @pytest.mark.asyncio

@@ -21,7 +21,11 @@ from memforge.memory.relation_candidate_retrieval import (
     RetrievedRelationCandidate,
 )
 from memforge.memory.relation_classifier import MemoryPairClassificationError
-from memforge.memory.relation_discovery import RelationDiscovery, RelationDiscoveryBudget
+from memforge.memory.relation_discovery import (
+    DEFAULT_RELATION_DISCOVERY_BUDGET,
+    RelationDiscovery,
+    RelationDiscoveryBudget,
+)
 from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryRequest,
     RelationDiscoveryWork,
@@ -159,7 +163,7 @@ class _Store:
 
     async def get_current_relation_evidence_unit(self, *_args, **_kwargs):
         return EvidenceUnit(
-            id="evidence-1",
+            id=primary_evidence_unit_fixture(self.challenger.id).evidence_unit_id,
             source_id="src-challenger",
             doc_id="doc-challenger",
             doc_revision_id="unit-revision-1",
@@ -250,9 +254,10 @@ class _CompletionFailingStore(_FailingStore):
 
 
 class _UsageReportingFailureClassifier(_Classifier):
-    def __init__(self, error_code: str | None = "output_invalid") -> None:
+    def __init__(self, error_code: str | None = "output_invalid", terminal_category: str | None = None) -> None:
         super().__init__()
         self.error_code = error_code
+        self.terminal_category = terminal_category
 
     async def classify(self, pairs):
         raise MemoryPairClassificationError(
@@ -260,6 +265,7 @@ class _UsageReportingFailureClassifier(_Classifier):
             pair_count=len(pairs),
             llm_calls=2,
             prompt_chars=321,
+            terminal_category=self.terminal_category,
             error_code=self.error_code,
         )
 
@@ -489,6 +495,28 @@ async def test_failed_classification_usage_counts_against_slice_budget(
     assert store.failure is not None
     assert store.failure["error_code"] == recorded_code
     assert store.failure["error"].startswith("MemoryPairClassificationError: ")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_category", "exhausted"),
+    [("request_error", True), ("invalid_response", True), ("provider_error", False), ("deadline_exceeded", False)],
+)
+async def test_failure_that_repeats_on_every_attempt_finishes_the_work_on_its_first_attempt(
+    terminal_category: str, exhausted: bool
+) -> None:
+    challenger = _memory("challenger", "Current claim")
+    candidate = _memory("candidate", "Other claim")
+    store = _FailingStore(challenger, (candidate,))
+    classifier = _UsageReportingFailureClassifier(terminal_category, terminal_category=terminal_category)
+
+    await _discovery(store, (candidate,), classifier).process_slice(worker_id="worker-1")
+
+    assert store.work.attempts < DEFAULT_RELATION_DISCOVERY_BUDGET.max_attempts
+    assert store.failure is not None
+    assert store.failure["error_code"] == terminal_category
+    assert store.failure["exhausted"] is exhausted
+    assert (store.failure["next_attempt_at"] is None) is exhausted
 
 
 @pytest.mark.asyncio

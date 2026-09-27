@@ -21,6 +21,7 @@ from memforge.memory.cross_document_relation import (
     RelationSubject,
     StructuredCrossDocumentRelationClassifier,
     load_relation_subjects,
+    newest_evidence_unit_id,
     pair_key,
 )
 from memforge.memory.evidence import EvidencePartKind, EvidenceRole
@@ -607,3 +608,70 @@ def test_engine_classifies_discovery_only_with_a_capable_client(client, expects_
 
     assert isinstance(engine.pair_classifier, StructuredCrossDocumentRelationClassifier) is expects_discovery
     assert (engine.pair_classifier is None) is not expects_discovery
+
+
+@pytest.mark.parametrize(
+    ("evidence_times", "chosen"),
+    [
+        ({"eu-b": "2026-03-24", "eu-a": "2026-03-25"}, "eu-a"),
+        ({"eu-a": "2026-03-24", "eu-b": "2026-03-25"}, "eu-b"),
+        ({"eu-b": "2026-03-25", "eu-a": "2026-03-25"}, "eu-a"),
+        ({"eu-a": None, "eu-b": "2026-03-01"}, "eu-b"),
+        ({"eu-b": None, "eu-a": None}, "eu-a"),
+        ({}, None),
+    ],
+)
+def test_relation_evidence_is_the_newest_current_unit_with_ties_to_the_lowest_id(evidence_times, chosen) -> None:
+    assert newest_evidence_unit_id(evidence_times) == chosen
+
+
+def _second_evidence_unit(memory_id: str, *, evidence_unit_id: str, observed_at: str) -> tuple:
+    """Another current Evidence Unit of ``memory_id`` in the same Source Unit, on its own Observation."""
+
+    unit = primary_evidence_unit_fixture(memory_id)
+    primary = unit.items[0]
+    observation_id = f"obs-{evidence_unit_id}"
+    revision = replace(
+        primary_observation_revision_fixture(memory_id),
+        id=f"rev-{evidence_unit_id}",
+        observation_id=observation_id,
+        content=f"Evidence of {evidence_unit_id}.",
+        observed_at=observed_at,
+    )
+    item = replace(
+        primary,
+        reference_id=f"ref-{evidence_unit_id}",
+        anchor=replace(primary.anchor, observation_id=observation_id, observation_revision_id=revision.id),
+    )
+    return replace(unit, evidence_unit_id=evidence_unit_id, items=(item,)), revision
+
+
+@pytest.mark.asyncio
+async def test_subject_reads_the_newest_of_several_current_evidence_units_in_one_source_unit() -> None:
+    memory_id = "mem-equivalent"
+    first = primary_evidence_unit_fixture(memory_id)
+    newer, newer_revision = _second_evidence_unit(
+        memory_id, evidence_unit_id="eu-z-newer", observed_at="2026-04-02T09:00:00+00:00"
+    )
+    store = _SubjectStore(
+        units={memory_id: (first, newer)},
+        documents={},
+        revisions={
+            first.source_unit_id: {
+                f"obs-{memory_id}": primary_observation_revision_fixture(memory_id),
+                newer_revision.observation_id: newer_revision,
+            }
+        },
+    )
+
+    subject = (await load_relation_subjects(store, (_memory(memory_id),)))[memory_id]
+    pinned = (
+        await load_relation_subjects(
+            store, (_memory(memory_id),), evidence_unit_ids={memory_id: first.evidence_unit_id}
+        )
+    )[memory_id]
+
+    assert (subject.evidence_time, subject.evidence) == ("2026-04-02", ("Evidence of eu-z-newer.",))
+    assert (pinned.evidence_time, pinned.evidence) == ("2026-03-25", (f"Evidence for {memory_id}.",))
+    with pytest.raises(ValueError, match="no longer current"):
+        await load_relation_subjects(store, (_memory(memory_id),), evidence_unit_ids={memory_id: "eu-removed"})
