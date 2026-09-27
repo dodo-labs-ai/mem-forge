@@ -44,7 +44,6 @@ def staged_fixture(projection=None):
         update_plan_stats=None,
         source_updated_at=now.isoformat(),
         user_id=None,
-        source_activity_epoch=None,
     )
     return projection, source_derivation_manifest(projection, (), context=context)
 

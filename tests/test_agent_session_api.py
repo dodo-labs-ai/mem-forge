@@ -289,7 +289,6 @@ def test_agent_patch_cancels_mutation_when_activity_heartbeat_fails():
             await _run_agent_patch_with_activity(
                 db=db,
                 source_id="src-agent",
-                expected_epoch=3,
                 operation=operation,
                 lease_seconds=1,
                 heartbeat_seconds=0,

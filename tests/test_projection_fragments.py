@@ -1535,7 +1535,6 @@ def test_v9_derivation_identity_includes_model_presentation_policy(
         update_plan_stats=None,
         source_updated_at=now.isoformat(),
         user_id=None,
-        source_activity_epoch=None,
     )
     batches = (
         ExtractionRequest(

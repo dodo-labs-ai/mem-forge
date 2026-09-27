@@ -83,7 +83,7 @@ from memforge.pipeline.sync import (
     summarize_failed_documents,
 )
 from memforge.runtime import SyncService
-from memforge.source_activity import SourceActivityConflict, SourceActivityKind
+from memforge.source_activity import SourceActivityKind
 from memforge.source_artifacts import (
     RawSourceArtifact,
     SourceArtifactDownload,
@@ -190,7 +190,6 @@ async def test_expired_source_activity_can_be_reacquired_with_same_id(
         source_id="src-activity-retry",
         kind=SourceActivityKind.EXTERNAL_COLLECTION,
         capability="job-stable-id",
-        expected_epoch=0,
     )
     await db.db.execute(
         "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
@@ -203,11 +202,10 @@ async def test_expired_source_activity_can_be_reacquired_with_same_id(
         source_id="src-activity-retry",
         kind=SourceActivityKind.EXTERNAL_COLLECTION,
         capability="job-stable-id",
-        expected_epoch=0,
     )
 
     assert retried.id == first.id
-    assert retried.epoch == first.epoch
+    assert (retried.kind, retried.capability) == (first.kind, first.capability)
 
 
 def test_local_agent_broker_has_its_own_forward_migration() -> None:
@@ -844,7 +842,7 @@ async def test_source_sync_run_recovery_waits_for_later_source_activity_expiry(
     assert first is not None
     assert first.lease_expires_at == now + timedelta(seconds=60)
     activity = await db.db.execute_fetchall(
-        "SELECT id, source_id, kind, epoch, capability, lease_until FROM source_activity_leases WHERE source_id = ?",
+        "SELECT id, source_id, kind, capability, lease_until FROM source_activity_leases WHERE source_id = ?",
         (source_id,),
     )
     assert [dict(row) for row in activity] == [
@@ -852,7 +850,6 @@ async def test_source_sync_run_recovery_waits_for_later_source_activity_expiry(
             "id": enqueued.run_id,
             "source_id": source_id,
             "kind": SourceActivityKind.SYNC.value,
-            "epoch": 0,
             "capability": "1",
             "lease_until": first.lease_expires_at.isoformat(),
         }
@@ -1827,13 +1824,11 @@ async def test_source_sync_input_artifact_attestation_fills_legacy_metadata_idem
         source_id=source_id,
         input_id=created.input_id,
         package_sha256="package-sha",
-        expected_activity_epoch=0,
     )
     repeated = await db.attest_source_sync_input_artifact(
         source_id=source_id,
         input_id=created.input_id,
         package_sha256="package-sha",
-        expected_activity_epoch=0,
     )
 
     assert repeated == attested
@@ -1855,7 +1850,6 @@ async def test_source_sync_input_artifact_attestation_fills_legacy_metadata_idem
             source_id=source_id,
             input_id=created.input_id,
             package_sha256="different-package-sha",
-            expected_activity_epoch=0,
         )
 
     listed = await db.list_source_sync_inputs(
@@ -1863,46 +1857,6 @@ async def test_source_sync_input_artifact_attestation_fills_legacy_metadata_idem
         workspace_id="workspace-a",
     )
     assert listed == [attested]
-
-
-@pytest.mark.asyncio
-async def test_source_sync_input_artifact_attestation_is_epoch_fenced(db: Database):
-    source_id = "src-input-attestation-fence"
-    await db.upsert_source(
-        id=source_id,
-        type="teams",
-        name="Teams",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    created = await db.create_source_sync_input(
-        source_id=source_id,
-        raw_uri="object://legacy.json",
-        raw_sha256="semantic-sha",
-        raw_content_type="application/json",
-        metadata={
-            "doc_id": "doc-a",
-            "manifest_entry": {"doc_id": "doc-a", "version": "v1"},
-        },
-    )
-    await db.db.execute(
-        "UPDATE sources SET activity_epoch = activity_epoch + 1 WHERE id = ?",
-        (source_id,),
-    )
-    await db.db.commit()
-
-    with pytest.raises(SourceActivityConflict, match="source activity epoch changed"):
-        await db.attest_source_sync_input_artifact(
-            source_id=source_id,
-            input_id=created.input_id,
-            package_sha256="package-sha",
-            expected_activity_epoch=0,
-        )
-
-    [unchanged] = await db.list_source_sync_inputs(source_id=source_id)
-    assert "package_sha256" not in unchanged.metadata
-    assert "package_sha256" not in unchanged.metadata["manifest_entry"]
 
 
 @pytest.mark.asyncio
@@ -2052,8 +2006,8 @@ async def test_source_sync_input_attestation_lookup_is_exact_and_history_bounded
             """INSERT INTO source_sync_snapshot_manifests (
                    workspace_id, source_id, snapshot_id, coverage, item_count,
                    manifest_sha256, local_agent_job_id, local_agent_attempt_count,
-                   source_activity_epoch, source_config_revision, created_at
-               ) VALUES (?, ?, ?, 'complete_snapshot', 1, ?, 'job', 1, 0, 'cfg', ?)""",
+                   source_config_revision, created_at
+               ) VALUES (?, ?, ?, 'complete_snapshot', 1, ?, 'job', 1, 'cfg', ?)""",
             (workspace_id, source_id, snapshot_id, "a" * 64, "2026-07-22T00:00:00+00:00"),
         )
         await db.db.execute(
@@ -2852,7 +2806,6 @@ class NoopMemoryEngine:
                             else None
                         ),
                         user_id=kwargs.get("user_id"),
-                        source_activity_epoch=kwargs.get("expected_source_activity_epoch"),
                         current_changed_ranges=kwargs.get(
                             "current_changed_ranges",
                             (),
@@ -2873,7 +2826,6 @@ class NoopMemoryEngine:
                 if kwargs.get("derivation_id") is not None
                 else None
             ),
-            expected_source_activity_epoch=kwargs.get("expected_source_activity_epoch"),
         )
         if not is_update:
             return {
@@ -3554,7 +3506,6 @@ async def test_unchanged_multi_observation_projection_skips_full_document_extrac
             update_plan_stats=None,
             source_updated_at=item.last_modified.isoformat(),
             user_id=None,
-            source_activity_epoch=None,
         ),
     )
 
@@ -4718,7 +4669,6 @@ async def _stage_completed_v9_recovery_attempt(
         update_plan_stats=None,
         source_updated_at=now.isoformat(),
         user_id=None,
-        source_activity_epoch=None,
     )
 
     async def extract(_batch):
@@ -4831,7 +4781,7 @@ async def test_derivation_recovery_resumes_active_v9_before_provider_work(
     db: Database,
 ) -> None:
     source_id = "src-v9-recovery"
-    attempt = await _stage_completed_v9_recovery_attempt(
+    await _stage_completed_v9_recovery_attempt(
         db,
         source_id=source_id,
     )
@@ -4850,7 +4800,6 @@ async def test_derivation_recovery_resumes_active_v9_before_provider_work(
 
     stats = await recovery._resume_source_derivations(
         source_id=source_id,
-        source_activity_epoch=attempt.context.source_activity_epoch,
         run_id="run-v9-recovery",
     )
 
@@ -4904,7 +4853,6 @@ async def test_derivation_recovery_supersedes_incomplete_work_of_an_earlier_cont
 
     stats = await recovery._resume_source_derivations(
         source_id=source_id,
-        source_activity_epoch=attempt.context.source_activity_epoch,
         run_id="run-earlier-contract",
     )
 
@@ -4919,7 +4867,7 @@ async def test_recovered_deferred_lifecycle_joins_commit_only_convergence(
     db: Database,
 ) -> None:
     source_id = "src-recovery-deferred-convergence"
-    attempt = await _stage_completed_v9_recovery_attempt(
+    await _stage_completed_v9_recovery_attempt(
         db,
         source_id=source_id,
     )
@@ -4940,7 +4888,6 @@ async def test_recovered_deferred_lifecycle_joins_commit_only_convergence(
 
     outcome = await recovery._resume_source_derivations(
         source_id=source_id,
-        source_activity_epoch=attempt.context.source_activity_epoch,
         run_id="run-recovery-deferred-convergence",
         lifecycle_execution_owner_id=(
             "run-recovery-deferred-convergence:attempt:1"
@@ -4991,7 +4938,6 @@ async def test_exact_provider_rediscovery_reuses_recovered_deferred_intent(
         gene=V9RecoveryReplayGene(attempt),
         source_name="Recovery provider overlap",
         source_id=source_id,
-        source_activity_epoch=attempt.context.source_activity_epoch,
         lifecycle_cycle_id="run-recovery-provider-overlap",
     )
 
@@ -5036,7 +4982,6 @@ async def test_newer_provider_target_supersedes_recovered_deferred_intent(
         ),
         source_name="Recovery provider newer target",
         source_id=source_id,
-        source_activity_epoch=attempt.context.source_activity_epoch,
         lifecycle_cycle_id="run-recovery-provider-newer",
     )
 
@@ -5103,7 +5048,6 @@ async def test_failed_newer_provider_target_still_supersedes_recovered_intent(
         ),
         source_name="Failed recovery provider target",
         source_id=source_id,
-        source_activity_epoch=attempt.context.source_activity_epoch,
         lifecycle_cycle_id="run-recovery-provider-newer-failed",
     )
 
@@ -5128,7 +5072,7 @@ async def test_successful_recovery_is_counted_without_provider_rediscovery(
     db: Database,
 ) -> None:
     source_id = "src-recovery-counts"
-    attempt = await _stage_completed_v9_recovery_attempt(
+    await _stage_completed_v9_recovery_attempt(
         db,
         source_id=source_id,
     )
@@ -5148,7 +5092,6 @@ async def test_successful_recovery_is_counted_without_provider_rediscovery(
         gene=IncompleteEmptyGene(),
         source_name="Recovery counts",
         source_id=source_id,
-        source_activity_epoch=attempt.context.source_activity_epoch,
         lifecycle_cycle_id="run-recovery-counts",
     )
 
@@ -5185,7 +5128,6 @@ async def test_successful_recovery_keeps_counts_on_exact_provider_rediscovery(
         gene=V9RecoveryReplayGene(attempt),
         source_name="Recovery counts provider overlap",
         source_id=source_id,
-        source_activity_epoch=attempt.context.source_activity_epoch,
         lifecycle_cycle_id="run-recovery-counts-provider-overlap",
     )
 
@@ -5202,7 +5144,7 @@ async def test_recovered_external_blocker_does_not_stop_provider_discovery(
     db: Database,
 ) -> None:
     source_id = "src-recovery-external-blocker"
-    attempt = await _stage_completed_v9_recovery_attempt(
+    await _stage_completed_v9_recovery_attempt(
         db,
         source_id=source_id,
     )
@@ -5245,7 +5187,6 @@ async def test_recovered_external_blocker_does_not_stop_provider_discovery(
         gene=gene,
         source_name="Recovery external blocker",
         source_id=source_id,
-        source_activity_epoch=attempt.context.source_activity_epoch,
         lifecycle_cycle_id="run-recovery-external-blocker",
     )
 
@@ -5297,7 +5238,6 @@ async def test_derivation_recovery_commits_the_current_policy_identity(
 
     stats = await recovery._resume_source_derivations(
         source_id=source_id,
-        source_activity_epoch=attempt.context.source_activity_epoch,
         run_id="run-v9-policy-replacement",
     )
 
@@ -5353,7 +5293,6 @@ async def test_policy_replacement_failure_preserves_recoverable_new_work(
     with pytest.raises(RuntimeError, match="lifecycle apply failed"):
         await recovery._resume_source_derivations(
             source_id=source_id,
-            source_activity_epoch=attempt.context.source_activity_epoch,
             run_id="run-v9-policy-replacement-failure",
         )
 
@@ -10479,7 +10418,6 @@ async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: D
     )
     recover = orchestrator._resume_source_derivations(
         source_id=source_id,
-        source_activity_epoch=attempt.context.source_activity_epoch,
         run_id="run-recovery-summary",
         lifecycle_execution_owner_id="run-recovery-summary:attempt:1",
     )
@@ -10507,10 +10445,10 @@ async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: D
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["returned_error", "stale", "success"])
+@pytest.mark.parametrize("outcome", ["returned_error", "success"])
 async def test_recovery_summary_distinguishes_nonthrowing_outcomes(db: Database, monkeypatch, outcome):
     source_id = "src-recovery-summary-outcome"
-    attempt = await _stage_completed_v9_recovery_attempt(db, source_id=source_id)
+    await _stage_completed_v9_recovery_attempt(db, source_id=source_id)
     if outcome == "returned_error":
         monkeypatch.setattr(
             source_derivation_module,
@@ -10533,18 +10471,11 @@ async def test_recovery_summary_distinguishes_nonthrowing_outcomes(db: Database,
     )
     stats = await recovery._resume_source_derivations(
         source_id=source_id,
-        source_activity_epoch=1 if outcome == "stale" else attempt.context.source_activity_epoch,
         run_id="run-summary-outcome",
     )
     summaries = await db.list_memory_audit_events(event_type="source_unit_llm_summary")
-    if outcome == "stale":
-        # Stale attempts are filtered before execution; do not fabricate a scope.
-        assert summaries == []
-        assert stats.processed == 0
-        assert engine.projected_lifecycle_calls == []
-        return
     assert len(summaries) == 1
-    assert summaries[0].status == {"returned_error": "failed", "stale": "skipped", "success": "committed"}[outcome]
+    assert summaries[0].status == {"returned_error": "failed", "success": "committed"}[outcome]
     assert summaries[0].payload["logical_calls"] == 0
     assert stats.processed == (1 if outcome == "success" else 0)
     assert len(engine.projected_lifecycle_calls) == (1 if outcome == "success" else 0)

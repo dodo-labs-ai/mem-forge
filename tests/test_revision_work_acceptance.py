@@ -155,7 +155,7 @@ class UnaffectedClient(Client):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("drift", "client_type"), [
-    (None, UnaffectedClient), ("epoch", Client), ("memory", Client), ("epoch", UnaffectedClient),
+    (None, UnaffectedClient), ("memory", Client), ("memory", UnaffectedClient),
 ])
 async def test_completed_assessments_cannot_commit_after_concurrent_state_change(tmp_path, drift, client_type):
     """Support Assessment and Change Impact receipts pass the commit gate only without concurrent change."""
@@ -207,7 +207,6 @@ async def test_completed_assessments_cannot_commit_after_concurrent_state_change
     try:
         await db.record_source_projection(context.base)
         await db.insert_memory(items[0].memory)
-        epoch = await db.get_source_activity_epoch(root.source_id)
         rows = await db.db.execute_fetchall(
             "SELECT status,content_hash,updated_at FROM memories WHERE id = ?", (items[0].memory.id,)
         )
@@ -223,11 +222,7 @@ async def test_completed_assessments_cannot_commit_after_concurrent_state_change
             assert executor.stage_counts["support_assess"] == 0 and executor.stage_counts["change_impact"]
         else:
             assert executor.final_work_ids and executor.stage_counts["support_assess"] > 1
-        if drift == "epoch":
-            await db.db.execute(
-                "UPDATE sources SET activity_epoch = activity_epoch + 1 WHERE id = ?", (root.source_id,)
-            )
-        elif drift == "memory":
+        if drift == "memory":
             await db.db.execute(
                 "UPDATE memories SET content_hash = ? WHERE id = ?", ("concurrent-change", items[0].memory.id)
             )
@@ -256,7 +251,6 @@ async def test_completed_assessments_cannot_commit_after_concurrent_state_change
                 derivation_id=root.id,
                 derivation_context_identity_hash=root.context_identity_hash,
                 required_derivation_work_ids=tuple(executor.final_work_ids),
-                expected_source_activity_epoch=epoch,
             )
 
         if drift is None:
@@ -265,7 +259,7 @@ async def test_completed_assessments_cannot_commit_after_concurrent_state_change
                 await db.get_current_source_unit_revision(root.source_unit_id)
             ).id == context.projection.source_unit_revisions[0].id
             return
-        with pytest.raises(ValueError, match="epoch|Memory stale guard"):
+        with pytest.raises(ValueError, match="Memory stale guard"):
             await commit()
         assert (
             await db.get_current_source_unit_revision(root.source_unit_id)

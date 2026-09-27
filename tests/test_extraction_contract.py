@@ -137,7 +137,6 @@ def test_v9_derivation_identity_binds_access_and_inference_capability() -> None:
         update_plan_stats=None,
         source_updated_at=now.isoformat(),
         user_id=None,
-        source_activity_epoch=1,
     )
     batches = _planned_requests(
         projection,
@@ -261,7 +260,6 @@ async def test_v9_reprocess_without_operation_identity_fails_before_llm(
                 update_plan_stats=None,
                 source_updated_at=now.isoformat(),
                 user_id=None,
-                source_activity_epoch=1,
                 reprocess_all_current_observations=True,
             ),
             plan_requests=plan,
@@ -375,7 +373,6 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
             update_plan_stats=None,
             source_updated_at=now.isoformat(),
             user_id=None,
-            source_activity_epoch=1,
             current_changed_ranges=((0, 7),),
         ),
         plan_requests=plan,
@@ -441,7 +438,6 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
             for revision in sorted(target.observation_revisions, key=lambda item: (item.observation_id, item.id))
         ],
         "reprocess_operation_id": None,
-        "source_activity_epoch": 1,
         "target_unit_revision_id": target.source_unit_revisions[0].id,
         "transition": "incremental",
     }

@@ -74,7 +74,6 @@ LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS = frozenset(
     }
 )
 LOCAL_AGENT_JOB_MAX_ATTEMPTS = 5
-LOCAL_AGENT_SOURCE_ACTIVITY_EPOCH_STALE = "local_agent_source_activity_epoch_stale"
 LOCAL_AGENT_SEMANTIC_INPUT_VERSION = "canonical-v1"
 LOCAL_PACKAGE_CONTRACT_VERSION = 2
 """The package contract this local agent collects under, declared in its manifest.
@@ -429,7 +428,6 @@ def local_agent_sync_job_payload(
     payload["source_id"] = str(source.get("id") or "").strip()
     payload["source_type"] = source_type
     payload["source_config_revision"] = local_agent_source_config_revision(source)
-    payload["source_activity_epoch"] = int(source.get("activity_epoch") or 0)
     return payload
 
 
