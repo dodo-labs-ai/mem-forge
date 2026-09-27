@@ -19,10 +19,12 @@ from memforge.pipeline.extraction_contract import (
 )
 from memforge.pipeline.memory_extractor import PROJECTION_FRAGMENT_EXTRACTION_PROMPT
 from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.pipeline.sync import _memory_extraction_error
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
     SourceUnitDeriver,
+    _planning_failure_extraction,
     source_derivation_manifest,
 )
 from memforge.pipeline.extraction_requests import plan_extraction_requests
@@ -30,6 +32,8 @@ from memforge.pipeline.projection_context import (
     PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION,
     ExtractionAuthority,
     ExtractionPlan,
+    ProjectionEvidencePlanningFailure,
+    ProjectionEvidencePlanningFailureCode,
     plan_projection_evidence_work,
 )
 from memforge.pipeline.revision_assessment import REVISION_INPUT_POLICY, RevisionAssessmentContext
@@ -410,6 +414,8 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
     assert len(published_assessments) == 1
     assert published_assessments[0][1] == published_events[0]
     assert result.extraction.error_type == "evidence_authority_planning_failed"
+    assert result.extraction.error is not None
+    assert result.extraction.error.startswith("INCREMENTAL_BASE_UNAVAILABLE")
     assert result.derivation.status == "completed"
     assert (
         result.derivation.terminal_reason_code
@@ -467,3 +473,34 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
             "INCREMENTAL_BASE_UNAVAILABLE",
         )
     ]
+
+
+def test_planning_failure_error_names_its_code_and_identifiers_but_no_source_text() -> None:
+    failure = ProjectionEvidencePlanningFailure(
+        code=ProjectionEvidencePlanningFailureCode.INCREMENTAL_AUTHORITY_UNMAPPABLE,
+        observation_id="obs-issue-core",
+        observation_revision_id="rev-issue-core-2",
+        representation_profile="jira.issue_core",
+        changed_structure_count=3,
+        authorized_structure_count=1,
+    )
+
+    error = _memory_extraction_error(doc_id="jira-SFPAY-1", extraction=_planning_failure_extraction(failure))
+
+    assert str(error) == (
+        "memory extraction failed for jira-SFPAY-1: evidence_authority_planning_failed: "
+        "INCREMENTAL_AUTHORITY_UNMAPPABLE (observation=obs-issue-core, observation_revision=rev-issue-core-2, "
+        "representation_profile=jira.issue_core, changed_structures=3, authorized_structures=1)"
+    )
+    assert error.error_code == "INCREMENTAL_AUTHORITY_UNMAPPABLE"
+
+
+def test_planning_failure_without_identifiers_is_its_code() -> None:
+    failure = ProjectionEvidencePlanningFailure(
+        code=ProjectionEvidencePlanningFailureCode.REPROCESS_AUTHORIZATION_MISSING,
+        observation_id=None,
+        observation_revision_id=None,
+        representation_profile=None,
+    )
+
+    assert _planning_failure_extraction(failure).error == "REPROCESS_AUTHORIZATION_MISSING"
