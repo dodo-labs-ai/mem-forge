@@ -55,6 +55,7 @@ from memforge.storage.adapters.protocols import (
 from memforge.models import (
     AgentHookReceipt,
     AgentSessionReceipt,
+    ContentItem,
     DocumentRecord,
     Entity,
     EntityAlias,
@@ -71,6 +72,7 @@ from memforge.models import (
     SourceDeletionResult,
     SourceSyncInput,
     SourceSyncRun,
+    SourceUnitInput,
     SyncState,
     UNSORTED_PROJECT_KEY,
     VIRTUAL_DOCUMENT_SOURCE_IDS,
@@ -652,6 +654,30 @@ def _validate_replacement_kind(value: str) -> ReplacementKind:
     return value  # type: ignore[return-value]
 
 
+# A derivation in these states can still be resumed and committed.
+_UNAPPLIED_DERIVATION_STATUSES_SQL = ", ".join(
+    f"'{status}'"
+    for status in (SOURCE_DERIVATION_PENDING, SOURCE_DERIVATION_RETRYABLE_FAILURE, SOURCE_DERIVATION_COMPLETED)
+)
+
+
+def _source_unit_input_from_row(row) -> SourceUnitInput:
+    return SourceUnitInput(
+        source_unit_id=str(row["source_unit_id"]),
+        unit_revision_id=str(row["unit_revision_id"]),
+        source_id=str(row["source_id"]),
+        document_id=str(row["document_id"]),
+        item=ContentItem.from_payload(json.loads(str(row["item_json"]))),
+        raw_content_uri=row["raw_content_uri"],
+        raw_content_type=str(row["raw_content_type"]),
+        raw_content_sha256=row["raw_content_sha256"],
+        normalized_content_uri=row["normalized_content_uri"],
+        normalized_content_hash=row["normalized_content_hash"],
+        pdf_content_uri=row["pdf_content_uri"],
+        recorded_at=_parse_dt(row["recorded_at"]),
+    )
+
+
 def _parse_dt(s: str | None) -> datetime | None:
     if not s:
         return None
@@ -900,10 +926,6 @@ CREATE TABLE IF NOT EXISTS documents (
     version             TEXT NOT NULL,
     content_hash        TEXT NOT NULL,
     token_count         INTEGER,
-    raw_content_uri     TEXT,
-    raw_content_type    TEXT,
-    normalized_content_uri TEXT,
-    pdf_content_uri     TEXT,
     last_synced         TEXT NOT NULL,
     created_at          TEXT DEFAULT (datetime('now')),
     updated_at          TEXT DEFAULT (datetime('now'))
@@ -1309,6 +1331,30 @@ CREATE TABLE IF NOT EXISTS source_unit_revisions (
     observed_at                   TEXT,
     created_at                    TEXT NOT NULL
 );
+
+-- The stored input of each Source Unit's latest recorded revision: the item
+-- its Gene discovered and the raw, normalized and PDF objects that Source
+-- stored for the Document (see SourceUnitInput).
+CREATE TABLE IF NOT EXISTS source_unit_inputs (
+    source_unit_id          TEXT PRIMARY KEY REFERENCES source_units(id) ON DELETE CASCADE,
+    source_id               TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    document_id             TEXT NOT NULL,
+    unit_revision_id        TEXT NOT NULL,
+    item_json               TEXT NOT NULL,
+    raw_content_uri         TEXT,
+    raw_content_type        TEXT NOT NULL,
+    raw_content_sha256      TEXT,
+    normalized_content_uri  TEXT,
+    normalized_content_hash TEXT,
+    pdf_content_uri         TEXT,
+    recorded_at             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_source_unit_inputs_document
+    ON source_unit_inputs(document_id, source_id);
+-- Artifact cleanup looks objects up by URI before deleting them.
+CREATE INDEX IF NOT EXISTS idx_source_unit_inputs_raw_uri ON source_unit_inputs(raw_content_uri);
+CREATE INDEX IF NOT EXISTS idx_source_unit_inputs_normalized_uri ON source_unit_inputs(normalized_content_uri);
+CREATE INDEX IF NOT EXISTS idx_source_unit_inputs_pdf_uri ON source_unit_inputs(pdf_content_uri);
 
 CREATE TABLE IF NOT EXISTS source_projection_relations (
     projection_run_id    TEXT NOT NULL REFERENCES source_projection_runs(id) ON DELETE CASCADE,
@@ -1746,6 +1792,8 @@ CREATE TABLE IF NOT EXISTS source_sync_inputs (
 
 CREATE INDEX IF NOT EXISTS idx_source_sync_inputs_source
     ON source_sync_inputs(workspace_id, source_id, input_generation);
+CREATE INDEX IF NOT EXISTS idx_source_sync_inputs_raw_uri
+    ON source_sync_inputs(raw_uri);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_source_sync_inputs_raw_hash
     ON source_sync_inputs(workspace_id, source_id, raw_sha256);
@@ -4439,6 +4487,16 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # regress the Unit (see _supersede_stored_input_reprocess_derivations_unlocked).
         [],
     ),
+    (
+        104,
+        "Record stored input on the Source Unit revision it was projected into",
+        # The Document row held one Source's stored input although several
+        # Sources can include the same Document. Each current Unit whose Source
+        # wrote that row keeps it as the input of its current revision; the
+        # other Units get input at their next committed revision (see
+        # _move_stored_input_to_source_units_unlocked).
+        [],
+    ),
 ]
 
 
@@ -4741,6 +4799,9 @@ class Database:
             if version == 103:
                 superseded = await self._supersede_stored_input_reprocess_derivations_unlocked()
                 logger.info("Superseded %d unapplied reprocess derivations staged from stored input", superseded)
+            if version == 104:
+                recorded = await self._move_stored_input_to_source_units_unlocked()
+                logger.info("Recorded the stored input of %d current Source Unit revisions", recorded)
             await self.db.execute(
                 "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, _now_iso()),
@@ -4795,6 +4856,74 @@ class Database:
             (DERIVATION_INPUT_SUPERSEDED, _now_iso()),
         )
         return cursor.rowcount
+
+    async def _move_stored_input_to_source_units_unlocked(self) -> int:
+        """Give each current Unit the stored input its own Source wrote to the Document row.
+
+        A Unit whose Document row another Source wrote last gets no input: a
+        rediscovering Source reads the provider on reprocess, and every Source
+        records input with its next committed revision.
+        """
+
+        async with self.db.execute("PRAGMA table_info(documents)") as cursor:
+            document_columns = {str(row[1]) async for row in cursor}
+        stored_input_columns = ("raw_content_uri", "raw_content_type", "normalized_content_uri", "pdf_content_uri")
+        if not set(stored_input_columns) <= document_columns:
+            return 0
+        rows = await self.db.execute_fetchall(
+            """SELECT unit.id AS source_unit_id, unit.source_id, unit.current_revision_id,
+                      d.doc_id, d.source_url, d.title, d.space_or_project, d.author,
+                      d.last_modified, d.labels, d.version, d.content_hash, d.item_extra_json,
+                      d.raw_content_uri, d.raw_content_type, d.normalized_content_uri,
+                      d.pdf_content_uri, d.updated_at
+                 FROM source_units unit
+                 JOIN source_unit_document_lineage_history lineage
+                   ON lineage.source_unit_id = unit.id AND lineage.is_current = 1
+                 JOIN documents d
+                   ON d.doc_id = lineage.document_id AND d.source = unit.source_id
+                WHERE unit.current_revision_id IS NOT NULL
+                  AND (d.raw_content_uri IS NOT NULL OR d.normalized_content_uri IS NOT NULL
+                       OR d.pdf_content_uri IS NOT NULL)
+                ORDER BY unit.id"""
+        )
+        now = _now_iso()
+        for row in rows:
+            raw_content_type = str(row["raw_content_type"] or "application/octet-stream")
+            item = ContentItem(
+                item_id=str(row["doc_id"]),
+                title=str(row["title"]),
+                source_url=str(row["source_url"]),
+                last_modified=datetime.fromisoformat(str(row["last_modified"])),
+                content_type=raw_content_type,
+                space_or_project=str(row["space_or_project"]),
+                version=str(row["version"]),
+                author=row["author"],
+                labels=json.loads(row["labels"] or "[]"),
+                extra=json.loads(row["item_extra_json"] or "{}"),
+            )
+            await self.db.execute(
+                """INSERT OR IGNORE INTO source_unit_inputs (
+                       source_unit_id, source_id, document_id, unit_revision_id, item_json,
+                       raw_content_uri, raw_content_type, raw_content_sha256,
+                       normalized_content_uri, normalized_content_hash, pdf_content_uri, recorded_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)""",
+                (
+                    row["source_unit_id"],
+                    row["source_id"],
+                    row["doc_id"],
+                    row["current_revision_id"],
+                    json.dumps(item.to_payload(), sort_keys=True),
+                    row["raw_content_uri"],
+                    raw_content_type,
+                    row["normalized_content_uri"],
+                    row["content_hash"],
+                    row["pdf_content_uri"],
+                    row["updated_at"] or now,
+                ),
+            )
+        for column_name in stored_input_columns:
+            await self.db.execute(f"ALTER TABLE documents DROP COLUMN {column_name}")
+        return len(rows)
 
     async def _backfill_evidence_context_associations_unlocked(self) -> None:
         rows = await self.db.execute_fetchall(
@@ -5293,20 +5422,14 @@ class Database:
             """INSERT INTO documents (
             doc_id, source, source_url, title, space_or_project,
             author, last_modified, labels, version, content_hash,
-            token_count, raw_content_uri, raw_content_type,
-            normalized_content_uri, pdf_content_uri, last_synced,
-            client, item_extra_json, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            token_count, last_synced, client, item_extra_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(doc_id) DO UPDATE SET
             source=excluded.source, source_url=excluded.source_url,
             title=excluded.title, space_or_project=excluded.space_or_project,
             author=excluded.author, last_modified=excluded.last_modified,
             labels=excluded.labels, version=excluded.version,
             content_hash=excluded.content_hash, token_count=excluded.token_count,
-            raw_content_uri=excluded.raw_content_uri,
-            raw_content_type=excluded.raw_content_type,
-            normalized_content_uri=excluded.normalized_content_uri,
-            pdf_content_uri=excluded.pdf_content_uri,
             last_synced=excluded.last_synced,
             client=COALESCE(excluded.client, documents.client),
             item_extra_json=excluded.item_extra_json,
@@ -5323,10 +5446,6 @@ class Database:
                 doc.version,
                 doc.content_hash,
                 doc.token_count,
-                doc.raw_content_uri,
-                doc.raw_content_type,
-                doc.normalized_content_uri,
-                doc.pdf_content_uri,
                 doc.last_synced.isoformat(),
                 doc.client,
                 _document_item_extra_json(doc),
@@ -5358,19 +5477,14 @@ class Database:
                 """INSERT INTO documents (
                     doc_id, source, source_url, title, space_or_project, author,
                     last_modified, labels, version, content_hash, token_count,
-                    raw_content_uri, raw_content_type, normalized_content_uri,
-                    pdf_content_uri, last_synced, client, item_extra_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_synced, client, item_extra_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(doc_id) DO UPDATE SET
                     source=excluded.source, source_url=excluded.source_url,
                     title=excluded.title, space_or_project=excluded.space_or_project,
                     author=excluded.author, last_modified=excluded.last_modified,
                     labels=excluded.labels, version=excluded.version,
                     content_hash=excluded.content_hash, token_count=excluded.token_count,
-                    raw_content_uri=excluded.raw_content_uri,
-                    raw_content_type=excluded.raw_content_type,
-                    normalized_content_uri=excluded.normalized_content_uri,
-                    pdf_content_uri=excluded.pdf_content_uri,
                     last_synced=excluded.last_synced,
                     client=COALESCE(excluded.client, documents.client),
                     item_extra_json=excluded.item_extra_json,
@@ -5388,10 +5502,6 @@ class Database:
                     doc.version,
                     doc.content_hash,
                     doc.token_count,
-                    doc.raw_content_uri,
-                    doc.raw_content_type,
-                    doc.normalized_content_uri,
-                    doc.pdf_content_uri,
                     doc.last_synced.isoformat(),
                     doc.client,
                     _document_item_extra_json(doc),
@@ -5479,11 +5589,6 @@ class Database:
                         tuple(row[column] for column in columns),
                     )
             await self.db.commit()
-
-    async def get_content_hash(self, doc_id: str) -> str | None:
-        async with self.db.execute("SELECT content_hash FROM documents WHERE doc_id = ?", (doc_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else None
 
     async def list_documents(
         self,
@@ -5944,9 +6049,11 @@ class Database:
         return enqueued
 
     async def count_documents(self, source: str | None = None) -> int:
-        """Return the number of indexed documents, optionally scoped to a source."""
+        """Return the number of Documents, or of the Documents one Source holds."""
         if source:
-            query = "SELECT COUNT(*) FROM documents WHERE source = ?"
+            query = """SELECT COUNT(DISTINCT document_id)
+                         FROM source_unit_document_lineage_history
+                        WHERE source_id = ? AND is_current = 1"""
             params: tuple[str, ...] = (source,)
         else:
             query = "SELECT COUNT(*) FROM documents"
@@ -5957,88 +6064,125 @@ class Database:
             return int(row[0]) if row else 0
 
     async def list_indexed_doc_ids(self, source_id: str) -> set[str]:
-        """Return the complete current document identity set for one source."""
+        """Return the Documents the Source holds: those with a current Source Unit."""
         async with self.db.execute(
-            "SELECT doc_id FROM documents WHERE source = ?",
+            """SELECT DISTINCT document_id
+                 FROM source_unit_document_lineage_history
+                WHERE source_id = ? AND is_current = 1""",
             (source_id,),
         ) as cursor:
             return {str(row[0]) async for row in cursor}
+
+    async def count_missing_pdf_uris(self, source_id: str) -> int:
+        """Count the Source's non-empty Confluence Units whose current stored input has no PDF."""
+        async with self.db.execute(
+            """SELECT COUNT(*)
+                 FROM source_unit_inputs input
+                 JOIN source_units unit
+                   ON unit.id = input.source_unit_id
+                  AND unit.current_revision_id = input.unit_revision_id
+                 JOIN sources s ON s.id = input.source_id
+                WHERE input.source_id = ?
+                  AND s.type = 'confluence'
+                  AND input.normalized_content_uri IS NOT NULL
+                  AND input.normalized_content_uri <> ''
+                  AND (input.normalized_content_hash IS NULL OR input.normalized_content_hash <> ?)
+                  AND (input.pdf_content_uri IS NULL OR input.pdf_content_uri = '')""",
+            (source_id, content_hash("")),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return int(row[0] if row else 0)
 
     async def delete_projected_document(
         self,
         doc_id: str,
         *,
+        source_id: str,
         source_activity: SourceActivityLease | None = None,
     ) -> None:
-        """Delete a document record and its unshared artifacts.
+        """Remove one Source's copy of a Document that it no longer holds.
 
         This method never changes Memory lifecycle and never deletes Source
-        Projection or Evidence lineage. It deletes only a document that no
-        Memory names as provenance, which this transaction checks before the
-        document record is removed; a caller retiring Memories first applies
-        the Lifecycle Plan that removes their document Support.
+        Projection or Evidence lineage. It requires that no Memory names the
+        Document as this Source's provenance, which this transaction checks; a
+        caller retiring Memories first applies the Lifecycle Plan that removes
+        their document Support.
+
+        The stored input of this Source's Units that no longer hold the
+        Document is removed and its objects are queued for cleanup; objects
+        are written per Source, so no other Source's input shares them. The
+        shared Document row stays while another Source holds the Document or
+        another Source's Memory names it, and is deleted with its side tables
+        otherwise.
         """
 
         async with self._write_lock:
             try:
-                async with self.db.execute(
-                    "SELECT 1 FROM memory_sources WHERE doc_id = ? LIMIT 1",
-                    (doc_id,),
-                ) as cursor:
-                    if await cursor.fetchone() is not None:
-                        raise ValueError("active document support remains after lifecycle plan")
-                async with self.db.execute(
-                    "SELECT source, raw_content_uri, normalized_content_uri, pdf_content_uri "
-                    "FROM documents WHERE doc_id = ?",
-                    (doc_id,),
-                ) as cursor:
-                    document_row = await cursor.fetchone()
-                if document_row is None:
-                    return
-                source_id = str(document_row["source"])
                 await self._assert_source_activity_fence_unlocked(
                     source_id,
                     source_activity,
                 )
-                for artifact_uri in dict.fromkeys(
-                    str(uri)
-                    for uri in (
-                        document_row["raw_content_uri"],
-                        document_row["normalized_content_uri"],
-                        document_row["pdf_content_uri"],
-                    )
-                    if uri
-                ):
-                    async with self.db.execute(
-                        """SELECT 1 FROM documents
-                           WHERE doc_id != ?
-                             AND (raw_content_uri = ? OR normalized_content_uri = ? OR pdf_content_uri = ?)
-                           LIMIT 1""",
-                        (doc_id, artifact_uri, artifact_uri, artifact_uri),
-                    ) as cursor:
-                        if await cursor.fetchone() is not None:
-                            continue
+                async with self.db.execute(
+                    "SELECT 1 FROM memory_sources WHERE doc_id = ? AND source_id = ? LIMIT 1",
+                    (doc_id, source_id),
+                ) as cursor:
+                    if await cursor.fetchone() is not None:
+                        raise ValueError("active document support remains after lifecycle plan")
+                released_inputs = await self.db.execute_fetchall(
+                    """SELECT input.source_unit_id, input.raw_content_uri,
+                              input.normalized_content_uri, input.pdf_content_uri
+                         FROM source_unit_inputs input
+                        WHERE input.source_id = ? AND input.document_id = ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM source_unit_document_lineage_history lineage
+                               WHERE lineage.source_unit_id = input.source_unit_id
+                                 AND lineage.document_id = input.document_id
+                                 AND lineage.is_current = 1
+                          )""",
+                    (source_id, doc_id),
+                )
+                for row in released_inputs:
                     await self.db.execute(
-                        "INSERT OR IGNORE INTO source_artifact_cleanup_tasks "
-                        "(task_id, source_id, artifact_uri) VALUES (?, ?, ?)",
-                        (
-                            source_artifact_cleanup_task_id(source_id, artifact_uri),
-                            source_id,
-                            artifact_uri,
-                        ),
+                        "DELETE FROM source_unit_inputs WHERE source_unit_id = ?",
+                        (row["source_unit_id"],),
                     )
-                await self.db.execute("DELETE FROM memory_search_metadata_fts WHERE doc_id = ?", (doc_id,))
-                await self.db.execute(
-                    "DELETE FROM memory_search_metadata_alias_fts WHERE doc_id = ?",
+                    await self._release_input_objects_unlocked(
+                        source_id,
+                        (row["raw_content_uri"], row["normalized_content_uri"], row["pdf_content_uri"]),
+                    )
+                async with self.db.execute(
+                    "SELECT source FROM documents WHERE doc_id = ?",
                     (doc_id,),
-                )
-                await self.db.execute(
-                    "DELETE FROM memory_search_metadata_trigram WHERE doc_id = ?",
-                    (doc_id,),
-                )
-                await self.db.execute("DELETE FROM changelog WHERE doc_id = ?", (doc_id,))
-                await self.db.execute("DELETE FROM agent_session_receipts WHERE doc_id = ?", (doc_id,))
-                await self.db.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                ) as cursor:
+                    document_row = await cursor.fetchone()
+                if document_row is not None:
+                    async with self.db.execute(
+                        "SELECT 1 FROM memory_sources WHERE doc_id = ? LIMIT 1",
+                        (doc_id,),
+                    ) as cursor:
+                        named_by_memory = await cursor.fetchone() is not None
+                    surviving_source = await self._document_surviving_source_unlocked(
+                        doc_id,
+                        excluding_source_id=source_id,
+                    )
+                    if surviving_source is not None:
+                        await self.db.execute(
+                            "UPDATE documents SET source = ? WHERE doc_id = ? AND source = ?",
+                            (surviving_source, doc_id, source_id),
+                        )
+                    elif not named_by_memory:
+                        await self.db.execute("DELETE FROM memory_search_metadata_fts WHERE doc_id = ?", (doc_id,))
+                        await self.db.execute(
+                            "DELETE FROM memory_search_metadata_alias_fts WHERE doc_id = ?",
+                            (doc_id,),
+                        )
+                        await self.db.execute(
+                            "DELETE FROM memory_search_metadata_trigram WHERE doc_id = ?",
+                            (doc_id,),
+                        )
+                        await self.db.execute("DELETE FROM changelog WHERE doc_id = ?", (doc_id,))
+                        await self.db.execute("DELETE FROM agent_session_receipts WHERE doc_id = ?", (doc_id,))
+                        await self.db.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
                 await self._assert_source_activity_fence_unlocked(
                     source_id,
                     source_activity,
@@ -6053,48 +6197,44 @@ class Database:
         old_doc_id: str,
         new_doc_id: str,
         *,
+        source_id: str,
         source_activity: SourceActivityLease | None = None,
     ) -> None:
-        """Move legacy document provenance after a stable Source Unit rename.
+        """Move one Source's document provenance after its Source Unit moved.
 
         Source Projection and Evidence lineage remain pinned to immutable old
-        revisions. Only the compatibility ``memory_sources`` edge follows the
-        current document locator.
+        revisions. Only this Source's compatibility ``memory_sources`` edges
+        follow the current document locator; another Source that still holds
+        the old Document keeps its edges.
         """
         if old_doc_id == new_doc_id:
             return
         async with self._write_lock:
             try:
-                rows = await self.db.execute_fetchall(
-                    "SELECT doc_id, source FROM documents WHERE doc_id IN (?, ?)",
-                    (old_doc_id, new_doc_id),
-                )
-                sources = {str(row["doc_id"]): str(row["source"]) for row in rows}
-                if new_doc_id not in sources:
-                    raise ValueError("target document must exist before provenance rebind")
-                if old_doc_id not in sources:
-                    return
-                if sources[old_doc_id] != sources[new_doc_id]:
-                    raise ValueError("document lineage cannot cross configured Sources")
-                source_id = sources[new_doc_id]
                 await self._assert_source_activity_fence_unlocked(
                     source_id,
                     source_activity,
                 )
+                async with self.db.execute(
+                    "SELECT 1 FROM documents WHERE doc_id = ?",
+                    (new_doc_id,),
+                ) as cursor:
+                    if await cursor.fetchone() is None:
+                        raise ValueError("target document must exist before provenance rebind")
                 await self.db.execute(
                     """DELETE FROM memory_sources AS old_support
-                       WHERE old_support.doc_id = ?
+                       WHERE old_support.doc_id = ? AND old_support.source_id = ?
                          AND EXISTS (
                              SELECT 1 FROM memory_sources AS new_support
                              WHERE new_support.memory_id = old_support.memory_id
                                AND new_support.source_id = old_support.source_id
                                AND new_support.doc_id = ?
                          )""",
-                    (old_doc_id, new_doc_id),
+                    (old_doc_id, source_id, new_doc_id),
                 )
                 await self.db.execute(
-                    "UPDATE memory_sources SET doc_id = ? WHERE doc_id = ?",
-                    (new_doc_id, old_doc_id),
+                    "UPDATE memory_sources SET doc_id = ? WHERE doc_id = ? AND source_id = ?",
+                    (new_doc_id, old_doc_id, source_id),
                 )
                 await self._refresh_metadata_fts_for_doc_unlocked(new_doc_id)
                 await self._assert_source_activity_fence_unlocked(
@@ -6710,6 +6850,7 @@ class Database:
         self,
         projection: SourceProjection,
         *,
+        unit_input: SourceUnitInput | None = None,
         expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
         _manage_transaction: bool = True,
@@ -6721,6 +6862,11 @@ class Database:
         provider identity. An Observation Revision recorded without a source time
         takes the one the projection now gives; a recorded source time is never
         replaced. Reusing a run id for a different payload is rejected.
+
+        ``unit_input`` is the stored input the projected Unit revision was
+        projected from. It is recorded in the same transaction as the revision,
+        also when the run was recorded before, unless a later revision of the
+        Unit is already current.
         """
 
         incoming_payload = source_projection_to_payload(projection)
@@ -6779,6 +6925,8 @@ class Database:
                         )
                     ):
                         raise ValueError("projection retry payload mismatch")
+                    if unit_input is not None:
+                        await self._record_source_unit_input_unlocked(projection, unit_input, now)
                     await self._assert_source_activity_fence_unlocked(
                         projection.source_id,
                         source_activity,
@@ -7015,6 +7163,8 @@ class Database:
                         "UPDATE source_units SET current_revision_id = ?, updated_at = ? WHERE id = ?",
                         (revision.id, now, revision.source_unit_id),
                     )
+                if unit_input is not None:
+                    await self._record_source_unit_input_unlocked(projection, unit_input, now)
 
                 for index, relation in enumerate(projection.relations):
                     await self.db.execute(
@@ -7708,6 +7858,137 @@ class Database:
             presentation_sha256=presentation_digest,
             current=current,
         )
+
+    async def _record_source_unit_input_unlocked(
+        self,
+        projection: SourceProjection,
+        unit_input: SourceUnitInput,
+        now: str,
+    ) -> None:
+        """Bind the stored input to the Unit revision this projection records."""
+
+        revisions = {revision.source_unit_id: revision.id for revision in projection.source_unit_revisions}
+        if (
+            unit_input.source_id != projection.source_id
+            or revisions.get(unit_input.source_unit_id) != unit_input.unit_revision_id
+        ):
+            raise ValueError("stored input does not belong to a Unit revision this projection records")
+        async with self.db.execute(
+            "SELECT current_revision_id FROM source_units WHERE id = ?",
+            (unit_input.source_unit_id,),
+        ) as cursor:
+            unit = await cursor.fetchone()
+        if unit is None or unit["current_revision_id"] != unit_input.unit_revision_id:
+            # A later revision of the Unit committed first; its input stays.
+            return
+        async with self.db.execute(
+            """SELECT raw_content_uri, normalized_content_uri, pdf_content_uri
+                 FROM source_unit_inputs WHERE source_unit_id = ?""",
+            (unit_input.source_unit_id,),
+        ) as cursor:
+            replaced = await cursor.fetchone()
+        await self.db.execute(
+            """INSERT INTO source_unit_inputs (
+                   source_unit_id, source_id, document_id, unit_revision_id, item_json,
+                   raw_content_uri, raw_content_type, raw_content_sha256,
+                   normalized_content_uri, normalized_content_hash, pdf_content_uri, recorded_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(source_unit_id) DO UPDATE SET
+                   document_id = excluded.document_id,
+                   unit_revision_id = excluded.unit_revision_id,
+                   item_json = excluded.item_json,
+                   raw_content_uri = excluded.raw_content_uri,
+                   raw_content_type = excluded.raw_content_type,
+                   raw_content_sha256 = excluded.raw_content_sha256,
+                   normalized_content_uri = excluded.normalized_content_uri,
+                   normalized_content_hash = excluded.normalized_content_hash,
+                   pdf_content_uri = excluded.pdf_content_uri,
+                   recorded_at = excluded.recorded_at""",
+            (
+                unit_input.source_unit_id,
+                unit_input.source_id,
+                unit_input.document_id,
+                unit_input.unit_revision_id,
+                json.dumps(unit_input.item.to_payload(), sort_keys=True),
+                unit_input.raw_content_uri,
+                unit_input.raw_content_type,
+                unit_input.raw_content_sha256,
+                unit_input.normalized_content_uri,
+                unit_input.normalized_content_hash,
+                unit_input.pdf_content_uri,
+                now,
+            ),
+        )
+        if replaced is not None:
+            # Objects are written in place per Source and Document; one the new
+            # input no longer names (a renamed or moved Document) is released.
+            kept = {unit_input.raw_content_uri, unit_input.normalized_content_uri, unit_input.pdf_content_uri}
+            await self._release_input_objects_unlocked(
+                unit_input.source_id,
+                tuple(
+                    uri
+                    for uri in (
+                        replaced["raw_content_uri"],
+                        replaced["normalized_content_uri"],
+                        replaced["pdf_content_uri"],
+                    )
+                    if uri not in kept
+                ),
+            )
+
+    async def _release_input_objects_unlocked(
+        self,
+        source_id: str,
+        uris: Sequence[str | None],
+    ) -> None:
+        """Queue released stored input objects for cleanup.
+
+        Whether an object is still referenced is decided when cleanup runs
+        (``source_artifact_uri_is_referenced``): the same key can be written
+        and named again before then.
+        """
+
+        for artifact_uri in dict.fromkeys(str(uri) for uri in uris if uri):
+            await self.db.execute(
+                "INSERT OR IGNORE INTO source_artifact_cleanup_tasks "
+                "(task_id, source_id, artifact_uri) VALUES (?, ?, ?)",
+                (
+                    source_artifact_cleanup_task_id(source_id, artifact_uri),
+                    source_id,
+                    artifact_uri,
+                ),
+            )
+
+    async def get_source_unit_input(self, source_unit_id: str) -> SourceUnitInput | None:
+        """The stored input of the Unit's current revision, or ``None`` when that revision has none."""
+
+        async with self.db.execute(
+            """SELECT input.*
+                 FROM source_unit_inputs input
+                 JOIN source_units unit
+                   ON unit.id = input.source_unit_id
+                  AND unit.current_revision_id = input.unit_revision_id
+                WHERE input.source_unit_id = ?""",
+            (source_unit_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return _source_unit_input_from_row(row) if row is not None else None
+
+    async def list_document_source_unit_inputs(self, document_id: str) -> list[SourceUnitInput]:
+        """The current stored input of every Source Unit that holds this Document, newest first."""
+
+        rows = await self.db.execute_fetchall(
+            """SELECT input.*
+                 FROM source_unit_document_lineage_history lineage
+                 JOIN source_units unit ON unit.id = lineage.source_unit_id
+                 JOIN source_unit_inputs input
+                   ON input.source_unit_id = unit.id
+                  AND input.unit_revision_id = unit.current_revision_id
+                WHERE lineage.document_id = ? AND lineage.is_current = 1
+                ORDER BY input.recorded_at DESC, input.source_id, input.source_unit_id""",
+            (document_id,),
+        )
+        return [_source_unit_input_from_row(row) for row in rows]
 
     async def find_source_unit_by_document_id(
         self,
@@ -8778,6 +9059,7 @@ class Database:
         plan: LifecyclePlan,
         *,
         document: DocumentRecord | None = None,
+        unit_input: SourceUnitInput | None = None,
         derivation_id: str | None = None,
         derivation_context_identity_hash: str | None = None,
         required_derivation_work_ids: tuple[str, ...] = (),
@@ -8785,7 +9067,11 @@ class Database:
         source_activity: SourceActivityLease | None = None,
         runtime_bundle: AgentRuntimeBundle | None = None,
     ) -> None:
-        """Advance Source Projection and Memory lifecycle in one transaction."""
+        """Advance Source Projection and Memory lifecycle in one transaction.
+
+        ``document`` updates the shared Document row and ``unit_input`` records
+        the stored input of the committed Unit revision.
+        """
 
         if required_derivation_work_ids and derivation_id is None:
             raise ValueError("assessment work requires its derivation root at commit")
@@ -8895,6 +9181,7 @@ class Database:
                     await self._upsert_document_unlocked(document)
                 await self.record_source_projection(
                     projection,
+                    unit_input=unit_input,
                     expected_source_activity_epoch=expected_source_activity_epoch,
                     source_activity=source_activity,
                     _manage_transaction=False,
@@ -12238,10 +12525,11 @@ class Database:
             try:
                 await self._assert_direct_source_write_allowed_unlocked(doc_id)
                 await self._upsert_memory_preserving_created_at_unlocked(mem)
+                source_id = await self._resolve_memory_source_id_unlocked(doc_id, source_id=None)
                 await self.db.execute(
                     """INSERT INTO memory_sources (
                         memory_id, doc_id, source_id, source_type, excerpt, support_kind, source_updated_at
-                    ) VALUES (?, ?, (SELECT source FROM documents WHERE doc_id = ?), ?, ?, 'extracted', ?)
+                    ) VALUES (?, ?, ?, ?, ?, 'extracted', ?)
                     ON CONFLICT(memory_id, source_id, doc_id) DO UPDATE SET
                         source_type = excluded.source_type,
                         excerpt = excluded.excerpt,
@@ -12250,7 +12538,7 @@ class Database:
                     (
                         mem.id,
                         doc_id,
-                        doc_id,
+                        source_id,
                         source_type,
                         excerpt,
                         _utc_iso(source_updated_at) if source_updated_at is not None else None,
@@ -13078,15 +13366,18 @@ class Database:
         )
 
     async def _assert_direct_source_write_allowed_unlocked(self, doc_id: str) -> None:
+        writers = await self._document_writer_source_ids_unlocked(doc_id)
+        if not writers:
+            return
+        placeholders = ", ".join("?" for _ in writers)
         async with self.db.execute(
-            """SELECT g.state
-               FROM documents d
-               JOIN source_lifecycle_gates g ON g.source_id = d.source
-               WHERE d.doc_id = ?""",
-            (doc_id,),
+            f"""SELECT 1 FROM source_lifecycle_gates
+                WHERE source_id IN ({placeholders}) AND state = ?
+                LIMIT 1""",
+            (*writers, LifecycleGateState.ENABLED.value),
         ) as cursor:
             gate = await cursor.fetchone()
-        if gate is not None and gate["state"] == LifecycleGateState.ENABLED.value:
+        if gate is not None:
             raise ValueError(
                 "direct configured-source Memory write rejected; projected lifecycle required"
             )
@@ -13556,21 +13847,47 @@ class Database:
         *,
         source_id: str | None,
     ) -> str:
-        """Resolve an exact edge identity or the owner-only convenience boundary."""
+        """Resolve an exact edge identity or the single Source that holds the Document.
+
+        A Document that one Source holds belongs to that Source. A Document no
+        Source syncs (a user memory or correction) belongs to the writer its
+        row names. A Document several Sources hold needs an explicit
+        ``source_id``.
+        """
 
         if source_id is not None:
             if not source_id:
                 raise ValueError("memory source projection requires source_id")
             return source_id
+        writers = await self._document_writer_source_ids_unlocked(doc_id)
+        if len(writers) > 1:
+            raise ValueError("memory source projection requires source_id for a Document several Sources hold")
+        if not writers:
+            raise ValueError("memory source projection requires a persisted document source")
+        return writers[0]
+
+    async def _document_writer_source_ids_unlocked(self, doc_id: str) -> tuple[str, ...]:
+        """The Sources a direct Memory write on this Document belongs to.
+
+        These are the Sources that hold the Document through a current Source
+        Unit, or, for a Document no Source holds, the writer its row names.
+        """
+
+        holders = await self.db.execute_fetchall(
+            """SELECT DISTINCT source_id FROM source_unit_document_lineage_history
+                WHERE document_id = ? AND is_current = 1
+                ORDER BY source_id""",
+            (doc_id,),
+        )
+        if holders:
+            return tuple(str(row["source_id"]) for row in holders)
         async with self.db.execute(
             "SELECT source FROM documents WHERE doc_id = ?",
             (doc_id,),
         ) as cursor:
             document = await cursor.fetchone()
-        resolved = str(document["source"] or "") if document is not None else ""
-        if not resolved:
-            raise ValueError("memory source projection requires a persisted document source")
-        return resolved
+        writer = str(document["source"] or "") if document is not None else ""
+        return (writer,) if writer else ()
 
     async def _refresh_memory_metadata_fts_unlocked(self, memory_id: str, doc_id: str) -> None:
         await self.db.execute(
@@ -16473,10 +16790,10 @@ class Database:
         owner_user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         visibility_sql = "m.id IS NULL OR m.visibility <> ?"
-        params: list[Any] = [source_id, Visibility.PRIVATE.value]
+        params: list[Any] = [source_id, source_id, Visibility.PRIVATE.value]
         if include_private and owner_user_id:
             visibility_sql = "m.id IS NULL OR m.visibility <> ? OR m.owner_user_id = ?"
-            params = [source_id, Visibility.PRIVATE.value, owner_user_id]
+            params = [source_id, source_id, Visibility.PRIVATE.value, owner_user_id]
         projects: list[dict[str, Any]] = []
         async with self.db.execute(
             f"""
@@ -16486,10 +16803,13 @@ class Database:
                 COUNT(DISTINCT ms.memory_id) AS memory_count,
                 MAX(d.last_modified) AS last_observed_at
             FROM documents d
-            LEFT JOIN memory_sources ms ON ms.doc_id = d.doc_id
+            JOIN (
+                SELECT DISTINCT document_id FROM source_unit_document_lineage_history
+                 WHERE source_id = ? AND is_current = 1
+            ) held ON held.document_id = d.doc_id
+            LEFT JOIN memory_sources ms ON ms.doc_id = d.doc_id AND ms.source_id = ?
             LEFT JOIN memories m ON m.id = ms.memory_id
-            WHERE d.source = ?
-              AND ({visibility_sql})
+            WHERE ({visibility_sql})
             GROUP BY COALESCE(NULLIF(TRIM(d.space_or_project), ''), 'Unspecified')
             ORDER BY last_observed_at DESC, project ASC
             """,
@@ -16716,8 +17036,10 @@ class Database:
     ) -> SourceDeletionResult:
         """Retire a Source and return Memories retired by last-support loss.
 
-        The Source row, its Evidence Units and their lineage stay as immutable
-        history; its active Support is removed and its documents are deleted.
+        The Source row, its Source Units with their stored input, its Evidence
+        Units and their lineage stay as immutable history; its active Support
+        is removed. Document rows stay: a row this Source wrote last names a
+        Source that still holds the Document, when one does.
         """
 
         async with self._write_lock:
@@ -16901,18 +17223,56 @@ class Database:
                 await self.db.rollback()
                 raise
 
+    async def source_artifact_uri_is_referenced(self, artifact_uri: str, *, source_id: str) -> bool:
+        """Whether anything still names the object.
+
+        That is a stored input of any Source Unit, a retained sync input, or
+        the stored input carried by a derivation of the Source that is staged
+        and not yet applied or superseded (the next run resumes and commits
+        it). Objects are keyed per Source, so only that Source's derivations
+        can name one; the lookup uses the ``(source_id, status)`` index.
+        """
+
+        async with self.db.execute(
+            f"""SELECT 1 FROM source_unit_inputs WHERE raw_content_uri = ?
+               UNION ALL SELECT 1 FROM source_unit_inputs WHERE normalized_content_uri = ?
+               UNION ALL SELECT 1 FROM source_unit_inputs WHERE pdf_content_uri = ?
+               UNION ALL SELECT 1 FROM source_sync_inputs WHERE raw_uri = ?
+               UNION ALL SELECT 1 FROM source_derivation_attempts
+                WHERE source_id = ? AND status IN ({_UNAPPLIED_DERIVATION_STATUSES_SQL})
+                  AND ? IN (
+                      json_extract(context_payload_json, '$.unit_input.raw_content_uri'),
+                      json_extract(context_payload_json, '$.unit_input.normalized_content_uri'),
+                      json_extract(context_payload_json, '$.unit_input.pdf_content_uri')
+                  )
+               LIMIT 1""",
+            (artifact_uri, artifact_uri, artifact_uri, artifact_uri, source_id, artifact_uri),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def list_source_artifact_cleanup_source_ids(self) -> list[str]:
+        """The Sources with pending artifact cleanup, oldest pending task first."""
+
+        rows = await self.db.execute_fetchall(
+            """SELECT source_id FROM source_artifact_cleanup_tasks
+               GROUP BY source_id ORDER BY MIN(created_at), source_id"""
+        )
+        return [str(row["source_id"]) for row in rows]
+
     async def list_source_artifact_cleanup_tasks(
         self,
         *,
         limit: int = 100,
+        source_id: str | None = None,
     ) -> list[SourceArtifactCleanupTask]:
         if limit <= 0:
             return []
         tasks: list[SourceArtifactCleanupTask] = []
+        source_clause = "WHERE source_id = ? " if source_id is not None else ""
         async with self.db.execute(
             "SELECT task_id, source_id, artifact_uri, attempt_count, last_error, created_at, updated_at "
-            "FROM source_artifact_cleanup_tasks ORDER BY created_at, task_id LIMIT ?",
-            (limit,),
+            f"FROM source_artifact_cleanup_tasks {source_clause}ORDER BY created_at, task_id LIMIT ?",
+            (*((source_id,) if source_id is not None else ()), limit),
         ) as cursor:
             async for row in cursor:
                 tasks.append(
@@ -18531,10 +18891,11 @@ class Database:
         """Resolve current projections reusable by one exact manifest snapshot.
 
         A current membership is reusable only when its immutable input was
-        already attested by an earlier manifest, its document revision still
-        matches the current manifest, and its active Source Unit revision was
-        projected under the current access context. Scope transitions retain
-        the full projection path because they require run-scoped coverage.
+        already attested by an earlier manifest, the item stored with its
+        current Unit revision still has the manifest's revision, and that
+        revision was projected under the current access context. Scope
+        transitions retain the full projection path because they require
+        run-scoped coverage.
         """
 
         normalized_snapshot_id = _non_empty_string(snapshot_id)
@@ -18552,10 +18913,6 @@ class Database:
                     AND si.source_id = mi.source_id
                     AND si.snapshot_id = mi.snapshot_id
                     AND si.doc_id = mi.doc_id
-                   JOIN documents d
-                     ON d.source = mi.source_id
-                    AND d.doc_id = mi.doc_id
-                    AND d.version = mi.revision
                    JOIN source_unit_document_lineage_history lineage
                      ON lineage.source_id = mi.source_id
                     AND lineage.document_id = mi.doc_id
@@ -18563,6 +18920,10 @@ class Database:
                    JOIN source_units unit
                      ON unit.id = lineage.source_unit_id
                     AND unit.source_id = mi.source_id
+                   JOIN source_unit_inputs input
+                     ON input.source_unit_id = unit.id
+                    AND input.unit_revision_id = unit.current_revision_id
+                    AND json_extract(input.item_json, '$.version') = mi.revision
                    JOIN source_unit_revisions revision
                      ON revision.id = unit.current_revision_id
                     AND revision.access_hash = ?
@@ -21453,10 +21814,6 @@ class Database:
             version=d["version"],
             content_hash=d["content_hash"],
             token_count=d["token_count"],
-            raw_content_uri=d["raw_content_uri"],
-            raw_content_type=d["raw_content_type"],
-            normalized_content_uri=d["normalized_content_uri"],
-            pdf_content_uri=d.get("pdf_content_uri"),
             last_synced=datetime.fromisoformat(d["last_synced"]),
             client=d.get("client"),
             created_at=_parse_dt(d.get("created_at")),

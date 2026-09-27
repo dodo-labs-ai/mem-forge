@@ -3,6 +3,7 @@ and recovery isolates Source Units."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from memforge.storage.database import Database
 from tests.test_source_reprocess import RawKeepingDocumentStore
 from tests.test_sync_bookkeeping import (
     FailingMemoryExtractor,
+    _unit_input,
     NoopMemoryEngine,
     ProjectionFragmentRecordingExtractor,
     RecordingMemoryEngine,
@@ -170,13 +172,15 @@ async def synced(db: Database) -> Harness:
 @pytest.mark.asyncio
 async def test_a_new_revision_stores_its_raw_input_although_the_markdown_is_unchanged(db):
     harness = await synced(db)
-    before = await db.get_document(doc_id("PAY-1"))
+    before = await _unit_input(db, SOURCE_ID, doc_id("PAY-1"))
     harness.provider.histories["PAY-1"].append(authored(SPRINT_HISTORY, "Ann"))
 
     assert (await harness.sync()).last_sync_status == "success"
 
-    after = await db.get_document(doc_id("PAY-1"))
-    assert after.content_hash == before.content_hash
+    after = await _unit_input(db, SOURCE_ID, doc_id("PAY-1"))
+    assert after.normalized_content_hash == before.normalized_content_hash
+    assert after.unit_revision_id != before.unit_revision_id
+    assert after.raw_content_sha256 == hashlib.sha256(harness.provider.payload("PAY-1")).hexdigest()
     assert set(await harness.current_changelog("PAY-1")) == {"9001", "9002"}
     assert [history["id"] for history in harness.stored_raw(after.raw_content_uri)["changelog"]["histories"]] == [
         "9001", "9002",
@@ -191,7 +195,7 @@ async def test_reprocess_reads_the_provider_and_keeps_entries_missing_only_from_
     assert (await harness.sync()).last_sync_status == "success"
     committed = await harness.current_changelog("PAY-1")
     # Stored input written before a sync kept it current lacks the newer entry.
-    harness.store.source_artifacts[(await db.get_document(doc_id("PAY-1"))).raw_content_uri] = stale_body
+    harness.store.source_artifacts[(await _unit_input(db, SOURCE_ID, doc_id("PAY-1"))).raw_content_uri] = stale_body
 
     state = await harness.reprocess("PAY-1")
 
@@ -390,7 +394,7 @@ async def test_a_raw_save_failure_fails_the_document_before_its_revision_commits
     harness = await synced(db)
     unit_id = await harness.unit_id("PAY-1")
     committed = await db.get_current_source_unit_revision(unit_id)
-    before = await db.get_document(doc_id("PAY-1"))
+    before = await _unit_input(db, SOURCE_ID, doc_id("PAY-1"))
     # A location-only change moves the Unit to a new revision without semantic work.
     harness.provider.urls["PAY-1"] = "https://jira.example/browse/PAY-1?moved"
     store_raw = harness.store.store_raw
@@ -403,14 +407,15 @@ async def test_a_raw_save_failure_fails_the_document_before_its_revision_commits
 
     assert failed.docs_failed == 1
     assert await db.get_current_source_unit_revision(unit_id) == committed
-    assert (await db.get_document(doc_id("PAY-1"))).raw_content_uri == before.raw_content_uri
+    assert await _unit_input(db, SOURCE_ID, doc_id("PAY-1")) == before
 
     harness.store.store_raw = store_raw
     assert (await harness.sync()).last_sync_status == "success"
     moved = await db.get_current_source_unit_revision(unit_id)
     assert moved.id != committed.id and moved.semantic_hash == committed.semantic_hash
-    stored = await db.get_document(doc_id("PAY-1"))
-    assert stored.source_url == harness.provider.urls["PAY-1"]
+    stored = await _unit_input(db, SOURCE_ID, doc_id("PAY-1"))
+    assert stored.unit_revision_id == moved.id
+    assert stored.item.source_url == harness.provider.urls["PAY-1"]
     assert harness.stored_raw(stored.raw_content_uri)["key"] == "PAY-1"
 
 

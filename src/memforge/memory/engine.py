@@ -79,7 +79,6 @@ from memforge.pipeline.support_relation_coordinator import (
 from memforge.memory.cross_document_relation import StructuredCrossDocumentRelationClassifier
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.source_access import (
-    memory_visibility_for_document,
     memory_visibility_for_source_id,
 )
 from memforge.source_activity import SourceActivityLease
@@ -97,6 +96,7 @@ from memforge.models import (
     RawMemory,
     ReconcileAction,
     ReconcileOperation,
+    SourceUnitInput,
     content_hash,
 )
 
@@ -160,6 +160,7 @@ class _PreparedProjectedLifecycleCommit:
     projection: "SourceProjection"
     plan_inputs: _PreparedLifecyclePlanInputs
     document: "DocumentRecord | None"
+    unit_input: "SourceUnitInput | None"
     derivation_id: str | None
     derivation_context_identity_hash: str | None
     required_derivation_work_ids: tuple[str, ...]
@@ -381,6 +382,7 @@ class MemoryEngine:
         user_id: str | None = None,
         protected_source_observation_ids: tuple[str, ...] = (),
         document: DocumentRecord | None = None,
+        unit_input: SourceUnitInput | None = None,
         derivation_id: str | None = None,
         derivation_reprocess_all_current_observations: bool = False,
         derivation_reprocess_operation_id: str | None = None,
@@ -415,6 +417,7 @@ class MemoryEngine:
                     user_id=user_id,
                     protected_source_observation_ids=protected_source_observation_ids,
                     document=document,
+                    unit_input=unit_input,
                     derivation_id=derivation_id,
                     derivation_reprocess_all_current_observations=(
                         derivation_reprocess_all_current_observations
@@ -689,6 +692,7 @@ class MemoryEngine:
                 prepared.projection,
                 plan,
                 document=prepared.document,
+                unit_input=prepared.unit_input,
                 derivation_id=prepared.derivation_id,
                 derivation_context_identity_hash=(
                     prepared.derivation_context_identity_hash
@@ -842,6 +846,7 @@ class MemoryEngine:
         user_id: str | None = None,
         protected_source_observation_ids: tuple[str, ...] = (),
         document: DocumentRecord | None = None,
+        unit_input: SourceUnitInput | None = None,
         derivation_id: str | None = None,
         derivation_reprocess_all_current_observations: bool = False,
         derivation_reprocess_operation_id: str | None = None,
@@ -1505,6 +1510,7 @@ class MemoryEngine:
                 evidence_references=projected_evidence.references,
             ),
             document=document,
+            unit_input=unit_input,
             derivation_id=derivation_id,
             derivation_context_identity_hash=derivation_context_identity_hash,
             required_derivation_work_ids=required_derivation_work_ids,
@@ -1624,7 +1630,7 @@ class MemoryEngine:
         support_states = await self.db.get_active_memory_support_states(tuple(incumbents_by_id))
         all_support = {memory_id: state.unit_ids for memory_id, state in support_states.items()}
         support_hashes = {memory_id: state.support_set_hash for memory_id, state in support_states.items()}
-        visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
+        visibility, owner_user_id = await memory_visibility_for_source_id(self.db, source_id=scope.source_id)
         plan = build_lifecycle_plan(
             plan_id=plan_id,
             scope=scope,

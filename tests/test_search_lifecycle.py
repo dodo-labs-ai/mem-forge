@@ -85,10 +85,6 @@ async def _document(
         version="1",
         content_hash=f"hash-{doc_id}",
         token_count=100,
-        raw_content_uri=None,
-        raw_content_type="text/html",
-        normalized_content_uri=str(source_md),
-        pdf_content_uri=str(source_pdf),
         last_synced=now,
     )
     await db.upsert_document(doc)
@@ -275,10 +271,6 @@ async def test_search_results_do_not_resolve_artifacts_through_configured_store(
         version="1",
         content_hash="hash-doc-object-search-artifact",
         token_count=100,
-        raw_content_uri=None,
-        raw_content_type="application/json",
-        normalized_content_uri="object://workspace/doc-object-search-artifact.md",
-        pdf_content_uri=None,
         last_synced=now,
     )
     await db.upsert_document(doc)

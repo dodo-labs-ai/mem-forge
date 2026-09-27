@@ -175,10 +175,6 @@ async def _source_backed_memory(
             version="1",
             content_hash=f"{suffix}-doc-hash",
             token_count=8,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=observed,
         )
     )
@@ -321,7 +317,7 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
     assert document is not None
     assert document.source == "user_memory"
     assert document.client == "codex"
-    assert document.normalized_content_uri is None
+    assert await db.list_document_source_unit_inputs(document.doc_id) == []
 
 
 @pytest.mark.asyncio
@@ -378,10 +374,6 @@ async def test_user_lifecycle_cannot_bypass_active_projected_source_support(db: 
             version="1",
             content_hash="managed-doc-hash",
             token_count=8,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=observed,
         )
     )

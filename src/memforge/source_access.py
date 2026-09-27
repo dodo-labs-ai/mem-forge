@@ -127,26 +127,6 @@ def memory_visibility_for_source(
     return (Visibility.WORKSPACE.value, None)
 
 
-async def memory_visibility_for_document(
-    database: Any,
-    *,
-    doc_id: str,
-) -> tuple[str, str | None]:
-    document = await database.get_document(doc_id)
-    if document is None:
-        raise ValueError(f"document {doc_id!r} has no Source access context")
-    if isinstance(document, Mapping):
-        source_id = str(document.get("source") or "").strip()
-    else:
-        source_id = str(getattr(document, "source", "") or "").strip()
-    if not source_id:
-        raise ValueError(f"document {doc_id!r} has no source_id")
-    source = await database.get_source(source_id)
-    if source is None:
-        raise ValueError(f"Source {source_id!r} has no access policy")
-    return memory_visibility_for_source(source)
-
-
 async def memory_visibility_for_source_id(
     database: Any,
     *,

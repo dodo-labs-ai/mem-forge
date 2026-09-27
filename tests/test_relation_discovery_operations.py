@@ -726,10 +726,6 @@ async def _shown_from(db: Database, memory_id: str, source_id: str) -> None:
             version="1",
             content_hash=f"doc-hash-{memory_id}",
             token_count=1,
-            raw_content_uri=None,
-            raw_content_type="text/markdown",
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=REVIEWED_AT,
         )
     )

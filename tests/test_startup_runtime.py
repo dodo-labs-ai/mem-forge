@@ -16,6 +16,7 @@ from memforge.config import AppConfig
 from memforge.models import Memory, SyncState, Visibility, content_hash
 from memforge.source_projection import ProjectionScopeAttestation
 from memforge.storage.database import Database
+from tests.test_sync_bookkeeping import _hold_document
 
 TEST_SOURCE_KEY = "VV4JjZLLr2BcgRnhV90gCnxzchn43M900VQy3dXJI30="
 
@@ -1294,10 +1295,8 @@ async def test_admin_sources_exposes_running_stored_counts_separately(db, tmp_pa
         await db.db.execute(
             """INSERT INTO documents (
                 doc_id, source, source_url, title, space_or_project, author,
-                last_modified, labels, version, content_hash, token_count,
-                raw_content_uri, raw_content_type, normalized_content_uri,
-                pdf_content_uri, last_synced
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                last_modified, labels, version, content_hash, token_count, last_synced
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 doc_id,
                 source_id,
@@ -1310,12 +1309,19 @@ async def test_admin_sources_exposes_running_stored_counts_separately(db, tmp_pa
                 f"version-{index}",
                 f"hash-{index}",
                 10,
-                None,
-                "text/markdown",
-                None,
-                None,
                 "2026-05-28T07:00:00+00:00",
             ),
+        )
+        await _hold_document(
+            db,
+            source_id=source_id,
+            source_type="github_pages",
+            doc_id=doc_id,
+            title=f"Doc {index}",
+            markdown=f"# Doc {index}",
+            version=f"version-{index}",
+            source_url=f"https://example.test/{doc_id}",
+            space_or_project="org/repo",
         )
         await db.db.execute(
             """INSERT INTO memories (

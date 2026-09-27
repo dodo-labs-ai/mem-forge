@@ -56,12 +56,13 @@ from memforge.models import (
     NormalizedContent,
     RawContent,
     RawMemory,
+    SourceUnitInput,
     SyncState,
     FailedDoc,
     content_hash,
 )
 from memforge.pipeline.sync_memory import MemorySample, SyncMemoryObserver
-from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.pipeline.source_projection_adapters import project_source_item, project_source_unit_tombstone
 from memforge.source_projection import (
     ProjectionScopeAttestation,
     ProjectionScopeTransition,
@@ -2104,7 +2105,7 @@ class EmptyGene:
         self,
         *,
         item,
-        existing_doc,
+        stored_input,
         existing_hash,
         new_hash,
     ) -> bool:
@@ -2595,7 +2596,7 @@ class IncrementalNewDocumentGene:
         self,
         *,
         item,
-        existing_doc,
+        stored_input,
         existing_hash,
         new_hash,
     ) -> bool:
@@ -2639,7 +2640,7 @@ class FailingAuthGene:
         self,
         *,
         item,
-        existing_doc,
+        stored_input,
         existing_hash,
         new_hash,
     ) -> bool:
@@ -2826,6 +2827,7 @@ class NoopMemoryEngine:
             projection,
             empty_plan,
             document=kwargs.get("document"),
+            unit_input=kwargs.get("unit_input"),
             derivation_id=kwargs.get("derivation_id"),
             derivation_context_identity_hash=(
                 source_derivation_context_identity_hash(
@@ -2899,7 +2901,7 @@ class RecordingDocumentDeleteMemoryStore:
 
     async def delete_projected_document(self, doc_id: str, **kwargs):
         self.calls.append((doc_id, kwargs))
-        await self.db.delete_projected_document(doc_id)
+        await self.db.delete_projected_document(doc_id, source_id=kwargs["source_id"])
 
     async def attempt_lifecycle_vector_delivery(self, *, source_id: str) -> None:
         del source_id
@@ -3541,10 +3543,6 @@ async def test_unchanged_multi_observation_projection_skips_full_document_extrac
                 version=item.version,
                 content_hash=hashlib.sha256(normalized.markdown_body.encode()).hexdigest(),
                 token_count=None,
-                raw_content_uri=None,
-                raw_content_type=None,
-                normalized_content_uri=None,
-                pdf_content_uri=None,
                 last_synced=item.last_modified,
             ),
             doc_type="conversation",
@@ -3618,7 +3616,7 @@ class BlockingFetchGene:
         self,
         *,
         item,
-        existing_doc,
+        stored_input,
         existing_hash,
         new_hash,
     ) -> bool:
@@ -4057,12 +4055,12 @@ class PdfBackfillGene(BlockingFetchGene):
         self,
         *,
         item,
-        existing_doc,
+        stored_input,
         existing_hash,
         new_hash,
     ) -> bool:
         del item
-        return existing_doc is None or existing_hash != new_hash or not getattr(existing_doc, "pdf_content_uri", None)
+        return stored_input is None or existing_hash != new_hash or not getattr(stored_input, "pdf_content_uri", None)
 
     @classmethod
     def metadata(cls):
@@ -4137,7 +4135,7 @@ class UpdatingDocumentGene:
         self,
         *,
         item,
-        existing_doc,
+        stored_input,
         existing_hash,
         new_hash,
     ) -> bool:
@@ -4406,6 +4404,116 @@ class RecordingMemoryReclaimer:
         }
 
 
+def _stored_input(
+    projection,
+    item: ContentItem,
+    *,
+    markdown: str,
+    raw_content_type: str,
+    raw_content_uri: str | None = None,
+    normalized_content_uri: str | None = None,
+    pdf_content_uri: str | None = None,
+) -> SourceUnitInput:
+    """The stored input a sync records with the projected Unit revision."""
+
+    unit_revision = projection.source_unit_revisions[0]
+    return SourceUnitInput(
+        source_unit_id=unit_revision.source_unit_id,
+        unit_revision_id=unit_revision.id,
+        source_id=projection.source_id,
+        document_id=item.item_id,
+        item=item,
+        raw_content_uri=raw_content_uri,
+        raw_content_type=raw_content_type,
+        raw_content_sha256=None,
+        normalized_content_uri=normalized_content_uri,
+        normalized_content_hash=content_hash(markdown),
+        pdf_content_uri=pdf_content_uri,
+    )
+
+
+async def _unit_input(db: Database, source_id: str, doc_id: str) -> SourceUnitInput | None:
+    """The stored input of the Source's current Unit for the Document."""
+
+    unit = await db.find_source_unit_by_document_id(source_id, doc_id, current_only=True)
+    return await db.get_source_unit_input(unit.id) if unit is not None else None
+
+
+async def _hold_document(
+    db: Database,
+    *,
+    source_id: str,
+    source_type: str,
+    doc_id: str,
+    title: str,
+    markdown: str,
+    version: str,
+    source_url: str,
+    space_or_project: str,
+    raw_content_uri: str | None = None,
+    raw_content_type: str | None = None,
+    normalized_content_uri: str | None = None,
+    pdf_content_uri: str | None = None,
+    item_extra: dict | None = None,
+) -> SourceUnitInput:
+    """Record the Source's Unit for a Document, with the stored input a sync records."""
+
+    now = datetime.now(timezone.utc)
+    item = ContentItem(
+        item_id=doc_id,
+        title=title,
+        source_url=source_url,
+        last_modified=now,
+        content_type="application/json" if source_type == "jira" else "text/markdown",
+        space_or_project=space_or_project,
+        version=version,
+        extra=dict(item_extra or {}),
+    )
+    raw = (
+        _jira_raw_content(item)
+        if source_type == "jira"
+        else RawContent(item=item, body=markdown.encode("utf-8"), content_type="text/markdown")
+    )
+    projection = project_source_item(
+        source_id=source_id,
+        source_type=source_type,
+        run_id=f"projection-fixture:{source_id}:{doc_id}",
+        item=item,
+        raw=raw,
+        normalized=NormalizedContent(item=item, markdown_body=markdown),
+        access_context={"access_policy": "workspace", "owner_user_id": "dev"},
+    )
+    unit_input = _stored_input(
+        projection,
+        item,
+        markdown=markdown,
+        raw_content_type=raw_content_type or raw.content_type,
+        raw_content_uri=raw_content_uri,
+        normalized_content_uri=normalized_content_uri,
+        pdf_content_uri=pdf_content_uri,
+    )
+    await db.record_source_projection(projection, unit_input=unit_input)
+    return unit_input
+
+
+async def _release_document(db: Database, *, source_id: str, source_type: str, doc_id: str) -> None:
+    """Record the tombstone a sync records when the Source stops listing the Document."""
+
+    unit = await db.find_source_unit_by_document_id(source_id, doc_id, current_only=True)
+    assert unit is not None
+    prior_observation_revisions = await db.get_current_source_observation_revisions(unit.id)
+    await db.record_source_projection(
+        project_source_unit_tombstone(
+            source_type=source_type,
+            run_id=f"projection-fixture-removal:{source_id}:{doc_id}",
+            source_unit=unit,
+            prior_unit_revision=await db.get_current_source_unit_revision(unit.id),
+            prior_observation_revisions=prior_observation_revisions,
+            reason="not_returned_by_authoritative_snapshot",
+        )
+    )
+
+
 async def _insert_source_and_doc(db: Database, source_id: str) -> None:
     await db.upsert_source(
         id=source_id,
@@ -4425,6 +4533,21 @@ async def _insert_source_and_doc(db: Database, source_id: str) -> None:
     await db.update_source_doc_count(source_id, 1)
 
 
+async def _insert_held_source_and_doc(db: Database, source_id: str) -> None:
+    await _insert_source_and_doc(db, source_id)
+    await _hold_document(
+        db,
+        source_id=source_id,
+        source_type="confluence",
+        doc_id="doc-1",
+        title="Doc 1",
+        markdown="# Doc 1",
+        version="1",
+        source_url="http://example/doc-1",
+        space_or_project="ARCH",
+    )
+
+
 async def _insert_source_with_docs(db: Database, source_id: str, doc_ids: list[str]) -> None:
     await db.upsert_source(
         id=source_id,
@@ -4441,6 +4564,17 @@ async def _insert_source_with_docs(db: Database, source_id: str, doc_ids: list[s
                (doc_id, source, source_url, title, space_or_project, last_modified, version, content_hash, last_synced)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (doc_id, source_id, f"agent-session://{doc_id}", doc_id, "sessions", now, "1", f"hash-{doc_id}", now),
+        )
+        await _hold_document(
+            db,
+            source_id=source_id,
+            source_type="agent_session",
+            doc_id=doc_id,
+            title=doc_id,
+            markdown=f"# {doc_id}",
+            version="1",
+            source_url=f"agent-session://{doc_id}",
+            space_or_project="sessions",
         )
     await db.update_source_doc_count(source_id, len(doc_ids))
 
@@ -4472,8 +4606,8 @@ async def _insert_document_with_metadata(
     await db.db.execute(
         """INSERT INTO documents
            (doc_id, source, source_url, title, space_or_project, last_modified, version,
-            content_hash, normalized_content_uri, last_synced)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            content_hash, last_synced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             doc_id,
             source_id,
@@ -4483,40 +4617,24 @@ async def _insert_document_with_metadata(
             now.isoformat(),
             version,
             content_hash(markdown),
-            normalized_content_uri,
             now.isoformat(),
         ),
     )
     await db.update_source_doc_count(source_id, 1)
     if projection_source_type is None:
         return
-
-    item_extra = {"issue_id": "100000", "issue_key": "PAY-0"} if projection_source_type == "jira" else {}
-    item = ContentItem(
-        item_id=doc_id,
+    await _hold_document(
+        db,
+        source_id=source_id,
+        source_type=projection_source_type,
+        doc_id=doc_id,
         title=title,
-        source_url=source_url,
-        last_modified=now,
-        content_type="application/json" if projection_source_type == "jira" else "text/markdown",
-        space_or_project=space_or_project,
+        markdown=markdown,
         version=version,
-        extra=item_extra,
-    )
-    raw = (
-        _jira_raw_content(item)
-        if projection_source_type == "jira"
-        else RawContent(item=item, body=markdown.encode("utf-8"), content_type="text/markdown")
-    )
-    await db.record_source_projection(
-        project_source_item(
-            source_id=source_id,
-            source_type=projection_source_type,
-            run_id=f"projection-fixture:{source_id}:{doc_id}",
-            item=item,
-            raw=raw,
-            normalized=NormalizedContent(item=item, markdown_body=markdown),
-            access_context={"access_policy": "workspace", "owner_user_id": "dev"},
-        )
+        source_url=source_url,
+        space_or_project=space_or_project,
+        normalized_content_uri=normalized_content_uri,
+        item_extra={"issue_id": "100000", "issue_key": "PAY-0"} if projection_source_type == "jira" else {},
     )
 
 
@@ -4587,10 +4705,6 @@ async def _stage_completed_v9_recovery_attempt(
         version="1",
         content_hash=hashlib.sha256(body.encode()).hexdigest(),
         token_count=12,
-        raw_content_uri=None,
-        raw_content_type="text/markdown",
-        normalized_content_uri=None,
-        pdf_content_uri=None,
         last_synced=now,
     )
     context = SourceUnitDerivationContext(
@@ -4677,7 +4791,7 @@ class V9RecoveryReplayGene:
         self,
         *,
         item,
-        existing_doc,
+        stored_input,
         existing_hash,
         new_hash,
     ) -> bool:
@@ -5501,7 +5615,7 @@ async def test_sync_memory_observer_records_lifecycle_exit_when_document_fails(d
 @pytest.mark.asyncio
 async def test_successful_zero_change_sync_advances_last_sync_and_keeps_doc_count(db: Database):
     source_id = "src-sync-bookkeeping"
-    await _insert_source_and_doc(db, source_id)
+    await _insert_held_source_and_doc(db, source_id)
     previous_sync = datetime.now(timezone.utc) - timedelta(days=1)
     await db.upsert_sync_state(
         SyncState(
@@ -5604,6 +5718,18 @@ async def test_full_discovery_without_completion_evidence_never_deletes_existing
         ("doc-existing", source_id, "https://example/doc", "Existing", "ENG", now, "1", "hash", now),
     )
     await db.db.commit()
+    await _hold_document(
+        db,
+        source_id=source_id,
+        source_type=source_type,
+        doc_id="doc-existing",
+        title="Existing",
+        markdown="# Existing",
+        version="1",
+        source_url="https://example/doc",
+        space_or_project="ENG",
+        item_extra={"issue_id": "100000", "issue_key": "ENG-1"} if source_type == "jira" else {},
+    )
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
@@ -5626,7 +5752,7 @@ async def test_full_discovery_without_completion_evidence_never_deletes_existing
 @pytest.mark.asyncio
 async def test_incremental_sync_uses_overlap_window_for_discovery(db: Database):
     source_id = "src-sync-overlap"
-    await _insert_source_and_doc(db, source_id)
+    await _insert_held_source_and_doc(db, source_id)
     previous_sync = datetime(2026, 5, 26, 14, 55, 33, tzinfo=timezone.utc)
     await db.upsert_sync_state(
         SyncState(
@@ -5698,7 +5824,7 @@ async def test_incremental_sync_does_not_delete_unchanged_documents_from_small_s
 @pytest.mark.asyncio
 async def test_force_full_sync_ignores_incremental_cursor(db: Database):
     source_id = "src-force-full-overlap"
-    await _insert_source_and_doc(db, source_id)
+    await _insert_held_source_and_doc(db, source_id)
     previous_sync = datetime(2026, 5, 26, 14, 55, 33, tzinfo=timezone.utc)
     await db.upsert_sync_state(
         SyncState(
@@ -5731,7 +5857,7 @@ async def test_force_full_sync_ignores_incremental_cursor(db: Database):
 @pytest.mark.asyncio
 async def test_authoritative_snapshot_ignores_cursor_without_forcing_reprocessing(db: Database):
     source_id = "src-authoritative-snapshot"
-    await _insert_source_and_doc(db, source_id)
+    await _insert_held_source_and_doc(db, source_id)
     await db.upsert_sync_state(
         SyncState(
             source=source_id,
@@ -6288,7 +6414,7 @@ async def test_deletion_failure_marks_sync_failed(db: Database):
 
 
 @pytest.mark.asyncio
-async def test_normal_sync_keeps_legacy_document_without_source_unit_fail_closed(
+async def test_a_document_row_naming_the_source_without_its_unit_is_not_held_by_the_source(
     db: Database,
 ) -> None:
     source_id = "src-normal-legacy-document"
@@ -6308,9 +6434,8 @@ async def test_normal_sync_keeps_legacy_document_without_source_unit_fail_closed
         source_id=source_id,
     )
 
-    assert state.last_sync_status == "failed"
-    assert state.docs_failed == 1
-    assert "without persisted Source Unit lineage" in state.failed_docs[0].error
+    assert state.last_sync_status == "success"
+    assert state.docs_failed == 0
     assert await db.get_document("doc-1") is not None
     assert memory_store.calls == []
 
@@ -7701,7 +7826,10 @@ async def test_source_projection_reuse_requires_prior_manifest_and_current_linea
         normalized=NormalizedContent(item=item, markdown_body=markdown),
         access_context={"access_policy": "workspace", "owner_user_id": "dev"},
     )
-    await db.record_source_projection(projection)
+    await db.record_source_projection(
+        projection,
+        unit_input=_stored_input(projection, item, markdown=markdown, raw_content_type=raw.content_type),
+    )
     access_hash = projection.source_unit_revisions[0].access_hash
     assert access_hash is not None
 
@@ -9885,8 +10013,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
             return LifecycleVectorDeliveryResult(state=LifecycleVectorDeliveryState.DELIVERED)
 
         async def delete_projected_document(self, doc_id: str, **kwargs):
-            del kwargs
-            await self.db.delete_projected_document(doc_id)
+            await self.db.delete_projected_document(doc_id, source_id=kwargs["source_id"])
 
     await db.upsert_source(
         id=source_id,
@@ -11325,11 +11452,11 @@ async def test_unchanged_document_backfills_pdf_uri_without_llm_reprocessing(db:
         source_id=source_id,
     )
 
-    document = await db.get_document("jira-0")
+    stored = await _unit_input(db, source_id, "jira-0")
     assert state.last_sync_status == "success"
     assert state.docs_updated == 0
-    assert document is not None
-    assert document.pdf_content_uri == f"file:///tmp/{source_id}/jira-0/Jira 0.pdf"
+    assert stored is not None
+    assert stored.pdf_content_uri == f"file:///tmp/{source_id}/jira-0/Jira 0.pdf"
 
 
 @pytest.mark.asyncio
@@ -11372,12 +11499,12 @@ async def test_missing_pdf_uri_forces_full_sync_without_llm_reprocessing(db: Dat
         source_id=source_id,
     )
 
-    document = await db.get_document("jira-0")
+    stored = await _unit_input(db, source_id, "jira-0")
     assert state.last_sync_status == "success"
     assert state.docs_processed == 1
     assert state.docs_updated == 0
-    assert document is not None
-    assert document.pdf_content_uri == f"file:///tmp/{source_id}/jira-0/Jira 0.pdf"
+    assert stored is not None
+    assert stored.pdf_content_uri == f"file:///tmp/{source_id}/jira-0/Jira 0.pdf"
 
 
 @pytest.mark.asyncio
@@ -11453,12 +11580,15 @@ async def test_authoritative_empty_confluence_page_does_not_require_pdf(db: Data
     )
 
     document = await db.get_document("jira-0")
+    stored = await _unit_input(db, source_id, "jira-0")
     assert state.last_sync_status == "success"
     assert state.docs_processed == 1
     assert state.docs_failed == 0
     assert document is not None
     assert document.content_hash == content_hash("")
-    assert document.pdf_content_uri is None
+    assert stored is not None
+    assert stored.normalized_content_hash == content_hash("")
+    assert stored.pdf_content_uri is None
 
 
 @pytest.mark.asyncio
@@ -11559,8 +11689,8 @@ async def test_existing_confluence_pdf_uri_is_preserved_when_unchanged_export_is
         space_or_project="PAY",
     )
     await db.db.execute(
-        "UPDATE documents SET pdf_content_uri = ? WHERE doc_id = ?",
-        ("file:///tmp/Architecture/existing.pdf", "jira-0"),
+        "UPDATE source_unit_inputs SET pdf_content_uri = ? WHERE source_id = ? AND document_id = ?",
+        ("file:///tmp/Architecture/existing.pdf", source_id, "jira-0"),
     )
     await db.db.commit()
     release = asyncio.Event()
@@ -11581,11 +11711,11 @@ async def test_existing_confluence_pdf_uri_is_preserved_when_unchanged_export_is
         source_id=source_id,
     )
 
-    document = await db.get_document("jira-0")
+    stored = await _unit_input(db, source_id, "jira-0")
     assert state.last_sync_status == "success"
     assert state.docs_updated == 0
-    assert document is not None
-    assert document.pdf_content_uri == "file:///tmp/Architecture/existing.pdf"
+    assert stored is not None
+    assert stored.pdf_content_uri == "file:///tmp/Architecture/existing.pdf"
 
 
 @pytest.mark.asyncio
@@ -11608,13 +11738,14 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
         space_or_project="PAY",
     )
     await db.db.execute(
-        """UPDATE documents
+        """UPDATE source_unit_inputs
            SET raw_content_uri = ?, raw_content_type = ?, pdf_content_uri = ?
-           WHERE doc_id = ?""",
+           WHERE source_id = ? AND document_id = ?""",
         (
             "file:///tmp/Architecture/existing.raw",
             "application/json",
             "file:///tmp/Architecture/existing.pdf",
+            source_id,
             "jira-0",
         ),
     )
@@ -11637,13 +11768,13 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
         source_id=source_id,
     )
 
-    document = await db.get_document("jira-0")
+    stored = await _unit_input(db, source_id, "jira-0")
     assert state.last_sync_status == "success"
     assert state.docs_updated == 0
-    assert document is not None
-    assert document.raw_content_uri == "file:///tmp/Architecture/existing.raw"
-    assert document.normalized_content_uri == "file:///tmp/Architecture/existing.md"
-    assert document.pdf_content_uri == "file:///tmp/Architecture/existing.pdf"
+    assert stored is not None
+    assert stored.raw_content_uri == "file:///tmp/Architecture/existing.raw"
+    assert stored.normalized_content_uri == "file:///tmp/Architecture/existing.md"
+    assert stored.pdf_content_uri == "file:///tmp/Architecture/existing.pdf"
 
 
 @pytest.mark.asyncio

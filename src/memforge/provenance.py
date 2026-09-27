@@ -1,72 +1,37 @@
-"""Helpers for source-document provenance exposed to agent clients."""
+"""Links to the stored content of source Documents exposed to agent clients.
+
+Each Source stores its own copy of a Document it syncs, recorded as the stored
+input of its Source Unit (:class:`memforge.models.SourceUnitInput`). A Unit
+link (``/api/v1/source-units/{source_unit_id}/...``) serves the copy stored
+with that Unit's current revision; Memory Evidence names the Unit that supports
+the Memory, so its links read that Source's copy. A Document link
+(``/api/v1/documents/{doc_id}/...``) serves, among the Sources that hold the
+Document and that the caller can read, the most recently recorded copy whose
+requested object is still stored.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from urllib.parse import quote
 
 from memforge.config import AppConfig
-from memforge.models import DocumentRecord
+from memforge.models import SourceUnitInput
 from memforge.storage.document_store import DocumentStore, LocalDocumentStore, StoredDocumentArtifact
 
 
 DocumentArtifactStore = DocumentStore
 
-
-def document_content_uri(doc: DocumentRecord | None) -> str | None:
-    """Return the best stored content artifact for a document."""
-    if doc is None:
-        return None
-    return doc.normalized_content_uri or doc.raw_content_uri
+NORMALIZED_MARKDOWN_MEDIA_TYPE = "text/markdown; charset=utf-8"
+PDF_MEDIA_TYPE = "application/pdf"
 
 
-def document_content_url(doc: DocumentRecord | None, config: AppConfig | None = None) -> str | None:
-    """Return a service URL for the stored content artifact, if present."""
-    if doc is None:
-        return None
-    if config is not None and select_document_artifact(doc, "content", config) is None:
-        return None
-    if config is None and document_content_uri(doc) is None:
-        return None
-    return f"/api/v1/documents/{quote(doc.doc_id, safe='')}/content"
+def source_unit_resource_path(source_unit_id: str) -> str:
+    return f"/api/v1/source-units/{quote(source_unit_id, safe='')}"
 
 
-def document_pdf_url(doc: DocumentRecord | None, config: AppConfig | None = None) -> str | None:
-    """Return a service URL for the stored PDF artifact, if present."""
-    if doc is None:
-        return None
-    if config is not None and select_document_artifact(doc, "pdf", config) is None:
-        return None
-    if config is None and doc.pdf_content_uri is None:
-        return None
-    return f"/api/v1/documents/{quote(doc.doc_id, safe='')}/pdf"
-
-
-def document_content_url_for_store(
-    doc: DocumentRecord | None,
-    config: AppConfig,
-    artifact_store: DocumentArtifactStore | None,
-) -> str | None:
-    """Return a content URL when the configured store can serve content."""
-    if doc is None:
-        return None
-    if select_document_artifact(doc, "content", config, artifact_store) is None:
-        return None
-    return f"/api/v1/documents/{quote(doc.doc_id, safe='')}/content"
-
-
-def document_pdf_url_for_store(
-    doc: DocumentRecord | None,
-    config: AppConfig,
-    artifact_store: DocumentArtifactStore | None,
-) -> str | None:
-    """Return a PDF URL when the configured store can serve a PDF."""
-    if doc is None:
-        return None
-    if select_document_artifact(doc, "pdf", config, artifact_store) is None:
-        return None
-    return f"/api/v1/documents/{quote(doc.doc_id, safe='')}/pdf"
+def document_resource_path(doc_id: str) -> str:
+    return f"/api/v1/documents/{quote(doc_id, safe='')}"
 
 
 @dataclass(frozen=True)
@@ -100,85 +65,88 @@ class DocumentArtifact:
         return data
 
 
-def list_document_artifacts(
-    doc: DocumentRecord,
-    config: AppConfig,
+def list_stored_input_artifacts(
+    unit_input: SourceUnitInput,
+    config: AppConfig | None,
     artifact_store: DocumentArtifactStore | None = None,
+    *,
+    resource_path: str,
 ) -> dict[str, DocumentArtifact]:
-    """Return available source artifacts keyed by explicit artifact kind."""
+    """Return the readable objects of one stored input, keyed by artifact kind.
+
+    ``resource_path`` is the Unit or Document path the artifact URLs extend.
+    """
     artifacts: dict[str, DocumentArtifact] = {}
-    store = artifact_store or LocalDocumentStore(config.storage.docs_path)
-
-    normalized = store.get_artifact(
-        doc.normalized_content_uri,
-        "text/markdown; charset=utf-8",
+    if artifact_store is not None:
+        store = artifact_store
+    elif config is not None:
+        store = LocalDocumentStore(config.storage.docs_path)
+    else:
+        return artifacts
+    candidates = (
+        ("normalized_markdown", unit_input.normalized_content_uri, NORMALIZED_MARKDOWN_MEDIA_TYPE),
+        ("raw_source", unit_input.raw_content_uri, unit_input.raw_content_type),
+        ("pdf", unit_input.pdf_content_uri, PDF_MEDIA_TYPE),
     )
-    if normalized is not None:
-        artifacts["normalized_markdown"] = DocumentArtifact(
-            kind="normalized_markdown",
-            stored=normalized,
-            media_type="text/markdown; charset=utf-8",
-            url=_document_artifact_url(doc.doc_id, "normalized_markdown"),
-        )
-
-    raw = store.get_artifact(
-        doc.raw_content_uri,
-        doc.raw_content_type or "application/octet-stream",
-    )
-    if raw is not None:
-        artifacts["raw_source"] = DocumentArtifact(
-            kind="raw_source",
-            stored=raw,
-            media_type=doc.raw_content_type or "application/octet-stream",
-            url=_document_artifact_url(doc.doc_id, "raw_source"),
-        )
-
-    pdf = store.get_artifact(doc.pdf_content_uri, "application/pdf")
-    if pdf is not None:
-        artifacts["pdf"] = DocumentArtifact(
-            kind="pdf",
-            stored=pdf,
-            media_type="application/pdf",
-            url=_document_artifact_url(doc.doc_id, "pdf"),
-        )
-
+    for kind, uri, media_type in candidates:
+        stored = store.get_artifact(uri, media_type)
+        if stored is not None:
+            artifacts[kind] = DocumentArtifact(
+                kind=kind,
+                stored=stored,
+                media_type=media_type,
+                url=f"{resource_path}/artifacts/{quote(kind, safe='')}",
+            )
     return artifacts
 
 
-def select_document_artifact(
-    doc: DocumentRecord,
+def select_stored_input_artifact(
+    unit_input: SourceUnitInput,
     kind: str,
-    config: AppConfig,
+    config: AppConfig | None,
     artifact_store: DocumentArtifactStore | None = None,
+    *,
+    resource_path: str,
 ) -> DocumentArtifact | None:
     """Select an artifact by explicit kind, with a content alias for text fallback."""
-    artifacts = list_document_artifacts(doc, config, artifact_store)
+    artifacts = list_stored_input_artifacts(unit_input, config, artifact_store, resource_path=resource_path)
     if kind == "content":
         return artifacts.get("normalized_markdown") or artifacts.get("raw_source")
     return artifacts.get(kind)
 
 
-def _document_artifact_url(doc_id: str, kind: str) -> str:
-    return f"/api/v1/documents/{quote(doc_id, safe='')}/artifacts/{quote(kind, safe='')}"
+def source_unit_content_url(
+    unit_input: SourceUnitInput | None,
+    config: AppConfig | None,
+    artifact_store: DocumentArtifactStore | None = None,
+) -> str | None:
+    """Return the Unit's content URL when its stored input has readable content.
 
-
-def resolve_document_artifact_path(uri: str | None, config: AppConfig) -> Path | None:
-    """Resolve a stored artifact path if it belongs to MemForge storage."""
-    if not uri:
+    Without a store or configuration to read from, a recorded object stands
+    for readable content.
+    """
+    if unit_input is None:
         return None
-
-    candidate = Path(uri).expanduser()
-    if not candidate.is_absolute():
-        candidate = Path(config.storage.docs_path) / candidate
-
-    try:
-        resolved = candidate.resolve(strict=True)
-    except OSError:
+    resource_path = source_unit_resource_path(unit_input.source_unit_id)
+    if config is None and artifact_store is None:
+        recorded = unit_input.normalized_content_uri or unit_input.raw_content_uri
+        return f"{resource_path}/content" if recorded else None
+    if select_stored_input_artifact(unit_input, "content", config, artifact_store, resource_path=resource_path) is None:
         return None
+    return f"{resource_path}/content"
 
-    docs_root = Path(config.storage.docs_path).expanduser().resolve()
-    if not (resolved == docs_root or docs_root in resolved.parents):
+
+def source_unit_pdf_url(
+    unit_input: SourceUnitInput | None,
+    config: AppConfig | None,
+    artifact_store: DocumentArtifactStore | None = None,
+) -> str | None:
+    """Return the Unit's PDF URL when its stored input has a readable PDF."""
+    if unit_input is None:
         return None
-    if not resolved.is_file():
+    resource_path = source_unit_resource_path(unit_input.source_unit_id)
+    if config is None and artifact_store is None:
+        return f"{resource_path}/pdf" if unit_input.pdf_content_uri else None
+    if select_stored_input_artifact(unit_input, "pdf", config, artifact_store, resource_path=resource_path) is None:
         return None
-    return resolved
+    return f"{resource_path}/pdf"

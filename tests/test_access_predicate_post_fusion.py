@@ -86,10 +86,6 @@ async def test_filter_visible_ids_admits_virtual_user_provenance_without_widenin
                     version="1",
                     content_hash=content_hash(doc_id),
                     token_count=1,
-                    raw_content_uri=None,
-                    raw_content_type=None,
-                    normalized_content_uri=None,
-                    pdf_content_uri=None,
                     last_synced=observed_at,
                 )
             )

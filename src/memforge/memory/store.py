@@ -1761,10 +1761,11 @@ class MemoryStore:
         self,
         doc_id: str,
         *,
+        source_id: str,
         deletion_context: dict[str, Any] | None = None,
         source_activity: SourceActivityLease | None = None,
     ) -> None:
-        """Remove document storage after lifecycle was committed separately.
+        """Remove one Source's copy of a Document after lifecycle was committed separately.
 
         This path deliberately performs no Memory mutation. Source Projection
         lineage and Evidence records remain durable for audit while relational
@@ -1777,6 +1778,7 @@ class MemoryStore:
         try:
             await self.db.delete_projected_document(
                 doc_id,
+                source_id=source_id,
                 source_activity=source_activity,
             )
         except SourceActivityConflict:

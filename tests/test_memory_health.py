@@ -11,6 +11,7 @@ from memforge.memory.health import MemoryIndexHealthChecker
 from memforge.memory.index_payloads import embedding_vector_hash
 from memforge.models import Memory, content_hash
 from memforge.storage.database import Database
+from tests.test_sync_bookkeeping import _hold_document
 
 
 class InspectableCollection:
@@ -287,23 +288,23 @@ async def test_health_reports_confluence_document_missing_pdf_uri(db: Database):
     await db.db.execute(
         """INSERT INTO documents
            (doc_id, source, source_url, title, space_or_project, last_modified, version,
-            content_hash, normalized_content_uri, pdf_content_uri, last_synced)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            "confluence-123",
-            "src-conf",
-            "https://wiki.example/doc",
-            "Architecture",
-            "PAY",
-            now,
-            "1",
-            "hash-doc",
-            "/tmp/architecture.md",
-            None,
-            now,
-        ),
+            content_hash, last_synced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("confluence-123", "src-conf", "https://wiki.example/doc", "Architecture", "PAY", now, "1", "hash-doc", now),
     )
     await db.db.commit()
+    await _hold_document(
+        db,
+        source_id="src-conf",
+        source_type="confluence",
+        doc_id="confluence-123",
+        title="Architecture",
+        markdown="# Architecture",
+        version="1",
+        source_url="https://wiki.example/doc",
+        space_or_project="PAY",
+        normalized_content_uri="/tmp/architecture.md",
+    )
 
     checker = MemoryIndexHealthChecker(db=db, memory_collection=InspectableCollection({}))
 

@@ -66,10 +66,6 @@ async def _seed_documents(db: Database, fixture: Mapping[str, Any]) -> None:
                 version=str(_value_or_default(document, "version", "1")),
                 content_hash=str(_value_or_default(document, "content_hash", f"h-{doc_id}")),
                 token_count=int(_value_or_default(document, "token_count", 1)),
-                raw_content_uri=None,
-                raw_content_type="text/plain",
-                normalized_content_uri=None,
-                pdf_content_uri=None,
                 last_synced=FIXED_NOW,
                 client=document.get("client"),
             )
