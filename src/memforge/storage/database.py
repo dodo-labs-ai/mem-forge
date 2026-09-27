@@ -654,6 +654,13 @@ def _validate_replacement_kind(value: str) -> ReplacementKind:
     return value  # type: ignore[return-value]
 
 
+# A derivation in these states can still be resumed and committed.
+_UNAPPLIED_DERIVATION_STATUSES_SQL = ", ".join(
+    f"'{status}'"
+    for status in (SOURCE_DERIVATION_PENDING, SOURCE_DERIVATION_RETRYABLE_FAILURE, SOURCE_DERIVATION_COMPLETED)
+)
+
+
 def _source_unit_input_from_row(row) -> SourceUnitInput:
     return SourceUnitInput(
         source_unit_id=str(row["source_unit_id"]),
@@ -17216,31 +17223,56 @@ class Database:
                 await self.db.rollback()
                 raise
 
-    async def source_artifact_uri_is_referenced(self, artifact_uri: str) -> bool:
-        """Whether a stored input of any Source Unit or a retained sync input names the object."""
+    async def source_artifact_uri_is_referenced(self, artifact_uri: str, *, source_id: str) -> bool:
+        """Whether anything still names the object.
+
+        That is a stored input of any Source Unit, a retained sync input, or
+        the stored input carried by a derivation of the Source that is staged
+        and not yet applied or superseded (the next run resumes and commits
+        it). Objects are keyed per Source, so only that Source's derivations
+        can name one; the lookup uses the ``(source_id, status)`` index.
+        """
 
         async with self.db.execute(
-            """SELECT 1 FROM source_unit_inputs WHERE raw_content_uri = ?
+            f"""SELECT 1 FROM source_unit_inputs WHERE raw_content_uri = ?
                UNION ALL SELECT 1 FROM source_unit_inputs WHERE normalized_content_uri = ?
                UNION ALL SELECT 1 FROM source_unit_inputs WHERE pdf_content_uri = ?
                UNION ALL SELECT 1 FROM source_sync_inputs WHERE raw_uri = ?
+               UNION ALL SELECT 1 FROM source_derivation_attempts
+                WHERE source_id = ? AND status IN ({_UNAPPLIED_DERIVATION_STATUSES_SQL})
+                  AND ? IN (
+                      json_extract(context_payload_json, '$.unit_input.raw_content_uri'),
+                      json_extract(context_payload_json, '$.unit_input.normalized_content_uri'),
+                      json_extract(context_payload_json, '$.unit_input.pdf_content_uri')
+                  )
                LIMIT 1""",
-            (artifact_uri, artifact_uri, artifact_uri, artifact_uri),
+            (artifact_uri, artifact_uri, artifact_uri, artifact_uri, source_id, artifact_uri),
         ) as cursor:
             return await cursor.fetchone() is not None
+
+    async def list_source_artifact_cleanup_source_ids(self) -> list[str]:
+        """The Sources with pending artifact cleanup, oldest pending task first."""
+
+        rows = await self.db.execute_fetchall(
+            """SELECT source_id FROM source_artifact_cleanup_tasks
+               GROUP BY source_id ORDER BY MIN(created_at), source_id"""
+        )
+        return [str(row["source_id"]) for row in rows]
 
     async def list_source_artifact_cleanup_tasks(
         self,
         *,
         limit: int = 100,
+        source_id: str | None = None,
     ) -> list[SourceArtifactCleanupTask]:
         if limit <= 0:
             return []
         tasks: list[SourceArtifactCleanupTask] = []
+        source_clause = "WHERE source_id = ? " if source_id is not None else ""
         async with self.db.execute(
             "SELECT task_id, source_id, artifact_uri, attempt_count, last_error, created_at, updated_at "
-            "FROM source_artifact_cleanup_tasks ORDER BY created_at, task_id LIMIT ?",
-            (limit,),
+            f"FROM source_artifact_cleanup_tasks {source_clause}ORDER BY created_at, task_id LIMIT ?",
+            (*((source_id,) if source_id is not None else ()), limit),
         ) as cursor:
             async for row in cursor:
                 tasks.append(
