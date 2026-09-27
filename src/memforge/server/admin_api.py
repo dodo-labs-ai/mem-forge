@@ -3776,7 +3776,11 @@ def create_admin_app(
         )
         app.state.sync_scheduler = None
         if config.sync.scheduler_enabled:
-            app.state.sync_scheduler = SyncScheduler(app.state.db, app.state.sync_service)
+            app.state.sync_scheduler = SyncScheduler(
+                app.state.db,
+                app.state.sync_service,
+                document_store=app.state.document_store,
+            )
             await app.state.sync_scheduler.start()
         app.state.sync_worker = None
         app.state.evaluation_worker = None
@@ -3857,7 +3861,15 @@ def create_admin_app(
             runtime_provider=runtime_provider,
             workspace_id=workspace_id,
         )
-        app.state.sync_scheduler = SyncScheduler(db, app.state.sync_service) if config.sync.scheduler_enabled else None
+        app.state.sync_scheduler = (
+            SyncScheduler(
+                db,
+                app.state.sync_service,
+                document_store=document_store or LocalDocumentStore(config.storage.docs_path),
+            )
+            if config.sync.scheduler_enabled
+            else None
+        )
         app.state.sync_worker = None
         app.state.evaluation_worker = None
         app.state.sync_worker_task = None
@@ -7505,10 +7517,13 @@ def create_admin_app(
                     "size_bytes": observed_size,
                 }
             content.seek(0)
+            # This write does not hold the Source activity lease, so the
+            # attempt writes a key of its own: a cleanup task queued by an
+            # earlier failed attempt can never name the object written here.
             artifact_uri = await asyncio.to_thread(
                 artifact_store.store_source_artifact,
                 source_id=source_id,
-                artifact_id=f"local-input-{input_sha256[:24]}",
+                artifact_id=f"local-input-{input_sha256[:24]}-{uuid.uuid4().hex}",
                 filename=str(filename).strip(),
                 content=content,
                 content_type=normalized_media_type,
@@ -7536,10 +7551,6 @@ def create_admin_app(
                         source_id=source_id,
                         artifact_uri=artifact_uri,
                     )
-                    await SourceArtifactCleanupService(
-                        db,
-                        artifact_store,
-                    ).run_pending(limit=1)
                 raise
             return {
                 "input_sha256": retained.raw_sha256,
@@ -7711,10 +7722,6 @@ def create_admin_app(
                     source_id=source_id,
                     artifact_uri=package_uri,
                 )
-                await SourceArtifactCleanupService(
-                    db,
-                    artifact_store,
-                ).run_pending(limit=100)
 
             try:
                 current_source = await db.get_source(source_id)

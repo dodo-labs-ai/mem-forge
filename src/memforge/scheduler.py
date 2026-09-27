@@ -13,6 +13,8 @@ from apscheduler.triggers.cron import CronTrigger
 
 from memforge.genes import source_type_supports_sync
 from memforge.runtime import SyncService
+from memforge.storage.document_store import DocumentStore, LocalDocumentStore
+from memforge.storage.source_cleanup import SourceArtifactCleanupService
 
 if TYPE_CHECKING:
     from memforge.storage.database import Database
@@ -24,6 +26,9 @@ EXPIRY_JOB_ID = "memforge-retire-expired"
 INDEX_HEALTH_JOB_ID = "memforge-index-health"
 SOURCE_SCHEDULE_SCAN_JOB_ID = "memforge-source-schedule-scan"
 AGENT_RUNTIME_RETENTION_JOB_ID = "memforge-agent-runtime-retention"
+ARTIFACT_CLEANUP_JOB_ID = "memforge-artifact-cleanup"
+# Tasks processed per run; the Cloud workspace worker uses the same batch.
+ARTIFACT_CLEANUP_BATCH_SIZE = 100
 
 
 def build_schedule_trigger(schedule: dict) -> CronTrigger:
@@ -49,9 +54,16 @@ def build_schedule_trigger(schedule: dict) -> CronTrigger:
 class SyncScheduler:
     """Owns the APScheduler job that periodically syncs all active sources."""
 
-    def __init__(self, db: "Database", sync_service: SyncService) -> None:
+    def __init__(
+        self,
+        db: "Database",
+        sync_service: SyncService,
+        *,
+        document_store: DocumentStore | None = None,
+    ) -> None:
         self.db = db
         self.sync_service = sync_service
+        self.document_store = document_store or LocalDocumentStore(sync_service.config.storage.docs_path)
         self.scheduler = AsyncIOScheduler()
         self._running_jobs: set[asyncio.Task[Any]] = set()
 
@@ -61,6 +73,7 @@ class SyncScheduler:
         self._ensure_index_health_job()
         self._ensure_source_schedule_scan_job()
         self._ensure_agent_runtime_retention_job()
+        self._ensure_artifact_cleanup_job()
         await self.reload()
 
     async def reload(self) -> None:
@@ -139,6 +152,19 @@ class SyncScheduler:
             max_instances=1,
         )
 
+    def _ensure_artifact_cleanup_job(self) -> None:
+        if self.scheduler.get_job(ARTIFACT_CLEANUP_JOB_ID):
+            return
+        self.scheduler.add_job(
+            self._run_tracked,
+            trigger=CronTrigger(minute="*", timezone="UTC"),
+            id=ARTIFACT_CLEANUP_JOB_ID,
+            args=(self._clean_up_released_artifacts,),
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+
     async def _run_tracked(self, operation: Callable[[], Awaitable[Any]]) -> Any:
         task = asyncio.current_task()
         assert task is not None
@@ -182,6 +208,17 @@ class SyncScheduler:
             )
         except Exception:
             logger.exception("Scheduled server source sync scan failed")
+
+    async def _clean_up_released_artifacts(self) -> None:
+        try:
+            cleaned = await SourceArtifactCleanupService(self.db, self.document_store).run_pending(
+                limit=ARTIFACT_CLEANUP_BATCH_SIZE,
+            )
+        except Exception:
+            logger.exception("Released artifact cleanup failed")
+            return
+        if cleaned:
+            logger.info("Completed %d artifact cleanup tasks", cleaned)
 
     async def _purge_agent_runtime_events(self) -> None:
         policy = self.sync_service.config.agent_evaluation

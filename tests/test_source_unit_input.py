@@ -23,6 +23,7 @@ from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.source_cleanup import SourceArtifactCleanupService
 from tests.test_stored_input_currency import SPRINT_HISTORY, JiraProvider, authored, doc_id
 from tests.test_sync_bookkeeping import (
+    FailingMemoryExtractor,
     NoopMemoryEngine,
     ProjectionFragmentRecordingExtractor,
     RecordingDocumentDeleteMemoryStore,
@@ -67,9 +68,9 @@ class Workspace:
     provider: JiraProvider
     engine: RecordingMemoryEngine
 
-    def orchestrator(self) -> GeneSyncOrchestrator:
+    def orchestrator(self, extractor=None) -> GeneSyncOrchestrator:
         return GeneSyncOrchestrator(
-            db=self.db, doc_store=self.store, memory_extractor=ProjectionFragmentRecordingExtractor(),
+            db=self.db, doc_store=self.store, memory_extractor=extractor or ProjectionFragmentRecordingExtractor(),
             memory_engine=self.engine, memory_store=RecordingDocumentDeleteMemoryStore(self.db), max_concurrent=1,
         )
 
@@ -89,11 +90,12 @@ class Workspace:
             access_policy="workspace", owner_user_id="dev",
         )
 
-    async def sync(self, source_id: str, *, force_full_sync: bool = False):
-        state = await self.orchestrator().sync_gene(
+    async def sync(self, source_id: str, *, force_full_sync: bool = False, extractor=None):
+        state = await self.orchestrator(extractor).sync_gene(
             gene=self.provider, source_name="Jira", source_id=source_id, force_full_sync=force_full_sync,
         )
-        assert state.last_sync_status == "success"
+        if extractor is None:
+            assert state.last_sync_status == "success"
         return state
 
     async def reprocess(self, source_id: str):
@@ -478,3 +480,73 @@ async def test_a_document_link_falls_back_to_the_next_copy_when_the_newest_is_mi
     assert workspace.stored_histories(team.raw_content_uri) == ["9001"]
     # The release copy's normalized markdown is still stored, so content keeps the newest copy.
     assert document_content.text == workspace.store.read_artifact(release.normalized_content_uri).decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_a_staged_derivation_keeps_the_objects_it_will_commit(workspace):
+    await workspace.add_source(TEAM, collected_locally=False)
+    await workspace.sync(TEAM)
+    original = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
+    discovered_item = workspace.provider._item
+    workspace.provider._item = _renamed(workspace.provider, "renamed")
+    await workspace.sync(TEAM)
+    # Renamed back with a change that needs extraction: the sync writes the
+    # original keys again and stages its derivation, then extraction fails.
+    workspace.provider._item = discovered_item
+    workspace.provider.histories[ISSUE].append(authored(SPRINT_HISTORY, "Ann"))
+    failed = await workspace.sync(TEAM, extractor=FailingMemoryExtractor())
+    assert failed.docs_failed >= 1
+    staged = await workspace.db.list_source_derivation_attempts(source_id=TEAM, statuses=("retryable_failure",))
+    assert [attempt.context.unit_input.raw_content_uri for attempt in staged] == [original.raw_content_uri]
+
+    await workspace.cleanup()
+    assert original.raw_content_uri not in workspace.store.deletions
+
+    await workspace.sync(TEAM)
+    committed = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
+    assert committed.raw_content_uri == original.raw_content_uri
+    assert workspace.stored(committed)
+    assert workspace.stored_histories(committed.raw_content_uri) == ["9001", "9002"]
+
+
+@pytest.mark.asyncio
+async def test_a_busy_source_does_not_hold_up_other_sources_cleanup(workspace):
+    await workspace.add_source(TEAM, collected_locally=False)
+    await workspace.add_source(RELEASE, collected_locally=False)
+    busy = workspace.store.store_raw(
+        source_id=TEAM, doc_id="doc-busy", title="Busy", content=b"{}", content_type="application/json",
+    )
+    idle = workspace.store.store_raw(
+        source_id=RELEASE, doc_id="doc-idle", title="Idle", content=b"{}", content_type="application/json",
+    )
+    await workspace.db.enqueue_source_artifact_cleanup_task(source_id=TEAM, artifact_uri=busy)
+    await workspace.db.enqueue_source_artifact_cleanup_task(source_id=RELEASE, artifact_uri=idle)
+    await workspace.db.acquire_source_activity(activity_id="team-sync", source_id=TEAM, kind=SourceActivityKind.SYNC)
+
+    assert await SourceArtifactCleanupService(workspace.db, workspace.store).run_pending(limit=1) == 1
+
+    assert workspace.store.deletions == [idle]
+    assert [task.artifact_uri for task in await workspace.db.list_source_artifact_cleanup_tasks(limit=10)] == [busy]
+
+
+@pytest.mark.asyncio
+async def test_the_scheduler_cleans_up_released_objects(workspace, tmp_path):
+    from memforge.runtime import SyncService
+    from memforge.scheduler import ARTIFACT_CLEANUP_JOB_ID, SyncScheduler
+
+    await workspace.add_source(TEAM, collected_locally=False)
+    released = workspace.store.store_raw(
+        source_id=TEAM, doc_id=doc_id(ISSUE), title="Released", content=b"{}", content_type="application/json",
+    )
+    await workspace.db.enqueue_source_artifact_cleanup_task(source_id=TEAM, artifact_uri=released)
+    scheduler = SyncScheduler(
+        workspace.db, SyncService(workspace.db, AppConfig(base_dir=tmp_path / "mem")), document_store=workspace.store,
+    )
+    await scheduler.start()
+    try:
+        assert scheduler.scheduler.get_job(ARTIFACT_CLEANUP_JOB_ID) is not None
+        await scheduler._clean_up_released_artifacts()
+    finally:
+        await scheduler.shutdown()
+
+    assert workspace.store.deletions == [released]
