@@ -1344,6 +1344,10 @@ CREATE TABLE IF NOT EXISTS source_unit_inputs (
 );
 CREATE INDEX IF NOT EXISTS idx_source_unit_inputs_document
     ON source_unit_inputs(document_id, source_id);
+-- Artifact cleanup looks objects up by URI before deleting them.
+CREATE INDEX IF NOT EXISTS idx_source_unit_inputs_raw_uri ON source_unit_inputs(raw_content_uri);
+CREATE INDEX IF NOT EXISTS idx_source_unit_inputs_normalized_uri ON source_unit_inputs(normalized_content_uri);
+CREATE INDEX IF NOT EXISTS idx_source_unit_inputs_pdf_uri ON source_unit_inputs(pdf_content_uri);
 
 CREATE TABLE IF NOT EXISTS source_projection_relations (
     projection_run_id    TEXT NOT NULL REFERENCES source_projection_runs(id) ON DELETE CASCADE,
@@ -1781,6 +1785,8 @@ CREATE TABLE IF NOT EXISTS source_sync_inputs (
 
 CREATE INDEX IF NOT EXISTS idx_source_sync_inputs_source
     ON source_sync_inputs(workspace_id, source_id, input_generation);
+CREATE INDEX IF NOT EXISTS idx_source_sync_inputs_raw_uri
+    ON source_sync_inputs(raw_uri);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_source_sync_inputs_raw_hash
     ON source_sync_inputs(workspace_id, source_id, raw_sha256);
@@ -6133,7 +6139,7 @@ class Database:
                         "DELETE FROM source_unit_inputs WHERE source_unit_id = ?",
                         (row["source_unit_id"],),
                     )
-                    await self._release_unreferenced_input_objects_unlocked(
+                    await self._release_input_objects_unlocked(
                         source_id,
                         (row["raw_content_uri"], row["normalized_content_uri"], row["pdf_content_uri"]),
                     )
@@ -7909,27 +7915,33 @@ class Database:
         if replaced is not None:
             # Objects are written in place per Source and Document; one the new
             # input no longer names (a renamed or moved Document) is released.
-            await self._release_unreferenced_input_objects_unlocked(
+            kept = {unit_input.raw_content_uri, unit_input.normalized_content_uri, unit_input.pdf_content_uri}
+            await self._release_input_objects_unlocked(
                 unit_input.source_id,
-                (replaced["raw_content_uri"], replaced["normalized_content_uri"], replaced["pdf_content_uri"]),
+                tuple(
+                    uri
+                    for uri in (
+                        replaced["raw_content_uri"],
+                        replaced["normalized_content_uri"],
+                        replaced["pdf_content_uri"],
+                    )
+                    if uri not in kept
+                ),
             )
 
-    async def _release_unreferenced_input_objects_unlocked(
+    async def _release_input_objects_unlocked(
         self,
         source_id: str,
         uris: Sequence[str | None],
     ) -> None:
-        """Queue cleanup of stored input objects no Source Unit's input names any more."""
+        """Queue released stored input objects for cleanup.
+
+        Whether an object is still referenced is decided when cleanup runs
+        (``source_artifact_uri_is_referenced``): the same key can be written
+        and named again before then.
+        """
 
         for artifact_uri in dict.fromkeys(str(uri) for uri in uris if uri):
-            async with self.db.execute(
-                """SELECT 1 FROM source_unit_inputs
-                   WHERE raw_content_uri = ? OR normalized_content_uri = ? OR pdf_content_uri = ?
-                   LIMIT 1""",
-                (artifact_uri, artifact_uri, artifact_uri),
-            ) as cursor:
-                if await cursor.fetchone() is not None:
-                    continue
             await self.db.execute(
                 "INSERT OR IGNORE INTO source_artifact_cleanup_tasks "
                 "(task_id, source_id, artifact_uri) VALUES (?, ?, ?)",
@@ -17203,6 +17215,19 @@ class Database:
             except Exception:
                 await self.db.rollback()
                 raise
+
+    async def source_artifact_uri_is_referenced(self, artifact_uri: str) -> bool:
+        """Whether a stored input of any Source Unit or a retained sync input names the object."""
+
+        async with self.db.execute(
+            """SELECT 1 FROM source_unit_inputs WHERE raw_content_uri = ?
+               UNION ALL SELECT 1 FROM source_unit_inputs WHERE normalized_content_uri = ?
+               UNION ALL SELECT 1 FROM source_unit_inputs WHERE pdf_content_uri = ?
+               UNION ALL SELECT 1 FROM source_sync_inputs WHERE raw_uri = ?
+               LIMIT 1""",
+            (artifact_uri, artifact_uri, artifact_uri, artifact_uri),
+        ) as cursor:
+            return await cursor.fetchone() is not None
 
     async def list_source_artifact_cleanup_tasks(
         self,
