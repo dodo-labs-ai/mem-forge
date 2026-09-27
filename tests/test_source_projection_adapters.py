@@ -761,6 +761,44 @@ def test_incomplete_embedded_jira_changelog_forces_partial_coverage() -> None:
     assert projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION
 
 
+def test_limited_jira_changelog_carries_unreturned_prior_histories() -> None:
+    item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
+    whole = [{"id": "1"}, {"id": "2"}, {"id": "3"}]
+    first_raw, first_normalized = _inputs(item, _jira_payload(histories=whole))
+    first = project_source_item(
+        source_id="src-j",
+        source_type="jira",
+        run_id="run-j-whole-changelog",
+        item=item,
+        raw=first_raw,
+        normalized=first_normalized,
+    )
+    limited_raw, limited_normalized = _inputs(
+        item,
+        _jira_payload(histories=whole[:1], changelog_total=len(whole)),
+    )
+    limited = project_source_item(
+        source_id="src-j",
+        source_type="jira",
+        run_id="run-j-limited-changelog",
+        item=item,
+        raw=limited_raw,
+        normalized=limited_normalized,
+        prior_unit_revision=first.source_unit_revisions[0],
+        prior_observation_revisions={revision.observation_id: revision for revision in first.observation_revisions},
+    )
+
+    unreturned = [
+        revision
+        for revision in first.observation_revisions
+        if revision.metadata.get("provider_key") in {"2", "3"}
+    ]
+    assert len(unreturned) == len(whole) - 1
+    assert limited.coverage is ProjectionCoverage.PARTIAL_PROJECTION
+    assert set(limited.carried_observation_revision_ids) == {revision.id for revision in unreturned}
+    assert limited.deltas[0].removed_observation_ids == ()
+
+
 def test_incomplete_local_agent_jira_changelog_forces_partial_coverage() -> None:
     item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
     raw, normalized = _inputs(
