@@ -340,7 +340,7 @@ def _planning_failure_extraction(
         metadata["offline_replay"] = True
     return MemoryExtractionResult(
         error_type="evidence_authority_planning_failed",
-        error="Evidence authority planning failed closed.",
+        error=failure.diagnostic,
         metadata=metadata,
     )
 

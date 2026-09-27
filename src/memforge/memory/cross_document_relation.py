@@ -564,17 +564,8 @@ class RelationSubjectStore(Protocol):
     ) -> Mapping[str, SourceObservationRevision]: ...
 
 
-def primary_evidence_unit(
-    units: Sequence[MemoryEvidenceUnitProjection],
-) -> MemoryEvidenceUnitProjection | None:
-    """The Evidence Unit a relation subject is shown from: the first current one."""
-
-    current = [unit for unit in units if unit.current]
-    return (current or list(units) or [None])[0]
-
-
-def _source_date(value: object) -> str | None:
-    """The UTC calendar date of a stored source timestamp, or None when unparsable."""
+def source_evidence_time(value: object) -> str | None:
+    """The Evidence time a stored source timestamp gives: its UTC calendar date, or None when unparsable."""
 
     if isinstance(value, datetime):
         moment = value
@@ -601,7 +592,26 @@ def _evidence_time(primary_revision: SourceObservationRevision | None) -> str | 
 
     if primary_revision is None:
         return None
-    return _source_date(primary_revision.observed_at)
+    return source_evidence_time(primary_revision.observed_at)
+
+
+def newest_evidence_unit_id(evidence_times: Mapping[str, str | None]) -> str | None:
+    """The Evidence Unit a Memory's relation subject is read from.
+
+    ``evidence_times`` maps each current Evidence Unit of the Memory to its
+    Evidence time. The subject reads the Unit with the newest Evidence time, the
+    time ``updates`` is ordered by; an unknown time ranks below every known one,
+    and Units with the same time go to the lowest Evidence Unit id, so the
+    choice is the same on every read. Storage applies this rule when discovery
+    reads the challenger's Evidence in its Source Unit, and the subject builder
+    applies it to every other Memory.
+    """
+
+    return max(
+        sorted(evidence_times),
+        key=lambda unit_id: (evidence_times[unit_id] is not None, evidence_times[unit_id] or ""),
+        default=None,
+    )
 
 
 def _field_value_text(field: CanonicalFieldRange) -> str:
@@ -689,25 +699,101 @@ def _anchored_text(
     return None
 
 
+class _RelationEvidenceReader:
+    """Reads each Memory's relation Evidence, loading each Source Unit's current revisions once."""
+
+    def __init__(self, store: RelationSubjectStore) -> None:
+        self._store = store
+        self._revisions: dict[str, Mapping[str, SourceObservationRevision]] = {}
+
+    async def revisions(self, source_unit_id: str) -> Mapping[str, SourceObservationRevision]:
+        if source_unit_id not in self._revisions:
+            self._revisions[source_unit_id] = await self._store.get_current_source_observation_revisions(
+                source_unit_id
+            )
+        return self._revisions[source_unit_id]
+
+    async def evidence_time(self, unit: MemoryEvidenceUnitProjection) -> str | None:
+        primary = _primary_item(unit)
+        if primary is None:
+            return None
+        return _evidence_time(_anchored_revision(primary, await self.revisions(unit.source_unit_id)))
+
+    async def evidence_unit(
+        self,
+        memory_id: str,
+        *,
+        evidence_unit_id: str | None = None,
+    ) -> MemoryEvidenceUnitProjection | None:
+        """The Evidence Unit a Memory is shown from.
+
+        Among the Memory's current Evidence Units it is the one
+        ``newest_evidence_unit_id`` chooses; a Memory without current Evidence
+        is shown from its first Evidence Unit. ``evidence_unit_id`` names a Unit
+        the caller already chose by the same rule, which must still support the
+        Memory.
+        """
+
+        units = await self._store.get_memory_evidence_units(memory_id)
+        if evidence_unit_id is not None:
+            chosen = next((unit for unit in units if unit.evidence_unit_id == evidence_unit_id), None)
+            if chosen is None:
+                raise ValueError("relation evidence is no longer current")
+            return chosen
+        current = {unit.evidence_unit_id: unit for unit in units if unit.current}
+        if not current:
+            return units[0] if units else None
+        times = {unit_id: await self.evidence_time(unit) for unit_id, unit in current.items()}
+        return current[newest_evidence_unit_id(times)]
+
+
+def _primary_item(unit: MemoryEvidenceUnitProjection) -> MemoryEvidenceItemProjection | None:
+    return next(
+        (item for item in unit.items if item.grants_support and item.role is EvidenceRole.PRIMARY),
+        None,
+    )
+
+
+async def load_relation_evidence_units(
+    store: RelationSubjectStore,
+    memories: Sequence[Memory],
+) -> Mapping[str, MemoryEvidenceUnitProjection | None]:
+    """The Evidence Unit each Memory's relation subject is read from."""
+
+    reader = _RelationEvidenceReader(store)
+    return {memory.id: await reader.evidence_unit(memory.id) for memory in memories}
+
+
 async def load_relation_subjects(
     store: RelationSubjectStore,
     memories: Sequence[Memory],
+    *,
+    evidence_unit_ids: Mapping[str, str] | None = None,
 ) -> Mapping[str, RelationSubject]:
     """Build the classifier input for each Memory from its current Evidence.
 
-    Discovery and the evaluation set both build subjects here, so an evaluated
-    pair shows the model the same statements, titles, Evidence times and
-    Evidence text that discovery shows it. Discovery groups a challenger's pairs
-    into one request; the evaluation sends each pinned pair on its own.
+    Each Memory is shown from the Evidence Unit ``newest_evidence_unit_id``
+    chooses among its current ones. ``evidence_unit_ids`` names the Unit for a
+    Memory whose Evidence the caller already chose: discovery shows its
+    challenger from the Evidence Unit it records the run against.
+
+    Discovery and the evaluation set both build subjects here with the same
+    rendering. Discovery chooses its challenger's Evidence Unit within the
+    work's Source Unit; the evaluation set chooses among all of the
+    challenger's current Units, so the two show the same Evidence unless the
+    challenger has current Evidence in several Source Units. Discovery groups a
+    challenger's pairs into one request; the evaluation sends each pinned pair
+    on its own.
     """
 
+    reader = _RelationEvidenceReader(store)
+    chosen_units = evidence_unit_ids or {}
     documents: dict[str, Any] = {}
-    revisions: dict[str, Mapping[str, SourceObservationRevision]] = {}
     subjects: dict[str, RelationSubject] = {}
     for memory in memories:
         if memory.id in subjects:
             continue
-        unit = primary_evidence_unit(await store.get_memory_evidence_units(memory.id))
+        unit = await reader.evidence_unit(memory.id, evidence_unit_id=chosen_units.get(memory.id))
         if unit is None:
             subjects[memory.id] = RelationSubject(
                 memory_id=memory.id,
@@ -719,13 +805,8 @@ async def load_relation_subjects(
         if unit.doc_id and unit.doc_id not in documents:
             documents[unit.doc_id] = await store.get_document(unit.doc_id)
         document = documents.get(unit.doc_id) if unit.doc_id else None
-        if unit.source_unit_id not in revisions:
-            revisions[unit.source_unit_id] = await store.get_current_source_observation_revisions(
-                unit.source_unit_id
-            )
-        unit_revisions = revisions[unit.source_unit_id]
+        unit_revisions = await reader.revisions(unit.source_unit_id)
         supporting = [item for item in unit.items if item.grants_support]
-        primary = next((item for item in supporting if item.role is EvidenceRole.PRIMARY), None)
         evidence = tuple(
             text
             for item in supporting
@@ -738,9 +819,7 @@ async def load_relation_subjects(
             memory_type=memory.memory_type,
             source_type=unit.source_type,
             document_title=getattr(document, "title", None) or None,
-            evidence_time=_evidence_time(
-                _anchored_revision(primary, unit_revisions) if primary is not None else None
-            ),
+            evidence_time=await reader.evidence_time(unit),
             evidence=evidence,
         )
     return subjects

@@ -26,6 +26,9 @@ from memforge.storage.adapters.protocols import RelationalStore
 from memforge.storage.adapters.sqlite.relational import SqliteRelationalStore
 from memforge.storage.admin_memory import MemoryAdminListFilters
 
+# A retry time already due, so the failed work is leased again at once.
+_RETRY_DUE_AT = "2000-01-01T00:00:00+00:00"
+
 
 async def _enqueue_relation_work(db: Database, *, work_id: str = "relation-work-1") -> Memory:
     await db.upsert_source(
@@ -92,7 +95,7 @@ async def test_sqlite_relation_work_records_the_last_failure_and_its_code(db: Da
         lease_token=first.lease_token,
         error="MemoryPairClassificationError: first failure",
         error_code="output_invalid",
-        next_attempt_at=None,
+        next_attempt_at=_RETRY_DUE_AT,
         exhausted=False,
     )
     second = await _lease_one(db)
@@ -102,7 +105,7 @@ async def test_sqlite_relation_work_records_the_last_failure_and_its_code(db: Da
         lease_token=second.lease_token,
         error="TimeoutError: second failure",
         error_code="TimeoutError",
-        next_attempt_at=None,
+        next_attempt_at=_RETRY_DUE_AT,
         exhausted=False,
     )
     third = await _lease_one(db)
@@ -134,16 +137,18 @@ async def test_sqlite_relation_work_counts_exhausted_failed_and_completed_select
         """INSERT INTO relation_discovery_work (
                id, lifecycle_plan_id, memory_id, expected_content_hash, source_id,
                source_unit_id, doc_id, status, attempts, error_code, classifier_version,
-               created_at, updated_at
+               next_attempt_at, created_at, updated_at
            ) SELECT ?, lifecycle_plan_id, memory_id, ?, source_id,
-                    source_unit_id, doc_id, ?, ?, ?, ?, created_at, ?
+                    source_unit_id, doc_id, ?, ?, ?, ?, ?, created_at, ?
                FROM relation_discovery_work WHERE id = 'relation-work-1'""",
         [
-            ("work-exhausted-a", "hash-work-exhausted-a", "failed", 5, "output_invalid", None, "2026-07-23T00:00:00+00:00"),
-            ("work-exhausted-b", "hash-work-exhausted-b", "failed", 6, "TimeoutError", None, "2026-07-25T00:00:00+00:00"),
-            ("work-retrying", "hash-work-retrying", "failed", 2, "TimeoutError", None, "2026-07-23T00:00:00+00:00"),
-            ("work-done-v1", "hash-work-done-v1", "completed", 1, None, "memory-relation-v4-sparse", "2026-07-23T00:00:00+00:00"),
-            ("work-done-v2", "hash-work-done-v2", "completed", 1, None, "cross-document-relation-v1", "2026-07-23T00:00:00+00:00"),
+            ("work-exhausted-a", "hash-work-exhausted-a", "failed", 5, "output_invalid", None, None, "2026-07-23T00:00:00+00:00"),
+            ("work-exhausted-b", "hash-work-exhausted-b", "failed", 6, "TimeoutError", None, None, "2026-07-25T00:00:00+00:00"),
+            # A failure that repeats on every attempt finishes before the last attempt.
+            ("work-request-error", "hash-work-request-error", "failed", 1, "request_error", None, None, "2026-07-23T00:00:00+00:00"),
+            ("work-retrying", "hash-work-retrying", "failed", 2, "TimeoutError", None, _RETRY_DUE_AT, "2026-07-23T00:00:00+00:00"),
+            ("work-done-v1", "hash-work-done-v1", "completed", 1, None, "memory-relation-v4-sparse", None, "2026-07-23T00:00:00+00:00"),
+            ("work-done-v2", "hash-work-done-v2", "completed", 1, None, "cross-document-relation-v1", None, "2026-07-23T00:00:00+00:00"),
         ],
     )
     await db.db.commit()
@@ -151,7 +156,7 @@ async def test_sqlite_relation_work_counts_exhausted_failed_and_completed_select
     def selection(state: RelationDiscoveryWorkState, **filters) -> RelationDiscoveryWorkSelection:
         return RelationDiscoveryWorkSelection(state=state, max_attempts=5, **filters)
 
-    assert await db.count_relation_discovery_work(selection(RelationDiscoveryWorkState.EXHAUSTED)) == 2
+    assert await db.count_relation_discovery_work(selection(RelationDiscoveryWorkState.EXHAUSTED)) == 3
     assert await db.count_relation_discovery_work(selection(RelationDiscoveryWorkState.FAILED)) == 1
     assert await db.count_relation_discovery_work(selection(RelationDiscoveryWorkState.COMPLETED)) == 2
     assert await db.count_relation_discovery_work(
@@ -169,7 +174,7 @@ async def test_sqlite_relation_work_counts_exhausted_failed_and_completed_select
     ) == 1
     assert await SqliteRelationalStore(db).count_relation_discovery_work(
         selection(RelationDiscoveryWorkState.EXHAUSTED)
-    ) == 2
+    ) == 3
 
 
 @pytest.mark.asyncio

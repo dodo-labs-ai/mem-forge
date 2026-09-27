@@ -28,8 +28,8 @@ from memforge.memory.cross_document_relation import (
     CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
     CrossDocumentRelationLabel,
     RelationSubjectStore,
+    load_relation_evidence_units,
     load_relation_subjects,
-    primary_evidence_unit,
 )
 from memforge.memory.cross_source_conflict_reviews import (
     REVIEW_DECISION_LABELS,
@@ -200,10 +200,11 @@ async def _pin_case(
 ) -> _PinnedCase | RelationCaseSkip:
     if Visibility.PRIVATE.value in {challenger.visibility, candidate.visibility}:
         return RelationCaseSkip.PRIVATE_MEMORY
-    unit = primary_evidence_unit(await store.get_memory_evidence_units(challenger.id))
+    shown = await load_relation_evidence_units(store, (challenger, candidate))
+    unit = shown[challenger.id]
     if unit is None or not unit.doc_id:
         return RelationCaseSkip.NO_SOURCE_EVIDENCE
-    candidate_unit = primary_evidence_unit(await store.get_memory_evidence_units(candidate.id))
+    candidate_unit = shown[candidate.id]
     shown_units = (unit, candidate_unit) if candidate_unit is not None else (unit,)
     for source_id in sorted({shown.source_id for shown in shown_units}):
         skip = _source_skip(await store.get_source(source_id))
