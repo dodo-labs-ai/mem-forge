@@ -235,7 +235,16 @@ def _issue_payload_from_search(issue: dict, config: dict) -> dict:
 
 
 def _mark_changelog_completeness(payload: dict) -> None:
-    """Make Jira's embedded changelog pagination explicit to projection."""
+    """Record whether the issue's embedded changelog is its whole history.
+
+    Jira Data Center returns every history of an issue read or searched with
+    ``expand=changelog`` and offers no paginated changelog endpoint, so the
+    embedded changelog is the only and complete record whenever its ``total``
+    equals the returned count. A shorter changelog (a response limit set by the
+    Jira administrator) cannot be completed: it is marked truncated, projection
+    declares partial coverage, and the histories it lacks are never read as
+    deleted.
+    """
 
     changelog = payload.get("changelog")
     if not isinstance(changelog, dict):
@@ -252,6 +261,12 @@ def _mark_changelog_completeness(payload: dict) -> None:
             "returned": returned,
             "total": total,
         }
+        logger.warning(
+            "Jira changelog truncated for %s: returned %d of %d histories",
+            payload.get("key"),
+            returned,
+            total,
+        )
 
 
 def _issue_content_item(issue: dict, base_url: str) -> ContentItem:
