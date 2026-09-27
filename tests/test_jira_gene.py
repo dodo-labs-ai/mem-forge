@@ -531,6 +531,162 @@ async def test_discover_hydrates_search_result_so_fetch_uses_no_per_issue_reques
     assert "Keep the low-request path." in normalized.markdown_body
 
 
+# Jira Data Center embeds an issue's whole changelog; this is more histories than
+# the single 100-history page a capped changelog would carry.
+LONG_CHANGELOG_HISTORY_COUNT = 150
+# A changelog cut short by a Jira administrator's response limit.
+LIMITED_CHANGELOG_HISTORY_COUNT = 100
+
+
+def _histories(count: int) -> list[dict]:
+    return [
+        {"created": "2026-05-21T08:00:00.000+0000", "items": [{"field": "Sprint"}]}
+        for _ in range(count)
+    ]
+
+
+def _project_jira(raw, normalized):
+    from memforge.pipeline.source_projection_adapters import project_source_item
+
+    return project_source_item(
+        source_id="src-jira",
+        source_type="jira",
+        run_id="run-jira-changelog",
+        item=raw.item,
+        raw=raw,
+        normalized=normalized,
+    )
+
+
+def _changelog_keys(projection) -> list[str]:
+    return [
+        observation.provider_key
+        for observation in projection.observations
+        if observation.observation_type == "changelog"
+    ]
+
+
+class _LongChangelogClient(RecordingAsyncClient):
+    """Serves PAY-7 with its whole long changelog embedded, as Jira Data Center does."""
+
+    async def request(self, method: str, url: str, **kwargs):
+        self.calls.append((method, url, kwargs))
+        issue = _jira_issue("PAY-7", issue_id="100007", histories=_histories(LONG_CHANGELOG_HISTORY_COUNT))
+        if url.endswith("/comment"):
+            return JsonResponse({"startAt": 0, "comments": [], "total": 0})
+        if url.startswith("/rest/api/2/issue/"):
+            return JsonResponse(issue)
+        return JsonResponse(_search_page([issue]))
+
+
+def _pay_7_item(**extra) -> ContentItem:
+    return ContentItem(
+        item_id="jira-PAY-7",
+        title="PAY-7: PAY-7",
+        source_url="https://jira.example.test/browse/PAY-7",
+        last_modified=datetime(2026, 5, 21, tzinfo=timezone.utc),
+        content_type="application/json",
+        version="2026-05-21T08:00:00.000+0000",
+        extra={"issue_key": "PAY-7", **extra},
+    )
+
+
+async def _read_hydrated_by_search(gene: JiraGene):
+    items = [item async for item in gene.discover()]
+    return await gene.fetch(items[0])
+
+
+async def _read_rediscovered(gene: JiraGene):
+    current = await gene.rediscover(_pay_7_item(issue_id="100007"))
+    return await gene.fetch(current)
+
+
+async def _read_per_issue(gene: JiraGene):
+    return await gene.fetch(_pay_7_item())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("read_issue", "expected_calls"),
+    [
+        (_read_hydrated_by_search, [("POST", "/rest/api/2/search")]),
+        (_read_rediscovered, [("GET", "/rest/api/2/issue/100007")]),
+        (
+            _read_per_issue,
+            [("GET", "/rest/api/2/issue/PAY-7"), ("GET", "/rest/api/2/issue/PAY-7/comment")],
+        ),
+    ],
+    ids=["search", "rediscover", "per-issue"],
+)
+async def test_every_issue_read_projects_the_whole_embedded_changelog_without_extra_requests(
+    read_issue,
+    expected_calls,
+):
+    from memforge.source_projection import ProjectionCoverage
+
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"], "include_comments": True},
+        source_id="src-jira",
+    )
+    client = _LongChangelogClient(base_url="https://jira.example.test")
+    gene._client = client
+    gene._base_url = "https://jira.example.test"
+    gene._hydrated_issues = {}
+
+    raw = await read_issue(gene)
+    projection = _project_jira(raw, await gene.normalize(raw))
+
+    assert [call[0:2] for call in client.calls] == expected_calls
+    assert "_changelog_truncated" not in json.loads(raw.body)
+    assert _changelog_keys(projection) == [
+        str(index + 1) for index in range(LONG_CHANGELOG_HISTORY_COUNT)
+    ]
+    assert projection.coverage is ProjectionCoverage.COMPLETE_SNAPSHOT
+
+
+@pytest.mark.asyncio
+async def test_limited_changelog_keeps_returned_histories_and_projects_partial_coverage():
+    from memforge.source_projection import ProjectionCoverage
+
+    class LimitedChangelogClient(RecordingAsyncClient):
+        async def request(self, method: str, url: str, **kwargs):
+            self.calls.append((method, url, kwargs))
+            return JsonResponse(
+                _search_page(
+                    [
+                        _jira_issue(
+                            "PAY-7",
+                            issue_id="100007",
+                            histories=_histories(LIMITED_CHANGELOG_HISTORY_COUNT),
+                            changelog_total=LONG_CHANGELOG_HISTORY_COUNT,
+                        )
+                    ]
+                )
+            )
+
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"], "include_comments": True},
+        source_id="src-jira",
+    )
+    client = LimitedChangelogClient(base_url="https://jira.example.test")
+    gene._client = client
+    gene._base_url = "https://jira.example.test"
+
+    raw = await _read_hydrated_by_search(gene)
+    projection = _project_jira(raw, await gene.normalize(raw))
+
+    # Jira Data Center has no changelog page to ask for, so nothing more is requested.
+    assert [call[0:2] for call in client.calls] == [("POST", "/rest/api/2/search")]
+    assert json.loads(raw.body)["_changelog_truncated"] == {
+        "returned": LIMITED_CHANGELOG_HISTORY_COUNT,
+        "total": LONG_CHANGELOG_HISTORY_COUNT,
+    }
+    assert _changelog_keys(projection) == [
+        str(index + 1) for index in range(LIMITED_CHANGELOG_HISTORY_COUNT)
+    ]
+    assert projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION
+
+
 @pytest.mark.asyncio
 async def test_fetch_describes_jira_image_attachment_with_comment_parent():
     image = b"\x89PNG\r\n\x1a\nknown-jira-image"
