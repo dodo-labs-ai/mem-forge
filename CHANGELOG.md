@@ -60,6 +60,15 @@
 - `projection-extraction-v9` is the only extraction contract. Offline
   derivation cases must pin `access_context_hash` and
   `inference_capability_hash`.
+- Remove the Source activity epoch (ADR 0042). Source activity leases,
+  local-agent job leases and derivation identities fence Source writes.
+  Local-agent sync job payloads no longer carry `source_activity_epoch`, and
+  heartbeats no longer fail jobs with `local_agent_source_activity_epoch_stale`.
+  The upgrade supersedes derivations staged before it: the next incremental
+  sync derives those Units again, and a reprocess or full sync that was in
+  progress must be requested again. Upgrading when no sync is running, no
+  derivation is unapplied, and no local-agent job is queued or leased avoids
+  that repeated work.
 
 ## 0.1.63 - 2026-09-26
 

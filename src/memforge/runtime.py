@@ -722,7 +722,6 @@ async def run_source_sync(
 ) -> SyncState:
     activity_id = source_activity.id if source_activity is not None else None
     owns_activity = False
-    source_activity_epoch: int | None = None
     heartbeat_task: asyncio.Task[None] | None = None
     activity_lease = source_activity
     if source_activity is not None:
@@ -730,7 +729,6 @@ async def run_source_sync(
             raise ValueError("durable Source activity does not belong to the synced Source")
         if source_activity.kind is not SourceActivityKind.SYNC:
             raise ValueError("durable Source activity must be a sync authority")
-        source_activity_epoch = source_activity.epoch
     else:
         activity_id = f"source-sync-{uuid.uuid4().hex}"
         try:
@@ -740,7 +738,6 @@ async def run_source_sync(
                 kind=SourceActivityKind.SYNC,
                 lease_seconds=300,
             )
-            source_activity_epoch = activity_lease.epoch
             owns_activity = True
         except SourceActivityConflict as exc:
             raise SourceSyncActivityConflict(str(exc)) from exc
@@ -774,7 +771,6 @@ async def run_source_sync(
             "authoritative_snapshot": authoritative_snapshot,
             "reprocess_doc_ids": reprocess_doc_ids,
             "execution_mode": execution_mode,
-            "source_activity_epoch": source_activity_epoch,
             "source_activity": activity_lease,
             "lifecycle_cycle_id": lifecycle_cycle_id,
             "scope_transition_run_id": scope_transition_run_id,

@@ -210,7 +210,6 @@ class SourceUnitDerivationContext:
     update_plan_stats: Mapping[str, object] | None
     source_updated_at: str | None
     user_id: str | None
-    source_activity_epoch: int | None
     current_changed_ranges: tuple[tuple[int, int], ...] = ()
     reprocess_all_current_observations: bool = False
     reprocess_operation_id: str | None = None
@@ -386,7 +385,6 @@ def _authority_plan_identity(
         "target_unit_revision_id": delta.current_unit_revision_id,
         "representation_profiles": profiles,
         "access_context_hash": request.access_context_hash,
-        "source_activity_epoch": request.context.source_activity_epoch,
         "inference_capability_hash": request.inference_capability_hash,
         "semantic_input_policy": REVISION_INPUT_POLICY,
         "authority_policy_version": (
@@ -797,7 +795,6 @@ def source_unit_derivation_context_to_payload(
         "update_plan_stats": (dict(context.update_plan_stats) if context.update_plan_stats is not None else None),
         "source_updated_at": context.source_updated_at,
         "user_id": context.user_id,
-        "source_activity_epoch": context.source_activity_epoch,
         "current_changed_ranges": [[start, end] for start, end in context.current_changed_ranges],
         "reprocess_all_current_observations": (
             context.reprocess_all_current_observations
@@ -944,9 +941,6 @@ def source_unit_derivation_context_from_payload(
         ),
         source_updated_at=_optional_string(payload.get("source_updated_at")),
         user_id=_optional_string(payload.get("user_id")),
-        source_activity_epoch=(
-            int(payload["source_activity_epoch"]) if payload.get("source_activity_epoch") is not None else None
-        ),
         current_changed_ranges=tuple(
             (int(value[0]), int(value[1]))
             for value in payload.get("current_changed_ranges", [])
@@ -1295,7 +1289,6 @@ def _derivation_context_identity_payload(
         "update_plan_stats": context_payload.get("update_plan_stats"),
         "source_updated_at": context_payload.get("source_updated_at"),
         "user_id": context_payload.get("user_id"),
-        "source_activity_epoch": context_payload.get("source_activity_epoch"),
         "current_changed_ranges": context_payload.get("current_changed_ranges"),
         "reprocess_all_current_observations": context_payload.get(
             "reprocess_all_current_observations",

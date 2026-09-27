@@ -545,13 +545,11 @@ class SqliteRelationalStore:
         projection: SourceProjection,
         *,
         unit_input: SourceUnitInput | None = None,
-        expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
     ) -> None:
         await self._db.record_source_projection(
             projection,
             unit_input=unit_input,
-            expected_source_activity_epoch=expected_source_activity_epoch,
             source_activity=source_activity,
         )
 
@@ -795,7 +793,6 @@ class SqliteRelationalStore:
         derivation_id: str | None = None,
         derivation_context_identity_hash: str | None = None,
         required_derivation_work_ids: tuple[str, ...] = (),
-        expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
         runtime_bundle: AgentRuntimeBundle | None = None,
     ) -> None:
@@ -807,7 +804,6 @@ class SqliteRelationalStore:
             derivation_id=derivation_id,
             derivation_context_identity_hash=(derivation_context_identity_hash),
             required_derivation_work_ids=required_derivation_work_ids,
-            expected_source_activity_epoch=expected_source_activity_epoch,
             source_activity=source_activity,
             runtime_bundle=runtime_bundle,
         )

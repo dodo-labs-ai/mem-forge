@@ -1166,42 +1166,6 @@ async def test_mutation_failure_rolls_back_source_projection_with_the_plan(db: D
 
 
 @pytest.mark.asyncio
-async def test_stale_source_activity_epoch_rejects_projected_lifecycle_commit(
-    db: Database,
-) -> None:
-    unit_id = await _persist_exact_support_and_provenance(db)
-    await db.enable_lifecycle_gate("src-1")
-    lease = await db.acquire_source_activity(
-        activity_id="sync-before-fence",
-        source_id="src-1",
-        kind=SourceActivityKind.SYNC,
-    )
-    await db.db.execute(
-        "UPDATE sources SET activity_epoch = activity_epoch + 1 WHERE id = ?",
-        ("src-1",),
-    )
-    await db.db.commit()
-    projection = replace(_projection(), run_id="projection-from-stale-worker")
-    plan = replace(
-        _retirement_plan(
-            unit_id,
-            await db.get_memory_support_set_hash("mem-1"),
-        ),
-        id="plan-from-stale-worker",
-    )
-
-    with pytest.raises(SourceActivityConflict, match="source activity"):
-        await db.apply_source_projection_lifecycle(
-            projection,
-            plan,
-            expected_source_activity_epoch=lease.epoch,
-        )
-
-    assert await db.get_source_projection(projection.run_id) is None
-    assert await db.get_lifecycle_plan_status(plan.id) is None
-
-
-@pytest.mark.asyncio
 async def test_memory_version_stale_guard_rejects_concurrent_incumbent_change(
     db: Database,
 ) -> None:

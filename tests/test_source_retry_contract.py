@@ -224,12 +224,11 @@ async def test_two_connections_retry_one_job_without_resetting_attempts(db):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field,value", [("source_config_revision", "obsolete"), ("source_activity_epoch", 99)])
-async def test_exact_local_retry_rejects_stale_payload(db, field, value):
+async def test_exact_local_retry_rejects_stale_payload(db):
     _, payload = await _queued_retry(db)
     await db.db.execute(
         "UPDATE local_agent_jobs SET payload_json = ? WHERE job_id = ?",
-        (json.dumps({**payload, field: value}), "laj-retry"),
+        (json.dumps({**payload, "source_config_revision": "obsolete"}), "laj-retry"),
     )
     await db.db.commit()
     before = await db.get_local_agent_job("laj-retry")
