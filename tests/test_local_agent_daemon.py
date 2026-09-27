@@ -499,7 +499,7 @@ def test_local_agent_rejected_initial_heartbeat_never_runs_handler(tmp_path):
         cloud_job_heartbeat=lambda job_id, attempt_count, lease_seconds: {
             "error": "MemForge API request failed",
             "status_code": 409,
-            "detail": '{"detail":"local_agent_source_activity_epoch_required"}',
+            "detail": '{"detail":"local_agent_lease_not_current"}',
         },
     )
 
@@ -509,7 +509,7 @@ def test_local_agent_rejected_initial_heartbeat_never_runs_handler(tmp_path):
     assert completed == []
     assert report["results"][-1]["status"] == "failed"
     assert report["results"][-1]["error_type"] == "CloudJobLeaseLost"
-    assert "local_agent_source_activity_epoch_required" in report["results"][-1]["error"]
+    assert "local_agent_lease_not_current" in report["results"][-1]["error"]
 
 
 def test_local_agent_forwards_retryable_handler_failure_to_broker(tmp_path):

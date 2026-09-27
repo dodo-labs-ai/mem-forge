@@ -27,6 +27,5 @@ class SourceActivityLease:
     id: str
     source_id: str
     kind: SourceActivityKind
-    epoch: int
     capability: str | None
     lease_until: datetime

@@ -282,22 +282,6 @@ assert.deepEqual(
 
 assert.deepEqual(
   presentSourceSyncActivity(
-    sourceSyncActivityFromLocalJob({
-      ...localJob,
-      status: "failed",
-      last_error: "local_agent_source_activity_epoch_stale",
-    }),
-    "GitHub Repository",
-    "documents",
-  ),
-  {
-    message: "Action needed",
-    detail: "The source changed while this sync was waiting. Retry to sync its current state.",
-  },
-);
-
-assert.deepEqual(
-  presentSourceSyncActivity(
     {
       state: "failed",
       error: {

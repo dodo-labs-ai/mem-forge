@@ -74,7 +74,6 @@ async def _run_agent_patch_with_activity(
     *,
     db: Database,
     source_id: str,
-    expected_epoch: int | None,
     operation: Callable[[], Awaitable[Any]],
     lease_seconds: int = 300,
     heartbeat_seconds: float = 60.0,
@@ -86,7 +85,6 @@ async def _run_agent_patch_with_activity(
         activity_id=activity_id,
         source_id=source_id,
         kind=SourceActivityKind.AGENT_PATCH,
-        expected_epoch=expected_epoch,
         lease_seconds=lease_seconds,
     )
 
@@ -1092,11 +1090,6 @@ async def submit_agent_session_window(
 
     source_id = agent_session_source_id(client, owner_user_id)
     source = await db.get_source(source_id)
-    source_activity_epoch = (
-        int(source.get("activity_epoch") or 0)
-        if source is not None
-        else None
-    )
 
     if structured_llm_client is None:
         await _record_window_outcome(
@@ -1300,14 +1293,11 @@ async def submit_agent_session_window(
             client=client,
             owner_user_id=owner_user_id,
         )
-        source_activity_epoch = int(source.get("activity_epoch") or 0)
 
-    assert source_activity_epoch is not None
     try:
         return await _run_agent_patch_with_activity(
             db=db,
             source_id=source_id,
-            expected_epoch=source_activity_epoch,
             operation=lambda: generate_and_apply(source),
         )
     except Exception as exc:

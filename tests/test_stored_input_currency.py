@@ -371,7 +371,7 @@ class _WrappingLifecycleEngine(RecordingMemoryEngine):
 @pytest.mark.parametrize(
     "cause",
     [
-        SourceActivityConflict("source activity epoch changed: expected 1, current 2"),
+        SourceActivityConflict("source activity fence is not current: sync-run"),
         sqlite3.OperationalError("database is locked"),
     ],
     ids=["lost_fence", "storage"],
@@ -456,6 +456,78 @@ async def test_the_migration_supersedes_unapplied_reprocess_derivations_staged_f
             assert after.updated_at > before.updated_at
         assert {attempt_id: attempts[attempt_id].status for attempt_id in ordinary} == ordinary
     finally:
+        await migrated.close()
+
+
+@pytest.mark.asyncio
+async def test_the_migration_supersedes_unapplied_derivations_staged_with_a_source_activity_epoch(tmp_path):
+    path = tmp_path / "epoch.db"
+    legacy = Database(str(path))
+    await legacy.connect()
+    NoopMemoryEngine.db = legacy
+    try:
+        harness = await synced(legacy)
+        staged = await _staged_changes(harness)
+        # A derivation staged before the upgrade carries the epoch in its context,
+        # and its id, derived from that context, differs from any id staged now.
+        epoch_derivation_id = "sdrv-staged-with-activity-epoch"
+        [(context_json,)] = await legacy.db.execute_fetchall(
+            "SELECT context_payload_json FROM source_derivation_attempts WHERE id = ?", (staged["PAY-1"].id,),
+        )
+        epoch_context = json.dumps(
+            {**json.loads(context_json), "source_activity_epoch": 0}, sort_keys=True, separators=(",", ":")
+        )
+        await legacy.db.commit()
+        await legacy.db.execute("PRAGMA foreign_keys = OFF")
+        for table in ("source_derivation_batches", "source_derivation_work"):
+            await legacy.db.execute(
+                f"UPDATE {table} SET derivation_id = ? WHERE derivation_id = ?",
+                (epoch_derivation_id, staged["PAY-1"].id),
+            )
+        await legacy.db.execute(
+            """UPDATE source_derivation_attempts SET id = ?, context_payload_json = ?, context_payload_hash = ?
+                WHERE id = ?""",
+            (
+                epoch_derivation_id,
+                epoch_context,
+                hashlib.sha256(epoch_context.encode("utf-8")).hexdigest(),
+                staged["PAY-1"].id,
+            ),
+        )
+        await legacy.db.commit()
+        await legacy.db.execute("PRAGMA foreign_keys = ON")
+        await legacy.db.execute("ALTER TABLE sources ADD COLUMN activity_epoch INTEGER NOT NULL DEFAULT 0")
+        await legacy.db.execute("DELETE FROM schema_migrations WHERE version = 105")
+        await legacy.db.commit()
+    finally:
+        NoopMemoryEngine.db = None
+        await legacy.close()
+
+    migrated = Database(str(path))
+    await migrated.connect()
+    NoopMemoryEngine.db = migrated
+    try:
+        attempts = {attempt.id: attempt for attempt in await migrated.list_source_derivation_attempts(source_id=SOURCE_ID)}
+        epoch_attempt = attempts[epoch_derivation_id]
+        assert (epoch_attempt.status, epoch_attempt.terminal_reason_code) == (
+            "superseded",
+            "DERIVATION_INPUT_SUPERSEDED",
+        )
+        assert epoch_attempt.updated_at > staged["PAY-1"].updated_at
+        assert attempts[staged["PAY-2"].id].status == staged["PAY-2"].status
+        columns = {row[1] for row in await migrated.db.execute_fetchall("PRAGMA table_info(sources)")}
+        assert "activity_epoch" not in columns
+
+        # The next incremental sync derives the Unit again instead of failing on the old derivation.
+        harness.db = migrated
+        assert (await harness.sync()).last_sync_status == "success"
+        for issue_key in ISSUES:
+            unit_id = staged[issue_key].source_unit_id
+            assert (await migrated.get_current_source_unit_revision(unit_id)).id == (
+                staged[issue_key].target_unit_revision_id
+            )
+    finally:
+        NoopMemoryEngine.db = None
         await migrated.close()
 
 

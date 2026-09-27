@@ -1822,7 +1822,6 @@ CREATE TABLE IF NOT EXISTS source_sync_snapshot_manifests (
     manifest_sha256     TEXT NOT NULL,
     local_agent_job_id  TEXT NOT NULL,
     local_agent_attempt_count INTEGER NOT NULL,
-    source_activity_epoch INTEGER NOT NULL,
     source_config_revision TEXT NOT NULL,
     scope_attestations_json TEXT NOT NULL DEFAULT '[]',
     created_at          TEXT NOT NULL,
@@ -4499,6 +4498,16 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # _move_stored_input_to_source_units_unlocked).
         [],
     ),
+    (
+        105,
+        "Remove the Source activity epoch",
+        # Source activity leases, local-agent job leases, and derivation
+        # identities fence Source writes (ADR 0042). An unapplied derivation
+        # whose context carries the epoch no longer matches its identity and is
+        # superseded; the columns are dropped where a database created before
+        # this version still has them (see _remove_source_activity_epoch_unlocked).
+        [],
+    ),
 ]
 
 
@@ -4768,9 +4777,12 @@ class Database:
                     else:
                         raise
             if version == 53:
-                await self._drop_memory_columns_if_present_unlocked("curation_cluster_id", "memory_level")
+                await self._drop_columns_if_present_unlocked("memories", "curation_cluster_id", "memory_level")
             if version == 96:
-                await self._drop_memory_columns_if_present_unlocked("contradiction_count")
+                await self._drop_columns_if_present_unlocked("memories", "contradiction_count")
+            if version == 105:
+                superseded = await self._remove_source_activity_epoch_unlocked()
+                logger.info("Superseded %d unapplied derivations staged with a Source activity epoch", superseded)
             if version == 26:
                 await self._backfill_relation_run_snapshot_audit()
             if version in (30, 31, 66):
@@ -4857,6 +4869,26 @@ class Database:
                   AND json_extract(context_payload_json, '$.support_without_baseline') = 1""",
             (DERIVATION_INPUT_SUPERSEDED, _now_iso()),
         )
+        return cursor.rowcount
+
+    async def _remove_source_activity_epoch_unlocked(self) -> int:
+        """Supersede derivations staged with a Source activity epoch and drop the epoch columns.
+
+        The context identity of such a derivation includes the epoch, so it can
+        no longer commit. An incremental sync derives its Unit again; a reprocess
+        or full sync is requested again by an operator.
+        """
+
+        cursor = await self.db.execute(
+            """UPDATE source_derivation_attempts
+                  SET status = 'superseded', terminal_reason_code = ?, updated_at = ?
+                WHERE status IN ('pending', 'retryable_failure', 'completed')
+                  AND json_type(context_payload_json, '$.source_activity_epoch') IS NOT NULL""",
+            (DERIVATION_INPUT_SUPERSEDED, _now_iso()),
+        )
+        await self._drop_columns_if_present_unlocked("sources", "activity_epoch")
+        await self._drop_columns_if_present_unlocked("source_activity_leases", "epoch")
+        await self._drop_columns_if_present_unlocked("source_sync_snapshot_manifests", "source_activity_epoch")
         return cursor.rowcount
 
     async def _move_stored_input_to_source_units_unlocked(self) -> int:
@@ -5022,13 +5054,13 @@ class Database:
             unresolved_revision_ids=tuple(unresolved),
         )
 
-    async def _drop_memory_columns_if_present_unlocked(self, *column_names: str) -> None:
-        """Drop Memory columns that a database created before their removal still has."""
-        async with self.db.execute("PRAGMA table_info(memories)") as cursor:
-            memory_columns = {str(row[1]) async for row in cursor}
+    async def _drop_columns_if_present_unlocked(self, table: str, *column_names: str) -> None:
+        """Drop columns that a database created before their removal still has."""
+        async with self.db.execute(f"PRAGMA table_info({table})") as cursor:
+            table_columns = {str(row[1]) async for row in cursor}
         for column_name in column_names:
-            if column_name in memory_columns:
-                await self.db.execute(f"ALTER TABLE memories DROP COLUMN {column_name}")
+            if column_name in table_columns:
+                await self.db.execute(f"ALTER TABLE {table} DROP COLUMN {column_name}")
 
     async def _migrate_source_access_policy_unlocked(self) -> None:
         """Materialize legacy Source access without guessing.
@@ -5729,11 +5761,8 @@ class Database:
             if target["status"] != "queued":
                 return retry_job_id, False
             current_payload = local_agent_sync_job_payload(source)
-            if any(
-                target["payload"].get(key) != current_payload[key]
-                for key in ("source_config_revision", "source_activity_epoch")
-            ):
-                raise ValueError("local agent retry target configuration or activity epoch is stale")
+            if target["payload"].get("source_config_revision") != current_payload["source_config_revision"]:
+                raise ValueError("local agent retry target configuration is stale")
             if trigger != "manual":
                 raise ValueError("targeted retry requires manual intent")
             await self.db.execute(
@@ -6853,7 +6882,6 @@ class Database:
         projection: SourceProjection,
         *,
         unit_input: SourceUnitInput | None = None,
-        expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
         _manage_transaction: bool = True,
     ) -> None:
@@ -6888,7 +6916,7 @@ class Database:
                     source_activity,
                 )
                 async with self.db.execute(
-                    "SELECT type, activity_epoch FROM sources WHERE id = ?",
+                    "SELECT type FROM sources WHERE id = ?",
                     (projection.source_id,),
                 ) as cursor:
                     persisted_source = await cursor.fetchone()
@@ -6896,13 +6924,6 @@ class Database:
                     raise ValueError("projection Source does not exist")
                 if str(persisted_source["type"]) != projection.source_type:
                     raise ValueError("projection Source type does not match the persisted Configured Source")
-                if expected_source_activity_epoch is not None:
-                    current_epoch = int(persisted_source["activity_epoch"] or 0)
-                    if current_epoch != expected_source_activity_epoch:
-                        raise SourceActivityConflict(
-                            "source activity epoch changed: "
-                            f"expected {expected_source_activity_epoch}, current {current_epoch}"
-                        )
                 async with self.db.execute(
                     "SELECT payload_hash, payload_json FROM source_projection_runs WHERE id = ?",
                     (projection.run_id,),
@@ -8232,24 +8253,16 @@ class Database:
         if source_lock.rowcount != 1:
             raise SourceActivityConflict(f"Source not found: {source_id}")
         async with self.db.execute(
-            "SELECT activity_epoch FROM sources WHERE id = ?",
-            (source_id,),
-        ) as cursor:
-            source = await cursor.fetchone()
-        async with self.db.execute(
-            """SELECT source_id, kind, capability, epoch, lease_until
+            """SELECT source_id, kind, capability, lease_until
                FROM source_activity_leases WHERE id = ?""",
             (source_activity.id,),
         ) as cursor:
             lease = await cursor.fetchone()
         if (
-            source is None
-            or int(source["activity_epoch"] or 0) != source_activity.epoch
-            or lease is None
+            lease is None
             or str(lease["source_id"]) != source_id
             or str(lease["kind"]) != source_activity.kind.value
             or lease["capability"] != source_activity.capability
-            or int(lease["epoch"]) != source_activity.epoch
             or str(lease["lease_until"]) <= _utc_iso(now)
         ):
             raise SourceActivityConflict(f"source activity fence is not current: {source_activity.id}")
@@ -8301,22 +8314,11 @@ class Database:
         kind: SourceActivityKind,
         capability: str | None,
         lease_seconds: int,
-        expected_epoch: int | None = None,
         now: datetime | None = None,
     ) -> SourceActivityLease:
         now = now or datetime.now(timezone.utc)
         now_iso = _utc_iso(now)
         lease_until = now + timedelta(seconds=max(1, lease_seconds))
-        async with self.db.execute(
-            "SELECT activity_epoch FROM sources WHERE id = ?",
-            (source_id,),
-        ) as cursor:
-            source = await cursor.fetchone()
-        if source is None:
-            raise SourceActivityConflict(f"Source not found: {source_id}")
-        epoch = int(source["activity_epoch"] or 0)
-        if expected_epoch is not None and epoch != expected_epoch:
-            raise SourceActivityConflict(f"source activity epoch changed: expected {expected_epoch}, current {epoch}")
         # Expiry removes admission authority. Purge stale rows while holding
         # the Source write boundary so a deterministic job/activity id can be
         # reacquired after a crash without colliding with its old primary key.
@@ -8325,7 +8327,7 @@ class Database:
             (source_id, now_iso),
         )
         async with self.db.execute(
-            """SELECT id, kind, epoch, capability, lease_until
+            """SELECT id, kind, capability, lease_until
                FROM source_activity_leases
                WHERE source_id = ? AND lease_until > ?
                ORDER BY created_at LIMIT 1""",
@@ -8335,7 +8337,7 @@ class Database:
         if active is not None and str(active["id"]) != activity_id:
             raise SourceActivityConflict(f"source activity already active: {active['id']} ({active['kind']})")
         if active is not None:
-            if str(active["kind"]) != kind.value or int(active["epoch"]) != epoch or active["capability"] != capability:
+            if str(active["kind"]) != kind.value or active["capability"] != capability:
                 raise SourceActivityConflict("source activity retry identity mismatch")
             await self.db.execute(
                 "UPDATE source_activity_leases SET lease_until = ?, updated_at = ? WHERE id = ?",
@@ -8344,14 +8346,13 @@ class Database:
         else:
             await self.db.execute(
                 """INSERT INTO source_activity_leases (
-                       id, source_id, kind, epoch, capability, lease_until,
+                       id, source_id, kind, capability, lease_until,
                        created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     activity_id,
                     source_id,
                     kind.value,
-                    epoch,
                     capability,
                     _utc_iso(lease_until),
                     now_iso,
@@ -8362,7 +8363,6 @@ class Database:
             id=activity_id,
             source_id=source_id,
             kind=kind,
-            epoch=epoch,
             capability=capability,
             lease_until=lease_until,
         )
@@ -8375,7 +8375,6 @@ class Database:
         kind: SourceActivityKind,
         capability: str | None = None,
         lease_seconds: int = 900,
-        expected_epoch: int | None = None,
     ) -> SourceActivityLease:
         async with self._write_lock:
             try:
@@ -8391,7 +8390,6 @@ class Database:
                     kind=kind,
                     capability=capability,
                     lease_seconds=lease_seconds,
-                    expected_epoch=expected_epoch,
                 )
                 await self.db.commit()
                 return lease
@@ -8425,7 +8423,7 @@ class Database:
                 await self.db.rollback()
                 raise SourceActivityConflict(f"source activity lease is not current: {activity_id}")
             async with self.db.execute(
-                "SELECT source_id, kind, epoch FROM source_activity_leases WHERE id = ?",
+                "SELECT source_id, kind FROM source_activity_leases WHERE id = ?",
                 (activity_id,),
             ) as read_cursor:
                 row = await read_cursor.fetchone()
@@ -8435,7 +8433,6 @@ class Database:
             id=activity_id,
             source_id=str(row["source_id"]),
             kind=SourceActivityKind(str(row["kind"])),
-            epoch=int(row["epoch"]),
             capability=capability,
             lease_until=lease_until,
         )
@@ -8453,16 +8450,6 @@ class Database:
             )
             await self.db.commit()
         return bool(cursor.rowcount)
-
-    async def get_source_activity_epoch(self, source_id: str) -> int:
-        async with self.db.execute(
-            "SELECT activity_epoch FROM sources WHERE id = ?",
-            (source_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row is None:
-            raise SourceActivityConflict(f"Source not found: {source_id}")
-        return int(row["activity_epoch"] or 0)
 
     async def _unit_references_unlocked(
         self,
@@ -9065,7 +9052,6 @@ class Database:
         derivation_id: str | None = None,
         derivation_context_identity_hash: str | None = None,
         required_derivation_work_ids: tuple[str, ...] = (),
-        expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
         runtime_bundle: AgentRuntimeBundle | None = None,
     ) -> None:
@@ -9184,7 +9170,6 @@ class Database:
                 await self.record_source_projection(
                     projection,
                     unit_input=unit_input,
-                    expected_source_activity_epoch=expected_source_activity_epoch,
                     source_activity=source_activity,
                     _manage_transaction=False,
                 )
@@ -18200,12 +18185,10 @@ class Database:
         async with self.db.execute(
             """SELECT 1
                FROM source_activity_leases AS activity
-               JOIN sources AS source ON source.id = activity.source_id
                WHERE activity.id = ?
                  AND activity.source_id = ?
                  AND activity.kind = 'sync'
                  AND activity.capability = ?
-                 AND activity.epoch = source.activity_epoch
                  AND activity.lease_until > ?""",
             (
                 str(run["run_id"]),
@@ -18330,12 +18313,10 @@ class Database:
                      AND EXISTS (
                        SELECT 1
                        FROM source_activity_leases AS activity
-                       JOIN sources AS source ON source.id = activity.source_id
                        WHERE activity.id = source_sync_runs.run_id
                          AND activity.source_id = source_sync_runs.source_id
                          AND activity.kind = 'sync'
                          AND activity.capability = ?
-                         AND activity.epoch = source.activity_epoch
                          AND activity.lease_until > ?
                      )""",
                 (
@@ -18690,7 +18671,6 @@ class Database:
         raw_content_type: str,
         metadata: dict[str, object] | None = None,
         sync_snapshot_id: str | None = None,
-        expected_activity_epoch: int | None = None,
     ) -> SourceSyncInput:
         now = _now_iso()
         metadata_payload = dict(metadata or {})
@@ -18706,18 +18686,6 @@ class Database:
                 )
                 if source_lock.rowcount != 1:
                     raise ValueError(f"Source not found: {source_id}")
-                if expected_activity_epoch is not None:
-                    async with self.db.execute(
-                        "SELECT activity_epoch FROM sources WHERE id = ?",
-                        (source_id,),
-                    ) as cursor:
-                        epoch_row = await cursor.fetchone()
-                    current_epoch = int(epoch_row["activity_epoch"] or 0)
-                    if current_epoch != expected_activity_epoch:
-                        raise SourceActivityConflict(
-                            "source activity epoch changed: "
-                            f"expected {expected_activity_epoch}, current {current_epoch}"
-                        )
             except Exception:
                 await self.db.rollback()
                 raise
@@ -18973,7 +18941,6 @@ class Database:
                            AND prior_mi.revision = mi.revision
                            AND prior_mi.change_kind = mi.change_kind
                            AND prior_si.input_id = si.input_id
-                           AND prior_manifest.source_activity_epoch = current_manifest.source_activity_epoch
                            AND prior_manifest.source_config_revision = current_manifest.source_config_revision
                      )
                    ORDER BY mi.doc_id"""
@@ -19001,7 +18968,6 @@ class Database:
         local_agent_attempt_count: int,
         source_config_revision: str,
         scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
-        expected_activity_epoch: int | None = None,
     ) -> None:
         """Persist one fenced manifest and attach its reusable immutable inputs."""
         normalized_snapshot_id = _non_empty_string(snapshot_id)
@@ -19031,17 +18997,12 @@ class Database:
         async with self._write_lock:
             try:
                 async with self.db.execute(
-                    "SELECT activity_epoch FROM sources WHERE id = ?",
+                    "SELECT 1 FROM sources WHERE id = ?",
                     (source_id,),
                 ) as cursor:
                     source = await cursor.fetchone()
                 if source is None:
                     raise ValueError(f"Source not found: {source_id}")
-                if (
-                    expected_activity_epoch is not None
-                    and int(source["activity_epoch"] or 0) != expected_activity_epoch
-                ):
-                    raise SourceActivityConflict("source activity epoch changed")
                 async with self.db.execute(
                     """SELECT status, attempt_count, leased_until, payload_json
                        FROM local_agent_jobs
@@ -19063,7 +19024,6 @@ class Database:
                         and leased_until is not None
                         and leased_until > datetime.now(timezone.utc)
                         and str(job_payload.get("source_config_revision") or "") == source_config_revision
-                        and int(job_payload.get("source_activity_epoch", -1)) == int(source["activity_epoch"] or 0)
                     ):
                         raise SourceActivityConflict("local agent lease changed")
                 async with self.db.execute(
@@ -19078,8 +19038,7 @@ class Database:
                 async with self.db.execute(
                     """SELECT coverage, item_count, manifest_sha256,
                               local_agent_job_id, local_agent_attempt_count,
-                              source_activity_epoch, source_config_revision,
-                              scope_attestations_json
+                              source_config_revision, scope_attestations_json
                        FROM source_sync_snapshot_manifests
                        WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
                     (workspace_id, source_id, normalized_snapshot_id),
@@ -19091,7 +19050,6 @@ class Database:
                     manifest_sha256,
                     local_agent_job_id,
                     local_agent_attempt_count,
-                    int(source["activity_epoch"] or 0),
                     source_config_revision,
                     scope_attestations_json,
                 )
@@ -19102,7 +19060,6 @@ class Database:
                         str(existing_manifest["manifest_sha256"]),
                         str(existing_manifest["local_agent_job_id"]),
                         int(existing_manifest["local_agent_attempt_count"]),
-                        int(existing_manifest["source_activity_epoch"]),
                         str(existing_manifest["source_config_revision"]),
                         str(existing_manifest["scope_attestations_json"]),
                     )
@@ -19134,9 +19091,8 @@ class Database:
                         """INSERT INTO source_sync_snapshot_manifests (
                         workspace_id, source_id, snapshot_id, coverage, item_count, manifest_sha256,
                         local_agent_job_id, local_agent_attempt_count,
-                        source_activity_epoch, source_config_revision,
-                        scope_attestations_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        source_config_revision, scope_attestations_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             workspace_id,
                             source_id,
@@ -19146,7 +19102,6 @@ class Database:
                             manifest_sha256,
                             local_agent_job_id,
                             local_agent_attempt_count,
-                            int(source["activity_epoch"] or 0),
                             source_config_revision,
                             scope_attestations_json,
                             now,
@@ -19202,8 +19157,8 @@ class Database:
         """Return manifest coverage and whether every declared item is materialized."""
         async with self.db.execute(
             """SELECT m.coverage, m.item_count, m.local_agent_job_id,
-                      m.local_agent_attempt_count, m.source_activity_epoch,
-                      m.source_config_revision, m.scope_attestations_json,
+                      m.local_agent_attempt_count, m.source_config_revision,
+                      m.scope_attestations_json,
                       COUNT(si.doc_id) AS materialized_count
                FROM source_sync_snapshot_manifests m
                LEFT JOIN source_sync_snapshot_items si
@@ -19212,8 +19167,8 @@ class Database:
                 AND si.snapshot_id = m.snapshot_id
                WHERE m.workspace_id = ? AND m.source_id = ? AND m.snapshot_id = ?
                GROUP BY m.coverage, m.item_count, m.local_agent_job_id,
-                        m.local_agent_attempt_count, m.source_activity_epoch,
-                        m.source_config_revision, m.scope_attestations_json""",
+                        m.local_agent_attempt_count, m.source_config_revision,
+                        m.scope_attestations_json""",
             (workspace_id, source_id, snapshot_id),
         ) as cursor:
             row = await cursor.fetchone()
@@ -19228,7 +19183,6 @@ class Database:
             "ready": materialized_count == item_count,
             "local_agent_job_id": str(row["local_agent_job_id"]),
             "local_agent_attempt_count": int(row["local_agent_attempt_count"]),
-            "source_activity_epoch": int(row["source_activity_epoch"]),
             "source_config_revision": str(row["source_config_revision"]),
             "scope_attestations": tuple(
                 projection_scope_attestation_from_payload(item)
@@ -19242,7 +19196,6 @@ class Database:
         source_id: str,
         input_id: str,
         package_sha256: str,
-        expected_activity_epoch: int | None = None,
     ) -> SourceSyncInput:
         """Atomically fill or verify a retained input's own package hash."""
         async with self._write_lock:
@@ -19253,18 +19206,6 @@ class Database:
                 )
                 if source_lock.rowcount != 1:
                     raise ValueError(f"Source not found: {source_id}")
-                if expected_activity_epoch is not None:
-                    async with self.db.execute(
-                        "SELECT activity_epoch FROM sources WHERE id = ?",
-                        (source_id,),
-                    ) as cursor:
-                        epoch_row = await cursor.fetchone()
-                    current_epoch = int(epoch_row["activity_epoch"] or 0)
-                    if current_epoch != expected_activity_epoch:
-                        raise SourceActivityConflict(
-                            "source activity epoch changed: "
-                            f"expected {expected_activity_epoch}, current {current_epoch}"
-                        )
                 async with self.db.execute(
                     "SELECT * FROM source_sync_inputs WHERE input_id = ? AND source_id = ?",
                     (input_id, source_id),
