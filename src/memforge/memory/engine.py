@@ -164,7 +164,6 @@ class _PreparedProjectedLifecycleCommit:
     derivation_id: str | None
     derivation_context_identity_hash: str | None
     required_derivation_work_ids: tuple[str, ...]
-    expected_source_activity_epoch: int | None
     source_activity: SourceActivityLease | None
     base_stats: Mapping[str, int]
     lifecycle_execution_owner_id: str | None
@@ -387,7 +386,6 @@ class MemoryEngine:
         derivation_reprocess_all_current_observations: bool = False,
         derivation_reprocess_operation_id: str | None = None,
         derivation_support_without_baseline: bool = False,
-        expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
         current_changed_ranges: tuple[tuple[int, int], ...] = (),
         lifecycle_execution_owner_id: str | None = None,
@@ -426,7 +424,6 @@ class MemoryEngine:
                         derivation_reprocess_operation_id
                     ),
                     derivation_support_without_baseline=derivation_support_without_baseline,
-                    expected_source_activity_epoch=expected_source_activity_epoch,
                     source_activity=source_activity,
                     current_changed_ranges=current_changed_ranges,
                     lifecycle_execution_owner_id=lifecycle_execution_owner_id,
@@ -698,9 +695,6 @@ class MemoryEngine:
                     prepared.derivation_context_identity_hash
                 ),
                 required_derivation_work_ids=prepared.required_derivation_work_ids,
-                expected_source_activity_epoch=(
-                    prepared.expected_source_activity_epoch
-                ),
                 source_activity=prepared.source_activity,
                 runtime_bundle=runtime_bundle,
             )
@@ -851,7 +845,6 @@ class MemoryEngine:
         derivation_reprocess_all_current_observations: bool = False,
         derivation_reprocess_operation_id: str | None = None,
         derivation_support_without_baseline: bool = False,
-        expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
         current_changed_ranges: tuple[tuple[int, int], ...] = (),
         lifecycle_execution_owner_id: str | None = None,
@@ -1474,7 +1467,6 @@ class MemoryEngine:
                         else None
                     ),
                     user_id=user_id,
-                    source_activity_epoch=expected_source_activity_epoch,
                     current_changed_ranges=current_changed_ranges,
                     reprocess_all_current_observations=(
                         derivation_reprocess_all_current_observations
@@ -1514,7 +1506,6 @@ class MemoryEngine:
             derivation_id=derivation_id,
             derivation_context_identity_hash=derivation_context_identity_hash,
             required_derivation_work_ids=required_derivation_work_ids,
-            expected_source_activity_epoch=expected_source_activity_epoch,
             source_activity=source_activity,
             base_stats=dict(stats),
             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
@@ -1567,7 +1558,6 @@ class MemoryEngine:
         doc_id: str,
         reason: str,
         lifecycle_cycle_id: str,
-        expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
     ) -> dict[str, int | bool]:
         """Apply an authoritative Source Unit tombstone without an LLM call.
@@ -1659,7 +1649,6 @@ class MemoryEngine:
         await self.db.apply_source_projection_lifecycle(
             projection,
             plan,
-            expected_source_activity_epoch=expected_source_activity_epoch,
             source_activity=source_activity,
         )
         await self.memory_store.attempt_lifecycle_vector_delivery(plan.id)

@@ -869,7 +869,6 @@ def test_local_source_sync_enqueues_canonical_owner_job(tmp_path):
         assert jobs[0]["execution_owner_user_id"] == "owner-a"
         job_payload = dict(jobs[0]["payload"])
         assert job_payload.pop("source_config_revision")
-        assert job_payload.pop("source_activity_epoch") == 0
         assert job_payload == {
             "region": "emea",
             "conversation_ids": ["19:conversation-a@example.test"],
@@ -1131,77 +1130,6 @@ def test_source_config_change_fences_leased_job_and_enqueues_successor(tmp_path)
         assert stale.json()["detail"] == "local_agent_lease_not_current"
         assert successor.status_code == 202, successor.text
         assert successor.json()["job_id"] != leased["job_id"]
-    finally:
-        asyncio.run(database.close())
-
-
-def test_lifecycle_epoch_change_terminally_fails_leased_local_sync_job(tmp_path):
-    database = _connect_database(tmp_path)
-    try:
-        app = _app(tmp_path, database)
-        headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
-        with TestClient(app) as client:
-            created = client.post("/api/v1/sources", headers=headers, json=_teams_payload())
-            source_id = created.json()["id"]
-            triggered = client.post(f"/api/v1/sources/{source_id}/sync", headers=headers)
-            leased = client.post(
-                "/api/cloud/local-agent/jobs/lease",
-                headers=headers,
-                json={"limit": 1, "lease_seconds": 60},
-            ).json()["jobs"][0]
-
-            async def fence_job_epoch() -> None:
-                await database.db.execute(
-                    "UPDATE sources SET activity_epoch = activity_epoch + 1 WHERE id = ?",
-                    (source_id,),
-                )
-                await database.db.commit()
-
-            asyncio.run(fence_job_epoch())
-
-            heartbeat = client.post(
-                f"/api/cloud/local-agent/jobs/{leased['job_id']}/heartbeat",
-                headers=headers,
-                json={
-                    "attempt_count": leased["attempt_count"],
-                    "lease_seconds": 60,
-                },
-            )
-            detail = client.get(
-                f"/api/cloud/local-agent/jobs/{leased['job_id']}",
-                headers=headers,
-            )
-            released_again = client.post(
-                "/api/cloud/local-agent/jobs/lease",
-                headers=headers,
-                json={"limit": 1, "lease_seconds": 60},
-            )
-            replacement = client.post(f"/api/v1/sources/{source_id}/sync", headers=headers)
-            replacement_lease = client.post(
-                "/api/cloud/local-agent/jobs/lease",
-                headers=headers,
-                json={"limit": 1, "lease_seconds": 60},
-            )
-
-        assert triggered.status_code == 202, triggered.text
-        assert leased["payload"]["source_activity_epoch"] == 0
-        assert asyncio.run(database.get_source_activity_epoch(source_id)) == 1
-        assert heartbeat.status_code == 409, heartbeat.text
-        assert heartbeat.json()["detail"] == "local_agent_source_activity_epoch_stale"
-        assert detail.status_code == 200, detail.text
-        assert detail.json()["status"] == "failed"
-        assert detail.json()["last_error"] == "local_agent_source_activity_epoch_stale"
-        assert detail.json()["result"] == {
-            "error_code": "local_agent_source_activity_epoch_stale",
-            "retryable": False,
-        }
-        assert detail.json()["leased_until"] is None
-        assert released_again.status_code == 200, released_again.text
-        assert released_again.json()["jobs"] == []
-        assert replacement.status_code == 202, replacement.text
-        replacement_job = replacement_lease.json()["jobs"][0]
-        assert replacement_job["job_id"] != leased["job_id"]
-        assert replacement_job["payload"]["source_activity_epoch"] == 1
     finally:
         asyncio.run(database.close())
 

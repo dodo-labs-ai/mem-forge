@@ -1079,7 +1079,6 @@ async def test_deriver_stages_projection_extraction_v9_without_ingestion_replay(
                 update_plan_stats=None,
                 source_updated_at=now.isoformat(),
                 user_id=None,
-                source_activity_epoch=None,
             ),
             plan_requests=fixture_request_planner(projection, access_context_hash="access-support-v2"),
             extract_request=extract,

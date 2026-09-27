@@ -197,7 +197,6 @@ from memforge.source_access_transition import (
 from memforge.local_agent.readiness import connection_status_from_browser_session
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_SYNC_OPERATIONS,
-    LOCAL_AGENT_SOURCE_ACTIVITY_EPOCH_STALE,
     TEAMS_ROLLING_RETENTION_PRESETS,
     execution_owner_user_id,
     is_local_agent_backed_source,
@@ -536,8 +535,6 @@ async def _require_current_local_agent_lease(
             and job.get("lease_owner_user_id") == resolve_request_principal(request)
             and int(job.get("attempt_count") or 0) == attempt_count
             and (job.get("payload") or {}).get("source_config_revision") == expected_config_revision
-            and int((job.get("payload") or {}).get("source_activity_epoch", -1))
-            == int(source.get("activity_epoch") or 0)
             and leased_until is not None
             and leased_until > datetime.now(timezone.utc)
         )
@@ -546,7 +543,6 @@ async def _require_current_local_agent_lease(
     return {
         **job_payload,
         "source_config_revision": expected_config_revision,
-        "source_activity_epoch": int(source.get("activity_epoch") or 0),
     }
 
 
@@ -1724,7 +1720,6 @@ async def _resolve_local_source_artifact_inputs(
     workspace_id: str,
     input_hashes: list[str],
     expected_source_unit_key: str,
-    expected_source_activity_epoch: int,
 ) -> list[dict[str, Any]]:
     """Resolve only attested raw inputs owned by this Source Unit."""
 
@@ -1749,13 +1744,6 @@ async def _resolve_local_source_artifact_inputs(
             raise ValueError("local source Artifact input metadata is invalid")
         if str(metadata.get("source_unit_key") or "") != expected_source_unit_key:
             raise ValueError("local source Artifact input belongs to another Source Unit")
-        source_activity_epoch = metadata.get("source_activity_epoch")
-        if (
-            not isinstance(source_activity_epoch, int)
-            or isinstance(source_activity_epoch, bool)
-            or source_activity_epoch != expected_source_activity_epoch
-        ):
-            raise ValueError("local source Artifact input belongs to another source activity epoch")
         resolved.append(
             {
                 "provider_key": str(metadata.get("provider_key") or ""),
@@ -3669,7 +3657,6 @@ async def _attest_retained_local_source_input(
     source_type: str,
     source_id: str,
     retained_input: SourceSyncInput,
-    expected_activity_epoch: int,
 ) -> tuple[SourceSyncInput, str]:
     """Validate and attest a legacy retained artifact without trusting a duplicate upload."""
     metadata = retained_input.metadata
@@ -3702,7 +3689,6 @@ async def _attest_retained_local_source_input(
         source_id=source_id,
         input_id=retained_input.input_id,
         package_sha256=package_hash,
-        expected_activity_epoch=expected_activity_epoch,
     )
     return attested, package_hash
 
@@ -7241,7 +7227,6 @@ def create_admin_app(
         if (
             manifest_status["local_agent_job_id"] != (req.local_agent_job_id if req else None)
             or manifest_status["local_agent_attempt_count"] != (req.local_agent_attempt_count if req else None)
-            or manifest_status["source_activity_epoch"] != int(lease_payload["source_activity_epoch"])
             or manifest_status["source_config_revision"] != str(lease_payload["source_config_revision"])
         ):
             raise HTTPException(status_code=409, detail="source_snapshot_manifest_stale")
@@ -7447,7 +7432,7 @@ def create_admin_app(
             raise HTTPException(status_code=400, detail="source does not support local Artifact inputs")
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
-        lease_payload = await _require_current_local_agent_lease(
+        await _require_current_local_agent_lease(
             request,
             db,
             source=source,
@@ -7500,7 +7485,6 @@ def create_admin_app(
                 "media_type": normalized_media_type,
                 "size_bytes": observed_size,
                 "content_sha256": content_sha256,
-                "source_activity_epoch": int(lease_payload["source_activity_epoch"]),
             }
             input_sha256 = hashlib.sha256(
                 json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -7538,7 +7522,6 @@ def create_admin_app(
                     raw_sha256=input_sha256,
                     raw_content_type=normalized_media_type,
                     metadata={"local_source_artifact": descriptor},
-                    expected_activity_epoch=int(lease_payload["source_activity_epoch"]),
                 )
             except Exception:
                 raced = await db.get_source_sync_inputs_by_raw_hashes(
@@ -7603,7 +7586,7 @@ def create_admin_app(
             )
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
-        lease_payload = await _require_current_local_agent_lease(
+        await _require_current_local_agent_lease(
             request,
             db,
             source=source,
@@ -7629,7 +7612,6 @@ def create_admin_app(
                 workspace_id=workspace_id,
                 input_hashes=req.artifact_input_hashes,
                 expected_source_unit_key=str(req.artifact_source_unit_key or "").strip(),
-                expected_source_activity_epoch=int(lease_payload["source_activity_epoch"]),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -7727,7 +7709,7 @@ def create_admin_app(
                 current_source = await db.get_source(source_id)
                 if current_source is None:
                     raise HTTPException(status_code=404, detail="Source not found")
-                lease_payload = await _require_current_local_agent_lease(
+                await _require_current_local_agent_lease(
                     request,
                     db,
                     source=current_source,
@@ -7771,7 +7753,6 @@ def create_admin_app(
                         "manifest_entry": (manifest_entry if isinstance(manifest_entry, dict) else {}),
                     },
                     sync_snapshot_id=input_snapshot_id,
-                    expected_activity_epoch=int(lease_payload["source_activity_epoch"]),
                 )
             except HTTPException:
                 await discard_unretained_package()
@@ -7790,7 +7771,6 @@ def create_admin_app(
                         source_type=source_type,
                         source_id=source_id,
                         retained_input=retained_input,
-                        expected_activity_epoch=int(lease_payload["source_activity_epoch"]),
                     )
                 except ValueError as exc:
                     await discard_unretained_package()
@@ -7924,7 +7904,6 @@ def create_admin_app(
                 local_agent_attempt_count=req.local_agent_attempt_count,
                 source_config_revision=str(lease_payload["source_config_revision"]),
                 scope_attestations=scope_attestations,
-                expected_activity_epoch=int(lease_payload["source_activity_epoch"]),
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -9390,46 +9369,6 @@ def create_admin_app(
         db: Database = Depends(get_db),
     ):
         requester = resolve_request_principal(request)
-        job = await db.get_local_agent_job(job_id)
-        if (
-            job is not None
-            and job.get("status") == "leased"
-            and job.get("execution_owner_user_id") == requester
-            and int(job.get("attempt_count") or 0) == req.attempt_count
-            and job.get("operation") in LOCAL_AGENT_SYNC_OPERATIONS
-        ):
-            source = await db.get_source(str(job.get("source_id") or ""))
-            payload = job.get("payload") or {}
-            expected_epoch = payload.get("source_activity_epoch")
-            current_epoch = source.get("activity_epoch") if source is not None else None
-            if expected_epoch is not None and int(expected_epoch) != int(current_epoch or 0):
-                terminalized = await db.complete_local_agent_job(
-                    job_id=job_id,
-                    user_id=requester,
-                    attempt_count=req.attempt_count,
-                    status="failed",
-                    result={
-                        "error_code": LOCAL_AGENT_SOURCE_ACTIVITY_EPOCH_STALE,
-                        "retryable": False,
-                    },
-                    error=LOCAL_AGENT_SOURCE_ACTIVITY_EPOCH_STALE,
-                    retryable=False,
-                )
-                if not terminalized:
-                    raise HTTPException(status_code=404, detail="local_agent_job_not_found")
-                logger.info(
-                    "Terminally failed stale local-agent sync job",
-                    extra={
-                        "job_id": job_id,
-                        "source_id": str(job.get("source_id") or ""),
-                        "expected_source_activity_epoch": int(expected_epoch),
-                        "current_source_activity_epoch": int(current_epoch or 0),
-                    },
-                )
-                raise HTTPException(
-                    status_code=409,
-                    detail=LOCAL_AGENT_SOURCE_ACTIVITY_EPOCH_STALE,
-                )
         try:
             progress = normalize_sync_progress_snapshot(req.progress) if req.progress is not None else None
         except ValueError as exc:

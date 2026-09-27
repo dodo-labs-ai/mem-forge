@@ -645,7 +645,6 @@ def test_local_agent_sync_job_payload_uses_saved_config_and_request_controls_onl
         "rolling_retention_days": None,
         "source_id": "src-teams",
         "source_type": "teams",
-        "source_activity_epoch": 0,
         "force_full_sync": True,
     }
 

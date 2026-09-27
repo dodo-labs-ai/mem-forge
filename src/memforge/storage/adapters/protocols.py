@@ -377,7 +377,6 @@ class RelationalStore(Protocol):
         projection: SourceProjection,
         *,
         unit_input: SourceUnitInput | None = None,
-        expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
     ) -> None:
         """Persist one projection atomically; revisions are immutable.
@@ -570,7 +569,6 @@ class RelationalStore(Protocol):
         derivation_id: str | None = None,
         derivation_context_identity_hash: str | None = None,
         required_derivation_work_ids: tuple[str, ...] = (),
-        expected_source_activity_epoch: int | None = None,
         source_activity: SourceActivityLease | None = None,
         runtime_bundle: AgentRuntimeBundle | None = None,
     ) -> None: ...

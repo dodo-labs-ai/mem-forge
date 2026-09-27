@@ -1098,7 +1098,6 @@ async def test_derivation_replay_uses_shared_planner_without_durable_staging() -
         update_plan_stats=None,
         source_updated_at=item.last_modified.isoformat(),
         user_id=None,
-        source_activity_epoch=None,
     )
     seen_batches = []
 

@@ -65,7 +65,6 @@ class SourceArtifactCleanupStore(Protocol):
         kind: SourceActivityKind,
         capability: str | None = None,
         lease_seconds: int = 900,
-        expected_epoch: int | None = None,
     ) -> SourceActivityLease: ...
 
     async def release_source_activity(

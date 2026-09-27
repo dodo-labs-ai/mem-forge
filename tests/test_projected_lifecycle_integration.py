@@ -158,6 +158,7 @@ from memforge.source_derivation import (
     safe_derivation_error,
     source_derivation_manifest,
 )
+from memforge.source_activity import SourceActivityKind, SourceActivityLease
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
 
@@ -751,7 +752,14 @@ async def test_lifecycle_commit_rejection_returns_failure_bundle_without_success
             changed_hunks=None,
             update_plan_stats=None,
             source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
-            expected_source_activity_epoch=999,
+            # A lease this worker no longer holds.
+            source_activity=SourceActivityLease(
+                id="sync-run-stale",
+                source_id=projection.source_id,
+                kind=SourceActivityKind.SYNC,
+                capability="1",
+                lease_until=datetime(2026, 8, 17, tzinfo=timezone.utc),
+            ),
             lifecycle_execution_owner_id="sync-run-stale:lease-1",
         )
 
@@ -2447,7 +2455,6 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
         update_plan_stats=None,
         source_updated_at=None,
         user_id=None,
-        source_activity_epoch=None,
     )
     attempt = (
         await db.stage_source_derivation(
@@ -2649,7 +2656,6 @@ async def test_the_commit_gate_requires_the_revisions_candidate_admission_work(
                     document=document,
                     source_updated_at=source_updated_at.isoformat(),
                     user_id=None,
-                    source_activity_epoch=None,
                     **lifecycle_input,
                 ),
             )
@@ -2735,7 +2741,6 @@ async def test_atomic_projection_lifecycle_fences_other_sqlite_writers_before_ba
         update_plan_stats=None,
         source_updated_at=None,
         user_id=None,
-        source_activity_epoch=None,
     )
     attempt = (
         await db.stage_source_derivation(
@@ -2871,7 +2876,6 @@ async def test_source_deriver_persists_completed_batch_before_later_worker_failu
                     update_plan_stats=None,
                     source_updated_at=None,
                     user_id=None,
-                    source_activity_epoch=None,
                 ),
                 plan_requests=plan_requests,
                 extract_request=extract,
@@ -2926,7 +2930,6 @@ async def test_a_reading_group_beyond_capacity_is_skipped_and_the_derivation_com
                 update_plan_stats=None,
                 source_updated_at=None,
                 user_id=None,
-                source_activity_epoch=None,
             ),
             plan_requests=fixture_request_planner(
                 projection, access_context_hash="access-extraction-capacity", extractor=_OversizedGroupExtractor(),
@@ -3001,7 +3004,6 @@ async def test_source_deriver_binds_provider_neutral_quality_events_to_current_l
                 update_plan_stats=None,
                 source_updated_at=None,
                 user_id=None,
-                source_activity_epoch=None,
             ),
             plan_requests=fixture_request_planner(projection, access_context_hash="access-agent-eval"),
             extract_request=extract,
@@ -3086,7 +3088,6 @@ async def test_source_derivation_separates_exact_payload_hash_from_stable_identi
         update_plan_stats=None,
         source_updated_at=None,
         user_id=None,
-        source_activity_epoch=None,
     )
     first_manifest = source_derivation_manifest(
         first,
@@ -3115,26 +3116,26 @@ async def test_source_derivation_separates_exact_payload_hash_from_stable_identi
 
     first_stage = await db.stage_source_derivation(first_manifest)
     retry_stage = await db.stage_source_derivation(second_manifest)
-    next_epoch_manifest = source_derivation_manifest(
+    reprocess_manifest = source_derivation_manifest(
         second,
         (),
-        context=replace(context, source_activity_epoch=2),
+        context=replace(context, reprocess_operation_id="reprocess-2"),
     )
-    next_epoch_stage = await db.stage_source_derivation(next_epoch_manifest)
+    reprocess_stage = await db.stage_source_derivation(reprocess_manifest)
 
     first_attempt = first_stage.attempt
     retry_attempt = retry_stage.attempt
-    next_epoch_attempt = next_epoch_stage.attempt
+    reprocess_attempt = reprocess_stage.attempt
     assert first_stage.created is True
     assert retry_stage.created is False
-    assert next_epoch_stage.created is True
+    assert reprocess_stage.created is True
 
     assert retry_attempt.id == first_attempt.id
     assert retry_attempt.projection_payload_hash == first_manifest.projection_payload_hash
     assert retry_attempt.projection.run_id == first.run_id
-    assert next_epoch_attempt.id != first_attempt.id
-    assert next_epoch_attempt.target_unit_revision_id == (first_attempt.target_unit_revision_id)
-    assert next_epoch_attempt.context.source_activity_epoch == 2
+    assert reprocess_attempt.id != first_attempt.id
+    assert reprocess_attempt.target_unit_revision_id == (first_attempt.target_unit_revision_id)
+    assert reprocess_attempt.context.reprocess_operation_id == "reprocess-2"
 
     with pytest.raises(
         ValueError,
@@ -3185,7 +3186,6 @@ async def test_exact_terminal_derivation_replay_keeps_creation_runtime_facts(
         update_plan_stats=None,
         source_updated_at=None,
         user_id=None,
-        source_activity_epoch=None,
     )
     manifest = source_derivation_manifest(projection, (), context=context)
     signal = QualitySignal(
@@ -3283,7 +3283,6 @@ async def test_source_derivation_creation_audit_failure_rolls_back_manifest(
         update_plan_stats=None,
         source_updated_at=None,
         user_id=None,
-        source_activity_epoch=None,
     )
     manifest = source_derivation_manifest(projection, (), context=context)
     [event] = bind_quality_signals(
@@ -3345,7 +3344,6 @@ async def test_projection_extraction_contract_change_invalidates_staged_derivati
         update_plan_stats=None,
         source_updated_at=None,
         user_id=None,
-        source_activity_epoch=None,
     )
 
     authority = plan_projection_evidence_work(
@@ -3424,7 +3422,6 @@ async def test_batch_result_and_runtime_events_rollback_together(db: Database) -
         update_plan_stats=None,
         source_updated_at=None,
         user_id=None,
-        source_activity_epoch=None,
     )
     authority = plan_projection_evidence_work(
         projection,
@@ -3569,7 +3566,6 @@ async def test_noop_preserves_stale_support_only_with_explicit_unresolved_skip(
                     update_plan_stats=None,
                     source_updated_at=None,
                     user_id=None,
-                    source_activity_epoch=None,
                 ),
             )
         )
