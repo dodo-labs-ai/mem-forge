@@ -5031,7 +5031,7 @@ def create_admin_app(
         offset: int = Query(default=0, ge=0),
         db: Database = Depends(get_db),
     ):
-        """List discovery work by state with its last error; exhausted work used every attempt."""
+        """List discovery work by state with its last error; exhausted work has no retry left."""
 
         _require_maintenance_operator(request)
         selection = _relation_discovery_selection(

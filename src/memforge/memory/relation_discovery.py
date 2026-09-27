@@ -11,6 +11,8 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+
+from memforge.llm.structured import failure_retryable
 from memforge.memory.cross_document_relation import (
     CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
     CrossDocumentRelationClassification,
@@ -159,7 +161,9 @@ class RelationDiscovery:
                     prompt_chars += error.prompt_chars
                     recorded_error = error.cause
                 logger.exception("Relation discovery work %s failed", work.request.id)
-                exhausted = work.attempts >= policy.max_attempts
+                # A failure that repeats on every attempt ends the work now
+                # instead of spending the remaining attempts on it.
+                exhausted = work.attempts >= policy.max_attempts or not failure_retryable(recorded_error)
                 retry_at = None
                 if not exhausted:
                     exponent = max(0, work.attempts - 1)
@@ -249,7 +253,11 @@ class RelationDiscovery:
         candidate_support = await self._store.get_active_memory_support_states(
             tuple(candidate.id for candidate in candidates)
         )
-        subjects = await load_relation_subjects(self._store, (challenger, *candidates))
+        subjects = await load_relation_subjects(
+            self._store,
+            (challenger, *candidates),
+            evidence_unit_ids={challenger.id: evidence_unit.id},
+        )
         pairs = tuple(
             CrossDocumentRelationPair(challenger=subjects[challenger.id], candidate=subjects[candidate.id])
             for candidate in candidates

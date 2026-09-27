@@ -328,7 +328,9 @@ class RelationalStore(Protocol):
         *,
         source_id: str,
         source_unit_id: str,
-    ) -> EvidenceUnit | None: ...
+    ) -> EvidenceUnit | None:
+        """The current Evidence Unit ``newest_evidence_unit_id`` chooses among the Memory's in one Source Unit."""
+        ...
     async def list_disabled_source_ids_for_user(self, user_id: str) -> list[str]: ...
     async def list_active_memories(self, memory_ids: Sequence[str]) -> list[Memory]:
         """Return active rows in caller order, chunked by each adapter's bind limit."""
@@ -696,7 +698,9 @@ class RelationalStore(Protocol):
         error_code: str,
         next_attempt_at: str | None,
         exhausted: bool,
-    ) -> None: ...
+    ) -> None:
+        """Record a failure; exhausted work is not retried, other work is retried at ``next_attempt_at``."""
+        ...
     async def count_relation_discovery_work(
         self,
         selection: RelationDiscoveryWorkSelection,
