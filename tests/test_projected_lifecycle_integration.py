@@ -2168,10 +2168,6 @@ async def _add_independent_support_alternative(
             version="1",
             content_hash=f"{doc_id}-hash",
             token_count=10,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=now,
         )
     )
@@ -4093,10 +4089,6 @@ async def test_projected_support_invariant_accepts_other_valid_same_source_unit(
             version="1",
             content_hash="independent-page-hash",
             token_count=10,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=now,
         )
     )
@@ -7650,10 +7642,6 @@ async def test_relation_discovery_rejects_candidate_provenance_removed_before_co
             version="1",
             content_hash="candidate-doc-hash",
             token_count=4,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=now,
         )
     )
@@ -7722,10 +7710,6 @@ async def test_relation_discovery_rejects_candidate_support_change_before_commit
             version="1",
             content_hash="candidate-doc-hash",
             token_count=4,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=now,
         )
     )
@@ -7813,10 +7797,6 @@ async def test_private_relation_completion_rechecks_access_as_current_owner(
             version="1",
             content_hash="candidate-doc-hash",
             token_count=4,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=now,
         )
     )
@@ -7907,10 +7887,6 @@ async def test_relation_discovery_records_relation_after_lifecycle_commit(
             version="1",
             content_hash="candidate-doc-hash",
             token_count=4,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=now,
         )
     )
@@ -7992,10 +7968,6 @@ async def _relation_pair_fixture(db: Database, *, run_id: str) -> tuple[Memory, 
             version="1",
             content_hash="candidate-doc-hash",
             token_count=4,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=now,
         )
     )
@@ -8305,10 +8277,6 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
             version="1",
             content_hash="old-hash",
             token_count=10,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=now,
         )
     )
@@ -8383,10 +8351,6 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
             version="1",
             content_hash="jira-hash",
             token_count=20,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
             last_synced=now,
         )
     )
@@ -8711,7 +8675,7 @@ async def test_enabled_source_tombstone_retires_last_supported_incumbent(db: Dat
     assert result == {"retired": 1, "pending_review": 0, "can_delete_document": True}
     assert await db.list_lifecycle_vector_tasks() == []
 
-    await db.delete_projected_document("confluence-123")
+    await db.delete_projected_document("confluence-123", source_id=initial.source_id)
 
     assert await db.get_document("confluence-123") is None
     assert await db.get_memory_sources(incumbent.id) == []
@@ -8751,7 +8715,7 @@ async def test_gated_source_tombstone_only_opens_review(db: Database) -> None:
     assert active is not None and active.status == "active"
     assert result == {"retired": 0, "pending_review": 1, "can_delete_document": False}
     with pytest.raises(ValueError, match="active document support remains"):
-        await db.delete_projected_document("confluence-123")
+        await db.delete_projected_document("confluence-123", source_id=initial.source_id)
 
 
 @pytest.mark.asyncio

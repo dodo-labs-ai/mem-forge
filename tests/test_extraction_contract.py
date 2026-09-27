@@ -120,10 +120,6 @@ def test_v9_derivation_identity_binds_access_and_inference_capability() -> None:
         version="1",
         content_hash=hashlib.sha256(body.encode()).hexdigest(),
         token_count=12,
-        raw_content_uri=None,
-        raw_content_type="text/markdown",
-        normalized_content_uri=None,
-        pdf_content_uri=None,
         last_synced=now,
     )
     context = SourceUnitDerivationContext(
@@ -233,10 +229,6 @@ async def test_v9_reprocess_without_operation_identity_fails_before_llm(
         version="1",
         content_hash=hashlib.sha256(body.encode()).hexdigest(),
         token_count=8,
-        raw_content_uri=None,
-        raw_content_type="text/markdown",
-        normalized_content_uri=None,
-        pdf_content_uri=None,
         last_synced=now,
     )
     extractor_called = False
@@ -352,10 +344,6 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
         version="2",
         content_hash=hashlib.sha256(target_body.encode()).hexdigest(),
         token_count=5,
-        raw_content_uri=None,
-        raw_content_type="text/markdown",
-        normalized_content_uri=None,
-        pdf_content_uri=None,
         last_synced=now,
     )
     extractor_called = False

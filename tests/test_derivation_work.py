@@ -31,10 +31,6 @@ def staged_fixture(projection=None):
         version="1",
         content_hash="hash",
         token_count=20,
-        raw_content_uri=None,
-        raw_content_type="text/markdown",
-        normalized_content_uri=None,
-        pdf_content_uri=None,
         last_synced=now,
     )
     context = SourceUnitDerivationContext(

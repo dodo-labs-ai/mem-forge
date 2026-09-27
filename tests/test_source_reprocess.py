@@ -27,6 +27,7 @@ from tests.test_sync_bookkeeping import (
     RecordingMemoryEngine,
     StubDocumentStore,
     _jira_raw_content,
+    _unit_input,
     _valid_png_bytes,
 )
 
@@ -230,8 +231,8 @@ async def test_reprocessing_the_same_revision_again_runs_as_a_new_operation(db):
 @pytest.mark.asyncio
 async def test_a_unit_without_stored_input_fails_with_its_reason_and_the_others_continue(db):
     harness = await synced(db)
-    document = await db.get_document(doc_id("PAY-2"))
-    del harness.store.source_artifacts[document.raw_content_uri]
+    stored = await _unit_input(db, SOURCE_ID, doc_id("PAY-2"))
+    del harness.store.source_artifacts[stored.raw_content_uri]
 
     state = await harness.reprocess("PAY-1", "PAY-2", "PAY-404")
 
@@ -239,7 +240,7 @@ async def test_a_unit_without_stored_input_fails_with_its_reason_and_the_others_
     assert (state.docs_processed, state.docs_failed) == (1, 2)
     assert {failed.doc_id: failed.error.split(":")[0] for failed in state.failed_docs} == {
         doc_id("PAY-2"): "stored_raw_content_missing",
-        doc_id("PAY-404"): "stored_document_missing",
+        doc_id("PAY-404"): "stored_source_unit_missing",
     }
     assert [call["doc_id"] for call in harness.engine.projected_lifecycle_calls] == [doc_id("PAY-1")]
 
@@ -248,8 +249,9 @@ async def test_a_unit_without_stored_input_fails_with_its_reason_and_the_others_
 async def test_stored_input_that_would_move_the_unit_fails_closed(db):
     harness = await synced(db)
     await db.db.execute(
-        "UPDATE documents SET source_url = ? WHERE doc_id = ?",
-        ("https://jira.example/browse/elsewhere", doc_id("PAY-2")),
+        """UPDATE source_unit_inputs SET item_json = json_set(item_json, '$.source_url', ?)
+            WHERE source_id = ? AND document_id = ?""",
+        ("https://jira.example/browse/elsewhere", SOURCE_ID, doc_id("PAY-2")),
     )
     await db.db.commit()
 
@@ -521,7 +523,7 @@ async def test_the_reprocess_route_previews_then_queues_one_run(db, tmp_path):
     report = preview.json()
     units = {unit["document_id"]: unit for unit in report["units"]}
     assert {key: value for key, value in units["jira-PAY-404"].items() if value is not None} == {
-        "document_id": "jira-PAY-404", "available": False, "reason": "stored_document_missing",
+        "document_id": "jira-PAY-404", "available": False, "reason": "stored_source_unit_missing",
     }
     unit = units["jira-PAY-1"]
     assert unit["available"] and unit["artifact_count"] == 1

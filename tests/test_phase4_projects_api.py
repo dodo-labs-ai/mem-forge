@@ -490,10 +490,6 @@ def test_resolved_projects_endpoint_groups_memories_by_resolved_key(tmp_path):
                     version="1",
                     content_hash=f"h-{doc_id}",
                     token_count=None,
-                    raw_content_uri=None,
-                    raw_content_type=None,
-                    normalized_content_uri=None,
-                    pdf_content_uri=None,
                     last_synced=ts,
                 )
             )

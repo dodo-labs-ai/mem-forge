@@ -8,6 +8,7 @@ import pytest
 
 from memforge.models import DocumentRecord, Memory, SyncState, content_hash
 from memforge.storage.database import Database
+from tests.test_sync_bookkeeping import _hold_document, _release_document
 
 
 @pytest.fixture
@@ -150,14 +151,23 @@ class TestSupportAwareRetirement:
                 version="1",
                 content_hash="cleanup-hash",
                 token_count=10,
-                raw_content_uri=None,
-                raw_content_type=None,
-                normalized_content_uri=artifact_uri,
-                pdf_content_uri=None,
                 last_synced=now,
             )
         )
-        await db.delete_projected_document("doc-cleanup")
+        await _hold_document(
+            db,
+            source_id=source_id,
+            source_type="confluence",
+            doc_id="doc-cleanup",
+            title="Architecture",
+            markdown="# Architecture",
+            version="1",
+            source_url="https://wiki.example.test/doc-cleanup",
+            space_or_project="SFPAY",
+            normalized_content_uri=artifact_uri,
+        )
+        await _release_document(db, source_id=source_id, source_type="confluence", doc_id="doc-cleanup")
+        await db.delete_projected_document("doc-cleanup", source_id=source_id)
 
         processed = await SourceArtifactCleanupService(db, document_store).run_pending(limit=10)
 
@@ -194,14 +204,23 @@ class TestSupportAwareRetirement:
                 version="1",
                 content_hash="legacy-artifact-hash",
                 token_count=10,
-                raw_content_uri=None,
-                raw_content_type=None,
-                normalized_content_uri=stale_uri,
-                pdf_content_uri=None,
                 last_synced=now,
             )
         )
-        await db.delete_projected_document("doc-legacy-artifact")
+        await _hold_document(
+            db,
+            source_id=source_id,
+            source_type="confluence",
+            doc_id="doc-legacy-artifact",
+            title="Legacy Architecture",
+            markdown="# Legacy Architecture",
+            version="1",
+            source_url="https://wiki.example.test/doc-legacy-artifact",
+            space_or_project="SFPAY",
+            normalized_content_uri=stale_uri,
+        )
+        await _release_document(db, source_id=source_id, source_type="confluence", doc_id="doc-legacy-artifact")
+        await db.delete_projected_document("doc-legacy-artifact", source_id=source_id)
 
         processed = await SourceArtifactCleanupService(
             db,
@@ -231,15 +250,24 @@ class TestSupportAwareRetirement:
                 version="1",
                 content_hash="document-cleanup-hash",
                 token_count=10,
-                raw_content_uri=None,
-                raw_content_type=None,
-                normalized_content_uri="object-store://workspace/documents/src-document-cleanup/page.md",
-                pdf_content_uri=None,
                 last_synced=now,
             )
         )
 
-        await db.delete_projected_document("doc-document-cleanup")
+        await _hold_document(
+            db,
+            source_id=source_id,
+            source_type="confluence",
+            doc_id="doc-document-cleanup",
+            title="Architecture",
+            markdown="# Architecture",
+            version="1",
+            source_url="https://wiki.example.test/doc-document-cleanup",
+            space_or_project="SFPAY",
+            normalized_content_uri="object-store://workspace/documents/src-document-cleanup/page.md",
+        )
+        await _release_document(db, source_id=source_id, source_type="confluence", doc_id="doc-document-cleanup")
+        await db.delete_projected_document("doc-document-cleanup", source_id=source_id)
 
         tasks = await db.list_source_artifact_cleanup_tasks(limit=10)
         assert [(task.source_id, task.artifact_uri) for task in tasks] == [
@@ -270,10 +298,6 @@ class TestSupportAwareRetirement:
                     version="1",
                     content_hash="fenced-hash",
                     token_count=10,
-                    raw_content_uri=None,
-                    raw_content_type=None,
-                    normalized_content_uri=None,
-                    pdf_content_uri=None,
                     last_synced=now,
                 )
             )

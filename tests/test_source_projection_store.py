@@ -852,10 +852,6 @@ async def test_document_write_rejects_deleted_or_missing_source(db: Database) ->
         version="1",
         content_hash="hash-1",
         token_count=0,
-        raw_content_uri=None,
-        raw_content_type=None,
-        normalized_content_uri=None,
-        pdf_content_uri=None,
         last_synced=datetime(2026, 7, 15, tzinfo=timezone.utc),
     )
     await db.upsert_document(document, require_configured_source=True)
@@ -886,10 +882,6 @@ async def test_synthetic_document_write_does_not_require_configured_source(db: D
         version="1",
         content_hash="user-memory-hash-1",
         token_count=3,
-        raw_content_uri=None,
-        raw_content_type=None,
-        normalized_content_uri=None,
-        pdf_content_uri=None,
         last_synced=now,
     )
 
@@ -935,10 +927,6 @@ async def test_configured_document_write_serializes_with_cross_process_source_de
         version="1",
         content_hash="race-hash-1",
         token_count=3,
-        raw_content_uri=None,
-        raw_content_type=None,
-        normalized_content_uri=None,
-        pdf_content_uri=None,
         last_synced=now,
     )
     source_fenced = asyncio.Event()
@@ -1104,12 +1092,10 @@ async def test_stable_unit_preserves_document_lineage_across_move(db: Database) 
 
 
 @pytest.mark.asyncio
-async def test_document_move_rebinds_legacy_support_without_cleaning_shared_artifacts(
+async def test_document_move_rebinds_only_the_moving_sources_support(
     db: Database,
 ) -> None:
     now = datetime(2026, 7, 15, tzinfo=timezone.utc)
-    shared_raw_uri = "/artifacts/raw/page-1.html"
-    shared_normalized_uri = "/artifacts/normalized/page-1.md"
     for doc_id in ("old-path", "new-path"):
         await db.upsert_document(
             DocumentRecord(
@@ -1124,10 +1110,6 @@ async def test_document_move_rebinds_legacy_support_without_cleaning_shared_arti
                 version="1",
                 content_hash="same-content",
                 token_count=10,
-                raw_content_uri=shared_raw_uri,
-                raw_content_type="text/html",
-                normalized_content_uri=shared_normalized_uri,
-                pdf_content_uri=None,
                 last_synced=now,
             )
         )
@@ -1163,17 +1145,18 @@ async def test_document_move_rebinds_legacy_support_without_cleaning_shared_arti
         )
     )
 
-    await db.rebind_projected_document_support("old-path", "new-path")
-    await db.delete_projected_document("old-path")
+    await db.rebind_projected_document_support("old-path", "new-path", source_id="src-1")
+    await db.delete_projected_document("old-path", source_id="src-1")
 
+    # Another Source that still names the old Document keeps its support and the row.
     assert sorted(
         (source.source_id, source.doc_id)
         for source in await db.get_memory_sources(memory.id)
     ) == [
         ("src-1", "new-path"),
-        ("src-overlap", "new-path"),
+        ("src-overlap", "old-path"),
     ]
-    assert await db.get_document("old-path") is None
+    assert await db.get_document("old-path") is not None
     assert await db.get_document("new-path") is not None
     cleanup_rows = await db.db.execute_fetchall(
         "SELECT artifact_uri FROM source_artifact_cleanup_tasks"

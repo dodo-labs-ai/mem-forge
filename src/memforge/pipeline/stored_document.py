@@ -1,32 +1,36 @@
 """Input of one Source Unit for reprocessing it with the current adapter and compiler.
 
+A Document can be reprocessed for a Source when that Source has a current
+Source Unit for it. Several Sources can include the same provider Document;
+each keeps its own Unit and its own stored input, so reprocessing one Source
+never reads what another Source stored.
+
 A reprocess reads the provider's current state when the Source can ask its
-provider for one Document by id: the Gene rediscovers the Document and the
-ordinary fetch reads it. A Document the provider no longer returns is reported
-for that Document and nothing is inferred removed; removal belongs to a sync
-whose discovery proves it.
+provider for one Document by id: the Gene rediscovers the Document from the
+item the Unit's stored input records (or, when the Unit has none, from the
+shared Document row) and the ordinary fetch reads it. A Document the provider
+no longer returns is reported for that Document and nothing is inferred
+removed; removal belongs to a sync whose discovery proves it.
 
 A Source whose content has no provider to ask (a local agent collected it, or a
-user uploaded it) reprocesses its stored input: the Document row with the item
-metadata its Gene discovered, the raw content the last sync stored, and the
-Artifacts the committed Unit revision cites. The Artifacts come back with the
-Unit so a complete snapshot does not mistake them for removals. The stored raw
-content is never older than the committed revision, because a sync that commits
-a new revision stores the raw content it projected. When a sync stored newer
-raw content whose revision never committed, reprocessing projects and commits
-that content, as the next ordinary sync would. A Document stored before its
-item metadata was kept may not place the Unit where its committed revision
-does; such a stored input cannot stand for that revision until an ordinary sync
-stores the Document again.
+user uploaded it) reprocesses the stored input of the Unit's current revision:
+the item its Gene discovered, the raw content the Source stored, and the
+Artifacts the committed revision cites. The Artifacts come back with the Unit
+so a complete snapshot does not mistake them for removals. The stored raw
+content is the input of the committed revision, or of a later sync of the same
+Source that stored its input and has not committed yet; reprocessing then
+projects and commits that content, as the next ordinary sync would. A Unit
+whose current revision has no stored input cannot be reprocessed from storage
+until the Source's next committed revision records one.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from memforge.models import ContentItem, DocumentRecord, RawContent
+from memforge.models import ContentItem, DocumentRecord, RawContent, SourceUnitInput
 from memforge.source_artifacts import (
     SOURCE_ARTIFACT_OBSERVATION_TYPE,
     StoredSourceArtifact,
@@ -48,8 +52,11 @@ _RELATION_REQUESTS_PER_SUPPORTED_UNIT = 1
 
 
 class StoredDocumentUnavailableReason(str, Enum):
-    DOCUMENT_MISSING = "stored_document_missing"
+    # The Source has no current Source Unit for the Document.
     SOURCE_UNIT_MISSING = "stored_source_unit_missing"
+    # Nothing describes the Document to ask the provider for it.
+    DOCUMENT_MISSING = "stored_document_missing"
+    # The Unit's current revision has no stored input, or its raw object is gone.
     RAW_CONTENT_MISSING = "stored_raw_content_missing"
     CONTENT_EMPTY = "stored_content_empty"
     ARTIFACT_MISSING = "stored_artifact_missing"
@@ -77,7 +84,7 @@ class StoredDocumentUnavailable(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class StoredSourceDocument:
-    document: DocumentRecord
+    unit_input: SourceUnitInput
     item: ContentItem
     raw: RawContent
     artifacts: tuple[StoredSourceArtifact, ...]
@@ -85,31 +92,27 @@ class StoredSourceDocument:
     committed: SourceProjection
 
 
-async def _committed_source_document(
+async def _committed_source_unit(
     db: RelationalStore,
     *,
     source_id: str,
     document_id: str,
-) -> tuple[DocumentRecord, SourceProjection]:
-    """Read one Document of the Source and its Unit at the current revision."""
+) -> SourceProjection:
+    """The Source's current Unit for the Document, at its current revision."""
 
-    document = await db.get_document(document_id)
-    if document is None or document.source != source_id:
-        raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.DOCUMENT_MISSING, document_id)
     unit = await db.find_source_unit_by_document_id(source_id, document_id, current_only=True)
     committed = await db.get_current_source_unit_projection(unit.id) if unit is not None else None
     if committed is None:
         raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.SOURCE_UNIT_MISSING, document_id)
-    return document, committed
+    return committed
 
 
-def _stored_content_item(document: DocumentRecord) -> ContentItem:
+def _document_content_item(document: DocumentRecord) -> ContentItem:
     return ContentItem(
         item_id=document.doc_id,
         title=document.title,
         source_url=document.source_url,
         last_modified=document.last_modified,
-        content_type=document.raw_content_type or "application/octet-stream",
         space_or_project=document.space_or_project,
         version=document.version,
         author=document.author,
@@ -127,8 +130,16 @@ async def rediscover_source_document(
 ) -> ContentItem:
     """Ask the provider for the current item of one Document whose Unit is current."""
 
-    document, _ = await _committed_source_document(db, source_id=source_id, document_id=document_id)
-    current = await gene.rediscover(_stored_content_item(document))
+    committed = await _committed_source_unit(db, source_id=source_id, document_id=document_id)
+    unit_input = await db.get_source_unit_input(committed.source_unit_revisions[0].source_unit_id)
+    if unit_input is not None:
+        stored_item = unit_input.item
+    else:
+        document = await db.get_document(document_id)
+        if document is None:
+            raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.DOCUMENT_MISSING, document_id)
+        stored_item = _document_content_item(document)
+    current = await gene.rediscover(stored_item)
     if current is None or current.item_id != document_id:
         raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.PROVIDER_DOCUMENT_MISSING, document_id)
     return current
@@ -141,25 +152,26 @@ async def load_stored_source_document(
     source_id: str,
     document_id: str,
 ) -> StoredSourceDocument:
-    """Read one Document's stored input and the Artifacts of its committed Unit revision."""
+    """Read the stored input of the Unit's current revision and the Artifacts it cites."""
 
     def unavailable(reason: StoredDocumentUnavailableReason) -> StoredDocumentUnavailable:
         return StoredDocumentUnavailable(reason, document_id)
 
-    document, committed = await _committed_source_document(db, source_id=source_id, document_id=document_id)
-    item = _stored_content_item(document)
-    if not _stored(document_store, document.raw_content_uri, item.content_type):
+    committed = await _committed_source_unit(db, source_id=source_id, document_id=document_id)
+    unit_input = await db.get_source_unit_input(committed.source_unit_revisions[0].source_unit_id)
+    if unit_input is None or not _stored(document_store, unit_input.raw_content_uri, unit_input.raw_content_type):
         raise unavailable(StoredDocumentUnavailableReason.RAW_CONTENT_MISSING)
-    body = document_store.read_artifact(str(document.raw_content_uri))
+    body = document_store.read_artifact(str(unit_input.raw_content_uri))
     if not body.strip():
         raise unavailable(StoredDocumentUnavailableReason.CONTENT_EMPTY)
     artifacts = _committed_artifacts(committed, unavailable)
     if not all(_stored(document_store, artifact.uri, artifact.media_type) for artifact in artifacts):
         raise unavailable(StoredDocumentUnavailableReason.ARTIFACT_MISSING)
+    item = replace(unit_input.item, labels=list(unit_input.item.labels), extra=dict(unit_input.item.extra))
     return StoredSourceDocument(
-        document=document,
+        unit_input=unit_input,
         item=item,
-        raw=RawContent(item=item, body=body, content_type=item.content_type),
+        raw=RawContent(item=item, body=body, content_type=unit_input.raw_content_type),
         artifacts=artifacts,
         committed=committed,
     )
@@ -266,7 +278,7 @@ async def reprocess_preview(
     for document_id in sorted(set(document_ids)):
         try:
             if rediscovers:
-                _, committed = await _committed_source_document(db, source_id=source_id, document_id=document_id)
+                committed = await _committed_source_unit(db, source_id=source_id, document_id=document_id)
                 artifact_count = sum(
                     observation.observation_type == SOURCE_ARTIFACT_OBSERVATION_TYPE
                     for observation in committed.observations

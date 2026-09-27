@@ -14,7 +14,7 @@ from typing import Any, Protocol
 
 from memforge.llm.failure_trace import failure_trace_context
 from memforge.derivation_work import DerivationWorkStore
-from memforge.models import DocumentRecord, MemoryExtractionResult, RawMemory
+from memforge.models import ContentItem, DocumentRecord, MemoryExtractionResult, RawMemory, SourceUnitInput
 from memforge.memory.evidence import (
     EvidencePartKind,
     EvidenceRole,
@@ -217,6 +217,9 @@ class SourceUnitDerivationContext:
     # An operator reprocess reads every Support over the whole Unit, as if it
     # had no usable baseline.
     support_without_baseline: bool = False
+    # The stored input of the target Unit revision, recorded when the
+    # derivation commits.
+    unit_input: SourceUnitInput | None = None
 
 
 class SourceDerivationStore(DerivationWorkStore, Protocol):
@@ -801,7 +804,47 @@ def source_unit_derivation_context_to_payload(
         ),
         "reprocess_operation_id": context.reprocess_operation_id,
         "support_without_baseline": context.support_without_baseline,
+        "unit_input": (
+            _source_unit_input_payload(context.unit_input) if context.unit_input is not None else None
+        ),
     }
+
+
+def _source_unit_input_payload(unit_input: SourceUnitInput) -> dict[str, object]:
+    return {
+        "source_unit_id": unit_input.source_unit_id,
+        "unit_revision_id": unit_input.unit_revision_id,
+        "source_id": unit_input.source_id,
+        "document_id": unit_input.document_id,
+        "item": unit_input.item.to_payload(),
+        "raw_content_uri": unit_input.raw_content_uri,
+        "raw_content_type": unit_input.raw_content_type,
+        "raw_content_sha256": unit_input.raw_content_sha256,
+        "normalized_content_uri": unit_input.normalized_content_uri,
+        "normalized_content_hash": unit_input.normalized_content_hash,
+        "pdf_content_uri": unit_input.pdf_content_uri,
+    }
+
+
+def _source_unit_input_from_payload(payload: object) -> SourceUnitInput | None:
+    if not isinstance(payload, Mapping):
+        return None
+    item = payload.get("item")
+    if not isinstance(item, Mapping):
+        raise ValueError("Source derivation stored input has no item")
+    return SourceUnitInput(
+        source_unit_id=str(payload["source_unit_id"]),
+        unit_revision_id=str(payload["unit_revision_id"]),
+        source_id=str(payload["source_id"]),
+        document_id=str(payload["document_id"]),
+        item=ContentItem.from_payload(dict(item)),
+        raw_content_uri=_optional_string(payload.get("raw_content_uri")),
+        raw_content_type=str(payload.get("raw_content_type") or "application/octet-stream"),
+        raw_content_sha256=_optional_string(payload.get("raw_content_sha256")),
+        normalized_content_uri=_optional_string(payload.get("normalized_content_uri")),
+        normalized_content_hash=_optional_string(payload.get("normalized_content_hash")),
+        pdf_content_uri=_optional_string(payload.get("pdf_content_uri")),
+    )
 
 
 def source_derivation_projection_identity_hash(
@@ -848,10 +891,6 @@ def _document_record_payload(
         "version": document.version,
         "content_hash": document.content_hash,
         "token_count": document.token_count,
-        "raw_content_uri": document.raw_content_uri,
-        "raw_content_type": document.raw_content_type,
-        "normalized_content_uri": document.normalized_content_uri,
-        "pdf_content_uri": document.pdf_content_uri,
         "last_synced": document.last_synced.isoformat(),
         "client": document.client,
         "item_extra": dict(document.item_extra),
@@ -880,10 +919,6 @@ def source_unit_derivation_context_from_payload(
             version=str(raw_document.get("version") or ""),
             content_hash=str(raw_document["content_hash"]),
             token_count=(int(raw_document["token_count"]) if raw_document.get("token_count") is not None else None),
-            raw_content_uri=_optional_string(raw_document.get("raw_content_uri")),
-            raw_content_type=_optional_string(raw_document.get("raw_content_type")),
-            normalized_content_uri=_optional_string(raw_document.get("normalized_content_uri")),
-            pdf_content_uri=_optional_string(raw_document.get("pdf_content_uri")),
             last_synced=datetime.fromisoformat(str(raw_document["last_synced"])),
             client=_optional_string(raw_document.get("client")),
             item_extra=dict(raw_document.get("item_extra") or {}),
@@ -924,6 +959,7 @@ def source_unit_derivation_context_from_payload(
             payload.get("reprocess_operation_id")
         ),
         support_without_baseline=bool(payload.get("support_without_baseline", False)),
+        unit_input=_source_unit_input_from_payload(payload.get("unit_input")),
     )
 
 
