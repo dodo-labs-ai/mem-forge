@@ -861,7 +861,9 @@ def _enabled_source_visibility_condition(
 # Cross-document relations between two Memories, bound to both contents, and
 # the dismissals people record for them. A pair is stored lower Memory id first.
 # Each side keeps the Evidence time (a UTC date) the relation was decided on;
-# an updates pair is stored only when those dates order it.
+# an updates pair is stored only when those dates order it. A classifier
+# relation names the discovery work that recorded it, and that work's next
+# completed run replaces it.
 _CROSS_DOCUMENT_RELATION_DDL = """
 CREATE TABLE IF NOT EXISTS cross_document_relations (
     memory_low_id       TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -886,6 +888,8 @@ CREATE TABLE IF NOT EXISTS cross_document_relations (
 );
 CREATE INDEX IF NOT EXISTS idx_cross_document_relations_high
     ON cross_document_relations(memory_high_id);
+CREATE INDEX IF NOT EXISTS idx_cross_document_relations_work
+    ON cross_document_relations(discovery_work_id);
 
 CREATE TABLE IF NOT EXISTS cross_document_relation_dismissals (
     id                  TEXT PRIMARY KEY,
@@ -10742,7 +10746,7 @@ class Database:
                 bundle = _with_relation_snapshot_audit(relation_run)
                 if not await self._relation_run_recorded_unlocked(bundle):
                     await self._insert_relation_run_unlocked(bundle)
-                    await self._record_cross_document_relations_unlocked(document_relations)
+                    await self._record_cross_document_relations_unlocked(work_id, document_relations)
                 completed_at = _now_iso()
                 cursor = await self.db.execute(
                     """UPDATE relation_discovery_work
@@ -10769,15 +10773,25 @@ class Database:
                 await self.db.rollback()
                 raise
 
-    async def _record_cross_document_relations_unlocked(self, outcome: CrossDocumentRelationOutcome) -> None:
-        """Apply one discovery run's labels to the pairs it judged.
+    async def _record_cross_document_relations_unlocked(
+        self,
+        work_id: str,
+        outcome: CrossDocumentRelationOutcome,
+    ) -> None:
+        """Make one discovery run the record of what its work decided.
 
-        The completion guard has checked that both contents of every judged
-        pair are current. The run's label replaces the stored relation, and a
-        pair judged none loses it, unless a person confirmed the stored relation
-        for these same contents.
+        The run replaces every relation the classifier recorded for this work,
+        so a pair the work no longer judges keeps no relation from it. The
+        completion guard has checked that both contents of every judged pair
+        are current. The run's label replaces the stored relation, whichever
+        work recorded it, and a pair judged none loses it, unless a person
+        confirmed the stored relation for these same contents.
         """
 
+        await self.db.execute(
+            "DELETE FROM cross_document_relations WHERE discovery_work_id = ? AND decided_by = ?",
+            (work_id, CrossDocumentRelationDecider.CLASSIFIER.value),
+        )
         found = {(record.memory_low_id, record.memory_high_id): record for record in outcome.relations}
         decided_at = _now_iso()
         for memory_id, judged_content_hash in outcome.judged_content_hashes.items():

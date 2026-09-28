@@ -107,7 +107,7 @@ from memforge.memory.cross_document_relation import (
     CrossDocumentRelationLabel,
     CrossDocumentRelationOutcome,
 )
-from memforge.memory.relation_discovery import RelationDiscovery
+from memforge.memory.relation_discovery import DEFAULT_RELATION_DISCOVERY_BUDGET, RelationDiscovery
 from memforge.memory.relation_discovery_contract import RelationDiscoveryWorkSelection, RelationDiscoveryWorkState
 from memforge.models import (
     ContentItem,
@@ -8177,6 +8177,74 @@ async def test_relation_discovery_none_judgment_drops_the_classifier_relation(db
     assert second.completed_work == 1
     assert await _stored_relations(db) == []
     assert len(await db.db.execute_fetchall("SELECT id FROM relation_runs WHERE result_memory_id = ?", (challenger.id,))) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_rerun_drops_the_relations_its_work_decided_for_pairs_it_no_longer_judges(db: Database) -> None:
+    _challenger, candidate = await _relation_pair_fixture(db, run_id="projection-relation-rerun-drops")
+    first = await _run_relation_discovery(db, candidate, CrossDocumentRelationLabel.CONTRADICTS)
+    assert first.completed_work == 1
+    assert [row["label"] for row in await _stored_relations(db)] == ["contradicts"]
+
+    rerun = await db.rerun_relation_discovery_work(
+        RelationDiscoveryWorkSelection(
+            state=RelationDiscoveryWorkState.COMPLETED,
+            max_attempts=DEFAULT_RELATION_DISCOVERY_BUDGET.max_attempts,
+        ),
+        actor="operator-1",
+    )
+    assert rerun == 1
+    second = await _run_relation_discovery(
+        db, candidate, CrossDocumentRelationLabel.CONTRADICTS, candidates=_EmptyRelationCandidates(),
+    )
+
+    assert second.completed_work == 1
+    assert await _stored_relations(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_rerun_keeps_relations_a_person_confirmed_or_another_work_decided(db: Database) -> None:
+    challenger, candidate = await _relation_pair_fixture(db, run_id="projection-relation-rerun-keeps")
+    other = Memory(
+        id="mem-relation-other-work",
+        memory_type="decision",
+        content="A7 applies to bonus payroll.",
+        content_hash=content_hash("A7 applies to bonus payroll."),
+        project_key="ENG",
+    )
+    await db.insert_memory(other)
+    await _insert_review_relation(db, challenger, candidate)
+    low_id, high_id = sorted((challenger.id, other.id))
+    hashes = {challenger.id: challenger.content_hash, other.id: other.content_hash}
+    await db.db.execute(
+        """INSERT INTO cross_document_relations (
+               memory_low_id, memory_high_id, label, low_content_hash, high_content_hash,
+               classifier_version, relation_run_id, discovery_work_id, decided_by, decided_at
+           ) VALUES (?, ?, 'contradicts', ?, ?, ?, 'relation-run-other', 'relation-work-other', 'classifier', ?)""",
+        (low_id, high_id, hashes[low_id], hashes[high_id], CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+         "2026-07-20T00:00:00+00:00"),
+    )
+    await db.db.commit()
+    dismissal = await db.record_cross_document_relation_dismissal(
+        memory_id=challenger.id,
+        counterpart_memory_id=candidate.id,
+        label=CrossDocumentRelationLabel.UPDATES,
+        expected_content_hash=challenger.content_hash,
+        counterpart_expected_content_hash=candidate.content_hash,
+        actor="reader-1",
+    )
+
+    result = await _run_relation_discovery(
+        db, candidate, CrossDocumentRelationLabel.CONTRADICTS, candidates=_EmptyRelationCandidates(),
+    )
+
+    assert result.completed_work == 1
+    stored = {(row["memory_low_id"], row["memory_high_id"], row["decided_by"]) for row in await _stored_relations(db)}
+    assert stored == {(*sorted((challenger.id, candidate.id)), "review"), (low_id, high_id, "classifier")}
+    dismissals = await db.db.execute_fetchall(
+        "SELECT id FROM cross_document_relation_dismissals WHERE restored_at IS NULL"
+    )
+    assert [row["id"] for row in dismissals] == [dismissal.id]
 
 
 async def _insert_review_relation(

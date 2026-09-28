@@ -14,7 +14,10 @@ from memforge.llm.structured import (
     StructuredLlmError,
 )
 from memforge.memory.cross_document_relation import (
+    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+    CROSS_DOCUMENT_RELATION_INPUT_VERSIONS,
     CROSS_DOCUMENT_RELATION_PROMPT,
+    CROSS_DOCUMENT_RELATION_QUESTION,
     CROSS_DOCUMENT_RELATION_RULES,
     CrossDocumentRelationJudgment,
     CrossDocumentRelationLabel,
@@ -23,6 +26,7 @@ from memforge.memory.cross_document_relation import (
     CrossDocumentRelationRecord,
     RelationSubject,
     StructuredCrossDocumentRelationClassifier,
+    cross_document_relation_prompt,
     load_relation_subjects,
     newest_evidence_unit_id,
     pair_key,
@@ -66,9 +70,12 @@ def _pairs(count: int, *, challenger: str = "mem-challenger") -> tuple[CrossDocu
     )
 
 
+def _section(prompt: str, tag: str):
+    return json.loads(prompt.split(f"<{tag}>\n", 1)[1].split(f"\n</{tag}>", 1)[0])
+
+
 def _pair_indexes(prompt: str) -> list[int]:
-    groups = json.loads(prompt.split("<statement_pair_groups>\n", 1)[1].split("\n</statement_pair_groups>", 1)[0])
-    return [item["pair_index"] for group in groups for item in group["compared_with"]]
+    return [question["pair_index"] for question in _section(prompt, "questions")]
 
 
 @dataclass
@@ -206,34 +213,98 @@ async def test_prompt_shows_statement_context_without_identity() -> None:
     await _classifier(client).classify((CrossDocumentRelationPair(challenger=challenger, candidate=candidate),))
 
     [prompt] = client.prompts
-    groups = json.loads(prompt.split("<statement_pair_groups>\n", 1)[1].split("\n</statement_pair_groups>", 1)[0])
-    assert groups == [
+    assert _section(prompt, "subject") == {
+        "statement": "Payroll runs weekly.",
+        "memory_type": "decision",
+        "source_type": "jira",
+        "document_title": "Payroll design",
+        "evidence_time": "2026-04-10",
+        "evidence": ["Payroll runs weekly for all employees."],
+    }
+    assert _section(prompt, "questions") == [
         {
-            "statement": {
-                "statement": "Payroll runs weekly.",
+            "pair_index": 0,
+            "question": CROSS_DOCUMENT_RELATION_QUESTION,
+            "candidate": {
+                "statement": "Payroll runs monthly.",
                 "memory_type": "decision",
                 "source_type": "jira",
-                "document_title": "Payroll design",
-                "evidence_time": "2026-04-10",
-                "evidence": ["Payroll runs weekly for all employees."],
+                "document_title": "Payroll ticket",
+                "evidence_time": None,
+                "evidence": [],
             },
-            "compared_with": [
-                {
-                    "pair_index": 0,
-                    "statement": {
-                        "statement": "Payroll runs monthly.",
-                        "memory_type": "decision",
-                        "source_type": "jira",
-                        "document_title": "Payroll ticket",
-                        "evidence_time": None,
-                        "evidence": [],
-                    },
-                }
-            ],
         }
     ]
     for hidden in ("secret-id", "memory_id", "content_hash", "source_id"):
         assert hidden not in prompt
+
+
+@pytest.mark.asyncio
+async def test_every_request_states_one_challenger_once_and_asks_only_about_its_candidates() -> None:
+    client = _Client()
+    first = _pairs(2, challenger="mem-challenger-a")
+    second = tuple(
+        replace(pair, challenger=_subject("mem-challenger-b", "Payroll runs monthly.")) for pair in _pairs(2)
+    )
+    pairs = (first[0], second[0], first[1], second[1])
+
+    result = await _classifier(client).classify(pairs)
+
+    assert [judgment.pair for judgment in result.judgments] == list(pairs)
+    assert result.llm_calls == len(client.prompts) == 2
+    asked = {_section(prompt, "subject")["statement"]: _pair_indexes(prompt) for prompt in client.prompts}
+    assert asked == {"Payroll runs weekly.": [0, 2], "Payroll runs monthly.": [1, 3]}
+    for prompt in client.prompts:
+        assert prompt.count("<subject>") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_split_request_states_its_challenger_again() -> None:
+    def respond(prompt):
+        indexes = _pair_indexes(prompt)
+        if len(indexes) > 1:
+            raise StructuredLlmError("context window", terminal_category="provider_error", error_code=INPUT_CAPACITY_EXCEEDED)
+        return CrossDocumentRelationResponse(decisions=[{"pair_index": index, "label": "none"} for index in indexes])
+
+    client = _Client(respond=respond)
+
+    result = await _classifier(client).classify(_pairs(2))
+
+    assert len(result.judgments) == 2
+    assert all(_section(prompt, "subject")["statement"] == "Payroll runs weekly." for prompt in client.prompts)
+
+
+def test_the_prompt_asks_one_question_per_candidate_about_the_subject_only() -> None:
+    subject = _subject("mem-subject", "Payroll runs weekly.")
+    candidates = [(4, _subject("mem-a", "Payroll runs weekly.")), (9, _subject("mem-b", "Payroll runs weekly."))]
+
+    prompt = cross_document_relation_prompt(subject, candidates)
+
+    assert prompt.startswith(CROSS_DOCUMENT_RELATION_RULES)
+    assert CROSS_DOCUMENT_RELATION_QUESTION == "What is the relation of this candidate to the subject?"
+    assert [(question["pair_index"], question["question"]) for question in _section(prompt, "questions")] == [
+        (4, CROSS_DOCUMENT_RELATION_QUESTION),
+        (9, CROSS_DOCUMENT_RELATION_QUESTION),
+    ]
+    assert _section(prompt, "subject") == subject.prompt_payload()
+    framing = " ".join(prompt[len(CROSS_DOCUMENT_RELATION_RULES) :].split())
+    for sentence in (
+        "Every question below asks for the relation between one candidate statement and the subject statement.",
+        "The subject is one statement; each candidate is one statement from another document.",
+        "Many candidates repeat one another.",
+        "two candidates that state the same thing tell nothing about the subject",
+        "a candidate is equivalent only when it and the subject state the same knowledge.",
+    ):
+        assert sentence in framing
+
+
+def test_the_contract_is_v4_and_replays_cases_pinned_under_the_same_input() -> None:
+    assert CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION == "cross-document-relation-v4"
+    assert CROSS_DOCUMENT_RELATION_INPUT_VERSIONS == {
+        "cross-document-relation-v2",
+        "cross-document-relation-v3",
+        "cross-document-relation-v4",
+    }
 
 
 def test_rules_define_the_same_situation_domain_neutrally_and_prefer_none() -> None:
@@ -253,7 +324,8 @@ def test_rules_define_the_same_situation_domain_neutrally_and_prefer_none() -> N
         assert condition in rules
     for clarification in (
         "decide whether the statements are about the same situation before deciding whether both can hold",
-        "when the statements overlap only in part, compare only the part they share",
+        "when the statements overlap only in part, they conflict if the part they share cannot hold for both; "
+        "a shared part never makes them equivalent",
         "compare only what the statements state: a conflict that has to be inferred from either statement "
         "is not a relation",
         "read the kind from what each statement says, not from its memory type",
@@ -262,8 +334,11 @@ def test_rules_define_the_same_situation_domain_neutrally_and_prefer_none() -> N
     assert "when you are not certain, the label is none" in rules
     assert "both can hold without stating the same knowledge" in rules
     assert "more specific than the other" in rules
+    assert "one adds a fact, condition, step or outcome the other does not state" in rules
+    assert "each statement as a whole states everything the other states; they differ only in wording" in rules
+    assert "the two statements directly state incompatible things about it" in rules
     assert "judge the statements themselves" not in rules
-    for dimension in ("version", "country", "environment", "ticket"):
+    for dimension in ("version", "country", "environment"):
         assert dimension not in rules
 
 

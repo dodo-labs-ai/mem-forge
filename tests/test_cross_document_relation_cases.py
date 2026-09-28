@@ -446,12 +446,15 @@ async def test_a_case_pinned_for_another_classifier_is_neither_curated_nor_repla
 
 
 @pytest.mark.asyncio
-async def test_a_case_pinned_for_a_classifier_with_the_same_input_is_replayed(db: Database) -> None:
+@pytest.mark.parametrize("pinned_version", ["cross-document-relation-v2", "cross-document-relation-v3"])
+async def test_a_case_pinned_for_a_classifier_with_the_same_input_is_replayed(
+    db: Database, pinned_version: str,
+) -> None:
     run_id = await _executed_relation_run(db)
     [output, *_rest] = await OfflineAgentEvaluation(db, executors={}).read_case_outputs(
         run_id, requesting_user_id=ACTOR
     )
-    pinned = {**output.case.manifest, "classifier_version": "cross-document-relation-v2"}
+    pinned = {**output.case.manifest, "classifier_version": pinned_version}
 
     replayed = await CrossDocumentRelationReplayExecutor(_LabelClient()).execute(
         replace(output.case, manifest=pinned),
