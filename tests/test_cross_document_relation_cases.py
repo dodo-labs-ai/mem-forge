@@ -34,6 +34,9 @@ from tests.relation_evidence_fixture import (
 
 UPDATED_AT = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
 ACTOR = "operator@example.test"
+# rev-updated's candidate mem-d is recorded before its challenger, so an
+# ``updates`` label on that pair is ordered by its Evidence times.
+EARLIER_OBSERVED_AT = "2026-03-01T10:00:00.000+0000"
 
 
 def _memory(memory_id: str, content: str, **overrides) -> Memory:
@@ -69,6 +72,7 @@ class _ReviewStore:
         self.memories = {memory.id: memory for memory in memories}
         self.reviews = reviews
         self.units = {memory.id: (replace(primary_evidence_unit_fixture(memory.id), source_id="src-teams"),) for memory in memories}
+        self.observed_at: dict[str, str] = {}
 
     async def list_memory_reviews(self, status=None, kind=None, limit=100, offset=0):
         matching = [review for review in self.reviews if review.status == status and review.kind == kind]
@@ -85,7 +89,10 @@ class _ReviewStore:
 
     async def get_current_source_observation_revisions(self, source_unit_id):
         memory_id = source_unit_id.removeprefix("unit-")
-        return {f"obs-{memory_id}": primary_observation_revision_fixture(memory_id)}
+        revision = primary_observation_revision_fixture(memory_id)
+        if memory_id in self.observed_at:
+            revision = replace(revision, observed_at=self.observed_at[memory_id])
+        return {f"obs-{memory_id}": revision}
 
     async def get_source(self, source_id):
         return await self.db.get_source(source_id)
@@ -130,6 +137,7 @@ def _review_store(db: Database) -> _ReviewStore:
             _review("rev-pending", "pending", "mem-a", "mem-f"),
         ],
     )
+    store.observed_at["mem-d"] = EARLIER_OBSERVED_AT
     return store
 
 
@@ -174,6 +182,28 @@ async def test_seed_pins_decided_reviews_with_labels_and_is_repeatable(db: Datab
         "rev-updated": ("updates", AgentEvaluationPopulation.REPRESENTATIVE_CONTROL),
         "rev-dismissed": ("none", AgentEvaluationPopulation.FAILURE_REGRESSION),
     }
+
+
+@pytest.mark.asyncio
+async def test_seed_pins_an_updates_relabel_on_a_same_day_pair_as_contradicts(db: Database) -> None:
+    store = _review_store(db)
+
+    # rev-confirmed pairs mem-a and mem-b, both recorded on the same date.
+    report = await seed_cross_document_relation_cases(
+        store,
+        OfflineAgentEvaluation(db, executors={}),
+        actor=ACTOR,
+        label_overrides={"rev-confirmed": CrossDocumentRelationLabel.UPDATES},
+    )
+
+    assert report.label_counts == {"none": 1, "equivalent": 0, "updates": 0, "contradicts": 2}
+    cohort = await db.get_agent_evaluation_cohort(report.cohort_id)
+    expected_labels = {}
+    for item in cohort.items:
+        case = await db.get_agent_evaluation_case(item.case_id)
+        ground_truth = await db.get_accepted_ground_truth_revision(item.ground_truth_revision_id)
+        expected_labels[case.manifest["origin"]["review_id"]] = ground_truth.rubric["expected_label"]
+    assert expected_labels == {"rev-confirmed": "contradicts", "rev-updated": "contradicts", "rev-dismissed": "none"}
 
 
 @pytest.mark.asyncio
@@ -275,7 +305,14 @@ class _LabelClient:
 
     async def classify_cross_document_relations(self, prompt, *, max_tokens, model=None):
         label = "contradicts" if "weekly" in prompt else "none"
-        return CrossDocumentRelationResponse(decisions=[{"pair_index": 0, "label": label, "reason": "fixture"}])
+        return CrossDocumentRelationResponse(decisions=[{"pair_index": 0, "label": label}])
+
+
+class _UpdatesClient(_LabelClient):
+    """Labels every pair updates."""
+
+    async def classify_cross_document_relations(self, prompt, *, max_tokens, model=None):
+        return CrossDocumentRelationResponse(decisions=[{"pair_index": 0, "label": "updates"}])
 
 
 @pytest.mark.asyncio
@@ -409,8 +446,54 @@ async def test_a_case_pinned_for_another_classifier_is_neither_curated_nor_repla
 
 
 @pytest.mark.asyncio
+async def test_a_case_pinned_for_a_classifier_with_the_same_input_is_replayed(db: Database) -> None:
+    run_id = await _executed_relation_run(db)
+    [output, *_rest] = await OfflineAgentEvaluation(db, executors={}).read_case_outputs(
+        run_id, requesting_user_id=ACTOR
+    )
+    pinned = {**output.case.manifest, "classifier_version": "cross-document-relation-v2"}
+
+    replayed = await CrossDocumentRelationReplayExecutor(_LabelClient()).execute(
+        replace(output.case, manifest=pinned),
+        {"model": FIXTURE_MODEL},
+    )
+
+    assert replayed["classifier_version"] == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("challenger_time", "candidate_time", "recorded"),
+    [
+        ("2026-03-25", "2026-03-01", "updates"),
+        ("2026-03-25", "2026-03-25", "contradicts"),
+        ("2026-03-25", None, "contradicts"),
+    ],
+)
+async def test_replay_scores_the_label_discovery_records(
+    db: Database, challenger_time: str, candidate_time: str | None, recorded: str
+) -> None:
+    run_id = await _executed_relation_run(db)
+    [output, *_rest] = await OfflineAgentEvaluation(db, executors={}).read_case_outputs(
+        run_id, requesting_user_id=ACTOR
+    )
+    manifest = {
+        **output.case.manifest,
+        "challenger": {**output.case.manifest["challenger"], "evidence_time": challenger_time},
+        "candidate": {**output.case.manifest["candidate"], "evidence_time": candidate_time},
+    }
+
+    replayed = await CrossDocumentRelationReplayExecutor(_UpdatesClient()).execute(
+        replace(output.case, manifest=manifest),
+        {"model": FIXTURE_MODEL},
+    )
+
+    assert (replayed["label"], replayed["classifier_label"]) == (recorded, "updates")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("operator", "status"), [(False, 403), (True, 200)])
-async def test_case_outputs_route_returns_pinned_input_label_and_reason(
+async def test_case_outputs_route_returns_pinned_input_and_labels(
     db: Database, tmp_path, operator: bool, status: int
 ) -> None:
     from memforge.server.admin_api import create_admin_app
@@ -445,6 +528,6 @@ async def test_case_outputs_route_returns_pinned_input_label_and_reason(
         "case_kind": AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION.value,
         "classifier_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
         "label": "contradicts",
-        "reason": "fixture",
+        "classifier_label": "contradicts",
     }
     assert {check["reason_code"] for check in confirmed["checks"]} >= {"contradicts:contradicts"}

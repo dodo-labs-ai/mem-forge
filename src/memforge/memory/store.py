@@ -165,7 +165,6 @@ def _memory_metadata(
         "repo_identifier": memory.repo_identifier or "",
         "visibility": memory.visibility,
         "owner_user_id": memory.owner_user_id or "",
-        "confidence": memory.confidence,
         "status": memory.status,
         "content_hash": memory.content_hash,
         "embedding_text_hash": embedding_text_hash,
@@ -1073,7 +1072,6 @@ class MemoryStore:
         self,
         memory_id: str,
         new_content: str,
-        new_confidence: float | None = None,
     ) -> None:
         """Update a memory's content across all stores."""
         context = self._operation_context()
@@ -1081,7 +1079,7 @@ class MemoryStore:
         previous_vector = await self._memory_vector_snapshot(memory_id)
         memory = None
         try:
-            await self.db.update_memory_content(memory_id, new_content, new_confidence)
+            await self.db.update_memory_content(memory_id, new_content)
 
             # Re-embed and update ChromaDB
             memory = await self.db.get_memory(memory_id)
@@ -1329,7 +1327,6 @@ class MemoryStore:
         display_anchor: str,
         claim_text: str,
         memory_type: str,
-        confidence: float,
         observed_at: datetime,
         source_updated_at: datetime | None,
         citations: list[str] | None = None,
@@ -1352,7 +1349,6 @@ class MemoryStore:
                 display_anchor=display_anchor,
                 claim_text=claim_text,
                 memory_type=memory_type,
-                confidence=confidence,
                 observed_at=observed_at,
                 citations=citations,
                 concept_projection=concept_projection,
@@ -1396,7 +1392,6 @@ class MemoryStore:
         display_anchor: str,
         claim_text: str,
         memory_type: str,
-        confidence: float,
         observed_at: datetime,
         source_updated_at: datetime | None,
         citations: list[str] | None = None,
@@ -1428,7 +1423,6 @@ class MemoryStore:
                 display_anchor=display_anchor,
                 claim_text=claim_text,
                 memory_type=memory_type,
-                confidence=confidence,
                 observed_at=observed_at,
                 citations=citations,
                 concept_markdown_body=concept_markdown_body,
@@ -1474,7 +1468,6 @@ class MemoryStore:
         display_anchor: str,
         claim_text: str,
         memory_type: str,
-        confidence: float,
         observed_at: datetime,
         concept_markdown_body: str,
         maintenance_receipt: MemoryAuditEvent | None = None,
@@ -1493,7 +1486,6 @@ class MemoryStore:
                 display_anchor=display_anchor,
                 claim_text=claim_text,
                 memory_type=memory_type,
-                confidence=confidence,
                 observed_at=observed_at,
                 concept_markdown_body=concept_markdown_body,
                 maintenance_receipt=maintenance_receipt,

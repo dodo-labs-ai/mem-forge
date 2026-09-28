@@ -41,7 +41,6 @@ def _replacement() -> RawMemory:
     return RawMemory(
         content="A7 is retained and marked as reduced retro chain.",
         memory_type="decision",
-        confidence=0.9,
         evidence_quote="A7 is retained",
         extraction_context="the entire untrusted source document",
     )
@@ -195,7 +194,6 @@ def test_gated_noop_evidence_rebind_stages_review_without_mutating_incumbent() -
     candidate = RawMemory(
         content=old.content,
         memory_type=old.memory_type,
-        confidence=0.9,
         evidence_quote="A7 is removed.",
         support_validation={"validated_quote": "A7 is removed."},
     )

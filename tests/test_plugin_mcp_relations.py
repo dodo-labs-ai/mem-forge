@@ -20,7 +20,6 @@ def _relation() -> dict[str, object]:
             "sources": [{"source_id": "src-jira", "source_type": "jira", "name": "Payroll Jira"}],
             "evidence_time": "2026-08-01",
         },
-        "reason": "The later ticket moves the closing day.",
         "decided_by": "classifier",
     }
 

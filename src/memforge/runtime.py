@@ -551,12 +551,8 @@ def _has_structured_llm_credentials(llm: EffectiveLlmConfig) -> bool:
 
 
 def _retrieval_config_for_llm(config: AppConfig, llm: EffectiveLlmConfig):
-    """Use the effective enrichment model for optional LLM retrieval assists."""
-    return replace(
-        config.retrieval,
-        entity_model=llm.enrichment_model,
-        rerank_model=llm.enrichment_model,
-    )
+    """Use the effective main model for the optional retrieval rerank."""
+    return replace(config.retrieval, rerank_model=llm.enrichment_model)
 
 
 async def build_search_engine(

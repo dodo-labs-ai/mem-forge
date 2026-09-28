@@ -67,7 +67,6 @@ class _Classifier:
                 CrossDocumentRelationJudgment(
                     pair=pair,
                     label=self.labels.get(pair.candidate.memory_id, CrossDocumentRelationLabel.NONE),
-                    reason="deterministic fixture",
                 )
                 for pair in pairs
             ),

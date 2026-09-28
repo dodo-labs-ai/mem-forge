@@ -24,6 +24,20 @@ from memforge.llm.structured import (
 )
 
 
+class FixtureRelationDecision(MemoryRelationAssessment):
+    """One scenario relation for an application-issued pair slot.
+
+    It becomes a Sparse Relation row, and its classification alone answers a
+    pair review.
+    """
+
+    pair_index: int = Field(ge=0)
+
+
+class FixtureRelationResponse(BaseModel):
+    decisions: list[FixtureRelationDecision]
+
+
 class FixtureSupport(BaseModel):
     """One scenario Support judgment before it is written as an ordered-reading wire row."""
 

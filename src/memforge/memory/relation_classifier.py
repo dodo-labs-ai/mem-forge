@@ -1,4 +1,10 @@
-"""Provider-neutral relationship rules and exact Memory-pair classification."""
+"""Provider-neutral relationship rules and the same-Unit pair review.
+
+The pair review is a Decision: the program supplies two supported refinements
+of the same old Memory, and the model returns one memory relation label.
+``contradicts`` is the safe answer and the only label the program acts on: it
+turns the refinement uncertain and blocks the UPDATE.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +16,6 @@ from typing import Any
 from memforge.llm.batch_runner import BatchStats, ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
 from memforge.llm.decision_model import DecisionTask, decision_task_model
 from memforge.llm.structured import MemoryRelationResponse, StructuredLlmError
-from memforge.memory.evidence import RelationDirection
 from memforge.models import Memory
 
 
@@ -42,9 +47,11 @@ class MemoryRelationType(str, Enum):
     UNRELATED = "unrelated"
 
 
-MEMORY_PAIR_CLASSIFIER_VERSION = "memory-relation-v3"
+# The pair review contract: its question, labels and prompt. It is part of the
+# semantic contract of every reconciliation manifest.
+MEMORY_PAIR_REVIEW_CONTRACT = "memory-pair-review-v1"
 # The same-Unit pair review: do two refinements of the same old Memory contradict.
-PAIR_REVIEW_TASK = DecisionTask("same_unit_pair_review", MEMORY_PAIR_CLASSIFIER_VERSION)
+PAIR_REVIEW_TASK = DecisionTask("same_unit_pair_review", MEMORY_PAIR_REVIEW_CONTRACT)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,13 +68,6 @@ class MemoryPair:
 class MemoryPairDecision:
     pair: MemoryPair
     relation_type: MemoryRelationType
-    direction: RelationDirection
-    reason: str
-
-    def __post_init__(self) -> None:
-        directional = self.relation_type is MemoryRelationType.REFINES
-        if directional == (self.direction is RelationDirection.SYMMETRIC):
-            raise ValueError("REFINES must be directional and other relations symmetric")
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,25 +108,19 @@ MEMORY_RELATION_RULES = """Use these definitions strictly:
 - UNRELATED: none of the relationships above applies.
 
 Equivalence is symmetric and must be false when either claim narrows, broadens,
-conditions, updates, contradicts, or adds any material fact. For REFINES, set
-direction to challenger_to_candidate when the challenger is more specific, or
-candidate_to_challenger when the candidate is more specific. For every other
-classification direction must be symmetric. Labels never imply authority,
-recency, preference, or permission to mutate either Memory.
+conditions, updates, contradicts, or adds any material fact. Labels never imply
+authority, recency, preference, or permission to mutate either Memory.
 
-Before returning CONTRADICTS, prove that the claims concern the same subject and
-an overlapping operational scope, including system, environment, repository,
-project, time, and modality when those facts are present. State the overlap
-explicitly: a universal rule includes its subsets, so an incompatible exception
-within that subset can contradict the universal rule. REFINES requires compatible
-assertions; a narrower scope alone cannot make incompatible values compatible.
-Different document lineage alone does not prove different operational subjects.
-Set
-same_subject_and_scope=true only after that proof and state the two mutually
-incompatible assertions in incompatible_assertions. If the claims concern
-different systems, environments, templates, examples, time periods, or disjoint
-scopes, return UNRELATED or REFINES as appropriate. For every non-CONTRADICTS decision,
-incompatible_assertions must be an empty string.
+Return CONTRADICTS only when the claims concern the same subject and an
+overlapping operational scope, including system, environment, repository,
+project, time, and modality when those facts are present, and make mutually
+incompatible assertions within that overlap. A universal rule includes its
+subsets, so an incompatible exception within that subset can contradict the
+universal rule. REFINES requires compatible assertions; a narrower scope alone
+cannot make incompatible values compatible. Different document lineage alone
+does not prove different operational subjects. If the claims concern different
+systems, environments, templates, examples, time periods, or disjoint scopes,
+return UNRELATED or REFINES as appropriate.
 
 Compare the proposition rather than presentation alone, but preserve material
 modality. A normative requirement and a descriptive state have different truth
@@ -149,9 +143,10 @@ Return exactly one decision for every pair_index and no other pair_index.
 """
 
 
-# Requested output per relation request: a response envelope plus one decision per pair.
+# Requested output per relation request: a response envelope plus one decision
+# per pair, which holds only its pair index and label with their JSON keys.
 _RELATION_OUTPUT_BASE_TOKENS = 512
-_RELATION_OUTPUT_TOKENS_PER_PAIR = 768
+_RELATION_OUTPUT_TOKENS_PER_PAIR = 32
 
 
 def relation_output_tokens(policy: MemoryPairClassificationPolicy, pair_count: int) -> int:
@@ -223,16 +218,6 @@ def _classification_error(
     )
 
 
-def _auditable_relation_reason(decision: Any) -> str:
-    reason = str(getattr(decision, "reason", "") or "").strip()
-    if str(decision.classification) != MemoryRelationType.CONTRADICTS.value:
-        return reason
-    incompatible = str(getattr(decision, "incompatible_assertions", "") or "").strip()
-    scope_proof = bool(getattr(decision, "same_subject_and_scope", False))
-    proof = f"same_subject_and_scope={str(scope_proof).lower()}; incompatible_assertions={incompatible}"
-    return f"{reason} [{proof}]" if reason else proof
-
-
 def _prompt_memory(memory: Memory) -> dict[str, object]:
     return {
         "id": memory.id,
@@ -296,19 +281,15 @@ class StructuredMemoryPairClassifier:
             return LlmRequest(prompt, MemoryRelationResponse, relation_output_tokens(self._policy, len(item_ids)))
 
         def decode(response: MemoryRelationResponse, _item_ids: tuple[str, ...], _context: tuple):
-            """Each decision is validated alone by its own rule; the runner rejects an unrequested pair_index."""
+            """Each decision names one supplied pair; the runner rejects an unrequested pair_index."""
             for decision in response.decisions:
                 pair_index = int(decision.pair_index)
                 if not 0 <= pair_index < len(pairs):
                     yield str(pair_index), RejectedRow(f"pair_index {pair_index} was not requested")
-                elif (error := decision.row_error()) is not None:
-                    yield str(pair_index), RejectedRow(f"pair_index {pair_index}: {error}")
                 else:
                     yield str(pair_index), MemoryPairDecision(
                         pair=pairs[pair_index],
                         relation_type=MemoryRelationType(decision.classification),
-                        direction=RelationDirection(decision.direction),
-                        reason=_auditable_relation_reason(decision),
                     )
 
         decisions, unjudged = await judge_pair_items(runner, ItemTask(

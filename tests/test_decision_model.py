@@ -32,7 +32,7 @@ from memforge.memory.entity_resolver import (
 from memforge.memory.engine import _lifecycle_decision_task_models, _source_lifecycle_operation_input_hash
 from memforge.models import Entity
 from memforge.memory.relation_classifier import (
-    MEMORY_PAIR_CLASSIFIER_VERSION,
+    MEMORY_PAIR_REVIEW_CONTRACT,
     PAIR_REVIEW_TASK,
     StructuredMemoryPairClassifier,
 )
@@ -69,7 +69,7 @@ def test_every_decision_task_carries_its_current_contract_version() -> None:
     )
     assert [task.contract_version for task in tasks] == [
         CHANGE_IMPACT_CONTRACT,
-        MEMORY_PAIR_CLASSIFIER_VERSION,
+        MEMORY_PAIR_REVIEW_CONTRACT,
         CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
         ENTITY_ADJUDICATION_CONTRACT,
         AGENT_SESSION_AUTHORITY_CONTRACT,
@@ -242,7 +242,7 @@ def test_pair_review_is_registered_by_its_own_task_name(monkeypatch) -> None:
     client = SimpleNamespace(decision_model=DECISION_MODEL)
     assert StructuredMemoryPairClassifier(client=client, model=MAIN_MODEL)._model == MAIN_MODEL
 
-    register(monkeypatch, {PAIR_REVIEW_TASK.name: MEMORY_PAIR_CLASSIFIER_VERSION})
+    register(monkeypatch, {PAIR_REVIEW_TASK.name: MEMORY_PAIR_REVIEW_CONTRACT})
     assert StructuredMemoryPairClassifier(client=client, model=MAIN_MODEL)._model == DECISION_MODEL
 
 

@@ -185,8 +185,7 @@ class Memory:
     # Entity linkage
     entity_refs: list[str] = field(default_factory=list)
 
-    # Confidence and lifecycle
-    confidence: float = 0.7
+    # Corroboration and validity
     corroboration_count: int = 1
     valid_from: date | None = None
     valid_until: date | None = None
@@ -210,7 +209,6 @@ class RawMemory:
 
     content: str
     memory_type: str
-    confidence: float = 0.7
     entity_refs: list[str] = field(default_factory=list)
     valid_from: str | None = None
     valid_until: str | None = None
@@ -728,7 +726,6 @@ class MemoryRelationContext:
     label: str
     role: str
     counterpart: RelatedMemory
-    reason: str
     decided_by: str
 
 
@@ -739,7 +736,6 @@ class SearchResult:
     memory_id: str
     memory_type: str
     summary: str
-    confidence: float
     relevance_score: float
     # Metadata
     corroborated_by: int = 1

@@ -231,7 +231,6 @@ def _prepared_memory_authority_hash(memory: Memory) -> str:
         "owner_user_id": memory.owner_user_id,
         "project_key": memory.project_key,
         "repo_identifier": memory.repo_identifier,
-        "confidence": memory.confidence,
         "valid_from": memory.valid_from.isoformat() if memory.valid_from else None,
         "valid_until": memory.valid_until.isoformat() if memory.valid_until else None,
         "status": memory.status,
@@ -1835,19 +1834,20 @@ def _source_lifecycle_operation_input_hash(
 ) -> str:
     """Digest the exact reconciliation manifest without persisting source content."""
 
+    from memforge.memory.relation_classifier import MEMORY_PAIR_REVIEW_CONTRACT
     from memforge.pipeline.claim_revision import CLAIM_REVISION_CONTRACT
     from memforge.pipeline.revision_assessment import REVISION_SUPPORT_CONTRACT, REVISION_INPUT_POLICY
 
     manifest = {
         "semantic_contract": "/".join((REVISION_SUPPORT_CONTRACT, CANDIDATE_ADMISSION_CONTRACT,
-                                       CLAIM_REVISION_CONTRACT, REVISION_INPUT_POLICY)),
+                                       CLAIM_REVISION_CONTRACT, MEMORY_PAIR_REVIEW_CONTRACT,
+                                       REVISION_INPUT_POLICY)),
         "input_policy_identity": input_policy_identity,
         "projection_identity_hash": source_derivation_projection_identity_hash(projection),
         "candidates": [
             {
                 "content_hash": content_hash(candidate.content.strip()),
                 "memory_type": candidate.memory_type,
-                "confidence": candidate.confidence,
                 "source_observation_id": candidate.source_observation_id,
                 "required_source_observation_ids": sorted(
                     candidate.required_source_observation_ids

@@ -209,10 +209,11 @@ async def test_refinement_that_drops_unsupported_incumbent_truth_removes_its_sup
     assert [op.action for op in result.operations] == [ReconcileAction.ADD, ReconcileAction.DELETE]
 
 
-@pytest.mark.parametrize("stage", ["support", "admission", "claim"])
+@pytest.mark.parametrize("stage", ["support", "admission", "claim", "pair_review"])
 def test_semantic_assessment_contract_change_invalidates_operation_reuse(monkeypatch, stage):
     from memforge.memory import engine
     from memforge.memory.engine import _source_lifecycle_operation_input_hash
+    from memforge.memory import relation_classifier
     from memforge.pipeline import revision_assessment, claim_revision
 
     _, target = revisions("Two reviewers required.\n", "Two reviewers from distinct teams required.\n")
@@ -233,6 +234,7 @@ def test_semantic_assessment_contract_change_invalidates_operation_reuse(monkeyp
         "support": (revision_assessment, "REVISION_SUPPORT_CONTRACT"),
         "admission": (engine, "CANDIDATE_ADMISSION_CONTRACT"),
         "claim": (claim_revision, "CLAIM_REVISION_CONTRACT"),
+        "pair_review": (relation_classifier, "MEMORY_PAIR_REVIEW_CONTRACT"),
     }[stage]
     monkeypatch.setattr(module, field, "a-future-semantic-contract")
     assert _source_lifecycle_operation_input_hash(**inputs) != before
@@ -344,8 +346,7 @@ async def test_conflicting_current_refiners_skip_their_incumbent():
             return response.model_copy(update={"results": [response.results[0],
                 response.results[0].model_copy(update={"candidate_id": "NEW-0002"})]})
         async def classify_memory_relations(self, prompt, **kwargs):
-            return MemoryRelationResponse(decisions=[MemoryRelationDecision(pair_index=0, classification="contradicts",
-                direction="symmetric", same_subject_and_scope=True, incompatible_assertions="Mutually exclusive refinements")])
+            return MemoryRelationResponse(decisions=[MemoryRelationDecision(pair_index=0, classification="contradicts")])
     client = Conflicting("refines", "challenger_to_candidate")
     result = await reconcile_memories(new_extractions=[candidate(), candidate()], existing_memories=[memory()],
         llm_model="test-model", structured_llm_client=client, supports=dict([pinned("memory", True)]))

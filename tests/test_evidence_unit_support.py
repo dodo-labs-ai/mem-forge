@@ -38,6 +38,7 @@ from memforge.llm.structured import (
     ProjectionFragmentMemoryCandidate,
     ProjectionFragmentMemoryExtractionResponse,
 )
+from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_CONTRACT_VERSION
 from memforge.pipeline.extraction_requests import plan_extraction_requests
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionRequest
@@ -1022,7 +1023,7 @@ async def test_invalid_supporting_part_omits_complete_evidence_unit(db) -> None:
 
 
 @pytest.mark.asyncio
-async def test_deriver_stages_projection_extraction_v9_without_ingestion_replay(db) -> None:
+async def test_deriver_stages_projection_extraction_without_ingestion_replay(db) -> None:
     await _seed_complete_unit_support(db)
     now = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
     body = "# Durable rule\n\nAlways validate the complete Evidence Unit.\n"
@@ -1089,6 +1090,6 @@ async def test_deriver_stages_projection_extraction_v9_without_ingestion_replay(
     )
     assert len(seen_batches) == 1
     assert isinstance(seen_batches[0], ExtractionRequest)
-    assert result.derivation.extraction_contract_version == "projection-extraction-v9"
+    assert result.derivation.extraction_contract_version == PROJECTION_EXTRACTION_CONTRACT_VERSION
     assert result.derivation.target_unit_revision_id == projection.source_unit_revisions[0].id
 

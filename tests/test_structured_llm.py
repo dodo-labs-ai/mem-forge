@@ -267,40 +267,22 @@ def test_agent_session_authority_response_accepts_typed_decisions():
     response = AgentSessionAuthorityResponse.model_validate(
         {
             "decisions": [
-                {
-                    "evidence_id": "E1",
-                    "is_authoritative": True,
-                    "authority_kind": "durable_user_intent",
-                    "reason": "user explicitly set a durable convention",
-                },
-                {
-                    "evidence_id": "E2",
-                    "is_authoritative": False,
-                    "authority_kind": "not_authoritative",
-                    "reason": "generic continuation",
-                },
+                {"evidence_id": "E1", "authority_kind": "durable_user_intent"},
+                {"evidence_id": "E2", "authority_kind": "not_authoritative"},
             ]
         }
     )
 
     assert response.decisions[0].evidence_id == "E1"
     assert response.decisions[0].is_authoritative is True
-    assert response.decisions[1].authority_kind == "not_authoritative"
+    assert response.decisions[1].is_authoritative is False
 
 
-def test_agent_session_authority_row_rule_rejects_contradictory_decisions():
-    response = AgentSessionAuthorityResponse.model_validate(
-        {
-            "decisions": [
-                {"evidence_id": "E1", "is_authoritative": True, "authority_kind": "not_authoritative",
-                 "reason": "contradictory"},
-                {"evidence_id": "E2", "is_authoritative": False, "authority_kind": "design_decision",
-                 "reason": "contradictory"},
-            ]
-        }
-    )
-    # The shape parses; each row's meaning rule rejects that row alone.
-    assert all(decision.row_error() is not None for decision in response.decisions)
+def test_agent_session_authority_decision_holds_only_the_authority_kind():
+    with pytest.raises(ValidationError):
+        AgentSessionAuthorityResponse.model_validate(
+            {"decisions": [{"evidence_id": "E1", "authority_kind": "design_decision", "reason": "a rule"}]}
+        )
 
 
 def test_memory_extraction_response_rejects_top_level_array():
@@ -362,7 +344,7 @@ async def test_litellm_structured_client_uses_response_schema_for_memory_extract
         calls.append(kwargs)
         return CompletionResponse(
             '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact",'
-            '"confidence":0.9,"primary_ref":"P1"}]}'
+            '"primary_ref":"P1"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -582,8 +564,7 @@ async def test_litellm_structured_client_uses_response_schema_for_agent_session_
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
         return CompletionResponse(
-            '{"decisions":[{"evidence_id":"E1","is_authoritative":true,'
-            '"authority_kind":"durable_user_intent","reason":"explicit user rule"}]}'
+            '{"decisions":[{"evidence_id":"E1","authority_kind":"durable_user_intent"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -616,8 +597,7 @@ async def test_agent_session_authority_classifier_retries_invalid_native_schema_
         if len(calls) == 1:
             return CompletionResponse("not valid json")
         return CompletionResponse(
-            '{"decisions":[{"evidence_id":"E1","is_authoritative":true,'
-            '"authority_kind":"durable_user_intent","reason":"explicit user rule"}]}'
+            '{"decisions":[{"evidence_id":"E1","authority_kind":"durable_user_intent"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -649,7 +629,7 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
         calls.append(kwargs)
         return CompletionResponse(
             '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact",'
-            '"confidence":0.9,"primary_ref":"P1"}]}'
+            '"primary_ref":"P1"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -694,7 +674,7 @@ async def test_litellm_structured_client_supports_prompt_template_transport(
         calls.append(kwargs)
         return CompletionResponse(
             '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact",'
-            '"confidence":0.9,"primary_ref":"P1"}]}'
+            '"primary_ref":"P1"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -731,7 +711,7 @@ async def test_litellm_structured_client_uses_explicit_json_schema_response_form
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
         return CompletionResponse(
-            '{"decisions":[{"candidate_id":"CND-0001","verdict":"ADMITTED","reject_reason":null,"duplicate_of":[],"reason":"complete"}]}'
+            '{"decisions":[{"candidate_id":"CND-0001","verdict":"ADMITTED","reject_reason":null,"duplicate_of":[]}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -851,7 +831,7 @@ async def test_litellm_structured_client_repairs_invalid_json_backslash_escapes(
     async def fake_acompletion(**kwargs):
         return CompletionResponse(
             r'{"memories":[{"content":"Use regex \s+ for whitespace.","memory_type":"fact",'
-            r'"confidence":0.8,"primary_ref":"P1"}]}'
+            r'"primary_ref":"P1"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -881,7 +861,7 @@ async def test_litellm_structured_client_repairs_unescaped_quotes_without_changi
         calls.append(kwargs)
         return CompletionResponse(
             '{"memories":[{"content":"Use "规则" for validation.",'
-            '"memory_type":"procedure","confidence":0.9,'
+            '"memory_type":"procedure",'
             '"entity_refs":[],"primary_ref":"P1"}]}'
         )
 
@@ -965,7 +945,7 @@ async def test_litellm_structured_client_rejects_quote_repair_when_schema_is_inv
         calls.append(kwargs)
         return CompletionResponse(
             '{"memories":[{"content":"Use "规则" for validation.",'
-            '"memory_type":"unsupported","confidence":0.9,"primary_ref":"P1"}]}'
+            '"memory_type":"unsupported","primary_ref":"P1"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -1068,7 +1048,7 @@ async def test_litellm_structured_client_reports_content_free_validation_fields(
     async def fake_acompletion(**kwargs):
         return CompletionResponse(
             '{"memories":[{"content":"secret source text",'
-            '"memory_type":"unsupported","confidence":2.0,'
+            '"memory_type":"unsupported",'
             '"entity_refs":[],"primary_ref":"P1"}]}'
         )
 
@@ -1092,7 +1072,6 @@ async def test_litellm_structured_client_reports_content_free_validation_fields(
     assert raised.value.error_code == "ValidationError"
     assert raised.value.validation_fields == (
         ("memories.0.memory_type", "literal_error"),
-        ("memories.0.confidence", "less_than_equal"),
     )
     assert "secret source text" not in str(raised.value)
 
@@ -1114,9 +1093,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
             )
         if schema is MemoryRelationResponse:
             return CompletionResponse(
-                '{"decisions":[{"pair_index":0,"classification":"refines",'
-                '"direction":"challenger_to_candidate","same_subject_and_scope":true,'
-                '"incompatible_assertions":"","reason":"adds a condition"}]}'
+                '{"decisions":[{"pair_index":0,"classification":"refines"}]}'
             )
         if schema is RerankResponse:
             return CompletionResponse('{"ranking":[2,0,1]}')
@@ -1134,7 +1111,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     )
 
     assert (await client.admit_candidates("prompt", max_tokens=512)).decisions[0].verdict == "ADMITTED"
-    assert (await client.classify_memory_relations("prompt")).decisions[0].direction == "challenger_to_candidate"
+    assert (await client.classify_memory_relations("prompt")).decisions[0].classification == "refines"
     assert (await client.validate_entity_batch("prompt")).decisions[0].matched_id == 7
     assert (await client.rerank_memories("prompt")).ranking == [2, 0, 1]
 
@@ -1146,38 +1123,14 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     ]
 
 
-def test_memory_relation_row_rule_requires_scope_proof_for_contradiction() -> None:
-    rejected = MemoryRelationResponse.model_validate(
-        {
-            "decisions": [
-                {
-                    "pair_index": 0,
-                    "classification": "contradicts",
-                    "direction": "symmetric",
-                    "same_subject_and_scope": False,
-                    "incompatible_assertions": "enabled versus disabled",
-                    "reason": "Different deployment environments.",
-                }
-            ]
-        }
+def test_memory_relation_decision_holds_only_the_label() -> None:
+    response = MemoryRelationResponse.model_validate(
+        {"decisions": [{"pair_index": 0, "classification": "contradicts"}]}
     )
-    assert "same subject and scope" in rejected.decisions[0].row_error()
-
-    accepted = MemoryRelationResponse.model_validate(
-        {
-            "decisions": [
-                {
-                    "pair_index": 0,
-                    "classification": "contradicts",
-                    "direction": "symmetric",
-                    "same_subject_and_scope": True,
-                    "incompatible_assertions": "CI is enabled; CI is disabled",
-                    "reason": "The same repository and environment assert opposite states.",
-                }
-            ]
-        }
-    )
-    assert accepted.decisions[0].classification == "contradicts"
+    assert response.decisions[0].classification == "contradicts"
+    assert set(MemoryRelationResponse.model_json_schema()["$defs"]["MemoryRelationDecision"]["properties"]) == {
+        "pair_index", "classification",
+    }
 
 
 def test_batch_decisions_name_the_item_they_judge() -> None:
@@ -1226,7 +1179,7 @@ async def test_litellm_structured_client_falls_back_once_to_json_text(monkeypatc
             raise first_error
         return CompletionResponse(
             '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact",'
-            '"confidence":0.9,"primary_ref":"P1"}]}'
+            '"primary_ref":"P1"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -1354,13 +1307,13 @@ async def test_litellm_structured_client_repairs_invalid_json_fallback_with_vali
         if len(calls) < 3:
             return CompletionResponse(
                 '{"memories":[{"content":"A durable constraint.",'
-                '"memory_type":"unsupported","confidence":0.9,'
+                '"memory_type":"unsupported",'
                 '"entity_refs":[],"valid_from":null,"valid_until":null,'
                 '"primary_ref":"p000001","required_refs":[]}]}'
             )
         return CompletionResponse(
             '{"memories":[{"content":"A durable constraint.",'
-            '"memory_type":"convention","confidence":0.9,'
+            '"memory_type":"convention",'
             '"entity_refs":[],"valid_from":null,"valid_until":null,'
             '"primary_ref":"p000001","required_refs":[]}]}'
         )
@@ -1413,13 +1366,13 @@ async def test_litellm_structured_client_repairs_invalid_json_first_response(
         if len(calls) == 1:
             return CompletionResponse(
                 '{"memories":[{"content":"A durable constraint.",'
-                '"memory_type":"unsupported","confidence":0.9,'
+                '"memory_type":"unsupported",'
                 '"entity_refs":[],"valid_from":null,"valid_until":null,'
                 '"primary_ref":"p000001","required_refs":[]}]}'
             )
         return CompletionResponse(
             '{"memories":[{"content":"A durable constraint.",'
-            '"memory_type":"convention","confidence":0.9,'
+            '"memory_type":"convention",'
             '"entity_refs":[],"valid_from":null,"valid_until":null,'
             '"primary_ref":"p000001","required_refs":[]}]}'
         )
@@ -1498,7 +1451,6 @@ async def test_litellm_structured_client_bounds_schema_repair_diagnostics(
         {
             "content": f"Sensitive candidate {index}.",
             "memory_type": "secret-invalid-type",
-            "confidence": 0.9,
             "entity_refs": [],
             "valid_from": None,
             "valid_until": None,
@@ -2115,9 +2067,10 @@ async def test_cross_document_relations_reject_a_refused_empty_reply(
 @pytest.mark.parametrize(
     "decision",
     [
-        {"pair_index": 0, "label": "refines", "reason": "narrower"},
-        {"pair_index": 0, "label": "none", "reason": "", "direction": "symmetric"},
-        {"pair_index": -1, "label": "none", "reason": ""},
+        {"pair_index": 0, "label": "refines"},
+        {"pair_index": 0, "label": "none", "direction": "symmetric"},
+        {"pair_index": 0, "label": "none", "reason": "a later decision"},
+        {"pair_index": -1, "label": "none"},
     ],
 )
 def test_cross_document_relation_schema_accepts_only_the_closed_labels(decision) -> None:
@@ -2128,7 +2081,7 @@ def test_cross_document_relation_schema_accepts_only_the_closed_labels(decision)
     with pytest.raises(ValidationError):
         CrossDocumentRelationResponse.model_validate({"decisions": [decision]})
     assert CrossDocumentRelationResponse.model_validate(
-        {"decisions": [{"pair_index": 0, "label": "updates", "reason": "a later decision"}]}
+        {"decisions": [{"pair_index": 0, "label": "updates"}]}
     ).decisions[0].label == "updates"
 
 

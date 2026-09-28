@@ -42,7 +42,6 @@ class AdapterOnlyEntityDb:
             memory_type="fact",
             content="Payroll cutoff is the 25th.",
             content_hash=content_hash("Payroll cutoff is the 25th."),
-            confidence=0.9,
             status="active",
             created_at=datetime(2026, 6, 10, tzinfo=timezone.utc),
             updated_at=datetime(2026, 6, 11, tzinfo=timezone.utc),
