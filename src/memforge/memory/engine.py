@@ -42,6 +42,7 @@ from memforge.memory.coordinator_review import (
     carry_into_ledger,
     is_coordinator_review,
 )
+from memforge.llm.decision_model import decision_task_model
 from memforge.memory.entity_resolver import EntityResolver
 from memforge.memory.evidence import (
     EvidenceReference,
@@ -65,11 +66,13 @@ from memforge.memory.lifecycle_planner import (
     lifecycle_plan_id,
 )
 from memforge.memory.quality import classify_memory_candidate
+from memforge.memory.relation_classifier import PAIR_REVIEW_TASK
 from memforge.pipeline.projection_fragments import (
     SupportRevalidationLimitation,
     SupportRevalidationLimitationCode,
 )
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext, SupportAssessment
+from memforge.pipeline.revision_work import CHANGE_IMPACT_TASK
 from memforge.pipeline.support_relation_coordinator import (
     MemorySupport,
     RecheckReading,
@@ -930,6 +933,7 @@ class MemoryEngine:
             changed_hunks=changed_hunks,
             update_plan_stats=update_plan_stats,
             llm_model=self.llm_model,
+            decision_task_models=_lifecycle_decision_task_models(self.structured_llm_client, self.llm_model),
             input_policy_identity=getattr(self.structured_llm_client, "input_policy_identity", None),
         )
         _runtime_context.operation_input_hash = operation_input_hash
@@ -1805,6 +1809,15 @@ def _candidate_rejection_payload(rejection: CandidateRejection, revision: Source
     }
 
 
+def _lifecycle_decision_task_models(client: Any, llm_model: str) -> dict[str, str | None]:
+    """The model that answers each Decision task a source lifecycle operation runs."""
+
+    return {
+        task.name: decision_task_model(client, task, llm_model)
+        for task in (CHANGE_IMPACT_TASK, PAIR_REVIEW_TASK)
+    }
+
+
 def _source_lifecycle_operation_input_hash(
     *,
     projection: SourceProjection,
@@ -1816,6 +1829,7 @@ def _source_lifecycle_operation_input_hash(
     changed_hunks: str | None,
     update_plan_stats: Mapping[str, Any] | None,
     llm_model: str,
+    decision_task_models: Mapping[str, str | None],
     input_policy_identity: str | None = None,
 ) -> str:
     """Digest the exact reconciliation manifest without persisting source content."""
@@ -1858,6 +1872,7 @@ def _source_lifecycle_operation_input_hash(
         ),
         "update_plan_stats": dict(update_plan_stats or {}),
         "llm_model": llm_model,
+        "decision_task_models": dict(decision_task_models),
     }
     return hashlib.sha256(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")

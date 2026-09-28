@@ -14,6 +14,7 @@ from enum import Enum
 from typing import Any
 
 from memforge.llm.batch_runner import BatchStats, ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
+from memforge.llm.decision_model import DecisionTask, decision_task_model
 from memforge.llm.structured import MemoryRelationResponse, StructuredLlmError
 from memforge.models import Memory
 
@@ -49,6 +50,8 @@ class MemoryRelationType(str, Enum):
 # The pair review contract: its question, labels and prompt. It is part of the
 # semantic contract of every reconciliation manifest.
 MEMORY_PAIR_REVIEW_CONTRACT = "memory-pair-review-v1"
+# The same-Unit pair review: do two refinements of the same old Memory contradict.
+PAIR_REVIEW_TASK = DecisionTask("same_unit_pair_review", MEMORY_PAIR_REVIEW_CONTRACT)
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,7 +264,7 @@ class StructuredMemoryPairClassifier:
         policy: MemoryPairClassificationPolicy | None = None,
     ) -> None:
         self._client = client
-        self._model = model
+        self._model = decision_task_model(client, PAIR_REVIEW_TASK, model)
         self._policy = policy or MemoryPairClassificationPolicy()
 
     async def classify(

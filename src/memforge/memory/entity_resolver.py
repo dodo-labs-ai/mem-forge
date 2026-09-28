@@ -13,6 +13,7 @@ from time import perf_counter
 from typing import Any
 
 from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
+from memforge.llm.decision_model import DecisionTask, decision_task_model
 from memforge.llm.structured import EntityBatchValidationResponse, StructuredLlmError
 from memforge.models import Entity, EntityAlias, canonicalize_entity_name
 from memforge.storage.adapters.protocols import (
@@ -96,6 +97,10 @@ def validate_alias(alias_name: str, canonical_name: str) -> bool:
         or SequenceMatcher(None, alias, canonical).ratio() >= 0.5
     )
 
+
+# Versions the adjudication question, its options and the rule that accepts an answer.
+ENTITY_ADJUDICATION_CONTRACT = "entity-adjudication-v1"
+ENTITY_ADJUDICATION_TASK = DecisionTask("entity_adjudication", ENTITY_ADJUDICATION_CONTRACT)
 
 _ENTITY_BATCH_PROMPT = """Resolve each entity mention against only its supplied candidates.
 
@@ -248,7 +253,10 @@ class EntityResolver:
         validation_retries = 0
         learned_aliases: list[EntityAlias] = []
         if ambiguous and self.structured_llm_client is not None:
-            runner = LlmBatchRunner(self.structured_llm_client, model=self.llm_model)
+            runner = LlmBatchRunner(
+                self.structured_llm_client,
+                model=decision_task_model(self.structured_llm_client, ENTITY_ADJUDICATION_TASK, self.llm_model),
+            )
             decisions = await self._adjudicate(runner, ambiguous, texts_by_canonical)
             structured_llm_calls = runner.stats.calls
             validation_retries = runner.stats.corrections + runner.stats.reasks
