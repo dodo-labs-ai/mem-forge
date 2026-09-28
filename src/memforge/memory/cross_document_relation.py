@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Any, Protocol
 
 from memforge.llm.batch_runner import ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
+from memforge.llm.decision_model import DecisionTask, decision_task_model
 from memforge.llm.structured import CrossDocumentRelationResponse
 from memforge.memory.evidence import (
     EvidencePartKind,
@@ -50,6 +51,7 @@ class CrossDocumentRelationDecider(str, Enum):
 
 
 CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION = "cross-document-relation-v2"
+CROSS_DOCUMENT_RELATION_TASK = DecisionTask("cross_document_relation", CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION)
 
 # Requested output per request: a response envelope plus one label and one
 # sentence of reasoning per pair.
@@ -498,7 +500,7 @@ class StructuredCrossDocumentRelationClassifier:
         policy: MemoryPairClassificationPolicy | None = None,
     ) -> None:
         self._client = client
-        self._model = model
+        self._model = decision_task_model(client, CROSS_DOCUMENT_RELATION_TASK, model)
         self._policy = policy or MemoryPairClassificationPolicy()
 
     async def classify(

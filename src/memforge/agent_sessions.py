@@ -30,6 +30,7 @@ from memforge.agent_knowledge import (
 )
 from memforge.memory.project_resolver import resolve_project_key
 from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
+from memforge.llm.decision_model import DecisionTask, decision_task_model
 from memforge.llm.structured import AgentSessionAuthorityResponse
 from memforge.models import AgentHookReceipt, AgentSessionReceipt, content_hash, slugify
 from memforge.repo_identity import normalize_repo_identifier
@@ -201,6 +202,9 @@ _MAX_CANONICAL_EVENT_TEXT_CHARS = 4_000
 # Requested output: one short decision per candidate, with a floor for the envelope.
 AGENT_SESSION_AUTHORITY_DECISION_OUTPUT_TOKENS = 256
 AGENT_SESSION_AUTHORITY_MIN_OUTPUT_TOKENS = 1024
+# Versions the authority question, its closed authority kinds and the rule that accepts an answer.
+AGENT_SESSION_AUTHORITY_CONTRACT = "agent-session-authority-v1"
+AGENT_SESSION_AUTHORITY_TASK = DecisionTask("agent_session_authority", AGENT_SESSION_AUTHORITY_CONTRACT)
 
 
 def _now_iso() -> str:
@@ -439,8 +443,12 @@ async def _classify_agent_session_authority(
             error = decision.row_error()
             yield evidence_id, decision if error is None else RejectedRow(f"{evidence_id}: {error}")
 
-    # The window client is built for this route, so its configured model applies.
-    runner = LlmBatchRunner(structured_llm_client, model=None)
+    # The window client is built for this route: its configured model applies,
+    # or its decision model once this task is registered.
+    runner = LlmBatchRunner(
+        structured_llm_client,
+        model=decision_task_model(structured_llm_client, AGENT_SESSION_AUTHORITY_TASK, None),
+    )
     outcomes = await runner.run_items(ItemTask(
         item_ids=tuple(dict.fromkeys(candidate_ids)), render=render, decode=decode,
         call=structured_llm_client.classify_agent_session_evidence_authority,

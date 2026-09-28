@@ -27,9 +27,11 @@ async def build_offline_evaluation_for_run(
     """Build candidate and judge adapters from one pinned Run manifest."""
 
     llm = await get_effective_llm_config(store, config)
+    # The Run pins one model for every step it replays.
     candidate_llm = replace(
         llm,
         enrichment_model=str(run.candidate_manifest["model"]),
+        decision_model="",
     )
     structured_client = runtime_provider.build_structured_llm_client(
         candidate_llm,
