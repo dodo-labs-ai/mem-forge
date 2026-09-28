@@ -7401,7 +7401,6 @@ class _DeterministicRelationClassifier:
                 CrossDocumentRelationJudgment(
                     pair=pair,
                     label=self.label,
-                    reason="deterministic contract fixture",
                 )
                 for pair in pairs
             ),
@@ -8192,8 +8191,8 @@ async def _insert_review_relation(
     await db.db.execute(
         """INSERT INTO cross_document_relations (
                memory_low_id, memory_high_id, label, low_content_hash, high_content_hash,
-               low_evidence_time, high_evidence_time, reason, decided_by, decided_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'confirmed by a reviewer', 'review', ?)""",
+               low_evidence_time, high_evidence_time, decided_by, decided_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'review', ?)""",
         (
             low_id,
             high_id,

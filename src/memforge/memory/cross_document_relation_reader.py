@@ -201,7 +201,6 @@ async def relation_contexts(
                 label=relation.label.value,
                 role=relation_role(relation, memory_id).value,
                 counterpart=_dated(counterparts[relation.counterpart_of(memory_id)], relation),
-                reason=relation.reason,
                 decided_by=relation.decided_by.value,
             )
             for relation in graph.relations_of(memory_id)
@@ -295,7 +294,6 @@ class RelationPairView:
 
     label: str
     newer_memory_id: str | None
-    reason: str
     decided_by: str
     decided_at: str
     memories: tuple[RelatedMemory, RelatedMemory]
@@ -325,7 +323,6 @@ async def list_relation_pairs(
         RelationPairView(
             label=relation.label.value,
             newer_memory_id=relation.newer_memory_id,
-            reason=relation.reason,
             decided_by=relation.decided_by.value,
             decided_at=relation.decided_at,
             memories=(
