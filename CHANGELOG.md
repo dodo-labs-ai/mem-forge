@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Cross-document relation classifier `cross-document-relation-v4`: every
+  request states one challenger once as the subject and asks one question per
+  candidate, with sharper relation rules (ADR 0043 amendment of 2026-09-29).
+  Evaluation cases pinned under `v2` and `v3` are still replayed. Search returns
+  both Memories of an `equivalent` pair, each naming the other, instead of
+  leaving one out. A completed discovery run replaces every relation the
+  classifier recorded for its work, so a re-run keeps no relation for a pair it
+  no longer judges; relations a person confirmed and dismissals stay. To apply
+  `v4` to existing Memories, re-run completed work with
+  `POST /api/v1/relation-discovery/work/rerun` and `{"state": "completed"}`.
 - A Memory has no confidence. The Memory API, Review summaries, search
   results, the MCP `create_memory`, `search` and `get_memory` tools, the CLI
   `memories list` table, hook context text and the Admin UI no longer return or
