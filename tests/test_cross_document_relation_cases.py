@@ -275,7 +275,14 @@ class _LabelClient:
 
     async def classify_cross_document_relations(self, prompt, *, max_tokens, model=None):
         label = "contradicts" if "weekly" in prompt else "none"
-        return CrossDocumentRelationResponse(decisions=[{"pair_index": 0, "label": label, "reason": "fixture"}])
+        return CrossDocumentRelationResponse(decisions=[{"pair_index": 0, "label": label}])
+
+
+class _UpdatesClient(_LabelClient):
+    """Labels every pair updates."""
+
+    async def classify_cross_document_relations(self, prompt, *, max_tokens, model=None):
+        return CrossDocumentRelationResponse(decisions=[{"pair_index": 0, "label": "updates"}])
 
 
 @pytest.mark.asyncio
@@ -409,8 +416,54 @@ async def test_a_case_pinned_for_another_classifier_is_neither_curated_nor_repla
 
 
 @pytest.mark.asyncio
+async def test_a_case_pinned_for_a_classifier_with_the_same_input_is_replayed(db: Database) -> None:
+    run_id = await _executed_relation_run(db)
+    [output, *_rest] = await OfflineAgentEvaluation(db, executors={}).read_case_outputs(
+        run_id, requesting_user_id=ACTOR
+    )
+    pinned = {**output.case.manifest, "classifier_version": "cross-document-relation-v2"}
+
+    replayed = await CrossDocumentRelationReplayExecutor(_LabelClient()).execute(
+        replace(output.case, manifest=pinned),
+        {"model": FIXTURE_MODEL},
+    )
+
+    assert replayed["classifier_version"] == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("challenger_time", "candidate_time", "recorded"),
+    [
+        ("2026-03-25", "2026-03-01", "updates"),
+        ("2026-03-25", "2026-03-25", "contradicts"),
+        ("2026-03-25", None, "contradicts"),
+    ],
+)
+async def test_replay_scores_the_label_discovery_records(
+    db: Database, challenger_time: str, candidate_time: str | None, recorded: str
+) -> None:
+    run_id = await _executed_relation_run(db)
+    [output, *_rest] = await OfflineAgentEvaluation(db, executors={}).read_case_outputs(
+        run_id, requesting_user_id=ACTOR
+    )
+    manifest = {
+        **output.case.manifest,
+        "challenger": {**output.case.manifest["challenger"], "evidence_time": challenger_time},
+        "candidate": {**output.case.manifest["candidate"], "evidence_time": candidate_time},
+    }
+
+    replayed = await CrossDocumentRelationReplayExecutor(_UpdatesClient()).execute(
+        replace(output.case, manifest=manifest),
+        {"model": FIXTURE_MODEL},
+    )
+
+    assert (replayed["label"], replayed["classifier_label"]) == (recorded, "updates")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("operator", "status"), [(False, 403), (True, 200)])
-async def test_case_outputs_route_returns_pinned_input_label_and_reason(
+async def test_case_outputs_route_returns_pinned_input_and_labels(
     db: Database, tmp_path, operator: bool, status: int
 ) -> None:
     from memforge.server.admin_api import create_admin_app
@@ -445,6 +498,6 @@ async def test_case_outputs_route_returns_pinned_input_label_and_reason(
         "case_kind": AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION.value,
         "classifier_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
         "label": "contradicts",
-        "reason": "fixture",
+        "classifier_label": "contradicts",
     }
     assert {check["reason_code"] for check in confirmed["checks"]} >= {"contradicts:contradicts"}

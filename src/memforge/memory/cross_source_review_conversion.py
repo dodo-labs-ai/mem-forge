@@ -106,7 +106,6 @@ class ConvertedReviewDecision:
     high_content_hash: str
     low_evidence_time: str | None
     high_evidence_time: str | None
-    reason: str
     reviewer: str | None
     resolved_at: str | None
     note: str | None
@@ -365,7 +364,6 @@ def _converted_decision(
         high_content_hash=by_id[high_id].content_hash,
         low_evidence_time=low_time,
         high_evidence_time=high_time,
-        reason=review.reason or "",
         reviewer=review.reviewer,
         resolved_at=review.resolved_at.isoformat() if review.resolved_at else None,
         note=review.review_note,
