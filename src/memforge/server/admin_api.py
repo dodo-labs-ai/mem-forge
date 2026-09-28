@@ -4719,7 +4719,7 @@ def create_admin_app(
             visibility=mem.visibility,
             owner_user_id=mem.owner_user_id,
             project_key=mem.project_key,
-                corroboration_count=mem.corroboration_count,
+            corroboration_count=mem.corroboration_count,
             valid_from=_dt_iso(mem.valid_from),
             valid_until=_dt_iso(mem.valid_until),
             superseded_by=mem.superseded_by,
@@ -4756,7 +4756,7 @@ def create_admin_app(
         if not memory:
             raise HTTPException(status_code=404, detail="Memory not found")
 
-        if req.content is not None:
+        if req.content:
             memory_store = await _build_memory_store(db, config, runtime_provider)
             try:
                 await memory_store.update_memory(
