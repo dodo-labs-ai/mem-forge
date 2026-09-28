@@ -123,6 +123,8 @@ class EffectiveLlmConfig:
     context_window_tokens: int | None = None
     max_output_tokens: int | None = None
     input_budget_fraction: float = 0.8
+    # Environment-only: no stored LLM configuration row names a decision model.
+    decision_model: str = ""
 
 
 @dataclass
@@ -261,6 +263,7 @@ class DefaultRuntimeProvider:
         return LiteLlmStructuredClient(
             StructuredLlmConfig(
                 model=llm.enrichment_model,
+                decision_model=llm.decision_model or None,
                 base_url=llm.enrichment_base_url or None,
                 api_key=llm.enrichment_api_key or None,
                 timeout_s=llm.request_timeout_s,
@@ -380,6 +383,7 @@ async def get_effective_llm_config(db: "Database", config: AppConfig) -> Effecti
         context_window_tokens=config.llm.context_window_tokens,
         max_output_tokens=config.llm.max_output_tokens,
         input_budget_fraction=config.llm.input_budget_fraction,
+        decision_model=config.llm.decision_model,
         embedding_model=value("embedding_model", config.llm.embedding_model),
         embedding_base_url=value("embedding_base_url", config.llm.embedding_base_url),
         embedding_api_key=value("embedding_api_key", config.llm.embedding_api_key),
