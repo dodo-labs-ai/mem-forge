@@ -455,7 +455,6 @@ def _row_to_current_cross_document_relation(row: Any) -> CurrentCrossDocumentRel
         high_content_hash=str(row["high_content_hash"]),
         low_evidence_time=row["low_evidence_time"],
         high_evidence_time=row["high_evidence_time"],
-        reason=str(row["reason"] or ""),
         decided_by=CrossDocumentRelationDecider(row["decided_by"]),
         decided_at=str(row["decided_at"]),
     )
@@ -872,7 +871,6 @@ CREATE TABLE IF NOT EXISTS cross_document_relations (
     high_content_hash   TEXT NOT NULL,
     low_evidence_time   TEXT,
     high_evidence_time  TEXT,
-    reason              TEXT NOT NULL DEFAULT '',
     classifier_version  TEXT,
     relation_run_id     TEXT,
     discovery_work_id   TEXT,
@@ -4508,6 +4506,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
     ),
     (
         106,
+        "Record cross-document relations by label only",
+        # The relation classifier returns only a label (ADR 0043). The column is
+        # dropped where a database created before this version still has it.
+        [],
+    ),
+    (
+        107,
         "Remove Memory and agent claim confidence",
         # No lifecycle, ranking, filtering or hook decision reads a confidence
         # (ADR 0043). The columns are dropped where a database created before
@@ -4786,10 +4791,12 @@ class Database:
                 await self._drop_columns_if_present_unlocked("memories", "curation_cluster_id", "memory_level")
             if version == 96:
                 await self._drop_columns_if_present_unlocked("memories", "contradiction_count")
+            if version == 106:
+                await self._drop_columns_if_present_unlocked("cross_document_relations", "reason")
             if version == 105:
                 superseded = await self._remove_source_activity_epoch_unlocked()
                 logger.info("Superseded %d unapplied derivations staged with a Source activity epoch", superseded)
-            if version == 106:
+            if version == 107:
                 await self._drop_columns_if_present_unlocked("memories", "confidence")
                 await self._drop_columns_if_present_unlocked("agent_claims", "confidence")
             if version == 26:
@@ -10795,16 +10802,15 @@ class Database:
                 """INSERT INTO cross_document_relations (
                        memory_low_id, memory_high_id, label, low_content_hash, high_content_hash,
                        low_evidence_time, high_evidence_time,
-                       reason, classifier_version, relation_run_id, discovery_work_id,
+                       classifier_version, relation_run_id, discovery_work_id,
                        decided_by, decided_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(memory_low_id, memory_high_id) DO UPDATE SET
                        label = excluded.label,
                        low_content_hash = excluded.low_content_hash,
                        high_content_hash = excluded.high_content_hash,
                        low_evidence_time = excluded.low_evidence_time,
                        high_evidence_time = excluded.high_evidence_time,
-                       reason = excluded.reason,
                        classifier_version = excluded.classifier_version,
                        relation_run_id = excluded.relation_run_id,
                        discovery_work_id = excluded.discovery_work_id,
@@ -10823,7 +10829,6 @@ class Database:
                     record.high_content_hash,
                     record.low_evidence_time,
                     record.high_evidence_time,
-                    record.reason,
                     record.classifier_version,
                     record.relation_run_id,
                     record.discovery_work_id,
@@ -11039,15 +11044,14 @@ class Database:
                     await self.db.execute(
                         """INSERT INTO cross_document_relations (
                                memory_low_id, memory_high_id, label, low_content_hash, high_content_hash,
-                               low_evidence_time, high_evidence_time, reason, decided_by, decided_at
-                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               low_evidence_time, high_evidence_time, decided_by, decided_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                            ON CONFLICT(memory_low_id, memory_high_id) DO UPDATE SET
                                label = excluded.label,
                                low_content_hash = excluded.low_content_hash,
                                high_content_hash = excluded.high_content_hash,
                                low_evidence_time = excluded.low_evidence_time,
                                high_evidence_time = excluded.high_evidence_time,
-                               reason = excluded.reason,
                                classifier_version = NULL,
                                relation_run_id = NULL,
                                discovery_work_id = NULL,
@@ -11061,7 +11065,6 @@ class Database:
                             decision.high_content_hash,
                             decision.low_evidence_time,
                             decision.high_evidence_time,
-                            decision.reason,
                             CrossDocumentRelationDecider.REVIEW.value,
                             decision.resolved_at or applied_at,
                         ),

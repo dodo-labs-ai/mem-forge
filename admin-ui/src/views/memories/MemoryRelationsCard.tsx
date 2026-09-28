@@ -99,7 +99,6 @@ export function MemoryRelationsCard({ memory }: { memory: Memory }) {
               </Button>
             </div>
             <CounterpartLine memory={relation.counterpart} />
-            {relation.reason && <p className="mt-2 text-xs text-muted-foreground">{relation.reason}</p>}
           </div>
         ))}
         {dismissed.map((dismissal) => (

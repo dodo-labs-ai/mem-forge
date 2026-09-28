@@ -378,10 +378,6 @@ class MemoryRelationResponse(StructuredResponseModel):
     decisions: list[MemoryRelationDecision]
 
 
-# One sentence of reasoning per pair keeps the output small and auditable.
-CROSS_DOCUMENT_RELATION_REASON_MAX_CHARS = 500
-
-
 class CrossDocumentRelationDecision(StructuredResponseModel):
     """One closed relation label for one application-issued pair slot."""
 
@@ -389,7 +385,6 @@ class CrossDocumentRelationDecision(StructuredResponseModel):
 
     pair_index: int = Field(ge=0)
     label: Literal["none", "equivalent", "updates", "contradicts"]
-    reason: str = Field(max_length=CROSS_DOCUMENT_RELATION_REASON_MAX_CHARS)
 
 
 class CrossDocumentRelationResponse(StructuredResponseModel):

@@ -66,7 +66,6 @@ export interface MemoryRelation {
   label: RelationLabel;
   role: "newer" | "older" | "peer";
   counterpart: RelatedMemory;
-  reason: string;
   decided_by: "classifier" | "review";
 }
 
@@ -82,7 +81,6 @@ export interface DismissedRelation {
 export interface RelationPair {
   label: RelationLabel;
   newer_memory_id: string | null;
-  reason: string;
   decided_by: "classifier" | "review";
   decided_at: string;
   memories: RelatedMemory[];

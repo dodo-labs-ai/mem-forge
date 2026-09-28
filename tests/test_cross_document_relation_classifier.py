@@ -5,13 +5,16 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 import pytest
+from pydantic import ValidationError
 
 from memforge.llm.structured import (
     INPUT_CAPACITY_EXCEEDED,
+    CrossDocumentRelationDecision,
     CrossDocumentRelationResponse,
     StructuredLlmError,
 )
 from memforge.memory.cross_document_relation import (
+    CROSS_DOCUMENT_RELATION_PROMPT,
     CROSS_DOCUMENT_RELATION_RULES,
     CrossDocumentRelationJudgment,
     CrossDocumentRelationLabel,
@@ -91,7 +94,7 @@ class _Client:
             return self.respond(prompt)
         return CrossDocumentRelationResponse(
             decisions=[
-                {"pair_index": index, "label": self.label, "reason": "fixture"}
+                {"pair_index": index, "label": self.label}
                 for index in _pair_indexes(prompt)
             ]
         )
@@ -109,17 +112,17 @@ async def test_classifier_returns_one_judgment_per_pair_by_pair_index() -> None:
         labels = ["contradicts", "none", "updates"]
         return CrossDocumentRelationResponse(
             decisions=[
-                {"pair_index": index, "label": labels[index], "reason": f"reason {index}"}
+                {"pair_index": index, "label": labels[index]}
                 for index in reversed(_pair_indexes(prompt))
             ]
         )
 
     result = await _classifier(_Client(respond=respond)).classify(pairs)
 
-    assert [(judgment.pair.key, judgment.label, judgment.reason) for judgment in result.judgments] == [
-        (pairs[0].key, CrossDocumentRelationLabel.CONTRADICTS, "reason 0"),
-        (pairs[1].key, CrossDocumentRelationLabel.NONE, "reason 1"),
-        (pairs[2].key, CrossDocumentRelationLabel.UPDATES, "reason 2"),
+    assert [(judgment.pair.key, judgment.label) for judgment in result.judgments] == [
+        (pairs[0].key, CrossDocumentRelationLabel.CONTRADICTS),
+        (pairs[1].key, CrossDocumentRelationLabel.NONE),
+        (pairs[2].key, CrossDocumentRelationLabel.UPDATES),
     ]
     assert result.llm_calls == 1
 
@@ -128,10 +131,10 @@ async def test_classifier_returns_one_judgment_per_pair_by_pair_index() -> None:
 @pytest.mark.parametrize(
     "decisions",
     [
-        [{"pair_index": 0, "label": "none", "reason": ""}],
+        [{"pair_index": 0, "label": "none"}],
         [
-            {"pair_index": 0, "label": "none", "reason": ""},
-            {"pair_index": 0, "label": "none", "reason": ""},
+            {"pair_index": 0, "label": "none"},
+            {"pair_index": 0, "label": "none"},
         ],
     ],
     ids=["missing_pair", "duplicate_hides_missing"],
@@ -174,7 +177,7 @@ async def test_classifier_halves_a_request_that_exceeds_the_route_capacity() -> 
         if len(indexes) > 2:
             raise StructuredLlmError("context window", terminal_category="provider_error", error_code=INPUT_CAPACITY_EXCEEDED)
         return CrossDocumentRelationResponse(
-            decisions=[{"pair_index": index, "label": "none", "reason": ""} for index in indexes]
+            decisions=[{"pair_index": index, "label": "none"} for index in indexes]
         )
 
     result = await _classifier(_Client(respond=respond)).classify(_pairs(4))
@@ -248,6 +251,14 @@ def test_rules_define_the_same_situation_domain_neutrally_and_prefer_none() -> N
         "neither replaces the other over time",
     ):
         assert condition in rules
+    for clarification in (
+        "decide whether the statements are about the same situation before deciding whether both can hold",
+        "when the statements overlap only in part, compare only the part they share",
+        "compare only what the statements state: a conflict that has to be inferred from either statement "
+        "is not a relation",
+        "read the kind from what each statement says, not from its memory type",
+    ):
+        assert clarification in rules
     assert "when you are not certain, the label is none" in rules
     assert "both can hold without stating the same knowledge" in rules
     assert "more specific than the other" in rules
@@ -256,13 +267,47 @@ def test_rules_define_the_same_situation_domain_neutrally_and_prefer_none() -> N
         assert dimension not in rules
 
 
+def test_a_decision_is_the_pair_index_and_its_label_only() -> None:
+    assert set(CrossDocumentRelationDecision.model_fields) == {"pair_index", "label"}
+    with pytest.raises(ValidationError):
+        CrossDocumentRelationDecision.model_validate({"pair_index": 0, "label": "none", "reason": "text"})
+    assert "reason" not in CROSS_DOCUMENT_RELATION_PROMPT.lower()
+
+
+@pytest.mark.parametrize(
+    ("challenger_time", "candidate_time", "label", "recorded"),
+    [
+        ("2026-04-10", "2026-04-01", CrossDocumentRelationLabel.UPDATES, CrossDocumentRelationLabel.UPDATES),
+        ("2026-04-10", "2026-04-10", CrossDocumentRelationLabel.UPDATES, CrossDocumentRelationLabel.CONTRADICTS),
+        (None, "2026-04-01", CrossDocumentRelationLabel.UPDATES, CrossDocumentRelationLabel.CONTRADICTS),
+        (None, None, CrossDocumentRelationLabel.EQUIVALENT, CrossDocumentRelationLabel.EQUIVALENT),
+        (None, None, CrossDocumentRelationLabel.NONE, CrossDocumentRelationLabel.NONE),
+    ],
+)
+def test_a_judgment_is_recorded_with_the_label_its_evidence_times_allow(
+    challenger_time, candidate_time, label, recorded
+) -> None:
+    pair = CrossDocumentRelationPair(
+        challenger=replace(_subject("mem-z", "Payroll runs weekly."), evidence_time=challenger_time),
+        candidate=replace(_subject("mem-a", "Payroll runs monthly."), evidence_time=candidate_time),
+    )
+
+    judgment = CrossDocumentRelationJudgment(pair=pair, label=label)
+
+    assert judgment.recorded_label is recorded
+    if recorded is not CrossDocumentRelationLabel.NONE:
+        record = CrossDocumentRelationRecord.from_judgment(
+            judgment, relation_run_id="run-1", discovery_work_id="work-1"
+        )
+        assert record.label is recorded
+
+
 def test_record_orders_the_pair_and_binds_both_contents() -> None:
     challenger = _subject("mem-z", "Payroll runs weekly.")
     candidate = _subject("mem-a", "Payroll runs monthly.")
     judgment = CrossDocumentRelationJudgment(
         pair=CrossDocumentRelationPair(challenger=challenger, candidate=candidate),
         label=CrossDocumentRelationLabel.CONTRADICTS,
-        reason="different schedules",
     )
 
     record = CrossDocumentRelationRecord.from_judgment(judgment, relation_run_id="run-1", discovery_work_id="work-1")
@@ -272,7 +317,7 @@ def test_record_orders_the_pair_and_binds_both_contents() -> None:
     assert pair_key("mem-z", "mem-a") == ("mem-a", "mem-z")
     with pytest.raises(ValueError):
         CrossDocumentRelationRecord.from_judgment(
-            CrossDocumentRelationJudgment(pair=judgment.pair, label=CrossDocumentRelationLabel.NONE, reason=""),
+            CrossDocumentRelationJudgment(pair=judgment.pair, label=CrossDocumentRelationLabel.NONE),
             relation_run_id="run-1",
             discovery_work_id="work-1",
         )
@@ -285,12 +330,10 @@ def test_outcome_binds_every_judged_pair_to_the_contents_it_was_judged_on() -> N
         CrossDocumentRelationJudgment(
             pair=CrossDocumentRelationPair(challenger=challenger, candidate=judged[0]),
             label=CrossDocumentRelationLabel.CONTRADICTS,
-            reason="different schedules",
         ),
         CrossDocumentRelationJudgment(
             pair=CrossDocumentRelationPair(challenger=challenger, candidate=judged[1]),
             label=CrossDocumentRelationLabel.NONE,
-            reason="compatible",
         ),
     )
 

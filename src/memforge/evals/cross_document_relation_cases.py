@@ -3,11 +3,15 @@
 The labeled set comes from people's decisions on Cross-Source Conflict Reviews.
 A case pins both Memories as the classifier sees them, together with the
 classifier contract version whose input it holds, so the set survives the
-removal of the Reviews and any later change of either Memory, and a case is
-replayed only by the contract it was pinned for. A decision is pinned only
-while both Memories still hold the version it was made for, and only when both
-come from active workspace Sources: the set is shared workspace content, and a
-decision it cannot pin is counted by reason, never read.
+removal of the Reviews and any later change of either Memory. A case is
+replayed by any classifier contract that reads the input it pinned
+(``CROSS_DOCUMENT_RELATION_INPUT_VERSIONS``), and it expects the label the
+program records for the human decision, the same label the Review
+conversion stores (``CrossDocumentRelationJudgment.recorded_label``). A
+decision is pinned only while both Memories still hold the version it was made
+for, and only when both come from active workspace Sources: the set is shared
+workspace content, and a decision it cannot pin is counted by reason, never
+read.
 """
 
 from __future__ import annotations
@@ -26,7 +30,9 @@ from memforge.evals.offline_evaluation import (
 )
 from memforge.memory.cross_document_relation import (
     CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+    CrossDocumentRelationJudgment,
     CrossDocumentRelationLabel,
+    CrossDocumentRelationPair,
     RelationSubjectStore,
     load_relation_evidence_units,
     load_relation_subjects,
@@ -41,7 +47,7 @@ from memforge.memory.cross_source_conflict_reviews import (
 from memforge.models import Memory, MemoryReview, ReviewStatus, Visibility
 from memforge.source_access import SourceAccessPolicy, SourceAccessState
 
-RELATION_CASE_POLICY_VERSION = "cross-document-relation-cases-v2"
+RELATION_CASE_POLICY_VERSION = "cross-document-relation-cases-v3"
 RELATION_CASE_GROUP_KEY = "cross_document_relation"
 
 # A dismissed finding is a recorded false positive; a confirmed one is a
@@ -96,7 +102,9 @@ async def seed_cross_document_relation_cases(
     """Pin every decided Review whose Memories are unchanged and freeze one cohort.
 
     A confirmed Review is labeled contradicts and a dismissed one none, unless
-    ``label_overrides`` relabels it by Review id. Seeding again with the same
+    ``label_overrides`` relabels it by Review id. An ``updates`` label on a pair
+    the pinned Evidence times do not order is pinned as ``contradicts``, the
+    label the program records for it. Seeding again with the same
     input pins the same cases and returns the same cohort.
     """
 
@@ -211,6 +219,10 @@ async def _pin_case(
         if skip is not None:
             return skip
     subjects = await load_relation_subjects(store, (challenger, candidate))
+    expected_label = CrossDocumentRelationJudgment(
+        pair=CrossDocumentRelationPair(challenger=subjects[challenger.id], candidate=subjects[candidate.id]),
+        label=label,
+    ).recorded_label
     case = await evaluation.curate_case(
         case_kind=AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION,
         source_id=unit.source_id,
@@ -227,13 +239,13 @@ async def _pin_case(
     )
     ground_truth = await evaluation.accept_ground_truth(
         case_id=case.case_id,
-        rubric={"expected_label": label.value},
+        rubric={"expected_label": expected_label.value},
         accepted_by=actor,
     )
     return _PinnedCase(
         case_id=case.case_id,
         ground_truth_revision_id=ground_truth.ground_truth_revision_id,
-        label=label,
+        label=expected_label,
         population=population,
     )
 

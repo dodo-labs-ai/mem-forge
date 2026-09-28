@@ -80,7 +80,6 @@ async def _relate(
     *,
     times: Mapping[str, str] | None = None,
     decided_at: str = EARLIER,
-    reason: str = "Both statements govern the same case.",
 ) -> None:
     """Store a relation with the Evidence time of each Memory in ``times``."""
 
@@ -91,8 +90,8 @@ async def _relate(
         """INSERT INTO cross_document_relations (
                memory_low_id, memory_high_id, label, low_content_hash, high_content_hash,
                low_evidence_time, high_evidence_time,
-               reason, classifier_version, relation_run_id, discovery_work_id, decided_by, decided_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)""",
+               classifier_version, relation_run_id, discovery_work_id, decided_by, decided_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)""",
         (
             low_id,
             high_id,
@@ -101,7 +100,6 @@ async def _relate(
             by_id[high_id].content_hash,
             evidence_times.get(low_id),
             evidence_times.get(high_id),
-            reason,
             CrossDocumentRelationDecider.CLASSIFIER.value,
             decided_at,
         ),
@@ -184,6 +182,27 @@ async def test_relation_is_current_from_both_memories(db):
     assert [item.counterpart_of(first.id) for item in relations[first.id]] == [second.id]
     assert [item.counterpart_of(second.id) for item in relations[second.id]] == [first.id]
     assert relations[first.id][0].label is CONTRADICTS
+
+
+@pytest.mark.asyncio
+async def test_the_migration_drops_the_relation_reason_and_keeps_the_relations(db):
+    first, second = await _pair(db)
+    await db.db.execute("ALTER TABLE cross_document_relations ADD COLUMN reason TEXT NOT NULL DEFAULT ''")
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 106")
+    await db.db.commit()
+    await db.close()
+
+    migrated = Database(db.db_path)
+    await migrated.connect()
+    try:
+        columns = {row[1] for row in await migrated.db.execute_fetchall("PRAGMA table_info(cross_document_relations)")}
+        relations = await SqliteRelationalStore(migrated).list_cross_document_relations((first.id,), _scope())
+    finally:
+        await migrated.close()
+        await db.connect()
+
+    assert "reason" not in columns
+    assert [item.counterpart_of(first.id) for item in relations[first.id]] == [second.id]
 
 
 @pytest.mark.asyncio
@@ -412,7 +431,6 @@ def _stored(
         high_content_hash="high",
         low_evidence_time=evidence_times.get(low_id),
         high_evidence_time=evidence_times.get(high_id),
-        reason="",
         decided_by=CrossDocumentRelationDecider.CLASSIFIER,
         decided_at=EARLIER,
     )
@@ -493,7 +511,7 @@ def test_notice_names_conflicts_and_newer_memories_only():
     )
 
     def context(label: str, role: str) -> MemoryRelationContext:
-        return MemoryRelationContext(label=label, role=role, counterpart=counterpart, reason="", decided_by="classifier")
+        return MemoryRelationContext(label=label, role=role, counterpart=counterpart, decided_by="classifier")
 
     assert relation_notice([context("equivalent", "peer"), context("updates", "newer")]) is None
     assert relation_notice([context("updates", "older")]) == (
