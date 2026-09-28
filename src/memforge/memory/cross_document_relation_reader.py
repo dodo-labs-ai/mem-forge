@@ -100,23 +100,15 @@ async def load_relation_graph(
 def order_by_relations(memory_ids: Sequence[str], graph: RelationGraph) -> list[str]:
     """Apply relations to one ranked window before it is paged.
 
-    A Memory equivalent to a higher-ranked kept Memory is left out; the kept
-    one names it through its relations. Within the window, the newer Memory
-    of an ``updates`` pair is placed directly ahead of the older one.
+    Within the window, the newer Memory of an ``updates`` pair is placed
+    directly ahead of the older one. Every Memory stays in the window: an
+    ``equivalent`` pair is shown as both Memories, each naming the other
+    through its relations, because a wrong ``equivalent`` would otherwise
+    remove a different Memory from the results.
     """
 
-    kept: list[str] = []
-    kept_ids: set[str] = set()
-    for memory_id in memory_ids:
-        if any(
-            relation.label is CrossDocumentRelationLabel.EQUIVALENT
-            and relation.counterpart_of(memory_id) in kept_ids
-            for relation in graph.relations_of(memory_id)
-        ):
-            continue
-        kept.append(memory_id)
-        kept_ids.add(memory_id)
-    rank = {memory_id: index for index, memory_id in enumerate(kept)}
+    window = list(dict.fromkeys(memory_ids))
+    rank = {memory_id: index for index, memory_id in enumerate(window)}
     newer_first = {
         memory_id: sorted(
             (
@@ -128,14 +120,14 @@ def order_by_relations(memory_ids: Sequence[str], graph: RelationGraph) -> list[
             ),
             key=rank.__getitem__,
         )
-        for memory_id in kept
+        for memory_id in window
     }
     # Each relation keeps the Evidence times it was decided on, so relations
     # decided at different times can form a newer-than cycle. A Memory already
     # being placed is not waited for again, so each Memory is placed once.
     ordered: list[str] = []
     placed: set[str] = set()
-    for memory_id in kept:
+    for memory_id in window:
         if memory_id in placed:
             continue
         entered = {memory_id}
