@@ -571,6 +571,11 @@ class StructuredLlmConfig:
     context_window_tokens: int | None = None
     max_output_tokens: int | None = None
     input_budget_fraction: float = 0.8
+    # The model that answers the Decision tasks registered in
+    # ``memforge.llm.decision_model``. It shares this client's gateway,
+    # credentials and capacity caps, and has its own schema wire contract.
+    decision_model: str | None = None
+    decision_native_schema_transport: NativeSchemaTransport = "auto"
 
 
 @dataclass(frozen=True)
@@ -613,6 +618,8 @@ class StructuredLlmCallTelemetry:
     completion_tokens: int | None
     total_tokens: int | None
     diagnostic_attempts: tuple[StructuredLlmAttemptTelemetry, ...] = ()
+    # The model that answered the call.
+    model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -749,6 +756,7 @@ def structured_llm_line_scope() -> Iterator[StructuredLlmMetricsCollector]:
 @dataclass
 class _StructuredCallState:
     operation: str
+    model: str
     retry_budget: int
     attempt_count: int = 0
     retry_count: int = 0
@@ -868,6 +876,7 @@ class _StructuredCallState:
             completion_tokens=self.completion_tokens if usage_known else None,
             total_tokens=self.total_tokens if usage_known else None,
             diagnostic_attempts=tuple(self.diagnostic_attempts),
+            model=self.model,
         )
 
 
@@ -1628,6 +1637,12 @@ class LiteLlmStructuredClient:
 
         return max(1, int(self.config.max_concurrent))
 
+    @property
+    def decision_model(self) -> str | None:
+        """The model for registered Decision tasks; ``None`` runs them on the main model."""
+
+        return self.config.decision_model or None
+
     def request_budget(self, model: str | None = None):
         from memforge.llm.request_budget import RequestBudget
 
@@ -1861,6 +1876,7 @@ class LiteLlmStructuredClient:
         deadline = loop.time() + max(0.0, self.config.timeout_s)
         state = _StructuredCallState(
             operation=_schema_operation_name(response_format),
+            model=model or self.config.model,
             retry_budget=max(0, self.config.num_retries),
         )
         failure: _StructuredLlmFailure | None = None
@@ -1967,7 +1983,7 @@ class LiteLlmStructuredClient:
         state: _StructuredCallState,
         images: tuple[StructuredLlmImage, ...],
     ):
-        native_schema_transport = self.config.native_schema_transport
+        native_schema_transport = self._native_schema_transport(model_name)
         if (
             native_schema_transport == "auto"
             and not _supports_native_response_schema(model_name)
@@ -2265,6 +2281,12 @@ class LiteLlmStructuredClient:
             state.record_response(response)
             return response, attempt_index
 
+    def _native_schema_transport(self, model_name: str) -> NativeSchemaTransport:
+        decision_model = self.config.decision_model
+        if decision_model and model_name == litellm_model_name(decision_model):
+            return self.config.decision_native_schema_transport
+        return self.config.native_schema_transport
+
     def _emit_telemetry(self, telemetry: StructuredLlmCallTelemetry) -> None:
         try:
             self._emit_call_diagnostics(telemetry)
@@ -2276,6 +2298,7 @@ class LiteLlmStructuredClient:
     def _emit_call_diagnostics(self, telemetry: StructuredLlmCallTelemetry) -> None:
         from memforge.evals.agent_evaluation import QualitySignal, record_quality_signal
 
+        model = telemetry.model or self.config.model
         payload = {
             "event": "structured_llm_call",
             "operation": telemetry.operation,
@@ -2312,8 +2335,8 @@ class LiteLlmStructuredClient:
                 outcome=outcome,
                 reason_code=reason_code,
                 operation=telemetry.operation,
-                provider=_safe_llm_provider(self.config.model),
-                model=self.config.model,
+                provider=_safe_llm_provider(model),
+                model=model,
                 attempt_count=telemetry.attempt_count,
                 retry_count=telemetry.retry_count,
                 fallback_count=telemetry.fallback_count,
@@ -2340,8 +2363,8 @@ class LiteLlmStructuredClient:
                     outcome=attempt_outcome,
                     reason_code=attempt_reason,
                     operation=telemetry.operation,
-                    provider=_safe_llm_provider(self.config.model),
-                    model=self.config.model,
+                    provider=_safe_llm_provider(model),
+                    model=model,
                     attempt_index=attempt.attempt_index,
                     structured_mode=attempt.structured_mode,
                     schema_transport=attempt.schema_transport,

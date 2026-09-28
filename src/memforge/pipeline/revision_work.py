@@ -26,6 +26,7 @@ from memforge.derivation_work import DerivationWork, DerivationWorkJournal, Deri
 from memforge.llm.batch_runner import (
     ChainStep, ChainTask, ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow,
 )
+from memforge.llm.decision_model import DecisionTask, decision_task_model
 from memforge.llm.failure_trace import failure_trace_context
 from memforge.llm.structured import (
     ChangeImpactWireResponse as ImpactResponse,
@@ -124,6 +125,7 @@ Copy work IDs exactly. Give no explanation.
 # validation is versioned by ``REVISION_SUPPORT_CONTRACT``, so a change to what
 # an UNAFFECTED label means raises that contract too.
 CHANGE_IMPACT_CONTRACT = "change-impact-v2"
+CHANGE_IMPACT_TASK = DecisionTask("change_impact", CHANGE_IMPACT_CONTRACT)
 
 # The smallest output any Support Assessment or Change Impact request reserves.
 _MIN_OUTPUT_TOKENS = 1024
@@ -181,6 +183,8 @@ class RevisionWorkExecutor:
         self, *, client, model: str, store: DerivationWorkStore | None = None, derivation_id: str | None = None
     ):
         self.client, self.model = client, model
+        # Change Impact is a Decision task; Support Assessment always reads on ``model``.
+        self.impact_model = decision_task_model(client, CHANGE_IMPACT_TASK, model)
         self.store = store if derivation_id is not None else _OperationWorkStore()
         self.derivation_id = derivation_id
         self.final_work_ids = []
@@ -189,7 +193,7 @@ class RevisionWorkExecutor:
         self.change_impact_counts = {"unaffected": 0, "affected": 0, "failed": 0}
         # Separate runners keep separate request statistics for the two tasks.
         self._runner = LlmBatchRunner(client, model=model)
-        self._impact_runner = LlmBatchRunner(client, model=model)
+        self._impact_runner = LlmBatchRunner(client, model=self.impact_model)
         self._work_aliases = {}
 
     @property
@@ -306,7 +310,7 @@ class RevisionWorkExecutor:
             )
             return context.attach_images(request, bundle, fits=self._impact_runner.fits)
 
-        journal = self._journal("change_impact", CHANGE_IMPACT_CONTRACT, catalog, items)
+        journal = self._journal("change_impact", CHANGE_IMPACT_CONTRACT, catalog, items, model=self.impact_model)
         outcomes = await self._impact_runner.run_items(ItemTask(
             item_ids=list(by_id),
             context=plan.changes,
@@ -338,6 +342,12 @@ class RevisionWorkExecutor:
             )
         return {item.id for item in unaffected}
 
+    def _answering_model(self, route: SupportRoute) -> str | None:
+        """The model whose answer a revalidated Support rests on; a program rebind rests on none."""
+        if route is SupportRoute.REBIND_SUPPORT:
+            return None
+        return self.impact_model if route is SupportRoute.CHANGE_IMPACT else self.model
+
     def _revalidated(self, item, selection, route: SupportRoute) -> RawMemory:
         return _revalidated_memory(
             item.memory,
@@ -345,7 +355,7 @@ class RevisionWorkExecutor:
             {
                 "contract": REVISION_SUPPORT_CONTRACT,
                 "supported": True,
-                "model": None if route is SupportRoute.REBIND_SUPPORT else self.model,
+                "model": self._answering_model(route),
                 "route": route.value,
             },
         )
@@ -375,7 +385,9 @@ class RevisionWorkExecutor:
                 for item in items
             }
         context = plan.context
-        journal = self._journal("support_assess", SUPPORT_ASSESSMENT_CONTRACT, plan.catalog, items, scope)
+        journal = self._journal(
+            "support_assess", SUPPORT_ASSESSMENT_CONTRACT, plan.catalog, items, scope, model=self.model,
+        )
         # Each Support's most recently decoded state; a capacity diagnostic reports its carried witnesses.
         latest = {item.id: SupportReadingState() for item in items}
         outcomes = await self._runner.run_chain(self._chain_task(plan, reading, supports, journal, latest))
@@ -606,14 +618,14 @@ class RevisionWorkExecutor:
             **({"reading": reading} if reading is not None else {}),
         }
 
-    def _journal(self, kind, contract, catalog, items, reading=None) -> DerivationWorkJournal:
+    def _journal(self, kind, contract, catalog, items, reading=None, *, model: str) -> DerivationWorkJournal:
         return DerivationWorkJournal(
             store=self.store,
             derivation_id=self.derivation_id,
             kind=kind,
             scope={"contract": contract, **self._scope_identity(catalog, items, reading)},
-            budget_identity=self.client.input_policy_identity_for(self.model),
-            model=self.model,
+            budget_identity=self.client.input_policy_identity_for(model),
+            model=model,
         )
 
     async def _complete(

@@ -53,6 +53,9 @@ class StorageConfig:
 @dataclass
 class LlmConfig:
     enrichment_model: str = "claude-sonnet-4-20250514"
+    # Answers every Decision task registered in memforge.llm.decision_model;
+    # empty runs every task on ``enrichment_model``.
+    decision_model: str = ""
     enrichment_base_url: str = "https://api.anthropic.com"
     enrichment_api_key: str = ""
     enrichment_max_tokens: int = DEFAULT_ENRICHMENT_MAX_TOKENS
@@ -147,6 +150,10 @@ class AppConfig:
         self.llm.enrichment_model = env_override(
             "MEMFORGE_ENRICHMENT_MODEL",
             self.llm.enrichment_model,
+        )
+        self.llm.decision_model = env_override(
+            "MEMFORGE_DECISION_MODEL",
+            self.llm.decision_model,
         )
         self.llm.enrichment_base_url = env_override(
             "MEMFORGE_ENRICHMENT_BASE_URL",

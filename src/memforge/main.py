@@ -6390,6 +6390,7 @@ def config_show(ctx):
         "ChromaDB": config.storage.chroma_path,
         "Documents": config.storage.docs_path,
         "Enrichment model": config.llm.enrichment_model,
+        "Decision model": config.llm.decision_model or "[dim]main model[/]",
         "Enrichment API": config.llm.enrichment_base_url,
         "Enrichment key": "***" if config.llm.enrichment_api_key else "[red]NOT SET[/]",
         "Embedding model": config.llm.embedding_model,
