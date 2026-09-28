@@ -79,6 +79,10 @@ from memforge.pipeline.source_projection_adapters import project_source_item
 # writes and is recorded with every processed agent-session window.
 AGENT_SESSION_INTENT_CONTRACT = "agent_session_intent_v2"
 
+# Program-owned reasons recorded when an agent patch carries no reason of its own.
+AGENT_CLAIM_CREATED_REASON = "agent claim created"
+AGENT_CLAIM_UPDATED_REASON = "agent claim updated"
+
 PatchAction = Literal[
     "create_new_concept",
     "update_existing_claim",
@@ -547,7 +551,7 @@ class AgentKnowledgeBundleService:
             repo_identifier=repo_identifier,
             project_key=project_key,
             source_type="agent_session",
-            replacement_reason=proposal.reason or "agent claim updated",
+            replacement_reason=proposal.reason or AGENT_CLAIM_UPDATED_REASON,
             replacement_kind=_replacement_kind_for_action(proposal.action),
             submitted_at=submitted_at,
             observed_at=submitted_at,
@@ -924,8 +928,10 @@ class AgentKnowledgeBundleService:
         concept_projection: dict[str, object] | None = None,
         concept_markdown_body: str | None = None,
     ) -> str:
+        reason = proposal.reason or AGENT_CLAIM_CREATED_REASON
         intent = _agent_relation_intent(
             proposal=proposal,
+            reason=reason,
             client=client,
             session_id=session_id,
             workspace=workspace,
@@ -952,7 +958,7 @@ class AgentKnowledgeBundleService:
             concept_markdown_body=concept_markdown_body,
             incumbent_memory_id=None,
             reconcile_action=ReconcileAction.ADD,
-            reconciliation_reason=proposal.reason or "agent claim created",
+            reconciliation_reason=reason,
             primary_event_id=proposal.primary_event_id,
             required_event_ids=tuple(proposal.required_event_ids),
         )
@@ -981,7 +987,7 @@ class AgentKnowledgeBundleService:
             review_case=None,
             memory_id=memory_id,
             candidates=[],
-            reason=proposal.reason,
+            reason=reason,
             submitted_at=submitted_at,
         )
         if existing is None:
@@ -1448,6 +1454,7 @@ class AgentKnowledgeBundleService:
     ) -> str:
         intent = _agent_relation_intent(
             proposal=proposal,
+            reason=replacement_reason,
             client=client,
             session_id=session_id,
             workspace=workspace,
@@ -1983,6 +1990,7 @@ def _utc(value: datetime | None) -> datetime:
 def _agent_relation_intent(
     *,
     proposal: AgentKnowledgePatchProposal,
+    reason: str,
     client: str,
     session_id: str,
     workspace: str,
@@ -2001,7 +2009,7 @@ def _agent_relation_intent(
             "source_patch_intent": proposal.action,
             "session_id": session_id,
             "workspace": workspace,
-            "reason": proposal.reason,
+            "reason": reason,
             "citations": [citation for citation in proposal.citations if citation.strip()],
         },
     )

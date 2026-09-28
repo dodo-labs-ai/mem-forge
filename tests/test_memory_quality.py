@@ -1733,3 +1733,23 @@ async def test_admin_pending_review_status_cleans_search_indexes(
     assert stored.status == "pending_review"
     assert await _fts_has_memory(db, memory.id) is False
     assert collection.deleted == [memory.id]
+
+
+@pytest.mark.asyncio
+async def test_admin_memory_update_with_empty_content_keeps_content(
+    db: Database,
+    tmp_path: Path,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    content = "Admin updates with empty content leave the memory text unchanged."
+    memory = await _insert_memory(db, mem_id="mem-admin-empty-content", content=content)
+
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    with TestClient(app) as client:
+        response = client.put(f"/api/v1/memories/{memory.id}", json={"content": ""})
+
+    stored = await db.get_memory(memory.id)
+    assert response.status_code == 200
+    assert stored.content == content
+    assert stored.content_hash == memory.content_hash
