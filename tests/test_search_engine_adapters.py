@@ -80,7 +80,6 @@ def _memory(
         memory_type=memory_type,
         content=content,
         content_hash=content_hash(content),
-        confidence=0.9,
         created_at=now,
         updated_at=now,
         status=status,

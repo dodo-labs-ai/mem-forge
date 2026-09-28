@@ -215,14 +215,13 @@ async def _upsert_doc_with_artifacts(
     )
 
 
-def _memory(mem_id: str, content: str, *, status: str = "active", confidence: float = 0.9) -> Memory:
+def _memory(mem_id: str, content: str, *, status: str = "active") -> Memory:
     now = datetime.now(timezone.utc)
     return Memory(
         id=mem_id,
         memory_type="fact",
         content=content,
         content_hash=content_hash(content),
-        confidence=confidence,
         created_at=now,
         updated_at=now,
         status=status,
@@ -317,7 +316,6 @@ async def _seed_lifecycle_review(db: Database, *, review_id: str = "review-lifec
         "candidate": {
             "content": "The service moves to Team Pfizer.",
             "memory_type": "fact",
-            "confidence": 0.91,
         },
         "proposed_mutations": [],
     }
@@ -357,7 +355,6 @@ async def _seed_refreshable_stale_lifecycle_review(db: Database) -> str:
         "candidate": {
             "content": "The service moves to Team Pfizer.",
             "memory_type": "fact",
-            "confidence": 0.91,
         },
         "proposed_mutations": [
             {
@@ -1600,7 +1597,6 @@ class TestApprove:
         await db.update_memory_content(
             incumbent.id,
             new_content="PostgreSQL is now version 15",
-            new_confidence=None,
         )
 
         with pytest.raises(ReviewAlreadyResolved, match="already stale"):

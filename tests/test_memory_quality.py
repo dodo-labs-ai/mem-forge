@@ -80,7 +80,6 @@ def _raw(content: str, context: str) -> RawMemory:
     return RawMemory(
         content=content,
         memory_type="fact",
-        confidence=0.9,
         entity_refs=[],
         extraction_context=context,
     )
@@ -151,7 +150,6 @@ async def _insert_memory(db: Database, *, mem_id: str, content: str) -> Memory:
         memory_type="fact",
         content=content,
         content_hash=content_hash(content),
-        confidence=0.9,
         created_at=now,
         updated_at=now,
         status="active",
@@ -1364,7 +1362,6 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
                         memory_id="mem-proxy-search",
                         memory_type="fact",
                         summary="Proxy search stays service-owned.",
-                        confidence=0.9,
                         relevance_score=1.0,
                     )
                 ],
@@ -1736,3 +1733,23 @@ async def test_admin_pending_review_status_cleans_search_indexes(
     assert stored.status == "pending_review"
     assert await _fts_has_memory(db, memory.id) is False
     assert collection.deleted == [memory.id]
+
+
+@pytest.mark.asyncio
+async def test_admin_memory_update_with_empty_content_keeps_content(
+    db: Database,
+    tmp_path: Path,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    content = "Admin updates with empty content leave the memory text unchanged."
+    memory = await _insert_memory(db, mem_id="mem-admin-empty-content", content=content)
+
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    with TestClient(app) as client:
+        response = client.put(f"/api/v1/memories/{memory.id}", json={"content": ""})
+
+    stored = await db.get_memory(memory.id)
+    assert response.status_code == 200
+    assert stored.content == content
+    assert stored.content_hash == memory.content_hash

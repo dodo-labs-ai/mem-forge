@@ -675,7 +675,6 @@ def _revalidated_memory(memory: Memory, selection, support_validation: dict) -> 
     return RawMemory(
         content=memory.content,
         memory_type=memory.memory_type,
-        confidence=memory.confidence,
         valid_from=memory.valid_from.isoformat() if memory.valid_from else None,
         valid_until=memory.valid_until.isoformat() if memory.valid_until else None,
         evidence_quote=primary.excerpt,

@@ -26,7 +26,6 @@ def _make_memory(mem_id: str, content: str, *, status: str = "active", corrobora
         memory_type="fact",
         content=content,
         content_hash=content_hash(content),
-        confidence=0.9,
         corroboration_count=corroboration_count,
         created_at=now,
         updated_at=now,

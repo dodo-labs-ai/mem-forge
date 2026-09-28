@@ -22,6 +22,7 @@ from memforge.agent_session_contract import (
 )
 from memforge.config import AppConfig
 from memforge.agent_knowledge import (
+    AGENT_SESSION_INTENT_CONTRACT,
     AgentKnowledgeBundleService,
     AgentKnowledgePatchModelResponse,
     AgentKnowledgePatchProposal,
@@ -29,7 +30,7 @@ from memforge.agent_knowledge import (
     render_agent_knowledge_patch_prompt,
 )
 from memforge.memory.project_resolver import resolve_project_key
-from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
+from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
 from memforge.llm.decision_model import DecisionTask, decision_task_model
 from memforge.llm.structured import AgentSessionAuthorityResponse
 from memforge.models import AgentHookReceipt, AgentSessionReceipt, content_hash, slugify
@@ -199,11 +200,13 @@ _TOOL_RESULT_TYPES = {
     "custom_tool_call_output",
 }
 _MAX_CANONICAL_EVENT_TEXT_CHARS = 4_000
-# Requested output: one short decision per candidate, with a floor for the envelope.
-AGENT_SESSION_AUTHORITY_DECISION_OUTPUT_TOKENS = 256
-AGENT_SESSION_AUTHORITY_MIN_OUTPUT_TOKENS = 1024
-# Versions the authority question, its closed authority kinds and the rule that accepts an answer.
+# The agent-session authority Decision contract: its question, options and
+# prompt. It is recorded with every processed agent-session window.
 AGENT_SESSION_AUTHORITY_CONTRACT = "agent-session-authority-v1"
+# Requested output: one decision per candidate holds only its evidence ID and
+# authority kind with their JSON keys, with a floor for the envelope.
+AGENT_SESSION_AUTHORITY_DECISION_OUTPUT_TOKENS = 48
+AGENT_SESSION_AUTHORITY_MIN_OUTPUT_TOKENS = 1024
 AGENT_SESSION_AUTHORITY_TASK = DecisionTask("agent_session_authority", AGENT_SESSION_AUTHORITY_CONTRACT)
 
 
@@ -439,9 +442,7 @@ async def _classify_agent_session_authority(
             else AgentSessionAuthorityResponse.model_validate(generated)
         )
         for decision in response.decisions:
-            evidence_id = decision.evidence_id.strip()
-            error = decision.row_error()
-            yield evidence_id, decision if error is None else RejectedRow(f"{evidence_id}: {error}")
+            yield decision.evidence_id.strip(), decision
 
     # The window client is built for this route: its configured model applies,
     # or its decision model once this task is registered.
@@ -465,8 +466,11 @@ async def _classify_agent_session_authority(
 
 
 def _patch_proposal(generated: Any) -> AgentKnowledgePatchProposal:
+    """The service's patch command for one generated patch; the model writes no reason."""
     if isinstance(generated, AgentKnowledgePatchProposal):
         return generated
+    if isinstance(generated, AgentKnowledgePatchModelResponse):
+        generated = generated.model_dump()
     return AgentKnowledgePatchProposal.model_validate(generated)
 
 
@@ -912,6 +916,10 @@ async def _record_window_outcome(
         "window_retention": "none",
         "receipt": receipt or {},
         "user_id": owner_user_id,
+        "judgment_contracts": {
+            "authority": AGENT_SESSION_AUTHORITY_CONTRACT,
+            "patch": AGENT_SESSION_INTENT_CONTRACT,
+        },
     }
     stored_metadata.update(_receipt_metadata(metadata))
     receipt_record = AgentSessionReceipt(

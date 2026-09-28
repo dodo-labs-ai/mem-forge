@@ -14,7 +14,6 @@ export interface Memory {
   visibility: Visibility | string;
   owner_user_id: string | null;
   project_key: string | null;
-  confidence: number;
   corroboration_count: number;
   status: "active" | "superseded" | "retired" | "decayed" | "pending_review";
   retirement_reason: string | null;
@@ -67,7 +66,6 @@ export interface MemoryRelation {
   label: RelationLabel;
   role: "newer" | "older" | "peer";
   counterpart: RelatedMemory;
-  reason: string;
   decided_by: "classifier" | "review";
 }
 
@@ -83,7 +81,6 @@ export interface DismissedRelation {
 export interface RelationPair {
   label: RelationLabel;
   newer_memory_id: string | null;
-  reason: string;
   decided_by: "classifier" | "review";
   decided_at: string;
   memories: RelatedMemory[];
@@ -873,7 +870,6 @@ export interface MemoryReviewMemorySummary {
   id: string;
   memory_type: Memory["memory_type"];
   content: string;
-  confidence: number;
   corroboration_count: number;
   status: string;
   entity_refs: string[];

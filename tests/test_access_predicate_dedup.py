@@ -137,7 +137,6 @@ async def test_workspace_write_does_not_corroborate_other_users_private(store_fi
                 "project_key": SHARED_PROJECT_KEY,
                 "visibility": PRIVATE,
                 "owner_user_id": "u-2",
-                "confidence": u2_priv.confidence,
                 "status": "active",
                 "content_hash": u2_priv.content_hash,
                 "embedding_text_hash": "h",

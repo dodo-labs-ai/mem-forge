@@ -799,7 +799,6 @@ class MemoryRelationDetail(BaseModel):
     label: RelationLabelLiteral
     role: Literal["newer", "older", "peer"]
     counterpart: RelatedMemoryDetail
-    reason: str
     decided_by: Literal["classifier", "review"]
 
 
@@ -816,7 +815,6 @@ class DismissedRelationDetail(BaseModel):
 class RelationPairDetail(BaseModel):
     label: RelationLabelLiteral
     newer_memory_id: str | None = None
-    reason: str
     decided_by: Literal["classifier", "review"]
     decided_at: str
     memories: list[RelatedMemoryDetail]
@@ -951,7 +949,6 @@ class MemoryResponse(BaseModel):
     visibility: str
     owner_user_id: str | None = None
     project_key: str | None = None
-    confidence: float
     corroboration_count: int
     valid_from: str | None = None
     valid_until: str | None = None
@@ -996,7 +993,6 @@ class MemoryStatsResponse(BaseModel):
 
 class MemoryUpdateRequest(BaseModel):
     content: str | None = None
-    confidence: float | None = None
     status: str | None = None  # active, superseded, retired, decayed, pending_review
 
 
@@ -1061,10 +1057,18 @@ class MemoryCreateRequest(BaseModel):
     content: str = Field(min_length=1)
     provenance: str = Field(min_length=1)
     memory_type: Literal["fact", "decision", "convention", "procedure"] = "fact"
-    confidence: float = 0.95
     client: Literal["codex", "claude-code"] = "codex"
     repo_identifier: str | None = None
     idempotency_key: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_client_confidence(cls, value: object) -> object:
+        """A Memory has no confidence; a ``confidence`` sent by released plugins is ignored."""
+
+        if isinstance(value, Mapping) and "confidence" in value:
+            return {key: item for key, item in value.items() if key != "confidence"}
+        return value
 
 
 class MemoryCreateResponse(BaseModel):
@@ -1900,7 +1904,6 @@ class MemoryReviewMemorySummary(BaseModel):
     id: str
     memory_type: str
     content: str
-    confidence: float
     corroboration_count: int
     status: str
     entity_refs: list[str] = []
@@ -3141,7 +3144,6 @@ def _memory_to_response(
         visibility=mem.visibility,
         owner_user_id=mem.owner_user_id,
         project_key=mem.project_key,
-        confidence=mem.confidence,
         corroboration_count=mem.corroboration_count,
         valid_from=_dt_iso(mem.valid_from),
         valid_until=_dt_iso(mem.valid_until),
@@ -3288,7 +3290,6 @@ async def _build_memory_summary(
         id=memory.id,
         memory_type=memory.memory_type,
         content=memory.content,
-        confidence=memory.confidence,
         corroboration_count=memory.corroboration_count,
         status=memory.status,
         entity_refs=entity_names,
@@ -3309,7 +3310,6 @@ def _build_memory_review_list_summary(
         id=memory.id,
         memory_type=memory.memory_type,
         content=memory.content,
-        confidence=memory.confidence,
         corroboration_count=memory.corroboration_count,
         status=memory.status,
         created_at=_dt_iso(memory.created_at),
@@ -3395,7 +3395,6 @@ async def _lifecycle_review_response(
             id=candidate_id or f"candidate:{review.id}",
             memory_type=str(candidate_payload.get("memory_type") or "fact"),
             content=str(candidate_payload["content"]),
-            confidence=float(candidate_payload.get("confidence") or 0.0),
             corroboration_count=0,
             status="proposed",
             origin_source_type=str(source.get("type") or "") or None,
@@ -4718,7 +4717,6 @@ def create_admin_app(
             visibility=mem.visibility,
             owner_user_id=mem.owner_user_id,
             project_key=mem.project_key,
-            confidence=mem.confidence,
             corroboration_count=mem.corroboration_count,
             valid_from=_dt_iso(mem.valid_from),
             valid_until=_dt_iso(mem.valid_until),
@@ -4751,18 +4749,17 @@ def create_admin_app(
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        """Update a memory's content, confidence, or status (admin override)."""
+        """Update a memory's content or status (admin override)."""
         memory = await db.get_memory(memory_id)
         if not memory:
             raise HTTPException(status_code=404, detail="Memory not found")
 
-        if req.content is not None or req.confidence is not None:
+        if req.content:
             memory_store = await _build_memory_store(db, config, runtime_provider)
             try:
                 await memory_store.update_memory(
                     memory_id,
-                    new_content=req.content or memory.content,
-                    new_confidence=req.confidence,
+                    new_content=req.content,
                 )
             except ValueError as exc:
                 if "active source support" in str(exc):
@@ -4829,7 +4826,6 @@ def create_admin_app(
                 content=req.content,
                 provenance=req.provenance,
                 memory_type=req.memory_type,
-                confidence=req.confidence,
                 owner_user_id=resolve_request_principal(request),
                 client=req.client,
                 repo_identifier=req.repo_identifier,
@@ -6770,7 +6766,6 @@ def create_admin_app(
                                 "id": d["id"],
                                 "memory_type": d["memory_type"],
                                 "content": d["content"],
-                                "confidence": d["confidence"],
                                 "status": d["status"],
                                 "corroboration_count": d["corroboration_count"],
                                 "updated_at": d.get("updated_at"),

@@ -588,7 +588,6 @@ TOOLS: list[dict[str, Any]] = [
                     "enum": ["fact", "decision", "convention", "procedure"],
                     "default": "fact",
                 },
-                "confidence": {"type": "number"},
                 "repository_context": REPOSITORY_CONTEXT_SCHEMA,
                 "idempotency_key": {
                     "type": "string",
@@ -1101,11 +1100,6 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
                 "memory_type": memory_type,
                 "client": _mcp_client(),
             }
-            if "confidence" in args:
-                confidence = args.get("confidence")
-                if not isinstance(confidence, (int, float)):
-                    raise ValueError("confidence must be a number")
-                body["confidence"] = float(confidence)
             if call_context.repo_identifier:
                 body["repo_identifier"] = call_context.repo_identifier
             idempotency_key = str(args.get("idempotency_key") or "").strip()
@@ -1819,7 +1813,6 @@ def _compact_search_result(result: dict[str, Any]) -> dict[str, Any]:
         "memory_id",
         "memory_type",
         "summary",
-        "confidence",
         "relevance_score",
         "freshness",
         "status",
@@ -1842,7 +1835,6 @@ def _compact_memory_response(payload: dict[str, Any]) -> dict[str, Any]:
         "memory_type",
         "content",
         "content_hash",
-        "confidence",
         "status",
         "entity_refs",
         "relation_notice",

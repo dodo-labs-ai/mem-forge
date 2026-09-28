@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A Memory has no confidence. The Memory API, Review summaries, search
+  results, the MCP `create_memory`, `search` and `get_memory` tools, the CLI
+  `memories list` table, hook context text and the Admin UI no longer return or
+  show `confidence`, and `PUT /memories/{id}` no longer accepts it. A
+  `confidence` sent to `create_memory` by an older plugin is ignored. SQLite
+  migration 106 drops `memories.confidence` and `agent_claims.confidence`.
 - Every Observation Revision records the source's own time for its content: a
   Confluence page version, a GitHub file's latest commit, a GitHub Pages commit,
   sitemap `lastmod` or `Last-Modified`, the latest change to a Jira issue's core
