@@ -861,7 +861,9 @@ def _enabled_source_visibility_condition(
 # Cross-document relations between two Memories, bound to both contents, and
 # the dismissals people record for them. A pair is stored lower Memory id first.
 # Each side keeps the Evidence time (a UTC date) the relation was decided on;
-# an updates pair is stored only when those dates order it.
+# an updates pair is stored only when those dates order it. A classifier
+# relation names the discovery work that recorded it, and that work's next
+# completed run replaces it.
 _CROSS_DOCUMENT_RELATION_DDL = """
 CREATE TABLE IF NOT EXISTS cross_document_relations (
     memory_low_id       TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -886,6 +888,8 @@ CREATE TABLE IF NOT EXISTS cross_document_relations (
 );
 CREATE INDEX IF NOT EXISTS idx_cross_document_relations_high
     ON cross_document_relations(memory_high_id);
+CREATE INDEX IF NOT EXISTS idx_cross_document_relations_work
+    ON cross_document_relations(discovery_work_id);
 
 CREATE TABLE IF NOT EXISTS cross_document_relation_dismissals (
     id                  TEXT PRIMARY KEY,
@@ -10742,7 +10746,7 @@ class Database:
                 bundle = _with_relation_snapshot_audit(relation_run)
                 if not await self._relation_run_recorded_unlocked(bundle):
                     await self._insert_relation_run_unlocked(bundle)
-                    await self._record_cross_document_relations_unlocked(document_relations)
+                    await self._record_cross_document_relations_unlocked(work_id, document_relations)
                 completed_at = _now_iso()
                 cursor = await self.db.execute(
                     """UPDATE relation_discovery_work
@@ -10769,15 +10773,28 @@ class Database:
                 await self.db.rollback()
                 raise
 
-    async def _record_cross_document_relations_unlocked(self, outcome: CrossDocumentRelationOutcome) -> None:
-        """Apply one discovery run's labels to the pairs it judged.
+    async def _delete_work_classifier_relations_unlocked(self, work_id: str) -> None:
+        await self.db.execute(
+            "DELETE FROM cross_document_relations WHERE discovery_work_id = ? AND decided_by = ?",
+            (work_id, CrossDocumentRelationDecider.CLASSIFIER.value),
+        )
 
-        The completion guard has checked that both contents of every judged
-        pair are current. The run's label replaces the stored relation, and a
-        pair judged none loses it, unless a person confirmed the stored relation
-        for these same contents.
+    async def _record_cross_document_relations_unlocked(
+        self,
+        work_id: str,
+        outcome: CrossDocumentRelationOutcome,
+    ) -> None:
+        """Make one discovery run the record of what its work decided.
+
+        The run replaces every relation the classifier recorded for this work,
+        so a pair the work no longer judges keeps no relation from it. The
+        completion guard has checked that both contents of every judged pair
+        are current. The run's label replaces the stored relation, whichever
+        work recorded it, and a pair judged none loses it, unless a person
+        confirmed the stored relation for these same contents.
         """
 
+        await self._delete_work_classifier_relations_unlocked(work_id)
         found = {(record.memory_low_id, record.memory_high_id): record for record in outcome.relations}
         decided_at = _now_iso()
         for memory_id, judged_content_hash in outcome.judged_content_hashes.items():
@@ -11237,7 +11254,9 @@ class Database:
     ) -> None:
         """Fence and finish leased work; each failure replaces the recorded error.
 
-        An obsolete finish records its reason only when no failure is recorded.
+        An obsolete finish records its reason only when no failure is recorded,
+        and removes the relations the classifier recorded for the work: work
+        that no longer decides anything keeps no relation from an earlier run.
         """
         if status not in {
             RelationDiscoveryWorkStatus.FAILED,
@@ -11247,37 +11266,44 @@ class Database:
         failed = status is RelationDiscoveryWorkStatus.FAILED
         now = _now_iso()
         async with self._write_lock:
-            cursor = await self.db.execute(
-                """UPDATE relation_discovery_work
-                      SET status = ?, lease_owner = NULL, lease_token = NULL,
-                          lease_until = NULL, next_attempt_at = ?,
-                          error = CASE WHEN ? THEN ? ELSE COALESCE(error, ?) END,
-                          error_code = CASE WHEN ? THEN ? ELSE error_code END,
-                          updated_at = ?,
-                          completed_at = CASE WHEN ? = 'obsolete' THEN ? ELSE NULL END
-                    WHERE id = ? AND status = 'running'
-                      AND lease_owner = ? AND lease_token = ?
-                      AND lease_until > ?""",
-                (
-                    status.value,
-                    next_attempt_at,
-                    failed,
-                    message[:RELATION_DISCOVERY_ERROR_MAX_CHARS],
-                    message[:RELATION_DISCOVERY_ERROR_MAX_CHARS],
-                    failed,
-                    error_code,
-                    now,
-                    status.value,
-                    now,
-                    work_id,
-                    worker_id,
-                    lease_token,
-                    now,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise ValueError("relation discovery lease was lost")
-            await self.db.commit()
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                cursor = await self.db.execute(
+                    """UPDATE relation_discovery_work
+                          SET status = ?, lease_owner = NULL, lease_token = NULL,
+                              lease_until = NULL, next_attempt_at = ?,
+                              error = CASE WHEN ? THEN ? ELSE COALESCE(error, ?) END,
+                              error_code = CASE WHEN ? THEN ? ELSE error_code END,
+                              updated_at = ?,
+                              completed_at = CASE WHEN ? = 'obsolete' THEN ? ELSE NULL END
+                        WHERE id = ? AND status = 'running'
+                          AND lease_owner = ? AND lease_token = ?
+                          AND lease_until > ?""",
+                    (
+                        status.value,
+                        next_attempt_at,
+                        failed,
+                        message[:RELATION_DISCOVERY_ERROR_MAX_CHARS],
+                        message[:RELATION_DISCOVERY_ERROR_MAX_CHARS],
+                        failed,
+                        error_code,
+                        now,
+                        status.value,
+                        now,
+                        work_id,
+                        worker_id,
+                        lease_token,
+                        now,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("relation discovery lease was lost")
+                if status is RelationDiscoveryWorkStatus.OBSOLETE:
+                    await self._delete_work_classifier_relations_unlocked(work_id)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def _relation_discovery_lease_row_unlocked(
         self,

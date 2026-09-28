@@ -484,7 +484,7 @@ def test_window_order_ends_when_relations_decided_at_different_times_form_a_cycl
     assert sorted(ordered) == ["mem-1", "mem-2", "mem-3"]
 
 
-def test_window_order_drops_equivalents_of_kept_memories_and_puts_newer_first():
+def test_window_order_keeps_both_memories_of_an_equivalent_pair_and_puts_newer_first():
     graph = _graph(
         [
             _stored("mem-1", "mem-2", EQUIVALENT),
@@ -495,6 +495,7 @@ def test_window_order_drops_equivalents_of_kept_memories_and_puts_newer_first():
 
     assert order_by_relations(["mem-1", "mem-2", "mem-3", "mem-4", "mem-5"], graph) == [
         "mem-1",
+        "mem-2",
         "mem-4",
         "mem-3",
         "mem-5",
@@ -628,25 +629,26 @@ async def test_search_ranks_the_newer_memory_ahead_and_notes_the_older(db, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_search_returns_one_of_an_equivalent_pair_and_pages_stably(db, tmp_path):
-    kept = _memory("mem-kept", "Payroll closes on the 20th.")
+async def test_search_returns_both_memories_of_an_equivalent_pair_each_naming_the_other(db, tmp_path):
+    first = _memory("mem-first", "Payroll closes on the 20th.")
     same = _memory("mem-same", "Payroll closing day is the 20th.")
     other = _memory("mem-other", "Payroll approvals close on the 18th.")
-    for memory in (kept, same, other):
+    for memory in (first, same, other):
         await db.insert_memory(memory)
-    await _relate(db, kept, same, EQUIVALENT)
-    engine = _engine(db, tmp_path, [kept.id, same.id, other.id])
+    await _relate(db, first, same, EQUIVALENT)
+    engine = _engine(db, tmp_path, [first.id, same.id, other.id])
 
-    first_page = await engine.search("Payroll", top_k=1)
-    second_page = await engine.search("Payroll", top_k=1, offset=1)
+    first_page = await engine.search("Payroll", top_k=2)
+    second_page = await engine.search("Payroll", top_k=2, offset=2)
 
-    returned = [item.memory_id for page in (first_page, second_page) for item in page["results"]]
-    assert same.id not in returned
-    assert sorted(returned) == sorted([kept.id, other.id])
+    results = [item for page in (first_page, second_page) for item in page["results"]]
+    assert sorted(item.memory_id for item in results) == sorted([first.id, same.id, other.id])
     assert first_page["has_more"] is True
     assert second_page["has_more"] is False
-    kept_result = next(item for page in (first_page, second_page) for item in page["results"] if item.memory_id == kept.id)
-    assert [(item.label, item.counterpart.memory_id) for item in kept_result.relations] == [("equivalent", same.id)]
+    by_id = {item.memory_id: item for item in results}
+    assert [(item.label, item.counterpart.memory_id) for item in by_id[first.id].relations] == [("equivalent", same.id)]
+    assert [(item.label, item.counterpart.memory_id) for item in by_id[same.id].relations] == [("equivalent", first.id)]
+    assert by_id[first.id].relation_notice is None and by_id[same.id].relation_notice is None
 
 
 # ---------------------------------------------------------------- admin API

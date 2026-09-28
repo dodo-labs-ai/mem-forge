@@ -50,13 +50,13 @@ class CrossDocumentRelationDecider(str, Enum):
     REVIEW = "review"
 
 
-CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION = "cross-document-relation-v3"
+CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION = "cross-document-relation-v4"
 # Classifier contracts that read the current ``RelationSubject`` input. An
 # evaluation case pinned under any of them holds the input this contract reads
 # and is replayed under it; a contract that changes the input is evaluated on a
 # set seeded again under it.
 CROSS_DOCUMENT_RELATION_INPUT_VERSIONS = frozenset(
-    {"cross-document-relation-v2", CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION}
+    {"cross-document-relation-v2", "cross-document-relation-v3", CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION}
 )
 CROSS_DOCUMENT_RELATION_TASK = DecisionTask("cross_document_relation", CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION)
 
@@ -309,7 +309,9 @@ class CrossDocumentRelationOutcome:
     ``judged_content_hashes`` maps every judged candidate to the content it was
     judged on; a judged candidate without a relation was judged none. Storage
     records the outcome only while the challenger and every judged candidate
-    still hold those contents.
+    still hold those contents, and the outcome replaces every relation the
+    classifier recorded for the same discovery work: a pair the run did not
+    judge keeps no relation from that work.
     """
 
     challenger_id: str
@@ -451,55 +453,84 @@ Two statements are about the same situation only if all of these hold:
 - they concern the same object;
 - they have the same scope: the conditions under which one applies do not
   exclude the other;
-- they are the same kind of statement: both say what should be, both say
-  what actually happened, or both say what was planned or decided. Read the
-  kind from what each statement says, not from its memory type;
-- they concern the same occurrence: statements about different events or
-  runs are about different situations, while two statements about the same
+- they are the same kind of statement: both say what should be (a
+  requirement, design, rule or expected behaviour), both say what actually
+  happened (a reported defect, test result, incident or observed behaviour),
+  or both say what was planned or decided. Read the kind from what each
+  statement says, not from its memory type;
+- they concern the same occurrence: statements about different events,
+  tickets, incidents, test runs or cases are about different situations, while two statements about the same
   lasting state or decision are about the same situation even when their
   sources recorded them at different times.
 If any of these differs, or the inputs do not establish it, the statements
 are not about the same situation.
 
 Decide whether the statements are about the same situation before deciding
-whether both can hold. When the statements overlap only in part, compare only
-the part they share. Compare only what the statements state: a conflict that
-has to be inferred from either statement is not a relation.
+whether both can hold. Compare only what the statements state: a conflict that
+has to be inferred from either statement is not a relation. When the
+statements overlap only in part, they conflict if the part they share cannot
+hold for both; a shared part never makes them equivalent.
 
 Give every pair exactly one label:
 - none: the statements are not about the same situation, or they are about
   the same situation and both can hold without stating the same knowledge
-  (for example, one is more specific than the other).
-- equivalent: same situation, and both state the same knowledge.
+  (for example, one is more specific than the other, or one adds a fact,
+  condition, step or outcome the other does not state).
+- equivalent: same situation, and each statement as a whole states everything
+  the other states; they differ only in wording.
 - updates: same situation, both cannot hold now, and the later statement
   replaces the earlier one.
-- contradicts: same situation, both cannot hold, and neither replaces the
-  other over time.
+- contradicts: same situation, the two statements directly state
+  incompatible things about it, and neither replaces the other over time.
 
 When you are not certain, the label is none: a false relation warns every
 reader of both statements, while a missed one only omits a hint.
 """
 
+# Every request states one challenger once, as the subject, and asks one
+# question per candidate. Candidates of one subject often repeat one another,
+# so the prompt says that such repetition tells nothing about the subject.
+CROSS_DOCUMENT_RELATION_QUESTION = "What is the relation of this candidate to the subject?"
 CROSS_DOCUMENT_RELATION_PROMPT = CROSS_DOCUMENT_RELATION_RULES + """
-<statement_pair_groups>
-{groups_json}
-</statement_pair_groups>
+Every question below asks for the relation between one candidate statement and the subject statement. \
+The subject is one statement; each candidate is one statement from another document.
+Many candidates repeat one another. Judge each candidate only against the subject: \
+two candidates that state the same thing tell nothing about the subject, \
+and a candidate is equivalent only when it and the subject state the same knowledge.
 
+<subject>
+{subject_json}
+</subject>
+
+<questions>
+{questions_json}
+</questions>
+
+For every question, answer with its pair_index and the label for that candidate's relation to the subject. \
 Return exactly one decision for every pair_index and no other pair_index.
 """
 
 
-def _grouped_pairs_json(indexed_pairs: Sequence[tuple[int, CrossDocumentRelationPair]]) -> str:
-    groups: dict[str, dict[str, Any]] = {}
-    for pair_index, pair in indexed_pairs:
-        group = groups.setdefault(
-            pair.challenger.memory_id,
-            {"statement": pair.challenger.prompt_payload(), "compared_with": []},
-        )
-        group["compared_with"].append(
-            {"pair_index": pair_index, "statement": pair.candidate.prompt_payload()}
-        )
-    return json.dumps(list(groups.values()), ensure_ascii=False)
+def cross_document_relation_prompt(
+    subject: RelationSubject,
+    questions: Sequence[tuple[int, RelationSubject]],
+) -> str:
+    """One request: the subject stated once and one question per ``(pair_index, candidate)``."""
+
+    return CROSS_DOCUMENT_RELATION_PROMPT.format(
+        subject_json=json.dumps(subject.prompt_payload(), ensure_ascii=False),
+        questions_json=json.dumps(
+            [
+                {
+                    "pair_index": pair_index,
+                    "question": CROSS_DOCUMENT_RELATION_QUESTION,
+                    "candidate": candidate.prompt_payload(),
+                }
+                for pair_index, candidate in questions
+            ],
+            ensure_ascii=False,
+        ),
+    )
 
 
 def cross_document_relation_output_tokens(policy: MemoryPairClassificationPolicy, pair_count: int) -> int:
@@ -507,7 +538,12 @@ def cross_document_relation_output_tokens(policy: MemoryPairClassificationPolicy
 
 
 class StructuredCrossDocumentRelationClassifier:
-    """Label exact pairs with the Structured LLM; any pair left without a label fails the run."""
+    """Label exact pairs with the Structured LLM; any pair left without a label fails the run.
+
+    Pairs are asked about per challenger: every request holds the pairs of one
+    challenger, which it states once as the subject. The batch runner packs and
+    splits each challenger's questions by capacity.
+    """
 
     def __init__(
         self,
@@ -524,13 +560,40 @@ class StructuredCrossDocumentRelationClassifier:
         self,
         pairs: tuple[CrossDocumentRelationPair, ...],
     ) -> CrossDocumentRelationClassification:
-        if not pairs:
-            return CrossDocumentRelationClassification(judgments=(), llm_calls=0, prompt_chars=0)
         runner = LlmBatchRunner(self._client, model=self._model)
+        by_challenger: dict[str, list[int]] = {}
+        for pair_index, pair in enumerate(pairs):
+            by_challenger.setdefault(pair.challenger.memory_id, []).append(pair_index)
+        judgments: dict[int, CrossDocumentRelationJudgment] = {}
+        for pair_indexes in by_challenger.values():
+            results = await run_pair_items(
+                runner,
+                self._challenger_task(pairs, pair_indexes),
+                pair_count=len(pairs),
+                label="cross-document relation classification",
+            )
+            judgments.update(zip(pair_indexes, results, strict=True))
+        return CrossDocumentRelationClassification(
+            judgments=tuple(judgments[pair_index] for pair_index in range(len(pairs))),
+            llm_calls=runner.stats.calls,
+            prompt_chars=runner.stats.prompt_chars,
+        )
 
-        def render(item_ids: tuple[str, ...], _context: tuple) -> LlmRequest:
-            indexed = tuple((int(item_id), pairs[int(item_id)]) for item_id in item_ids)
-            prompt = CROSS_DOCUMENT_RELATION_PROMPT.format(groups_json=_grouped_pairs_json(indexed))
+    def _challenger_task(
+        self,
+        pairs: tuple[CrossDocumentRelationPair, ...],
+        pair_indexes: Sequence[int],
+    ) -> ItemTask:
+        """The questions about one challenger's pairs, with the challenger as their shared context."""
+
+        asked = {pair_index: pairs[pair_index] for pair_index in pair_indexes}
+
+        def render(item_ids: tuple[str, ...], context: tuple[RelationSubject, ...]) -> LlmRequest:
+            [subject] = context
+            prompt = cross_document_relation_prompt(
+                subject,
+                [(int(item_id), asked[int(item_id)].candidate) for item_id in item_ids],
+            )
             return LlmRequest(
                 prompt,
                 CrossDocumentRelationResponse,
@@ -541,30 +604,21 @@ class StructuredCrossDocumentRelationClassifier:
             """Each decision is its pair's row; the runner rejects an unrequested pair_index."""
             for decision in response.decisions:
                 pair_index = int(decision.pair_index)
-                if not 0 <= pair_index < len(pairs):
+                if pair_index not in asked:
                     yield str(pair_index), RejectedRow(f"pair_index {pair_index} was not requested")
                     continue
                 yield str(pair_index), CrossDocumentRelationJudgment(
-                    pair=pairs[pair_index],
+                    pair=asked[pair_index],
                     label=CrossDocumentRelationLabel(decision.label),
                 )
 
-        judgments = await run_pair_items(
-            runner,
-            ItemTask(
-                item_ids=tuple(str(index) for index in range(len(pairs))),
-                render=render,
-                decode=decode,
-                call=self._client.classify_cross_document_relations,
-                label=lambda item_id: f"pair_index {item_id}",
-            ),
-            pair_count=len(pairs),
-            label="cross-document relation classification",
-        )
-        return CrossDocumentRelationClassification(
-            judgments=tuple(judgments),
-            llm_calls=runner.stats.calls,
-            prompt_chars=runner.stats.prompt_chars,
+        return ItemTask(
+            item_ids=tuple(str(pair_index) for pair_index in pair_indexes),
+            render=render,
+            decode=decode,
+            call=self._client.classify_cross_document_relations,
+            context=(pairs[pair_indexes[0]].challenger,),
+            label=lambda item_id: f"pair_index {item_id}",
         )
 
 
@@ -799,9 +853,9 @@ async def load_relation_subjects(
     rendering. Discovery chooses its challenger's Evidence Unit within the
     work's Source Unit; the evaluation set chooses among all of the
     challenger's current Units, so the two show the same Evidence unless the
-    challenger has current Evidence in several Source Units. Discovery groups a
-    challenger's pairs into one request; the evaluation sends each pinned pair
-    on its own.
+    challenger has current Evidence in several Source Units. Discovery asks
+    about all of a challenger's candidates in requests that state the
+    challenger once; the evaluation sends each pinned pair on its own.
     """
 
     reader = _RelationEvidenceReader(store)
