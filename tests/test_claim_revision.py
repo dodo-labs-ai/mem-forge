@@ -226,6 +226,7 @@ def test_semantic_assessment_contract_change_invalidates_operation_reuse(monkeyp
         changed_hunks=None,
         update_plan_stats=None,
         llm_model="test",
+        decision_task_models={},
     )
     before = _source_lifecycle_operation_input_hash(**inputs)
     module, field = {

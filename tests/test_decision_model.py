@@ -2,22 +2,35 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
-from memforge.agent_sessions import AGENT_SESSION_AUTHORITY_CONTRACT, AGENT_SESSION_AUTHORITY_TASK
+from memforge.agent_sessions import (
+    AGENT_SESSION_AUTHORITY_CONTRACT,
+    AGENT_SESSION_AUTHORITY_TASK,
+    _classify_agent_session_authority,
+    canonicalize_agent_session_events,
+)
 from memforge.config import AppConfig
 from memforge.llm import decision_model
 from memforge.llm.decision_model import EVALUATED_DECISION_TASKS, DecisionTask, decision_task_model
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
+from memforge.memory import engine
 from memforge.memory.cross_document_relation import (
     CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
     CROSS_DOCUMENT_RELATION_TASK,
     StructuredCrossDocumentRelationClassifier,
 )
-from memforge.memory.entity_resolver import ENTITY_ADJUDICATION_CONTRACT, ENTITY_ADJUDICATION_TASK
+from memforge.memory.entity_resolver import (
+    ENTITY_ADJUDICATION_CONTRACT,
+    ENTITY_ADJUDICATION_TASK,
+    EntityResolutionContext,
+    EntityResolver,
+)
+from memforge.memory.engine import _lifecycle_decision_task_models, _source_lifecycle_operation_input_hash
+from memforge.models import Entity
 from memforge.memory.relation_classifier import (
     MEMORY_PAIR_CLASSIFIER_VERSION,
     PAIR_REVIEW_TASK,
@@ -25,9 +38,11 @@ from memforge.memory.relation_classifier import (
 )
 from memforge.pipeline.revision_work import CHANGE_IMPACT_CONTRACT, CHANGE_IMPACT_TASK, RevisionWorkExecutor
 from memforge.runtime import DefaultRuntimeProvider, get_effective_llm_config
+from tests.test_agent_session_api import _AuthorizesAllCandidateUserEvidence, _authorized_events
 from tests.test_change_impact import ImpactClient, cohort, impact_works
 from tests.test_cross_document_relation_classifier import _Client as RelationClient
 from tests.test_cross_document_relation_classifier import _pairs
+from tests.test_entity_resolver import _SCOPE, EntityClient, FakeEntityStore, _match_first_candidate
 from tests.test_revision_work import Store
 
 MAIN_MODEL = "gateway/main-model"
@@ -229,6 +244,122 @@ def test_pair_review_is_registered_by_its_own_task_name(monkeypatch) -> None:
 
     register(monkeypatch, {PAIR_REVIEW_TASK.name: MEMORY_PAIR_CLASSIFIER_VERSION})
     assert StructuredMemoryPairClassifier(client=client, model=MAIN_MODEL)._model == DECISION_MODEL
+
+
+@dataclass
+class DecisionEntityClient(EntityClient):
+    decision_model: str = DECISION_MODEL
+    models: list[str | None] = field(default_factory=list)
+
+    async def validate_entity_batch(self, prompt, *, max_tokens, model):
+        self.models.append(model)
+        return await super().validate_entity_batch(prompt, max_tokens=max_tokens, model=model)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("registered", "expected"),
+    [
+        pytest.param({}, MAIN_MODEL, id="unregistered"),
+        pytest.param({ENTITY_ADJUDICATION_TASK.name: ENTITY_ADJUDICATION_CONTRACT}, DECISION_MODEL, id="registered"),
+    ],
+)
+async def test_entity_adjudication_runs_on_the_model_its_registration_selects(
+    monkeypatch, registered, expected,
+) -> None:
+    register(monkeypatch, registered)
+    candidate = Entity(id=1, canonical_name="payroll service", display_name="Payroll Service")
+    store = FakeEntityStore(EntityResolutionContext(
+        exact_matches={}, alias_matches={}, candidates={"pay service": (candidate,)},
+    ))
+    monkeypatch.setattr(
+        "memforge.retrieval.embeddings.embed_texts",
+        lambda texts, *_args: [[1.0, 0.0] for _ in texts],
+    )
+    client = DecisionEntityClient(respond=_match_first_candidate)
+    resolver = EntityResolver(
+        store=store,  # type: ignore[arg-type]
+        embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+        structured_llm_client=client,
+        llm_model=MAIN_MODEL,
+    )
+
+    result = await resolver.resolve_many({"pay service": ()}, scope=_SCOPE)
+
+    assert client.models == [expected]
+    assert result.entity_id("pay service") == candidate.id
+
+
+class DecisionAuthorityClient(_AuthorizesAllCandidateUserEvidence):
+    decision_model = DECISION_MODEL
+
+    def __init__(self):
+        self.models = []
+
+    async def classify_agent_session_evidence_authority(self, prompt: str, **kwargs):
+        self.models.append(kwargs["model"])
+        return await super().classify_agent_session_evidence_authority(prompt, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("registered", "expected"),
+    [
+        pytest.param({}, None, id="unregistered"),
+        pytest.param(
+            {AGENT_SESSION_AUTHORITY_TASK.name: AGENT_SESSION_AUTHORITY_CONTRACT}, DECISION_MODEL, id="registered",
+        ),
+    ],
+)
+async def test_agent_session_authority_runs_on_the_model_its_registration_selects(
+    monkeypatch, registered, expected,
+) -> None:
+    """Unregistered, the window client answers on its own configured model."""
+
+    register(monkeypatch, registered)
+    client = DecisionAuthorityClient()
+
+    classified = await _classify_agent_session_authority(
+        structured_llm_client=client,
+        owner_user_id="owner",
+        client="codex",
+        session_id="session",
+        trigger="Stop",
+        workspace="/workspace/mem-forge",
+        repo_identifier="github.com/shno-labs/mem-forge",
+        branch="main",
+        events=canonicalize_agent_session_events(_authorized_events()),
+    )
+
+    assert client.models == [expected]
+    assert [event["evidence_role"] for event in classified] == ["primary"]
+
+
+def test_source_lifecycle_operation_identity_names_the_model_of_each_decision_task(monkeypatch) -> None:
+    client = SimpleNamespace(decision_model=DECISION_MODEL)
+
+    register(monkeypatch, {})
+    unregistered = _lifecycle_decision_task_models(client, MAIN_MODEL)
+    register(monkeypatch, {CHANGE_IMPACT_TASK.name: CHANGE_IMPACT_CONTRACT})
+    registered = _lifecycle_decision_task_models(client, MAIN_MODEL)
+
+    assert unregistered == {CHANGE_IMPACT_TASK.name: MAIN_MODEL, PAIR_REVIEW_TASK.name: MAIN_MODEL}
+    assert registered == {CHANGE_IMPACT_TASK.name: DECISION_MODEL, PAIR_REVIEW_TASK.name: MAIN_MODEL}
+    inputs = dict(
+        projection=SimpleNamespace(),
+        candidates=[],
+        incumbents=[],
+        support_hashes={},
+        gate_state="enabled",
+        update_mode="incremental",
+        changed_hunks=None,
+        update_plan_stats=None,
+        llm_model=MAIN_MODEL,
+    )
+    monkeypatch.setattr(engine, "source_derivation_projection_identity_hash", lambda _projection: "projection")
+    assert _source_lifecycle_operation_input_hash(
+        **inputs, decision_task_models=unregistered,
+    ) != _source_lifecycle_operation_input_hash(**inputs, decision_task_models=registered)
 
 
 def test_decision_model_capacity_resolves_for_its_own_route(monkeypatch) -> None:
