@@ -72,7 +72,6 @@ class TestMemoryDataclass:
         assert mem.visibility == Visibility.WORKSPACE.value
         assert mem.owner_user_id is None
         assert mem.status == "active"
-        assert mem.confidence == 0.7
         assert mem.corroboration_count == 1
         assert mem.entity_refs == []
 
@@ -84,12 +83,10 @@ class TestMemoryDataclass:
             content_hash="def456",
             visibility=Visibility.WORKSPACE.value,
             project_key="PAY",
-            confidence=0.95,
         )
         assert mem.memory_type == "decision"
         assert mem.visibility == Visibility.WORKSPACE.value
         assert mem.project_key == "PAY"
-        assert mem.confidence == 0.95
 
 
 class TestMemoryStatus:
@@ -100,7 +97,6 @@ class TestMemoryStatus:
 class TestRawMemory:
     def test_minimal(self):
         rm = RawMemory(content="test", memory_type="fact")
-        assert rm.confidence == 0.7
         assert rm.entity_refs == []
         assert rm.valid_from is None
 

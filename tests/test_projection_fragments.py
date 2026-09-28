@@ -371,7 +371,6 @@ def test_v9_well_formed_response_remains_byte_stable() -> None:
             {
                 "content": "Approval is required.",
                 "memory_type": "fact",
-                "confidence": 0.7,
                 "entity_refs": [],
                 "valid_from": None,
                 "valid_until": None,
@@ -1883,7 +1882,7 @@ async def test_selector_correction_preserves_success_and_fixed_claims(mode) -> N
     )
     failed = ProjectionFragmentMemoryCandidate(
         content="Release requires approval by two reviewers.", memory_type="convention",
-        confidence=0.8, entity_refs=["Release"], valid_from="2026-09-01", valid_until="2027-09-01",
+        entity_refs=["Release"], valid_from="2026-09-01", valid_until="2027-09-01",
         primary_ref="broken", required_refs=[required],
     )
 
@@ -1955,7 +1954,7 @@ async def test_selector_correction_preserves_success_and_fixed_claims(mode) -> N
     assert "private provider text" not in json.dumps(result.metadata)
     if mode == "repaired":
         repaired = result.memories[1]
-        for field in ("content", "memory_type", "confidence", "entity_refs", "valid_from", "valid_until"):
+        for field in ("content", "memory_type", "entity_refs", "valid_from", "valid_until"):
             assert getattr(repaired, field) == getattr(failed, field)
         assert len(repaired.resolved_evidence_selection.parts) == 2
         assert failed.primary_ref == "broken"

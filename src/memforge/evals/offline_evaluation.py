@@ -2834,7 +2834,6 @@ def _raw_memory_from_payload(payload: Mapping[str, object]) -> RawMemory:
     return RawMemory(
         content=str(payload.get("content") or ""),
         memory_type=str(payload.get("memory_type") or "fact"),
-        confidence=float(payload.get("confidence") or 0.7),
         entity_refs=[str(value) for value in payload.get("entity_refs", [])],
         valid_from=_optional_str(payload.get("valid_from")),
         valid_until=_optional_str(payload.get("valid_until")),
@@ -2862,7 +2861,6 @@ def _memory_from_payload(payload: Mapping[str, object]) -> Memory:
         project_key=_optional_str(payload.get("project_key")),
         repo_identifier=_optional_str(payload.get("repo_identifier")),
         entity_refs=[str(value) for value in payload.get("entity_refs", [])],
-        confidence=float(payload.get("confidence") or 0.7),
         extraction_context=_optional_str(payload.get("extraction_context")),
         status=str(payload.get("status") or "active"),
     )

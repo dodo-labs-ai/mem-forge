@@ -218,7 +218,6 @@ async def _search_memories(
             "id": row.memory_id,
             "memory_type": row.memory_type,
             "content": row.summary,
-            "confidence": row.confidence,
         })
     return rows
 
@@ -311,8 +310,7 @@ def _render_context_markdown(
         lines.extend(["", "### Relevant Memories"])
         for memory in memories:
             lines.append(
-                f"- [{memory['id']}] ({memory['memory_type']}, confidence "
-                f"{memory['confidence']:.2f}) {memory['content']}"
+                f"- [{memory['id']}] ({memory['memory_type']}) {memory['content']}"
             )
 
     if recent_changes:

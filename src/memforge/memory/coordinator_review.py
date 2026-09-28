@@ -49,7 +49,6 @@ def staged_candidate(raw: RawMemory) -> dict[str, object]:
     return {
         "content": raw.content,
         "memory_type": raw.memory_type,
-        "confidence": raw.confidence,
         "valid_from": raw.valid_from,
         "valid_until": raw.valid_until,
         "entity_refs": list(raw.entity_refs),
@@ -181,7 +180,6 @@ def _current_candidate(value: object, catalog: ProjectionFragmentCatalog) -> Raw
     return RawMemory(
         content=str(value["content"]),
         memory_type=str(value["memory_type"]),
-        confidence=float(value["confidence"]),
         entity_refs=[str(ref) for ref in value.get("entity_refs") or ()],
         valid_from=_optional_text(value.get("valid_from")),
         valid_until=_optional_text(value.get("valid_until")),

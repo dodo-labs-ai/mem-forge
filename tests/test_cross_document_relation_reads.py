@@ -65,7 +65,6 @@ def _memory(memory_id: str, content: str | None = None, **overrides) -> Memory:
             memory_type="fact",
             content=text,
             content_hash=content_hash(text),
-            confidence=0.9,
             created_at=now,
             updated_at=now,
         ),

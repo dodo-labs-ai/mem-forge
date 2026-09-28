@@ -2401,7 +2401,6 @@ def memories_list(ctx, memory_type: str | None, entity: str | None, source: str 
         table.add_column("ID", style="dim", max_width=12)
         table.add_column("Type", max_width=12)
         table.add_column("Content", max_width=60)
-        table.add_column("Confidence", justify="right", max_width=6)
         table.add_column("Corr.", justify="right", max_width=5)
         table.add_column("Status", max_width=10)
         table.add_column("Updated", max_width=20)
@@ -2412,7 +2411,6 @@ def memories_list(ctx, memory_type: str | None, entity: str | None, source: str 
                 m.id,
                 m.memory_type,
                 content_preview,
-                f"{m.confidence:.2f}",
                 str(m.corroboration_count),
                 m.status,
                 m.updated_at.isoformat()[:19] if m.updated_at else "",

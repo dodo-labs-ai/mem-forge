@@ -74,6 +74,11 @@ from memforge.pipeline.projection_fragments import (
 from memforge.pipeline.source_projection_adapters import project_source_item
 
 
+# The managed agent patch contract: the generated patch fields and the prompt
+# that asks for them. It is the classifier version of every relation a patch
+# writes and is recorded with every processed agent-session window.
+AGENT_SESSION_INTENT_CONTRACT = "agent_session_intent_v2"
+
 PatchAction = Literal[
     "create_new_concept",
     "update_existing_claim",
@@ -126,8 +131,8 @@ class DurableClaim(BaseModel):
         return text or None
 
 
-class AgentKnowledgePatchProposal(BaseModel):
-    """Validated LLM proposal. The service validates scope before applying it."""
+class _AgentKnowledgePatch(BaseModel):
+    """The fields of one agent-session knowledge patch and their shape rules."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -149,8 +154,6 @@ class AgentKnowledgePatchProposal(BaseModel):
     claim_text: str = ""
     durable_claim: DurableClaim | None = None
     memory_type: Literal["fact", "decision", "convention", "procedure"] = "fact"
-    reason: str = ""
-    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     citations: list[str] = Field(default_factory=list)
     primary_event_id: str | None = None
     required_event_ids: list[str] = Field(default_factory=list)
@@ -194,13 +197,27 @@ class AgentKnowledgePatchProposal(BaseModel):
 
     @property
     def primary_evidence_ids(self) -> list[str]:
-        """Compatibility read for completed legacy callers; never part of v9 schema."""
+        """Compatibility read for completed legacy callers; never part of the model schema."""
 
         return [self.primary_event_id] if self.primary_event_id is not None else []
 
 
-class AgentKnowledgePatchModelResponse(AgentKnowledgePatchProposal):
-    """Provider response schema; internal application commands stay separately authorized."""
+class AgentKnowledgePatchProposal(_AgentKnowledgePatch):
+    """A patch the service applies after validating its scope.
+
+    ``reason`` is program-owned text: a user's reason for a correction, or why
+    the service turned a model proposal into ``no_output``. The model never
+    writes it.
+    """
+
+    reason: str = ""
+
+
+class AgentKnowledgePatchModelResponse(_AgentKnowledgePatch):
+    """Provider response schema: the generated patch, with no explanation or confidence.
+
+    Internal application commands stay separately authorized.
+    """
 
     @model_validator(mode="before")
     @classmethod
@@ -381,7 +398,6 @@ class AgentKnowledgeBundleService:
                 claim_text=proposal.claim_text,
                 memory_content=memory_content,
                 memory_type=proposal.memory_type,
-                confidence=proposal.confidence,
                 owner_user_id=owner_user_id,
                 repo_identifier=repo_identifier,
                 project_key=project_key,
@@ -480,7 +496,6 @@ class AgentKnowledgeBundleService:
                 claim_text=proposal.claim_text,
                 memory_content=memory_content,
                 memory_type=proposal.memory_type,
-                confidence=proposal.confidence,
                 owner_user_id=owner_user_id,
                 repo_identifier=repo_identifier,
                 project_key=project_key,
@@ -528,7 +543,6 @@ class AgentKnowledgeBundleService:
             claim_text=proposal.claim_text,
             memory_content=memory_content,
             memory_type=proposal.memory_type,
-            confidence=proposal.confidence,
             owner_user_id=owner_user_id,
             repo_identifier=repo_identifier,
             project_key=project_key,
@@ -601,7 +615,6 @@ class AgentKnowledgeBundleService:
             durable_claim=DurableClaim(rule=replacement_content, scope=provenance),
             memory_type=str(claim["memory_type"]),
             reason=reason,
-            confidence=float(claim["confidence"]),
         )
         markdown_body = await self._render_concept_markdown_with_patch(
             concept,
@@ -622,7 +635,6 @@ class AgentKnowledgeBundleService:
             claim_text=replacement_content,
             memory_content=replacement_content,
             memory_type=str(claim["memory_type"]),
-            confidence=float(claim["confidence"]),
             owner_user_id=owner_user_id,
             repo_identifier=concept.get("repo_identifier"),
             project_key=old_memory.project_key,
@@ -773,7 +785,6 @@ class AgentKnowledgeBundleService:
             claim_text=str(claim["claim_text"]),
             memory_content=None,
             memory_type=str(claim["memory_type"]),
-            confidence=float(claim["confidence"]),
             owner_user_id=str(concept["owner_user_id"]),
             repo_identifier=concept.get("repo_identifier"),
             project_key=old_memory.project_key,
@@ -802,7 +813,6 @@ class AgentKnowledgeBundleService:
             display_anchor=str(claim["display_anchor"]),
             claim_text=str(claim["claim_text"]),
             memory_type=str(claim["memory_type"]),
-            confidence=float(claim["confidence"]),
             observed_at=observed_at,
             concept_markdown_body=markdown_body,
             maintenance_receipt=maintenance_receipt,
@@ -866,7 +876,6 @@ class AgentKnowledgeBundleService:
             claim_text=proposal.claim_text,
             memory_content=memory_content,
             memory_type=proposal.memory_type,
-            confidence=proposal.confidence,
             owner_user_id=owner_user_id,
             repo_identifier=repo_identifier,
             project_key=project_key,
@@ -904,7 +913,6 @@ class AgentKnowledgeBundleService:
         claim_text: str,
         memory_content: str,
         memory_type: str,
-        confidence: float,
         owner_user_id: str,
         repo_identifier: str | None,
         project_key: str | None,
@@ -935,7 +943,6 @@ class AgentKnowledgeBundleService:
             claim_text=claim_text,
             memory_content=memory_content,
             memory_type=memory_type,
-            confidence=confidence,
             owner_user_id=owner_user_id,
             repo_identifier=repo_identifier,
             project_key=project_key,
@@ -962,7 +969,6 @@ class AgentKnowledgeBundleService:
             claim_text=claim_text,
             memory_content=memory_content,
             memory_type=memory_type,
-            confidence=confidence,
             owner_user_id=owner_user_id,
             repo_identifier=repo_identifier,
             project_key=project_key,
@@ -975,7 +981,6 @@ class AgentKnowledgeBundleService:
             review_case=None,
             memory_id=memory_id,
             candidates=[],
-            confidence=confidence,
             reason=proposal.reason,
             submitted_at=submitted_at,
         )
@@ -991,7 +996,6 @@ class AgentKnowledgeBundleService:
                 display_anchor=display_anchor,
                 claim_text=claim_text.strip(),
                 memory_type=memory_type,
-                confidence=confidence,
                 observed_at=observed_at,
                 source_updated_at=source_updated_at,
                 citations=citations,
@@ -1015,7 +1019,6 @@ class AgentKnowledgeBundleService:
         claim_text: str,
         memory_content: str,
         memory_type: str,
-        confidence: float,
         owner_user_id: str,
         repo_identifier: str | None,
         project_key: str | None,
@@ -1133,7 +1136,6 @@ class AgentKnowledgeBundleService:
             RawMemory(
                 content=memory_content,
                 memory_type=memory_type,
-                confidence=confidence,
                 extraction_context=(memory_extraction_context or claim_text).strip(),
                 evidence_quote=claim_text.strip(),
             )
@@ -1193,7 +1195,6 @@ class AgentKnowledgeBundleService:
                 incumbent_candidates[memory_id] = RawMemory(
                     content=current.content,
                     memory_type=current.memory_type,
-                    confidence=current.confidence,
                     extraction_context=str(claim["claim_text"]).strip(),
                     evidence_quote=str(claim["claim_text"]).strip(),
                 )
@@ -1241,7 +1242,6 @@ class AgentKnowledgeBundleService:
             incumbent_candidates[incumbent_memory_id] = RawMemory(
                 content=requested_memory.content,
                 memory_type=requested_memory.memory_type,
-                confidence=requested_memory.confidence,
                 extraction_context=str(requested_claim["claim_text"]).strip(),
                 evidence_quote=str(requested_claim["claim_text"]).strip(),
             )
@@ -1433,7 +1433,6 @@ class AgentKnowledgeBundleService:
         claim_text: str,
         memory_content: str,
         memory_type: str,
-        confidence: float,
         owner_user_id: str,
         repo_identifier: str | None,
         project_key: str | None,
@@ -1466,7 +1465,6 @@ class AgentKnowledgeBundleService:
             claim_text=claim_text,
             memory_content=memory_content,
             memory_type=memory_type,
-            confidence=confidence,
             owner_user_id=owner_user_id,
             repo_identifier=repo_identifier,
             project_key=project_key,
@@ -1504,7 +1502,6 @@ class AgentKnowledgeBundleService:
                 candidates=committed_candidates,
                 incomplete_mandatory_buckets=existing_run.incomplete_mandatory_buckets,
                 candidate_count=existing_run.candidate_count,
-                confidence=confidence,
                 reason=replacement_reason,
                 submitted_at=submitted_at,
             )
@@ -1542,7 +1539,6 @@ class AgentKnowledgeBundleService:
             candidate_memory_id=old_memory_id,
             relation_type=(RelationType.REFINES if replacement_kind == "revision" else RelationType.CONTRADICTS),
             authority_case=AuthorityCase.SAME_AGENT_CLAIM,
-            confidence=confidence,
             reason=replacement_reason,
             proposed_memory_content=memory_content,
             evidence_excerpt=claim_text.strip(),
@@ -1558,7 +1554,6 @@ class AgentKnowledgeBundleService:
             claim_text=claim_text,
             memory_content=memory_content,
             memory_type=memory_type,
-            confidence=confidence,
             owner_user_id=owner_user_id,
             repo_identifier=repo_identifier,
             project_key=project_key,
@@ -1573,7 +1568,6 @@ class AgentKnowledgeBundleService:
             candidates=universe.candidates,
             incomplete_mandatory_buckets=universe.incomplete_mandatory_buckets,
             candidate_count=universe.total_unique_candidates,
-            confidence=confidence,
             reason=replacement_reason,
             submitted_at=submitted_at,
         )
@@ -1592,7 +1586,6 @@ class AgentKnowledgeBundleService:
             display_anchor=display_anchor,
             claim_text=claim_text.strip(),
             memory_type=memory_type,
-            confidence=confidence,
             observed_at=observed_at,
             source_updated_at=source_updated_at,
             relation_outcome=relation_outcome,
@@ -1636,7 +1629,6 @@ class AgentKnowledgeBundleService:
         memory_id: str,
         candidates: tuple[RelationCandidateRecord, ...] | list[RelationCandidateRecord],
         incomplete_mandatory_buckets: tuple[str, ...] = (),
-        confidence: float,
         reason: str,
         submitted_at: datetime,
         candidate_count: int | None = None,
@@ -1650,10 +1642,10 @@ class AgentKnowledgeBundleService:
                 authority_case=AuthorityCase.SAME_AGENT_CLAIM,
                 is_authoritative_support=True,
                 source_lineage_id=unit.source_lineage_id,
-                confidence=confidence,
+                confidence=None,
                 reason=reason,
                 excerpt=unit.excerpt,
-                classifier_version="agent_session_intent_v1",
+                classifier_version=AGENT_SESSION_INTENT_CONTRACT,
                 relation_run_id=relation_run_id,
                 created_at=now,
             ),
@@ -1672,7 +1664,7 @@ class AgentKnowledgeBundleService:
                 mandatory_candidate_count=sum(1 for candidate in candidates if candidate.is_mandatory),
                 checked_candidate_count=sum(1 for candidate in candidates if candidate.was_checked),
                 incomplete_mandatory_buckets=incomplete_mandatory_buckets,
-                classifier_version="agent_session_intent_v1",
+                classifier_version=AGENT_SESSION_INTENT_CONTRACT,
                 lifecycle_action=lifecycle_action,
                 review_case=review_case,
                 status="applied",
@@ -1692,7 +1684,6 @@ class AgentKnowledgeBundleService:
         claim_text: str,
         memory_content: str,
         memory_type: str,
-        confidence: float,
         owner_user_id: str,
         repo_identifier: str | None,
         project_key: str | None,
@@ -1707,7 +1698,6 @@ class AgentKnowledgeBundleService:
             owner_user_id=owner_user_id,
             project_key=project_key,
             repo_identifier=repo_identifier,
-            confidence=confidence,
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
             status="active",

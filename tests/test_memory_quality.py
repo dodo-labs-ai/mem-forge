@@ -80,7 +80,6 @@ def _raw(content: str, context: str) -> RawMemory:
     return RawMemory(
         content=content,
         memory_type="fact",
-        confidence=0.9,
         entity_refs=[],
         extraction_context=context,
     )
@@ -151,7 +150,6 @@ async def _insert_memory(db: Database, *, mem_id: str, content: str) -> Memory:
         memory_type="fact",
         content=content,
         content_hash=content_hash(content),
-        confidence=0.9,
         created_at=now,
         updated_at=now,
         status="active",
@@ -1364,7 +1362,6 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
                         memory_id="mem-proxy-search",
                         memory_type="fact",
                         summary="Proxy search stays service-owned.",
-                        confidence=0.9,
                         relevance_score=1.0,
                     )
                 ],

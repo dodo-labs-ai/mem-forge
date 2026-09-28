@@ -988,7 +988,6 @@ CREATE TABLE IF NOT EXISTS memories (
     owner_user_id       TEXT,
     project_key         TEXT,
     repo_identifier     TEXT,
-    confidence          REAL NOT NULL DEFAULT 0.7,
     corroboration_count INTEGER NOT NULL DEFAULT 1,
     valid_from          TEXT,
     valid_until         TEXT,
@@ -1704,7 +1703,6 @@ CREATE TABLE IF NOT EXISTS agent_claims (
     claim_text          TEXT NOT NULL,
     memory_type         TEXT NOT NULL,
     tags                TEXT NOT NULL DEFAULT '[]',
-    confidence          REAL NOT NULL DEFAULT 0.7,
     memory_id           TEXT NOT NULL REFERENCES memories(id),
     created_at          TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
@@ -4508,6 +4506,14 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # this version still has them (see _remove_source_activity_epoch_unlocked).
         [],
     ),
+    (
+        106,
+        "Remove Memory and agent claim confidence",
+        # No lifecycle, ranking, filtering or hook decision reads a confidence
+        # (ADR 0043). The columns are dropped where a database created before
+        # this version still has them.
+        [],
+    ),
 ]
 
 
@@ -4783,6 +4789,9 @@ class Database:
             if version == 105:
                 superseded = await self._remove_source_activity_epoch_unlocked()
                 logger.info("Superseded %d unapplied derivations staged with a Source activity epoch", superseded)
+            if version == 106:
+                await self._drop_columns_if_present_unlocked("memories", "confidence")
+                await self._drop_columns_if_present_unlocked("agent_claims", "confidence")
             if version == 26:
                 await self._backfill_relation_run_snapshot_audit()
             if version in (30, 31, 66):
@@ -9207,7 +9216,6 @@ class Database:
         display_anchor: str,
         claim_text: str,
         memory_type: str,
-        confidence: float,
         observed_at: datetime,
         citations: list[str] | None = None,
         concept_projection: dict[str, Any] | None = None,
@@ -9260,7 +9268,6 @@ class Database:
                     display_anchor=display_anchor,
                     claim_text=claim_text,
                     memory_type=memory_type,
-                    confidence=confidence,
                     memory_id=memory_id,
                     observed=observed,
                 )
@@ -9795,7 +9802,6 @@ class Database:
                 project_key=raw.get("project_key") if isinstance(raw.get("project_key"), str) else None,
                 repo_identifier=raw.get("repo_identifier") if isinstance(raw.get("repo_identifier"), str) else None,
                 entity_refs=[str(value) for value in raw.get("entity_refs", [])],
-                confidence=float(raw.get("confidence", 0.7)),
                 valid_from=_parse_date(raw.get("valid_from")),
                 valid_until=_parse_date(raw.get("valid_until")),
                 extraction_context=(
@@ -12287,12 +12293,12 @@ class Database:
             """INSERT INTO memories (
                 id, memory_type, content, content_hash, visibility, owner_user_id,
                 project_key, repo_identifier,
-                confidence, corroboration_count,
+                corroboration_count,
                 valid_from, valid_until,
                 superseded_by, status, retirement_reason, retired_at,
                 superseded_at, replacement_reason, replacement_kind, extraction_context,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 mem.id,
                 mem.memory_type,
@@ -12302,7 +12308,6 @@ class Database:
                 mem.owner_user_id,
                 project_key,
                 mem.repo_identifier,
-                mem.confidence,
                 mem.corroboration_count,
                 mem.valid_from.isoformat() if mem.valid_from else None,
                 mem.valid_until.isoformat() if mem.valid_until else None,
@@ -12334,12 +12339,12 @@ class Database:
             """INSERT INTO memories (
                 id, memory_type, content, content_hash, visibility, owner_user_id,
                 project_key, repo_identifier,
-                confidence, corroboration_count,
+                corroboration_count,
                 valid_from, valid_until,
                 superseded_by, status, retirement_reason, retired_at,
                 superseded_at, replacement_reason, replacement_kind, extraction_context,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 memory_type=excluded.memory_type,
                 content=excluded.content,
@@ -12348,7 +12353,6 @@ class Database:
                 owner_user_id=excluded.owner_user_id,
                 project_key=excluded.project_key,
                 repo_identifier=excluded.repo_identifier,
-                confidence=excluded.confidence,
                 corroboration_count=excluded.corroboration_count,
                 valid_from=excluded.valid_from,
                 valid_until=excluded.valid_until,
@@ -12370,7 +12374,6 @@ class Database:
                 mem.owner_user_id,
                 project_key,
                 mem.repo_identifier,
-                mem.confidence,
                 mem.corroboration_count,
                 mem.valid_from.isoformat() if mem.valid_from else None,
                 mem.valid_until.isoformat() if mem.valid_until else None,
@@ -12509,7 +12512,6 @@ class Database:
         display_anchor: str,
         claim_text: str,
         memory_type: str,
-        confidence: float,
         observed_at: datetime,
         source_updated_at: datetime | None,
         citations: list[str] | None = None,
@@ -12565,7 +12567,6 @@ class Database:
                     display_anchor=display_anchor,
                     claim_text=claim_text,
                     memory_type=memory_type,
-                    confidence=confidence,
                     memory_id=mem.id,
                     observed=observed,
                 )
@@ -12886,13 +12887,12 @@ class Database:
         self,
         memory_id: str,
         new_content: str,
-        new_confidence: float | None,
     ) -> None:
         async with self._write_lock:
             from memforge.models import content_hash
 
             async with self.db.execute(
-                "SELECT content_hash, confidence FROM memories WHERE id = ?",
+                "SELECT content_hash FROM memories WHERE id = ?",
                 (memory_id,),
             ) as cursor:
                 row = await cursor.fetchone()
@@ -12901,16 +12901,14 @@ class Database:
             if row["content_hash"] != content_hash(new_content):
                 await self._assert_no_active_source_support_unlocked(memory_id)
 
-            confidence = new_confidence if new_confidence is not None else row["confidence"]
             now = _now_iso()
             await self.db.execute(
                 """UPDATE memories SET
-                    content = ?, content_hash = ?, confidence = ?, updated_at = ?
+                    content = ?, content_hash = ?, updated_at = ?
                    WHERE id = ?""",
                 (
                     new_content,
                     content_hash(new_content),
-                    confidence,
                     now,
                     memory_id,
                 ),
@@ -13095,7 +13093,6 @@ class Database:
                     memory_type = ?, content = ?, content_hash = ?,
                     visibility = ?, owner_user_id = ?, project_key = ?,
                     repo_identifier = ?,
-                    confidence = ?,
                     corroboration_count = ?,
                     valid_from = ?, valid_until = ?, superseded_by = ?,
                     status = ?, retirement_reason = ?, retired_at = ?,
@@ -13110,7 +13107,6 @@ class Database:
                     memory.owner_user_id,
                     project_key,
                     memory.repo_identifier,
-                    memory.confidence,
                     memory.corroboration_count,
                     memory.valid_from.isoformat() if memory.valid_from else None,
                     memory.valid_until.isoformat() if memory.valid_until else None,
@@ -14604,7 +14600,6 @@ class Database:
         display_anchor: str,
         claim_text: str,
         memory_type: str,
-        confidence: float,
         memory_id: str,
         observed_at: datetime,
     ) -> None:
@@ -14616,7 +14611,6 @@ class Database:
                 display_anchor=display_anchor,
                 claim_text=claim_text,
                 memory_type=memory_type,
-                confidence=confidence,
                 memory_id=memory_id,
                 observed=observed,
             )
@@ -14630,22 +14624,19 @@ class Database:
         display_anchor: str,
         claim_text: str,
         memory_type: str,
-        confidence: float,
         memory_id: str,
         observed: str,
     ) -> None:
         await self.db.execute(
             """INSERT INTO agent_claims (
                 id, concept_id, display_anchor, claim_text, memory_type,
-                confidence, memory_id, created_at, updated_at,
-                last_observed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                memory_id, created_at, updated_at, last_observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 concept_id=excluded.concept_id,
                 display_anchor=excluded.display_anchor,
                 claim_text=excluded.claim_text,
                 memory_type=excluded.memory_type,
-                confidence=excluded.confidence,
                 memory_id=excluded.memory_id,
                 updated_at=excluded.updated_at,
                 last_observed_at=excluded.last_observed_at""",
@@ -14655,7 +14646,6 @@ class Database:
                 display_anchor,
                 claim_text,
                 memory_type,
-                confidence,
                 memory_id,
                 observed,
                 observed,
@@ -14680,7 +14670,6 @@ class Database:
         display_anchor: str,
         claim_text: str,
         memory_type: str,
-        confidence: float,
         observed_at: datetime,
         source_updated_at: datetime | None,
         citations: list[str] | None = None,
@@ -14708,12 +14697,12 @@ class Database:
                     """INSERT INTO memories (
                     id, memory_type, content, content_hash, visibility, owner_user_id,
                     project_key, repo_identifier,
-                    confidence, corroboration_count,
+                    corroboration_count,
                     valid_from, valid_until,
                     superseded_by, status, retirement_reason, retired_at,
                     superseded_at, replacement_reason, replacement_kind, extraction_context,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         new_memory.id,
                         new_memory.memory_type,
@@ -14723,7 +14712,6 @@ class Database:
                         new_memory.owner_user_id,
                         project_key,
                         new_memory.repo_identifier,
-                        new_memory.confidence,
                         new_memory.corroboration_count,
                         new_memory.valid_from.isoformat() if new_memory.valid_from else None,
                         new_memory.valid_until.isoformat() if new_memory.valid_until else None,
@@ -14753,15 +14741,13 @@ class Database:
                 await self.db.execute(
                     """INSERT INTO agent_claims (
                     id, concept_id, display_anchor, claim_text, memory_type,
-                    confidence, memory_id, created_at, updated_at,
-                    last_observed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    memory_id, created_at, updated_at, last_observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     concept_id=excluded.concept_id,
                     display_anchor=excluded.display_anchor,
                     claim_text=excluded.claim_text,
                     memory_type=excluded.memory_type,
-                    confidence=excluded.confidence,
                     memory_id=excluded.memory_id,
                     updated_at=excluded.updated_at,
                     last_observed_at=excluded.last_observed_at""",
@@ -14771,7 +14757,6 @@ class Database:
                         display_anchor,
                         claim_text,
                         memory_type,
-                        confidence,
                         new_memory.id,
                         created_at,
                         observed,
@@ -14969,88 +14954,6 @@ class Database:
                         source_updated_at=_parse_dt(d.get("source_updated_at")),
                     )
                 )
-        return results
-
-    async def get_source_support_candidates(
-        self,
-        *,
-        doc_id: str,
-        entity_ids: list[int],
-        project_key: str | None = None,
-        limit: int = 30,
-        writer_visibility: str | None = None,
-        writer_owner_user_id: str | None = None,
-        writer_project_key: str | None = None,
-        excluded_source_ids: Sequence[str] = (),
-    ) -> list[Memory]:
-        """Rank active memories that may be supported by the current document.
-
-        When ``writer_visibility`` is provided, the candidate pool is narrowed
-        to the same visibility tier as the writer; private writers see only
-        their own owner's set, and workspace writers see only candidates in
-        their own project. Callers that omit the writer args (legacy and tests)
-        receive the unscoped pool.
-        """
-        if not entity_ids:
-            return []
-
-        placeholders = ",".join("?" for _ in entity_ids)
-        scope_clauses: list[str] = []
-        scope_params: list[Any] = []
-        if writer_visibility is not None:
-            scope_clauses.append("AND m.visibility = ?")
-            scope_params.append(writer_visibility)
-            if writer_visibility == Visibility.PRIVATE.value and writer_owner_user_id is not None:
-                scope_clauses.append("AND m.owner_user_id = ?")
-                scope_params.append(writer_owner_user_id)
-            if writer_visibility == Visibility.WORKSPACE.value:
-                # NULL project_key is normalized to UNSORTED at persistence
-                # time; resolve the writer side the same way so the candidate
-                # pool stays inside one project boundary.
-                scope_clauses.append("AND m.project_key = ?")
-                scope_params.append(writer_project_key or UNSORTED_PROJECT_KEY)
-        if excluded_source_ids:
-            placeholders_sources = ",".join("?" for _ in excluded_source_ids)
-            scope_clauses.append(
-                f"""AND (
-                    NOT EXISTS (
-                        SELECT 1 FROM memory_sources ms_any
-                        WHERE ms_any.memory_id = m.id
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM memory_sources ms_enabled
-                        WHERE ms_enabled.memory_id = m.id
-                          AND (ms_enabled.source_id IS NULL OR ms_enabled.source_id NOT IN ({placeholders_sources}))
-                    )
-                )"""
-            )
-            scope_params.extend(excluded_source_ids)
-        scope_sql = ("\n              " + "\n              ".join(scope_clauses)) if scope_clauses else ""
-        sql = f"""
-            SELECT m.*,
-                   COUNT(DISTINCT me.entity_id) AS entity_overlap,
-                   CASE WHEN ? IS NOT NULL AND m.project_key = ? THEN 1 ELSE 0 END AS same_project
-            FROM memories m
-            JOIN memory_entities me ON m.id = me.memory_id
-            WHERE me.entity_id IN ({placeholders})
-              AND m.status = 'active'{scope_sql}
-              AND NOT EXISTS (
-                  SELECT 1 FROM memory_sources ms
-                  WHERE ms.memory_id = m.id AND ms.doc_id = ?
-              )
-            GROUP BY m.id
-            ORDER BY same_project DESC,
-                     entity_overlap DESC,
-                     m.corroboration_count DESC,
-                     m.confidence DESC,
-                     m.updated_at DESC
-            LIMIT ?
-        """
-        params = [project_key, project_key, *entity_ids, *scope_params, doc_id, limit]
-        results: list[Memory] = []
-        async with self.db.execute(sql, params) as cursor:
-            async for row in cursor:
-                results.append(self._row_to_memory(row))
         return results
 
     async def refresh_memory_support_state(
@@ -21787,7 +21690,6 @@ class Database:
             owner_user_id=d["owner_user_id"],
             project_key=d["project_key"],
             repo_identifier=d.get("repo_identifier"),
-            confidence=d["confidence"],
             corroboration_count=d["corroboration_count"],
             valid_from=_parse_date(d.get("valid_from")),
             valid_until=_parse_date(d.get("valid_until")),

@@ -22,6 +22,8 @@ from tests.unit_support_fixture import (
     withdraw_lifecycle_gate,
 )
 from tests.revision_client_fixture import (
+    FixtureRelationDecision,
+    FixtureRelationResponse,
     EvidenceSelection,
     RequiredSelection,
     RevisionClientFixture,
@@ -39,8 +41,6 @@ import pytest_asyncio
 from memforge.llm.structured import (
     CandidateAdmissionDecision,
     CandidateAdmissionResponse,
-    MemoryRelationDecision,
-    MemoryRelationResponse,
     StructuredLlmError,
 )
 from memforge.evals.agent_evaluation import (
@@ -495,7 +495,7 @@ def _uniform_relation_response(
     *,
     classification: str,
     reason: str,
-) -> MemoryRelationResponse:
+) -> FixtureRelationResponse:
     groups_json = prompt.split("<memory_pair_groups>\n", 1)[1].split(
         "\n</memory_pair_groups>",
         1,
@@ -506,9 +506,9 @@ def _uniform_relation_response(
         for group in groups
         for item in group["candidates"]
     ]
-    return MemoryRelationResponse(
+    return FixtureRelationResponse(
         decisions=[
-            MemoryRelationDecision(
+            FixtureRelationDecision(
                 pair_index=pair_index,
                 classification=classification,
                 direction="symmetric",
@@ -570,9 +570,9 @@ class _AdditiveRevisionClient(RevisionClientFixture):
             1,
         )[0]
         pair_index = json.loads(groups_json)[0]["candidates"][0]["pair_index"]
-        return MemoryRelationResponse(
+        return FixtureRelationResponse(
             decisions=[
-                MemoryRelationDecision(
+                FixtureRelationDecision(
                     pair_index=pair_index,
                     classification="refines",
                     direction="challenger_to_candidate",
@@ -615,9 +615,9 @@ class _RunbookComponentFallbackClient(RevisionClientFixture):
             1,
         )[0]
         pair_indices = [item["pair_index"] for group in json.loads(groups_json) for item in group["candidates"]]
-        return MemoryRelationResponse(
+        return FixtureRelationResponse(
             decisions=[
-                MemoryRelationDecision(
+                FixtureRelationDecision(
                     pair_index=pair_index,
                     classification="refines",
                     direction="challenger_to_candidate",
@@ -1590,7 +1590,6 @@ async def test_projected_lifecycle_records_low_value_admission_without_content(
             candidate_id="CND-0002",
             verdict="REJECTED",
             reject_reason="low_value",
-            reason=f"Do not persist: {instance_content}",
         ),
     )
     adapters = build_sqlite_adapters(db, object())
@@ -1823,9 +1822,9 @@ class _SemanticEquivalentClient(RevisionClientFixture):
         assert len(payload) == 1
         assert payload[0]["challenger"]["content"] == "A7 remains excluded."
         assert payload[0]["candidates"][0]["candidate"]["content"] == "A7 is removed."
-        return MemoryRelationResponse(
+        return FixtureRelationResponse(
             decisions=[
-                MemoryRelationDecision(
+                FixtureRelationDecision(
                     pair_index=payload[0]["candidates"][0]["pair_index"],
                     classification="equivalent",
                     direction="symmetric",
@@ -2353,7 +2352,6 @@ async def test_noop_rebinds_support_to_current_source_revision(db: Database) -> 
             RawMemory(
                 content=incumbent.content,
                 memory_type=incumbent.memory_type,
-                confidence=incumbent.confidence,
                 extraction_context="A7 is removed.",
                 evidence_quote="A7 is removed.",
             )
@@ -6303,8 +6301,8 @@ async def test_deferred_commit_rematerializes_without_semantic_replay(
     assert ineligible.value.commit_attempted is False
 
     await db.db.execute(
-        "UPDATE memories SET confidence = ? WHERE id = ?",
-        (0.1, scenario.incumbent.id),
+        "UPDATE memories SET repo_identifier = ? WHERE id = ?",
+        ("changed-before-commit", scenario.incumbent.id),
     )
     await db.db.commit()
     with pytest.raises(
@@ -6316,8 +6314,8 @@ async def test_deferred_commit_rematerializes_without_semantic_replay(
             eligible_same_run_source_unit_ids={scenario.alternative.source_units[0].id},
         )
     await db.db.execute(
-        "UPDATE memories SET confidence = ? WHERE id = ?",
-        (scenario.incumbent.confidence, scenario.incumbent.id),
+        "UPDATE memories SET repo_identifier = ? WHERE id = ?",
+        (scenario.incumbent.repo_identifier, scenario.incumbent.id),
     )
     await db.db.commit()
     await db.db.execute(
@@ -7003,7 +7001,6 @@ async def test_same_source_cross_unit_exact_claim_creates_its_own_memory(
     first_raw = RawMemory(
         content="A7 is retained for regular payroll.",
         memory_type="decision",
-        confidence=0.95,
         evidence_quote="A7 is retained for regular payroll.",
         source_observation_id=_body_observation(first).id,
     )
@@ -7142,7 +7139,6 @@ async def test_cross_source_exact_claim_creates_its_own_memory(
     raw = RawMemory(
         content="A7 is retained for regular payroll.",
         memory_type="decision",
-        confidence=0.95,
         evidence_quote="A7 is retained for regular payroll.",
         source_observation_id=_body_observation(second).id,
     )
@@ -7198,7 +7194,6 @@ async def test_projected_memory_support_survives_relation_work_retry_and_empty_c
     raw = RawMemory(
         content="A7 applies only to regular payroll.",
         memory_type="decision",
-        confidence=0.95,
         evidence_quote="A7 applies only to regular payroll.",
         extraction_context="A7 applies only to regular payroll.",
         evidence_anchor="projection_batch",
@@ -8313,7 +8308,6 @@ async def test_new_projected_memory_commit_survives_vector_outbox_delivery_failu
     raw = RawMemory(
         content="A7 applies only to regular payroll.",
         memory_type="decision",
-        confidence=0.95,
         evidence_quote="A7 applies only to regular payroll.",
         extraction_context="A7 applies only to regular payroll.",
     )
@@ -8382,18 +8376,10 @@ async def test_direct_terminal_transition_rejects_active_source_support(db: Data
     with pytest.raises(ValueError, match="active source support"):
         await db.update_memory_status(incumbent.id, "pending_review", reason="direct bypass")
     with pytest.raises(ValueError, match="active source support"):
-        await db.update_memory_content(
-            incumbent.id,
-            "A7 was mutated in place.",
-            None,
-        )
+        await db.update_memory_content(incumbent.id, "A7 was mutated in place.")
 
-    # Non-semantic metadata tuning does not invalidate source evidence.
-    await db.update_memory_content(
-        incumbent.id,
-        incumbent.content,
-        0.8,
-    )
+    # Rewriting the same content does not invalidate source evidence.
+    await db.update_memory_content(incumbent.id, incumbent.content)
 
     replacement = Memory(
         id="mem-direct-replacement",
@@ -8412,7 +8398,6 @@ async def test_direct_terminal_transition_rejects_active_source_support(db: Data
     stored = await db.get_memory(incumbent.id)
     assert stored is not None and stored.status == "active"
     assert stored.content == incumbent.content
-    assert stored.confidence == 0.8
     assert await db.get_memory(replacement.id) is None
 
 
@@ -8590,7 +8575,6 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
             RawMemory(
                 content="A7 is retained and marked as reduced retro chain.",
                 memory_type="decision",
-                confidence=0.95,
                 entity_refs=["A7"],
                 extraction_context="A7 is retained and marked as reduced retro chain.",
                 evidence_quote="A7 is retained and marked as reduced retro chain.",

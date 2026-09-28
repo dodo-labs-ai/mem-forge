@@ -111,7 +111,6 @@ def make_memory(
         owner_user_id=owner_user_id,
         project_key=project_key,
         repo_identifier=repo_identifier,
-        confidence=0.9,
         created_at=created_at or now,
         updated_at=updated_at or now,
         status=status,

@@ -138,7 +138,6 @@ class ToolClient:
         content: str,
         provenance: str,
         memory_type: str = "fact",
-        confidence: float | None = None,
         client: str = "codex",
         repo_identifier: str | None = None,
         idempotency_key: str | None = None,
@@ -149,8 +148,6 @@ class ToolClient:
             "client": client,
             "provenance": provenance,
         }
-        if confidence is not None:
-            body["confidence"] = confidence
         if repo_identifier:
             body["repo_identifier"] = repo_identifier
         if idempotency_key:

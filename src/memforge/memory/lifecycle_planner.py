@@ -738,7 +738,6 @@ def _review_mutation(
         staged["candidate"] = {
             "content": operation.memory.content,
             "memory_type": operation.memory.memory_type,
-            "confidence": operation.memory.confidence,
         }
     staged["proposed_disposition"] = disposition.value
     staged["replacement_memory_id"] = replacement_memory_id
@@ -782,7 +781,6 @@ def _memory_payload(
         "content": content,
         "content_hash": content_hash(content),
         "memory_type": raw.memory_type,
-        "confidence": raw.confidence,
         "visibility": defaults.visibility,
         "owner_user_id": defaults.owner_user_id,
         "project_key": defaults.project_key,

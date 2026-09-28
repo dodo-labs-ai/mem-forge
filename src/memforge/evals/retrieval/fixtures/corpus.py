@@ -86,7 +86,6 @@ async def _seed_memories(db: Database, fixture: Mapping[str, Any]) -> None:
                 memory_type=str(_value_or_default(memory, "memory_type", "fact")) if isinstance(memory, Mapping) else "fact",
                 content=content,
                 content_hash=content_hash(content),
-                confidence=float(_value_or_default(memory, "confidence", 0.9)) if isinstance(memory, Mapping) else 0.9,
                 visibility=str(_value_or_default(memory, "visibility", "workspace")) if isinstance(memory, Mapping) else "workspace",
                 owner_user_id=_value_or_default(memory, "owner_user_id", None) if isinstance(memory, Mapping) else None,
                 project_key=memory.get("project_key") if isinstance(memory, Mapping) else None,
