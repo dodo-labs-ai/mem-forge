@@ -49,12 +49,20 @@ class CrossDocumentRelationDecider(str, Enum):
     REVIEW = "review"
 
 
-CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION = "cross-document-relation-v2"
+CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION = "cross-document-relation-v3"
+# Classifier contracts that read the current ``RelationSubject`` input. An
+# evaluation case pinned under any of them holds the input this contract reads
+# and is replayed under it; a contract that changes the input is evaluated on a
+# set seeded again under it.
+CROSS_DOCUMENT_RELATION_INPUT_VERSIONS = frozenset(
+    {"cross-document-relation-v2", CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION}
+)
 
-# Requested output per request: a response envelope plus one label and one
-# sentence of reasoning per pair.
+# Requested output per request: a response envelope plus one label-only row per
+# pair. A {"pair_index": ..., "label": ...} row is under 20 tokens with its JSON
+# punctuation; the allowance rounds it up to cover large pair indexes.
 _OUTPUT_BASE_TOKENS = 256
-_OUTPUT_TOKENS_PER_PAIR = 192
+_OUTPUT_TOKENS_PER_PAIR = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +135,14 @@ class CrossDocumentRelationPair:
 class CrossDocumentRelationJudgment:
     pair: CrossDocumentRelationPair
     label: CrossDocumentRelationLabel
-    reason: str
+
+    @property
+    def recorded_label(self) -> CrossDocumentRelationLabel:
+        """The label this judgment is recorded with; see ``recorded_relation_label``."""
+
+        times = {subject.memory_id: subject.evidence_time for subject in (self.pair.challenger, self.pair.candidate)}
+        low_id, high_id = pair_key(*times)
+        return recorded_relation_label(self.label, low_id, high_id, times[low_id], times[high_id])
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,7 +257,6 @@ class CrossDocumentRelationRecord:
     high_content_hash: str
     low_evidence_time: str | None
     high_evidence_time: str | None
-    reason: str
     relation_run_id: str
     discovery_work_id: str
     classifier_version: str = CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
@@ -276,12 +290,11 @@ class CrossDocumentRelationRecord:
         return cls(
             memory_low_id=low_id,
             memory_high_id=high_id,
-            label=recorded_relation_label(judgment.label, low_id, high_id, low.evidence_time, high.evidence_time),
+            label=judgment.recorded_label,
             low_content_hash=low.content_hash,
             high_content_hash=high.content_hash,
             low_evidence_time=low.evidence_time,
             high_evidence_time=high.evidence_time,
-            reason=judgment.reason,
             relation_run_id=relation_run_id,
             discovery_work_id=discovery_work_id,
         )
@@ -368,7 +381,6 @@ class CurrentCrossDocumentRelation:
     high_content_hash: str
     low_evidence_time: str | None
     high_evidence_time: str | None
-    reason: str
     decided_by: CrossDocumentRelationDecider
     decided_at: str
 
@@ -438,13 +450,19 @@ Two statements are about the same situation only if all of these hold:
 - they have the same scope: the conditions under which one applies do not
   exclude the other;
 - they are the same kind of statement: both say what should be, both say
-  what actually happened, or both say what was planned or decided;
+  what actually happened, or both say what was planned or decided. Read the
+  kind from what each statement says, not from its memory type;
 - they concern the same occurrence: statements about different events or
   runs are about different situations, while two statements about the same
   lasting state or decision are about the same situation even when their
   sources recorded them at different times.
 If any of these differs, or the inputs do not establish it, the statements
 are not about the same situation.
+
+Decide whether the statements are about the same situation before deciding
+whether both can hold. When the statements overlap only in part, compare only
+the part they share. Compare only what the statements state: a conflict that
+has to be inferred from either statement is not a relation.
 
 Give every pair exactly one label:
 - none: the statements are not about the same situation, or they are about
@@ -466,7 +484,6 @@ CROSS_DOCUMENT_RELATION_PROMPT = CROSS_DOCUMENT_RELATION_RULES + """
 </statement_pair_groups>
 
 Return exactly one decision for every pair_index and no other pair_index.
-Keep each reason to one sentence.
 """
 
 
@@ -528,7 +545,6 @@ class StructuredCrossDocumentRelationClassifier:
                 yield str(pair_index), CrossDocumentRelationJudgment(
                     pair=pairs[pair_index],
                     label=CrossDocumentRelationLabel(decision.label),
-                    reason=decision.reason.strip(),
                 )
 
         judgments = await run_pair_items(

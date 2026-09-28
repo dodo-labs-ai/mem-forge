@@ -728,7 +728,6 @@ class MemoryRelationContext:
     label: str
     role: str
     counterpart: RelatedMemory
-    reason: str
     decided_by: str
 
 
