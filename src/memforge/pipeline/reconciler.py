@@ -386,7 +386,6 @@ def _transient_candidate(index: int, raw: RawMemory) -> Memory:
         content=raw.content,
         content_hash=content_hash(raw.content),
         entity_refs=list(raw.entity_refs),
-        confidence=raw.confidence,
         valid_from=parse_memory_validity_date(raw.valid_from),
         valid_until=parse_memory_validity_date(raw.valid_until),
     )

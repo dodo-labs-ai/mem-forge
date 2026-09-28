@@ -281,8 +281,8 @@ async def test_sqlite_active_memories_chunk_large_bind_sets(
     await db.db.executemany(
         """INSERT INTO memories (
                id, memory_type, content, content_hash, visibility,
-               confidence, status, created_at, updated_at
-           ) VALUES (?, 'fact', ?, ?, 'workspace', 0.9, 'active', ?, ?)""",
+               status, created_at, updated_at
+           ) VALUES (?, 'fact', ?, ?, 'workspace', 'active', ?, ?)""",
         tuple((memory_id, f"content for {memory_id}", f"hash-{memory_id}", now, now) for memory_id in memory_ids),
     )
     await db.db.commit()
@@ -373,7 +373,6 @@ def _memory(
         content_hash=content_hash(f"content for {mem_id}"),
         visibility=visibility,
         owner_user_id=owner_user_id,
-        confidence=0.9,
         created_at=now,
         updated_at=now,
         status=status,

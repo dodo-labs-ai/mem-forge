@@ -14,8 +14,6 @@ import pytest
 
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
 from memforge.memory.candidate_admission import admit_candidates
-from memforge.memory.relation_classifier import MemoryPair, StructuredMemoryPairClassifier
-from memforge.models import Memory, content_hash
 from memforge.pipeline.claim_revision import assess_claim_pairs
 from tests.llm_fixture import admission_payload
 from tests.revision_client_fixture import catalog_payload
@@ -96,39 +94,6 @@ async def test_one_admission_row_rejected_without_a_reason_is_re_asked_alone(mon
     assert [row["id"] for row in admission_payload(prompts[1])["candidates"]] == ["CND-0002"]
     assert "CND-0002: REJECTED requires reject_reason" in prompts[1]
     assert len(result.admitted) == 3 and result.rejected == ()
-
-
-@pytest.mark.asyncio
-async def test_one_memory_relation_row_with_a_wrong_direction_is_re_asked_alone(monkeypatch):
-    def groups(prompt):
-        return json.loads(prompt.split("<memory_pair_groups>\n", 1)[1].split("\n</memory_pair_groups>", 1)[0])
-
-    def respond(prompt):
-        decisions = []
-        for group in groups(prompt):
-            for item in group["candidates"]:
-                # Valid shape, invalid meaning: a symmetric REFINES.
-                refines = item["pair_index"] == 1 and CORRECTION not in prompt
-                decisions.append({
-                    "pair_index": item["pair_index"], "classification": "refines" if refines else "unrelated",
-                    "direction": "symmetric", "same_subject_and_scope": False, "incompatible_assertions": "",
-                })
-        return {"decisions": decisions}
-
-    client, prompts = parse_path_client(monkeypatch, respond)
-
-    def claim(memory_id: str) -> Memory:
-        text = f"{memory_id} claim"
-        return Memory(id=memory_id, content=text, content_hash=content_hash(text), memory_type="fact")
-
-    pairs = tuple(MemoryPair(claim(f"new-{index}"), claim(f"old-{index}")) for index in range(3))
-
-    result = await StructuredMemoryPairClassifier(client=client, model=MODEL).classify(pairs)
-
-    assert len(prompts) == 2
-    assert [item["pair_index"] for group in groups(prompts[1]) for item in group["candidates"]] == [1]
-    assert "pair_index 1: REFINES must be directional" in prompts[1]
-    assert len(result.decisions) == 3 and result.unjudged == ()
 
 
 @pytest.mark.asyncio

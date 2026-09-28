@@ -584,7 +584,6 @@ class RelationalStore(Protocol):
         display_anchor: str,
         claim_text: str,
         memory_type: str,
-        confidence: float,
         observed_at: datetime,
         citations: list[str] | None = None,
         concept_projection: Mapping[str, object] | None = None,

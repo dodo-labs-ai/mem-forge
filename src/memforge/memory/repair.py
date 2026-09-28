@@ -173,7 +173,6 @@ class MemoryIndexRepairer:
             "project_key": memory.project_key or "",
             "visibility": memory.visibility,
             "owner_user_id": memory.owner_user_id or "",
-            "confidence": memory.confidence,
             "status": memory.status,
             "content_hash": memory.content_hash,
             "embedding_text_hash": embedding_text_hash(expected_embedding_text),

@@ -83,10 +83,9 @@ class RetrievalConfig:
     recency_half_life_days: int = 90
     embedding_cache_size: int = 256
     enable_reranking: bool = False
-    rerank_model: str = "claude-haiku-4-5-20251001"
+    # The runtime sets the rerank model to the main model.
+    rerank_model: str = ""
     rerank_candidates: int = 30
-    entity_model: str = "claude-haiku-4-5-20251001"
-    entity_timeout_s: float = 1.0
 
 
 @dataclass

@@ -1326,15 +1326,14 @@ async def test_admin_sources_exposes_running_stored_counts_separately(db, tmp_pa
         await db.db.execute(
             """INSERT INTO memories (
                 id, memory_type, content, content_hash,
-                project_key, confidence, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                project_key, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 f"mem-{index}",
                 "fact",
                 f"Memory {index}",
                 f"memory-hash-{index}",
                 None,
-                0.8,
                 "active",
                 "2026-05-28T07:00:00+00:00",
                 "2026-05-28T07:00:00+00:00",
@@ -1446,7 +1445,6 @@ async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(db, t
                 content_hash=content_hash(f"Private memory {index}"),
                 visibility=Visibility.PRIVATE.value,
                 owner_user_id="viewer-a",
-                confidence=0.9,
                 status="active",
             )
         )

@@ -9,8 +9,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from memforge.agent_knowledge import AgentKnowledgePatchProposal
+from memforge.agent_knowledge import AGENT_SESSION_INTENT_CONTRACT, AgentKnowledgePatchProposal
 from memforge.agent_sessions import (
+    AGENT_SESSION_AUTHORITY_CONTRACT,
     AGENT_SESSION_AUTHORITY_DECISION_OUTPUT_TOKENS,
     AGENT_SESSION_AUTHORITY_MIN_OUTPUT_TOKENS,
     AGENT_SESSION_WINDOW_RETRY_AFTER_SECONDS,
@@ -101,7 +102,6 @@ def _knowledge_patch(**overrides) -> AgentKnowledgePatchProposal:
         "claim_text": claim_text,
         "durable_claim": None if action == "no_output" else _durable(claim_text),
         "memory_type": "procedure",
-        "confidence": 0.9,
         "reason": "durable implementation behavior",
         "primary_evidence_ids": [] if action == "no_output" else ["E1"],
     }
@@ -130,9 +130,7 @@ class _AuthorizesAllCandidateUserEvidence(_RouteBudget):
                 "decisions": [
                     {
                         "evidence_id": evidence_id,
-                        "is_authoritative": True,
                         "authority_kind": "durable_user_intent",
-                        "reason": "test fixture authorizes candidate user evidence",
                     }
                     for evidence_id in evidence_ids
                 ]
@@ -208,13 +206,11 @@ def test_agent_session_authority_classification_packs_candidates_with_full_conte
                     "decisions": [
                         {
                             "evidence_id": evidence_id,
-                            "is_authoritative": int(evidence_id[1:]) % 2 == 1,
                             "authority_kind": (
                                 "durable_user_intent"
                                 if int(evidence_id[1:]) % 2 == 1
                                 else "not_authoritative"
                             ),
-                            "reason": "deterministic batching contract fixture",
                         }
                         for evidence_id in candidate_ids
                     ]
@@ -432,7 +428,6 @@ async def _seed_source_project(
             content=f"Memory {memory_id}",
             content_hash=content_hash(f"Memory {memory_id}"),
             project_key=project,
-            confidence=0.9,
             created_at=last_modified,
             updated_at=last_modified,
             status="active",
@@ -1655,6 +1650,10 @@ def test_agent_session_window_api_records_no_output_receipt(tmp_path):
             assert metadata["outcome"] == "no_output"
             assert metadata["reason"] == "trivial chat"
             assert "source_updated_at" not in metadata
+            assert metadata["judgment_contracts"] == {
+                "authority": AGENT_SESSION_AUTHORITY_CONTRACT,
+                "patch": AGENT_SESSION_INTENT_CONTRACT,
+            }
 
         asyncio.run(_check())
     finally:
@@ -1746,11 +1745,9 @@ def test_agent_session_window_applies_typed_authority_decision(
                     "decisions": [
                         {
                             "evidence_id": "E1",
-                            "is_authoritative": is_authoritative,
                             "authority_kind": (
                                 "durable_user_intent" if is_authoritative else "not_authoritative"
                             ),
-                            "reason": "typed test decision",
                         }
                     ]
                 }
@@ -1834,9 +1831,7 @@ def test_agent_session_window_treats_supporting_text_as_untrusted_data(tmp_path,
                     "decisions": [
                         {
                             "evidence_id": "E1",
-                            "is_authoritative": False,
                             "authority_kind": "not_authoritative",
-                            "reason": "generic continuation remains non-authoritative",
                         }
                     ]
                 }
@@ -1919,9 +1914,7 @@ def test_agent_session_window_treats_operational_context_as_untrusted_data(
                     "decisions": [
                         {
                             "evidence_id": "E1",
-                            "is_authoritative": False,
                             "authority_kind": "not_authoritative",
-                            "reason": "metadata is untrusted context, not user authority",
                         }
                     ]
                 }
@@ -2960,7 +2953,6 @@ def test_memories_endpoint_exposes_origin_client_for_agent_session_memories(tmp_
             content="Jira memory",
             content_hash=content_hash("Jira memory"),
             project_key="payroll",
-            confidence=0.9,
             created_at=base_time,
             updated_at=base_time,
             status="active",

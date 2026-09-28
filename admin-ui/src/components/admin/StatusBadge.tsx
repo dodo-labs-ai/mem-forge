@@ -32,8 +32,3 @@ export function StatusDot({ status, className }: { status: string; className?: s
     />
   );
 }
-
-export function ConfidenceBadge({ confidence }: { confidence: number }) {
-  const label = confidence >= 0.8 ? "Strong" : confidence >= 0.55 ? "Moderate" : "Low";
-  return <Badge variant="secondary">{label}</Badge>;
-}
