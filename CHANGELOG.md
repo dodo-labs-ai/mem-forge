@@ -9,7 +9,8 @@
   both Memories of an `equivalent` pair, each naming the other, instead of
   leaving one out. A completed discovery run replaces every relation the
   classifier recorded for its work, so a re-run keeps no relation for a pair it
-  no longer judges; relations a person confirmed and dismissals stay. To apply
+  no longer judges, and a re-run that finds its work obsolete keeps none from
+  that work; relations a person confirmed and dismissals stay. To apply
   `v4` to existing Memories, re-run completed work with
   `POST /api/v1/relation-discovery/work/rerun` and `{"state": "completed"}`.
 - A Memory has no confidence. The Memory API, Review summaries, search

@@ -8203,6 +8203,35 @@ async def test_a_rerun_drops_the_relations_its_work_decided_for_pairs_it_no_long
 
 
 @pytest.mark.asyncio
+async def test_a_rerun_that_becomes_obsolete_drops_the_relations_its_work_decided(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    challenger, candidate = await _relation_pair_fixture(db, run_id="projection-relation-rerun-obsolete")
+    first = await _run_relation_discovery(db, candidate, CrossDocumentRelationLabel.CONTRADICTS)
+    assert first.completed_work == 1
+    assert [row["label"] for row in await _stored_relations(db)] == ["contradicts"]
+
+    rerun = await db.rerun_relation_discovery_work(
+        RelationDiscoveryWorkSelection(
+            state=RelationDiscoveryWorkState.COMPLETED,
+            max_attempts=DEFAULT_RELATION_DISCOVERY_BUDGET.max_attempts,
+        ),
+        actor="operator-1",
+    )
+    assert rerun == 1
+
+    async def no_current_evidence_unit(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(db, "get_current_relation_evidence_unit", no_current_evidence_unit)
+    second = await _run_relation_discovery(db, candidate, CrossDocumentRelationLabel.CONTRADICTS)
+
+    assert second.obsolete_work == 1
+    assert (await db.get_memory(challenger.id)).status == "active"
+    assert await _stored_relations(db) == []
+
+
+@pytest.mark.asyncio
 async def test_a_rerun_keeps_relations_a_person_confirmed_or_another_work_decided(db: Database) -> None:
     challenger, candidate = await _relation_pair_fixture(db, run_id="projection-relation-rerun-keeps")
     other = Memory(
