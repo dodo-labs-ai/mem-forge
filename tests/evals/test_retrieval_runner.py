@@ -204,20 +204,19 @@ async def test_sqlite_runner_applies_time_range(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sqlite_fixture_preserves_visibility_repo_and_zero_confidence(tmp_path) -> None:
+async def test_sqlite_fixture_preserves_visibility_and_repo(tmp_path) -> None:
     from memforge.evals.retrieval import load_case_set
     from memforge.evals.retrieval.fixtures.corpus import seed_sqlite_fixture
 
     fixture = deepcopy(load_case_set("retrieval-core-v1").manifest.fixtures["default"])
     fixture["memories"].append(
         {
-            "id": "mem-private-low-confidence",
+            "id": "mem-private",
             "content": "Private fixture memory.",
-            "confidence": 0.0,
-                "visibility": "private",
-                "owner_user_id": "eval-user",
-                "repo_identifier": "repo/example",
-            }
+            "visibility": "private",
+            "owner_user_id": "eval-user",
+            "repo_identifier": "repo/example",
+        }
     )
 
     db = await seed_sqlite_fixture(
@@ -225,12 +224,11 @@ async def test_sqlite_fixture_preserves_visibility_repo_and_zero_confidence(tmp_
         fixture=fixture,
     )
     try:
-        memory = await db.get_memory("mem-private-low-confidence")
+        memory = await db.get_memory("mem-private")
     finally:
         await db.close()
 
     assert memory is not None
-    assert memory.confidence == 0.0
     assert memory.visibility == "private"
     assert memory.owner_user_id == "eval-user"
     assert memory.repo_identifier == "repo/example"

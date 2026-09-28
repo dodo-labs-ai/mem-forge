@@ -3192,7 +3192,6 @@ def test_mcp_proxy_forwards_create_memory_with_plugin_client_context(monkeypatch
             "content": "Use readable confirmation previews before memory mutations.",
             "provenance": "User asked to remember this after reviewing the MemForge MCP UX.",
             "memory_type": "convention",
-            "confidence": 0.9,
         },
     )
 
@@ -3203,7 +3202,6 @@ def test_mcp_proxy_forwards_create_memory_with_plugin_client_context(monkeypatch
         "content": "Use readable confirmation previews before memory mutations.",
         "provenance": "User asked to remember this after reviewing the MemForge MCP UX.",
         "memory_type": "convention",
-        "confidence": 0.9,
         "client": "claude-code",
         "repo_identifier": "github.com/shno-labs/mem-forge",
     }
@@ -3895,7 +3893,6 @@ def test_mcp_proxy_compacts_search_response_for_agent_context(monkeypatch):
                             "memory_id": "mem-1",
                             "memory_type": "fact",
                             "summary": "Create blocker hint task details",
-                            "confidence": 0.9,
                             "relevance_score": 0.99,
                             "freshness": "current",
                             "status": "active",
@@ -3931,7 +3928,6 @@ def test_mcp_proxy_compacts_search_response_for_agent_context(monkeypatch):
                 "memory_id": "mem-1",
                 "memory_type": "fact",
                 "summary": "Create blocker hint task details",
-                "confidence": 0.9,
                 "relevance_score": 0.99,
                 "freshness": "current",
                 "status": "active",
@@ -3975,7 +3971,6 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
                     "visibility": "workspace",
                     "owner_user_id": "user-1",
                     "project_key": "PAY",
-                    "confidence": 0.93,
                     "corroboration_count": 1,
                     "status": "active",
                     "retirement_reason": None,
@@ -4029,7 +4024,6 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
         "memory_type": "procedure",
         "content": "Persist blocker hints.",
         "content_hash": "sha256-secret",
-        "confidence": 0.93,
         "status": "active",
         "entity_refs": ["periodcutoffblockerhint"],
         "evidence": [

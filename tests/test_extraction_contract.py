@@ -65,7 +65,7 @@ def _planned_requests(projection, authority):
 def test_extraction_contract_version_is_pinned_into_derivation_identity() -> None:
     # Stored derivations and batch ids hash this value; changing it supersedes
     # every stored derivation instead of resuming it.
-    assert PROJECTION_EXTRACTION_CONTRACT_VERSION == "projection-extraction-v9"
+    assert PROJECTION_EXTRACTION_CONTRACT_VERSION == "projection-extraction-v10"
 
 
 def test_extraction_prompt_carries_the_durable_memory_quality_contract() -> None:

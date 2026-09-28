@@ -12,17 +12,18 @@ import json
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 
-from memforge.llm.structured import (
-    MemoryRelationDecision,
-    MemoryRelationResponse,
-    SupportAssessmentWireResponse,
-)
+from memforge.llm.structured import SupportAssessmentWireResponse
 from memforge.memory.engine import MemoryEngine
 from memforge.models import RawMemory
 from memforge.source_projection import SourceProjection
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
-from tests.revision_client_fixture import FixtureSupport, RevisionClientFixture
+from tests.revision_client_fixture import (
+    FixtureRelationDecision,
+    FixtureRelationResponse,
+    FixtureSupport,
+    RevisionClientFixture,
+)
 from tests.test_projected_lifecycle_integration import (
     _OutboxDrainer,
     _candidate_retriever,
@@ -64,13 +65,13 @@ class ScriptedClient(RevisionClientFixture):
         for group in groups:
             for item in group["candidates"]:
                 label = self.relations.get((group["challenger"]["content"], item["content"]), "unrelated")
-                decisions.append(MemoryRelationDecision(
+                decisions.append(FixtureRelationDecision(
                     pair_index=item["pair_index"], classification=label, direction="symmetric",
                     same_subject_and_scope=label == "contradicts",
                     incompatible_assertions="the reviewer counts differ" if label == "contradicts" else "",
                     reason=f"fixture {label}",
                 ))
-        return MemoryRelationResponse(decisions=decisions)
+        return FixtureRelationResponse(decisions=decisions)
 
     def judge_change_impact(self, work, payload):
         return self.impact

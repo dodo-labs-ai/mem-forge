@@ -576,7 +576,7 @@ class RelationDecision:
     candidate_memory_id: str
     relation_type: RelationType
     authority_case: AuthorityCase
-    confidence: float
+    confidence: float | None = None
     reason: str | None = None
     proposed_memory_content: str | None = None
     evidence_excerpt: str | None = None

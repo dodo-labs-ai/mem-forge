@@ -8,6 +8,8 @@ import hashlib
 import json
 
 from tests.revision_client_fixture import (
+    FixtureRelationDecision,
+    FixtureRelationResponse,
     RevisionClientFixture,
     RevisionProof,
     RevisionProofs,
@@ -15,11 +17,7 @@ from tests.revision_client_fixture import (
 
 import pytest
 
-from memforge.llm.structured import (
-    MemoryRelationDecision,
-    MemoryRelationResponse,
-    StructuredLlmError,
-)
+from memforge.llm.structured import StructuredLlmError
 from memforge.memory.evidence import (
     EvidencePartKind,
     EvidenceRole,
@@ -99,13 +97,13 @@ def _with_selection(raw: RawMemory) -> RawMemory:
     )
 
 
-def _relations_from_prompt(prompt: str, classification: str = "unrelated") -> MemoryRelationResponse:
+def _relations_from_prompt(prompt: str, classification: str = "unrelated") -> FixtureRelationResponse:
     groups = json.loads(
         prompt.split("<memory_pair_groups>\n", 1)[1].split("\n</memory_pair_groups>", 1)[0]
     )
-    return MemoryRelationResponse(
+    return FixtureRelationResponse(
         decisions=[
-            MemoryRelationDecision(
+            FixtureRelationDecision(
                 pair_index=item["pair_index"],
                 classification=classification,
                 direction="symmetric",
@@ -118,10 +116,10 @@ def _relations_from_prompt(prompt: str, classification: str = "unrelated") -> Me
     )
 
 
-def _single_refines_response() -> MemoryRelationResponse:
-    return MemoryRelationResponse(
+def _single_refines_response() -> FixtureRelationResponse:
+    return FixtureRelationResponse(
         decisions=[
-            MemoryRelationDecision(
+            FixtureRelationDecision(
                 pair_index=0,
                 classification="refines",
                 direction="challenger_to_candidate",
@@ -150,9 +148,9 @@ async def test_supported_incumbent_and_unrelated_case25_keep_and_add() -> None:
     class RelationFirstClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
-            return MemoryRelationResponse(
+            return FixtureRelationResponse(
                 decisions=[
-                    MemoryRelationDecision(
+                    FixtureRelationDecision(
                         pair_index=0,
                         classification="unrelated",
                         direction="symmetric",
@@ -196,9 +194,9 @@ async def test_additive_refinement_with_complete_current_evidence_is_revision() 
     class RevisionClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
-            return MemoryRelationResponse(
+            return FixtureRelationResponse(
                 decisions=[
-                    MemoryRelationDecision(
+                    FixtureRelationDecision(
                         pair_index=0,
                         classification="refines",
                         direction="challenger_to_candidate",
@@ -645,7 +643,7 @@ async def test_refinements_whose_comparison_stays_invalid_leave_their_edges_unce
 
     class InvalidComparisonClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **kwargs):
-            return MemoryRelationResponse(decisions=[])
+            return FixtureRelationResponse(decisions=[])
 
     incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
     refinements = [

@@ -33,7 +33,6 @@ def _memory(
         content=content,
         content_hash=content_hash(content),
         project_key=project_key,
-        confidence=0.91,
         created_at=now,
         updated_at=now,
         status="active",

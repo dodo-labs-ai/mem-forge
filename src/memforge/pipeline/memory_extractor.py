@@ -68,7 +68,6 @@ Only the following application-owned Evidence Fragments may support a Memory:
 Each Memory must contain exactly:
 - "content": one self-contained durable claim
 - "memory_type": one of "fact", "decision", "convention", "procedure"
-- "confidence": 0.0-1.0
 - "entity_refs": entity names copied from supporting Fragments
 - "valid_from": YYYY-MM-DD or null
 - "valid_until": YYYY-MM-DD or null
@@ -250,8 +249,8 @@ class MemoryExtractor:
         )
         if not callable(invoke):
             return MemoryExtractionResult(
-                error_type="projection_extraction_v9_unavailable",
-                error="Structured client does not implement projection-extraction-v9",
+                error_type="projection_extraction_unavailable",
+                error=f"Structured client does not implement {PROJECTION_EXTRACTION_CONTRACT_VERSION}",
             )
         reading = ExtractionReading(catalog, revision_context, source_type=source_type, doc_type=doc_type)
         runner = LlmBatchRunner(self.structured_llm_client, model=self.model)
@@ -425,7 +424,6 @@ class _SelectionResolution:
                 RawMemory(
                     content=candidate.content,
                     memory_type=candidate.memory_type,
-                    confidence=candidate.confidence,
                     entity_refs=list(candidate.entity_refs),
                     valid_from=candidate.valid_from,
                     valid_until=candidate.valid_until,

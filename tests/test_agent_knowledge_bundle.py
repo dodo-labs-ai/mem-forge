@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import pytest
 
 from memforge.agent_knowledge import (
+    AGENT_CLAIM_CREATED_REASON,
     AgentKnowledgeBundleService,
     AgentKnowledgePatchProposal,
     render_agent_knowledge_patch_prompt,
@@ -109,7 +110,6 @@ def _proposal(**overrides) -> AgentKnowledgePatchProposal:
         },
         "memory_type": "procedure",
         "reason": "The window confirms a durable scheduler invariant.",
-        "confidence": 0.9,
         "citations": ["agent-window://codex/sess-1/sha256-window"],
     }
     base.update(overrides)
@@ -305,6 +305,31 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
     ]
     assert await _support_evidence_unit_ids(db, result.memory_id) == {evidence_unit.id}
     assert await _stale_support_part_count(db, result.memory_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_created_claim_without_reason_records_program_reason(bundle_stack):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+
+    result = await service.apply_patch_proposal(
+        proposal=_proposal(reason=""),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        submitted_at=datetime(2026, 6, 18, 12, 0, tzinfo=timezone.utc),
+        source_updated_at=None,
+    )
+
+    [relation_run] = await _relation_runs_for_memory(db, result.memory_id)
+    evidence_unit = await db.get_evidence_unit(relation_run["evidence_unit_id"])
+    assert evidence_unit.source_metadata["reason"] == AGENT_CLAIM_CREATED_REASON
+    relations = await db.get_evidence_relations(evidence_unit.id)
+    assert [relation.reason for relation in relations] == [AGENT_CLAIM_CREATED_REASON]
 
 
 @pytest.mark.asyncio
@@ -1538,7 +1563,6 @@ async def test_update_existing_claim_records_complete_mandatory_candidate_univer
         memory_type="procedure",
         content="A separate scheduler claim under the same concept remains active.",
         content_hash=content_hash("A separate scheduler claim under the same concept remains active."),
-        confidence=0.9,
         visibility=Visibility.PRIVATE.value,
         owner_user_id="u-andrew",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",

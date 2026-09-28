@@ -306,7 +306,6 @@ def _memory(mem_id: str, content: str, *, status: str = "active") -> Memory:
         memory_type="fact",
         content=content,
         content_hash=content_hash(content),
-        confidence=0.9,
         created_at=now,
         updated_at=now,
         status=status,
@@ -512,7 +511,6 @@ async def test_agent_claim_retry_with_unknown_source_timestamp_clears_stale_valu
         display_anchor="source-updated",
         claim_text="Agent claim source timestamp",
         memory_type="fact",
-        confidence=0.9,
         observed_at=observed_at,
         source_updated_at=source_updated_at,
         concept_projection={
@@ -541,7 +539,6 @@ async def test_agent_claim_retry_with_unknown_source_timestamp_clears_stale_valu
         display_anchor="source-updated",
         claim_text="Agent claim source timestamp",
         memory_type="fact",
-        confidence=0.9,
         observed_at=observed_at,
         source_updated_at=None,
         concept_projection={
@@ -723,12 +720,12 @@ async def test_update_memory_refreshes_chroma_embedding(db: Database):
     collection = RecordingCollection()
     store = _store(db, collection)
 
-    await store.update_memory(memory.id, "New content", new_confidence=0.8)
+    await store.update_memory(memory.id, "New content")
 
     stored = await db.get_memory(memory.id)
     audit_rows = await db.list_memory_audit_events(event_type="memory_update_committed")
     assert stored.content == "New content"
-    assert collection.upserted[memory.id]["confidence"] == 0.8
+    assert collection.upserted[memory.id]["content_hash"] == stored.content_hash
     assert [row.memory_id for row in audit_rows] == [memory.id]
 
 
@@ -1927,12 +1924,11 @@ async def test_update_memory_restores_sqlite_when_chroma_upsert_fails(db: Databa
     store = _store(db, FailingUpsertCollection())
 
     with pytest.raises(RuntimeError, match="upsert failed"):
-        await store.update_memory(memory.id, "New content", new_confidence=0.4)
+        await store.update_memory(memory.id, "New content")
 
     stored = await db.get_memory(memory.id)
     audit_rows = await db.list_memory_audit_events(memory_id=memory.id)
     assert stored.content == "Old content"
-    assert stored.confidence == 0.9
     assert stored.content_hash == memory.content_hash
     assert "memory_update_committed" not in {row.event_type for row in audit_rows}
 
@@ -1950,7 +1946,7 @@ async def test_update_memory_restores_chroma_when_upsert_mutates_then_fails(db: 
     store = _store(db, collection)
 
     with pytest.raises(RuntimeError, match="upsert failed after mutation"):
-        await store.update_memory(memory.id, "New content", new_confidence=0.4)
+        await store.update_memory(memory.id, "New content")
 
     stored = await db.get_memory(memory.id)
     assert stored.content == "Old content"
@@ -1970,11 +1966,10 @@ async def test_update_memory_restores_sqlite_when_reembedding_fails(db: Database
     store._embed = fail_embed  # type: ignore[assignment]
 
     with pytest.raises(RuntimeError, match="embedding failed"):
-        await store.update_memory(memory.id, "New content", new_confidence=0.4)
+        await store.update_memory(memory.id, "New content")
 
     stored = await db.get_memory(memory.id)
     assert stored.content == "Old content"
-    assert stored.confidence == 0.9
     assert memory.id not in collection.upserted
 
 

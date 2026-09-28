@@ -38,7 +38,6 @@ def _memory(
         memory_type="fact",
         content=content,
         content_hash=content_hash(content),
-        confidence=0.9,
         created_at=now,
         updated_at=updated_at or now,
         status=status,

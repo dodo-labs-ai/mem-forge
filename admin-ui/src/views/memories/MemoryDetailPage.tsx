@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, ArrowLeft, ExternalLink, Loader2 } from "lucide-react";
 import { resourceClient } from "@/api/client";
 import type { Memory, MemoryEvidenceGroup } from "@/api/types";
-import { ConfidenceBadge, MemoryTypeBadge, StatusDot } from "@/components/admin/StatusBadge";
+import { MemoryTypeBadge, StatusDot } from "@/components/admin/StatusBadge";
 import { MemoryTypeIcon } from "@/components/memories/MemoryTypeIcon";
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { Badge } from "@/components/ui/badge";
@@ -125,13 +125,7 @@ export function MemoryDetailPage() {
         <CardContent>
           <p className="mb-6 text-base leading-relaxed text-foreground">{memory.content}</p>
 
-          <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-4">
-            <div>
-              <span className="text-xs text-muted-foreground">Confidence</span>
-              <div className="mt-1">
-                <ConfidenceBadge confidence={memory.confidence} />
-              </div>
-            </div>
+          <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-3">
             <div>
               <span className="text-xs text-muted-foreground">Corroborations</span>
               <div className="mt-1 text-foreground">{memory.corroboration_count}</div>
