@@ -2115,9 +2115,10 @@ async def test_cross_document_relations_reject_a_refused_empty_reply(
 @pytest.mark.parametrize(
     "decision",
     [
-        {"pair_index": 0, "label": "refines", "reason": "narrower"},
-        {"pair_index": 0, "label": "none", "reason": "", "direction": "symmetric"},
-        {"pair_index": -1, "label": "none", "reason": ""},
+        {"pair_index": 0, "label": "refines"},
+        {"pair_index": 0, "label": "none", "direction": "symmetric"},
+        {"pair_index": 0, "label": "none", "reason": "a later decision"},
+        {"pair_index": -1, "label": "none"},
     ],
 )
 def test_cross_document_relation_schema_accepts_only_the_closed_labels(decision) -> None:
@@ -2128,7 +2129,7 @@ def test_cross_document_relation_schema_accepts_only_the_closed_labels(decision)
     with pytest.raises(ValidationError):
         CrossDocumentRelationResponse.model_validate({"decisions": [decision]})
     assert CrossDocumentRelationResponse.model_validate(
-        {"decisions": [{"pair_index": 0, "label": "updates", "reason": "a later decision"}]}
+        {"decisions": [{"pair_index": 0, "label": "updates"}]}
     ).decisions[0].label == "updates"
 
 

@@ -799,7 +799,6 @@ class MemoryRelationDetail(BaseModel):
     label: RelationLabelLiteral
     role: Literal["newer", "older", "peer"]
     counterpart: RelatedMemoryDetail
-    reason: str
     decided_by: Literal["classifier", "review"]
 
 
@@ -816,7 +815,6 @@ class DismissedRelationDetail(BaseModel):
 class RelationPairDetail(BaseModel):
     label: RelationLabelLiteral
     newer_memory_id: str | None = None
-    reason: str
     decided_by: Literal["classifier", "review"]
     decided_at: str
     memories: list[RelatedMemoryDetail]

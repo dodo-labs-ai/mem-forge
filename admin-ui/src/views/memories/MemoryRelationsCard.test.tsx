@@ -89,7 +89,6 @@ describe("Memory relations", () => {
             label: "updates",
             role: "older",
             counterpart,
-            reason: "The close day moved.",
             decided_by: "classifier",
           },
         ],

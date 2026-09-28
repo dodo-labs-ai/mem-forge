@@ -26,6 +26,7 @@ from memforge.llm.batch_runner import ItemFailure, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import OfflineSemanticJudgeResponse
 from memforge.memory.cross_document_relation import (
     CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+    CROSS_DOCUMENT_RELATION_INPUT_VERSIONS,
     CrossDocumentRelationLabel,
     CrossDocumentRelationPair,
     RelationSubject,
@@ -605,7 +606,8 @@ class AgentEvaluationCaseOutput:
     """One run result with the protected content needed to analyze it.
 
     It holds the case's pinned input, its accepted rubric, the candidate output
-    (for a relation case, the label and the model's reason) and the code checks.
+    (for a relation case, the recorded label and the classifier's label) and the
+    code checks.
     """
 
     case: AgentEvaluationCase
@@ -1004,8 +1006,11 @@ class SourceUnitReconciliationReplayExecutor:
 class CrossDocumentRelationReplayExecutor:
     """Label one pinned Memory pair with the production cross-document classifier.
 
-    A case pinned for another classifier contract holds another input shape, so
-    it fails instead of being replayed with this contract.
+    The scored ``label`` is the one discovery would record: an ``updates`` the
+    pinned Evidence times do not order is recorded as ``contradicts``.
+    ``classifier_label`` keeps the classifier's own answer for failure
+    analysis. A case pinned for a classifier contract with another input shape
+    fails instead of being replayed with this contract.
     """
 
     def __init__(self, structured_llm_client: object) -> None:
@@ -1016,7 +1021,7 @@ class CrossDocumentRelationReplayExecutor:
         case: AgentEvaluationCase,
         candidate_manifest: Mapping[str, object],
     ) -> Mapping[str, object]:
-        _require_current_relation_contract(case.manifest)
+        _require_relation_input_contract(case.manifest)
         pair = CrossDocumentRelationPair(
             challenger=RelationSubject.from_manifest(_mapping(case.manifest, "challenger")),
             candidate=RelationSubject.from_manifest(_mapping(case.manifest, "candidate")),
@@ -1029,8 +1034,8 @@ class CrossDocumentRelationReplayExecutor:
         return {
             "case_kind": case.case_kind.value,
             "classifier_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
-            "label": judgment.label.value,
-            "reason": judgment.reason,
+            "label": judgment.recorded_label.value,
+            "classifier_label": judgment.label.value,
         }
 
 
@@ -2736,7 +2741,7 @@ def _validate_case_manifest(
     manifest: Mapping[str, object],
 ) -> None:
     if case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION:
-        _require_current_relation_contract(manifest)
+        _require_relation_input_contract(manifest)
         subjects = [
             RelationSubject.from_manifest(_mapping(manifest, side))
             for side in ("challenger", "candidate")
@@ -2759,12 +2764,12 @@ def _validate_case_manifest(
         _pinned_supports(manifest)
 
 
-def _require_current_relation_contract(manifest: Mapping[str, object]) -> None:
+def _require_relation_input_contract(manifest: Mapping[str, object]) -> None:
     pinned = manifest.get("classifier_version")
-    if pinned != CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION:
+    if pinned not in CROSS_DOCUMENT_RELATION_INPUT_VERSIONS:
         raise ValueError(
-            f"relation case is pinned for classifier {pinned!r}, "
-            f"not {CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION}"
+            f"relation case is pinned for classifier {pinned!r}; "
+            f"{CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION} reads a different input"
         )
 
 

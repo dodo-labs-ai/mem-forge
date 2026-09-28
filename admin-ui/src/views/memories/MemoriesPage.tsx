@@ -711,7 +711,6 @@ function RelationPairList({
                           </Link>
                         );
                       })}
-                      {pair.reason && <p className="text-xs text-muted-foreground">{pair.reason}</p>}
                     </div>
                   </TableCell>
                   <TableCell className="align-top text-muted-foreground">
