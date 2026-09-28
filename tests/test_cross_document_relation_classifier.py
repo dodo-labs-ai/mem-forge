@@ -793,3 +793,31 @@ async def test_subject_reads_the_newest_of_several_current_evidence_units_in_one
     assert (pinned.evidence_time, pinned.evidence) == ("2026-03-25", (f"Evidence for {memory_id}.",))
     with pytest.raises(ValueError, match="no longer current"):
         await load_relation_subjects(store, (_memory(memory_id),), evidence_unit_ids={memory_id: "eu-removed"})
+
+
+@pytest.mark.asyncio
+async def test_a_reask_states_the_same_single_subject_and_asks_only_its_rejected_pairs() -> None:
+    first = _pairs(2, challenger="mem-challenger-a")
+    second = tuple(
+        replace(pair, challenger=_subject("mem-challenger-b", "Payroll runs monthly.")) for pair in _pairs(2)
+    )
+    pairs = (first[0], second[0], first[1], second[1])
+    left_out = 2
+
+    def respond(prompt):
+        indexes = _pair_indexes(prompt)
+        if "<correction>" not in prompt:
+            indexes = [index for index in indexes if index != left_out]
+        return CrossDocumentRelationResponse(
+            decisions=[{"pair_index": index, "label": "none"} for index in indexes]
+        )
+
+    client = _Client(respond=respond)
+    result = await _classifier(client).classify(pairs)
+
+    assert [judgment.pair for judgment in result.judgments] == list(pairs)
+    [correction] = [prompt for prompt in client.prompts if "<correction>" in prompt]
+    assert correction.count("<subject>") == 1
+    assert _section(correction, "subject")["statement"] == first[0].challenger.statement
+    assert _pair_indexes(correction) == [left_out]
+    assert result.llm_calls == len(client.prompts) == 3
