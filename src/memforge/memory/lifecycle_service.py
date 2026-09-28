@@ -122,7 +122,6 @@ class MemoryLifecycleService:
         owner_user_id: str,
         client: str,
         memory_type: str = MemoryType.FACT.value,
-        confidence: float = 0.95,
         repo_identifier: str | None = None,
         idempotency_key: str | None = None,
     ) -> CreateMemoryResult:
@@ -145,7 +144,6 @@ class MemoryLifecycleService:
             owner_user_id=owner_user_id.strip(),
             project_key=UNSORTED_PROJECT_KEY,
             repo_identifier=repo_identifier.strip() if repo_identifier else None,
-            confidence=confidence,
             created_at=now,
             updated_at=now,
             status="active",
@@ -544,7 +542,6 @@ class MemoryLifecycleService:
             owner_user_id=old.owner_user_id,
             project_key=old.project_key,
             repo_identifier=old.repo_identifier,
-            confidence=old.confidence,
             created_at=now,
             updated_at=now,
             status="active" if can_apply else "pending_review",

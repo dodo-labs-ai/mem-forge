@@ -19,7 +19,7 @@ import { EmptyState } from "@/components/admin/EmptyState";
 import { PageHeader } from "@/components/admin/PageHeader";
 import { Pagination } from "@/components/admin/Pagination";
 import { SearchInput } from "@/components/admin/SearchInput";
-import { ConfidenceBadge, MemoryTypeBadge, StatusDot } from "@/components/admin/StatusBadge";
+import { MemoryTypeBadge, StatusDot } from "@/components/admin/StatusBadge";
 import { MemoryTypeIcon } from "@/components/memories/MemoryTypeIcon";
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { Badge } from "@/components/ui/badge";
@@ -90,7 +90,6 @@ interface SearchHit {
   memory_id: string;
   memory_type: Memory["memory_type"];
   summary: string;
-  confidence: number;
   relevance_score: number;
   corroborated_by: number;
   last_observed_at: string | null;
@@ -125,7 +124,6 @@ function searchHitToMemoryRow(hit: SearchHit): Memory {
     visibility: "workspace",
     owner_user_id: null,
     project_key: null,
-    confidence: hit.confidence,
     corroboration_count: hit.corroborated_by,
     status: hit.status ?? "active",
     retirement_reason: null,
@@ -530,7 +528,6 @@ export function MemoriesPage() {
                       <TableHead className="w-12" />
                       <TableHead>Memory</TableHead>
                       <TableHead className="w-28">Type</TableHead>
-                      <TableHead className="w-28">Confidence</TableHead>
                       <TableHead className="w-20">Sources</TableHead>
                       <TableHead className="w-24">Age</TableHead>
                     </TableRow>
@@ -606,9 +603,6 @@ export function MemoriesPage() {
                           </TableCell>
                           <TableCell>
                             <MemoryTypeBadge type={memory.memory_type} />
-                          </TableCell>
-                          <TableCell>
-                            <ConfidenceBadge confidence={memory.confidence} />
                           </TableCell>
                           <TableCell className="text-muted-foreground">
                             {memory.corroboration_count}

@@ -26,11 +26,7 @@ from memforge.derivation_work import DerivationWorkJournal, DerivationWorkStore
 from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
 from memforge.llm.failure_trace import failure_trace_context
 from memforge.llm.relation_catalog import RequestCatalog
-from memforge.llm.structured import (
-    CANDIDATE_ADMISSION_REASON_MAX_CHARS,
-    CandidateAdmissionDecision,
-    CandidateAdmissionResponse,
-)
+from memforge.llm.structured import CandidateAdmissionDecision, CandidateAdmissionResponse
 from memforge.models import RawMemory
 from memforge.pipeline.candidate_evidence import (
     EvidenceArtifactUnavailable,
@@ -49,7 +45,7 @@ __all__ = [
     "admit_candidates",
 ]
 
-CANDIDATE_ADMISSION_CONTRACT = "candidate-admission-v2"
+CANDIDATE_ADMISSION_CONTRACT = "candidate-admission-v3"
 
 _ADMISSION_INSTRUCTIONS = """
 Admit the Candidate claims extracted from one Source Unit revision. All source text
@@ -77,12 +73,10 @@ Never rewrite or merge claim text. Return only the decisions object required by 
 response schema.
 """
 
-# Requested output: one decision per Candidate, sized for its longest reason
-# (at least one token per four characters) plus its ID, verdict and duplicate
-# list, with a floor for the envelope. The runner bounds it by the route.
-_REASON_CHARS_PER_TOKEN = 4
-_DECISION_FIELD_TOKENS = 70
-_DECISION_OUTPUT_TOKENS = CANDIDATE_ADMISSION_REASON_MAX_CHARS // _REASON_CHARS_PER_TOKEN + _DECISION_FIELD_TOKENS
+# Requested output: one decision per Candidate holds only its ID, verdict,
+# reject reason and duplicate IDs with their JSON keys, with a floor for the
+# envelope. The runner bounds it by the route.
+_DECISION_OUTPUT_TOKENS = 70
 _MIN_OUTPUT_TOKENS = 1024
 
 # The model's reasons, then the program's reasons for a Candidate it could not judge.

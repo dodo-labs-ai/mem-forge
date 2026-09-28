@@ -91,14 +91,14 @@ async def _insert_null_visibility_row(db: Database, mid: str, content: str) -> N
     await db.db.execute(
         """INSERT INTO memories (
             id, memory_type, content, content_hash,
-            visibility, owner_user_id, project_key, confidence,
+            visibility, owner_user_id, project_key,
             corroboration_count,
             valid_from, valid_until, superseded_by, status,
             retirement_reason, retired_at, superseded_at,
             replacement_reason, extraction_context,
             created_at, updated_at
         ) VALUES (?, ?, ?, ?,
-                  NULL, NULL, ?, 0.5,
+                  NULL, NULL, ?,
                   1,
                   NULL, NULL, NULL, 'active',
                   NULL, NULL, NULL,

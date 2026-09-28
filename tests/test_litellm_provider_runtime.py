@@ -219,7 +219,7 @@ def test_openai_compatible_http_embedding_rejects_invalid_response_indexes(
         )
 
 
-def test_retrieval_assist_models_follow_effective_llm_config() -> None:
+def test_rerank_model_follows_effective_llm_config() -> None:
     from memforge.config import AppConfig
     from memforge.runtime import EffectiveLlmConfig, _retrieval_config_for_llm
 
@@ -236,6 +236,5 @@ def test_retrieval_assist_models_follow_effective_llm_config() -> None:
 
     retrieval = _retrieval_config_for_llm(config, llm)
 
-    assert retrieval.entity_model == "sap/anthropic--claude-4.6-sonnet"
     assert retrieval.rerank_model == "sap/anthropic--claude-4.6-sonnet"
-    assert config.retrieval.entity_model != retrieval.entity_model
+    assert config.retrieval.rerank_model != retrieval.rerank_model

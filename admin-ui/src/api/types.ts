@@ -14,7 +14,6 @@ export interface Memory {
   visibility: Visibility | string;
   owner_user_id: string | null;
   project_key: string | null;
-  confidence: number;
   corroboration_count: number;
   status: "active" | "superseded" | "retired" | "decayed" | "pending_review";
   retirement_reason: string | null;
@@ -873,7 +872,6 @@ export interface MemoryReviewMemorySummary {
   id: string;
   memory_type: Memory["memory_type"];
   content: string;
-  confidence: number;
   corroboration_count: number;
   status: string;
   entity_refs: string[];

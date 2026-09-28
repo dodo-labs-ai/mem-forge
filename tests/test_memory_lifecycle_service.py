@@ -120,7 +120,6 @@ def _memory(mem_id: str, content: str) -> Memory:
         memory_type="fact",
         content=content,
         content_hash=content_hash(content),
-        confidence=0.91,
         created_at=now,
         updated_at=now,
     )
@@ -779,7 +778,6 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
             },
             memory_type="fact",
             reason="Initial observed convention.",
-            confidence=0.91,
         ),
         owner_user_id="andrew.sun01@sap.com",
         source_id="src-agent-sessions-codex",
@@ -882,7 +880,6 @@ async def _legacy_limited_managed_agent_claim(
             },
             memory_type="decision",
             reason="Initial managed claim.",
-            confidence=0.9,
         ),
         owner_user_id="owner@example.test",
         source_id=source_id,

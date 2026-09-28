@@ -126,7 +126,6 @@ async def test_store_operation_events_share_operation_id(db: Database):
         memory_type="fact",
         content="Grouped audit event fact",
         content_hash=content_hash("Grouped audit event fact"),
-        confidence=0.9,
         created_at=now,
         updated_at=now,
     )

@@ -196,12 +196,15 @@ class StructuredResponseModel(BaseModel):
 
 
 class AgentSessionAuthorityDecision(StructuredResponseModel):
-    """One semantic authority decision for a candidate agent-session user event."""
+    """One authority kind for a candidate agent-session user event.
+
+    ``not_authoritative`` is the safe answer; every other kind authorizes
+    durable memory.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     evidence_id: str = Field(min_length=1)
-    is_authoritative: bool
     authority_kind: Literal[
         "durable_user_intent",
         "future_memory_intent",
@@ -211,21 +214,10 @@ class AgentSessionAuthorityDecision(StructuredResponseModel):
         "approval_of_durable_direction",
         "not_authoritative",
     ]
-    reason: str = Field(min_length=1)
 
-    def row_error(self) -> str | None:
-        """This row's meaning rule; None when it holds.
-
-        Response models validate only the JSON shape of a row. A rule about one
-        row's meaning is ``row_error``, which the task checks on that row alone,
-        so a row that breaks it is rejected by itself.
-        """
-
-        if self.is_authoritative and self.authority_kind == "not_authoritative":
-            return "an authoritative decision requires an authoritative authority_kind"
-        if not self.is_authoritative and self.authority_kind != "not_authoritative":
-            return "a non-authoritative decision requires authority_kind='not_authoritative'"
-        return None
+    @property
+    def is_authoritative(self) -> bool:
+        return self.authority_kind != "not_authoritative"
 
 
 class AgentSessionAuthorityResponse(StructuredResponseModel):
@@ -237,13 +229,12 @@ class AgentSessionAuthorityResponse(StructuredResponseModel):
 
 
 class ProjectionFragmentMemoryCandidate(StructuredResponseModel):
-    """v9 model judgment with catalog-local selectors and no authority fields."""
+    """One extracted claim with catalog-local selectors and no authority fields."""
 
     model_config = ConfigDict(extra="forbid")
 
     content: str = Field(min_length=1)
     memory_type: Literal["fact", "decision", "convention", "procedure"]
-    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     entity_refs: list[str] = Field(default_factory=list)
     valid_from: str | None = None
     valid_until: str | None = None
@@ -266,7 +257,7 @@ class ProjectionFragmentMemoryCandidate(StructuredResponseModel):
     )
 
 class ProjectionFragmentMemoryExtractionResponse(StructuredResponseModel):
-    """projection-extraction-v9 response containing model judgments only."""
+    """Claim Extraction response containing model judgments only."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -303,8 +294,6 @@ class ProjectionFragmentSelectorCorrectionResponse(StructuredResponseModel):
 
 
 CANDIDATE_REF_PATTERN = r"^CND-[0-9]{4}$"
-# Bounds the model's explanation of one admission decision.
-CANDIDATE_ADMISSION_REASON_MAX_CHARS = 1000
 
 
 class CandidateAdmissionDecision(StructuredResponseModel):
@@ -321,7 +310,6 @@ class CandidateAdmissionDecision(StructuredResponseModel):
     duplicate_of: list[Annotated[str, Field(pattern=CANDIDATE_REF_PATTERN)]] = Field(
         default_factory=list, description=(
             "IDs from round_claims, other than this Candidate, that state the same knowledge."))
-    reason: str = Field(default="", max_length=CANDIDATE_ADMISSION_REASON_MAX_CHARS)
 
     def row_error(self) -> str | None:
         """This decision's meaning rule; None when it holds."""
@@ -373,10 +361,13 @@ class MemoryRelationAssessment(StructuredResponseModel):
         return None
 
 
-class MemoryRelationDecision(MemoryRelationAssessment):
-    """Bind a relationship to one application-issued pair slot."""
+class MemoryRelationDecision(StructuredResponseModel):
+    """One memory relation label for one application-issued pair slot."""
+
+    model_config = ConfigDict(extra="ignore")
 
     pair_index: int = Field(ge=0)
+    classification: Literal["equivalent", "refines", "contradicts", "unrelated"]
 
 
 class MemoryRelationResponse(StructuredResponseModel):

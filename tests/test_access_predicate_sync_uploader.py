@@ -85,7 +85,6 @@ class _SingleMemoryExtractor(NoopMemoryExtractor):
                     memory_type="fact",
                     content="durable design fact",
                     entity_refs=[],
-                    confidence=0.9,
                     source_observation_id=primary.anchor.observation_id,
                     resolved_evidence_selection=catalog.resolve_selection(
                         primary_ref=primary.reference,

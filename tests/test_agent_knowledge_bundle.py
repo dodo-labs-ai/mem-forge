@@ -109,7 +109,6 @@ def _proposal(**overrides) -> AgentKnowledgePatchProposal:
         },
         "memory_type": "procedure",
         "reason": "The window confirms a durable scheduler invariant.",
-        "confidence": 0.9,
         "citations": ["agent-window://codex/sess-1/sha256-window"],
     }
     base.update(overrides)
@@ -1538,7 +1537,6 @@ async def test_update_existing_claim_records_complete_mandatory_candidate_univer
         memory_type="procedure",
         content="A separate scheduler claim under the same concept remains active.",
         content_hash=content_hash("A separate scheduler claim under the same concept remains active."),
-        confidence=0.9,
         visibility=Visibility.PRIVATE.value,
         owner_user_id="u-andrew",
         repo_identifier="github.tools.sap/hcm/memforge-cloud",

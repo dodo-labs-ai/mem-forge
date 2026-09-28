@@ -246,6 +246,8 @@ async def test_upgrade_from_legacy_db_without_visibility(tmp_path):
         cols = await _columns(db, "memories")
         assert "visibility" in cols
         assert "owner_user_id" in cols
+        assert "confidence" not in cols
+        assert "confidence" not in await _columns(db, "agent_claims")
         idx = await _indexes(db)
         assert "idx_memories_access" in idx
         assert "idx_memories_owner" in idx

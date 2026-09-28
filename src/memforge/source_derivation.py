@@ -994,7 +994,6 @@ def memory_extraction_result_from_output_payload(
             RawMemory(
                 content=str(value.get("content") or ""),
                 memory_type=str(value.get("memory_type") or ""),
-                confidence=float(value.get("confidence", 0.7)),
                 entity_refs=_string_list(value.get("entity_refs")),
                 valid_from=_optional_string(value.get("valid_from")),
                 valid_until=_optional_string(value.get("valid_until")),
@@ -1124,7 +1123,6 @@ def _raw_memory_payload(memory: RawMemory) -> dict[str, object]:
     return {
         "content": memory.content,
         "memory_type": memory.memory_type,
-        "confidence": memory.confidence,
         "entity_refs": list(memory.entity_refs),
         "valid_from": memory.valid_from,
         "valid_until": memory.valid_until,
