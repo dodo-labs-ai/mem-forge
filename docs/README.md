@@ -27,6 +27,7 @@ read each document's status and current-versus-target comparison.
 | Current extraction/catalog/selector contract | [Source-Agnostic Memory Extraction](design/source-agnostic-memory-extraction.md) |
 | Representation-specific incremental Primary algorithm | [Incremental Primary authority](design/representation-scoped-incremental-primary-authority.md) |
 | Unified support/claim assessment orchestration | [ADR 0034](adr/0034-unify-incremental-support-and-claim-assessment.md) |
+| Model step kinds, the decision contract and the decision model | [ADR 0043](adr/0043-assign-model-judgments-by-task-shape-and-share-one-decision-contract.md), [Semantic judgment execution](design/semantic-judgment-execution.md) |
 | Historical large-document incident and unapproved Review options | [Large-document recovery analysis](design/large-document-reconciliation-recovery.md) |
 | Managed agent-session entrypoint | [Agent-session flow](design/agent-session-saas-plugin-flow.md) |
 
