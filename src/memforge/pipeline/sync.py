@@ -467,6 +467,12 @@ def _is_provider_unreachable(error: str) -> bool:
     )
 
 
+# How rate-limit failures read: Atlassian's rate-limit error, an HTTP "429 Too Many Requests",
+# or a LiteLLM RateLimitError. A bare status number is not matched, because identifiers
+# and ranges quoted in other errors contain the same digits.
+_RATE_LIMIT_MARKERS = ("rate limit", "ratelimit", "too many requests")
+
+
 def _failure_category(error: str) -> str:
     normalized = error.lower()
     if "embedding provider unreachable" in normalized:
@@ -477,7 +483,7 @@ def _failure_category(error: str) -> str:
         "litellm" in normalized or "anthropicexception" in normalized or "openaiexception" in normalized
     ):
         return "llm_provider_unreachable"
-    if "rate limit" in normalized or "429" in normalized:
+    if any(marker in normalized for marker in _RATE_LIMIT_MARKERS):
         return "rate_limit"
     if "pdf export" in normalized or "did not produce a pdf" in normalized:
         return "pdf_export"
@@ -510,7 +516,7 @@ def summarize_failed_documents(docs_failed: int, failed_docs: list[FailedDoc]) -
         if counts.get("pdf_export"):
             details.append(f"PDF export was unavailable for {_plural(counts['pdf_export'], 'document')}")
         if counts.get("rate_limit"):
-            details.append(f"Confluence rate limited {_plural(counts['rate_limit'], 'document')}")
+            details.append(f"Source rate limit was reached for {_plural(counts['rate_limit'], 'document')}")
         if counts.get("certificate"):
             details.append(f"certificate verification failed for {_plural(counts['certificate'], 'document')}")
         if counts.get("other"):
@@ -523,12 +529,12 @@ def summarize_failed_documents(docs_failed: int, failed_docs: list[FailedDoc]) -
         return " ".join(parts)
 
     if counts.get("pdf_export") or counts.get("rate_limit") or counts.get("certificate"):
-        parts = [f"{_plural(docs_failed, 'Confluence document')} could not be imported."]
+        parts = [f"{_plural(docs_failed, 'document')} could not be imported."]
         details: list[str] = []
         if counts.get("pdf_export"):
             details.append(f"PDF export was unavailable for {_plural(counts['pdf_export'], 'document')}")
         if counts.get("rate_limit"):
-            details.append(f"Confluence rate limited {_plural(counts['rate_limit'], 'document')}")
+            details.append(f"Source rate limit was reached for {_plural(counts['rate_limit'], 'document')}")
         if counts.get("certificate"):
             details.append(f"certificate verification failed for {_plural(counts['certificate'], 'document')}")
         if counts.get("other"):
