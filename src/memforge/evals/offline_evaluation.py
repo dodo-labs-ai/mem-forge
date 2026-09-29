@@ -77,6 +77,10 @@ RELATION_LABEL_CRITERION = "relation_label"
 # classifier related to the subject; its reason code is the recorded label and
 # it waits for a person's label.
 UNLABELLED_RELATION_CRITERION = "unlabelled_relation"
+# A check that scores one item of a case stores its reason code as
+# "reason/item_id", so each stored assessment names the item it scores, such as
+# "none:equivalent/mem-1" for one candidate of a relation group.
+CHECK_ITEM_SEPARATOR = "/"
 _RELATION_LABELS = frozenset(label.value for label in CrossDocumentRelationLabel)
 
 
@@ -569,7 +573,8 @@ class DeterministicCheck:
     """One code check of a result.
 
     ``item_id`` names the judged item a check scores when a case holds several,
-    such as one candidate of a relation group; each item gets its own check.
+    such as one candidate of a relation group; each item gets its own check,
+    and its stored reason code names the item (``CHECK_ITEM_SEPARATOR``).
     """
 
     criterion: str
@@ -2726,11 +2731,13 @@ def relation_label_metrics(
 ) -> tuple[dict[str, dict[str, float | int | None]], dict[str, int]]:
     """Per-label precision and recall from "expected:actual" relation checks.
 
-    A metric is None when its denominator is zero.
+    A group check's reason code also names its candidate, which the confusion
+    counts leave out. A metric is None when its denominator is zero.
     """
 
     confusion: dict[str, int] = {}
-    for code in reason_codes:
+    for stored in reason_codes:
+        code = stored.partition(CHECK_ITEM_SEPARATOR)[0]
         expected, _, actual = code.partition(":")
         if expected in _RELATION_LABELS and actual in _RELATION_LABELS:
             confusion[code] = confusion.get(code, 0) + 1
@@ -2877,7 +2884,11 @@ def _assessment_for_check(
         criterion=check.criterion,
         status="completed",
         label=label,
-        reason_code=check.reason_code,
+        reason_code=(
+            check.reason_code
+            if check.item_id is None
+            else f"{check.reason_code}{CHECK_ITEM_SEPARATOR}{check.item_id}"
+        ),
         annotator_kind="code",
         evaluator_name="memforge.deterministic.offline_contract",
         evaluator_version=OFFLINE_DETERMINISTIC_EVALUATOR_VERSION,

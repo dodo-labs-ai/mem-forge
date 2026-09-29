@@ -57,7 +57,23 @@ CANDIDATE_MANIFEST = {
 }
 
 
-def _memory(memory_id: str, content: str, **overrides) -> Memory:
+STATEMENTS = {
+    "mem-subject": "Payroll runs weekly.",
+    "mem-monthly": "Payroll runs monthly.",
+    "mem-earlier": "Payroll ran fortnightly until March.",
+    "mem-same-day": "Payroll runs every second week.",
+    "mem-repeat-1": REPEATED_STATEMENT,
+    "mem-repeat-2": REPEATED_STATEMENT,
+    "mem-other": "The export job writes CSV files.",
+    "mem-second": "Payslips are sent by email.",
+    "mem-second-candidate": "Payslips are sent by post.",
+    "mem-private": "Private note.",
+    "mem-retired": "Retired statement.",
+}
+
+
+def _memory(memory_id: str, **overrides) -> Memory:
+    content = STATEMENTS[memory_id]
     return replace(
         Memory(
             id=memory_id,
@@ -70,6 +86,25 @@ def _memory(memory_id: str, content: str, **overrides) -> Memory:
     )
 
 
+def _labelled_hashes(*memory_ids: str) -> dict[str, str]:
+    """The content hash each Memory had when its group was labelled."""
+
+    return {memory_id: content_hash(STATEMENTS.get(memory_id, memory_id)) for memory_id in memory_ids}
+
+
+def _group(
+    challenger_memory_id: str,
+    candidate_memory_ids: tuple[str, ...],
+    labels: dict[str, CrossDocumentRelationLabel],
+) -> RelationGroupLabels:
+    return RelationGroupLabels(
+        challenger_memory_id=challenger_memory_id,
+        candidate_memory_ids=candidate_memory_ids,
+        labels=labels,
+        content_hashes=_labelled_hashes(challenger_memory_id, *candidate_memory_ids),
+    )
+
+
 class _GroupStore:
     def __init__(self, db: Database, memories: list[Memory]) -> None:
         self.db = db
@@ -79,17 +114,21 @@ class _GroupStore:
             for memory in memories
         }
         self.observed_at: dict[str, str] = {}
+        self.unit_reads: dict[str, int] = {}
+        self.revision_reads: dict[str, int] = {}
 
     async def list_memories_by_ids(self, memory_ids):
         return [self.memories[memory_id] for memory_id in memory_ids if memory_id in self.memories]
 
     async def get_memory_evidence_units(self, memory_id):
+        self.unit_reads[memory_id] = self.unit_reads.get(memory_id, 0) + 1
         return self.units.get(memory_id, ())
 
     async def get_document(self, doc_id):
         return SimpleNamespace(title=f"Title {doc_id}")
 
     async def get_current_source_observation_revisions(self, source_unit_id):
+        self.revision_reads[source_unit_id] = self.revision_reads.get(source_unit_id, 0) + 1
         memory_id = source_unit_id.removeprefix("unit-")
         revision = primary_observation_revision_fixture(memory_id)
         if memory_id in self.observed_at:
@@ -120,17 +159,13 @@ def _group_store(db: Database) -> _GroupStore:
     store = _GroupStore(
         db,
         [
-            _memory("mem-subject", "Payroll runs weekly."),
-            _memory("mem-monthly", "Payroll runs monthly."),
-            _memory("mem-earlier", "Payroll ran fortnightly until March."),
-            _memory("mem-same-day", "Payroll runs every second week."),
-            _memory("mem-repeat-1", REPEATED_STATEMENT),
-            _memory("mem-repeat-2", REPEATED_STATEMENT),
-            _memory("mem-other", "The export job writes CSV files."),
-            _memory("mem-second", "Payslips are sent by email."),
-            _memory("mem-second-candidate", "Payslips are sent by post."),
-            _memory("mem-private", "Private note.", visibility="private", owner_user_id="owner-1"),
-            _memory("mem-retired", "Retired statement.", status="retired"),
+            *(
+                _memory(memory_id)
+                for memory_id in STATEMENTS
+                if memory_id not in {"mem-private", "mem-retired"}
+            ),
+            _memory("mem-private", visibility="private", owner_user_id="owner-1"),
+            _memory("mem-retired", status="retired"),
         ],
     )
     store.observed_at["mem-earlier"] = EARLIER_OBSERVED_AT
@@ -138,9 +173,9 @@ def _group_store(db: Database) -> _GroupStore:
 
 
 def _payroll_group(**overrides) -> RelationGroupLabels:
-    group = RelationGroupLabels(
-        challenger_memory_id="mem-subject",
-        candidate_memory_ids=(
+    fields = {
+        "challenger_memory_id": "mem-subject",
+        "candidate_memory_ids": (
             "mem-monthly",
             "mem-repeat-1",
             "mem-earlier",
@@ -148,22 +183,23 @@ def _payroll_group(**overrides) -> RelationGroupLabels:
             "mem-same-day",
             "mem-other",
         ),
-        labels={
+        "labels": {
             "mem-monthly": CrossDocumentRelationLabel.CONTRADICTS,
             "mem-earlier": CrossDocumentRelationLabel.UPDATES,
             "mem-same-day": CrossDocumentRelationLabel.UPDATES,
             "mem-repeat-1": CrossDocumentRelationLabel.NONE,
             "mem-repeat-2": CrossDocumentRelationLabel.NONE,
         },
-    )
-    return replace(group, **overrides)
+        **overrides,
+    }
+    return _group(fields["challenger_memory_id"], fields["candidate_memory_ids"], fields["labels"])
 
 
 def _second_group() -> RelationGroupLabels:
-    return RelationGroupLabels(
-        challenger_memory_id="mem-second",
-        candidate_memory_ids=("mem-second-candidate",),
-        labels={"mem-second-candidate": CrossDocumentRelationLabel.CONTRADICTS},
+    return _group(
+        "mem-second",
+        ("mem-second-candidate",),
+        {"mem-second-candidate": CrossDocumentRelationLabel.CONTRADICTS},
     )
 
 
@@ -285,6 +321,8 @@ async def test_seed_pins_each_group_with_its_ordered_candidates_and_recorded_lab
     [
         ("missing-candidate", RelationCaseSkip.MEMORY_CHANGED),
         ("retired-candidate", RelationCaseSkip.MEMORY_CHANGED),
+        ("candidate-edited-after-labelling", RelationCaseSkip.MEMORY_CHANGED),
+        ("challenger-edited-after-labelling", RelationCaseSkip.MEMORY_CHANGED),
         ("private-candidate", RelationCaseSkip.PRIVATE_MEMORY),
         ("challenger-without-evidence", RelationCaseSkip.NO_SOURCE_EVIDENCE),
         ("candidate-from-changing-source", RelationCaseSkip.SOURCE_UNAVAILABLE),
@@ -302,6 +340,10 @@ async def test_seed_skips_a_whole_group_it_cannot_show_and_pins_the_rest(
         candidates = (*candidates, "mem-retired")
     elif change == "private-candidate":
         candidates = (*candidates, "mem-private")
+    elif change.endswith("-edited-after-labelling"):
+        edited = "mem-subject" if change.startswith("challenger") else "mem-earlier"
+        content = "Payroll runs weekly on Fridays."
+        store.memories[edited] = replace(store.memories[edited], content=content, content_hash=content_hash(content))
     elif change == "challenger-without-evidence":
         store.units["mem-subject"] = ()
     else:
@@ -340,12 +382,54 @@ async def test_seed_skips_a_whole_group_it_cannot_show_and_pins_the_rest(
             "distinct candidates",
         ),
         (lambda: [_payroll_group(candidate_memory_ids=("mem-subject", "mem-monthly"))], "distinct candidates"),
+        (
+            lambda: [
+                replace(
+                    _second_group(),
+                    content_hashes=_labelled_hashes("mem-second"),
+                )
+            ],
+            "content hash",
+        ),
+        (
+            lambda: [
+                replace(
+                    _second_group(),
+                    content_hashes=_labelled_hashes("mem-second", "mem-second-candidate", "mem-monthly"),
+                )
+            ],
+            "content hash",
+        ),
     ],
-    ids=["unlisted-label", "repeated-challenger", "repeated-candidate", "challenger-as-candidate"],
+    ids=[
+        "unlisted-label",
+        "repeated-challenger",
+        "repeated-candidate",
+        "challenger-as-candidate",
+        "hash-missing",
+        "hash-for-unlisted-memory",
+    ],
 )
 async def test_seed_rejects_groups_whose_ids_do_not_fit(db: Database, groups, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         await _seed(db, _group_store(db), groups())
+
+
+@pytest.mark.asyncio
+async def test_seed_reads_each_memory_once_across_groups(db: Database) -> None:
+    store = _group_store(db)
+    shared_candidate = _group(
+        "mem-second",
+        ("mem-second-candidate", "mem-monthly"),
+        {"mem-monthly": CrossDocumentRelationLabel.NONE},
+    )
+
+    report = await _seed(db, store, [_payroll_group(), shared_candidate])
+
+    assert report.pinned_group_count == 2
+    assert store.unit_reads["mem-monthly"] == 1
+    assert set(store.unit_reads.values()) == {1}
+    assert set(store.revision_reads.values()) == {1}
 
 
 @pytest.mark.asyncio
@@ -411,19 +495,23 @@ async def test_a_group_run_scores_labelled_candidates_and_counts_unlabelled_rela
     }
     code_checks = [assessment for assessment in report.assessments if assessment.annotator_kind == "code"]
     assert sum(check.criterion == RELATION_LABEL_CRITERION for check in code_checks) == 6
+    assert {check.reason_code for check in code_checks if check.criterion == RELATION_LABEL_CRITERION} == {
+        "contradicts:contradicts/mem-monthly",
+        "none:none/mem-repeat-1",
+        "updates:none/mem-earlier",
+        "none:none/mem-repeat-2",
+        "contradicts:none/mem-same-day",
+        "contradicts:none/mem-second-candidate",
+    }
     [unlabelled] = [check for check in code_checks if check.criterion == UNLABELLED_RELATION_CRITERION]
-    assert (unlabelled.label, unlabelled.reason_code) == ("needs_review", "equivalent")
+    assert (unlabelled.label, unlabelled.reason_code) == ("needs_review", "equivalent/mem-other")
     summary = agent_evaluation_report_public_payload(report, None)["summary"]
     assert summary["relation_summary"] == report.relation_summary
 
 
 @pytest.mark.asyncio
 async def test_a_group_without_labels_is_replayed_for_its_unlabelled_relations(db: Database) -> None:
-    unlabelled = RelationGroupLabels(
-        challenger_memory_id="mem-second",
-        candidate_memory_ids=("mem-second-candidate", "mem-monthly"),
-        labels={},
-    )
+    unlabelled = _group("mem-second", ("mem-second-candidate", "mem-monthly"), {})
     seed = await _seed(db, _group_store(db), [unlabelled])
 
     report = await _run(db, seed.cohort_id, _RecordingClient())
@@ -515,6 +603,7 @@ async def test_group_seed_route_requires_a_maintenance_operator(
                 "challenger_memory_id": "mem-unknown",
                 "candidate_memory_ids": ["mem-a", "mem-b"],
                 "labels": {"mem-a": "equivalent"},
+                "content_hashes": _labelled_hashes("mem-unknown", "mem-a", "mem-b"),
             }
         ],
     }
@@ -528,6 +617,13 @@ async def test_group_seed_route_requires_a_maintenance_operator(
         unknown_label = client.post(
             "/api/v1/agent-evaluations/relation-group-cases/seed",
             json={**body, "groups": [{**body["groups"][0], "labels": {"mem-a": "similar"}}]},
+        )
+        without_hashes = client.post(
+            "/api/v1/agent-evaluations/relation-group-cases/seed",
+            json={
+                **body,
+                "groups": [{key: value for key, value in body["groups"][0].items() if key != "content_hashes"}],
+            },
         )
 
     assert response.status_code == status
@@ -544,3 +640,4 @@ async def test_group_seed_route_requires_a_maintenance_operator(
     }
     assert unlisted.status_code == 400
     assert unknown_label.status_code == 422
+    assert without_hashes.status_code == 422

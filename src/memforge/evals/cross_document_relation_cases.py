@@ -39,9 +39,8 @@ from memforge.memory.cross_document_relation import (
     CrossDocumentRelationLabel,
     CrossDocumentRelationPair,
     RelationSubject,
+    RelationSubjectReader,
     RelationSubjectStore,
-    load_relation_evidence_units,
-    load_relation_subjects,
 )
 from memforge.memory.cross_source_conflict_reviews import (
     REVIEW_DECISION_LABELS,
@@ -71,7 +70,7 @@ class RelationCaseSkip(str, Enum):
     """Why a decided Review or a labelled group is not pinned."""
 
     # A Memory is gone, no longer active, or no longer holds the version the
-    # decision was made for.
+    # decision or the labels were made for.
     MEMORY_CHANGED = "memory_changed"
     # A Memory or the Source it is shown from is private.
     PRIVATE_MEMORY = "private_memory"
@@ -128,11 +127,13 @@ async def seed_cross_document_relation_cases(
         for review in await list_cross_source_conflict_reviews(store, status=status)
     ]
     labels = decided_review_labels(reviews, label_overrides)
+    reader = RelationSubjectReader(store)
     pinned: list[_PinnedCase] = []
     skipped = {reason.value: 0 for reason in RelationCaseSkip}
     for review in reviews:
         outcome = await _pin_review_case(
             store,
+            reader,
             evaluation,
             review=review,
             actor=actor,
@@ -172,6 +173,7 @@ async def seed_cross_document_relation_cases(
 
 async def _pin_review_case(
     store: RelationCaseStore,
+    reader: RelationSubjectReader,
     evaluation: OfflineAgentEvaluation,
     *,
     review: MemoryReview,
@@ -194,6 +196,7 @@ async def _pin_review_case(
         return RelationCaseSkip.MEMORY_CHANGED
     return await _pin_case(
         store,
+        reader,
         evaluation,
         challenger=challenger,
         candidate=candidate,
@@ -211,6 +214,7 @@ async def _pin_review_case(
 
 async def _pin_case(
     store: RelationCaseStore,
+    reader: RelationSubjectReader,
     evaluation: OfflineAgentEvaluation,
     *,
     challenger: Memory,
@@ -220,7 +224,7 @@ async def _pin_case(
     population: AgentEvaluationPopulation,
     actor: str,
 ) -> _PinnedCase | RelationCaseSkip:
-    pinned = await _pinned_subjects(store, challenger, (candidate,))
+    pinned = await _pinned_subjects(store, reader, challenger, (candidate,))
     if isinstance(pinned, RelationCaseSkip):
         return pinned
     unit, subjects = pinned
@@ -260,14 +264,18 @@ class RelationGroupLabels:
     """People's labels for some candidates of one challenger's discovery request.
 
     ``candidate_memory_ids`` lists every candidate discovery asked about for
-    the challenger, in discovery's order; ``labels`` labels some of them. A
-    group without labels is still replayed: the relations the classifier gives
-    its candidates are counted for people to label.
+    the challenger, in discovery's order; ``labels`` labels some of them.
+    ``content_hashes`` gives the content hash the challenger and every
+    candidate had when the group was labelled, the version the labels and the
+    side-by-side context were judged on. A group without labels is still
+    replayed: the relations the classifier gives its candidates are counted
+    for people to label.
     """
 
     challenger_memory_id: str
     candidate_memory_ids: tuple[str, ...]
     labels: Mapping[str, CrossDocumentRelationLabel]
+    content_hashes: Mapping[str, str]
 
     def __post_init__(self) -> None:
         candidates = self.candidate_memory_ids
@@ -280,6 +288,10 @@ class RelationGroupLabels:
         unknown = sorted(set(self.labels) - set(candidates))
         if unknown:
             raise ValueError(f"group {self.challenger_memory_id} labels Memories it does not list: {unknown}")
+        if set(self.content_hashes) != {self.challenger_memory_id, *candidates}:
+            raise ValueError(
+                f"group {self.challenger_memory_id} must give the content hash of its challenger and each candidate"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,10 +322,12 @@ async def seed_cross_document_relation_group_cases(
     labelled_by: str,
     actor: str,
 ) -> RelationGroupSeedReport:
-    """Pin every labelled group whose Memories can be shown and freeze one cohort.
+    """Pin every labelled group whose Memories are unchanged and freeze one cohort.
 
     A group is pinned whole or not at all: replay must show the classifier
-    every candidate production showed. Each label is pinned as the label the
+    every candidate production showed, as the labels judged it. A group whose
+    challenger or candidate no longer has the content hash it was labelled
+    with is skipped as changed. Each label is pinned as the label the
     program records for it, so an ``updates`` label on a pair the pinned
     Evidence times do not order is pinned as ``contradicts``. Seeding again
     with the same input pins the same cases and returns the same cohort.
@@ -324,10 +338,13 @@ async def seed_cross_document_relation_group_cases(
         raise ValueError("each challenger must appear in one group")
     if not labelled_by.strip():
         raise ValueError("labelled_by is required")
+    reader = RelationSubjectReader(store)
     pinned: list[_PinnedGroup] = []
     skipped_groups: dict[str, str] = {}
     for group in groups:
-        outcome = await _pin_group_case(store, evaluation, group=group, labelled_by=labelled_by, actor=actor)
+        outcome = await _pin_group_case(
+            store, reader, evaluation, group=group, labelled_by=labelled_by, actor=actor
+        )
         if isinstance(outcome, RelationCaseSkip):
             skipped_groups[group.challenger_memory_id] = outcome.value
         else:
@@ -369,6 +386,7 @@ async def seed_cross_document_relation_group_cases(
 
 async def _pin_group_case(
     store: RelationGroupCaseStore,
+    reader: RelationSubjectReader,
     evaluation: OfflineAgentEvaluation,
     *,
     group: RelationGroupLabels,
@@ -380,10 +398,15 @@ async def _pin_group_case(
         for memory in await store.list_memories_by_ids((group.challenger_memory_id, *group.candidate_memory_ids))
     }
     memories = [by_id.get(memory_id) for memory_id in (group.challenger_memory_id, *group.candidate_memory_ids)]
-    if any(memory is None or memory.status != MemoryStatus.ACTIVE.value for memory in memories):
+    if any(
+        memory is None
+        or memory.status != MemoryStatus.ACTIVE.value
+        or memory.content_hash != group.content_hashes[memory.id]
+        for memory in memories
+    ):
         return RelationCaseSkip.MEMORY_CHANGED
     challenger, *candidates = (memory for memory in memories if memory is not None)
-    pinned = await _pinned_subjects(store, challenger, candidates)
+    pinned = await _pinned_subjects(store, reader, challenger, candidates)
     if isinstance(pinned, RelationCaseSkip):
         return pinned
     unit, subjects = pinned
@@ -424,6 +447,7 @@ async def _pin_group_case(
 
 async def _pinned_subjects(
     store: RelationGroupCaseStore,
+    reader: RelationSubjectReader,
     challenger: Memory,
     candidates: Sequence[Memory],
 ) -> tuple[MemoryEvidenceUnitProjection, Mapping[str, RelationSubject]] | RelationCaseSkip:
@@ -437,7 +461,7 @@ async def _pinned_subjects(
     memories = (challenger, *candidates)
     if any(memory.visibility == Visibility.PRIVATE.value for memory in memories):
         return RelationCaseSkip.PRIVATE_MEMORY
-    shown = await load_relation_evidence_units(store, memories)
+    shown = {memory.id: await reader.evidence_unit(memory.id) for memory in memories}
     unit = shown[challenger.id]
     if unit is None or not unit.doc_id:
         return RelationCaseSkip.NO_SOURCE_EVIDENCE
@@ -445,7 +469,7 @@ async def _pinned_subjects(
         skip = _source_skip(await store.get_source(source_id))
         if skip is not None:
             return skip
-    return unit, await load_relation_subjects(store, memories)
+    return unit, {memory.id: await reader.subject(memory) for memory in memories}
 
 
 def _source_skip(source: Mapping[str, Any] | None) -> RelationCaseSkip | None:
