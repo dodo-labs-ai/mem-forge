@@ -1,4 +1,4 @@
-"""Client-generated agent session document intake."""
+"""Agent-session window intake: private Agent Knowledge patches from coding-client transcripts."""
 
 from __future__ import annotations
 
@@ -6,20 +6,13 @@ import asyncio
 import contextlib
 import hashlib
 import json
-import os
 import re
-import tempfile
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
-from memforge.agent_session_contract import (
-    AGENT_SESSION_CONTENT_ROLE,
-    AGENT_SESSION_PACKAGE_KIND,
-    AGENT_SESSION_WINDOW_SOURCE_KIND,
-)
+from memforge.agent_session_contract import AGENT_SESSION_WINDOW_SOURCE_KIND
 from memforge.config import AppConfig
 from memforge.agent_knowledge import (
     AGENT_SESSION_INTENT_CONTRACT,
@@ -33,14 +26,13 @@ from memforge.memory.project_resolver import resolve_project_key
 from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
 from memforge.llm.decision_model import DecisionTask, decision_task_model
 from memforge.llm.structured import AgentSessionAuthorityResponse
-from memforge.models import AgentHookReceipt, AgentSessionReceipt, content_hash, slugify
+from memforge.models import AgentHookReceipt, AgentSessionReceipt, slugify
 from memforge.repo_identity import normalize_repo_identifier
 from memforge.source_time import parse_source_time, reported_source_time
 from memforge.storage.database import Database
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 
 AGENT_SESSION_SOURCE_TYPE = "agent_session"
-AGENT_SESSION_SOURCE_KIND = "generated_agent_summary"
 AGENT_SESSION_KNOWLEDGE_PATCH_MAX_TOKENS = 8192
 AGENT_SESSION_LLM_FAILED_CODE = "agent_session_llm_failed"
 AGENT_SESSION_LLM_UNAVAILABLE_CATEGORY = "unavailable"
@@ -240,11 +232,6 @@ def _receipt_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
     return {key: value for key, value in dict(metadata or {}).items() if key != "source_updated_at"}
 
 
-def default_agent_session_documents_dir(config: AppConfig) -> Path:
-    """Return the local inbox directory for generated session packages."""
-    return Path(config.storage.docs_path).parent / "agent-session-submissions"
-
-
 def redact_agent_session_markdown(markdown: str) -> str:
     """Redact obvious secrets before storing generated agent session content."""
     redacted = markdown
@@ -283,7 +270,7 @@ def redact_agent_session_payload(value: Any) -> Any:
 
 
 def canonicalize_agent_session_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return the service-owned evidence stream used for package generation.
+    """Return the service-owned evidence stream used for knowledge patch generation.
 
     Evidence IDs are local to one canonicalized submission. They are prompt
     handles, not persistent identifiers for historical rows.
@@ -566,10 +553,10 @@ def build_agent_session_doc_id(
     history_window_end: object | None,
     window_hash: str | None = None,
 ) -> str:
-    """Build a stable document id for one client history window.
+    """Build the stable receipt id for one client history window.
 
     Identity combines the event range with the content hash: an event range
-    fixes where the window sits, and ``window_hash`` makes documents
+    fixes where the window sits, and ``window_hash`` makes receipts
     content-distinct so a window that reuses a range with different content gets
     a new id instead of overwriting the earlier one.
     """
@@ -689,22 +676,17 @@ async def submit_agent_hook_receipt(
 
 async def ensure_agent_session_source(
     db: Database,
-    config: AppConfig,
     *,
     client: str,
     owner_user_id: str,
-    documents_dir: str | None = None,
 ) -> dict:
     """Ensure the private source for one coding client and user exists."""
     source_id = agent_session_source_id(client, owner_user_id)
     source_name = agent_session_source_name(client)
-    inbox_root = Path(documents_dir) if documents_dir else default_agent_session_documents_dir(config)
-    inbox = inbox_root / source_id
-    inbox.mkdir(parents=True, exist_ok=True)
-    source_config = {"documents_dir": str(inbox), "client": client}
+    source_config = {"client": client}
     # Preserve any admin-attached project_binding across the idempotent
     # upsert so a binding configured through the admin API is not silently
-    # cleared the next time a session document arrives.
+    # cleared the next time a window arrives.
     existing = await db.get_source(source_id)
     existing_binding = existing.get("project_binding") if existing else None
     await db.upsert_source(
@@ -722,151 +704,6 @@ async def ensure_agent_session_source(
     source = await db.get_source(source_id)
     assert source is not None
     return source
-
-
-async def submit_agent_session_document(
-    *,
-    db: Database,
-    config: AppConfig,
-    client: str,
-    session_id: str,
-    trigger: str,
-    document_markdown: str,
-    workspace: str,
-    repo: str | None = None,
-    branch: str | None = None,
-    commit_sha: str | None = None,
-    history_window_kind: str = "session",
-    history_window_start: str | None = None,
-    history_window_end: str | None = None,
-    title: str | None = None,
-    metadata: dict[str, Any] | None = None,
-    source_kind: str = AGENT_SESSION_SOURCE_KIND,
-    window_hash: str | None = None,
-    submitted_at: str | None = None,
-    source_updated_at: str | None = None,
-    user_id: str,
-) -> dict:
-    """Store a generated session document package and receipt lineage."""
-    if not client.strip():
-        raise ValueError("client is required")
-    if not session_id.strip():
-        raise ValueError("session_id is required")
-    if not trigger.strip():
-        raise ValueError("trigger is required")
-    if not workspace.strip():
-        raise ValueError("workspace is required")
-    if not document_markdown.strip():
-        raise ValueError("document_markdown is required")
-
-    source = await ensure_agent_session_source(
-        db,
-        config,
-        client=client,
-        owner_user_id=user_id,
-    )
-    documents_dir = Path(source["config"]["documents_dir"])
-
-    submitted_at = submitted_at or _now_iso()
-    normalized_source_updated_at = _normalize_source_updated_at(source_updated_at)
-    redacted_markdown = redact_agent_session_markdown(document_markdown)
-    document_hash = content_hash(redacted_markdown)
-    doc_id = build_agent_session_doc_id(
-        owner_user_id=user_id,
-        client=client,
-        session_id=session_id,
-        trigger=trigger,
-        workspace=workspace,
-        history_window_kind=history_window_kind,
-        history_window_start=history_window_start,
-        history_window_end=history_window_end,
-        window_hash=window_hash,
-    )
-    per_client_source_id = agent_session_source_id(client, user_id)
-    source_url = f"agent-session://{slugify(client)}/{slugify(session_id)}/{slugify(trigger)}/{doc_id}"
-    doc_title = title or f"Agent Session: {client} {session_id} {trigger}"
-    project = resolve_project_key(
-        source.get("project_binding"),
-        item_field_value=None,
-        repo=repo,
-        workspace=workspace,
-    )
-    package_path = documents_dir / slugify(project) / f"{doc_id}.json"
-    package_path.parent.mkdir(parents=True, exist_ok=True)
-
-    receipt_metadata = _receipt_metadata(metadata)
-    if user_id is not None:
-        receipt_metadata["user_id"] = user_id
-    receipt_metadata.setdefault("repo_identifier", normalize_repo_identifier(repo))
-
-    receipt = AgentSessionReceipt(
-        doc_id=doc_id,
-        source_id=per_client_source_id,
-        client=client,
-        session_id=session_id,
-        trigger=trigger,
-        workspace=workspace,
-        repo=repo,
-        branch=branch,
-        commit_sha=commit_sha,
-        history_window_kind=history_window_kind,
-        history_window_start=history_window_start,
-        history_window_end=history_window_end,
-        submitted_at=submitted_at,
-        document_hash=document_hash,
-        source_kind=source_kind,
-        document_uri=str(package_path),
-        metadata=receipt_metadata,
-        updated_at=submitted_at,
-    )
-    package = {
-        "package_kind": AGENT_SESSION_PACKAGE_KIND,
-        "content_role": AGENT_SESSION_CONTENT_ROLE,
-        "doc_id": doc_id,
-        "title": doc_title,
-        "source_url": source_url,
-        "last_modified": submitted_at,
-        "space_or_project": project,
-        "version": document_hash,
-        "markdown": redacted_markdown,
-        "receipt": receipt.__dict__,
-    }
-    if normalized_source_updated_at is not None:
-        package["source_updated_at"] = normalized_source_updated_at
-    # Write the package atomically: serialize to a sibling temp file on the same
-    # filesystem, then rename it into place. A reader (or a concurrent same-id
-    # write) sees either the previous package or the complete new one, never a
-    # half-written file.
-    payload_text = json.dumps(package, indent=2, sort_keys=True)
-    package_existed = package_path.exists()
-    package_written = False
-    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(package_path.parent), suffix=".json.tmp")
-    try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
-            handle.write(payload_text)
-        os.replace(tmp_name, package_path)
-        package_written = True
-        await db.upsert_agent_session_receipt(receipt)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        if package_written and not package_existed:
-            try:
-                os.unlink(package_path)
-            except OSError:
-                pass
-        raise
-
-    return {
-        "doc_id": doc_id,
-        "source_id": per_client_source_id,
-        "source_type": AGENT_SESSION_SOURCE_TYPE,
-        "document_uri": str(package_path),
-        "document_hash": document_hash,
-        "receipt": receipt.__dict__,
-    }
 
 
 async def _record_window_outcome(
@@ -891,12 +728,12 @@ async def _record_window_outcome(
     reason: str,
     metadata: dict[str, Any] | None = None,
 ) -> str:
-    """Persist lineage for a window that produced no stored document.
+    """Persist the receipt that records one window's outcome.
 
-    Every uploaded window records its fate (no_output or failed), so a window
-    that was processed but kept nothing is never indistinguishable from one that
-    was lost or never sent. The receipt carries no package file, only the outcome
-    and reason, keyed by the same window identity a stored package would use.
+    Every uploaded window records its fate (knowledge_patched, no_output or
+    failed), so a window that was processed but kept nothing is never
+    indistinguishable from one that was lost or never sent. The receipt keeps no
+    window content, only the outcome and reason, keyed by the window identity.
     """
     doc_id = build_agent_session_doc_id(
         owner_user_id=owner_user_id,
@@ -1054,7 +891,7 @@ async def submit_agent_session_window(
     window_hash = agent_session_window_hash(window_content)
     # Window identity combines the event range with the content hash. The range
     # (possibly absent for transcript windows) fixes where the window sits; the
-    # hash, passed to build_agent_session_doc_id, makes documents content-distinct
+    # hash, passed to build_agent_session_doc_id, makes receipts content-distinct
     # so an identical window is idempotent and a same-range window with different
     # content gets a new id instead of overwriting the earlier one.
     window_kind = str(history_window.get("kind") or "boundary")
@@ -1144,8 +981,8 @@ async def submit_agent_session_window(
 
     citation = f"agent-window://{slugify(client)}/{slugify(session_id)}/sha256-{window_hash}"
 
-    async def generate_proposal() -> AgentKnowledgePatchProposal:
-        prompt = await render_agent_knowledge_patch_prompt(
+    async def render_prompt() -> str:
+        return await render_agent_knowledge_patch_prompt(
             db=db,
             owner_user_id=owner_user_id,
             client=client,
@@ -1158,6 +995,8 @@ async def submit_agent_session_window(
             events=canonical_events,
             transcript_markdown=transcript_fallback,
         )
+
+    async def generate_proposal(prompt: str) -> AgentKnowledgePatchProposal:
         request = LlmRequest(
             prompt,
             AgentKnowledgePatchModelResponse,
@@ -1296,19 +1135,31 @@ async def submit_agent_session_window(
             "covered_claim_id": patch.covered_claim_id,
         }
 
-    async def generate_and_apply(admitted_source: dict[str, Any]) -> dict[str, Any]:
-        return await apply_proposal(await generate_proposal(), admitted_source)
-
+    # A client's first patching window has no Source yet, and a window with
+    # nothing to keep must not create one, so its proposal is generated before
+    # the Source exists. A proposal is determined by its prompt: under the
+    # Source activity lease it is applied as generated when the prompt still
+    # renders the same, and generated again when concurrent writes changed it.
+    admission: tuple[str, AgentKnowledgePatchProposal] | None = None
     if source is None:
-        preliminary = await generate_proposal()
-        if preliminary.action == "no_output":
-            return await apply_proposal(preliminary, None)
+        admission_prompt = await render_prompt()
+        admission_proposal = await generate_proposal(admission_prompt)
+        if admission_proposal.action == "no_output":
+            return await apply_proposal(admission_proposal, None)
+        admission = (admission_prompt, admission_proposal)
         source = await ensure_agent_session_source(
             db,
-            config,
             client=client,
             owner_user_id=owner_user_id,
         )
+
+    async def generate_and_apply(admitted_source: dict[str, Any]) -> dict[str, Any]:
+        prompt = await render_prompt()
+        if admission is not None and admission[0] == prompt:
+            proposal = admission[1]
+        else:
+            proposal = await generate_proposal(prompt)
+        return await apply_proposal(proposal, admitted_source)
 
     try:
         return await _run_agent_patch_with_activity(

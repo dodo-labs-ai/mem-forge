@@ -754,40 +754,6 @@ def test_admin_source_sync_rejects_paused_source(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_agent_session_document_intake_is_retired_before_source_status(db, tmp_path):
-    from memforge.agent_sessions import agent_session_source_id
-    from memforge.server.admin_api import create_admin_app
-
-    source_id = agent_session_source_id("codex", "dev")
-    await db.upsert_source(
-        id=source_id,
-        type="agent_session",
-        name="Codex Session",
-        config_json=json.dumps({"documents_dir": str(tmp_path / "sessions"), "client": "codex"}),
-        status="paused",
-        access_policy="private",
-        owner_user_id="dev",
-    )
-
-    app = create_admin_app(db=db, config=_config(tmp_path))
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/agent-sessions/documents",
-            json={
-                "client": "codex",
-                "session_id": "session-1",
-                "trigger": "compact",
-                "workspace": "/repo",
-                "document_markdown": "# Summary\n\nUseful durable notes.",
-                "process_now": True,
-            },
-        )
-
-    assert response.status_code == 410
-    assert "agent-session document intake has been retired" in response.json()["detail"]
-
-
-@pytest.mark.asyncio
 async def test_agent_session_window_intake_rejects_paused_source_before_llm(
     db,
     tmp_path,
@@ -800,7 +766,7 @@ async def test_agent_session_window_intake_rejects_paused_source_before_llm(
         id=source_id,
         type="agent_session",
         name="Claude Code Session",
-        config_json=json.dumps({"documents_dir": str(tmp_path / "sessions"), "client": "claude-code"}),
+        config_json=json.dumps({"client": "claude-code"}),
         status="paused",
         access_policy="private",
         owner_user_id="dev",

@@ -32,7 +32,7 @@ registers the MCP server; duplicating it in `config.toml` can pin Codex to a
 stale plugin cache path after upgrades.
 
 The bundled MCP proxy does not need a local MemForge CLI or local-DB MCP
-process. It forwards search, current recent-Memory listing, memory detail, and session document
+process. It forwards search, current recent-Memory listing, memory detail, memory write, and Review
 calls through the configured immutable target. MCP and lifecycle hooks read the
 same agent-level routing values. `get_resource(mode="file")` is handled locally
 so returned `local_path` values point to the agent machine.
