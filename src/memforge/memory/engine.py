@@ -452,9 +452,6 @@ class MemoryEngine:
                     SupportRevalidationLimitationCode.COMPILER_FAILURE: (
                         "support_revalidation_compiler_failure"
                     ),
-                    SupportRevalidationLimitationCode.CAPACITY_EXCEEDED: (
-                        "support_revalidation_capacity_exceeded"
-                    ),
                 }[exc.code]
                 if isinstance(exc, SupportRevalidationLimitation)
                 else None

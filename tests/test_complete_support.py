@@ -62,6 +62,8 @@ def test_a_claim_may_state_every_unit_title_value_and_the_unit_title_is_never_ev
     assert "appears in that Evidence or in the unit_title" in definition
     assert "The unit_title is never Evidence" in definition
     assert "never Evidence" in title
+    assert "Apart from the Unit's own earlier names, an identifier that neither the unit_title nor the Evidence " \
+        "contains, such as another Unit's key, is not supported." in definition
     assert "selected Evidence (evidence_refs into evidence_catalog, one Primary and any Required parts), read with " \
         "the unit_title, completely supports the entire claim" in " ".join(candidate_admission._ADMISSION_INSTRUCTIONS.split())
 

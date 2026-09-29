@@ -20,4 +20,6 @@ claim matches. Use no knowledge outside the Evidence and the unit_title. The uni
 Evidence, but every value it shows, such as the Unit's key, type, summary, title or path, is a fact
 about the Unit that a claim may state without Evidence for it. A claim that names its Unit by an
 earlier name, such as a former title or path, still speaks of that Unit; that the name differs from
-the unit_title is never alone a reason for unsupported."""
+the unit_title is never alone a reason for unsupported. Apart from the Unit's own earlier names, an
+identifier that neither the unit_title nor the Evidence contains, such as another Unit's key, is not
+supported."""

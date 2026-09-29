@@ -5,8 +5,8 @@
 - The Unit Title is reading context carried by the Source Projection
   (`SourceProjection.unit_title`), no longer a Unit's first Observation. It
   takes no part in Unit revision identity, so a change of only the Unit Title's
-  values, such as a renamed Teams chat, creates no revision and no model work;
-  a name that also appears in the content or the locator, such as a Confluence
+  values, such as a renamed Teams chat, creates no revision and no model work; a
+  name that also appears in the content or the locator, such as a Confluence
   page title or a file path, changes as content or location does. Claim
   Extraction, Candidate Admission, Support Assessment and Change Impact show the
   current Unit Title in every request, rendered once from the adapter's values,
@@ -14,27 +14,26 @@
   claim state every Unit Title value, including a Jira issue type and summary,
   and name its Unit by an earlier name; Candidate Admission reads the selected
   Evidence with the Unit Title, and another Unit's key that neither the Unit
-  Title nor the Evidence contains is still unsupported. Stored revisions are compared in the current
-  representation only: a Unit that stored its Unit Title as an Observation gets
-  one new revision at its next fetch with no changed content, its exact
-  Supports are rebound by the program without a model call and drop the title
-  part, and a partial projection no longer carries the old title. A stored
-  projection read in the current representation, as a reprocess preview or an
-  offline replay reads it, drops the stored title from its Revision Delta too. The old
-  title is retired, not removed: removal still means only proven absence. A
-  store keeps a Unit's current Observations equal to the members of its current
-  revision and clears the current revision of every Observation that is not a
-  member.
-  Contracts: `revision-input-v8`, `projection-extraction-v11`, model
-  presentation policy 6, `candidate-admission-v4`, `support-ordered-reading-v6`,
-  `revision-support-v8` and `change-impact-v3`. Cloud: no HANA schema, storage
-  protocol, configuration or `proxy/external_runtime.py` change; the HANA
-  store's `_record_source_projection_sync` must clear the pointers of
-  Observations that are not members of the new current revision, shipped
-  together with the pin, or reading the current Unit fails for partial Units
-  that stored a Unit Title Observation. Derivation attempts staged before the
-  upgrade are not resumed. See ADR 0034 and the ADR 0043 amendment
-  on replaying model input changes.
+  Title nor the Evidence contains is still unsupported. Stored revisions are
+  compared in the current representation only: a Unit that stored its Unit Title
+  as an Observation gets one new revision at its next fetch with no changed
+  content, its exact Supports are rebound by the program without a model call
+  and drop the title part, and a partial projection no longer carries the old
+  title. A stored projection read in the current representation, as a reprocess
+  preview or an offline replay reads it, drops the stored title from its
+  Revision Delta too. The old title is retired, not removed: removal still means
+  only proven absence. A store keeps a Unit's current Observations equal to the
+  members of its current revision and clears the current revision of every
+  Observation that is not a member. Contracts: `revision-input-v8`,
+  `projection-extraction-v11`, model presentation policy 6,
+  `candidate-admission-v4`, `support-ordered-reading-v6`, `revision-support-v8`
+  and `change-impact-v3`. Cloud: no HANA schema, storage protocol, configuration
+  or `proxy/external_runtime.py` change; the HANA store's
+  `_record_source_projection_sync` must clear the pointers of Observations that
+  are not members of the new current revision, shipped together with the pin, or
+  reading the current Unit fails for partial Units that stored a Unit Title
+  Observation. Derivation attempts staged before the upgrade are not resumed.
+  See ADR 0034 and the ADR 0043 amendment on replaying model input changes.
 
 - Relation group evaluation cases (`cross_document_relation_group_v1`) replay
   discovery's requests: one case pins a challenger with every candidate

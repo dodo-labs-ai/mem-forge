@@ -6714,26 +6714,12 @@ async def test_noop_propagates_representation_compiler_contract_failure(
     assert await db.list_lifecycle_reviews("src-1") == []
 
 
-@pytest.mark.parametrize(
-    ("limitation_code", "reason_code"),
-    [
-        (
-            SupportRevalidationLimitationCode.COMPILER_FAILURE,
-            "support_revalidation_compiler_failure",
-        ),
-        (
-            SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
-            "support_revalidation_capacity_exceeded",
-        ),
-    ],
-)
 @pytest.mark.asyncio
 async def test_noop_propagates_bounded_revalidation_operational_limitation(
     db: Database,
     monkeypatch,
-    limitation_code: SupportRevalidationLimitationCode,
-    reason_code: str,
 ) -> None:
+    limitation_code = SupportRevalidationLimitationCode.COMPILER_FAILURE
     access_context_hash = lifecycle_access_context_hash(
         visibility="workspace",
         owner_user_id=None,
@@ -6806,7 +6792,7 @@ async def test_noop_propagates_bounded_revalidation_operational_limitation(
         )
 
     assert failure.value.retryable is False
-    assert failure.value.runtime_bundle.event.reason_code == reason_code
+    assert failure.value.runtime_bundle.event.reason_code == "support_revalidation_compiler_failure"
     assert failure.value.runtime_bundle.event.model_call_count == 0
     assert client.validation_calls == 0
     assert await db.get_active_memory_support_unit_ids(incumbent.id)
