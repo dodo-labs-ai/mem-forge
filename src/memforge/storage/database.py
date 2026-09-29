@@ -5236,9 +5236,6 @@ class Database:
                 target_source_id = _agent_session_source_id_for_owner(client, owner)
                 target_config = dict(config)
                 target_config["client"] = client
-                documents_dir = str(target_config.get("documents_dir") or "").strip()
-                if documents_dir:
-                    target_config["documents_dir"] = str(Path(documents_dir).parent / target_source_id)
                 await self.db.execute(
                     """INSERT INTO sources (
                            id, type, name, config, status, last_sync, doc_count,
@@ -17439,7 +17436,7 @@ class Database:
     # ==================================================================
 
     async def upsert_agent_session_receipt(self, receipt: AgentSessionReceipt) -> None:
-        """Insert or update lineage for a generated agent session document."""
+        """Insert or update the receipt for one agent-session window."""
         activity_at = successful_agent_session_activity_at(receipt)
         async with self._write_lock:
             try:
@@ -17506,7 +17503,7 @@ class Database:
                 raise
 
     async def get_agent_session_receipt(self, doc_id: str) -> dict | None:
-        """Return receipt metadata for one generated agent session document."""
+        """Return the receipt for one agent-session window."""
         async with self.db.execute(
             "SELECT * FROM agent_session_receipts WHERE doc_id = ?",
             (doc_id,),
@@ -17522,7 +17519,7 @@ class Database:
         session_id: str | None = None,
         limit: int = 100,
     ) -> list[dict]:
-        """List generated agent session document receipts."""
+        """List agent-session window receipts."""
         query = "SELECT * FROM agent_session_receipts WHERE 1=1"
         params: list = []
         if source_id:

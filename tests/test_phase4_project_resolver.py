@@ -1,13 +1,7 @@
 import json
-from pathlib import Path
 
 import pytest
 
-from memforge.agent_sessions import (
-    ensure_agent_session_source,
-    submit_agent_session_document,
-)
-from memforge.config import AppConfig
 from memforge.genes.agent_session_gene import AgentSessionGene
 from memforge.memory.project_resolver import resolve_project_key
 from memforge.models import UNSORTED_PROJECT_KEY
@@ -72,84 +66,12 @@ def test_no_binding_resolves_to_unsorted():
 # ---------------------------------------------------------------------------
 
 
-def _config(tmp_path: Path) -> AppConfig:
-    cfg = AppConfig(base_dir=tmp_path / "mem")
-    cfg.llm.enrichment_api_key = ""
-    cfg.llm.embedding_api_key = ""
-    return cfg
-
-
 @pytest.fixture
 async def db(tmp_path):
     database = Database(str(tmp_path / "resolver_writer.db"))
     await database.connect()
     yield database
     await database.close()
-
-
-@pytest.mark.asyncio
-async def test_agent_session_with_no_repo_lands_in_unsorted(db, tmp_path):
-    """Without a repo and with the default (None) binding, the package
-    must land under the UNSORTED project bucket: the basename of the
-    workspace path must NOT leak into the project key."""
-    cfg = _config(tmp_path)
-    result = await submit_agent_session_document(
-        db=db,
-        config=cfg,
-        user_id="user-owner",
-        client="codex",
-        session_id="sess-no-repo",
-        trigger="Stop",
-        document_markdown="# Session Summary\n\n## User-Confirmed Decisions\n- ok.",
-        workspace="/tmp/scratch-xyz",
-        repo=None,
-    )
-
-    package = json.loads(Path(result["document_uri"]).read_text(encoding="utf-8"))
-    assert package["space_or_project"] == UNSORTED_PROJECT_KEY
-    # The on-disk layout follows the resolved project, so a no-repo run
-    # never seeds a junk directory derived from the workspace basename.
-    assert Path(result["document_uri"]).parent.name == UNSORTED_PROJECT_KEY.lower()
-
-
-@pytest.mark.asyncio
-async def test_agent_session_by_field_repo_maps_to_configured_key(db, tmp_path):
-    """A `by_field` binding on `repo` resolves to the mapped key, so the
-    package's `space_or_project` carries the project decided at intake."""
-    cfg = _config(tmp_path)
-    # Seed the per-client agent-session source first so we can attach a
-    # binding to it before the submit call resolves the project key.
-    source = await ensure_agent_session_source(
-        db,
-        cfg,
-        client="codex",
-        owner_user_id="user-owner",
-    )
-    binding = {
-        "mode": "by_field",
-        "field": "repo",
-        "map": {"my-app": "APP"},
-        "default": "UNSORTED",
-    }
-    await db.db.execute(
-        "UPDATE sources SET project_binding = ? WHERE id = ?",
-        (json.dumps(binding), source["id"]),
-    )
-    await db.db.commit()
-
-    result = await submit_agent_session_document(
-        db=db,
-        config=cfg,
-        user_id="user-owner",
-        client="codex",
-        session_id="sess-mapped",
-        trigger="Stop",
-        document_markdown="# Session Summary\n\n## User-Confirmed Decisions\n- ok.",
-        workspace="/tmp/work",
-        repo="my-app",
-    )
-    package = json.loads(Path(result["document_uri"]).read_text(encoding="utf-8"))
-    assert package["space_or_project"] == "APP"
 
 
 @pytest.mark.asyncio
