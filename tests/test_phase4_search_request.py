@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
 from memforge.server.admin_api import MemorySearchRequest, RecentMemoryListRequest
+
+ADMIN_UI_SEARCH_REQUEST_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "admin-ui" / "tests" / "fixtures" / "memory-search-request.json"
+)
 
 
 def test_project_first_without_active_project_coerces_to_workspace():
@@ -114,6 +120,21 @@ def test_queryless_search_requires_deterministic_filter():
 def test_search_request_rejects_legacy_top_level_sources_filter():
     with pytest.raises(Exception):
         MemorySearchRequest(query="jira defects", sources=["Matterhorn Defects"])  # type: ignore[call-arg]
+
+
+def test_search_request_accepts_admin_ui_project_query_source_body():
+    """The admin UI Memories page builds this body for project + query + source;
+    admin-ui/src/views/memories/memorySearchRequest.test.ts asserts it matches."""
+    body = json.loads(ADMIN_UI_SEARCH_REQUEST_FIXTURE.read_text(encoding="utf-8"))
+
+    req = MemorySearchRequest.model_validate(body)
+
+    assert req.active_project == "PAY"
+    assert req.scope_mode == "project"
+    assert req.memory_types == ["decision"]
+    assert req.status == "active"
+    assert req.source_filter is not None
+    assert req.source_filter.source_ids == ["src-jira"]
 
 
 def test_source_filter_rejects_source_type_selector():
