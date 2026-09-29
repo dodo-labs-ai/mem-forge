@@ -771,25 +771,46 @@ def _anchored_text(
     return None
 
 
-class _RelationEvidenceReader:
-    """Reads each Memory's relation Evidence, loading each Source Unit's current revisions once."""
+class RelationSubjectReader:
+    """Reads Memories' relation Evidence and builds their classifier input for one pass.
+
+    A reader reads each Memory's Evidence Units, each Source Unit's current
+    Observation Revisions and each Document once, and builds each Memory's
+    subject once, so a pass that shows one Memory in several requests or cases
+    reads it once. What it read stays as it was read; a new pass uses a new
+    reader.
+    """
 
     def __init__(self, store: RelationSubjectStore) -> None:
         self._store = store
+        self._units: dict[str, tuple[MemoryEvidenceUnitProjection, ...]] = {}
+        self._chosen_units: dict[str, MemoryEvidenceUnitProjection | None] = {}
         self._revisions: dict[str, Mapping[str, SourceObservationRevision]] = {}
+        self._documents: dict[str, Any] = {}
+        self._subjects: dict[tuple[str, str, str | None], RelationSubject] = {}
 
-    async def revisions(self, source_unit_id: str) -> Mapping[str, SourceObservationRevision]:
+    async def _memory_units(self, memory_id: str) -> tuple[MemoryEvidenceUnitProjection, ...]:
+        if memory_id not in self._units:
+            self._units[memory_id] = await self._store.get_memory_evidence_units(memory_id)
+        return self._units[memory_id]
+
+    async def _unit_revisions(self, source_unit_id: str) -> Mapping[str, SourceObservationRevision]:
         if source_unit_id not in self._revisions:
             self._revisions[source_unit_id] = await self._store.get_current_source_observation_revisions(
                 source_unit_id
             )
         return self._revisions[source_unit_id]
 
-    async def evidence_time(self, unit: MemoryEvidenceUnitProjection) -> str | None:
+    async def _document(self, doc_id: str) -> Any:
+        if doc_id not in self._documents:
+            self._documents[doc_id] = await self._store.get_document(doc_id)
+        return self._documents[doc_id]
+
+    async def _evidence_time(self, unit: MemoryEvidenceUnitProjection) -> str | None:
         primary = _primary_item(unit)
         if primary is None:
             return None
-        return _evidence_time(_anchored_revision(primary, await self.revisions(unit.source_unit_id)))
+        return _evidence_time(_anchored_revision(primary, await self._unit_revisions(unit.source_unit_id)))
 
     async def evidence_unit(
         self,
@@ -806,17 +827,60 @@ class _RelationEvidenceReader:
         Memory.
         """
 
-        units = await self._store.get_memory_evidence_units(memory_id)
+        units = await self._memory_units(memory_id)
         if evidence_unit_id is not None:
             chosen = next((unit for unit in units if unit.evidence_unit_id == evidence_unit_id), None)
             if chosen is None:
                 raise ValueError("relation evidence is no longer current")
             return chosen
-        current = {unit.evidence_unit_id: unit for unit in units if unit.current}
-        if not current:
-            return units[0] if units else None
-        times = {unit_id: await self.evidence_time(unit) for unit_id, unit in current.items()}
-        return current[newest_evidence_unit_id(times)]
+        if memory_id not in self._chosen_units:
+            current = {unit.evidence_unit_id: unit for unit in units if unit.current}
+            if not current:
+                self._chosen_units[memory_id] = units[0] if units else None
+            else:
+                times = {unit_id: await self._evidence_time(unit) for unit_id, unit in current.items()}
+                self._chosen_units[memory_id] = current[newest_evidence_unit_id(times)]
+        return self._chosen_units[memory_id]
+
+    async def subject(self, memory: Memory, *, evidence_unit_id: str | None = None) -> RelationSubject:
+        """The classifier input for ``memory``, shown from the Evidence Unit ``evidence_unit`` gives."""
+
+        unit = await self.evidence_unit(memory.id, evidence_unit_id=evidence_unit_id)
+        key = (memory.id, memory.content_hash, unit.evidence_unit_id if unit is not None else None)
+        if key not in self._subjects:
+            self._subjects[key] = await self._build_subject(memory, unit)
+        return self._subjects[key]
+
+    async def _build_subject(
+        self,
+        memory: Memory,
+        unit: MemoryEvidenceUnitProjection | None,
+    ) -> RelationSubject:
+        if unit is None:
+            return RelationSubject(
+                memory_id=memory.id,
+                content_hash=memory.content_hash,
+                statement=memory.content,
+                memory_type=memory.memory_type,
+            )
+        document = await self._document(unit.doc_id) if unit.doc_id else None
+        unit_revisions = await self._unit_revisions(unit.source_unit_id)
+        supporting = [item for item in unit.items if item.grants_support]
+        evidence = tuple(
+            text
+            for item in supporting
+            if (text := _anchored_text(item, _anchored_revision(item, unit_revisions)))
+        )
+        return RelationSubject(
+            memory_id=memory.id,
+            content_hash=memory.content_hash,
+            statement=memory.content,
+            memory_type=memory.memory_type,
+            source_type=unit.source_type,
+            document_title=getattr(document, "title", None) or None,
+            evidence_time=await self._evidence_time(unit),
+            evidence=evidence,
+        )
 
 
 def _primary_item(unit: MemoryEvidenceUnitProjection) -> MemoryEvidenceItemProjection | None:
@@ -824,16 +888,6 @@ def _primary_item(unit: MemoryEvidenceUnitProjection) -> MemoryEvidenceItemProje
         (item for item in unit.items if item.grants_support and item.role is EvidenceRole.PRIMARY),
         None,
     )
-
-
-async def load_relation_evidence_units(
-    store: RelationSubjectStore,
-    memories: Sequence[Memory],
-) -> Mapping[str, MemoryEvidenceUnitProjection | None]:
-    """The Evidence Unit each Memory's relation subject is read from."""
-
-    reader = _RelationEvidenceReader(store)
-    return {memory.id: await reader.evidence_unit(memory.id) for memory in memories}
 
 
 async def load_relation_subjects(
@@ -849,49 +903,20 @@ async def load_relation_subjects(
     Memory whose Evidence the caller already chose: discovery shows its
     challenger from the Evidence Unit it records the run against.
 
-    Discovery and the evaluation set both build subjects here with the same
-    rendering. Discovery chooses its challenger's Evidence Unit within the
-    work's Source Unit; the evaluation set chooses among all of the
-    challenger's current Units, so the two show the same Evidence unless the
-    challenger has current Evidence in several Source Units. Discovery asks
-    about all of a challenger's candidates in requests that state the
-    challenger once; the evaluation sends each pinned pair on its own.
+    Discovery and the evaluation set both build subjects with
+    ``RelationSubjectReader`` and the same rendering. Discovery chooses its
+    challenger's Evidence Unit within the work's Source Unit; the evaluation set
+    chooses among all of the challenger's current Units, so the two show the
+    same Evidence unless the challenger has current Evidence in several Source
+    Units. Discovery asks about all of a challenger's candidates in requests
+    that state the challenger once; a relation group case replays those
+    requests with the candidates it pinned, and a pair case sends its one pair
+    on its own.
     """
 
-    reader = _RelationEvidenceReader(store)
+    reader = RelationSubjectReader(store)
     chosen_units = evidence_unit_ids or {}
-    documents: dict[str, Any] = {}
-    subjects: dict[str, RelationSubject] = {}
-    for memory in memories:
-        if memory.id in subjects:
-            continue
-        unit = await reader.evidence_unit(memory.id, evidence_unit_id=chosen_units.get(memory.id))
-        if unit is None:
-            subjects[memory.id] = RelationSubject(
-                memory_id=memory.id,
-                content_hash=memory.content_hash,
-                statement=memory.content,
-                memory_type=memory.memory_type,
-            )
-            continue
-        if unit.doc_id and unit.doc_id not in documents:
-            documents[unit.doc_id] = await store.get_document(unit.doc_id)
-        document = documents.get(unit.doc_id) if unit.doc_id else None
-        unit_revisions = await reader.revisions(unit.source_unit_id)
-        supporting = [item for item in unit.items if item.grants_support]
-        evidence = tuple(
-            text
-            for item in supporting
-            if (text := _anchored_text(item, _anchored_revision(item, unit_revisions)))
-        )
-        subjects[memory.id] = RelationSubject(
-            memory_id=memory.id,
-            content_hash=memory.content_hash,
-            statement=memory.content,
-            memory_type=memory.memory_type,
-            source_type=unit.source_type,
-            document_title=getattr(document, "title", None) or None,
-            evidence_time=await reader.evidence_time(unit),
-            evidence=evidence,
-        )
-    return subjects
+    return {
+        memory.id: await reader.subject(memory, evidence_unit_id=chosen_units.get(memory.id))
+        for memory in memories
+    }

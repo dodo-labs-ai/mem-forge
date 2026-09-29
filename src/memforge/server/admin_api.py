@@ -898,6 +898,30 @@ class CrossSourceReviewLabelsRequest(BaseModel):
     label_overrides: dict[str, CrossDocumentRelationLabel] = Field(default_factory=dict)
 
 
+class RelationGroupLabelsRequest(BaseModel):
+    """One challenger, every candidate discovery asked about for it in discovery's order, and labels for some.
+
+    ``content_hashes`` gives each of these Memories' content hash when the
+    group was labelled.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    challenger_memory_id: str = Field(min_length=1)
+    candidate_memory_ids: list[str] = Field(min_length=1)
+    labels: dict[str, CrossDocumentRelationLabel] = Field(default_factory=dict)
+    content_hashes: dict[str, str]
+
+
+class RelationGroupCasesSeedRequest(BaseModel):
+    """Labelled discovery groups of the request's workspace, named by Memory id only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    groups: list[RelationGroupLabelsRequest] = Field(min_length=1)
+    labelled_by: str = Field(min_length=1)
+
+
 class CrossSourceReviewConversionReportResponse(BaseModel):
     report_id: str
     review_count: int
@@ -5971,6 +5995,56 @@ def create_admin_app(
             "pinned_case_count": report.pinned_case_count,
             "label_counts": dict(report.label_counts),
             "skipped": dict(report.skipped),
+        }
+
+    @evaluation_router.post("/relation-group-cases/seed")
+    async def seed_relation_group_evaluation_cases(
+        body: RelationGroupCasesSeedRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Pin labelled discovery groups as relation group cases and freeze their cohort.
+
+        The server reads every Memory and its classifier input itself; the
+        request carries Memory ids, labels and the content hashes the labels
+        were made for only.
+        """
+
+        from memforge.evals.cross_document_relation_cases import (
+            RelationGroupLabels,
+            seed_cross_document_relation_group_cases,
+        )
+        from memforge.evals.offline_evaluation import OfflineAgentEvaluation
+
+        actor = _require_maintenance_operator(request)
+        try:
+            report = await seed_cross_document_relation_group_cases(
+                db,
+                OfflineAgentEvaluation(db, executors={}),
+                groups=[
+                    RelationGroupLabels(
+                        challenger_memory_id=group.challenger_memory_id,
+                        candidate_memory_ids=tuple(group.candidate_memory_ids),
+                        labels=group.labels,
+                        content_hashes=group.content_hashes,
+                    )
+                    for group in body.groups
+                ],
+                labelled_by=body.labelled_by,
+                actor=actor,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "cohort_id": report.cohort_id,
+            "pinned_group_count": report.pinned_group_count,
+            "candidate_count": report.candidate_count,
+            "labelled_pair_count": report.labelled_pair_count,
+            "label_counts": dict(report.label_counts),
+            "skipped": dict(report.skipped),
+            "skipped_groups": dict(report.skipped_groups),
         }
 
     @evaluation_router.post("/runs", status_code=202)
