@@ -34,7 +34,7 @@ conflict or one updates another.
 ## What It Does
 
 - Ingests source context from genes such as wiki pages, issue trackers,
-  GitHub Pages, Teams exports, and generated agent-session packages.
+  GitHub Pages, Teams exports, and Codex and Claude Code session windows.
 - Extracts durable facts, decisions, procedures, and conventions with quality
   gates before persistence.
 - Stores memory, provenance, review state, full-text search, and vector search
@@ -98,9 +98,10 @@ flowchart LR
 ```
 
 Client adapters collect bounded, redacted evidence windows and upload them to
-`POST /api/agent-sessions/windows`. The service canonicalizes the window,
-generates the package, and queues the source sync. This keeps agent clients
-portable across local and future hosted deployments.
+`POST /api/v1/agent-sessions/windows`. The service canonicalizes the window,
+checks which user messages carry durable authority, and patches the user's
+private Agent Knowledge directly. This keeps agent clients portable across local
+and future hosted deployments.
 
 For MCP, Codex and Claude Code talk to a plugin-local proxy over stdio. That
 proxy calls the self-hosted or hosted MemForge API over HTTP(S), so search and

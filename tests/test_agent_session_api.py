@@ -24,7 +24,7 @@ from memforge.agent_sessions import (
 )
 from memforge.config import AppConfig
 from memforge.llm.structured import AgentSessionAuthorityResponse, StructuredLlmError
-from memforge.models import DocumentRecord, Memory, content_hash
+from memforge.models import UNSORTED_PROJECT_KEY, DocumentRecord, Memory, content_hash
 from memforge.storage.database import Database
 from tests.test_sync_bookkeeping import _hold_document
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
@@ -436,88 +436,10 @@ async def _seed_source_project(
         await db.add_memory_source(memory.id, doc_id, "agent_session", source_updated_at=None)
 
 
-def test_agent_session_document_submit_api_is_retired(tmp_path):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = Database(str(tmp_path / "api.db"))
-
-    async def _setup():
-        await database.connect()
-
-    import asyncio
-
-    asyncio.run(_setup())
-    try:
-        app = create_admin_app(db=database, config=cfg)
-        with TestClient(app) as client:
-            response = client.post(
-                "/api/v1/agent-sessions/documents",
-                json={
-                    "client": "codex",
-                    "session_id": "sess-api",
-                    "trigger": "Stop",
-                    "workspace": "/workspace/mem-forge",
-                    "repo": "mem-forge",
-                    "branch": "main",
-                    "commit_sha": "abc123",
-                    "history_window_kind": "session",
-                    "history_window_start": "2026-05-21T10:00:00+00:00",
-                    "history_window_end": "2026-05-21T11:00:00+00:00",
-                    "document_markdown": "# Summary\n\n## Outcome\nAPI accepted a generated session document.",
-                    "process_now": False,
-                },
-            )
-
-        assert response.status_code == 410
-        assert "agent-session document intake has been retired" in response.json()["detail"]
-    finally:
-        asyncio.run(database.close())
-
-
-def test_agent_session_document_submit_retired_before_principal_handling(tmp_path):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = Database(str(tmp_path / "api.db"))
-
-    async def _setup():
-        await database.connect()
-
-    import asyncio
-
-    asyncio.run(_setup())
-    try:
-        app = create_admin_app(
-            db=database,
-            config=cfg,
-            principal_resolver=lambda request: "u-authorized",
-        )
-        with TestClient(app) as client:
-            response = client.post(
-                "/api/v1/agent-sessions/documents",
-                json={
-                    "client": "codex",
-                    "session_id": "sess-principal",
-                    "trigger": "Stop",
-                    "workspace": "/workspace/mem-forge",
-                    "repo": "mem-forge",
-                    "document_markdown": "# Summary\n\nThe route pins owner identity.",
-                    "process_now": False,
-                    "user_id": "u-spoofed",
-                },
-            )
-
-        assert response.status_code == 410
-        assert "agent-session document intake has been retired" in response.json()["detail"]
-    finally:
-        asyncio.run(database.close())
-
-
 def test_agent_session_window_submit_uses_server_principal(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
-    class PackageClient(_AuthorizesAllCandidateUserEvidence):
+    class PatchClient(_AuthorizesAllCandidateUserEvidence):
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
             return _knowledge_patch(
                 title="Principal patch",
@@ -539,7 +461,7 @@ def test_agent_session_window_submit_uses_server_principal(tmp_path):
             config=cfg,
             principal_resolver=lambda request: "u-authorized",
         )
-        app.state.agent_session_window_client = PackageClient()
+        app.state.agent_session_window_client = PatchClient()
         with TestClient(app) as client:
             response = client.post(
                 "/api/v1/agent-sessions/windows",
@@ -587,7 +509,6 @@ def test_agent_session_window_holds_activity_while_llm_builds_patch(
     asyncio.run(
         ensure_agent_session_source(
             database,
-            cfg,
             client="codex",
             owner_user_id="u-race",
         )
@@ -655,7 +576,6 @@ def test_agent_session_window_does_not_build_prompt_during_active_maintenance(tm
     asyncio.run(
         ensure_agent_session_source(
             database,
-            cfg,
             client="codex",
             owner_user_id="u-maintenance",
         )
@@ -827,7 +747,7 @@ def test_source_projects_endpoint_groups_agent_session_memory_by_project(tmp_pat
         asyncio.run(database.close())
 
 
-def test_agent_session_window_api_generates_package_and_discards_raw_window(tmp_path):
+def test_agent_session_window_api_patches_knowledge_and_discards_raw_window(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     class FakeWindowClient(_AuthorizesAllCandidateUserEvidence):
@@ -906,7 +826,7 @@ def test_agent_session_window_api_generates_package_and_discards_raw_window(tmp_
         asyncio.run(database.close())
 
 
-def test_agent_session_window_api_canonicalizes_evidence_before_packaging(tmp_path):
+def test_agent_session_window_api_canonicalizes_evidence_before_patching(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     class FakeWindowClient(_AuthorizesAllCandidateUserEvidence):
@@ -977,13 +897,13 @@ def test_agent_session_window_api_canonicalizes_evidence_before_packaging(tmp_pa
         asyncio.run(database.close())
 
 
-def test_agent_session_window_api_queues_service_owned_sync(tmp_path):
+def test_agent_session_window_api_patches_knowledge_without_source_sync(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     class FakeWindowClient(_AuthorizesAllCandidateUserEvidence):
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
             return _knowledge_patch(
-                title="Agent Session: queued service sync",
+                title="Agent Session: direct knowledge patch",
                 claim_text="Agent session windows write knowledge directly without queuing source sync.",
             )
 
@@ -1085,7 +1005,10 @@ def test_agent_session_window_api_accepts_no_output_without_creating_source(tmp_
     from memforge.server.admin_api import create_admin_app
 
     class NoOutputClient(_AuthorizesAllCandidateUserEvidence):
+        proposal_calls = 0
+
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            self.proposal_calls += 1
             return _knowledge_patch(
                 action="no_output",
                 title=None,
@@ -1105,7 +1028,8 @@ def test_agent_session_window_api_accepts_no_output_without_creating_source(tmp_
     asyncio.run(_setup())
     try:
         app = create_admin_app(db=database, config=cfg)
-        app.state.agent_session_window_client = NoOutputClient()
+        window_client = NoOutputClient()
+        app.state.agent_session_window_client = window_client
         with TestClient(app) as client:
             response = client.post(
                 "/api/v1/agent-sessions/windows",
@@ -1123,11 +1047,125 @@ def test_agent_session_window_api_accepts_no_output_without_creating_source(tmp_
         body = response.json()
         assert body["result"] == "no_output"
         assert body["reason"] == "trivial explanation"
+        assert window_client.proposal_calls == 1
 
         async def _assert_no_source():
             assert await database.get_source(agent_session_source_id("codex", "dev")) is None
 
         asyncio.run(_assert_no_source())
+    finally:
+        asyncio.run(database.close())
+
+
+def test_agent_session_first_patching_window_makes_one_proposal_call(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    class CountingClient(_AuthorizesAllCandidateUserEvidence):
+        proposal_calls = 0
+
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            self.proposal_calls += 1
+            return _knowledge_patch(
+                title="First window",
+                claim_text="The first patching window of a client creates its Source with one proposal.",
+            )
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+    import asyncio
+
+    asyncio.run(database.connect())
+    try:
+        assert asyncio.run(database.get_source(agent_session_source_id("codex", "dev"))) is None
+        app = create_admin_app(db=database, config=cfg)
+        window_client = CountingClient()
+        app.state.agent_session_window_client = window_client
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/agent-sessions/windows",
+                json={
+                    "client": "codex",
+                    "session_id": "sess-first-window",
+                    "trigger": "Stop",
+                    "workspace": "/workspace/mem-forge",
+                    "events": _authorized_events({"role": "assistant", "text": "Worth keeping."}),
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["result"] == "knowledge_patched"
+        assert window_client.proposal_calls == 1
+        source = asyncio.run(database.get_source(agent_session_source_id("codex", "dev")))
+        assert source is not None
+        memory_sources = asyncio.run(database.get_memory_sources(body["memory_id"]))
+        assert {memory_source.source_id for memory_source in memory_sources} == {source["id"]}
+    finally:
+        asyncio.run(database.close())
+
+
+def test_agent_session_first_window_regenerates_proposal_when_prompt_changed_before_lease(tmp_path):
+    """A write that lands between Source admission and the lease is seen by the applied proposal."""
+    from memforge.server.admin_api import create_admin_app
+
+    concurrent_title = "Concurrent Claude Code concept"
+
+    class ConcurrentWriteClient(_AuthorizesAllCandidateUserEvidence):
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                other_source = await ensure_agent_session_source(
+                    database,
+                    client="claude-code",
+                    owner_user_id="dev",
+                )
+                await database.upsert_agent_concept(
+                    concept_id="concept-concurrent",
+                    source_id=other_source["id"],
+                    owner_user_id="dev",
+                    workspace="/workspace/mem-forge",
+                    repo_identifier=None,
+                    concept_type="convention",
+                    concept_path="dev/none/convention/concurrent.md",
+                    title=concurrent_title,
+                    markdown_body=f"# {concurrent_title}\n",
+                    frontmatter={},
+                    observed_at=datetime(2026, 9, 29, tzinfo=timezone.utc),
+                )
+            return _knowledge_patch(
+                title="Admission window",
+                claim_text="A proposal applied under the lease reflects the knowledge state the lease protects.",
+            )
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+    import asyncio
+
+    asyncio.run(database.connect())
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        window_client = ConcurrentWriteClient()
+        app.state.agent_session_window_client = window_client
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/agent-sessions/windows",
+                json={
+                    "client": "codex",
+                    "session_id": "sess-admission-race",
+                    "trigger": "Stop",
+                    "workspace": "/workspace/mem-forge",
+                    "events": _authorized_events({"role": "assistant", "text": "Worth keeping."}),
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["result"] == "knowledge_patched"
+        assert len(window_client.prompts) == 2
+        assert concurrent_title not in window_client.prompts[0]
+        assert concurrent_title in window_client.prompts[1]
     finally:
         asyncio.run(database.close())
 
@@ -1268,7 +1306,7 @@ def test_agent_session_window_api_returns_retryable_503_for_provider_failures(
     async def _setup():
         await database.connect()
         # An existing Source makes the patch run under a Source activity lease.
-        await ensure_agent_session_source(database, cfg, client="codex", owner_user_id="dev")
+        await ensure_agent_session_source(database, client="codex", owner_user_id="dev")
 
     asyncio.run(_setup())
     window = {
@@ -2082,7 +2120,7 @@ def test_agent_session_memory_detail_exposes_source_updated_at(tmp_path):
     """Memory provenance reports the source updated time separately from link time."""
     from memforge.server.admin_api import create_admin_app
 
-    class PackageClient(_AuthorizesAllCandidateUserEvidence):
+    class PatchClient(_AuthorizesAllCandidateUserEvidence):
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
             return _knowledge_patch(
                 title="Observed timestamp contract",
@@ -2102,7 +2140,7 @@ def test_agent_session_memory_detail_exposes_source_updated_at(tmp_path):
             config=cfg,
             principal_resolver=lambda request: "u-observed",
         )
-        app.state.agent_session_window_client = PackageClient()
+        app.state.agent_session_window_client = PatchClient()
         with TestClient(app) as client:
             response = client.post(
                 "/api/v1/agent-sessions/windows",
@@ -2154,7 +2192,7 @@ def test_agent_session_window_rejects_naive_source_updated_at(tmp_path):
     """Source observation time must be timezone-explicit; it is never localized."""
     from memforge.server.admin_api import create_admin_app
 
-    class PackageClient(_AuthorizesAllCandidateUserEvidence):
+    class PatchClient(_AuthorizesAllCandidateUserEvidence):
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
             return _knowledge_patch(
                 title="Naive timestamp rejected",
@@ -2174,7 +2212,7 @@ def test_agent_session_window_rejects_naive_source_updated_at(tmp_path):
             config=cfg,
             principal_resolver=lambda request: "u-observed",
         )
-        app.state.agent_session_window_client = PackageClient()
+        app.state.agent_session_window_client = PatchClient()
         with TestClient(app) as client:
             response = client.post(
                 "/api/v1/agent-sessions/windows",
@@ -2206,7 +2244,7 @@ def test_agent_session_memory_detail_does_not_fallback_source_updated_at(tmp_pat
     """Absent source updated time stays unknown instead of copying submitted_at."""
     from memforge.server.admin_api import create_admin_app
 
-    class PackageClient(_AuthorizesAllCandidateUserEvidence):
+    class PatchClient(_AuthorizesAllCandidateUserEvidence):
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
             return _knowledge_patch(
                 title="No fallback timestamp",
@@ -2226,7 +2264,7 @@ def test_agent_session_memory_detail_does_not_fallback_source_updated_at(tmp_pat
             config=cfg,
             principal_resolver=lambda request: "u-observed",
         )
-        app.state.agent_session_window_client = PackageClient()
+        app.state.agent_session_window_client = PatchClient()
         with TestClient(app) as client:
             response = client.post(
                 "/api/v1/agent-sessions/windows",
@@ -2643,7 +2681,7 @@ def test_summarize_agent_session_outcomes_ignores_explicit_document_metadata(tmp
     asyncio.run(_run())
 
 
-def test_agent_window_patch_writes_memory_without_package_file(tmp_path):
+def test_agent_window_patch_writes_memory_without_document_uri(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     class FakeWindowClient(_AuthorizesAllCandidateUserEvidence):
@@ -2688,7 +2726,7 @@ def test_per_client_source_split_creates_two_distinct_source_rows(tmp_path):
     """Submitting from codex and claude-code creates two separate source rows."""
     from memforge.server.admin_api import create_admin_app
 
-    class PackageClient(_AuthorizesAllCandidateUserEvidence):
+    class PatchClient(_AuthorizesAllCandidateUserEvidence):
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
             return _knowledge_patch(
                 title="Client source split",
@@ -2703,7 +2741,7 @@ def test_per_client_source_split_creates_two_distinct_source_rows(tmp_path):
     asyncio.run(database.connect())
     try:
         app = create_admin_app(db=database, config=cfg)
-        app.state.agent_session_window_client = PackageClient()
+        app.state.agent_session_window_client = PatchClient()
         with TestClient(app) as client:
             codex_response = client.post(
                 "/api/v1/agent-sessions/windows",
@@ -2756,9 +2794,88 @@ def test_per_client_source_split_creates_two_distinct_source_rows(tmp_path):
             assert claude_src["access_policy"] == "private"
             assert claude_src["owner_user_id"] == "dev"
 
+            codex_memory_sources = await database.get_memory_sources(codex_body["memory_id"])
+            claude_memory_sources = await database.get_memory_sources(claude_body["memory_id"])
+            assert {source.source_id for source in codex_memory_sources} == {codex_source_id}
+            assert {source.source_id for source in claude_memory_sources} == {claude_source_id}
+
         asyncio.run(_check_sources())
     finally:
         asyncio.run(database.close())
+
+
+def _submit_patching_window(tmp_path, *, workspace: str, repo: str | None, setup=None):
+    """Submit one patching window for user ``dev`` and return the written memory."""
+    from memforge.server.admin_api import create_admin_app
+
+    class PatchClient(_AuthorizesAllCandidateUserEvidence):
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
+                title="Project attribution",
+                claim_text="Agent-session memories carry the project and repository of their window.",
+            )
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+    import asyncio
+
+    asyncio.run(database.connect())
+    try:
+        if setup is not None:
+            asyncio.run(setup(database))
+        app = create_admin_app(db=database, config=cfg)
+        app.state.agent_session_window_client = PatchClient()
+        window = {
+            "client": "codex",
+            "session_id": "sess-project",
+            "trigger": "Stop",
+            "workspace": workspace,
+            "events": _authorized_events({"role": "assistant", "text": "Worth keeping."}),
+        }
+        if repo is not None:
+            window["repo"] = repo
+        with TestClient(app) as client:
+            response = client.post("/api/v1/agent-sessions/windows", json=window)
+
+        assert response.status_code == 200, response.text
+        memory = asyncio.run(database.get_memory(response.json()["memory_id"]))
+        assert memory is not None
+        return memory
+    finally:
+        asyncio.run(database.close())
+
+
+def test_agent_session_window_without_repo_resolves_to_unsorted_project(tmp_path):
+    """A window without a repo never mints a project key from the workspace basename."""
+    memory = _submit_patching_window(tmp_path, workspace="/tmp/scratch-xyz", repo=None)
+
+    assert memory.project_key == UNSORTED_PROJECT_KEY
+    assert memory.repo_identifier is None
+
+
+def test_agent_session_window_resolves_project_through_repo_binding(tmp_path):
+    async def bind_repo_to_project(database: Database) -> None:
+        source = await ensure_agent_session_source(database, client="codex", owner_user_id="dev")
+        binding = {"mode": "by_field", "field": "repo", "map": {"my-app": "APP"}, "default": "UNSORTED"}
+        await database.db.execute(
+            "UPDATE sources SET project_binding = ? WHERE id = ?",
+            (json.dumps(binding), source["id"]),
+        )
+        await database.db.commit()
+
+    memory = _submit_patching_window(tmp_path, workspace="/tmp/work", repo="my-app", setup=bind_repo_to_project)
+
+    assert memory.project_key == "APP"
+
+
+def test_agent_session_window_normalizes_repo_identifier(tmp_path):
+    memory = _submit_patching_window(
+        tmp_path,
+        workspace="/workspace/memforge-cloud",
+        repo="git@github.tools.sap:HCM/memforge-cloud.git",
+    )
+
+    assert memory.repo_identifier == "github.tools.sap/hcm/memforge-cloud"
 
 
 def test_db_migration_partitions_legacy_client_source_by_owner(tmp_path):

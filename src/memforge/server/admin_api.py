@@ -1680,25 +1680,6 @@ async def _raise_if_source_paused(db: Database, source_id: str) -> None:
         raise _source_paused_http_error()
 
 
-class AgentSessionDocumentRequest(BaseModel):
-    client: str
-    session_id: str
-    trigger: str
-    workspace: str
-    document_markdown: str
-    repo: str | None = None
-    branch: str | None = None
-    commit_sha: str | None = None
-    history_window_kind: str = "session"
-    history_window_start: str | None = None
-    history_window_end: str | None = None
-    title: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    submitted_at: str | None = None
-    source_updated_at: str | None = None
-    process_now: bool = True
-
-
 class LocalSourcePackageRequest(BaseModel):
     """One raw local-source package pushed by the local daemon/adapter.
 
@@ -7986,25 +7967,8 @@ def create_admin_app(
         }
 
     # ===================================================================
-    # 4b. Agent Session Document Intake
+    # 4b. Agent Session Windows
     # ===================================================================
-
-    @agent_session_router.post("/documents")
-    async def submit_agent_session_summary(
-        req: AgentSessionDocumentRequest,
-        request: Request,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        sync_service: SyncService = Depends(get_sync_service),
-    ):
-        """Submit a client-generated agent session summary document."""
-        raise HTTPException(
-            status_code=410,
-            detail=(
-                "agent-session document intake has been retired; submit canonical "
-                "agent-session windows so user-active evidence can be verified"
-            ),
-        )
 
     @agent_session_router.get("/completeness")
     async def agent_session_completeness(

@@ -2707,7 +2707,6 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "search" in tools
     assert "list_sources" in tools
     assert "list_recent_changes" not in tools
-    assert "submit_agent_session_document" not in tools
     assert "suggest_memory_replacement" not in tools
     assert "create_memory" in tools
     assert "retire_memory" in tools

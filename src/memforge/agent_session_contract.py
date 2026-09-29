@@ -1,19 +1,10 @@
-"""Shared contract for generated agent-session source packages."""
+"""Shared contract for agent-session window receipts."""
 
 from datetime import datetime, timezone
 
 from memforge.models import AgentSessionReceipt
 
-AGENT_SESSION_PACKAGE_KIND = "agent_session_document"
-AGENT_SESSION_CONTENT_ROLE = "generated_summary"
 AGENT_SESSION_WINDOW_SOURCE_KIND = "generated_agent_window_summary"
-
-LLM_VISIBLE_METADATA_KEYS = {
-    "has_transcript_path",
-    "hook_event_name",
-    "permission_mode",
-    "turn_id",
-}
 
 _SUCCESSFUL_WINDOW_OUTCOMES = frozenset(
     {
