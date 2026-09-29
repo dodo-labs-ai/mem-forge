@@ -205,8 +205,12 @@ class SupportRevisionPlan:
         }
 
         def first_part_end(support: SupportPlan) -> int:
+            # The Unit Title is context of every part, so Evidence on it places no part in the first part.
             own_ends = (
-                position[fragment.anchor] + 1 for correspondence in support.parts for fragment in correspondence.current
+                position[fragment.anchor] + 1
+                for correspondence in support.parts
+                for fragment in correspondence.current
+                if fragment.anchor not in self.context.unit_title_anchors
             )
             # Prior Evidence travels with the first part, so every Support reads at least one part before concluding.
             return max((1, len(self.changes), *own_ends))
