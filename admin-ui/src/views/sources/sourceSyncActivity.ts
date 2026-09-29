@@ -327,6 +327,9 @@ function currentSourceDate(snapshot: SyncProgressSnapshot): string {
   }).format(parsed);
 }
 
+// How rate-limit failures read; a bare "429" is not matched, since identifiers in other errors contain those digits.
+const RATE_LIMIT_MARKERS = ["rate limit", "ratelimit", "too many requests"];
+
 function safeFailureDetail(error: SourceSyncActivity["error"]): string {
   const messages = [error?.message, ...(error?.items ?? []).map((item) => item.error)]
     .filter((value): value is string => Boolean(value?.trim()));
@@ -353,7 +356,7 @@ function safeFailureDetail(error: SourceSyncActivity["error"]): string {
   )) {
     return "The AI provider is unavailable. Check its connection, then retry.";
   }
-  if (normalized.includes("rate limit") || normalized.includes("429")) {
+  if (RATE_LIMIT_MARKERS.some((marker) => normalized.includes(marker))) {
     return "The source is temporarily rate limited. Wait a few minutes, then retry.";
   }
   if (normalized.includes("pdf export") || normalized.includes("did not produce a pdf")) {

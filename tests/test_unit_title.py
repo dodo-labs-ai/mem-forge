@@ -395,3 +395,23 @@ def test_a_teams_window_keeps_its_unit_title_as_it_grows():
         "Teams conversation\nConversation type: group_chat\nConversation: Payroll Dev\nFrom: 2026-09-29T02:39:00+00:00"
     )
     assert title_revision(grown).id == title_revision(first).id
+
+
+def test_a_support_that_selected_an_unchanged_title_reads_its_own_evidence_first():
+    first = jira()
+    changed = jira(description="Payroll context changed.", prior=first, run_id="run-2")
+    context = RevisionAssessmentContext(projection=changed, base=first, access_context_hash="scope")
+    named = (
+        support_part(first, "Payroll context.", reference_id="e1"),
+        support_part(first, "Jira issue", role=EvidenceRole.REQUIRED, reference_id="e2"),
+    )
+
+    plan = plan_supports(context, named)
+    [support] = plan.supports
+    assert [part.status for part in support.parts] == [
+        EvidenceCorrespondence.MODIFIED, EvidenceCorrespondence.EXACT_UNCHANGED,
+    ]
+    order = plan.reading_order(plan.supports)
+
+    # The unchanged title is context of every step, so it places no step of its own in the first part.
+    assert order.first_part_end == {"w0": len(plan.changes)}

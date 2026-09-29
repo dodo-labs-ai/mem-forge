@@ -52,3 +52,18 @@ it("does not expose arbitrary raw errors or offer unavailable configuration", ()
   expect(screen.queryByText(/private credentials/)).toBeNull();
   expect(screen.queryByRole("button", { name: "Configure file scope" })).toBeNull();
 });
+
+it("does not read 429 digits inside a failed document's identifiers as a rate limit", () => {
+  render(<SourceSyncStatusCard activity={{ state: "failed", error: {
+    message: "1 document could not be synced. Review the failed document details.",
+    items: [{ doc_id: "jira-SFPAY-183473", title: "SFPAY-183473", error: "SourceAnchor(observation_id='obs-a4296a4dd', range_end=429)" }],
+  } }} sourceName="SFPAY Defect 2026" itemLabel="issues" />);
+  expect(screen.queryByText(/rate limited/)).toBeNull();
+});
+
+it("recognizes an HTTP Too Many Requests failure as a rate limit", () => {
+  render(<SourceSyncStatusCard activity={{ state: "failed", error: {
+    message: "Client error '429 Too Many Requests' for url 'https://teams.example.test/messages'",
+  } }} sourceName="Teams" itemLabel="messages" />);
+  expect(screen.getByText("The source is temporarily rate limited. Wait a few minutes, then retry.")).toBeTruthy();
+});

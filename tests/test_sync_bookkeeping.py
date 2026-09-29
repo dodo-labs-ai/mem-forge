@@ -2479,10 +2479,38 @@ def test_failed_document_summary_keeps_rate_limit_precedence_over_llm_timeout_te
     )
 
     assert message == (
-        "1 Confluence document could not be imported. Confluence rate limited 1 document. "
+        "1 document could not be imported. Source rate limit was reached for 1 document. "
         "Wait a few minutes, then retry the sync."
     )
 
+
+
+def test_failed_document_summary_recognizes_each_rate_limit_wording():
+    errors = [
+        "Jira rate limit persisted after 5 attempts for https://jira.example.test/rest/api/2/issue/SFPAY-1.",
+        "Client error '429 Too Many Requests' for url 'https://teams.example.test/messages'",
+        "RateLimitError: error details omitted",
+    ]
+    message = summarize_failed_documents(
+        len(errors),
+        [FailedDoc(doc_id=f"doc-{index}", title="Doc", error=error) for index, error in enumerate(errors)],
+    )
+
+    assert message == (
+        "3 documents could not be imported. Source rate limit was reached for 3 documents. "
+        "Wait a few minutes, then retry the sync."
+    )
+
+
+def test_failed_document_summary_does_not_read_429_digits_in_identifiers_as_a_rate_limit():
+    error = (
+        "SourceAnchor(kind=<AnchorKind.REVISION_RANGE: 'revision_range'>, "
+        "observation_id='obs-a4296a4dd4e3987513f63e75', observation_revision_id='obsrev-b9976f6e', "
+        "fragment_id=None, range_start=0, range_end=429)"
+    )
+    message = summarize_failed_documents(1, [FailedDoc(doc_id="jira-SFPAY-183473", title="Doc", error=error)])
+
+    assert message == "1 document could not be synced. Review the failed document details."
 
 def test_failed_document_summary_preserves_mixed_failure_guidance():
     message = summarize_failed_documents(
@@ -2500,7 +2528,7 @@ def test_failed_document_summary_preserves_mixed_failure_guidance():
 
     assert message == (
         "3 documents could not be synced. Embedding provider was unreachable for 1 document; "
-        "PDF export was unavailable for 1 document; Confluence rate limited 1 document. "
+        "PDF export was unavailable for 1 document; Source rate limit was reached for 1 document. "
         "Wait a few minutes, then retry the sync. "
         "Check the provider endpoint, network access, and service status, then retry the sync."
     )
@@ -11476,7 +11504,7 @@ async def test_missing_required_confluence_pdf_fails_sync_without_hiding_gap(db:
     assert state.docs_processed == 0
     assert state.docs_failed == 1
     assert state.error_message == (
-        "1 Confluence document could not be imported. PDF export was unavailable for 1 document."
+        "1 document could not be imported. PDF export was unavailable for 1 document."
     )
     assert "Confluence PDF export did not produce a PDF" in state.failed_docs[0].error
 
