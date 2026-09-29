@@ -8,6 +8,7 @@ current representation only.
 import json
 from dataclasses import replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,6 +36,7 @@ from memforge.pipeline.stored_document import reprocess_preview
 from memforge.pipeline.unit_title import UNIT_TITLE_DEFINITION, render_unit_title, unit_title_block
 from memforge.source_projection import (
     AnchorKind,
+    DeltaAxis,
     EvidenceCoordinateSpace,
     EvidenceRepresentationProfile,
     ProjectionCoverage,
@@ -91,6 +93,54 @@ def jira(summary="Payroll run fails", *, issue_type=None, description="Payroll c
             {revision.observation_id: revision for revision in prior.observation_revisions} if prior else None
         ),
     )
+
+
+def teams(messages, *, conversation_name="Payroll Dev", prior=None, run_id="run-1"):
+    times = [message["time"] for message in messages]
+    item = ContentItem(
+        item_id="teams-window-1", title=f"Group: {conversation_name} -- {times[0]}-{times[-1]}",
+        source_url="https://teams.example.test/conversations/conversation-1", last_modified=NOW, version=run_id,
+        extra={"conversation_id": "conversation-1", "window_id": "window-1", "root_message_id": messages[0]["id"],
+               "block_start": times[0], "block_end": times[-1]},
+    )
+    payload = {
+        "conversation_id": "conversation-1", "window_id": "window-1", "conversation_type": "group_chat",
+        "title": item.title, "channel_name": conversation_name, "conversation_name": conversation_name,
+        "messages": messages, "first_message_time": times[0], "last_message_time": times[-1],
+    }
+    return project_source_item(
+        source_id="src-teams", source_type="teams", run_id=run_id, item=item,
+        raw=RawContent(item=item, body=json.dumps(payload).encode(), content_type="application/json"),
+        normalized=NormalizedContent(item=item, markdown_body="normalized Teams window"),
+        prior_unit_revision=prior.source_unit_revisions[0] if prior else None,
+        prior_observation_revisions=(
+            {revision.observation_id: revision for revision in prior.observation_revisions} if prior else None
+        ),
+    )
+
+
+def agent_session(markdown, *, prior=None, run_id="run-1"):
+    item = ContentItem(
+        item_id="concept-payroll", title="Payroll retention", source_url="memforge://agent/concept-payroll",
+        last_modified=NOW, version=run_id,
+    )
+    native = {
+        "item_id": item.item_id, "doc_id": "concept-payroll", "markdown": markdown,
+        "receipt": {"client": "codex", "session_id": "session-1", "history_window_kind": "agent_knowledge_patch"},
+    }
+    return project_source_item(
+        source_id="src-agent", source_type="agent_session", run_id=run_id, item=item,
+        raw=RawContent(item=item, body=json.dumps(native).encode(), content_type="application/json"),
+        normalized=NormalizedContent(item=item, markdown_body=markdown),
+        prior_unit_revision=prior.source_unit_revisions[0] if prior else None,
+        prior_observation_revisions=(
+            {revision.observation_id: revision for revision in prior.observation_revisions} if prior else None
+        ),
+    )
+
+
+FIRST_MESSAGE = {"id": "msg-1", "content": COMMENT, "time": "2026-09-29T02:39:00+00:00"}
+LATER_MESSAGE = {"id": "msg-2", "content": "Agreed.", "time": "2026-09-29T03:10:00+00:00"}
 
 
 def with_stored_title(projection):
@@ -160,8 +210,8 @@ async def database_with_stored_title(tmp_path, monkeypatch, stored) -> Database:
     db = Database(str(tmp_path / "title.db"))
     await db.connect()
     await db.upsert_source(
-        id="src-jira", type="jira", name="Jira", config_json="{}", access_policy="workspace",
-        owner_user_id="owner-1",
+        id=stored.source_id, type=stored.source_type, name=stored.source_type, config_json="{}",
+        access_policy="workspace", owner_user_id="owner-1",
     )
     declared = database_module.representation_profile_for_observation_contract
     supported_contract = database_module.representation_contract_for_profile
@@ -258,9 +308,9 @@ async def test_a_unit_that_stored_its_title_moves_to_a_title_free_revision_and_r
     assert {revision.id for revision in current.observation_revisions} == {
         revision.id for revision in stored.observation_revisions if in_current_representation(revision)
     }
-    # Only the stored title leaves the Unit; no content changed or was added.
-    assert (delta.changed_anchors, delta.added_observation_ids) == ((), ())
-    assert delta.removed_observation_ids == ("obs-stored-title",)
+    # Only the stored title leaves the Unit; no content changed, was added or was removed.
+    assert (delta.changed_anchors, delta.added_observation_ids, delta.removed_observation_ids) == ((), (), ())
+    assert DeltaAxis.MEMBERSHIP in delta.axes
 
     authority = plan_projection_evidence_work(
         current, committed_base_snapshot=committed(stored), reprocess_all_current_observations=False,
@@ -290,15 +340,52 @@ async def test_a_unit_that_stored_its_title_moves_to_a_title_free_revision_and_r
     ]
 
 
-@pytest.mark.asyncio
-async def test_partial_coverage_does_not_carry_the_stored_title_and_the_store_retires_it(tmp_path, monkeypatch):
+def test_a_unit_whose_prior_revision_held_only_its_title_is_compared_with_that_revision():
     stored = with_stored_title(jira())
-    partial = jira(comments_truncated=True, prior=stored, run_id="run-partial")
+    [title_revision] = [revision for revision in stored.observation_revisions if not in_current_representation(revision)]
+    title_only = replace(stored.source_unit_revisions[0], observation_revision_ids=(title_revision.id,))
+    current = jira(
+        prior=SimpleNamespace(source_unit_revisions=(title_only,), observation_revisions=(title_revision,)),
+        run_id="run-2",
+    )
+    delta = current.deltas[0]
+    content_ids = tuple(sorted(observation.id for observation in current.observations))
+
+    assert delta.previous_unit_revision_id == title_only.id
+    # All content is new to that revision; the title is retired, not removed.
+    assert delta.added_observation_ids == content_ids
+    assert tuple(anchor.observation_id for anchor in delta.changed_anchors) == content_ids
+    assert delta.removed_observation_ids == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored_projection", "reproject"),
+    [
+        pytest.param(lambda: jira(), lambda prior: jira(comments_truncated=True, prior=prior, run_id="run-2"), id="jira"),
+        pytest.param(
+            lambda: teams([FIRST_MESSAGE]),
+            lambda prior: teams([FIRST_MESSAGE, LATER_MESSAGE], prior=prior, run_id="run-2"),
+            id="teams",
+        ),
+        pytest.param(
+            lambda: agent_session(COMMENT),
+            lambda prior: agent_session(f"{COMMENT}\n\nAgreed.", prior=prior, run_id="run-2"),
+            id="agent_session",
+        ),
+    ],
+)
+async def test_a_partial_unit_that_stored_its_title_is_recorded_and_read_without_it(
+    tmp_path, monkeypatch, stored_projection, reproject,
+):
+    stored = with_stored_title(stored_projection())
+    partial = reproject(stored)
 
     assert partial.coverage is ProjectionCoverage.PARTIAL_PROJECTION
     assert "obsrev-stored-title" not in {revision.id for revision in partial.observation_revisions}
     assert partial.carried_observation_revision_ids == ()
-    assert partial.deltas[0].removed_observation_ids == ("obs-stored-title",)
+    # Partial coverage proves nothing absent; the title is retired, not removed.
+    assert partial.deltas[0].removed_observation_ids == ()
 
     db = await database_with_stored_title(tmp_path, monkeypatch, stored)
     try:
@@ -307,7 +394,31 @@ async def test_partial_coverage_does_not_carry_the_stored_title_and_the_store_re
         unit_id = partial.source_units[0].id
         current = await db.get_current_source_unit_projection(unit_id)
         assert current.source_unit_revisions[0].id == partial.source_unit_revisions[0].id
-        assert "obs-stored-title" not in await db.get_current_source_observation_revisions(unit_id)
+        assert set(await db.get_current_source_observation_revisions(unit_id)) == {
+            observation.id for observation in partial.observations
+        }
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_an_observation_a_partial_projection_carries_keeps_its_current_revision(tmp_path, monkeypatch):
+    stored = with_stored_title(teams([FIRST_MESSAGE]))
+    partial = teams([LATER_MESSAGE], prior=stored, run_id="run-2")
+    [carried] = [revision for revision in stored.observation_revisions if revision.id in partial.carried_observation_revision_ids]
+
+    db = await database_with_stored_title(tmp_path, monkeypatch, stored)
+    try:
+        await db.record_source_projection(partial)
+
+        unit_id = partial.source_units[0].id
+        current = await db.get_current_source_unit_projection(unit_id)
+        assert set(current.source_unit_revisions[0].observation_revision_ids) == {
+            revision.id for revision in partial.observation_revisions
+        }
+        pointers = await db.get_current_source_observation_revisions(unit_id)
+        assert pointers[carried.observation_id].id == carried.id
+        assert "obs-stored-title" not in pointers
     finally:
         await db.close()
 
@@ -472,38 +583,10 @@ async def test_the_unit_title_is_shown_in_every_support_step_and_change_impact_r
     assert all(block in prompt for prompt in (*client.impact_prompts, *client.prompts))
 
 
-def teams(messages, *, conversation_name="Payroll Dev", prior=None, run_id="run-1"):
-    times = [message["time"] for message in messages]
-    item = ContentItem(
-        item_id="teams-window-1", title=f"Group: {conversation_name} -- {times[0]}-{times[-1]}",
-        source_url="https://teams.example.test/conversations/conversation-1", last_modified=NOW, version=run_id,
-        extra={"conversation_id": "conversation-1", "window_id": "window-1", "root_message_id": messages[0]["id"],
-               "block_start": times[0], "block_end": times[-1]},
-    )
-    payload = {
-        "conversation_id": "conversation-1", "window_id": "window-1", "conversation_type": "group_chat",
-        "title": item.title, "channel_name": conversation_name, "conversation_name": conversation_name,
-        "messages": messages, "first_message_time": times[0], "last_message_time": times[-1],
-    }
-    return project_source_item(
-        source_id="src-teams", source_type="teams", run_id=run_id, item=item,
-        raw=RawContent(item=item, body=json.dumps(payload).encode(), content_type="application/json"),
-        normalized=NormalizedContent(item=item, markdown_body="normalized Teams window"),
-        prior_unit_revision=prior.source_unit_revisions[0] if prior else None,
-        prior_observation_revisions=(
-            {revision.observation_id: revision for revision in prior.observation_revisions} if prior else None
-        ),
-    )
-
-
 def test_a_teams_window_keeps_its_unit_title_as_it_grows_and_a_renamed_chat_needs_no_revision():
-    first_message = {"id": "msg-1", "content": COMMENT, "time": "2026-09-29T02:39:00+00:00"}
-    first = teams([first_message])
-    grown = teams(
-        [first_message, {"id": "msg-2", "content": "Agreed.", "time": "2026-09-29T03:10:00+00:00"}],
-        prior=first, run_id="run-2",
-    )
-    renamed = teams([first_message], conversation_name="Payroll Core", prior=first, run_id="run-3")
+    first = teams([FIRST_MESSAGE])
+    grown = teams([FIRST_MESSAGE, LATER_MESSAGE], prior=first, run_id="run-2")
+    renamed = teams([FIRST_MESSAGE], conversation_name="Payroll Core", prior=first, run_id="run-3")
 
     assert render_unit_title(first.unit_title) == (
         "Teams conversation\nConversation type: group_chat\nConversation: Payroll Dev\nFrom: 2026-09-29T02:39:00+00:00"

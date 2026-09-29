@@ -17,14 +17,21 @@
   representation only: a Unit that stored its Unit Title as an Observation gets
   one new revision at its next fetch with no changed content, its exact
   Supports are rebound by the program without a model call and drop the title
-  part, and a partial projection no longer carries the old title. A store now
-  clears every removed Observation's current revision, whatever the coverage.
+  part, and a partial projection no longer carries the old title. The old
+  title is retired, not removed: removal still means only proven absence. A
+  store keeps a Unit's current Observations equal to the members of its current
+  revision and clears the current revision of every Observation that is not a
+  member.
   Contracts: `revision-input-v8`, `projection-extraction-v11`, model
   presentation policy 6, `candidate-admission-v4`, `support-ordered-reading-v6`,
   `revision-support-v8` and `change-impact-v3`. Cloud: no HANA schema, storage
-  protocol, configuration or `proxy/external_runtime.py` change; the HANA store
-  drops the coverage condition when it clears removed Observations. See ADR 0034
-  and the ADR 0043 amendment on replaying model input changes.
+  protocol, configuration or `proxy/external_runtime.py` change; the HANA
+  store's `_record_source_projection_sync` must clear the pointers of
+  Observations that are not members of the new current revision, shipped
+  together with the pin, or reading the current Unit fails for partial Units
+  that stored a Unit Title Observation. Derivation attempts staged before the
+  upgrade are not resumed. See ADR 0034 and the ADR 0043 amendment
+  on replaying model input changes.
 
 - Relation group evaluation cases (`cross_document_relation_group_v1`) replay
   discovery's requests: one case pins a challenger with every candidate
