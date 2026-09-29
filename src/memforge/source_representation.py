@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping
 
 from memforge.source_artifacts import SOURCE_ARTIFACT_OBSERVATION_TYPE
 from memforge.source_projection import (
     EvidenceCoordinateSpace,
     EvidenceRepresentationProfile,
+    SourceObservationRevision,
+    SourceProjection,
 )
 
 
@@ -24,15 +26,6 @@ BINARY_ARTIFACT_PROFILE = EvidenceRepresentationProfile(
 )
 PLAIN_TEXT_PROFILE = EvidenceRepresentationProfile(
     name="plain-text",
-    version=1,
-    coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
-)
-# The Unit Title: the provider's human-facing name of one Source Unit, such as a
-# Jira key, type and summary. It is one Required-only Fragment: it scopes and
-# identifies claims but states none, so it is never Primary Evidence.
-UNIT_TITLE_OBSERVATION_TYPE = "unit_identity"
-UNIT_TITLE_PROFILE = EvidenceRepresentationProfile(
-    name="unit-identity",
     version=1,
     coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
 )
@@ -189,7 +182,6 @@ _SUPPORTED_REPRESENTATION_CONTRACTS: Mapping[
         MARKDOWN_STRUCTURAL_PROFILE,
         BINARY_ARTIFACT_PROFILE,
         PLAIN_TEXT_PROFILE,
-        UNIT_TITLE_PROFILE,
         *_REPRESENTATION_CONTRACTS.values(),
     }
 }
@@ -203,6 +195,60 @@ def representation_contract_for_profile(
     return _SUPPORTED_REPRESENTATION_CONTRACTS.get(profile)
 
 
+def in_current_representation(revision: SourceObservationRevision) -> bool:
+    """Whether a stored Observation revision is content the adapters still project.
+
+    Revisions are compared with a new projection only when both sides are in the
+    current representation. A stored revision in a profile no adapter projects is
+    outside it: no later Unit revision carries it, it is no change of the Unit,
+    and Evidence on it is dropped when the Support is rebound. A revision stored
+    before profiles were recorded counts as current.
+    """
+
+    profile = revision.evidence_profile
+    return profile is None or profile in _SUPPORTED_REPRESENTATION_CONTRACTS
+
+
+def current_representation_of(projection: SourceProjection) -> SourceProjection:
+    """A stored projection as it is read today, without its revisions outside the current representation.
+
+    A new projection is always in the current representation. A stored one read as
+    the revision itself, such as the committed revision a reprocess preview reads
+    or a replayed case, may still hold a retired revision; it is read without it.
+    Its Unit revision keeps its id: this is how that revision is read, not a new one.
+    Its Revision Deltas keep their axes and name no retired revision or Observation,
+    so a retired revision is neither changed nor added content of the read projection.
+    """
+
+    retired = {r.id for r in projection.observation_revisions if not in_current_representation(r)}
+    if not retired:
+        return projection
+    revisions = tuple(r for r in projection.observation_revisions if r.id not in retired)
+    kept = {r.observation_id for r in revisions}
+    left = {r.observation_id for r in projection.observation_revisions if r.id in retired} - kept
+    return replace(
+        projection,
+        observations=tuple(o for o in projection.observations if o.id not in left),
+        observation_revisions=revisions,
+        source_unit_revisions=tuple(
+            replace(unit, observation_revision_ids=tuple(i for i in unit.observation_revision_ids if i not in retired))
+            for unit in projection.source_unit_revisions
+        ),
+        deltas=tuple(
+            replace(
+                delta,
+                changed_anchors=tuple(a for a in delta.changed_anchors if a.observation_revision_id not in retired),
+                added_observation_ids=tuple(i for i in delta.added_observation_ids if i not in left),
+                fragment_mappings=tuple(m for m in delta.fragment_mappings if m.current_revision_id not in retired),
+            )
+            for delta in projection.deltas
+        ),
+        carried_observation_revision_ids=tuple(
+            i for i in projection.carried_observation_revision_ids if i not in retired
+        ),
+    )
+
+
 def representation_profile_for_observation_contract(
     *,
     source_type: str,
@@ -212,9 +258,6 @@ def representation_profile_for_observation_contract(
 
     if observation_type == SOURCE_ARTIFACT_OBSERVATION_TYPE:
         return BINARY_ARTIFACT_PROFILE
-    if observation_type == UNIT_TITLE_OBSERVATION_TYPE:
-        # Every adapter supplies its Unit Title in the same representation.
-        return UNIT_TITLE_PROFILE
     if observation_type == "document_content":
         # The extension-safe projection fallback is explicitly normalized Markdown.
         return MARKDOWN_STRUCTURAL_PROFILE

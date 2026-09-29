@@ -87,7 +87,7 @@ async def test_a_single_candidate_is_judged_with_exactly_its_selected_evidence()
     client = AdmissionClient()
     only = candidate(MOST_SPECIFIC)
 
-    result = await admit_candidates([only], client=client, model="fixture")
+    result = await admit_candidates([only], client=client, model="fixture", unit_title=None)
 
     assert result.admitted == (only,) and result.rejected == () and result.merged_count == 0
     assert result.llm_calls == 1
@@ -111,7 +111,7 @@ async def test_rejected_candidate_is_not_admitted_and_keeps_its_reason(reject_re
         return admitted(row, _round)
 
     kept, dropped = candidate(MOST_SPECIFIC), candidate(SAME_KNOWLEDGE, required=False)
-    result = await admit_candidates([kept, dropped], client=AdmissionClient(judge), model="fixture")
+    result = await admit_candidates([kept, dropped], client=AdmissionClient(judge), model="fixture", unit_title=None)
 
     assert result.admitted == (kept,)
     assert [(rejection.candidate, rejection.reject_reason) for rejection in result.rejected] == [(dropped, reject_reason)]
@@ -134,7 +134,7 @@ async def test_duplicates_judged_in_different_requests_merge_into_the_most_speci
     client = AdmissionClient(judge, fits=fits)
     specific, same, independent = candidate(MOST_SPECIFIC), candidate(SAME_KNOWLEDGE), candidate(INDEPENDENT)
 
-    result = await admit_candidates([same, independent, specific], client=client, model="fixture")
+    result = await admit_candidates([same, independent, specific], client=client, model="fixture", unit_title=None)
 
     assert result.admitted == (independent, specific)
     assert result.merged_count == 1 and result.rejected == ()
@@ -153,7 +153,7 @@ async def test_a_rejection_in_any_context_chunk_rejects_the_candidate():
         return admitted(row, round_claims)
 
     same, independent = candidate(SAME_KNOWLEDGE), candidate(INDEPENDENT)
-    result = await admit_candidates([same, independent], client=AdmissionClient(judge, fits=fits), model="fixture")
+    result = await admit_candidates([same, independent], client=AdmissionClient(judge, fits=fits), model="fixture", unit_title=None)
 
     assert result.admitted == (independent,)
     assert [rejection.candidate for rejection in result.rejected] == [same]
@@ -169,7 +169,7 @@ async def test_a_rejected_candidate_neither_absorbs_nor_links_duplicates():
         return admitted(row, round_claims)
 
     specific, same, independent = candidate(MOST_SPECIFIC), candidate(SAME_KNOWLEDGE), candidate(INDEPENDENT)
-    result = await admit_candidates([specific, same, independent], client=AdmissionClient(judge), model="fixture")
+    result = await admit_candidates([specific, same, independent], client=AdmissionClient(judge), model="fixture", unit_title=None)
 
     assert result.admitted == (specific, independent)
     assert result.merged_count == 0
@@ -184,7 +184,7 @@ async def test_identical_claims_are_each_judged_and_merge_once_admitted():
     client = AdmissionClient()
     first, second = candidate(MOST_SPECIFIC), repeated(MOST_SPECIFIC)
 
-    result = await admit_candidates([first, second], client=client, model="fixture")
+    result = await admit_candidates([first, second], client=client, model="fixture", unit_title=None)
 
     assert result.admitted == (first,) and result.merged_count == 1 and result.rejected == ()
     [request] = client.requests
@@ -200,7 +200,7 @@ async def test_an_identical_claim_with_complete_evidence_survives_a_rejected_cop
 
     incomplete, complete = candidate(MOST_SPECIFIC, required=False), repeated(MOST_SPECIFIC)
 
-    result = await admit_candidates([incomplete, complete], client=AdmissionClient(judge), model="fixture")
+    result = await admit_candidates([incomplete, complete], client=AdmissionClient(judge), model="fixture", unit_title=None)
 
     assert result.admitted == (complete,)
     assert [rejection.candidate for rejection in result.rejected] == [incomplete]
@@ -212,7 +212,7 @@ async def test_identical_claims_of_different_validity_are_not_merged_by_the_prog
     first = candidate(MOST_SPECIFIC)
     later = replace(repeated(MOST_SPECIFIC), valid_from="2027-01-01")
 
-    result = await admit_candidates([first, later], client=AdmissionClient(), model="fixture")
+    result = await admit_candidates([first, later], client=AdmissionClient(), model="fixture", unit_title=None)
 
     assert result.admitted == (first, later) and result.merged_count == 0
 
@@ -220,7 +220,7 @@ async def test_identical_claims_of_different_validity_are_not_merged_by_the_prog
 @pytest.mark.asyncio
 async def test_no_candidates_need_no_model_call():
     client = AdmissionClient()
-    result = await admit_candidates([], client=client, model="fixture")
+    result = await admit_candidates([], client=client, model="fixture", unit_title=None)
     assert result.admitted == () and client.calls == 0
 
 
@@ -242,7 +242,7 @@ async def test_a_candidate_whose_admission_stays_invalid_is_rejected_for_this_ro
         return judge(row, round_claims) if round_claims.get(row["id"]) == MOST_SPECIFIC else admitted(row, round_claims)
 
     client = AdmissionClient(answer)
-    result = await admit_candidates([unjudged, judged], client=client, model="fixture")
+    result = await admit_candidates([unjudged, judged], client=client, model="fixture", unit_title=None)
 
     assert result.admitted == (judged,)
     assert [(rejection.candidate, rejection.reject_reason) for rejection in result.rejected] == [
@@ -261,7 +261,7 @@ async def test_a_candidate_that_alone_exceeds_capacity_is_rejected_for_this_roun
     def fits(payload):
         return all(row["claim"] != MOST_SPECIFIC for row in payload["candidates"])
 
-    result = await admit_candidates([oversized, judged], client=AdmissionClient(fits=fits), model="fixture")
+    result = await admit_candidates([oversized, judged], client=AdmissionClient(fits=fits), model="fixture", unit_title=None)
 
     assert result.admitted == (judged,)
     assert [(rejection.candidate, rejection.reject_reason) for rejection in result.rejected] == [
@@ -272,7 +272,7 @@ async def test_a_candidate_that_alone_exceeds_capacity_is_rejected_for_this_roun
 @pytest.mark.asyncio
 async def test_a_transient_admission_failure_raises():
     with pytest.raises(StructuredLlmError) as raised:
-        await admit_candidates([candidate(MOST_SPECIFIC)], client=AdmissionClient(fail_at=1), model="fixture")
+        await admit_candidates([candidate(MOST_SPECIFIC)], client=AdmissionClient(fail_at=1), model="fixture", unit_title=None)
     assert raised.value.terminal_category == "deadline_exceeded"
 
 
@@ -280,7 +280,7 @@ async def test_a_transient_admission_failure_raises():
 async def test_a_candidate_without_selected_evidence_is_an_execution_failure():
     with pytest.raises(CandidateAdmissionError) as raised:
         await admit_candidates([RawMemory(content=MOST_SPECIFIC, memory_type="fact")],
-                               client=AdmissionClient(), model="fixture")
+                               client=AdmissionClient(), model="fixture", unit_title=None)
     assert (raised.value.reason_code, raised.value.terminal_category) == ("candidate_evidence_missing", None)
 
 
@@ -291,7 +291,7 @@ async def test_a_retried_sync_reuses_completed_admission_requests(tmp_path):
     path = tmp_path / "admission.db"
     db, root = await prepare_database(path)
     candidates = [candidate(MOST_SPECIFIC), candidate(SAME_KNOWLEDGE), candidate(INDEPENDENT)]
-    kwargs = dict(model="fixture", derivation_id=root.id, operation_input_hash="a" * 64)
+    kwargs = dict(model="fixture", unit_title=None, derivation_id=root.id, operation_input_hash="a" * 64)
 
     def one_candidate_per_request(payload):
         return len(payload["candidates"]) == 1

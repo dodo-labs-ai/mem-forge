@@ -205,12 +205,8 @@ class SupportRevisionPlan:
         }
 
         def first_part_end(support: SupportPlan) -> int:
-            # The Unit Title is context of every part, so Evidence on it places no part in the first part.
             own_ends = (
-                position[fragment.anchor] + 1
-                for correspondence in support.parts
-                for fragment in correspondence.current
-                if fragment.anchor not in self.context.unit_title_anchors
+                position[fragment.anchor] + 1 for correspondence in support.parts for fragment in correspondence.current
             )
             # Prior Evidence travels with the first part, so every Support reads at least one part before concluding.
             return max((1, len(self.changes), *own_ends))
@@ -238,8 +234,15 @@ def plan_support_revision(
     for fragment in catalog.fragments:
         by_observation.setdefault(fragment.anchor.observation_id, []).append(fragment)
     returned = frozenset(observation.id for observation in context.projection.observations)
+    # Evidence on a revision outside the current representation is dropped: the
+    # Support is judged by its other parts, and rebinding it leaves that part out.
     correspondences = [
-        tuple(_correspond(part, context, returned, by_observation) for part in item.support) for item in items
+        tuple(
+            _correspond(part, context, returned, by_observation)
+            for part in item.support
+            if part.anchor.observation_revision_id not in context.retired
+        )
+        for item in items
     ]
     # Only a Support with an UNKNOWN part neither judges nor reads the revision.
     reads_revision = any(not _any_unknown(parts) for parts in correspondences)
@@ -317,6 +320,10 @@ def _all_exact(parts: tuple[PartCorrespondence, ...]) -> bool:
     return all(correspondence.status is EvidenceCorrespondence.EXACT_UNCHANGED for correspondence in parts)
 
 
+def _has_primary(parts: tuple[PartCorrespondence, ...]) -> bool:
+    return any(correspondence.evidence.role is EvidenceRole.PRIMARY for correspondence in parts)
+
+
 def _any_unknown(parts: tuple[PartCorrespondence, ...]) -> bool:
     return any(correspondence.status is EvidenceCorrespondence.UNKNOWN for correspondence in parts)
 
@@ -326,7 +333,8 @@ def _route(parts: tuple[PartCorrespondence, ...], context: RevisionAssessmentCon
     if _any_unknown(parts):
         return SupportRoute.UNRESOLVED_PARTIAL_COVERAGE
     # Without a usable baseline nothing is known to be unchanged: read the whole revision.
-    if context.base is None or not _all_exact(parts):
+    # A Support whose Primary part was dropped has nothing to rebind to.
+    if context.base is None or not _all_exact(parts) or not _has_primary(parts):
         return SupportRoute.SUPPORT_ASSESSMENT
     return SupportRoute.CHANGE_IMPACT if changed else SupportRoute.REBIND_SUPPORT
 
@@ -336,13 +344,12 @@ def _changes(
     catalog: ProjectionFragmentCatalog,
     groups: tuple[tuple[EvidenceFragment, ...], ...],
 ) -> tuple[tuple[ReadingPart, ...], frozenset[str]]:
-    """The changed Unit Title and current ReadingGroups, whole, then removed old text: it may have qualified a claim."""
+    """The changed current ReadingGroups, whole, then removed old text: it may have qualified a claim."""
     changed_fragments, removed = context.delta_fragments()
     changed_anchors = {fragment.anchor for fragment in changed_fragments}
     # A list that lost an item changed, so its remaining items are read with the removal.
     touched = changed_anchors | _remaining_list_items(context, catalog, removed)
-    title = tuple(fragment for fragment in catalog.fragments if fragment.anchor in context.unit_title_anchors)
-    changed_groups = tuple(group for group in (title, *groups) if any(f.anchor in touched for f in group))
+    changed_groups = tuple(group for group in groups if any(f.anchor in touched for f in group))
     changes = (
         *(ReadingPart(fragments=group) for group in changed_groups),
         *(

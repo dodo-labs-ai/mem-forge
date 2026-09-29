@@ -38,6 +38,7 @@ from memforge.source_artifacts import (
     stored_source_artifact_from_observation,
 )
 from memforge.source_projection import SourceProjection
+from memforge.source_representation import current_representation_of
 
 if TYPE_CHECKING:
     from memforge.genes.base import Gene
@@ -289,6 +290,7 @@ async def reprocess_preview(
                 )
                 committed = stored.committed
                 artifact_count = len(stored.artifacts)
+            committed = current_representation_of(committed)
             authority = whole_revision_extraction_authority(committed)
             if isinstance(authority, ProjectionEvidencePlanningFailure):
                 raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.EXTRACTION_UNPLANNABLE, document_id)
