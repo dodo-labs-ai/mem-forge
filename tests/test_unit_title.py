@@ -359,6 +359,44 @@ def test_the_unit_title_is_never_a_support_reading_step(with_base):
     assert all(part in plan.changes for part in title_steps)
 
 
+def teams(messages, *, prior=None, run_id="run-1"):
+    times = [message["time"] for message in messages]
+    item = ContentItem(
+        item_id="teams-window-1", title=f"Group: Payroll Dev -- {times[0]}-{times[-1]}",
+        source_url="https://teams.example.test/conversations/conversation-1", last_modified=NOW, version=run_id,
+        extra={"conversation_id": "conversation-1", "window_id": "window-1", "root_message_id": messages[0]["id"],
+               "block_start": times[0], "block_end": times[-1]},
+    )
+    payload = {
+        "conversation_id": "conversation-1", "window_id": "window-1", "conversation_type": "group_chat",
+        "title": item.title, "channel_name": "Payroll Dev", "conversation_name": "Payroll Dev",
+        "messages": messages, "first_message_time": times[0], "last_message_time": times[-1],
+    }
+    return project_source_item(
+        source_id="src-teams", source_type="teams", run_id=run_id, item=item,
+        raw=RawContent(item=item, body=json.dumps(payload).encode(), content_type="application/json"),
+        normalized=NormalizedContent(item=item, markdown_body="normalized Teams window"),
+        prior_unit_revision=prior.source_unit_revisions[0] if prior else None,
+        prior_observation_revisions=(
+            {revision.observation_id: revision for revision in prior.observation_revisions} if prior else None
+        ),
+    )
+
+
+def test_a_teams_window_keeps_its_unit_title_as_it_grows():
+    first_message = {"id": "msg-1", "content": COMMENT, "time": "2026-09-29T02:39:00+00:00"}
+    first = teams([first_message])
+    grown = teams(
+        [first_message, {"id": "msg-2", "content": "Agreed.", "time": "2026-09-29T03:10:00+00:00"}],
+        prior=first, run_id="run-2",
+    )
+
+    assert title_revision(first).content == (
+        "Teams conversation\nConversation type: group_chat\nConversation: Payroll Dev\nFrom: 2026-09-29T02:39:00+00:00"
+    )
+    assert title_revision(grown).id == title_revision(first).id
+
+
 def test_a_support_that_selected_an_unchanged_title_reads_its_own_evidence_first():
     first = jira()
     changed = jira(description="Payroll context changed.", prior=first, run_id="run-2")
