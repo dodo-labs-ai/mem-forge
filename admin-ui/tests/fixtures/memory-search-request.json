@@ -1,0 +1,10 @@
+{
+  "query": "payroll cutoff",
+  "memory_types": ["decision"],
+  "status": "active",
+  "source_filter": { "source_ids": ["src-jira"] },
+  "active_project": "PAY",
+  "scope_mode": "project",
+  "include_private": true,
+  "top_k": 50
+}
