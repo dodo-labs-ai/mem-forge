@@ -512,8 +512,6 @@ def project_source_item(
         if observation_id not in prior_observation_revisions
         or prior_observation_revisions[observation_id].semantic_hash != revision.semantic_hash
     }
-    if prior_unit_revision is None:
-        changed_ids = current_ids
     changed_anchors = tuple(
         SourceAnchor(
             kind=AnchorKind.WHOLE_OBSERVATION,

@@ -70,7 +70,6 @@ class FragmentSelectionError(ValueError):
 class SupportRevalidationLimitationCode(str, Enum):
     UNSUPPORTED_REPRESENTATION = "unsupported_representation"
     COMPILER_FAILURE = "compiler_failure"
-    CAPACITY_EXCEEDED = "capacity_exceeded"
 
 
 class SupportRevalidationLimitation(RuntimeError):
