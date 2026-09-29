@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- The Unit Title is reading context carried by the Source Projection
+  (`SourceProjection.unit_title`), no longer a Unit's first Observation. It
+  takes no part in Unit revision identity, so renaming a Unit (a page title, a
+  file path, a Teams chat name) creates no revision and no model work. Claim
+  Extraction, Candidate Admission, Support Assessment and Change Impact show the
+  current Unit Title in every request, rendered once from the adapter's values,
+  and it is never selectable Evidence. The complete-support definition lets a
+  claim state the Unit Title's values and name its Unit by an earlier name;
+  another Unit's key that neither the Unit Title nor the Evidence contains is
+  still unsupported. Stored revisions are compared in the current
+  representation only: a Unit that stored its Unit Title as an Observation gets
+  one new revision at its next fetch with no changed content, its exact
+  Supports are rebound by the program without a model call and drop the title
+  part, and a partial projection no longer carries the old title. A store now
+  clears every removed Observation's current revision, whatever the coverage.
+  Contracts: `revision-input-v8`, `projection-extraction-v11`, model
+  presentation policy 6, `candidate-admission-v4`, `support-ordered-reading-v6`,
+  `revision-support-v8` and `change-impact-v3`. Cloud: no HANA schema, storage
+  protocol, configuration or `proxy/external_runtime.py` change; the HANA store
+  drops the coverage condition when it clears removed Observations. See ADR 0034
+  and the ADR 0043 amendment on replaying model input changes.
+
 - Relation group evaluation cases (`cross_document_relation_group_v1`) replay
   discovery's requests: one case pins a challenger with every candidate
   discovery asked about for it, in order, and labels for some of them. A
