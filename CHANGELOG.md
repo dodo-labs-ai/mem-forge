@@ -11,13 +11,16 @@
   Extraction, Candidate Admission, Support Assessment and Change Impact show the
   current Unit Title in every request, rendered once from the adapter's values,
   and it is never selectable Evidence. The complete-support definition lets a
-  claim state the Unit Title's values and name its Unit by an earlier name;
-  another Unit's key that neither the Unit Title nor the Evidence contains is
-  still unsupported. Stored revisions are compared in the current
+  claim state every Unit Title value, including a Jira issue type and summary,
+  and name its Unit by an earlier name; Candidate Admission reads the selected
+  Evidence with the Unit Title, and another Unit's key that neither the Unit
+  Title nor the Evidence contains is still unsupported. Stored revisions are compared in the current
   representation only: a Unit that stored its Unit Title as an Observation gets
   one new revision at its next fetch with no changed content, its exact
   Supports are rebound by the program without a model call and drop the title
-  part, and a partial projection no longer carries the old title. The old
+  part, and a partial projection no longer carries the old title. A stored
+  projection read in the current representation, as a reprocess preview or an
+  offline replay reads it, drops the stored title from its Revision Delta too. The old
   title is retired, not removed: removal still means only proven absence. A
   store keeps a Unit's current Observations equal to the members of its current
   revision and clears the current revision of every Observation that is not a

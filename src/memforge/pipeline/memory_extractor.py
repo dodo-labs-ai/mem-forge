@@ -47,8 +47,6 @@ _FRAGMENT_OUTPUT_MIN_TOKENS = 768
 _FRAGMENT_OUTPUT_CHARS_PER_TOKEN = 2
 
 
-_UNIT_TITLE_GUIDANCE = "A claim may state unit_title values, such as the Unit's key, without Evidence for them."
-
 PROJECTION_FRAGMENT_EXTRACTION_PROMPT = """You are extracting durable atomic knowledge from one authorized Source Unit catalog.
 
 <source_type>{source_type}</source_type>
@@ -218,7 +216,7 @@ class MemoryExtractor:
         payload = revision_context.model_payload(catalog)
         return PROJECTION_FRAGMENT_EXTRACTION_PROMPT.format(
             source_type=source_type, doc_type=doc_type, catalog_digest=catalog.digest,
-            unit_title=unit_title_block(revision_context.projection.unit_title, guidance=_UNIT_TITLE_GUIDANCE),
+            unit_title=unit_title_block(revision_context.projection.unit_title),
             fragment_catalog=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         )
 
