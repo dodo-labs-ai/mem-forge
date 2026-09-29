@@ -21,6 +21,7 @@ from memforge.pipeline import revision_work
 from memforge.pipeline.complete_support import COMPLETE_SUPPORT_DEFINITION
 from memforge.pipeline.revision_assessment import REVISION_SUPPORT_CONTRACT, RevisionAssessmentContext
 from memforge.pipeline.revision_work import SUPPORT_ASSESSMENT_CONTRACT, RevisionWorkExecutor
+from memforge.pipeline.unit_title import render_unit_title
 from memforge.storage.database import Database
 from tests.coordination_fixture import JIRA_DOCUMENT, SOURCE_ID, ScriptedClient, coordination_engine
 from tests.revision_client_fixture import FixtureSupport
@@ -85,7 +86,7 @@ async def test_every_support_reading_and_admission_request_carries_the_definitio
     )], client=admission, model="fixture", unit_title=projection.unit_title)
     [prompt] = admission.prompts
     assert COMPLETE_SUPPORT_DEFINITION in prompt
-    assert f"<unit_title>\n{projection.unit_title.text}\n</unit_title>" in prompt
+    assert f"<unit_title>\n{render_unit_title(projection.unit_title)}\n</unit_title>" in prompt
 
 
 class _IdentifierReadingClient(ScriptedClient):

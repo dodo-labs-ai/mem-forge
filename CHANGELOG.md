@@ -4,8 +4,10 @@
 
 - The Unit Title is reading context carried by the Source Projection
   (`SourceProjection.unit_title`), no longer a Unit's first Observation. It
-  takes no part in Unit revision identity, so renaming a Unit (a page title, a
-  file path, a Teams chat name) creates no revision and no model work. Claim
+  takes no part in Unit revision identity, so a change of only the Unit Title's
+  values, such as a renamed Teams chat, creates no revision and no model work;
+  a name that also appears in the content or the locator, such as a Confluence
+  page title or a file path, changes as content or location does. Claim
   Extraction, Candidate Admission, Support Assessment and Change Impact show the
   current Unit Title in every request, rendered once from the adapter's values,
   and it is never selectable Evidence. The complete-support definition lets a

@@ -130,12 +130,17 @@ class RevisionAssessmentContext:
         image_loader=None,
         indexes: dict | None = None,
         known_observations: tuple = (),
+        evidence_revisions: tuple = (),
     ):
         """``known_observations`` describe carried Observations that neither the target
         nor the baseline returns, such as those of the committed Source Unit revision.
+        ``evidence_revisions`` are the stored Observation revisions prior Evidence names.
 
-        The baseline is compared in the current representation only: a baseline
-        revision outside it is no previous content, and its Observation is ``retired``.
+        The target is a revision in the current representation: a new projection, or
+        a stored one read through ``current_representation_of``. The baseline is
+        compared in the current representation only: a baseline revision outside it
+        is no previous content. Every revision known here outside it is ``retired``,
+        so Evidence on it is dropped.
         """
         self.projection = projection
         self.base = base
@@ -151,7 +156,7 @@ class RevisionAssessmentContext:
             if r.id in projection.source_unit_revisions[0].observation_revision_ids
         }
         baseline = base.observation_revisions if base else ()
-        self.retired = frozenset(r.observation_id for r in baseline if not in_current_representation(r))
+        self.retired = frozenset(r.id for r in (*baseline, *evidence_revisions) if not in_current_representation(r))
         observations = {o.id: o for o in (*known_observations, *(base.observations if base else ()))}
         observations.update({o.id: o for o in projection.observations})
         if set(self.current) - set(observations):
@@ -173,7 +178,7 @@ class RevisionAssessmentContext:
             if key not in self.tombstoned
             and observation_is_inference_eligible(observations[key].observation_type, r.metadata)
         }
-        self.previous = {r.observation_id: r for r in baseline if r.observation_id not in self.retired}
+        self.previous = {r.observation_id: r for r in baseline if r.id not in self.retired}
         self.full_fragments = tuple(f for revision in self.current.values() for f in self.index(revision).fragments)
         self._delta = None
         self.structural_context = {}
