@@ -11,10 +11,10 @@
   Memory is skipped as `memory_changed`, and the server pins each Memory's
   classifier input and each label as the label the program records. Runs
   classify every candidate of a group and score only labelled ones; each
-  check's reason code names its candidate (`expected:actual/memory_id`). Run reports add `relation_summary` with
-  `labelled_pairs`, `false_relations`, `none_recall` and
-  `unlabelled_relations` (relations given to unlabelled candidates, left for
-  people to label).
+  check's reason code names its candidate (`expected:actual/memory_id`). Run
+  reports add `relation_summary` with `labelled_pairs`, `false_relations`,
+  `none_recall` and `unlabelled_relations` (relations given to unlabelled
+  candidates, left for people to label).
 - Cross-document relation classifier `cross-document-relation-v4`: every
   request states one challenger once as the subject and asks one question per
   candidate, with sharper relation rules (ADR 0043 amendment of 2026-09-29).
