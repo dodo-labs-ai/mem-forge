@@ -1284,6 +1284,7 @@ class TeamsGene(Gene):
             "conversation_type": conv_type,
             "title": item.title,
             "channel_name": item.extra.get("channel_name", ""),
+            "conversation_name": item.extra.get("conversation_name"),
             "team_name": item.space_or_project,
             "team_id": item.extra.get("team_id"),
             "messages": [
@@ -1903,6 +1904,9 @@ class TeamsGene(Gene):
         team_name = conv_meta.get("team_name", "")
         person_name = conv_meta.get("person_name", "")
 
+        # The conversation's own name, unlike the display title, does not move as the window grows.
+        conversation_name = {"channel": channel_name, "group_chat": conv_meta.get("topic")}.get(conv_type, person_name)
+
         first_msg = messages[0] if messages else {}
 
         max_time = max((m["time"] for m in messages), default=datetime.now(timezone.utc))
@@ -1940,6 +1944,7 @@ class TeamsGene(Gene):
                 "root_message_id": first_msg_id,
                 "conversation_type": conv_type,
                 "channel_name": channel_name,
+                "conversation_name": conversation_name,
                 "team_id": conv_meta.get("team_id"),
                 "message_count": len(messages),
                 "is_thread": is_thread,
