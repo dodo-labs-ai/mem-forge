@@ -2766,11 +2766,6 @@ class GeneSyncOrchestrator:
                 changed_hunks=(update_plan.changed_hunks if update_plan else None),
                 update_plan_stats=self._document_update_plan_stats(update_plan),
                 source_updated_at=_source_updated_at(normalized.source_semantics),
-                user_id=(
-                    str(normalized.source_semantics.get("uploader_user_id")).strip()
-                    if normalized.source_semantics.get("uploader_user_id")
-                    else None
-                ),
                 document=doc_record,
                 unit_input=unit_input,
                 source_activity=source_activity,
@@ -2817,10 +2812,6 @@ class GeneSyncOrchestrator:
 
         repo_identifier = normalized.source_semantics.get("repo_identifier")
         source_updated_at = _source_updated_at(normalized.source_semantics)
-        uploader_user_id = normalized.source_semantics.get("uploader_user_id")
-        actor_user_id = (
-            str(uploader_user_id).strip() if isinstance(uploader_user_id, str) and uploader_user_id.strip() else None
-        )
         derivation_context = SourceUnitDerivationContext(
             document=doc_record,
             doc_type=source_type,
@@ -2831,7 +2822,7 @@ class GeneSyncOrchestrator:
             changed_hunks=(update_plan.changed_hunks if update_plan else None),
             update_plan_stats=self._document_update_plan_stats(update_plan),
             source_updated_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
-            user_id=actor_user_id,
+            user_id=None,
             current_changed_ranges=(update_plan.current_changed_ranges if update_plan is not None else ()),
             reprocess_all_current_observations=force_reprocess,
             reprocess_operation_id=(run_id if force_reprocess else None),
@@ -2895,7 +2886,6 @@ class GeneSyncOrchestrator:
             update_plan_stats=self._document_update_plan_stats(update_plan),
             current_changed_ranges=(update_plan.current_changed_ranges if update_plan is not None else ()),
             source_updated_at=source_updated_at,
-            user_id=actor_user_id,
             protected_source_observation_ids=(extraction_result.protected_source_observation_ids),
             document=doc_record,
             unit_input=unit_input,

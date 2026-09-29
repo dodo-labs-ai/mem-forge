@@ -243,7 +243,7 @@ class MemorySource:
 
 @dataclass
 class AgentSessionReceipt:
-    """Lineage for a client-generated agent session document."""
+    """Lineage and outcome for one uploaded agent-session window."""
 
     doc_id: str
     source_id: str
