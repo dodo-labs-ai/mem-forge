@@ -31,7 +31,8 @@ from memforge.pipeline.support_reading import (
     SupportWorkItem,
     plan_support_revision,
 )
-from memforge.pipeline.unit_title import unit_title_block
+from memforge.pipeline.stored_document import reprocess_preview
+from memforge.pipeline.unit_title import UNIT_TITLE_DEFINITION, render_unit_title, unit_title_block
 from memforge.source_projection import (
     AnchorKind,
     EvidenceCoordinateSpace,
@@ -44,7 +45,7 @@ from memforge.source_projection import (
     source_projection_from_payload,
     source_projection_to_payload,
 )
-from memforge.source_representation import in_current_representation
+from memforge.source_representation import current_representation_of, in_current_representation
 from memforge.storage import database as database_module
 from memforge.storage.database import Database
 from tests.llm_fixture import NoopMemoryExtractor
@@ -101,7 +102,7 @@ def with_stored_title(projection):
     )
     revision = SourceObservationRevision(
         id="obsrev-stored-title", observation_id=observation.id, semantic_hash="stored-title",
-        content=projection.unit_title.text, metadata={"provider_key": "$unit_identity"},
+        content=render_unit_title(projection.unit_title), metadata={"provider_key": "$unit_identity"},
         evidence_profile=LEGACY_TITLE_PROFILE,
     )
     unit_revision = replace(
@@ -154,17 +155,43 @@ def committed(projection):
     )
 
 
+async def database_with_stored_title(tmp_path, monkeypatch, stored) -> Database:
+    """A store whose current revision of the Unit is ``stored``, recorded under the contracts of its time."""
+    db = Database(str(tmp_path / "title.db"))
+    await db.connect()
+    await db.upsert_source(
+        id="src-jira", type="jira", name="Jira", config_json="{}", access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    declared = database_module.representation_profile_for_observation_contract
+    supported_contract = database_module.representation_contract_for_profile
+    with monkeypatch.context() as stored_contracts:
+        stored_contracts.setattr(
+            database_module, "representation_profile_for_observation_contract",
+            lambda *, source_type, observation_type: (
+                LEGACY_TITLE_PROFILE if observation_type == LEGACY_TITLE_TYPE
+                else declared(source_type=source_type, observation_type=observation_type)
+            ),
+        )
+        stored_contracts.setattr(
+            database_module, "representation_contract_for_profile",
+            lambda profile: object() if profile == LEGACY_TITLE_PROFILE else supported_contract(profile),
+        )
+        await db.record_source_projection(stored)
+    return db
+
+
 class NoModelClient(Client):
     async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
         raise AssertionError("a pure rebind calls no model")
 
 
 def test_jira_unit_title_names_the_issue_from_payload_values_only():
-    assert jira(issue_type="Defect").unit_title.text == (
+    assert render_unit_title(jira(issue_type="Defect").unit_title) == (
         "Jira issue\nKey: SFPAY-180000\nType: Defect\nSummary: Payroll run fails"
     )
     # A package without an issue type names what it has; nothing is guessed.
-    assert jira().unit_title.text == "Jira issue\nKey: SFPAY-180000\nSummary: Payroll run fails"
+    assert render_unit_title(jira().unit_title) == "Jira issue\nKey: SFPAY-180000\nSummary: Payroll run fails"
 
 
 @pytest.mark.parametrize("source_type", [*TEXTUAL_BUILTIN_SOURCE_TYPES, "extension_document"])
@@ -174,11 +201,11 @@ def test_every_adapter_names_its_unit_outside_its_observations(source_type):
         source_id=f"src-{source_type}", source_type=source_type, run_id="run-title",
         item=item, raw=raw, normalized=normalized,
     )
-    kind, *fields = projection.unit_title.text.split("\n")
+    kind, *fields = render_unit_title(projection.unit_title).split("\n")
 
     assert kind and all(": " in field and field.split(": ", 1)[1] for field in fields)
-    assert "None" not in projection.unit_title.text
-    assert all(revision.content != projection.unit_title.text for revision in projection.observation_revisions)
+    assert "None" not in render_unit_title(projection.unit_title)
+    assert all(revision.content != render_unit_title(projection.unit_title) for revision in projection.observation_revisions)
     assert not any(observation.provider_key.startswith("$") for observation in projection.observations)
 
 
@@ -198,7 +225,7 @@ def test_renaming_a_unit_creates_no_revision():
 
     assert renamed.source_unit_revisions[0].id == first.source_unit_revisions[0].id
     assert renamed.deltas[0].axes == frozenset() and not renamed.deltas[0].requires_extraction
-    assert renamed.unit_title.text.split("\n")[2] == "Type: Story"
+    assert render_unit_title(renamed.unit_title).split("\n")[2] == "Type: Story"
 
 
 def test_an_unchanged_unit_stored_without_a_title_produces_no_work():
@@ -273,29 +300,8 @@ async def test_partial_coverage_does_not_carry_the_stored_title_and_the_store_re
     assert partial.carried_observation_revision_ids == ()
     assert partial.deltas[0].removed_observation_ids == ("obs-stored-title",)
 
-    db = Database(str(tmp_path / "title.db"))
-    await db.connect()
+    db = await database_with_stored_title(tmp_path, monkeypatch, stored)
     try:
-        await db.upsert_source(
-            id="src-jira", type="jira", name="Jira", config_json="{}", access_policy="workspace",
-            owner_user_id="owner-1",
-        )
-        declared = database_module.representation_profile_for_observation_contract
-        supported_contract = database_module.representation_contract_for_profile
-        with monkeypatch.context() as stored_contracts:
-            # The contracts under which the title was recorded.
-            stored_contracts.setattr(
-                database_module, "representation_profile_for_observation_contract",
-                lambda *, source_type, observation_type: (
-                    LEGACY_TITLE_PROFILE if observation_type == LEGACY_TITLE_TYPE
-                    else declared(source_type=source_type, observation_type=observation_type)
-                ),
-            )
-            stored_contracts.setattr(
-                database_module, "representation_contract_for_profile",
-                lambda profile: object() if profile == LEGACY_TITLE_PROFILE else supported_contract(profile),
-            )
-            await db.record_source_projection(stored)
         await db.record_source_projection(partial)
 
         unit_id = partial.source_units[0].id
@@ -304,6 +310,84 @@ async def test_partial_coverage_does_not_carry_the_stored_title_and_the_store_re
         assert "obs-stored-title" not in await db.get_current_source_observation_revisions(unit_id)
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_unit_whose_current_revision_stores_its_title_is_read_without_it(tmp_path, monkeypatch):
+    stored = with_stored_title(jira())
+    read = current_representation_of(stored)
+
+    assert read.source_unit_revisions[0].id == stored.source_unit_revisions[0].id
+    assert "obs-stored-title" not in {observation.id for observation in read.observations}
+    assert "obsrev-stored-title" not in read.source_unit_revisions[0].observation_revision_ids
+    assert current_representation_of(read) is read
+
+    db = await database_with_stored_title(tmp_path, monkeypatch, stored)
+    try:
+        preview = await reprocess_preview(
+            db, None, source_id="src-jira", document_ids=("jira-SFPAY-180000",), rediscovers=True,
+        )
+    finally:
+        await db.close()
+    [unit] = preview.units
+    assert unit.available and unit.extraction_item_count >= 1
+    fragments = RevisionAssessmentContext(projection=jira(), base=None, access_context_hash="scope").full_fragments
+    assert unit.reading_chars == sum(len(fragment.presentation_text) for fragment in fragments)
+
+
+def test_evidence_on_the_stored_title_is_dropped_by_its_own_revision_without_a_baseline():
+    stored = with_stored_title(jira())
+    current = jira(prior=stored, run_id="run-2")
+    [title_revision] = [revision for revision in stored.observation_revisions if not in_current_representation(revision)]
+    named = (support_part(current, COMMENT), title_part(stored))
+
+    context = RevisionAssessmentContext(
+        projection=current, base=None, access_context_hash="scope", evidence_revisions=(title_revision,),
+    )
+    [support] = plan_supports(context, named).supports
+
+    # An operator reprocess reads the whole Unit, and the old title is no prior Evidence of it.
+    assert [part.evidence.reference_id for part in support.parts] == ["e1"]
+    assert support.route is SupportRoute.SUPPORT_ASSESSMENT
+
+
+def test_a_support_whose_primary_part_is_dropped_is_assessed_not_rebound():
+    stored = with_stored_title(jira())
+    current = jira(prior=stored, run_id="run-2")
+    context = RevisionAssessmentContext(projection=current, base=stored, access_context_hash="scope")
+    primary_on_title = replace(title_part(stored), role=EvidenceRole.PRIMARY)
+    required = support_part(current, COMMENT, role=EvidenceRole.REQUIRED, reference_id="e2")
+
+    [only_title, with_required] = plan_supports(context, (primary_on_title,), (primary_on_title, required)).supports
+
+    assert only_title.parts == () and only_title.route is SupportRoute.SUPPORT_ASSESSMENT
+    assert [part.status for part in with_required.parts] == [EvidenceCorrespondence.EXACT_UNCHANGED]
+    assert with_required.route is SupportRoute.SUPPORT_ASSESSMENT
+
+
+@pytest.mark.asyncio
+async def test_a_reading_of_a_projection_without_a_unit_title_describes_none():
+    projection = replace(jira(), unit_title=None)
+    context = RevisionAssessmentContext(projection=projection, base=None, access_context_hash="scope")
+    authority = plan_projection_evidence_work(projection, reprocess_all_current_observations=True)
+    [request, *_] = plan_extraction_requests(
+        context, authority, extractor=NoopMemoryExtractor(), source_type="jira", doc_type="ticket",
+    ).requests
+    extraction = MemoryExtractor.projection_fragment_prompt(
+        request.catalog, source_type="jira", doc_type="ticket", revision_context=context,
+    )
+    catalog = context.catalog(context.full_fragments)
+    comment = next(f for f in catalog.fragments if COMMENT in f.presentation_text)
+    client = AdmissionClient()
+    await admit_candidates([RawMemory(
+        content="Regular payroll retains A7.", memory_type="decision",
+        source_observation_id=comment.anchor.observation_id,
+        resolved_evidence_selection=catalog.resolve_selection(primary_ref=comment.reference),
+    )], client=client, model="fixture", unit_title=None)
+
+    for prompt in (extraction, *client.prompts):
+        assert "<unit_title>" not in prompt and UNIT_TITLE_DEFINITION not in prompt
+    assert "A claim may state unit_title values" not in extraction
 
 
 def test_a_support_on_a_renamed_unit_is_rebound_with_no_change_to_read():
@@ -327,7 +411,7 @@ def test_the_unit_title_is_never_a_fragment_and_every_extraction_request_shows_i
     ).requests
 
     assert requests
-    assert all(fragment.presentation_text != projection.unit_title.text for fragment in context.full_fragments)
+    assert all(fragment.presentation_text != render_unit_title(projection.unit_title) for fragment in context.full_fragments)
     for request in requests:
         prompt = MemoryExtractor.projection_fragment_prompt(
             request.catalog, source_type="jira", doc_type="ticket", revision_context=context,
@@ -353,7 +437,7 @@ async def test_admission_shows_the_unit_title_it_is_given():
     assert prompt.startswith(unit_title_block(projection.unit_title))
     [request] = client.requests
     # The title is context of the request, never one of its Evidence parts.
-    assert all(projection.unit_title.text not in entry["excerpt"] for entry in request["evidence_catalog"].values())
+    assert all(render_unit_title(projection.unit_title) not in entry["excerpt"] for entry in request["evidence_catalog"].values())
 
 
 @pytest.mark.asyncio
@@ -421,9 +505,9 @@ def test_a_teams_window_keeps_its_unit_title_as_it_grows_and_a_renamed_chat_need
     )
     renamed = teams([first_message], conversation_name="Payroll Core", prior=first, run_id="run-3")
 
-    assert first.unit_title.text == (
+    assert render_unit_title(first.unit_title) == (
         "Teams conversation\nConversation type: group_chat\nConversation: Payroll Dev\nFrom: 2026-09-29T02:39:00+00:00"
     )
     assert grown.unit_title == first.unit_title
     assert renamed.source_unit_revisions[0].id == first.source_unit_revisions[0].id
-    assert "Conversation: Payroll Core" in renamed.unit_title.text
+    assert "Conversation: Payroll Core" in render_unit_title(renamed.unit_title)

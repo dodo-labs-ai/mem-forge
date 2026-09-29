@@ -411,17 +411,13 @@ class UnitTitle:
     A Jira issue is named by its key, type and summary; a file by its path. Adapters
     supply only values present in the provider payload. The Unit Title is reading
     context of every model reading of the Unit: it is no Observation, no Evidence and
-    no part of the Unit's revision identity, so renaming a Unit, or naming it
-    differently, creates no revision.
+    no part of the Unit's revision identity, so a change of only its values creates
+    no revision. A name that also appears in the content or the locator, such as a
+    Confluence page title or a file path, changes as content or location does.
     """
 
     kind: str
     fields: tuple[tuple[str, str], ...] = ()
-
-    @property
-    def text(self) -> str:
-        """The one rendering every model reading shows: the kind, then one ``name: value`` line per value."""
-        return "\n".join((self.kind, *(f"{name}: {value}" for name, value in self.fields)))
 
 
 @dataclass(frozen=True, slots=True)

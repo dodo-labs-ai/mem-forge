@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping
 
 from memforge.source_artifacts import SOURCE_ARTIFACT_OBSERVATION_TYPE
@@ -10,6 +10,7 @@ from memforge.source_projection import (
     EvidenceCoordinateSpace,
     EvidenceRepresentationProfile,
     SourceObservationRevision,
+    SourceProjection,
 )
 
 
@@ -201,11 +202,37 @@ def in_current_representation(revision: SourceObservationRevision) -> bool:
     current representation. A stored revision in a profile no adapter projects is
     outside it: no later Unit revision carries it, it is no change of the Unit,
     and Evidence on it is dropped when the Support is rebound. A revision stored
-    before profiles were recorded is classified by its Observation contract.
+    before profiles were recorded counts as current.
     """
 
     profile = revision.evidence_profile
     return profile is None or profile in _SUPPORTED_REPRESENTATION_CONTRACTS
+
+
+def current_representation_of(projection: SourceProjection) -> SourceProjection:
+    """A stored projection as it is read today, without its revisions outside the current representation.
+
+    A new projection is always in the current representation. A stored one read as
+    the revision itself, such as the committed revision a reprocess preview reads
+    or a replayed case, may still hold a retired revision; it is read without it.
+    Its Unit revision keeps its id: this is how that revision is read, not a new one.
+    """
+
+    retired = {r.id for r in projection.observation_revisions if not in_current_representation(r)}
+    if not retired:
+        return projection
+    revisions = tuple(r for r in projection.observation_revisions if r.id not in retired)
+    kept = {r.observation_id for r in revisions}
+    left = {r.observation_id for r in projection.observation_revisions if r.id in retired} - kept
+    return replace(
+        projection,
+        observations=tuple(o for o in projection.observations if o.id not in left),
+        observation_revisions=revisions,
+        source_unit_revisions=tuple(
+            replace(unit, observation_revision_ids=tuple(i for i in unit.observation_revision_ids if i not in retired))
+            for unit in projection.source_unit_revisions
+        ),
+    )
 
 
 def representation_profile_for_observation_contract(

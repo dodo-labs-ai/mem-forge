@@ -19,5 +19,6 @@ supported, even when the rest of the claim matches. Use no knowledge outside the
 The unit_title identifies the Unit a claim belongs to: a claim may state its values, such as the
 Unit's key, type, title or path, without Evidence for them. A claim that names its Unit by an
 earlier name, such as a former title or path, still speaks of that Unit; that the name differs
-from the unit_title is never alone a reason for unsupported. An identifier that neither the
-unit_title nor the Evidence contains, such as another Unit's key, is not supported."""
+from the unit_title is never alone a reason for unsupported. Apart from the Unit's own earlier
+names, an identifier that neither the unit_title nor the Evidence contains, such as another
+Unit's key, is not supported."""

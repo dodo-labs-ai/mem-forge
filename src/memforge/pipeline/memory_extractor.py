@@ -34,7 +34,7 @@ from memforge.pipeline.projection_fragments import (
 )
 from memforge.pipeline.projection_context import ExtractionAuthority
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext, reading_group_label
-from memforge.pipeline.unit_title import UNIT_TITLE_DEFINITION, unit_title_block
+from memforge.pipeline.unit_title import unit_title_block
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +47,13 @@ _FRAGMENT_OUTPUT_MIN_TOKENS = 768
 _FRAGMENT_OUTPUT_CHARS_PER_TOKEN = 2
 
 
+_UNIT_TITLE_GUIDANCE = "A claim may state unit_title values, such as the Unit's key, without Evidence for them."
+
 PROJECTION_FRAGMENT_EXTRACTION_PROMPT = """You are extracting durable atomic knowledge from one authorized Source Unit catalog.
 
 <source_type>{source_type}</source_type>
 <doc_type>{doc_type}</doc_type>
-{unit_title}""" + UNIT_TITLE_DEFINITION + """
-A claim may state unit_title values, such as the Unit's key, without Evidence for them.
-Catalog rows are [ref, exact source text, optional metadata]. Headings are ordinary selectable Fragments.
+{unit_title}Catalog rows are [ref, exact source text, optional metadata]. Headings are ordinary selectable Fragments.
 Preserve table column/row associations, list order, code indentation and explicit exceptions.
 A table ref contains the complete table; read its headers before asserting a cell value.
 A figure preserves its image link and caption together. Only a supplied image Artifact
@@ -218,7 +218,7 @@ class MemoryExtractor:
         payload = revision_context.model_payload(catalog)
         return PROJECTION_FRAGMENT_EXTRACTION_PROMPT.format(
             source_type=source_type, doc_type=doc_type, catalog_digest=catalog.digest,
-            unit_title=unit_title_block(revision_context.projection.unit_title),
+            unit_title=unit_title_block(revision_context.projection.unit_title, guidance=_UNIT_TITLE_GUIDANCE),
             fragment_catalog=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         )
 

@@ -234,13 +234,13 @@ def plan_support_revision(
     for fragment in catalog.fragments:
         by_observation.setdefault(fragment.anchor.observation_id, []).append(fragment)
     returned = frozenset(observation.id for observation in context.projection.observations)
-    # Evidence on an Observation outside the current representation is dropped: the
+    # Evidence on a revision outside the current representation is dropped: the
     # Support is judged by its other parts, and rebinding it leaves that part out.
     correspondences = [
         tuple(
             _correspond(part, context, returned, by_observation)
             for part in item.support
-            if part.anchor.observation_id not in context.retired
+            if part.anchor.observation_revision_id not in context.retired
         )
         for item in items
     ]
@@ -320,6 +320,10 @@ def _all_exact(parts: tuple[PartCorrespondence, ...]) -> bool:
     return all(correspondence.status is EvidenceCorrespondence.EXACT_UNCHANGED for correspondence in parts)
 
 
+def _has_primary(parts: tuple[PartCorrespondence, ...]) -> bool:
+    return any(correspondence.evidence.role is EvidenceRole.PRIMARY for correspondence in parts)
+
+
 def _any_unknown(parts: tuple[PartCorrespondence, ...]) -> bool:
     return any(correspondence.status is EvidenceCorrespondence.UNKNOWN for correspondence in parts)
 
@@ -329,7 +333,8 @@ def _route(parts: tuple[PartCorrespondence, ...], context: RevisionAssessmentCon
     if _any_unknown(parts):
         return SupportRoute.UNRESOLVED_PARTIAL_COVERAGE
     # Without a usable baseline nothing is known to be unchanged: read the whole revision.
-    if context.base is None or not _all_exact(parts):
+    # A Support whose Primary part was dropped has nothing to rebind to.
+    if context.base is None or not _all_exact(parts) or not _has_primary(parts):
         return SupportRoute.SUPPORT_ASSESSMENT
     return SupportRoute.CHANGE_IMPACT if changed else SupportRoute.REBIND_SUPPORT
 

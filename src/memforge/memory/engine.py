@@ -1043,8 +1043,17 @@ class MemoryEngine:
                 base = await self.db.get_current_source_unit_projection(scope.source_unit_id)
                 if base is not None and base.source_unit_revisions[0].id not in {scope.base_unit_revision_id, scope.target_unit_revision_id}:
                     raise AuthorityPlanStaleError("revision assessment base changed")
+                evidence_by_memory = await self.db.get_active_memory_support_evidence_many(
+                    tuple(memory.id for memory in model_incumbents), source_id=projection.source_id,
+                )
+                # Each part is classified by the revision it names, whichever baseline its Support has.
+                evidence_revisions = tuple((await self.db.get_source_observation_revisions({
+                    item.anchor.observation_revision_id
+                    for items in evidence_by_memory.values() for item in items
+                } - {revision.id for revision in projection.observation_revisions})).values())
                 assessment_context = RevisionAssessmentContext(
-                    projection=projection, base=base, access_context_hash=access_context_hash, image_loader=evidence_image_loader,
+                    projection=projection, base=base, access_context_hash=access_context_hash,
+                    image_loader=evidence_image_loader, evidence_revisions=evidence_revisions,
                 )
 
                 def assessment_context_for(baseline):
@@ -1056,11 +1065,9 @@ class MemoryEngine:
                         projection=projection, base=baseline, access_context_hash=access_context_hash,
                         image_loader=evidence_image_loader, indexes=assessment_context.indexes,
                         known_observations=base.observations if base is not None else (),
+                        evidence_revisions=evidence_revisions,
                     )
                 contexts_by_revision = {base.source_unit_revisions[0].id: assessment_context} if base else {}
-                evidence_by_memory = await self.db.get_active_memory_support_evidence_many(
-                    tuple(memory.id for memory in model_incumbents), source_id=projection.source_id,
-                )
                 for memory in model_incumbents:
                     groups: dict[str, list] = {}
                     for item in evidence_by_memory.get(memory.id, ()):
