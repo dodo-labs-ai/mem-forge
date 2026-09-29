@@ -70,9 +70,13 @@ SEMANTIC_JUDGE_PROMPT_HASH = hashlib.sha256(
 ).hexdigest()
 # The judge answers with two enum fields; this leaves room for provider framing.
 _SEMANTIC_JUDGE_MAX_OUTPUT_TOKENS = 512
-# The deterministic criterion of a cross-document relation case; its reason
-# code is "expected:actual".
+# The deterministic criterion of a labelled cross-document relation pair; its
+# reason code is "expected:actual".
 RELATION_LABEL_CRITERION = "relation_label"
+# The criterion of an unlabelled candidate of a relation group that the
+# classifier related to the subject; its reason code is the recorded label and
+# it waits for a person's label.
+UNLABELLED_RELATION_CRITERION = "unlabelled_relation"
 _RELATION_LABELS = frozenset(label.value for label in CrossDocumentRelationLabel)
 
 
@@ -80,6 +84,7 @@ class AgentEvaluationCaseKind(str, Enum):
     SOURCE_UNIT_DERIVATION = "source_unit_derivation_v1"
     SOURCE_UNIT_RECONCILIATION = "source_unit_reconciliation_v1"
     CROSS_DOCUMENT_RELATION = "cross_document_relation_v1"
+    CROSS_DOCUMENT_RELATION_GROUP = "cross_document_relation_group_v1"
 
 
 class AgentEvaluationPopulation(str, Enum):
@@ -561,9 +566,16 @@ class AgentEvaluationRunExecution:
 
 @dataclass(frozen=True, slots=True)
 class DeterministicCheck:
+    """One code check of a result.
+
+    ``item_id`` names the judged item a check scores when a case holds several,
+    such as one candidate of a relation group; each item gets its own check.
+    """
+
     criterion: str
     label: DeterministicCheckLabel
     reason_code: str
+    item_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -595,10 +607,12 @@ class AgentEvaluationRunReport:
     error_result_count: int
     check_counts: Mapping[str, int]
     population_summaries: Mapping[str, Mapping[str, int]]
-    # Cross-document relation cases only: per-label counts and precision/recall,
-    # and "expected:actual" confusion counts.
+    # Cross-document relation cases only: per-label counts and precision/recall
+    # and "expected:actual" confusion counts over labelled pairs, and the
+    # summary ``relation_run_summary`` gives.
     label_metrics: Mapping[str, Mapping[str, float | int | None]] = field(default_factory=dict)
     label_confusion: Mapping[str, int] = field(default_factory=dict)
+    relation_summary: Mapping[str, float | int | None] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -606,8 +620,8 @@ class AgentEvaluationCaseOutput:
     """One run result with the protected content needed to analyze it.
 
     It holds the case's pinned input, its accepted rubric, the candidate output
-    (for a relation case, the recorded label and the classifier's label) and the
-    code checks.
+    (for a relation case, the recorded label and the classifier's label of each
+    judged pair) and the code checks.
     """
 
     case: AgentEvaluationCase
@@ -1036,6 +1050,52 @@ class CrossDocumentRelationReplayExecutor:
             "classifier_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
             "label": judgment.recorded_label.value,
             "classifier_label": judgment.label.value,
+        }
+
+
+class CrossDocumentRelationGroupReplayExecutor:
+    """Classify one pinned challenger with all of its pinned candidates, as discovery does.
+
+    Discovery asks about every candidate of one challenger through the
+    production classifier: requests state the challenger once as the subject
+    and ask one question per candidate, and the batch runner packs and splits
+    the questions by capacity. Replay sends the pinned candidates in their
+    pinned order the same way, so the candidates each request shows beside one
+    another are the ones production showed. Every candidate is judged, labelled
+    or not; ``judgments`` holds, in candidate order, the label discovery would
+    record and the classifier's own label.
+    """
+
+    def __init__(self, structured_llm_client: object) -> None:
+        self._structured_llm_client = structured_llm_client
+
+    async def execute(
+        self,
+        case: AgentEvaluationCase,
+        candidate_manifest: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        _require_relation_input_contract(case.manifest)
+        challenger = RelationSubject.from_manifest(_mapping(case.manifest, "challenger"))
+        pairs = tuple(
+            CrossDocumentRelationPair(challenger=challenger, candidate=RelationSubject.from_manifest(candidate))
+            for candidate in _mapping_list(case.manifest, "candidates")
+        )
+        classification = await StructuredCrossDocumentRelationClassifier(
+            client=self._structured_llm_client,
+            model=str(candidate_manifest["model"]),
+        ).classify(pairs)
+        return {
+            "case_kind": case.case_kind.value,
+            "classifier_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+            "llm_calls": classification.llm_calls,
+            "judgments": [
+                {
+                    "memory_id": judgment.pair.candidate.memory_id,
+                    "label": judgment.recorded_label.value,
+                    "classifier_label": judgment.label.value,
+                }
+                for judgment in classification.judgments
+            ],
         }
 
 
@@ -1569,7 +1629,7 @@ class OfflineAgentEvaluation:
             raise ValueError("adjudication_note is required")
         if len(note) > 2000:
             raise ValueError("adjudication_note must not exceed 2000 characters")
-        _validate_rubric(case.case_kind, rubric)
+        _validate_rubric(case, rubric)
         rubric_payload = _canonical_mapping(rubric)
         rubric_hash = _hash(rubric_payload)
         acceptance_policy_version = _required(
@@ -1611,7 +1671,7 @@ class OfflineAgentEvaluation:
     ) -> AcceptedGroundTruthRevision:
         case = await self._require_case(case_id)
         await self._store.authorize_agent_evaluation_source(case.source_id, accepted_by)
-        _validate_rubric(case.case_kind, rubric)
+        _validate_rubric(case, rubric)
         rubric_hash = _hash(rubric)
         revision = AcceptedGroundTruthRevision(
             ground_truth_revision_id=_id("aeg", case.case_id, rubric_hash),
@@ -2073,6 +2133,13 @@ class OfflineAgentEvaluation:
             for assessment in code_assessments
             if assessment.criterion == RELATION_LABEL_CRITERION
         )
+        relation_summary = relation_run_summary(
+            label_metrics,
+            label_confusion,
+            unlabelled_relations=sum(
+                assessment.criterion == UNLABELLED_RELATION_CRITERION for assessment in code_assessments
+            ),
+        )
         return AgentEvaluationRunReport(
             run=run,
             results=results,
@@ -2087,6 +2154,7 @@ class OfflineAgentEvaluation:
             population_summaries=population_summaries,
             label_metrics=label_metrics,
             label_confusion=label_confusion,
+            relation_summary=relation_summary,
         )
 
     async def read_case_outputs(
@@ -2501,6 +2569,37 @@ def deterministic_checks(
                 reason_code=f"{expected}:{actual}",
             )
         )
+    elif case.case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION_GROUP:
+        actual_labels = _group_judgment_labels(case, output)
+        if actual_labels is None:
+            return (
+                DeterministicCheck(
+                    criterion="typed_output",
+                    label=DeterministicCheckLabel.FAIL,
+                    reason_code="relation_output_invalid",
+                ),
+            )
+        expected_labels = _mapping(ground_truth.rubric, "expected_labels")
+        for memory_id, actual in actual_labels.items():
+            if memory_id in expected_labels:
+                expected = str(expected_labels[memory_id])
+                checks.append(
+                    DeterministicCheck(
+                        criterion=RELATION_LABEL_CRITERION,
+                        label=DeterministicCheckLabel.PASS if actual == expected else DeterministicCheckLabel.FAIL,
+                        reason_code=f"{expected}:{actual}",
+                        item_id=memory_id,
+                    )
+                )
+            elif actual != CrossDocumentRelationLabel.NONE.value:
+                checks.append(
+                    DeterministicCheck(
+                        criterion=UNLABELLED_RELATION_CRITERION,
+                        label=DeterministicCheckLabel.UNKNOWN,
+                        reason_code=actual,
+                        item_id=memory_id,
+                    )
+                )
     elif case.case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION:
         extraction = output.get("extraction")
         memories = extraction.get("memories") if isinstance(extraction, Mapping) else None
@@ -2600,6 +2699,28 @@ def deterministic_checks(
     return tuple(checks)
 
 
+def _group_judgment_labels(
+    case: AgentEvaluationCase,
+    output: Mapping[str, object],
+) -> dict[str, str] | None:
+    """The recorded label of every pinned candidate, in candidate order, or None when the output lacks one."""
+
+    judgments = output.get("judgments")
+    if not isinstance(judgments, list):
+        return None
+    labels = {
+        str(judgment.get("memory_id")): str(judgment.get("label"))
+        for judgment in judgments
+        if isinstance(judgment, Mapping)
+    }
+    candidate_ids = [str(candidate["memory_id"]) for candidate in _mapping_list(case.manifest, "candidates")]
+    if len(judgments) != len(candidate_ids) or sorted(labels) != sorted(candidate_ids):
+        return None
+    if any(label not in _RELATION_LABELS for label in labels.values()):
+        return None
+    return {memory_id: labels[memory_id] for memory_id in candidate_ids}
+
+
 def relation_label_metrics(
     reason_codes: Iterable[str],
 ) -> tuple[dict[str, dict[str, float | int | None]], dict[str, int]]:
@@ -2626,6 +2747,33 @@ def relation_label_metrics(
             "recall": correct_count / expected_count if expected_count else None,
         }
     return metrics, confusion
+
+
+def relation_run_summary(
+    label_metrics: Mapping[str, Mapping[str, float | int | None]],
+    label_confusion: Mapping[str, int],
+    *,
+    unlabelled_relations: int,
+) -> dict[str, float | int | None]:
+    """The relation outcomes a release gate reads, beside the per-label metrics.
+
+    ``false_relations`` counts labelled ``none`` pairs the classifier related,
+    the error a reader pays for; ``none_recall`` is the share of labelled
+    ``none`` pairs it left unrelated. ``unlabelled_relations`` counts relations
+    the classifier gave candidates of a group that carry no label yet.
+    """
+
+    none = CrossDocumentRelationLabel.NONE.value
+    return {
+        "labelled_pairs": sum(label_confusion.values()),
+        "false_relations": sum(
+            count
+            for code, count in label_confusion.items()
+            if code.split(":")[0] == none and code.split(":")[1] != none
+        ),
+        "none_recall": label_metrics[none]["recall"],
+        "unlabelled_relations": unlabelled_relations,
+    }
 
 
 def _derivation_evidence_resolves(
@@ -2720,6 +2868,7 @@ def _assessment_for_check(
         check.criterion,
         OFFLINE_DETERMINISTIC_EVALUATOR_VERSION,
         evaluator_version,
+        *((check.item_id,) if check.item_id is not None else ()),
     )
     return AgentAssessment(
         assessment_id=identity,
@@ -2751,6 +2900,18 @@ def _validate_case_manifest(
         origin = _mapping(manifest, "origin")
         if not origin.get("review_id"):
             raise ValueError("relation case origin requires review_id")
+    elif case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION_GROUP:
+        _require_relation_input_contract(manifest)
+        challenger = RelationSubject.from_manifest(_mapping(manifest, "challenger"))
+        candidate_ids = [
+            RelationSubject.from_manifest(candidate).memory_id for candidate in _mapping_list(manifest, "candidates")
+        ]
+        if not candidate_ids:
+            raise ValueError("relation group case requires pinned candidates")
+        if len(set(candidate_ids)) != len(candidate_ids) or challenger.memory_id in candidate_ids:
+            raise ValueError("relation group case requires distinct candidates other than the challenger")
+        if not _mapping(manifest, "origin").get("labelled_by"):
+            raise ValueError("relation group case origin requires labelled_by")
     elif case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION:
         _mapping(manifest, "projection")
         _mapping(manifest, "context")
@@ -2819,16 +2980,24 @@ def _validate_candidate_manifest(manifest: Mapping[str, object]) -> None:
 
 
 def _validate_rubric(
-    case_kind: AgentEvaluationCaseKind,
+    case: AgentEvaluationCase,
     rubric: Mapping[str, object],
 ) -> None:
     if not rubric:
         raise ValueError("accepted ground truth rubric cannot be empty")
     if "required_claims" in rubric and not isinstance(rubric["required_claims"], list):
         raise ValueError("required_claims must be a list")
+    case_kind = case.case_kind
     if case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION:
         if rubric.get("expected_label") not in _RELATION_LABELS:
             raise ValueError("relation rubric requires one expected_label of " + ", ".join(sorted(_RELATION_LABELS)))
+    if case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION_GROUP:
+        expected_labels = _mapping(rubric, "expected_labels")
+        candidate_ids = {str(candidate["memory_id"]) for candidate in _mapping_list(case.manifest, "candidates")}
+        if not set(expected_labels) <= candidate_ids:
+            raise ValueError("relation group rubric requires expected_labels for pinned candidates")
+        if any(label not in _RELATION_LABELS for label in expected_labels.values()):
+            raise ValueError("relation group expected_labels must be one of " + ", ".join(sorted(_RELATION_LABELS)))
     if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION:
         forbidden = rubric.get("forbidden_destructive_memory_ids", [])
         if not isinstance(forbidden, list):
@@ -3249,6 +3418,7 @@ def agent_evaluation_report_public_payload(
                 label: dict(metrics) for label, metrics in report.label_metrics.items()
             },
             "label_confusion": dict(report.label_confusion),
+            "relation_summary": dict(report.relation_summary),
         },
         "results": [agent_evaluation_result_to_payload(result) for result in report.results],
         "assessments": [

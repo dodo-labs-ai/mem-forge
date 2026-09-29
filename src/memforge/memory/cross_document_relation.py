@@ -855,7 +855,8 @@ async def load_relation_subjects(
     challenger's current Units, so the two show the same Evidence unless the
     challenger has current Evidence in several Source Units. Discovery asks
     about all of a challenger's candidates in requests that state the
-    challenger once; the evaluation sends each pinned pair on its own.
+    challenger once; a relation group case replays those requests with the
+    candidates it pinned, and a pair case sends its one pair on its own.
     """
 
     reader = _RelationEvidenceReader(store)

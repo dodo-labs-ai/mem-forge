@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Relation group evaluation cases (`cross_document_relation_group_v1`) replay
+  discovery's requests: one case pins a challenger with every candidate
+  discovery asked about for it, in order, and labels for some of them. A
+  maintenance operator seeds them with
+  `POST /api/v1/agent-evaluations/relation-group-cases/seed`, naming Memories
+  by id; the server pins each Memory's classifier input and each label as the
+  label the program records. Runs classify every candidate of a group and
+  score only labelled ones. Run reports add `relation_summary` with
+  `labelled_pairs`, `false_relations`, `none_recall` and
+  `unlabelled_relations` (relations given to unlabelled candidates, left for
+  people to label).
 - Cross-document relation classifier `cross-document-relation-v4`: every
   request states one challenger once as the subject and asks one question per
   candidate, with sharper relation rules (ADR 0043 amendment of 2026-09-29).
