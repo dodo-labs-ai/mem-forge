@@ -124,7 +124,6 @@ from memforge.models import (
 from memforge.pipeline.evidence_fragments import EvidenceFragment
 from memforge.pipeline.projection_evidence import build_projected_claim_evidence
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-from memforge.source_representation import UNIT_TITLE_OBSERVATION_TYPE
 from memforge import source_derivation as source_derivation_module
 from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_CONTRACT_VERSION
 from memforge.pipeline.projection_context import (
@@ -280,12 +279,8 @@ def _selected(
 
 
 def _body_observation(projection):
-    """The first provider Observation; the Unit Title precedes it."""
-    return next(
-        observation
-        for observation in projection.observations
-        if observation.observation_type != UNIT_TITLE_OBSERVATION_TYPE
-    )
+    """The first provider Observation."""
+    return projection.observations[0]
 
 
 def _body_revision(projection):
@@ -2052,10 +2047,7 @@ async def _seed_incumbent_support(
         memory_content,
         source_updated_at=None,
     )
-    # Index among the provider's Observations; the Unit Title precedes them.
-    observation = [
-        item for item in projection.observations if item.observation_type != UNIT_TITLE_OBSERVATION_TYPE
-    ][observation_index]
+    observation = projection.observations[observation_index]
     revisions_by_observation = {item.observation_id: item for item in projection.observation_revisions}
     revision = revisions_by_observation[observation.id]
     unit = EvidenceUnit(
@@ -5012,9 +5004,8 @@ async def _seed_jira_required_incumbent(
         "Decision: retain A7",
         source_updated_at=None,
     )
-    # The provider's second Observation (a comment or an Artifact) is Primary; its first is Required.
-    primary = [item for item in first.observations if item.observation_type != UNIT_TITLE_OBSERVATION_TYPE][1]
-    required = _body_observation(first)
+    primary = first.observations[1]
+    required = first.observations[0]
     revisions = {item.observation_id: item for item in first.observation_revisions}
     unit = EvidenceUnit(
         id="eu-jira-required",

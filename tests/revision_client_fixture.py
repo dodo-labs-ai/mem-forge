@@ -155,14 +155,16 @@ class RevisionClientFixture:
         or, once the last reading group is read, unsupported. ``assess_support``
         judges one claim from a scenario payload: the request payload with that
         claim's work fields, its prior Evidence as text, and the carried witnesses
-        merged back into the current candidates.
+        merged back into the current candidates, after the request's Unit Title.
         """
         from memforge.llm.structured import ChangeImpactWireResponse, SupportAssessmentWireResponse
 
         if response_format is ChangeImpactWireResponse:
             return change_impact_response(prompt, self.judge_change_impact)
         assert response_format is SupportAssessmentWireResponse
-        payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
+        head, body = prompt.split("<assessment>", 1)
+        payload = json.loads(body.split("</assessment>", 1)[0])
+        unit_title = head[head.index("<unit_title>"):] if "<unit_title>" in head else ""
         groups = payload["current"]["structural_groups"]
         sources = {ref: group for group in groups for ref in group["refs"]}
         rows = [
@@ -193,7 +195,7 @@ class RevisionClientFixture:
                 *payload["current"]["required_only_candidates"],
                 *(row for row in payload["carried_witness_catalog"] if row[0].startswith("REQ-")),
             ]}
-            assessment_prompt = "<assessment>" + json.dumps(scenario_payload) + "</assessment>"
+            assessment_prompt = unit_title + "<assessment>" + json.dumps(scenario_payload) + "</assessment>"
             if "<correction>" in prompt:
                 assessment_prompt += "previous selection used invalid refs"
             result = await self.assess_support(assessment_prompt, **kwargs)
@@ -317,7 +319,7 @@ class RevisionClientFixture:
         ]
         previous = payload["previous_evidence"]
         primary_old = next(item for item in previous if item["role"] == "primary")
-        # Only PRM refs may be Primary; the Unit Title, for one, is always REQ.
+        # Only PRM refs may be Primary.
         primary_capable = [item for item in current if item["ref"].startswith("PRM-")]
         primary = next(
             (item for item in primary_capable if item["text"] == primary_old["excerpt"]),

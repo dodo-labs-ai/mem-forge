@@ -951,6 +951,7 @@ class MemoryEngine:
             filtered_memories,
             client=self.structured_llm_client,
             model=self.llm_model,
+            unit_title=projection.unit_title,
             image_loader=evidence_image_loader,
             store=self.db,
             derivation_id=derivation_id,

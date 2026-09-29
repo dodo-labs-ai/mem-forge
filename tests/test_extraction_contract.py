@@ -65,7 +65,7 @@ def _planned_requests(projection, authority):
 def test_extraction_contract_version_is_pinned_into_derivation_identity() -> None:
     # Stored derivations and batch ids hash this value; changing it supersedes
     # every stored derivation instead of resuming it.
-    assert PROJECTION_EXTRACTION_CONTRACT_VERSION == "projection-extraction-v10"
+    assert PROJECTION_EXTRACTION_CONTRACT_VERSION == "projection-extraction-v11"
 
 
 def test_extraction_prompt_carries_the_durable_memory_quality_contract() -> None:
@@ -434,7 +434,6 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
                 "schema_version": None,
                 "version": 1,
             }
-            # The Unit Title and the file content.
             for revision in sorted(target.observation_revisions, key=lambda item: (item.observation_id, item.id))
         ],
         "reprocess_operation_id": None,

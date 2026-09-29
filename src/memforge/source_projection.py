@@ -334,12 +334,12 @@ class RevisionDelta:
     coverage: ProjectionCoverage
     changed_anchors: tuple[SourceAnchor, ...] = ()
     added_observation_ids: tuple[str, ...] = ()
+    # Observations that left the Unit: those the coverage proves absent, and those
+    # outside the current representation, which leave it under any coverage.
     removed_observation_ids: tuple[str, ...] = ()
     fragment_mappings: tuple[FragmentMapping, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.removed_observation_ids and not self.coverage.proves_absence:
-            raise ValueError("removed_observation_ids require absence-proving coverage")
         if self.removed_observation_ids and DeltaAxis.MEMBERSHIP not in self.axes:
             raise ValueError("removed observations require the membership delta axis")
 
@@ -405,6 +405,26 @@ class ProjectionEnvelope:
 
 
 @dataclass(frozen=True, slots=True)
+class UnitTitle:
+    """The provider's human-facing name of one Source Unit: its kind and named values.
+
+    A Jira issue is named by its key, type and summary; a file by its path. Adapters
+    supply only values present in the provider payload. The Unit Title is reading
+    context of every model reading of the Unit: it is no Observation, no Evidence and
+    no part of the Unit's revision identity, so renaming a Unit, or naming it
+    differently, creates no revision.
+    """
+
+    kind: str
+    fields: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def text(self) -> str:
+        """The one rendering every model reading shows: the kind, then one ``name: value`` line per value."""
+        return "\n".join((self.kind, *(f"{name}: {value}" for name, value in self.fields)))
+
+
+@dataclass(frozen=True, slots=True)
 class SourceProjection:
     run_id: str
     source_id: str
@@ -421,6 +441,8 @@ class SourceProjection:
     # Partial projections retain exact prior revisions for observations that
     # the provider did not return; this run annotation never mutates revision identity.
     carried_observation_revision_ids: tuple[str, ...] = ()
+    # The current name of the projected Unit; None for a tombstone, which names no live Unit.
+    unit_title: UnitTitle | None = None
 
     def __post_init__(self) -> None:
         _require_unique("observation", tuple(item.id for item in self.observations))
@@ -741,6 +763,17 @@ def source_projection_to_payload(projection: SourceProjection) -> dict[str, obje
         ],
         "checkpoint": dict(projection.checkpoint),
         "carried_observation_revision_ids": list(projection.carried_observation_revision_ids),
+        # Present only when the projection names its Unit.
+        **(
+            {
+                "unit_title": {
+                    "kind": projection.unit_title.kind,
+                    "fields": [list(value) for value in projection.unit_title.fields],
+                }
+            }
+            if projection.unit_title is not None
+            else {}
+        ),
     }
 
 
@@ -852,6 +885,19 @@ def source_projection_from_payload(payload: Mapping[str, object]) -> SourceProje
         carried_observation_revision_ids=tuple(
             str(value) for value in payload.get("carried_observation_revision_ids", [])
         ),
+        unit_title=_unit_title_from_payload(payload.get("unit_title")),
+    )
+
+
+def _unit_title_from_payload(value: object) -> UnitTitle | None:
+    """A stored Unit Title; a projection stored without one names no Unit."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or not isinstance(value.get("fields", []), list):
+        raise ValueError("invalid source projection unit_title")
+    return UnitTitle(
+        kind=str(value["kind"]),
+        fields=tuple((str(name), str(text)) for name, text in value.get("fields", [])),
     )
 
 

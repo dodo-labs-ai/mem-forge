@@ -27,7 +27,6 @@ from memforge.models import ContentItem, Memory, NormalizedContent, RawContent
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_artifacts import StoredSourceArtifact
 from memforge.source_projection import AnchorKind, SourceAnchor
-from memforge.source_representation import UNIT_TITLE_OBSERVATION_TYPE
 from memforge.storage.database import Database
 from tests.relation_evidence_fixture import primary_evidence_unit_fixture
 
@@ -83,8 +82,6 @@ def test_body_observation_takes_the_source_time_the_gene_reports(source_type, bo
 
     revisions = _revisions_by_type(projection)
     assert revisions[body_type].observed_at == SOURCE_TIME_UTC
-    # The Unit Title is the provider's name for the Unit, not content with a time of its own.
-    assert revisions[UNIT_TITLE_OBSERVATION_TYPE].observed_at is None
     assert projection.source_unit_revisions[0].observed_at == SOURCE_TIME_UTC
 
 
@@ -333,7 +330,6 @@ async def test_migration_gives_current_confluence_bodies_their_page_version_time
         types = {observation.id: observation.observation_type for observation in page.observations}
         assert {types[observation_id]: time for observation_id, time in times.items()} == {
             "page_body": "2026-02-11T10:00:00+00:00",
-            UNIT_TITLE_OBSERVATION_TYPE: None,
         }
     finally:
         await migrated.close()

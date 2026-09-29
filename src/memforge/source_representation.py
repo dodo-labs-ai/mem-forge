@@ -9,6 +9,7 @@ from memforge.source_artifacts import SOURCE_ARTIFACT_OBSERVATION_TYPE
 from memforge.source_projection import (
     EvidenceCoordinateSpace,
     EvidenceRepresentationProfile,
+    SourceObservationRevision,
 )
 
 
@@ -24,15 +25,6 @@ BINARY_ARTIFACT_PROFILE = EvidenceRepresentationProfile(
 )
 PLAIN_TEXT_PROFILE = EvidenceRepresentationProfile(
     name="plain-text",
-    version=1,
-    coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
-)
-# The Unit Title: the provider's human-facing name of one Source Unit, such as a
-# Jira key, type and summary. It is one Required-only Fragment: it scopes and
-# identifies claims but states none, so it is never Primary Evidence.
-UNIT_TITLE_OBSERVATION_TYPE = "unit_identity"
-UNIT_TITLE_PROFILE = EvidenceRepresentationProfile(
-    name="unit-identity",
     version=1,
     coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
 )
@@ -189,7 +181,6 @@ _SUPPORTED_REPRESENTATION_CONTRACTS: Mapping[
         MARKDOWN_STRUCTURAL_PROFILE,
         BINARY_ARTIFACT_PROFILE,
         PLAIN_TEXT_PROFILE,
-        UNIT_TITLE_PROFILE,
         *_REPRESENTATION_CONTRACTS.values(),
     }
 }
@@ -203,6 +194,20 @@ def representation_contract_for_profile(
     return _SUPPORTED_REPRESENTATION_CONTRACTS.get(profile)
 
 
+def in_current_representation(revision: SourceObservationRevision) -> bool:
+    """Whether a stored Observation revision is content the adapters still project.
+
+    Revisions are compared with a new projection only when both sides are in the
+    current representation. A stored revision in a profile no adapter projects is
+    outside it: no later Unit revision carries it, it is no change of the Unit,
+    and Evidence on it is dropped when the Support is rebound. A revision stored
+    before profiles were recorded is classified by its Observation contract.
+    """
+
+    profile = revision.evidence_profile
+    return profile is None or profile in _SUPPORTED_REPRESENTATION_CONTRACTS
+
+
 def representation_profile_for_observation_contract(
     *,
     source_type: str,
@@ -212,9 +217,6 @@ def representation_profile_for_observation_contract(
 
     if observation_type == SOURCE_ARTIFACT_OBSERVATION_TYPE:
         return BINARY_ARTIFACT_PROFILE
-    if observation_type == UNIT_TITLE_OBSERVATION_TYPE:
-        # Every adapter supplies its Unit Title in the same representation.
-        return UNIT_TITLE_PROFILE
     if observation_type == "document_content":
         # The extension-safe projection fallback is explicitly normalized Markdown.
         return MARKDOWN_STRUCTURAL_PROFILE
