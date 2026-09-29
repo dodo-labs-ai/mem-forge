@@ -8,6 +8,7 @@ from memforge.config import AppConfig
 from memforge.evals.offline_evaluation import (
     AgentEvaluationCaseKind,
     AgentEvaluationRun,
+    CrossDocumentRelationGroupReplayExecutor,
     CrossDocumentRelationReplayExecutor,
     OfflineAgentEvaluation,
     OfflineEvaluationStore,
@@ -51,6 +52,9 @@ async def build_offline_evaluation_for_run(
             ),
             AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION: (
                 CrossDocumentRelationReplayExecutor(structured_client)
+            ),
+            AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION_GROUP: (
+                CrossDocumentRelationGroupReplayExecutor(structured_client)
             ),
         },
         semantic_judge=(
