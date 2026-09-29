@@ -21,7 +21,7 @@ from memforge.pipeline import revision_work
 from memforge.pipeline.complete_support import COMPLETE_SUPPORT_DEFINITION
 from memforge.pipeline.revision_assessment import REVISION_SUPPORT_CONTRACT, RevisionAssessmentContext
 from memforge.pipeline.revision_work import SUPPORT_ASSESSMENT_CONTRACT, RevisionWorkExecutor
-from memforge.pipeline.unit_title import render_unit_title
+from memforge.pipeline.unit_title import UNIT_TITLE_DEFINITION, render_unit_title
 from memforge.storage.database import Database
 from tests.coordination_fixture import JIRA_DOCUMENT, SOURCE_ID, ScriptedClient, coordination_engine
 from tests.revision_client_fixture import FixtureSupport
@@ -44,13 +44,26 @@ FIRST_COMMIT_AT = datetime(2026, 9, 25, tzinfo=timezone.utc)
 
 
 def test_complete_support_names_every_kind_of_specific_a_claim_can_state():
+    definition = " ".join(COMPLETE_SUPPORT_DEFINITION.split())
     for specific in (
-        "names\nof people, systems and things", "identifiers", "quantities", "dates and times", "statuses",
-        "conditions\nand scope",
+        "names of people, systems and things", "identifiers", "quantities", "dates and times", "statuses",
+        "conditions and scope",
     ):
-        assert specific in COMPLETE_SUPPORT_DEFINITION
-    assert "contradicts or does not contain is not\nsupported" in COMPLETE_SUPPORT_DEFINITION
-    assert "even when the rest of the claim matches" in COMPLETE_SUPPORT_DEFINITION
+        assert specific in definition
+    assert "neither the Evidence nor the unit_title contains, is not supported" in definition
+    assert "even when the rest of the claim matches" in definition
+
+
+def test_a_claim_may_state_every_unit_title_value_and_the_unit_title_is_never_evidence():
+    definition = " ".join(COMPLETE_SUPPORT_DEFINITION.split())
+    title = " ".join(UNIT_TITLE_DEFINITION.split())
+    for text in (definition, title):
+        assert "key, type, summary, title or path" in text
+    assert "appears in that Evidence or in the unit_title" in definition
+    assert "The unit_title is never Evidence" in definition
+    assert "never Evidence" in title
+    assert "selected Evidence (evidence_refs into evidence_catalog, one Primary and any Required parts), read with " \
+        "the unit_title, completely supports the entire claim" in " ".join(candidate_admission._ADMISSION_INSTRUCTIONS.split())
 
 
 def test_support_assessment_and_admission_share_the_one_definition_and_change_impact_does_not_use_it():

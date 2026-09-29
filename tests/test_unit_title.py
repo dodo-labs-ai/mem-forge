@@ -446,6 +446,38 @@ async def test_a_unit_whose_current_revision_stores_its_title_is_read_without_it
     assert unit.reading_chars == sum(len(fragment.presentation_text) for fragment in fragments)
 
 
+def test_a_stored_payload_whose_delta_added_the_title_is_read_with_only_its_content_changes():
+    prior = jira(description="Earlier payroll context.")
+    current = jira(prior=prior, run_id="run-2")
+    stored = with_stored_title(current)
+    [title_revision] = [revision for revision in stored.observation_revisions if not in_current_representation(revision)]
+    title_anchor = SourceAnchor(
+        kind=AnchorKind.WHOLE_OBSERVATION, observation_id=title_revision.observation_id,
+        observation_revision_id=title_revision.id,
+    )
+    stored = replace(stored, deltas=(replace(
+        stored.deltas[0],
+        axes=stored.deltas[0].axes | {DeltaAxis.MEMBERSHIP},
+        changed_anchors=(title_anchor, *stored.deltas[0].changed_anchors),
+        added_observation_ids=(title_revision.observation_id, *stored.deltas[0].added_observation_ids),
+    ),))
+
+    read = current_representation_of(source_projection_from_payload(source_projection_to_payload(stored)))
+    [delta] = read.deltas
+
+    assert current.deltas[0].changed_anchors
+    assert (delta.changed_anchors, delta.added_observation_ids) == (
+        current.deltas[0].changed_anchors, current.deltas[0].added_observation_ids,
+    )
+    authority = plan_projection_evidence_work(
+        read, committed_base_snapshot=committed(prior), reprocess_all_current_observations=False,
+    )
+    assert isinstance(authority, ExtractionAuthority)
+    assert set(authority.ranges_by_observation_id) == {
+        anchor.observation_id for anchor in current.deltas[0].changed_anchors
+    }
+
+
 def test_evidence_on_the_stored_title_is_dropped_by_its_own_revision_without_a_baseline():
     stored = with_stored_title(jira())
     current = jira(prior=stored, run_id="run-2")
@@ -498,7 +530,6 @@ async def test_a_reading_of_a_projection_without_a_unit_title_describes_none():
 
     for prompt in (extraction, *client.prompts):
         assert "<unit_title>" not in prompt and UNIT_TITLE_DEFINITION not in prompt
-    assert "A claim may state unit_title values" not in extraction
 
 
 def test_a_support_on_a_renamed_unit_is_rebound_with_no_change_to_read():

@@ -13,9 +13,9 @@ from memforge.source_projection import UnitTitle
 
 __all__ = ["UNIT_TITLE_DEFINITION", "render_unit_title", "unit_title_block"]
 
-UNIT_TITLE_DEFINITION = """unit_title names the Source Unit this text belongs to by its kind and values, such as its
-key, type, title or path. It is the Unit's current name, not source text: it states no claim and is
-never Evidence."""
+UNIT_TITLE_DEFINITION = """unit_title is the Source Unit this text belongs to: its kind and its current values, such as
+its key, type, summary, title or path. Each value is a fact about the Unit that a claim may state.
+It is not source text and is never Evidence."""
 
 
 def render_unit_title(title: UnitTitle) -> str:

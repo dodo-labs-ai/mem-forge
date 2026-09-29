@@ -216,6 +216,8 @@ def current_representation_of(projection: SourceProjection) -> SourceProjection:
     the revision itself, such as the committed revision a reprocess preview reads
     or a replayed case, may still hold a retired revision; it is read without it.
     Its Unit revision keeps its id: this is how that revision is read, not a new one.
+    Its Revision Deltas keep their axes and name no retired revision or Observation,
+    so a retired revision is neither changed nor added content of the read projection.
     """
 
     retired = {r.id for r in projection.observation_revisions if not in_current_representation(r)}
@@ -231,6 +233,18 @@ def current_representation_of(projection: SourceProjection) -> SourceProjection:
         source_unit_revisions=tuple(
             replace(unit, observation_revision_ids=tuple(i for i in unit.observation_revision_ids if i not in retired))
             for unit in projection.source_unit_revisions
+        ),
+        deltas=tuple(
+            replace(
+                delta,
+                changed_anchors=tuple(a for a in delta.changed_anchors if a.observation_revision_id not in retired),
+                added_observation_ids=tuple(i for i in delta.added_observation_ids if i not in left),
+                fragment_mappings=tuple(m for m in delta.fragment_mappings if m.current_revision_id not in retired),
+            )
+            for delta in projection.deltas
+        ),
+        carried_observation_revision_ids=tuple(
+            i for i in projection.carried_observation_revision_ids if i not in retired
         ),
     )
 
