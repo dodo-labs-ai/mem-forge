@@ -7,9 +7,11 @@
   discovery asked about for it, in order, and labels for some of them. A
   maintenance operator seeds them with
   `POST /api/v1/agent-evaluations/relation-group-cases/seed`, naming Memories
-  by id; the server pins each Memory's classifier input and each label as the
-  label the program records. Runs classify every candidate of a group and
-  score only labelled ones. Run reports add `relation_summary` with
+  by id with the content hash each had when labelled; a group with a changed
+  Memory is skipped as `memory_changed`, and the server pins each Memory's
+  classifier input and each label as the label the program records. Runs
+  classify every candidate of a group and score only labelled ones; each
+  check's reason code names its candidate (`expected:actual/memory_id`). Run reports add `relation_summary` with
   `labelled_pairs`, `false_relations`, `none_recall` and
   `unlabelled_relations` (relations given to unlabelled candidates, left for
   people to label).

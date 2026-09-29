@@ -899,13 +899,18 @@ class CrossSourceReviewLabelsRequest(BaseModel):
 
 
 class RelationGroupLabelsRequest(BaseModel):
-    """One challenger, every candidate discovery asked about for it in discovery's order, and labels for some."""
+    """One challenger, every candidate discovery asked about for it in discovery's order, and labels for some.
+
+    ``content_hashes`` gives each of these Memories' content hash when the
+    group was labelled.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     challenger_memory_id: str = Field(min_length=1)
     candidate_memory_ids: list[str] = Field(min_length=1)
     labels: dict[str, CrossDocumentRelationLabel] = Field(default_factory=dict)
+    content_hashes: dict[str, str]
 
 
 class RelationGroupCasesSeedRequest(BaseModel):
@@ -6001,7 +6006,8 @@ def create_admin_app(
         """Pin labelled discovery groups as relation group cases and freeze their cohort.
 
         The server reads every Memory and its classifier input itself; the
-        request carries Memory ids and labels only.
+        request carries Memory ids, labels and the content hashes the labels
+        were made for only.
         """
 
         from memforge.evals.cross_document_relation_cases import (
@@ -6020,6 +6026,7 @@ def create_admin_app(
                         challenger_memory_id=group.challenger_memory_id,
                         candidate_memory_ids=tuple(group.candidate_memory_ids),
                         labels=group.labels,
+                        content_hashes=group.content_hashes,
                     )
                     for group in body.groups
                 ],
