@@ -334,12 +334,12 @@ class RevisionDelta:
     coverage: ProjectionCoverage
     changed_anchors: tuple[SourceAnchor, ...] = ()
     added_observation_ids: tuple[str, ...] = ()
-    # Observations that left the Unit: those the coverage proves absent, and those
-    # outside the current representation, which leave it under any coverage.
     removed_observation_ids: tuple[str, ...] = ()
     fragment_mappings: tuple[FragmentMapping, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.removed_observation_ids and not self.coverage.proves_absence:
+            raise ValueError("removed_observation_ids require absence-proving coverage")
         if self.removed_observation_ids and DeltaAxis.MEMBERSHIP not in self.axes:
             raise ValueError("removed observations require the membership delta axis")
 

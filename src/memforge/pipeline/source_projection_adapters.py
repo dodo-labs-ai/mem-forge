@@ -299,19 +299,15 @@ def project_source_item(
     ``stored_observation_revisions`` (keyed by revision id), is that stored row.
 
     Only prior revisions in the current representation are compared with this
-    projection or carried by it. A prior Observation outside it leaves the Unit
-    whatever the coverage, and is no semantic change of the Unit.
+    projection or carried by it. A prior Observation outside it is no member of
+    the projected revision under any coverage; it is retired, not removed, since
+    removal means only that the coverage proves the Observation absent.
     """
 
-    retired_observation_ids = tuple(sorted(
-        observation_id
-        for observation_id, revision in (prior_observation_revisions or {}).items()
-        if not in_current_representation(revision)
-    ))
     prior_observation_revisions = {
         observation_id: revision
         for observation_id, revision in (prior_observation_revisions or {}).items()
-        if observation_id not in retired_observation_ids
+        if in_current_representation(revision)
     }
     stored_by_id = {
         **dict(stored_observation_revisions or {}),
@@ -507,17 +503,16 @@ def project_source_item(
     added_ids = (
         tuple(sorted(current_ids - previous_ids)) if prior_unit_revision is not None else tuple(sorted(current_ids))
     )
-    removed_ids = tuple(sorted({
-        *(previous_ids - current_ids if prior_unit_revision is not None and coverage.proves_absence else ()),
-        *retired_observation_ids,
-    }))
+    removed_ids = (
+        tuple(sorted(previous_ids - current_ids)) if prior_unit_revision is not None and coverage.proves_absence else ()
+    )
     changed_ids = {
         observation_id
         for observation_id, revision in current_by_observation.items()
         if observation_id not in prior_observation_revisions
         or prior_observation_revisions[observation_id].semantic_hash != revision.semantic_hash
     }
-    if DeltaAxis.SEMANTIC in axes and not prior_observation_revisions:
+    if prior_unit_revision is None:
         changed_ids = current_ids
     changed_anchors = tuple(
         SourceAnchor(
