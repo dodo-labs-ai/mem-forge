@@ -21,7 +21,6 @@ from memforge.pipeline import revision_work
 from memforge.pipeline.complete_support import COMPLETE_SUPPORT_DEFINITION
 from memforge.pipeline.revision_assessment import REVISION_SUPPORT_CONTRACT, RevisionAssessmentContext
 from memforge.pipeline.revision_work import SUPPORT_ASSESSMENT_CONTRACT, RevisionWorkExecutor
-from memforge.source_representation import UNIT_TITLE_OBSERVATION_TYPE
 from memforge.storage.database import Database
 from tests.coordination_fixture import JIRA_DOCUMENT, SOURCE_ID, ScriptedClient, coordination_engine
 from tests.revision_client_fixture import FixtureSupport
@@ -60,9 +59,9 @@ def test_support_assessment_and_admission_share_the_one_definition_and_change_im
 
 
 def test_the_definition_raises_every_contract_whose_result_it_defines():
-    assert REVISION_SUPPORT_CONTRACT == "revision-support-v7"
-    assert SUPPORT_ASSESSMENT_CONTRACT == "support-ordered-reading-v5"
-    assert CANDIDATE_ADMISSION_CONTRACT == "candidate-admission-v3"
+    assert REVISION_SUPPORT_CONTRACT == "revision-support-v8"
+    assert SUPPORT_ASSESSMENT_CONTRACT == "support-ordered-reading-v6"
+    assert CANDIDATE_ADMISSION_CONTRACT == "candidate-admission-v4"
 
 
 @pytest.mark.asyncio
@@ -83,9 +82,10 @@ async def test_every_support_reading_and_admission_request_carries_the_definitio
         content=f"{TITLE_KEY} retains A7.", memory_type="decision",
         source_observation_id=decision.anchor.observation_id,
         resolved_evidence_selection=catalog.resolve_selection(primary_ref=decision.reference),
-    )], client=admission, model="fixture")
+    )], client=admission, model="fixture", unit_title=projection.unit_title)
     [prompt] = admission.prompts
     assert COMPLETE_SUPPORT_DEFINITION in prompt
+    assert f"<unit_title>\n{projection.unit_title.text}\n</unit_title>" in prompt
 
 
 class _IdentifierReadingClient(ScriptedClient):
@@ -98,27 +98,20 @@ class _IdentifierReadingClient(ScriptedClient):
     async def assess_support(self, prompt, **kwargs):
         payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
         rows = [*payload["current"]["primary_candidates"], *payload["current"]["required_only_candidates"]]
-        title = next((row for row in rows if row[1].startswith("Jira issue\n")), None)
         decision = next(row for row in rows if row[0].startswith("PRM-") and DECISION in row[1])
-        if title is None:
+        if "<unit_title>" not in prompt:
             return FixtureSupport(status="unsupported", primary_ref=decision[0])
-        self.titles_read.append(title[1])
-        [title_key] = re.findall(r"^Key: (\S+)$", title[1], flags=re.MULTILINE)
+        title = prompt.split("<unit_title>\n", 1)[1].split("\n</unit_title>", 1)[0]
+        self.titles_read.append(title)
+        [title_key] = re.findall(r"^Key: (\S+)$", title, flags=re.MULTILINE)
         named = set(ISSUE_KEY.findall(payload["claim"]))
         status = "supported" if named == {title_key} else "unsupported"
-        return FixtureSupport(status=status, primary_ref=decision[0], required_refs=[title[0]])
+        return FixtureSupport(status=status, primary_ref=decision[0])
 
 
-def _title_observation_id(projection) -> str:
-    return next(o.id for o in projection.observations if o.observation_type == UNIT_TITLE_OBSERVATION_TYPE)
-
-
-def _claim(projection, content: str) -> RawMemory:
-    """A claim whose Evidence is the decision comment with the Unit Title as Required Evidence."""
-    return RawMemory(
-        content=content, memory_type="decision", evidence_quote=DECISION,
-        required_source_observation_ids=[_title_observation_id(projection)],
-    )
+def _claim(content: str) -> RawMemory:
+    """A claim whose Evidence is the decision comment; the key it names is the Unit Title's to confirm."""
+    return RawMemory(content=content, memory_type="decision", evidence_quote=DECISION)
 
 
 async def _commit(db: Database, client, projection, claims, *, day: int, **options):
@@ -141,7 +134,7 @@ async def test_a_reprocessed_claim_naming_another_identifier_than_its_unit_title
         run_id="complete-support-1", description="Payroll context.", comment_id="501", comment_body=DECISION,
     )
     wrong = f"{OTHER_KEY} retains A7."
-    await _commit(db, ScriptedClient(), first, [_claim(first, wrong)], day=0)
+    await _commit(db, ScriptedClient(), first, [_claim(wrong)], day=0)
     [memory] = await db.list_memories()
     assert memory.content == wrong
 
@@ -154,7 +147,7 @@ async def test_a_reprocessed_claim_naming_another_identifier_than_its_unit_title
     corrected = f"{TITLE_KEY} retains A7."
     client = _IdentifierReadingClient(relations={(corrected, wrong): "contradicts"})
     stats = await _commit(
-        db, client, again, [_claim(again, corrected)] if correction else [],
+        db, client, again, [_claim(corrected)] if correction else [],
         day=1, derivation_support_without_baseline=True,
     )
 

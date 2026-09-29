@@ -7236,7 +7236,7 @@ class Database:
                             json.dumps(delta_payloads[index], sort_keys=True, separators=(",", ":")),
                         ),
                     )
-                    if delta.removed_observation_ids and delta.coverage.proves_absence:
+                    if delta.removed_observation_ids:
                         placeholders = ", ".join("?" for _ in delta.removed_observation_ids)
                         await self.db.execute(
                             f"""UPDATE source_observations

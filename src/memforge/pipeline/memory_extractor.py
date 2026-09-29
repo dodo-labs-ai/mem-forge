@@ -34,6 +34,7 @@ from memforge.pipeline.projection_fragments import (
 )
 from memforge.pipeline.projection_context import ExtractionAuthority
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext, reading_group_label
+from memforge.pipeline.unit_title import UNIT_TITLE_DEFINITION, unit_title_block
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,8 @@ PROJECTION_FRAGMENT_EXTRACTION_PROMPT = """You are extracting durable atomic kno
 
 <source_type>{source_type}</source_type>
 <doc_type>{doc_type}</doc_type>
+{unit_title}""" + UNIT_TITLE_DEFINITION + """
+A claim may state unit_title values, such as the Unit's key, without Evidence for them.
 Catalog rows are [ref, exact source text, optional metadata]. Headings are ordinary selectable Fragments.
 Preserve table column/row associations, list order, code indentation and explicit exceptions.
 A table ref contains the complete table; read its headers before asserting a cell value.
@@ -58,8 +61,6 @@ ref proves image contents; a caption or URL alone never proves unseen image deta
 Canonical fromString is the previous value; toString is the new value. Select the
 field-name/time refs when needed to state the change accurately.
 Structural groups describe ancestry, not additional Evidence. When a heading defines claim scope, select its current ref as Required.
-A row whose format is unit-identity names the Source Unit this catalog belongs to, such as its key, type or title.
-It states no claim itself: select it as Required when a claim names or depends on that Unit.
 Only the following application-owned Evidence Fragments may support a Memory:
 <evidence_fragment_catalog digest="{catalog_digest}">
 {fragment_catalog}
@@ -217,6 +218,7 @@ class MemoryExtractor:
         payload = revision_context.model_payload(catalog)
         return PROJECTION_FRAGMENT_EXTRACTION_PROMPT.format(
             source_type=source_type, doc_type=doc_type, catalog_digest=catalog.digest,
+            unit_title=unit_title_block(revision_context.projection.unit_title),
             fragment_catalog=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         )
 

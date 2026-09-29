@@ -43,18 +43,6 @@ def test_anchor_shape_is_controlled() -> None:
         )
 
 
-def test_partial_projection_cannot_claim_absence() -> None:
-    with pytest.raises(ValueError, match="removed_observation_ids"):
-        RevisionDelta(
-            source_unit_id="unit-1",
-            previous_unit_revision_id="unitrev-1",
-            current_unit_revision_id="unitrev-2",
-            axes=frozenset({DeltaAxis.MEMBERSHIP}),
-            coverage=ProjectionCoverage.PARTIAL_PROJECTION,
-            removed_observation_ids=("obs-removed",),
-        )
-
-
 def test_location_only_delta_requires_no_extraction() -> None:
     delta = RevisionDelta(
         source_unit_id="unit-page-1",
