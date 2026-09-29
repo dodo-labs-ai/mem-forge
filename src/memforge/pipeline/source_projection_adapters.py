@@ -1161,15 +1161,14 @@ def _project_native(
             relations=tuple(relations),
             coverage=coverage,
             locator=locator,
-            # A tombstoned window has no live Unit left to name.
+            # A tombstoned window has no live Unit left to name. A live window is named by its
+            # conversation and its start; its end moves with every new message, so it is no part of the name.
             title=None if tombstoned else _UnitTitle.of(
                 "Teams conversation",
                 ("Conversation type", data.get("conversation_type")),
                 ("Team", data.get("team_name")),
-                ("Channel", data.get("channel_name")),
-                ("Title", item.title),
+                ("Conversation", data.get("conversation_name") or data.get("channel_name")),
                 ("From", observed_from),
-                ("To", observed_to),
             ),
         )
     if source_type == "agent_session":
