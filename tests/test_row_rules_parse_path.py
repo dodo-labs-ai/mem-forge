@@ -88,7 +88,7 @@ async def test_one_admission_row_rejected_without_a_reason_is_re_asked_alone(mon
     client, prompts = parse_path_client(monkeypatch, respond)
     claims = ["US releases require two reviewers.", "Hotfixes need one reviewer.", "Audit logs are kept."]
 
-    result = await admit_candidates([admission_candidate(claim) for claim in claims], client=client, model=MODEL)
+    result = await admit_candidates([admission_candidate(claim) for claim in claims], client=client, model=MODEL, unit_title=None)
 
     assert len(prompts) == 2
     assert [row["id"] for row in admission_payload(prompts[1])["candidates"]] == ["CND-0002"]

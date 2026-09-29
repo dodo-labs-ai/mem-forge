@@ -35,6 +35,7 @@ from memforge.source_projection import (
     SourceRelationType,
     SourceUnit,
     SourceUnitRevision,
+    UnitTitle,
 )
 from memforge.source_time import (
     SOURCE_UPDATED_AT_KEY,
@@ -42,7 +43,7 @@ from memforge.source_time import (
     reported_source_time,
 )
 from memforge.source_representation import (
-    UNIT_TITLE_OBSERVATION_TYPE,
+    in_current_representation,
     representation_profile_for_observation_contract,
 )
 from memforge.source_projection_config import (
@@ -143,38 +144,18 @@ class _ObservationInput:
 
 
 _REVISION_SEMANTIC_METADATA_KEYS = ("claim_evidence_scope",)
-# The Unit Title's provider key; native provider keys never start with "$".
-_UNIT_TITLE_PROVIDER_KEY = "$unit_identity"
 
 
-@dataclass(frozen=True, slots=True)
-class _UnitTitle:
-    """The provider's human-facing name of one Source Unit: its kind and named values.
-
-    Adapters supply only values present in the provider payload; absent values
-    are omitted, never guessed.
-    """
-
-    kind: str
-    fields: tuple[tuple[str, str], ...]
-
-    @classmethod
-    def of(cls, kind: str, *fields: tuple[str, object]) -> _UnitTitle:
-        present = tuple(
+def _unit_title(kind: str, *fields: tuple[str, object]) -> UnitTitle:
+    """Name a Unit by the values present in its provider payload; absent values are omitted, never guessed."""
+    return UnitTitle(
+        kind=kind,
+        fields=tuple(
             (name, " ".join(str(value).split()))
             for name, value in fields
             if value is not None and str(value).strip()
-        )
-        return cls(kind=kind, fields=present)
-
-    def observation(self) -> _ObservationInput:
-        return _ObservationInput(
-            UNIT_TITLE_OBSERVATION_TYPE,
-            _UNIT_TITLE_PROVIDER_KEY,
-            "\n".join((self.kind, *(f"{name}: {value}" for name, value in self.fields))),
-            {"kind": self.kind, "fields": [list(field) for field in self.fields]},
-            {},
-        )
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,7 +169,7 @@ class _NativeProjection:
     coverage: ProjectionCoverage
     locator: Mapping[str, object]
     # None only when the payload tombstones the whole Unit.
-    title: _UnitTitle | None
+    title: UnitTitle | None
 
 
 def _observation_semantic_hash(value: _ObservationInput) -> str:
@@ -316,9 +297,18 @@ def project_source_item(
     hash. A projected revision whose id is already stored, as a current
     revision in ``prior_observation_revisions`` or any other revision in
     ``stored_observation_revisions`` (keyed by revision id), is that stored row.
+
+    Only prior revisions in the current representation are compared with this
+    projection or carried by it. A prior Observation outside it is no member of
+    the projected revision under any coverage; it is retired, not removed, since
+    removal means only that the coverage proves the Observation absent.
     """
 
-    prior_observation_revisions = prior_observation_revisions or {}
+    prior_observation_revisions = {
+        observation_id: revision
+        for observation_id, revision in (prior_observation_revisions or {}).items()
+        if in_current_representation(revision)
+    }
     stored_by_id = {
         **dict(stored_observation_revisions or {}),
         **{revision.id: revision for revision in prior_observation_revisions.values()},
@@ -390,13 +380,7 @@ def project_source_item(
         )
         for artifact in artifacts
     )
-    # The Unit Title comes first and is returned by every projection of a live Unit.
-    title = native_projection.title
-    observations_input = (
-        *((title.observation(),) if title is not None else ()),
-        *native_projection.observations,
-        *artifact_inputs,
-    )
+    observations_input = (*native_projection.observations, *artifact_inputs)
     observations: list[SourceObservation] = []
     revisions: list[SourceObservationRevision] = []
     carried_revision_ids: list[str] = []
@@ -528,8 +512,6 @@ def project_source_item(
         if observation_id not in prior_observation_revisions
         or prior_observation_revisions[observation_id].semantic_hash != revision.semantic_hash
     }
-    if DeltaAxis.SEMANTIC in axes and not prior_observation_revisions:
-        changed_ids = current_ids
     changed_anchors = tuple(
         SourceAnchor(
             kind=AnchorKind.WHOLE_OBSERVATION,
@@ -585,6 +567,7 @@ def project_source_item(
         deltas=(delta,),
         checkpoint={"item_id": item.item_id, "version": item.version},
         carried_observation_revision_ids=tuple(carried_revision_ids),
+        unit_title=native_projection.title,
     )
 
 
@@ -869,7 +852,7 @@ def _project_native(
                 "parent_page_id": parent_id or None,
                 "url": item.source_url,
             },
-            title=_UnitTitle.of(
+            title=_unit_title(
                 "Confluence page",
                 ("Space", item.extra.get("space_key") or item.space_or_project),
                 ("Title", item.title),
@@ -964,7 +947,7 @@ def _project_native(
             relations=tuple(relations),
             coverage=coverage,
             locator={"issue_id": issue_id, "issue_key": issue_key, "url": item.source_url},
-            title=_UnitTitle.of(
+            title=_unit_title(
                 "Jira issue",
                 ("Key", issue_key),
                 ("Type", _provider_name(fields.get("issuetype"))),
@@ -1036,7 +1019,7 @@ def _project_native(
             relations=relations,
             coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
             locator={"repository": repo, "path": path, "ref": item.extra.get("repo_ref"), "url": item.source_url},
-            title=_UnitTitle.of(
+            title=_unit_title(
                 "GitHub file",
                 ("Repository", repo),
                 ("Path", path),
@@ -1058,7 +1041,7 @@ def _project_native(
             relations=(),
             coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
             locator={"canonical_url": canonical_url, "title": item.title},
-            title=_UnitTitle.of("GitHub Pages page", ("Title", item.title), ("URL", canonical_url)),
+            title=_unit_title("GitHub Pages page", ("Title", item.title), ("URL", canonical_url)),
         )
     if source_type == "local_markdown":
         data = native if isinstance(native, dict) else {}
@@ -1073,7 +1056,7 @@ def _project_native(
             relations=(),
             coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
             locator={"vault_id": vault, "path": path, "url": item.source_url},
-            title=_UnitTitle.of(
+            title=_unit_title(
                 "Markdown file",
                 ("Vault", data.get("vault_id") or item.space_or_project),
                 ("Path", path),
@@ -1163,7 +1146,7 @@ def _project_native(
             locator=locator,
             # A tombstoned window has no live Unit left to name. A live window is named by its
             # conversation and its start; its end moves with every new message, so it is no part of the name.
-            title=None if tombstoned else _UnitTitle.of(
+            title=None if tombstoned else _unit_title(
                 "Teams conversation",
                 ("Conversation type", data.get("conversation_type")),
                 ("Team", data.get("team_name")),
@@ -1188,7 +1171,7 @@ def _project_native(
                 "history_window_kind": receipt.get("history_window_kind"),
                 "url": item.source_url,
             },
-            title=_UnitTitle.of(
+            title=_unit_title(
                 "Agent session",
                 ("Client", receipt.get("client")),
                 ("Window", receipt.get("history_window_kind")),
@@ -1212,7 +1195,7 @@ def _project_native(
             "title": item.title,
             "source_type": source_type,
         },
-        title=_UnitTitle.of("Document", ("Title", item.title), ("Source type", source_type)),
+        title=_unit_title("Document", ("Title", item.title), ("Source type", source_type)),
     )
 
 

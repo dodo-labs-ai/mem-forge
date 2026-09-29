@@ -20,7 +20,6 @@ from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import ExtractionAuthority, plan_projection_evidence_work
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.source_projection_adapters import project_source_item
-from memforge.source_representation import UNIT_TITLE_OBSERVATION_TYPE
 from tests.test_projection_context import _committed_snapshot, _confluence_projection, _jira_projection, _requests
 from tests.test_projection_fragments import _projection
 from tests.test_revision_work import Client
@@ -55,7 +54,7 @@ def whole(projection):
 
 
 def body_id(projection):
-    return next(item.id for item in projection.observations if item.observation_type != UNIT_TITLE_OBSERVATION_TYPE)
+    return projection.observations[0].id
 
 
 def primary(requests):
@@ -162,7 +161,7 @@ def test_a_changed_list_item_reads_its_whole_list_but_authorizes_only_the_change
     assert [f.presentation_text for f in request.catalog.fragments if f.primary_eligible] == ["- two reviewers"]
 
 
-def test_reading_context_and_the_unit_title_are_never_primary():
+def test_reading_context_is_never_primary():
     projection = _jira_projection(2)
     extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=Client(limit=40000))
     comment = next(item.id for item in projection.observations if item.observation_type == "comment")
@@ -170,12 +169,11 @@ def test_reading_context_and_the_unit_title_are_never_primary():
     by_observation = {}
     for fragment in request.catalog.fragments:
         by_observation.setdefault(fragment.anchor.observation_id, []).append(fragment.primary_eligible)
-    title = next(item.id for item in projection.observations if item.observation_type == UNIT_TITLE_OBSERVATION_TYPE)
     core = next(item.id for item in projection.observations if item.observation_type == "issue_core")
 
-    # The comment reads with the Unit Title and the core it follows; only the comment is Primary.
-    assert set(by_observation) == {comment, title, core}
-    assert all(by_observation[comment]) and not any(by_observation[title]) and not any(by_observation[core])
+    # The comment reads with the core it follows; only the comment is Primary.
+    assert set(by_observation) == {comment, core}
+    assert all(by_observation[comment]) and not any(by_observation[core])
 
 
 def test_reading_context_longer_than_20000_characters_is_read_whole():

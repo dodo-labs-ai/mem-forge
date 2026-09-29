@@ -7203,6 +7203,16 @@ class Database:
                         "UPDATE source_units SET current_revision_id = ?, updated_at = ? WHERE id = ?",
                         (revision.id, now, revision.source_unit_id),
                     )
+                    # The current Observations of a Unit are exactly the members of its
+                    # current revision: an Observation the revision does not hold, whether
+                    # its absence is proven or it left the current representation, has none.
+                    await self.db.execute(
+                        """UPDATE source_observations
+                            SET current_revision_id = NULL, updated_at = ?
+                            WHERE source_unit_id = ? AND current_revision_id IS NOT NULL
+                              AND current_revision_id NOT IN (SELECT value FROM json_each(?))""",
+                        (now, revision.source_unit_id, revision_ids_json),
+                    )
                 if unit_input is not None:
                     await self._record_source_unit_input_unlocked(projection, unit_input, now)
 
@@ -7236,14 +7246,6 @@ class Database:
                             json.dumps(delta_payloads[index], sort_keys=True, separators=(",", ":")),
                         ),
                     )
-                    if delta.removed_observation_ids and delta.coverage.proves_absence:
-                        placeholders = ", ".join("?" for _ in delta.removed_observation_ids)
-                        await self.db.execute(
-                            f"""UPDATE source_observations
-                                SET current_revision_id = NULL, updated_at = ?
-                                WHERE source_unit_id = ? AND id IN ({placeholders})""",
-                            (now, delta.source_unit_id, *delta.removed_observation_ids),
-                        )
                 await self._assert_source_activity_fence_unlocked(
                     projection.source_id,
                     source_activity,
