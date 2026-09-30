@@ -66,6 +66,7 @@ from memforge.models import (
     MemorySource,
     MemorySourceRef,
     Project,
+    RESERVED_PROJECT_KEYS,
     ReplacementKind,
     SHARED_PROJECT_KEY,
     SourceArtifactCleanupTask,
@@ -1873,15 +1874,6 @@ CREATE TABLE IF NOT EXISTS local_agent_heartbeats (
 -- ---------------------------------------------------------------
 -- Config singletons
 -- ---------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS schedule_config (
-    id          INTEGER PRIMARY KEY CHECK (id = 1),
-    enabled     INTEGER NOT NULL DEFAULT 0,
-    frequency   TEXT NOT NULL DEFAULT 'daily',
-    time        TEXT NOT NULL DEFAULT '02:00',
-    day_of_week INTEGER NOT NULL DEFAULT 0,
-    timezone    TEXT NOT NULL DEFAULT 'UTC'
-);
-
 CREATE TABLE IF NOT EXISTS llm_config (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
     enrichment_model    TEXT,
@@ -4522,6 +4514,12 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # (ADR 0043). The columns are dropped where a database created before
         # this version still has them.
         [],
+    ),
+    (
+        108,
+        "Remove the workspace-wide sync schedule",
+        # Sources sync on their own schedules only.
+        ["DROP TABLE IF EXISTS schedule_config"],
     ),
 ]
 
@@ -16854,6 +16852,15 @@ class Database:
         name: str | None = None,
         is_shared: bool | None = None,
     ) -> Project | None:
+        """Rename a project or change its kind; `None` for an unknown id.
+
+        Reserved keys (SHARED, UNSORTED) raise `ValueError` whenever a
+        field is supplied, so the built-in buckets keep their name and
+        kind.
+        """
+        target = await self.get_project(project_id)
+        if target is None:
+            return None
         fields: list[str] = []
         params: list[Any] = []
         if name is not None:
@@ -16863,7 +16870,9 @@ class Database:
             fields.append("is_shared = ?")
             params.append(1 if is_shared else 0)
         if not fields:
-            return await self.get_project(project_id)
+            return target
+        if target.key in RESERVED_PROJECT_KEYS:
+            raise ValueError(f"project {target.key!r} is reserved and cannot be changed")
         params.append(project_id)
         async with self._write_lock:
             await self.db.execute(
@@ -16887,7 +16896,7 @@ class Database:
         target = await self.get_project(project_id)
         if target is None:
             raise LookupError(f"project {project_id!r} not found")
-        if target.key in (SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY):
+        if target.key in RESERVED_PROJECT_KEYS:
             raise ValueError(f"project {target.key!r} is reserved and cannot be deleted")
         affected_ids: list[str] = []
         async with self.db.execute("SELECT id FROM memories WHERE project_key = ?", (target.key,)) as cur:
@@ -16912,7 +16921,7 @@ class Database:
         target = await self.get_project(project_id)
         if target is None:
             return
-        if target.key in (SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY):
+        if target.key in RESERVED_PROJECT_KEYS:
             raise ValueError(f"project {target.key!r} is reserved and cannot be deleted")
         async with self._write_lock:
             if affected_ids:
@@ -20796,50 +20805,6 @@ class Database:
             tuple(params),
         )
         return [self._row_to_agent_assessment(row) for row in rows]
-
-    # ==================================================================
-    # Config - schedule
-    # ==================================================================
-
-    async def get_schedule_config(self) -> dict:
-        async with self.db.execute("SELECT * FROM schedule_config WHERE id = 1") as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                return {
-                    "enabled": False,
-                    "frequency": "daily",
-                    "time": "02:00",
-                    "day_of_week": 0,
-                    "timezone": "UTC",
-                }
-            d = dict(row)
-            return {
-                "enabled": bool(d["enabled"]),
-                "frequency": d["frequency"],
-                "time": d["time"],
-                "day_of_week": d["day_of_week"],
-                "timezone": d.get("timezone", "UTC"),
-            }
-
-    async def set_schedule_config(self, config: dict) -> None:
-        async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO schedule_config (
-                    id, enabled, frequency, time, day_of_week, timezone
-                ) VALUES (1, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    enabled=excluded.enabled, frequency=excluded.frequency,
-                    time=excluded.time, day_of_week=excluded.day_of_week,
-                    timezone=excluded.timezone""",
-                (
-                    int(config.get("enabled", False)),
-                    config.get("frequency", "daily"),
-                    config.get("time", "02:00"),
-                    config.get("day_of_week", 0),
-                    config.get("timezone", "UTC"),
-                ),
-            )
-            await self.db.commit()
 
     # ==================================================================
     # Memory reviews

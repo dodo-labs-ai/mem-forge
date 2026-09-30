@@ -40,9 +40,6 @@ def test_memory_list_route_uses_storage_neutral_admin_reader(tmp_path):
         def __init__(self) -> None:
             self.calls = []
 
-        async def get_schedule_config(self) -> dict:
-            return {"enabled": False}
-
         async def claim_due_scheduled_sources(
             self,
             *,
@@ -117,9 +114,6 @@ def test_memory_list_route_uses_injected_principal_resolver(tmp_path):
     class FakeAdminReader:
         def __init__(self) -> None:
             self.scope: AccessScope | None = None
-
-        async def get_schedule_config(self) -> dict:
-            return {"enabled": False}
 
         async def claim_due_scheduled_sources(
             self,
