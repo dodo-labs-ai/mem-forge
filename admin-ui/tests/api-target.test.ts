@@ -3,7 +3,9 @@ import { readFileSync, readdirSync } from "node:fs";
 import { extname, join } from "node:path";
 
 import {
+  LOCAL_AGENT_HOST_BASE_URL,
   createWorkspaceApiController,
+  currentLocalAgentBaseUrl,
   resourceClient,
 } from "../src/api/client.js";
 
@@ -17,6 +19,20 @@ const queryClient = {
 const workspaceApi = createWorkspaceApiController(queryClient);
 assert.equal(resourceClient.defaults.baseURL, "/api/v1");
 assert.equal(workspaceApi.current(), null);
+assert.equal(
+  currentLocalAgentBaseUrl(),
+  LOCAL_AGENT_HOST_BASE_URL,
+  "the standalone admin UI must reach local-agent jobs on the host route",
+);
+
+const serverLocalAgentPrefix = readFileSync("../src/memforge/server/admin_api.py", "utf8").match(
+  /local_agent_router\s*=\s*APIRouter\(\s*prefix="([^"]+)"/,
+)?.[1];
+assert.equal(
+  LOCAL_AGENT_HOST_BASE_URL,
+  serverLocalAgentPrefix,
+  "the local-agent host route must match the server's local_agent_router prefix",
+);
 
 workspaceApi.setTarget({
   resourceBaseUrl: "/api/v1/",
@@ -43,6 +59,7 @@ workspaceApi.setTarget(null);
 assert.equal(resourceClient.defaults.baseURL, "/api/v1");
 assert.deepEqual(resourceClient.defaults.params, {});
 assert.equal(workspaceApi.current(), null);
+assert.equal(currentLocalAgentBaseUrl(), LOCAL_AGENT_HOST_BASE_URL);
 assert.equal(clearCount, 2);
 
 workspaceApi.setTarget(null);
