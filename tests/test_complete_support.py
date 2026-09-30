@@ -77,7 +77,7 @@ def test_support_assessment_and_admission_share_the_one_definition_and_change_im
 def test_the_definition_raises_every_contract_whose_result_it_defines():
     assert REVISION_SUPPORT_CONTRACT == "revision-support-v8"
     assert SUPPORT_ASSESSMENT_CONTRACT == "support-ordered-reading-v6"
-    assert CANDIDATE_ADMISSION_CONTRACT == "candidate-admission-v4"
+    assert CANDIDATE_ADMISSION_CONTRACT == "candidate-admission-v5"
 
 
 @pytest.mark.asyncio
