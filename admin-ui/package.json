@@ -2,6 +2,7 @@
   "name": "memforge-admin",
   "private": true,
   "version": "0.1.0",
+  "description": "Deprecated (admin-ui-v1): the V1 admin UI, served at / until the admin package replaces it (ADR 0044).",
   "type": "module",
   "scripts": {
     "dev": "vite --port 5174",

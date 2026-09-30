@@ -113,14 +113,16 @@ RESERVED_PROJECT_KEYS = frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY})
 class Project:
     """A relevance bucket within the bound datastore.
 
-    `is_shared=True` is the team-wide SHARED bucket: never down-weighted by the
-    cross-project affinity penalty and always open for the access predicate.
-    `is_shared=False` is a normal project (or the reserved UNSORTED backlog).
+    Ranking treats only the reserved `SHARED_PROJECT_KEY` as team-wide: a
+    project-scoped search down-weights every other project that is not its
+    active project, including the reserved UNSORTED backlog.
     """
 
     id: str
     key: str
     name: str
+    # Deprecated (admin-ui-v1): a display label with no effect on ranking or
+    # access. Removed with the V1 admin UI (ADR 0044).
     is_shared: bool = False
     created_at: datetime | None = None
 
