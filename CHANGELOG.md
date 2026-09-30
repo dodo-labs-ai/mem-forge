@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Candidate Admission judges value by one source-neutral definition
+  (`candidate-admission-v5`): a supported Candidate is rejected as `low_value`
+  when it is a record of what happened once, such as a status transition, an
+  assignment, a field change, a version bump or a bare link between items, and
+  kept when it is knowledge that holds apart from the event that produced it,
+  such as a rule, a design, a decision and its reason, a cause and its fix, or
+  a configuration or limit. When unsure, it is kept. The response schema's
+  `low_value` reason names this definition. On a held-out set of 207 Candidates
+  the rule caught 69% of one-off records, against 12% before, with the same
+  knowledge lost. Cloud: prompt text and contract version only, arriving with
+  the pin; no configuration, HANA or protocol change. Admission work completed
+  under `candidate-admission-v4` is not reinterpreted, and admitted Memories are
+  not judged again. See ADR 0034 (Value) and the ADR 0043 amendment of
+  2026-09-30.
+
 - The Unit Title is reading context carried by the Source Projection
   (`SourceProjection.unit_title`), no longer a Unit's first Observation. It
   takes no part in Unit revision identity, so a change of only the Unit Title's
