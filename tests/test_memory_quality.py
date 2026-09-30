@@ -1676,7 +1676,7 @@ async def test_admin_memory_list_search_accepts_fts_operator_text(db: Database, 
 
 
 @pytest.mark.asyncio
-async def test_admin_memory_delete_cleans_search_indexes(
+async def test_retire_memory_route_cleans_search_indexes(
     db: Database,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1685,8 +1685,8 @@ async def test_admin_memory_delete_cleans_search_indexes(
 
     memory = await _insert_memory(
         db,
-        mem_id="mem-admin-delete",
-        content="Admin delete should hide retired memories from search.",
+        mem_id="mem-admin-retire",
+        content="Retiring a memory should hide it from search.",
     )
     collection = FakeCollection()
     monkeypatch.setattr(
@@ -1696,10 +1696,13 @@ async def test_admin_memory_delete_cleans_search_indexes(
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        response = client.delete(f"/api/v1/memories/{memory.id}")
+        response = client.post(
+            f"/api/v1/memories/{memory.id}/retire",
+            json={"reason": "No longer accurate", "expected_content_hash": memory.content_hash},
+        )
 
     stored = await db.get_memory(memory.id)
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     assert stored.status == "retired"
     assert await _fts_has_memory(db, memory.id) is False
     assert collection.deleted == [memory.id]
