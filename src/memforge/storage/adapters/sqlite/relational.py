@@ -1879,5 +1879,8 @@ class SqliteRelationalStore:
     async def list_project_memory_ids(self, project_id: str) -> list[str]:
         return await self._db.list_project_memory_ids(project_id)
 
-    async def commit_project_deletion(self, project_id: str, affected_ids: Sequence[str]) -> None:
-        await self._db.commit_project_deletion(project_id, affected_ids)
+    async def list_sources_released_by_project_deletion(self, project_id: str) -> list[str]:
+        return await self._db.list_sources_released_by_project_deletion(project_id)
+
+    async def commit_project_deletion(self, project_id: str, affected_ids: Sequence[str]) -> list[str]:
+        return await self._db.commit_project_deletion(project_id, affected_ids)

@@ -10,14 +10,15 @@ uv run memforge api          # the Admin API on :8765
 cd admin && npm ci && npm run dev
 ```
 
-Open http://localhost:5175/v2/. Pages not built here yet open in V1, so run
-`npm run dev` in `admin-ui/` too if you follow those links.
+Open http://localhost:5175/v2/. Adding and configuring a source still happens
+on the V1 Sources page, so run `npm run dev` in `admin-ui/` too if you follow
+those links.
 
 | Command | What it does |
 |---|---|
 | `npm run lint` | ESLint, including the layer import rules |
 | `npm test` | Vitest unit and component tests |
-| `npm run test:e2e` | Playwright smoke tests against the production build, API stubbed |
+| `npm run test:e2e` | Playwright smoke tests against the production build, API stubbed; `ADMIN_E2E_PORT` moves the preview server off port 4175 |
 | `npm run storybook` | The catalogue of `ui` and `patterns` |
 | `npm run gen:api` | Regenerate API types after a backend change |
 
@@ -41,8 +42,9 @@ feature only through its `index.ts`. ESLint enforces both.
 1. Create `src/features/<area>/` with `api.ts` (query hooks), `model/` (pure
    logic and its tests) and the page component, and export the page from
    `index.ts`.
-2. Add it to `PRODUCT_ROUTES` in `src/app/router.tsx` and remove the item's
-   `v1Path` in `src/app/navigation.ts`.
+2. Add it to `PRODUCT_ROUTES` in `src/app/router.tsx` and its sidebar item to
+   `src/app/navigation.ts`. Put the paths other pages link to in
+   `src/lib/paths.ts`.
 3. If an endpoint the page uses has no response model, add one in
    `src/memforge/server/admin_api.py` and run `npm run gen:api`. Declare
    fields in `src/api/responses.ts` only where the schema is free-form.

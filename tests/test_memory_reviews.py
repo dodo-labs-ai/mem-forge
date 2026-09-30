@@ -1770,3 +1770,148 @@ class TestUnconvertedCrossSourceReviews:
         assert queue.status_code == 200
         assert review.id not in {item["id"] for item in queue.json()["data"]}
         assert detail.status_code == 404
+
+
+def _listed_review(response, review_id: str) -> dict:
+    assert response.status_code == 200, response.text
+    return next(item for item in response.json()["data"] if item["id"] == review_id)
+
+
+class TestReviewDecisionAuthority:
+    """`can_decide` on the list and the detail answers the same authority check the decision endpoints enforce."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("principal", "role", "can_decide"),
+        [
+            ("dev", "member", True),
+            ("bob", "workspace_admin", True),
+            ("bob", "member", False),
+        ],
+    )
+    async def test_memory_review_requires_managing_every_backing_source(
+        self,
+        db,
+        chroma,
+        tmp_path,
+        principal,
+        role,
+        can_decide,
+    ):
+        incumbent, _, review = await _seed_supersede_review(db, chroma, suffix="authority")
+        await _upsert_doc_with_artifacts(db, tmp_path, "doc-authority", normalized_content_uri=None)
+        await db.add_memory_source(
+            incumbent.id,
+            "doc-authority",
+            "confluence",
+            excerpt="incumbent source",
+            source_updated_at=None,
+        )
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(
+            db=db,
+            config=_config(tmp_path),
+            principal_resolver=lambda _request: principal,
+            workspace_role_resolver=lambda _request: role,
+        )
+        with TestClient(app) as client:
+            listed = client.get("/api/v1/memory-reviews")
+            detail = client.get(f"/api/v1/memory-reviews/{review.id}")
+            decision = client.post(
+                f"/api/v1/memory-reviews/{review.id}/approve",
+                json={"expected_fingerprint": detail.json()["decision_fingerprint"]},
+            )
+
+        assert _listed_review(listed, review.id)["can_decide"] is can_decide
+        assert detail.status_code == 200
+        assert detail.json()["can_decide"] is can_decide
+        assert decision.status_code == (200 if can_decide else 403)
+        if can_decide:
+            assert decision.json()["can_decide"] is True
+
+    @pytest.mark.asyncio
+    async def test_memory_review_without_backing_sources_is_decidable_by_any_viewer(self, db, chroma, tmp_path):
+        _, _, review = await _seed_supersede_review(db, chroma, suffix="unsourced")
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(
+            db=db,
+            config=_config(tmp_path),
+            principal_resolver=lambda _request: "bob",
+            workspace_role_resolver=lambda _request: "member",
+        )
+        with TestClient(app) as client:
+            listed = client.get("/api/v1/memory-reviews")
+            detail = client.get(f"/api/v1/memory-reviews/{review.id}")
+
+        assert _listed_review(listed, review.id)["can_decide"] is True
+        assert detail.status_code == 200
+        assert detail.json()["can_decide"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("principal", "role", "can_decide"),
+        [
+            ("owner-1", "member", True),
+            ("bob", "workspace_admin", True),
+            ("bob", "member", False),
+        ],
+    )
+    async def test_lifecycle_review_requires_managing_its_source(self, db, tmp_path, principal, role, can_decide):
+        review_id = await _seed_lifecycle_review(db)
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(
+            db=db,
+            config=_config(tmp_path),
+            principal_resolver=lambda _request: principal,
+            workspace_role_resolver=lambda _request: role,
+        )
+        with TestClient(app) as client:
+            listed = client.get("/api/v1/memory-reviews")
+            detail = client.get(f"/api/v1/memory-reviews/{review_id}")
+            decision = client.post(
+                f"/api/v1/memory-reviews/{review_id}/reject",
+                json={
+                    "expected_fingerprint": detail.json()["decision_fingerprint"],
+                    "note": "The current owner is still correct.",
+                },
+            )
+
+        assert _listed_review(listed, review_id)["can_decide"] is can_decide
+        assert detail.status_code == 200
+        assert detail.json()["can_decide"] is can_decide
+        assert decision.status_code == (200 if can_decide else 403)
+
+    @pytest.mark.asyncio
+    async def test_list_reads_sources_once_for_every_review(self, db, chroma, tmp_path, monkeypatch):
+        for suffix in ("batched-a", "batched-b"):
+            incumbent, _, _ = await _seed_supersede_review(db, chroma, suffix=suffix)
+            await _upsert_doc_with_artifacts(db, tmp_path, f"doc-{suffix}", normalized_content_uri=None)
+            await db.add_memory_source(
+                incumbent.id,
+                f"doc-{suffix}",
+                "confluence",
+                excerpt="incumbent source",
+                source_updated_at=None,
+            )
+
+        async def _per_item_read(*_args, **_kwargs):
+            raise AssertionError("the review list reads Sources in one batch, not per review")
+
+        monkeypatch.setattr(db, "get_source", _per_item_read)
+        monkeypatch.setattr(db, "get_memory_sources", _per_item_read)
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(
+            db=db,
+            config=_config(tmp_path),
+            principal_resolver=lambda _request: "bob",
+            workspace_role_resolver=lambda _request: "member",
+        )
+        with TestClient(app) as client:
+            listed = client.get("/api/v1/memory-reviews")
+
+        assert listed.status_code == 200, listed.text
+        assert [item["can_decide"] for item in listed.json()["data"]] == [False, False]
