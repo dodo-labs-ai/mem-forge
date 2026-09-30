@@ -27,6 +27,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.routing import APIRoute
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -670,6 +671,16 @@ async def _require_lifecycle_review_visibility(
 def _require_workspace_memory_administration(request: Request) -> None:
     if not can_manage_workspace(resolve_request_workspace_role(request)):
         raise HTTPException(status_code=403, detail="workspace_admin_authority_required")
+
+
+def _operation_id(route: APIRoute) -> str:
+    """Name an OpenAPI operation from the route name, path and first method in sorted order.
+
+    A route that serves several methods (GET and HEAD) gets the same id on
+    every run, so the published OpenAPI document is reproducible.
+    """
+    operation_id = re.sub(r"\W", "_", f"{route.name}{route.path_format}")
+    return f"{operation_id}_{sorted(route.methods)[0].lower()}"
 
 
 def _request_audit_context(request: Request) -> AuditContext:
@@ -4112,6 +4123,7 @@ def create_admin_app(
         version="0.1.0",
         description="Management API for the MemForge agent memory layer.",
         lifespan=lifespan,
+        generate_unique_id_function=_operation_id,
     )
     if db is not None:
         app.state.db = db
