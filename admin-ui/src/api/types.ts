@@ -520,6 +520,12 @@ export interface Project {
   created_at: string;
 }
 
+/** GET /projects: the workspace's projects and whether the caller may change them. */
+export interface ProjectList {
+  data: Project[];
+  can_manage: boolean;
+}
+
 /**
  * How a source binds its extracted memories to projects.
  *

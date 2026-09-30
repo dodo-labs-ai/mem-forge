@@ -12,7 +12,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleGate,
     LifecycleGateState,
 )
-from memforge.server.admin_api import create_admin_app
+from memforge.server.admin_api import ONLINE_EVALUATION_ROW_LIMIT, create_admin_app
 
 
 def _config(tmp_path) -> AppConfig:
@@ -372,7 +372,7 @@ def test_source_agent_evaluation_route_is_bounded_and_storage_neutral(tmp_path):
             assert query.requesting_user_id == "dev"
             assert query.include_private is True
             assert query.newest_first is True
-            assert query.limit == 1000
+            assert query.limit == ONLINE_EVALUATION_ROW_LIMIT
             return [event]
 
         async def list_agent_assessments(self, query):
@@ -380,7 +380,7 @@ def test_source_agent_evaluation_route_is_bounded_and_storage_neutral(tmp_path):
             assert query.requesting_user_id == "dev"
             assert query.include_private is True
             assert query.newest_first is True
-            assert query.limit == 1000
+            assert query.limit == ONLINE_EVALUATION_ROW_LIMIT
             return assessments
 
     app = create_admin_app(db=FakeSourceReader(), config=_config(tmp_path))
@@ -401,6 +401,7 @@ def test_source_agent_evaluation_route_is_bounded_and_storage_neutral(tmp_path):
         "action_issue_group_count": 1,
         "review_issue_group_count": 0,
         "truncated": False,
+        "row_limit": ONLINE_EVALUATION_ROW_LIMIT,
     }
     assert payload["assessments"][0]["target_event_id"] == event.event_id
 
@@ -626,7 +627,7 @@ def test_workspace_agent_evaluation_route_aggregates_only_discoverable_sources(t
             assert query.requesting_user_id == "dev"
             assert query.include_private is True
             assert query.newest_first is True
-            assert query.limit == 1000
+            assert query.limit == ONLINE_EVALUATION_ROW_LIMIT
             # Deliberately return a hidden Source event. The route must still
             # fail closed against the discoverable Source cohort.
             return all_events
@@ -636,7 +637,7 @@ def test_workspace_agent_evaluation_route_aggregates_only_discoverable_sources(t
             assert query.requesting_user_id == "dev"
             assert query.include_private is True
             assert query.newest_first is True
-            assert query.limit == 1000
+            assert query.limit == ONLINE_EVALUATION_ROW_LIMIT
             return all_assessments
 
     app = create_admin_app(

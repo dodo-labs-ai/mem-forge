@@ -11,6 +11,7 @@ import type {
   LocalAgentJobCreateResponse,
   LocalAgentJobStatusResponse,
   Project,
+  ProjectList,
   ResolvedProjectsResponse,
   Source,
   SourceCapabilities,
@@ -371,7 +372,7 @@ export function SourcesPage() {
 
   const projectsQuery = useQuery<Project[]>({
     queryKey: ["projects"],
-    queryFn: () => resourceClient.get("/projects").then((response) => response.data),
+    queryFn: () => resourceClient.get<ProjectList>("/projects").then((response) => response.data.data),
   });
 
   const syncSource = useMutation({

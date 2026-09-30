@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
 from memforge.models import Entity, EntityAlias, Memory, content_hash
+from memforge.storage.adapters.protocols import ActiveMemorySupportState
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -110,6 +111,20 @@ class AdapterOnlyEntityDb:
 
     async def get_memory_entity_names(self, memory_id: str) -> list[str]:
         return [self.entity.canonical_name] if memory_id == self.memory.id else []
+
+    async def get_memory_source_refs_many(self, memory_ids, scope):
+        return {memory_id: () for memory_id in memory_ids}
+
+    async def get_agent_claim_by_memory_id(self, memory_id: str) -> None:
+        return None
+
+    async def get_active_memory_support_states(self, memory_ids):
+        return {
+            memory_id: ActiveMemorySupportState(
+                unit_ids=(), support_set_hash="", current_unit_ids=(), current_support_set_hash=""
+            )
+            for memory_id in memory_ids
+        }
 
     async def list_cross_document_relations(self, memory_ids, scope):
         return {memory_id: () for memory_id in memory_ids}

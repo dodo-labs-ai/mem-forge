@@ -65,6 +65,14 @@ describe("unwrap", () => {
     );
   });
 
+  test("reads the message of a structured refusal", async () => {
+    const response = new Response(null, { status: 403 });
+    const error = { detail: { error: "project_management_forbidden", message: "Only a workspace admin can change projects." } };
+    await expect(unwrap(Promise.resolve({ error, response }))).rejects.toEqual(
+      new ApiError(403, "Only a workspace admin can change projects."),
+    );
+  });
+
   test("joins validation messages", async () => {
     const response = new Response(null, { status: 422 });
     const error = { detail: [{ msg: "Field required" }, { msg: "Too long" }] };

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
-from memforge.models import Memory, content_hash
+from memforge.models import Memory, MemorySourceRef, content_hash
 from memforge.server.admin_api import create_admin_app
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.admin_memory import (
@@ -35,8 +35,25 @@ def _config(tmp_path) -> AppConfig:
     return cfg
 
 
+class RelationFreeReader:
+    """The Source and relation reads of a store whose Memories have no relations."""
+
+    source_refs: dict[str, tuple[MemorySourceRef, ...]] = {}
+
+    async def get_memory_source_refs_many(self, memory_ids, scope):
+        return {memory_id: self.source_refs.get(memory_id, ()) for memory_id in memory_ids}
+
+    async def list_cross_document_relations(self, memory_ids, scope):
+        return {}
+
+    async def list_memories_by_ids(self, memory_ids):
+        return []
+
+
 def test_memory_list_route_uses_storage_neutral_admin_reader(tmp_path):
-    class FakeAdminReader:
+    class FakeAdminReader(RelationFreeReader):
+        source_refs = {"mem-neutral": (MemorySourceRef(source_id="src-a", source_type="confluence", name="Payroll wiki"),)}
+
         def __init__(self) -> None:
             self.calls = []
 
@@ -94,6 +111,10 @@ def test_memory_list_route_uses_storage_neutral_admin_reader(tmp_path):
     assert payload["offset"] == 2
     assert payload["data"][0]["id"] == "mem-neutral"
     assert payload["data"][0]["origin_source_type"] == "confluence"
+    assert payload["data"][0]["sources"] == [
+        {"source_id": "src-a", "source_type": "confluence", "name": "Payroll wiki"},
+    ]
+    assert payload["data"][0]["relations"] == []
 
     scope, filters, limit, offset = reader.calls[0]
     assert scope.user_id == LOCAL_DEV_USER_ID
@@ -111,7 +132,7 @@ def test_memory_list_route_uses_storage_neutral_admin_reader(tmp_path):
 
 
 def test_memory_list_route_uses_injected_principal_resolver(tmp_path):
-    class FakeAdminReader:
+    class FakeAdminReader(RelationFreeReader):
         def __init__(self) -> None:
             self.scope: AccessScope | None = None
 
@@ -155,3 +176,31 @@ def test_memory_list_route_uses_injected_principal_resolver(tmp_path):
     assert response.status_code == 200, response.text
     assert reader.scope is not None
     assert reader.scope.user_id == "cloud-user-1"
+
+
+def test_project_memory_counts_come_from_one_grouped_read():
+    import asyncio
+
+    from memforge.server.memory_admin_service import count_project_memories
+
+    class FakeAdminReader:
+        def __init__(self) -> None:
+            self.scopes: list[AccessScope] = []
+
+        async def count_memory_admin_projects(self, *, scope: AccessScope) -> dict[str, int]:
+            self.scopes.append(scope)
+            return {"PAY": 3, "RETIRED_PROJECT": 7}
+
+    reader = FakeAdminReader()
+    scope = AccessScope(
+        user_id=LOCAL_DEV_USER_ID,
+        include_private=True,
+        allowed_statuses=("active",),
+        active_project=None,
+        scope_mode="project-first",
+    )
+
+    counts = asyncio.run(count_project_memories(reader, scope=scope, project_keys=["PAY", "SHARED"]))
+
+    assert counts == {"PAY": 3, "SHARED": 0}
+    assert reader.scopes == [scope]

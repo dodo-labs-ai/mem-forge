@@ -52,6 +52,7 @@ from memforge.storage.adapters.protocols import (
     STORAGE_BIND_CHUNK_SIZE,
     build_active_memory_unit_support_states,
 )
+from memforge.memory.project_resolver import released_project_bindings
 from memforge.models import (
     AgentHookReceipt,
     AgentSessionReceipt,
@@ -13719,6 +13720,25 @@ class Database:
                 memories.append(self._row_to_memory(row))
         return MemoryAdminQueryPage(memories=memories, total=total)
 
+    async def count_memory_admin_projects(self, *, scope) -> dict[str, int]:
+        predicate_sql, predicate_params = visible_sql(scope, "m")
+        conditions = [predicate_sql, "m.project_key IS NOT NULL"]
+        params: list[Any] = list(predicate_params)
+        subscription_condition, subscription_params = _enabled_source_visibility_condition(
+            await self.list_disabled_source_ids_for_user(scope.user_id)
+        )
+        if subscription_condition:
+            conditions.append(subscription_condition)
+            params.extend(subscription_params)
+        counts: dict[str, int] = {}
+        async with self.db.execute(
+            f"SELECT m.project_key, COUNT(*) FROM memories m WHERE {' AND '.join(conditions)} GROUP BY m.project_key",
+            params,
+        ) as cursor:
+            async for project_key, count in cursor:
+                counts[project_key] = count
+        return counts
+
     async def count_memories(
         self,
         type: str | None = None,
@@ -16882,6 +16902,14 @@ class Database:
             await self.db.commit()
         return await self.get_project(project_id)
 
+    async def _deletable_project(self, project_id: str) -> Project:
+        target = await self.get_project(project_id)
+        if target is None:
+            raise LookupError(f"project {project_id!r} not found")
+        if target.key in RESERVED_PROJECT_KEYS:
+            raise ValueError(f"project {target.key!r} is reserved and cannot be deleted")
+        return target
+
     async def list_project_memory_ids(self, project_id: str) -> list[str]:
         """Return memory ids attached to a project, validating that the
         project is real and not a reserved bucket.
@@ -16893,20 +16921,37 @@ class Database:
         drop the project row. Reserved keys (SHARED, UNSORTED) raise
         `ValueError`; an unknown id raises `LookupError`.
         """
-        target = await self.get_project(project_id)
-        if target is None:
-            raise LookupError(f"project {project_id!r} not found")
-        if target.key in RESERVED_PROJECT_KEYS:
-            raise ValueError(f"project {target.key!r} is reserved and cannot be deleted")
+        target = await self._deletable_project(project_id)
         affected_ids: list[str] = []
         async with self.db.execute("SELECT id FROM memories WHERE project_key = ?", (target.key,)) as cur:
             async for row in cur:
                 affected_ids.append(row["id"])
         return affected_ids
 
-    async def commit_project_deletion(self, project_id: str, affected_ids: Sequence[str]) -> None:
-        """Rebucket the named memories to UNSORTED and drop the project
-        row, in one transaction.
+    async def list_sources_released_by_project_deletion(self, project_id: str) -> list[str]:
+        """Return the ids of the Sources that deleting the project releases,
+        exactly the ids `commit_project_deletion` would return now.
+
+        Reserved keys (SHARED, UNSORTED) raise `ValueError`; an unknown id
+        raises `LookupError`.
+        """
+        target = await self._deletable_project(project_id)
+        return [source_id for source_id, _ in await self._released_project_bindings(target.key)]
+
+    async def _released_project_bindings(self, project_key: str) -> list[tuple[str, dict[str, Any] | None]]:
+        async with self.db.execute(
+            "SELECT id, project_binding FROM sources "
+            "WHERE project_binding IS NOT NULL AND status <> 'retired' ORDER BY id"
+        ) as cursor:
+            stored_bindings = [(str(row["id"]), row["project_binding"]) for row in await cursor.fetchall()]
+        return released_project_bindings(stored_bindings, project_key)
+
+    async def commit_project_deletion(self, project_id: str, affected_ids: Sequence[str]) -> list[str]:
+        """Rebucket the named memories to UNSORTED, release the binding of
+        every Source that names the project, and drop the project row, in
+        one transaction. Returns the ids of the released Sources; the rule
+        is `released_project_bindings`, so a retired Source or a binding
+        that is not a JSON object keeps its row as is.
 
         `affected_ids` is the snapshot the caller already moved on the
         vector side. Rebucketing by id rather than by `project_key`
@@ -16920,18 +16965,29 @@ class Database:
         """
         target = await self.get_project(project_id)
         if target is None:
-            return
+            return []
         if target.key in RESERVED_PROJECT_KEYS:
             raise ValueError(f"project {target.key!r} is reserved and cannot be deleted")
         async with self._write_lock:
-            if affected_ids:
-                placeholders = ",".join("?" for _ in affected_ids)
-                await self.db.execute(
-                    f"UPDATE memories SET project_key = ? WHERE id IN ({placeholders}) AND project_key = ?",
-                    (UNSORTED_PROJECT_KEY, *affected_ids, target.key),
-                )
-            await self.db.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-            await self.db.commit()
+            try:
+                released = await self._released_project_bindings(target.key)
+                for source_id, binding in released:
+                    await self.db.execute(
+                        "UPDATE sources SET project_binding = ? WHERE id = ?",
+                        (json.dumps(binding) if binding else None, source_id),
+                    )
+                if affected_ids:
+                    placeholders = ",".join("?" for _ in affected_ids)
+                    await self.db.execute(
+                        f"UPDATE memories SET project_key = ? WHERE id IN ({placeholders}) AND project_key = ?",
+                        (UNSORTED_PROJECT_KEY, *affected_ids, target.key),
+                    )
+                await self.db.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return [source_id for source_id, _ in released]
 
     async def _document_surviving_source_unlocked(
         self,
