@@ -37,6 +37,11 @@ def normalize_workspace_role(role: str | None) -> str:
     )
 
 
+def can_manage_workspace(viewer_role: str) -> bool:
+    """Whether the role may change workspace-wide structure and memory."""
+    return viewer_role in {SELF_HOSTED_OWNER_ROLE, WORKSPACE_ADMIN_ROLE}
+
+
 def _is_managed_source_type(source_type: str) -> bool:
     return source_type in MANAGED_SOURCE_TYPES
 
