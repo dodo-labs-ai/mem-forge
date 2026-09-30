@@ -8345,7 +8345,7 @@
     "/api/v1/documents/{doc_id}/artifacts/{kind}": {
       "get": {
         "description": "Serve an explicit artifact kind of the newest stored copy of a Document that has it.",
-        "operationId": "get_document_artifact_api_v1_documents__doc_id__artifacts__kind__head",
+        "operationId": "get_document_artifact_api_v1_documents__doc_id__artifacts__kind__get",
         "parameters": [
           {
             "in": "path",
@@ -8395,7 +8395,7 @@
     "/api/v1/documents/{doc_id}/content": {
       "get": {
         "description": "Serve normalized source content through the API for Docker/SaaS clients.",
-        "operationId": "get_document_content_api_v1_documents__doc_id__content_head",
+        "operationId": "get_document_content_api_v1_documents__doc_id__content_get",
         "parameters": [
           {
             "in": "path",
@@ -8436,7 +8436,7 @@
     "/api/v1/documents/{doc_id}/pdf": {
       "get": {
         "description": "Serve a stored source PDF through the API for Docker/SaaS clients.",
-        "operationId": "get_document_pdf_api_v1_documents__doc_id__pdf_head",
+        "operationId": "get_document_pdf_api_v1_documents__doc_id__pdf_get",
         "parameters": [
           {
             "in": "path",
@@ -10855,7 +10855,7 @@
     "/api/v1/source-artifacts/{observation_revision_id}": {
       "get": {
         "description": "Serve one exact current Artifact revision under source access.",
-        "operationId": "get_source_artifact_api_v1_source_artifacts__observation_revision_id__head",
+        "operationId": "get_source_artifact_api_v1_source_artifacts__observation_revision_id__get",
         "parameters": [
           {
             "in": "path",
@@ -10999,7 +10999,7 @@
     "/api/v1/source-units/{source_unit_id}/artifacts/{kind}": {
       "get": {
         "description": "Serve an explicit artifact kind of the stored input of one Source Unit.",
-        "operationId": "get_source_unit_artifact_api_v1_source_units__source_unit_id__artifacts__kind__head",
+        "operationId": "get_source_unit_artifact_api_v1_source_units__source_unit_id__artifacts__kind__get",
         "parameters": [
           {
             "in": "path",
@@ -11049,7 +11049,7 @@
     "/api/v1/source-units/{source_unit_id}/content": {
       "get": {
         "description": "Serve the normalized content one Source stored for its Unit.",
-        "operationId": "get_source_unit_content_api_v1_source_units__source_unit_id__content_head",
+        "operationId": "get_source_unit_content_api_v1_source_units__source_unit_id__content_get",
         "parameters": [
           {
             "in": "path",
@@ -11090,7 +11090,7 @@
     "/api/v1/source-units/{source_unit_id}/pdf": {
       "get": {
         "description": "Serve the PDF one Source stored for its Unit.",
-        "operationId": "get_source_unit_pdf_api_v1_source_units__source_unit_id__pdf_head",
+        "operationId": "get_source_unit_pdf_api_v1_source_units__source_unit_id__pdf_get",
         "parameters": [
           {
             "in": "path",

@@ -506,7 +506,7 @@ export interface paths {
          * Get Document Artifact
          * @description Serve an explicit artifact kind of the newest stored copy of a Document that has it.
          */
-        get: operations["get_document_artifact_api_v1_documents__doc_id__artifacts__kind__head"];
+        get: operations["get_document_artifact_api_v1_documents__doc_id__artifacts__kind__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -526,7 +526,7 @@ export interface paths {
          * Get Document Content
          * @description Serve normalized source content through the API for Docker/SaaS clients.
          */
-        get: operations["get_document_content_api_v1_documents__doc_id__content_head"];
+        get: operations["get_document_content_api_v1_documents__doc_id__content_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -546,7 +546,7 @@ export interface paths {
          * Get Document Pdf
          * @description Serve a stored source PDF through the API for Docker/SaaS clients.
          */
-        get: operations["get_document_pdf_api_v1_documents__doc_id__pdf_head"];
+        get: operations["get_document_pdf_api_v1_documents__doc_id__pdf_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1415,7 +1415,7 @@ export interface paths {
          * Get Source Artifact
          * @description Serve one exact current Artifact revision under source access.
          */
-        get: operations["get_source_artifact_api_v1_source_artifacts__observation_revision_id__head"];
+        get: operations["get_source_artifact_api_v1_source_artifacts__observation_revision_id__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1479,7 +1479,7 @@ export interface paths {
          * Get Source Unit Artifact
          * @description Serve an explicit artifact kind of the stored input of one Source Unit.
          */
-        get: operations["get_source_unit_artifact_api_v1_source_units__source_unit_id__artifacts__kind__head"];
+        get: operations["get_source_unit_artifact_api_v1_source_units__source_unit_id__artifacts__kind__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1499,7 +1499,7 @@ export interface paths {
          * Get Source Unit Content
          * @description Serve the normalized content one Source stored for its Unit.
          */
-        get: operations["get_source_unit_content_api_v1_source_units__source_unit_id__content_head"];
+        get: operations["get_source_unit_content_api_v1_source_units__source_unit_id__content_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1519,7 +1519,7 @@ export interface paths {
          * Get Source Unit Pdf
          * @description Serve the PDF one Source stored for its Unit.
          */
-        get: operations["get_source_unit_pdf_api_v1_source_units__source_unit_id__pdf_head"];
+        get: operations["get_source_unit_pdf_api_v1_source_units__source_unit_id__pdf_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -5518,7 +5518,7 @@ export interface operations {
             };
         };
     };
-    get_document_artifact_api_v1_documents__doc_id__artifacts__kind__head: {
+    get_document_artifact_api_v1_documents__doc_id__artifacts__kind__get: {
         parameters: {
             query?: never;
             header?: never;
@@ -5550,7 +5550,7 @@ export interface operations {
             };
         };
     };
-    get_document_content_api_v1_documents__doc_id__content_head: {
+    get_document_content_api_v1_documents__doc_id__content_get: {
         parameters: {
             query?: never;
             header?: never;
@@ -5581,7 +5581,7 @@ export interface operations {
             };
         };
     };
-    get_document_pdf_api_v1_documents__doc_id__pdf_head: {
+    get_document_pdf_api_v1_documents__doc_id__pdf_get: {
         parameters: {
             query?: never;
             header?: never;
@@ -7147,7 +7147,7 @@ export interface operations {
             };
         };
     };
-    get_source_artifact_api_v1_source_artifacts__observation_revision_id__head: {
+    get_source_artifact_api_v1_source_artifacts__observation_revision_id__get: {
         parameters: {
             query?: never;
             header?: never;
@@ -7262,7 +7262,7 @@ export interface operations {
             };
         };
     };
-    get_source_unit_artifact_api_v1_source_units__source_unit_id__artifacts__kind__head: {
+    get_source_unit_artifact_api_v1_source_units__source_unit_id__artifacts__kind__get: {
         parameters: {
             query?: never;
             header?: never;
@@ -7294,7 +7294,7 @@ export interface operations {
             };
         };
     };
-    get_source_unit_content_api_v1_source_units__source_unit_id__content_head: {
+    get_source_unit_content_api_v1_source_units__source_unit_id__content_get: {
         parameters: {
             query?: never;
             header?: never;
@@ -7325,7 +7325,7 @@ export interface operations {
             };
         };
     };
-    get_source_unit_pdf_api_v1_source_units__source_unit_id__pdf_head: {
+    get_source_unit_pdf_api_v1_source_units__source_unit_id__pdf_get: {
         parameters: {
             query?: never;
             header?: never;
