@@ -1443,6 +1443,51 @@ async def test_source_scoped_reads_use_the_exact_projection_source(db):
 
 
 @pytest.mark.asyncio
+async def test_admin_project_counts_match_the_project_filtered_list_totals(db):
+    async def add(memory_id: str, project_key: str, *, source: str = "src-enabled", **fields) -> None:
+        memory = _memory(memory_id, **fields)
+        memory.project_key = project_key
+        await db.insert_memory(memory)
+        await _document(db, f"doc-{memory_id}", source=source)
+        await db.restore_memory_source_snapshot(
+            MemorySource(
+                memory_id=memory_id,
+                doc_id=f"doc-{memory_id}",
+                source_id=source,
+                source_type="jira",
+                source_updated_at=None,
+            )
+        )
+
+    await add("m-pay", "PAY")
+    await add("m-pay-mine", "PAY", visibility=Visibility.PRIVATE.value, owner_user_id=LOCAL_DEV_USER_ID)
+    await add("m-pay-theirs", "PAY", visibility=Visibility.PRIVATE.value, owner_user_id="someone-else")
+    await add("m-pay-retired", "PAY", status="retired")
+    await add("m-pay-muted", "PAY", source="src-disabled")
+    await add("m-shared", "SHARED")
+    await db.set_source_subscription("src-disabled", LOCAL_DEV_USER_ID, False)
+    scope = AccessScope(
+        user_id=LOCAL_DEV_USER_ID,
+        include_private=True,
+        allowed_statuses=("active",),
+        active_project=None,
+        scope_mode="project-first",
+    )
+
+    counts = await db.count_memory_admin_projects(scope=scope)
+
+    assert counts == {"PAY": 2, "SHARED": 1}
+    for project_key, count in counts.items():
+        page = await db.query_memory_admin_page(
+            scope=scope,
+            filters=MemoryAdminListFilters(project=project_key),
+            limit=10,
+            offset=0,
+        )
+        assert page.total == count
+
+
+@pytest.mark.asyncio
 async def test_source_id_backfill_migration_repairs_legacy_memory_sources(db):
     await db.insert_memory(_memory("m1"))
     await _document(db, "doc1", source="src-backfill")

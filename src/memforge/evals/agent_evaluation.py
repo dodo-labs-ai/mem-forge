@@ -28,12 +28,16 @@ AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v5"
 SOURCE_UNIT_LIFECYCLE_CONTRACT_VERSION = "source-unit-lifecycle-v1"
 DETERMINISTIC_RUNTIME_EVALUATOR_NAME = "memforge.deterministic.runtime_contract"
 DETERMINISTIC_RUNTIME_EVALUATOR_VERSION = "3"
-ONLINE_EVALUATION_COVERAGE_POLICY = "semantic_evaluator_v1"
+OnlineEvaluationCoveragePolicy = Literal["semantic_evaluator_v1"]
+ONLINE_EVALUATION_COVERAGE_POLICY: OnlineEvaluationCoveragePolicy = "semantic_evaluator_v1"
 AgentRuntimeOutcome = Literal["expected", "degraded", "rejected", "failed"]
 AgentAssessmentStatus = Literal["completed", "failed"]
 AgentAssessmentLabel = Literal["pass", "fail", "needs_review"]
+# The assessment labels that open an issue group.
+AgentIssueLabel = Literal["fail", "needs_review"]
 AgentAssessmentAnnotatorKind = Literal["code", "llm", "human"]
 AgentAssessmentConfidence = Literal["low", "medium", "high"]
+SourceEvaluationStatus = Literal["attention", "coverage_gap", "review", "healthy", "no_data"]
 logger = logging.getLogger(__name__)
 
 
@@ -1511,6 +1515,7 @@ def build_workspace_online_evaluation_view(
         pending = int(coverage["pending_occurrences"])
         evaluator_failures = int(coverage["evaluator_failure_occurrences"])
         eligible = int(coverage["eligible_occurrences"])
+        evaluation_status: SourceEvaluationStatus
         if action_groups:
             evaluation_status = "attention"
         elif pending or evaluator_failures:
@@ -1540,7 +1545,7 @@ def build_workspace_online_evaluation_view(
             }
         )
 
-    status_rank = {
+    status_rank: dict[SourceEvaluationStatus, int] = {
         "attention": 0,
         "coverage_gap": 1,
         "review": 2,

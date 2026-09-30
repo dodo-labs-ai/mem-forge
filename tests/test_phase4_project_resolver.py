@@ -3,7 +3,12 @@ import json
 import pytest
 
 from memforge.genes.agent_session_gene import AgentSessionGene
-from memforge.memory.project_resolver import resolve_project_key
+from memforge.memory.project_resolver import (
+    binding_names_project,
+    binding_without_project,
+    released_project_bindings,
+    resolve_project_key,
+)
 from memforge.models import UNSORTED_PROJECT_KEY
 from memforge.storage.database import Database
 
@@ -158,3 +163,53 @@ def test_agent_session_gene_declares_repo_as_project_field():
     the gene actually populates."""
     schema = AgentSessionGene.config_schema()
     assert schema.project_field == "repo"
+
+
+@pytest.mark.parametrize(
+    ("binding", "released"),
+    [
+        ({"mode": "fixed", "project_key": "PAY"}, None),
+        (
+            {"mode": "by_field", "field": "repo", "map": {"payroll": "PAY", "risk": "RISK"}, "default": "RISK"},
+            {"mode": "by_field", "field": "repo", "map": {"risk": "RISK"}, "default": "RISK"},
+        ),
+        (
+            {"mode": "by_field", "field": "repo", "default": "PAY"},
+            {"mode": "by_field", "field": "repo", "default": UNSORTED_PROJECT_KEY},
+        ),
+    ],
+)
+def test_a_released_binding_no_longer_resolves_to_the_deleted_project(binding, released):
+    assert binding_names_project(binding, "PAY")
+    assert binding_without_project(binding, "PAY") == released
+    assert not binding_names_project(released, "PAY")
+    assert resolve_project_key(released, item_field_value=None, repo="payroll", workspace=None) != "PAY"
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        None,
+        {"mode": "fixed", "project_key": "RISK"},
+        {"mode": "by_field", "field": "repo", "map": {"risk": "RISK"}, "default": UNSORTED_PROJECT_KEY},
+    ],
+)
+def test_bindings_to_other_projects_do_not_name_it(binding):
+    assert not binding_names_project(binding, "PAY")
+
+
+def test_released_project_bindings_reads_stored_json_and_skips_what_is_not_a_json_object():
+    fixed = {"mode": "fixed", "project_key": "PAY"}
+    stored = [
+        ("src-json", json.dumps(fixed)),
+        ("src-decoded", {"mode": "by_field", "field": "repo", "map": {"payroll": "PAY"}, "default": "PAY"}),
+        ("src-other", json.dumps({"mode": "fixed", "project_key": "RISK"})),
+        ("src-truncated", '{"mode": "fixed", "project_key": "PA'),
+        ("src-list", '["PAY"]'),
+        ("src-unbound", None),
+    ]
+
+    assert released_project_bindings(stored, "PAY") == [
+        ("src-json", None),
+        ("src-decoded", {"mode": "by_field", "field": "repo", "map": {}, "default": UNSORTED_PROJECT_KEY}),
+    ]

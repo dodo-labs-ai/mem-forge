@@ -2,11 +2,11 @@ import { useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, FolderKanban, Loader2, Lock, Plus, Trash2 } from "lucide-react";
+import { Check, FolderKanban, Loader2, Lock, Plus } from "lucide-react";
 import { resourceClient } from "@/api/client";
 import { apiErrorMessage } from "@/api/errors";
 import { RESERVED_PROJECT_KEYS, isReservedProjectKey } from "@/api/projectKeys";
-import type { Project, ProjectKind } from "@/api/types";
+import type { Project, ProjectKind, ProjectList } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
 import { DataSurface } from "@/components/admin/DataSurface";
 import { EmptyState } from "@/components/admin/EmptyState";
@@ -40,23 +40,7 @@ import {
   projectCreateKeyConflictsWithBuiltIn,
 } from "./projectCreateForm";
 import type { ProjectCreateFormState } from "./projectCreateForm";
-
-/**
- * The DELETE /projects/{id} response reports how many memories were
- * moved into the Unsorted project. We read it via a runtime key so the
- * snake_case wire name never appears as user-facing copy.
- */
-const REBUCKETED_COUNT_FIELD = "rebucketed" + "_count";
-
-interface DeleteProjectWireResponse {
-  id: string;
-  [field: string]: unknown;
-}
-
-function readMovedCount(payload: DeleteProjectWireResponse): number {
-  const value = payload[REBUCKETED_COUNT_FIELD];
-  return typeof value === "number" ? value : 0;
-}
+import { DeleteInNewAdminLink } from "./DeleteInNewAdminLink";
 
 function CreateProjectDialog({
   open,
@@ -165,48 +149,13 @@ function CreateProjectDialog({
   );
 }
 
-interface DeleteSummary {
-  name: string;
-  movedCount: number;
-}
-
 export function ProjectsPage() {
-  const queryClient = useQueryClient();
   const { activeProjectKey, setActiveProjectKey } = useActiveProject();
   const [createOpen, setCreateOpen] = useState(false);
-  const [pendingDeleteKey, setPendingDeleteKey] = useState<string | null>(null);
-  const [lastDeleteSummary, setLastDeleteSummary] = useState<DeleteSummary | null>(
-    null,
-  );
 
   const projectsQuery = useQuery<Project[]>({
     queryKey: ["projects"],
-    queryFn: () => resourceClient.get<Project[]>("/projects").then((response) => response.data),
-  });
-
-  const deleteProject = useMutation({
-    mutationFn: async (project: Project) => {
-      const response = await resourceClient.delete<DeleteProjectWireResponse>(
-        `/projects/${project.id}`,
-      );
-      return { project, payload: response.data };
-    },
-    onSuccess: ({ project, payload }) => {
-      queryClient.invalidateQueries({ queryKey: ["projects"] });
-      queryClient.invalidateQueries({ queryKey: ["memories"] });
-      setPendingDeleteKey(null);
-      setLastDeleteSummary({
-        name: project.name,
-        movedCount: readMovedCount(payload),
-      });
-      if (activeProjectKey === project.key) {
-        setActiveProjectKey(null);
-      }
-    },
-    onError: () => {
-      setPendingDeleteKey(null);
-      setLastDeleteSummary(null);
-    },
+    queryFn: () => resourceClient.get<ProjectList>("/projects").then((response) => response.data.data),
   });
 
   const allProjects = useMemo(
@@ -239,26 +188,6 @@ export function ProjectsPage() {
         }
       />
 
-      {deleteProject.isError && (
-        <p
-          className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
-          role="alert"
-        >
-          {apiErrorMessage(deleteProject.error) ?? "Failed to delete project."}
-        </p>
-      )}
-
-      {lastDeleteSummary && (
-        <div
-          className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-sm text-muted-foreground"
-          role="status"
-        >
-          {`Project "${lastDeleteSummary.name}" deleted. ${lastDeleteSummary.movedCount} ${
-            lastDeleteSummary.movedCount === 1 ? "memory" : "memories"
-          } moved to the Unsorted project.`}
-        </div>
-      )}
-
       <DataSurface>
         <AsyncBoundary
           isLoading={projectsQuery.isLoading}
@@ -282,13 +211,11 @@ export function ProjectsPage() {
                   <TableHead>Name</TableHead>
                   <TableHead className="w-32">Created</TableHead>
                   <TableHead className="w-40 text-right">Active</TableHead>
-                  <TableHead className="w-16 text-right" />
+                  <TableHead className="w-40 text-right" />
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {userProjects.map((project) => {
-                  const isDeleting =
-                    deleteProject.isPending && pendingDeleteKey === project.key;
                   const isActive = activeProjectKey === project.key;
                   return (
                     <TableRow
@@ -332,23 +259,7 @@ export function ProjectsPage() {
                         )}
                       </TableCell>
                       <TableCell className="text-right">
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-sm"
-                          aria-label={`Delete ${project.name}`}
-                          disabled={isDeleting}
-                          onClick={() => {
-                            setPendingDeleteKey(project.key);
-                            deleteProject.mutate(project);
-                          }}
-                        >
-                          {isDeleting ? (
-                            <Loader2 className="size-4 animate-spin" />
-                          ) : (
-                            <Trash2 className="size-4" />
-                          )}
-                        </Button>
+                        <DeleteInNewAdminLink project={project} />
                       </TableCell>
                     </TableRow>
                   );

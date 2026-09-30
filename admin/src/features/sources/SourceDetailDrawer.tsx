@@ -21,6 +21,7 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpe
   const presentation = activity ? presentSourceSyncActivity(activity, source.name, "items") : null;
   const schedule = source.sync_schedule;
   const failedItems = activity?.error?.items ?? [];
+  const sync = actions.syncControl(source, activity);
 
   return (
     <DetailDrawer
@@ -35,8 +36,8 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpe
       }
       actions={
         source.capabilities?.can_sync && source.status === "active" ? (
-          <Button size="sm" variant="outline" onClick={() => actions.syncNow(source)}>
-            Sync now
+          <Button size="sm" variant="outline" disabled={!sync.enabled} onClick={() => actions.syncNow(source, sync.retryTarget)}>
+            {sync.label}
           </Button>
         ) : null
       }

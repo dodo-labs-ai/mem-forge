@@ -816,7 +816,7 @@ export interface paths {
         get: operations["get_llm_config_api_v1_llm_config_get"];
         /**
          * Update Llm Config
-         * @description Update LLM configuration.
+         * @description Update LLM configuration and return the stored result.
          */
         put: operations["update_llm_config_api_v1_llm_config_put"];
         post?: never;
@@ -859,6 +859,10 @@ export interface paths {
          *
          *     Filters: type (fact/decision/convention/procedure), status, source,
          *     project, free-text search. Supports limit/offset pagination.
+         *
+         *     Without ``status`` the list holds active Memories, so its total for a
+         *     project equals that project's ``memory_count``; ``status`` lists the
+         *     Memories in exactly that lifecycle status instead.
          *
          *     The access predicate gates every row: workspace rows are visible
          *     across every project (the ranker handles project relevance, not
@@ -1077,6 +1081,9 @@ export interface paths {
         /**
          * Get Memory
          * @description Get full memory detail including provenance (linked source documents).
+         *
+         *     Every lifecycle status is readable, so a superseded, retired or
+         *     pending Memory still opens from the list, a review or its replacement.
          */
         get: operations["get_memory_api_v1_memories__memory_id__get"];
         /**
@@ -1315,7 +1322,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List Projects Route */
+        /**
+         * List Projects Route
+         * @description List projects with the number of memories the caller can see in each.
+         */
         get: operations["list_projects_route_api_v1_projects_get"];
         put?: never;
         /** Create Project Route */
@@ -1342,6 +1352,26 @@ export interface paths {
         head?: never;
         /** Update Project Route */
         patch: operations["update_project_route_api_v1_projects__project_id__patch"];
+        trace?: never;
+    };
+    "/api/v1/projects/{project_id}/deletion-impact": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Project Deletion Impact
+         * @description Count what deleting the project changes, so the admin can confirm it knowingly.
+         */
+        get: operations["get_project_deletion_impact_api_v1_projects__project_id__deletion_impact_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/v1/recent-changes": {
@@ -2173,6 +2203,179 @@ export interface components {
             alias: string;
         };
         /**
+         * AgentAssessmentResponse
+         * @description One content-free assessment, as ``assessment_public_payload`` returns it.
+         */
+        AgentAssessmentResponse: {
+            /** Annotator Id */
+            annotator_id: string | null;
+            /**
+             * Annotator Kind
+             * @enum {string}
+             */
+            annotator_kind: "code" | "llm" | "human";
+            /** Assessment Id */
+            assessment_id: string;
+            /** Confidence */
+            confidence: ("low" | "medium" | "high") | null;
+            /** Content Policy Id */
+            content_policy_id: string | null;
+            /** Created At */
+            created_at: string;
+            /** Criterion */
+            criterion: string;
+            /** Evaluator Name */
+            evaluator_name: string;
+            /** Evaluator Version */
+            evaluator_version: string;
+            /** Input Fingerprint */
+            input_fingerprint: string | null;
+            /** Label */
+            label: ("pass" | "fail" | "needs_review") | null;
+            /** Occurrence Count */
+            occurrence_count: number;
+            /** Reason Code */
+            reason_code: string;
+            /** Reused From Assessment Id */
+            reused_from_assessment_id: string | null;
+            /** Schema Version */
+            schema_version: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "completed" | "failed";
+            /** Target Candidate Id */
+            target_candidate_id: string | null;
+            /** Target Event Id */
+            target_event_id: string | null;
+            /** Target Result Id */
+            target_result_id: string | null;
+        };
+        /**
+         * AgentEvaluationCaseResponse
+         * @description One example of an issue group: identifiers and versions only, no content.
+         */
+        AgentEvaluationCaseResponse: {
+            /** Assessment Id */
+            assessment_id: string;
+            /** Batch Id */
+            batch_id: string | null;
+            /** Contract Version */
+            contract_version: string | null;
+            /** Criterion */
+            criterion: string;
+            /** Deployment Revision */
+            deployment_revision: string | null;
+            /** Derivation Id */
+            derivation_id: string | null;
+            /** Doc Id */
+            doc_id: string;
+            /** Event Id */
+            event_id: string;
+            /** Execution Id */
+            execution_id: string | null;
+            /** Extraction Contract Version */
+            extraction_contract_version: string | null;
+            /**
+             * Label
+             * @enum {string}
+             */
+            label: "fail" | "needs_review";
+            /** Model */
+            model: string | null;
+            /** Observation Id */
+            observation_id: string | null;
+            /** Observation Revision Id */
+            observation_revision_id: string | null;
+            /** Occurred At */
+            occurred_at: string;
+            /** Occurrence Count */
+            occurrence_count: number;
+            /** Operation Id */
+            operation_id: string | null;
+            /** Projection Run Id */
+            projection_run_id: string;
+            /** Provider */
+            provider: string | null;
+            /** Reason Code */
+            reason_code: string;
+            /** Source Id */
+            source_id: string;
+            /** Source Type */
+            source_type: string;
+            /** Source Unit Id */
+            source_unit_id: string;
+            /** Target Unit Revision Id */
+            target_unit_revision_id: string;
+            /** Trace Id */
+            trace_id: string | null;
+        };
+        /**
+         * AgentEvaluationCoverageResponse
+         * @description How many expected checks have a matching completed assessment.
+         */
+        AgentEvaluationCoverageResponse: {
+            /** Assessed Occurrences */
+            assessed_occurrences: number;
+            /** Coverage Rate */
+            coverage_rate: number;
+            /** Eligible Occurrences */
+            eligible_occurrences: number;
+            /** Evaluator Failure Occurrences */
+            evaluator_failure_occurrences: number;
+            /** Oldest Pending At */
+            oldest_pending_at: string | null;
+            /** Pending Occurrences */
+            pending_occurrences: number;
+            /**
+             * Policy
+             * @constant
+             */
+            policy: "semantic_evaluator_v1";
+        };
+        /**
+         * AgentEvaluationIssueGroupResponse
+         * @description Failed or degraded checks that share a criterion, reason and evaluator version.
+         */
+        AgentEvaluationIssueGroupResponse: {
+            /** Affected Source Count */
+            affected_source_count: number;
+            /** Affected Source Ids */
+            affected_source_ids: string[];
+            /** Criterion */
+            criterion: string;
+            /** Criterion Occurrence Count */
+            criterion_occurrence_count: number;
+            /** Criterion Rate */
+            criterion_rate: number;
+            /** Distinct Event Count */
+            distinct_event_count: number;
+            /** Evaluator Name */
+            evaluator_name: string;
+            /** Evaluator Version */
+            evaluator_version: string;
+            /** First Seen At */
+            first_seen_at: string;
+            /** Group Id */
+            group_id: string;
+            /**
+             * Label
+             * @enum {string}
+             */
+            label: "fail" | "needs_review";
+            /** Last Seen At */
+            last_seen_at: string;
+            /** Occurrence Count */
+            occurrence_count: number;
+            /** Reason Code */
+            reason_code: string;
+            /** Representative Cases */
+            representative_cases: components["schemas"]["AgentEvaluationCaseResponse"][];
+            /** Source Types */
+            source_types: string[];
+        };
+        /**
          * AgentEvaluationLangfuseExportRequest
          * @description Create one blinded reviewer task in an approved Langfuse queue.
          */
@@ -2230,6 +2433,101 @@ export interface components {
             semantic_judge?: {
                 [key: string]: unknown;
             } | null;
+        };
+        /** AgentEvaluationScopeResponse */
+        AgentEvaluationScopeResponse: {
+            /**
+             * Kind
+             * @constant
+             */
+            kind: "workspace";
+            /** Source Id */
+            source_id: string | null;
+            /** Source Type */
+            source_type: string | null;
+        };
+        /** AgentEvaluationSourceHealthResponse */
+        AgentEvaluationSourceHealthResponse: {
+            /** Action Issue Group Count */
+            action_issue_group_count: number;
+            coverage: components["schemas"]["AgentEvaluationCoverageResponse"];
+            /**
+             * Evaluation Status
+             * @enum {string}
+             */
+            evaluation_status: "attention" | "coverage_gap" | "review" | "healthy" | "no_data";
+            /** Fail Occurrences */
+            fail_occurrences: number;
+            /** Last Event At */
+            last_event_at: string | null;
+            /** Name */
+            name: string;
+            /** Review Issue Group Count */
+            review_issue_group_count: number;
+            /** Review Occurrences */
+            review_occurrences: number;
+            /** Source Id */
+            source_id: string;
+            /** Source Status */
+            source_status: string;
+            /** Type */
+            type: string;
+        };
+        /**
+         * AgentEvaluationSummaryResponse
+         * @description Occurrence counts over the effective assessments in the window.
+         */
+        AgentEvaluationSummaryResponse: {
+            /** Action Issue Group Count */
+            action_issue_group_count: number;
+            /**
+             * Affected Source Count
+             * @description Sources with failures, checks needing review, or coverage gaps.
+             */
+            affected_source_count: number;
+            /** Criterion Counts */
+            criterion_counts: {
+                [key: string]: number;
+            };
+            /** Eligible Assessment Count */
+            eligible_assessment_count: number;
+            /** Label Counts */
+            label_counts: {
+                [key: string]: number;
+            };
+            /** Missing Assessment Count */
+            missing_assessment_count: number;
+            /** Review Issue Group Count */
+            review_issue_group_count: number;
+            /**
+             * Row Limit
+             * @description The most runtime events, and the most assessments, that one window reads.
+             */
+            row_limit: number;
+            /** Runtime Event Count */
+            runtime_event_count: number;
+            /** Source Count */
+            source_count: number;
+            /** Status Counts */
+            status_counts: {
+                [key: string]: number;
+            };
+            /** Total Assessments */
+            total_assessments: number;
+            /**
+             * Truncated
+             * @description True when the window reached ``row_limit``, so counts are partial.
+             */
+            truncated: boolean;
+        };
+        /** AgentEvaluationWindowResponse */
+        AgentEvaluationWindowResponse: {
+            /** Days */
+            days: number;
+            /** From */
+            from: string;
+            /** To */
+            to: string;
         };
         /** AgentHookContextRequest */
         AgentHookContextRequest: {
@@ -2783,6 +3081,28 @@ export interface components {
              */
             kind: "enrichment" | "embedding";
         };
+        /** LlmConfigProbeResponse */
+        LlmConfigProbeResponse: {
+            /** Latency Ms */
+            latency_ms?: number | null;
+            /** Message */
+            message: string;
+            /** Models */
+            models?: components["schemas"]["LlmModelOption"][];
+            /**
+             * Models Supported
+             * @default false
+             */
+            models_supported: boolean;
+            /** Ok */
+            ok: boolean;
+            /** Stage */
+            stage?: ("validation" | "connect" | "tls" | "timeout" | "auth" | "http") | null;
+            /** Status */
+            status?: number | null;
+            /** Suggested Base Url */
+            suggested_base_url?: string | null;
+        };
         /** LlmConfigRequest */
         LlmConfigRequest: {
             /** Embedding Api Key */
@@ -2797,6 +3117,47 @@ export interface components {
             enrichment_base_url?: string | null;
             /** Enrichment Model */
             enrichment_model?: string | null;
+        };
+        /** LlmConfigResponse */
+        LlmConfigResponse: {
+            /** Embedding Api Key */
+            embedding_api_key?: string | null;
+            /** Embedding Api Key Last4 */
+            embedding_api_key_last4?: string | null;
+            /**
+             * Embedding Api Key Set
+             * @default false
+             */
+            embedding_api_key_set: boolean;
+            /** Embedding Base Url */
+            embedding_base_url?: string | null;
+            /** Embedding Model */
+            embedding_model?: string | null;
+            /** Enrichment Api Key */
+            enrichment_api_key?: string | null;
+            /** Enrichment Api Key Last4 */
+            enrichment_api_key_last4?: string | null;
+            /**
+             * Enrichment Api Key Set
+             * @default false
+             */
+            enrichment_api_key_set: boolean;
+            /** Enrichment Base Url */
+            enrichment_base_url?: string | null;
+            /** Enrichment Model */
+            enrichment_model?: string | null;
+            /**
+             * Writable
+             * @description False when the deployment environment manages LLM settings (MEMFORGE_LLM_CONFIG_WRITABLE), so updates are refused.
+             */
+            writable: boolean;
+        };
+        /** LlmModelOption */
+        LlmModelOption: {
+            /** Id */
+            id: string;
+            /** Label */
+            label?: string | null;
         };
         /** LocalAgentDaemonStatusResponse */
         LocalAgentDaemonStatusResponse: {
@@ -3226,6 +3587,16 @@ export interface components {
             retired_at?: string | null;
             /** Retirement Reason */
             retirement_reason?: string | null;
+            /**
+             * Source Backed
+             * @default false
+             */
+            source_backed: boolean;
+            /**
+             * Sources
+             * @default []
+             */
+            sources: components["schemas"]["MemorySourceRefDetail"][];
             /** Status */
             status: string;
             /** Superseded At */
@@ -3479,6 +3850,11 @@ export interface components {
             owner_user_id?: string | null;
             /** Project Key */
             project_key?: string | null;
+            /**
+             * Relations
+             * @default []
+             */
+            relations: components["schemas"]["MemoryRelationDetail"][];
             /** Replacement Kind */
             replacement_kind?: string | null;
             /** Replacement Reason */
@@ -3487,6 +3863,11 @@ export interface components {
             retired_at?: string | null;
             /** Retirement Reason */
             retirement_reason?: string | null;
+            /**
+             * Sources
+             * @default []
+             */
+            sources: components["schemas"]["MemorySourceRefDetail"][];
             /** Status */
             status: string;
             /** Superseded At */
@@ -3590,6 +3971,11 @@ export interface components {
         };
         /** MemoryReviewDetailResponse */
         MemoryReviewDetailResponse: {
+            /**
+             * Can Decide
+             * @description Whether the caller has the authority to decide this Review: it manages every Source behind it. The status says whether a decision is still open.
+             */
+            can_decide: boolean;
             challenger?: components["schemas"]["MemoryReviewMemorySummary"] | null;
             /** Challenger Memory Id */
             challenger_memory_id: string | null;
@@ -3649,6 +4035,11 @@ export interface components {
         };
         /** MemoryReviewListItemResponse */
         MemoryReviewListItemResponse: {
+            /**
+             * Can Decide
+             * @description Whether the caller has the authority to decide this Review: it manages every Source behind it. The status says whether a decision is still open.
+             */
+            can_decide: boolean;
             challenger?: components["schemas"]["MemoryReviewMemorySummary"] | null;
             /** Challenger Memory Id */
             challenger_memory_id: string | null;
@@ -3823,6 +4214,84 @@ export interface components {
              */
             top_k: number;
         };
+        /**
+         * MemorySearchResponse
+         * @description The search engine's result page.
+         *
+         *     The route leaves unset fields out, so a queryless listing and a ranked
+         *     search each keep their own shape: only a listing reports ``total_count``,
+         *     only a ranked search reports ``retrieval_intent``.
+         */
+        MemorySearchResponse: {
+            /**
+             * Candidate Count Kind
+             * @enum {string}
+             */
+            candidate_count_kind: "exact" | "windowed";
+            /** Has More */
+            has_more: boolean;
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Query Analysis */
+            query_analysis: {
+                [key: string]: unknown;
+            };
+            /** Ranking Window Size */
+            ranking_window_size: number;
+            /** Results */
+            results: components["schemas"]["MemorySearchResultDetail"][];
+            /** Retrieval Intent */
+            retrieval_intent?: {
+                [key: string]: string | null;
+            } | null;
+            /** Retrieval Time Ms */
+            retrieval_time_ms: number;
+            /** Total Candidates */
+            total_candidates: number;
+            /** Total Count */
+            total_count?: number | null;
+        };
+        /**
+         * MemorySearchResultDetail
+         * @description One ranked Memory, as ``SearchResult`` (memforge.models) carries it.
+         */
+        MemorySearchResultDetail: {
+            /** Corroborated By */
+            corroborated_by: number;
+            /** Follow Up */
+            follow_up?: {
+                [key: string]: string;
+            } | null;
+            /** Freshness */
+            freshness: string;
+            /** Last Observed At */
+            last_observed_at?: string | null;
+            /** Memory Id */
+            memory_id: string;
+            /** Memory Type */
+            memory_type: string;
+            /** Relation Notice */
+            relation_notice?: string | null;
+            /**
+             * Relations
+             * @default []
+             */
+            relations: components["schemas"]["MemoryRelationDetail"][];
+            /** Relevance Score */
+            relevance_score: number;
+            /** Repo Identifier */
+            repo_identifier?: string | null;
+            /** Retrieval Evidence */
+            retrieval_evidence?: {
+                [key: string]: unknown;
+            } | null;
+            /** Status */
+            status: string;
+            /** Summary */
+            summary: string;
+        };
         /** MemorySourceRefDetail */
         MemorySourceRefDetail: {
             /** Name */
@@ -3882,10 +4351,8 @@ export interface components {
             /**
              * Kind
              * @deprecated
-             * @default normal
-             * @enum {string}
              */
-            kind: "normal" | "shared";
+            kind?: ("normal" | "shared") | null;
             /** Name */
             name: string;
         };
@@ -3897,6 +4364,59 @@ export interface components {
             rebucketed_count: number;
             /** Rebucketed Memory Ids */
             rebucketed_memory_ids: string[];
+            /**
+             * Released Source Count
+             * @description Sources that stopped writing to the project. A fixed binding to it was removed; a field binding dropped its mappings to it, and its default moved to UNSORTED if it pointed to the project.
+             */
+            released_source_count: number;
+        };
+        /**
+         * ProjectDeletionImpactResponse
+         * @description What deleting the project changes, counted across the whole workspace.
+         */
+        ProjectDeletionImpactResponse: {
+            /**
+             * Memory Count
+             * @description Memories in the project, in every status, that move to UNSORTED.
+             */
+            memory_count: number;
+            /**
+             * Source Count
+             * @description Sources that stop writing to the project. A fixed binding to it is removed; a field binding drops its mappings to it, and its default moves to UNSORTED if it pointed to the project.
+             */
+            source_count: number;
+        };
+        /** ProjectListItemResponse */
+        ProjectListItemResponse: {
+            /** Created At */
+            created_at?: string | null;
+            /** Id */
+            id: string;
+            /** Key */
+            key: string;
+            /**
+             * Kind
+             * @deprecated
+             * @enum {string}
+             */
+            kind: "normal" | "shared";
+            /**
+             * Memory Count
+             * @description Active memories in this project that the caller can see, including the caller's private memories.
+             */
+            memory_count: number;
+            /** Name */
+            name: string;
+        };
+        /** ProjectListResponse */
+        ProjectListResponse: {
+            /**
+             * Can Manage
+             * @description Whether the caller may create, rename and delete projects. Built-in projects are never renamed or deleted.
+             */
+            can_manage: boolean;
+            /** Data */
+            data: components["schemas"]["ProjectListItemResponse"][];
         };
         /** ProjectResponse */
         ProjectResponse: {
@@ -4683,6 +5203,34 @@ export interface components {
             /** Error Type */
             type: string;
         };
+        /**
+         * WorkspaceAgentEvaluationResponse
+         * @description The online evaluation of the Sources the viewer can discover, over one window.
+         */
+        WorkspaceAgentEvaluationResponse: {
+            /**
+             * Assessments
+             * @description The latest effective assessments, newest first.
+             */
+            assessments: components["schemas"]["AgentAssessmentResponse"][];
+            /** Available Source Types */
+            available_source_types: string[];
+            coverage: components["schemas"]["AgentEvaluationCoverageResponse"];
+            /** Issue Groups */
+            issue_groups: components["schemas"]["AgentEvaluationIssueGroupResponse"][];
+            /**
+             * Runtime Events
+             * @description The latest runtime events, as ``event_public_payload`` returns them.
+             */
+            runtime_events: {
+                [key: string]: unknown;
+            }[];
+            scope: components["schemas"]["AgentEvaluationScopeResponse"];
+            /** Sources */
+            sources: components["schemas"]["AgentEvaluationSourceHealthResponse"][];
+            summary: components["schemas"]["AgentEvaluationSummaryResponse"];
+            window: components["schemas"]["AgentEvaluationWindowResponse"];
+        };
     };
     responses: never;
     parameters: never;
@@ -5066,7 +5614,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["WorkspaceAgentEvaluationResponse"];
                 };
             };
             /** @description Validation Error */
@@ -6027,7 +6575,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["LlmConfigResponse"];
                 };
             };
         };
@@ -6051,7 +6599,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["LlmConfigResponse"];
                 };
             };
             /** @description Validation Error */
@@ -6084,7 +6632,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["LlmConfigProbeResponse"];
                 };
             };
             /** @description Validation Error */
@@ -6419,7 +6967,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["MemorySearchResponse"];
                 };
             };
             /** @description Validation Error */
@@ -6940,7 +7488,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ProjectResponse"][];
+                    "application/json": components["schemas"]["ProjectListResponse"];
                 };
             };
         };
@@ -7031,6 +7579,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ProjectResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_project_deletion_impact_api_v1_projects__project_id__deletion_impact_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectDeletionImpactResponse"];
                 };
             };
             /** @description Validation Error */

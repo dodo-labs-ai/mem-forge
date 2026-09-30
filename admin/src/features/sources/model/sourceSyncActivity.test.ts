@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import {
   presentSourceSyncActivity,
   selectSourceSyncActivity,
-  sourceSyncActivityBlocksActions,
   sourceSyncActivityFromLocalJob,
-  sourceSyncActivityIsActionable,
+  sourceSyncActivityFromStatus,
   sourceSyncActivityIsVisible,
+  sourceSyncControl,
   COMPLETED_SYNC_VISIBLE_MS,
 } from "./sourceSyncActivity";
 import { makeLocalAgentJob } from "@/test/sourceFixtures";
@@ -183,7 +183,7 @@ test("selects and presents source sync activity", () => {
     presentSourceSyncActivity(waitingForCloud!, "Microsoft Teams", "conversations"),
     { message: "Processing in Cloud", detail: "Waiting for Cloud processing" },
   );
-  assert.equal(sourceSyncActivityBlocksActions(waitingForCloud), true);
+  assert.deepEqual(sourceSyncControl(waitingForCloud, false), { label: "Syncing", enabled: false });
 
   assert.equal(
     selectSourceSyncActivity({
@@ -228,34 +228,6 @@ test("selects and presents source sync activity", () => {
       },
     })?.state,
     "failed",
-  );
-
-  assert.equal(
-    sourceSyncActivityIsActionable(
-      {
-        state: "failed",
-      },
-      false,
-    ),
-    false,
-  );
-  assert.equal(
-    sourceSyncActivityIsActionable(
-      {
-        state: "failed",
-      },
-      true,
-    ),
-    true,
-  );
-  assert.equal(
-    sourceSyncActivityIsActionable(
-      {
-        state: "active",
-      },
-      false,
-    ),
-    true,
   );
 
   assert.equal(
@@ -334,4 +306,49 @@ test("selects and presents source sync activity", () => {
     false,
   );
   assert.equal(sourceSyncActivityIsVisible({ state: "failed" }), true);
+});
+
+const RETRY_DELAY_MS = 60 * 60_000;
+
+test("offers Retry now for a sync waiting for its automatic retry", () => {
+  const nextAttemptAt = new Date(Date.now() + RETRY_DELAY_MS).toISOString();
+  const serverRun: SyncStatus = {
+    status: "pending",
+    run_id: "ssr-1",
+    started_at: null,
+    finished_at: null,
+    error_message: "Rate limit exceeded",
+    progress: null,
+    next_attempt_at: nextAttemptAt,
+  };
+  assert.deepEqual(sourceSyncControl(sourceSyncActivityFromStatus(serverRun), false), {
+    label: "Retry now",
+    enabled: true,
+    retryTarget: { execution_kind: "source_sync_run", execution_id: "ssr-1" },
+  });
+
+  const localJob = makeLocalAgentJob({ job_id: "laj-9", status: "queued", next_attempt_at: nextAttemptAt });
+  assert.deepEqual(sourceSyncControl(sourceSyncActivityFromLocalJob(localJob), false), {
+    label: "Retry now",
+    enabled: true,
+    retryTarget: { execution_kind: "local_agent_job", execution_id: "laj-9" },
+  });
+});
+
+test("names the work that already covers a new sync request", () => {
+  const retryTimePassed = new Date(Date.now() - RETRY_DELAY_MS).toISOString();
+  assert.deepEqual(sourceSyncControl({ state: "queued" }, false), { label: "Sync queued", enabled: false });
+  assert.deepEqual(
+    sourceSyncControl({ state: "queued", nextAttemptAt: retryTimePassed }, false),
+    { label: "Sync queued", enabled: false },
+  );
+  assert.deepEqual(sourceSyncControl({ state: "active" }, false), { label: "Syncing", enabled: false });
+  assert.deepEqual(sourceSyncControl({ state: "recovering" }, false), { label: "Recovering", enabled: false });
+});
+
+test("offers Sync now when nothing is queued or running", () => {
+  for (const activity of [undefined, { state: "success" as const }, { state: "partial" as const }, { state: "failed" as const }]) {
+    assert.deepEqual(sourceSyncControl(activity, false), { label: "Sync now", enabled: true });
+  }
+  assert.deepEqual(sourceSyncControl(undefined, true), { label: "Starting", enabled: false });
 });
