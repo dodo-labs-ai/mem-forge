@@ -1,9 +1,9 @@
 import type { LocalAgentJob, SyncProgressSnapshot, SyncProgressUnit, SyncStatus } from "./types";
 
-export interface SourceSyncRetryTarget {
-  execution_kind: "local_agent_job" | "source_sync_run";
-  execution_id: string;
-}
+/** The queued work a retry starts: a local sync job, or a server run that needs no new collection. */
+export type SourceSyncRetryTarget =
+  | { execution_kind: "local_agent_job"; execution_id: string }
+  | { execution_kind: "source_sync_run"; execution_id: string };
 
 export type SourceSyncActivityState =
   | "queued"
@@ -35,10 +35,12 @@ export interface SourceSyncPresentation {
   total?: number;
 }
 
-export interface SourceSyncActivityPolicy {
-  activeRowLabel: string;
-  busyActionLabel: string;
-  busyAriaLabel: string;
+/** The sync button of a source: what it says, whether it can be pressed, and what a press does. */
+export interface SourceSyncControl {
+  label: string;
+  enabled: boolean;
+  /** Set when a press starts the queued retry now instead of requesting a new sync. */
+  retryTarget?: SourceSyncRetryTarget;
 }
 
 export function sourceSyncActivityFromLocalJob(job: LocalAgentJob): SourceSyncActivity {
@@ -143,29 +145,27 @@ function activityTime(activity: SourceSyncActivity): number {
   return Number.NEGATIVE_INFINITY;
 }
 
-export function sourceSyncActivityBlocksActions(
-  activity: SourceSyncActivity | undefined,
-): boolean {
-  return Boolean(activity && ["queued", "active", "recovering"].includes(activity.state));
-}
-
-export function sourceSyncActivityIsActionable(
-  activity: SourceSyncActivity,
-  canSync: boolean,
-): boolean {
-  return activity.state !== "failed" || canSync;
-}
-
-export function sourceSyncActivityPolicy(
-  activity: SourceSyncActivity,
-): SourceSyncActivityPolicy {
-  return {
-    activeRowLabel: activity.state === "queued"
-      ? isWaitingForRetry(activity) ? "Waiting to retry" : "Waiting to sync"
-      : "Syncing now",
-    busyActionLabel: "Syncing",
-    busyAriaLabel: "Sync in progress",
-  };
+/**
+ * The sync button for a source's current activity. A sync waiting for its
+ * automatic retry is not running, and the server starts that same retry at
+ * once on request, so the button offers Retry now. Other queued or running
+ * work already covers a new request, so the button names that work and stays
+ * disabled. `starting` is true while a sync or retry request is on its way.
+ */
+export function sourceSyncControl(activity: SourceSyncActivity | undefined, starting: boolean): SourceSyncControl {
+  if (starting) return { label: "Starting", enabled: false };
+  switch (activity?.state) {
+    case "queued":
+      return isWaitingForRetry(activity) && activity.retryTarget
+        ? { label: "Retry now", enabled: true, retryTarget: activity.retryTarget }
+        : { label: "Sync queued", enabled: false };
+    case "active":
+      return { label: "Syncing", enabled: false };
+    case "recovering":
+      return { label: "Recovering", enabled: false };
+    default:
+      return { label: "Sync now", enabled: true };
+  }
 }
 
 function isWaitingForRetry(activity: SourceSyncActivity): boolean {

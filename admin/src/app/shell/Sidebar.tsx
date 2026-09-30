@@ -17,14 +17,6 @@ function ProductNavLink({ item }: { item: NavItem }) {
   const Icon = item.icon;
   const redirect = findReservedRedirect(extension, item.segment);
   if (redirect && !(redirect.visibleWhen?.() ?? true)) return null;
-  if (item.v1Path !== undefined && redirect === undefined) {
-    return (
-      <a href={item.v1Path} className={itemClass}>
-        <Icon />
-        <span className="flex-1 truncate">{item.label}</span>
-      </a>
-    );
-  }
   return (
     <NavLink to={redirect?.to ?? `/${item.segment}`} className={({ isActive }) => cn(itemClass, isActive && activeClass)}>
       <Icon />

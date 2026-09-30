@@ -3474,6 +3474,12 @@ async def test_llm_config_put_can_preserve_and_clear_keys(db, tmp_path):
     assert clear_response.status_code == 200
     assert stored["embedding_api_key"] == "embed-secret"
     assert stored["enrichment_api_key"] is None
+    saved = clear_response.json()
+    assert saved["writable"] is True
+    assert saved["enrichment_api_key_set"] is False
+    assert saved["embedding_api_key_set"] is True
+    assert saved["embedding_api_key_last4"] == "cret"
+    assert "embed-secret" not in clear_response.text
 
 
 @pytest.mark.asyncio
@@ -3495,12 +3501,16 @@ async def test_llm_config_put_can_be_disabled_for_deployment_managed_config(db, 
     app = create_admin_app(db=db, config=cfg)
 
     with TestClient(app) as client:
+        read_response = client.get("/api/v1/llm-config")
         response = client.put(
             "/api/v1/llm-config",
             json={"enrichment_model": "replacement-model"},
         )
 
     stored = await db.get_llm_config()
+    assert read_response.status_code == 200
+    assert read_response.json()["writable"] is False
+    assert read_response.json()["enrichment_model"] == "chat-model"
     assert response.status_code == 405
     assert response.json()["detail"] == "LLM settings are managed by the deployment environment"
     assert stored["enrichment_model"] == "chat-model"
