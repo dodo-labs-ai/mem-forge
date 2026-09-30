@@ -86,6 +86,7 @@ HISTORY_SYNC_KEYS = {
     "memories_extracted",
     "error_message",
     "failed_docs",
+    "absence_check_skipped_reason",
     "progress",
 }
 ACCESS_TRANSITION_KEYS = {
@@ -384,6 +385,7 @@ def test_source_list_validates_rows_shaped_like_the_hana_workspace_store(tmp_pat
                     "memories_extracted": 0,
                     "error_message": "auth expired",
                     "failed_docs": [],
+                    "absence_check_skipped_reason": None,
                     "started_at": "2026-06-13T00:00:01+00:00",
                     "finished_at": "2026-06-13T00:00:02+00:00",
                     "run_id": None,

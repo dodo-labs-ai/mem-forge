@@ -6562,6 +6562,19 @@ async def test_migration_108_drops_workspace_wide_sync_schedule(db: Database):
 
 
 @pytest.mark.asyncio
+async def test_migration_112_adds_the_absence_check_skipped_reason_to_sync_history(db: Database):
+    await db.db.execute("ALTER TABLE sync_history DROP COLUMN absence_check_skipped_reason")
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 112")
+    await db.db.commit()
+
+    await db._run_migrations()  # noqa: SLF001
+    await db._run_migrations()  # noqa: SLF001
+
+    columns = {row[1] for row in await db.db.execute_fetchall("PRAGMA table_info(sync_history)")}
+    assert "absence_check_skipped_reason" in columns
+
+
+@pytest.mark.asyncio
 async def test_source_sync_schedule_round_trips_and_claims_due_sources(db: Database):
     claim_time = datetime(2026, 6, 16, tzinfo=timezone.utc)
     due_at = claim_time - timedelta(minutes=1)
