@@ -1,9 +1,11 @@
 """HTTP coverage for the `/api/projects` CRUD surface.
 
 The wire model exposes `kind: 'normal' | 'shared'` over the storage
-`is_shared` column. Reserved keys (SHARED, UNSORTED) refuse to delete.
-A real project's delete rebuckets its memories to UNSORTED across both
-the relational row and the vector metadata before removing the row.
+`is_shared` column. Creating, changing, and deleting projects requires
+workspace admin authority. Reserved keys (SHARED, UNSORTED) refuse to be
+created, renamed, re-kinded, or deleted. A real project's delete
+rebuckets its memories to UNSORTED across both the relational row and
+the vector metadata before removing the row.
 """
 
 from __future__ import annotations
@@ -12,6 +14,8 @@ import asyncio
 from pathlib import Path
 import re
 
+import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
@@ -35,7 +39,14 @@ def _config(tmp_path: Path) -> AppConfig:
     return cfg
 
 
-def _make_app(tmp_path: Path):
+_WORKSPACE_ROLE_HEADER = "x-test-workspace-role"
+
+
+def _workspace_role(request: Request) -> str:
+    return request.headers.get(_WORKSPACE_ROLE_HEADER, "member")
+
+
+def _make_app(tmp_path: Path, **app_options):
     from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
@@ -45,8 +56,24 @@ def _make_app(tmp_path: Path):
         await database.connect()
 
     asyncio.run(_setup())
-    app = create_admin_app(db=database, config=cfg)
+    app = create_admin_app(db=database, config=cfg, **app_options)
     return app, database
+
+
+def _make_role_app(tmp_path: Path):
+    return _make_app(
+        tmp_path,
+        principal_resolver=lambda _request: "workspace-user",
+        workspace_role_resolver=_workspace_role,
+    )
+
+
+def _as_role(role: str) -> dict[str, str]:
+    return {_WORKSPACE_ROLE_HEADER: role}
+
+
+def _projects_by_key(client: TestClient) -> dict[str, dict]:
+    return {p["key"]: p for p in client.get("/api/v1/projects").json()}
 
 
 def test_create_list_update_round_trip(tmp_path):
@@ -121,16 +148,109 @@ def test_duplicate_key_returns_conflict(tmp_path):
         asyncio.run(database.close())
 
 
-def test_delete_reserved_keys_refused(tmp_path):
+@pytest.mark.parametrize("reserved", [SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY])
+def test_reserved_projects_refuse_rename_kind_change_and_delete(tmp_path, reserved):
     app, database = _make_app(tmp_path)
     try:
         with TestClient(app) as client:
-            listed = client.get("/api/v1/projects").json()
-            by_key = {p["key"]: p for p in listed}
-            for reserved in (SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY):
-                resp = client.delete(f"/api/v1/projects/{by_key[reserved]['id']}")
-                assert resp.status_code == 400
-                assert "reserved" in resp.json()["detail"]
+            before = _projects_by_key(client)[reserved]
+            attempts = (
+                client.patch(f"/api/v1/projects/{before['id']}", json={"name": "Renamed"}),
+                client.patch(f"/api/v1/projects/{before['id']}", json={"kind": "normal"}),
+                client.patch(f"/api/v1/projects/{before['id']}", json={"kind": "shared"}),
+                client.delete(f"/api/v1/projects/{before['id']}"),
+            )
+            for resp in attempts:
+                assert resp.status_code == 409, resp.text
+                detail = resp.json()["detail"]
+                assert detail["error"] == "reserved_project"
+                assert reserved in detail["message"]
+            assert _projects_by_key(client)[reserved] == before
+    finally:
+        asyncio.run(database.close())
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"name": "Team", "key": SHARED_PROJECT_KEY},
+        {"name": "Backlog", "key": UNSORTED_PROJECT_KEY.lower()},
+        {"name": "Unsorted"},
+    ],
+)
+def test_create_refuses_reserved_keys(tmp_path, payload):
+    app, database = _make_app(tmp_path)
+    try:
+        with TestClient(app) as client:
+            before = _projects_by_key(client)
+            resp = client.post("/api/v1/projects", json=payload)
+            assert resp.status_code == 409, resp.text
+            assert resp.json()["detail"]["error"] == "reserved_project"
+            assert _projects_by_key(client) == before
+    finally:
+        asyncio.run(database.close())
+
+
+@pytest.mark.parametrize("role", ["viewer", "member"])
+def test_non_admin_roles_cannot_change_projects(tmp_path, role):
+    app, database = _make_role_app(tmp_path)
+    try:
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/v1/projects",
+                json={"name": "Pay", "key": "PAY"},
+                headers=_as_role("workspace_admin"),
+            )
+            assert created.status_code == 201, created.text
+            project_id = created.json()["id"]
+            shared_id = _projects_by_key(client)[SHARED_PROJECT_KEY]["id"]
+            before = _projects_by_key(client)
+
+            attempts = (
+                client.post("/api/v1/projects", json={"name": "Risk"}, headers=_as_role(role)),
+                client.patch(
+                    f"/api/v1/projects/{project_id}",
+                    json={"name": "Renamed"},
+                    headers=_as_role(role),
+                ),
+                client.patch(
+                    f"/api/v1/projects/{shared_id}",
+                    json={"kind": "normal"},
+                    headers=_as_role(role),
+                ),
+                client.delete(f"/api/v1/projects/{project_id}", headers=_as_role(role)),
+            )
+            for resp in attempts:
+                assert resp.status_code == 403, resp.text
+                assert resp.json()["detail"]["error"] == "project_management_forbidden"
+
+            listed = client.get("/api/v1/projects", headers=_as_role(role))
+            assert listed.status_code == 200
+            assert {p["key"]: p for p in listed.json()} == before
+    finally:
+        asyncio.run(database.close())
+
+
+def test_workspace_admin_can_create_change_and_delete_projects(tmp_path):
+    app, database = _make_role_app(tmp_path)
+    admin = _as_role("workspace_admin")
+    try:
+        with TestClient(app) as client:
+            created = client.post("/api/v1/projects", json={"name": "Pay"}, headers=admin)
+            assert created.status_code == 201, created.text
+            project_id = created.json()["id"]
+
+            renamed = client.patch(
+                f"/api/v1/projects/{project_id}",
+                json={"name": "Payroll"},
+                headers=admin,
+            )
+            assert renamed.status_code == 200, renamed.text
+            assert renamed.json()["name"] == "Payroll"
+
+            deleted = client.delete(f"/api/v1/projects/{project_id}", headers=admin)
+            assert deleted.status_code == 200, deleted.text
+            assert "PAY" not in _projects_by_key(client)
     finally:
         asyncio.run(database.close())
 
