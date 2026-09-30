@@ -6,6 +6,7 @@ import type { FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Loader2, Plus, Trash2 } from "lucide-react";
 import { resourceClient } from "@/api/client";
+import { apiErrorMessage } from "@/api/errors";
 import {
   UNSORTED_PROJECT_KEY,
   isReservedProjectKey,
@@ -561,8 +562,7 @@ function InlineCreateProjectDialog({
       onOpenChange(false);
     },
     onError: (error: unknown) => {
-      const detail = extractApiErrorDetail(error);
-      setErrorMessage(detail ?? "Failed to create project.");
+      setErrorMessage(apiErrorMessage(error) ?? "Failed to create project.");
     },
   });
 
@@ -628,11 +628,4 @@ function InlineCreateProjectDialog({
       </div>
     </div>
   );
-}
-
-function extractApiErrorDetail(error: unknown): string | null {
-  if (typeof error !== "object" || error === null) return null;
-  const candidate = error as { response?: { data?: { detail?: unknown } } };
-  const detail = candidate.response?.data?.detail;
-  return typeof detail === "string" ? detail : null;
 }
