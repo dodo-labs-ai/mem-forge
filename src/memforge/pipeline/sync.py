@@ -52,6 +52,7 @@ from memforge.models import (
     MemoryExtractionResult,
     NormalizedContent,
     RawContent,
+    ScopeListingKind,
     SourceUnitInput,
     SyncState,
     content_hash as compute_content_hash,
@@ -115,6 +116,7 @@ from memforge.pipeline.stored_document import (
     load_stored_source_document,
     project_stored_input,
     rediscover_source_document,
+    stored_source_item,
 )
 from memforge.pipeline.projection_images import (
     load_projection_images,
@@ -1002,8 +1004,8 @@ class GeneSyncOrchestrator:
                         )
 
                 run_coverage = source_run_projection_coverage(
-                    incremental=last_sync_time is not None,
                     authoritative_snapshot=authoritative_snapshot,
+                    scope_transition=scope_transition is not None,
                     discovery_complete=bool(getattr(gene, "discovery_complete", False)),
                 )
 
@@ -1369,11 +1371,14 @@ class GeneSyncOrchestrator:
                     runtime_bundles.append(r["runtime_bundle"])
 
             # ----------------------------------------------------------
-            # Step 5: Detect deletions (only on full sync, not incremental)
+            # Step 5: Remove Documents the provider no longer has
             # ----------------------------------------------------------
-            # When since= is set, the gene only returns CHANGED pages.
-            # Pages not returned aren't deleted — they're just unchanged.
-            # Only run deletion detection on full syncs (since=None).
+            # Discovery narrowed by ``since`` returns changed items only, so a
+            # Document it did not return proves nothing. A submitted snapshot,
+            # or a complete discovery of a newly configured scope, is the whole
+            # scope: what it did not return is removed. Every other run lists
+            # the configured scope by identifier and removes only what that
+            # listing proves absent (ADR 0045).
             #
             # Absence is proven only after every Unit of this run has committed,
             # so deferred commits blocked only by this run's Units converge
@@ -1383,9 +1388,19 @@ class GeneSyncOrchestrator:
             deferred_failures = sum(result.get("terminal_error") is not None for result in deferred_results)
             deleted_count = 0
             tombstoned_source_unit_ids: set[str] = set()
-            absence_is_authoritative = run_coverage.proves_absence and docs_failed + deferred_failures == 0
-
+            run_committed = docs_failed + deferred_failures == 0
+            absence_is_authoritative = run_coverage.proves_absence and run_committed
+            absent_doc_ids: set[str] | None = None
             if absence_is_authoritative:
+                absent_doc_ids = indexed_doc_ids - crawled_doc_ids
+            elif run_committed and not reprocessing and scope_transition is None:
+                absent_doc_ids = await self._absent_from_scope_listing(
+                    gene,
+                    source_id=source_id,
+                    indexed_doc_ids=indexed_doc_ids,
+                )
+
+            if absent_doc_ids is not None:
                 if progress_callback:
                     progress_callback(
                         {
@@ -1406,8 +1421,7 @@ class GeneSyncOrchestrator:
                     source_name=source_name,
                     run_id=run_id,
                     lifecycle_cycle_id=(scope_transition.id if scope_transition is not None else durable_cycle_id),
-                    indexed_doc_ids=indexed_doc_ids,
-                    crawled_doc_ids=crawled_doc_ids,
+                    absent_doc_ids=absent_doc_ids,
                     source_filter_summary=_source_filter_summary(gene, last_sync_time),
                     source_activity=source_activity,
                 )
@@ -1421,7 +1435,7 @@ class GeneSyncOrchestrator:
                     )
             else:
                 logger.debug(
-                    "Skipping deletion detection without authoritative coverage: "
+                    "Skipping deletion detection without absence proof: "
                     "coverage=%s failed_docs=%d returned=%d indexed=%d",
                     run_coverage.value,
                     docs_failed,
@@ -3484,6 +3498,47 @@ class GeneSyncOrchestrator:
     # Private: deletion detection
     # ==================================================================
 
+    async def _absent_from_scope_listing(
+        self,
+        gene: Any,
+        *,
+        source_id: str,
+        indexed_doc_ids: set[str],
+    ) -> set[str] | None:
+        """The held Documents this run's scope listing proves the provider no longer has.
+
+        ``None`` when the Gene cannot list its scope. A listing or confirmation
+        that fails raises, so the run fails and nothing is removed. An unlisted
+        Document of an existence listing is absent. One of a query listing is
+        absent only when the provider reports it not found; one that still
+        exists keeps its Unit and Support and is not refreshed while it stays
+        outside the query.
+        """
+
+        list_scope = getattr(gene, "list_scope", None)
+        listing = await list_scope() if callable(list_scope) else None
+        if listing is None:
+            return None
+        unlisted = indexed_doc_ids - listing.doc_ids
+        if not unlisted or listing.kind is ScopeListingKind.EXISTENCE:
+            return unlisted
+        items = []
+        for doc_id in sorted(unlisted):
+            try:
+                items.append(await stored_source_item(self.db, source_id=source_id, document_id=doc_id))
+            except StoredDocumentUnavailable as exc:
+                # Nothing identifies the Document to ask its provider for, so
+                # its absence cannot be proven and it is kept.
+                logger.warning("Cannot confirm whether unlisted Document %s still exists: %s", doc_id, exc)
+        absent = set(await gene.confirm_absent(items)) & unlisted
+        logger.info(
+            "Scope listing of %s left %d held Documents unlisted; %d are absent at the provider",
+            source_id,
+            len(unlisted),
+            len(absent),
+        )
+        return absent
+
     async def _detect_deletions(
         self,
         source_id: str,
@@ -3491,33 +3546,31 @@ class GeneSyncOrchestrator:
         source_name: str,
         run_id: str,
         lifecycle_cycle_id: str,
-        indexed_doc_ids: set[str],
-        crawled_doc_ids: set[str],
+        absent_doc_ids: set[str],
         source_filter_summary: str | None,
         source_activity: SourceActivityLease | None = None,
     ) -> tuple[int, list[FailedDoc], set[str]]:
-        """Detect and handle documents deleted from the source.
+        """Remove the held Documents this run proved the provider no longer has.
 
-        For each deleted document, persist an explicit Source Unit tombstone,
+        For each absent document, persist an explicit Source Unit tombstone,
         apply a gate-checked complete lifecycle ledger, and only then remove
         document storage when no review is required.
 
         Returns the count, failures, and Source Units whose tombstones committed.
         """
-        deleted_ids = indexed_doc_ids - crawled_doc_ids
-        if not deleted_ids:
+        if not absent_doc_ids:
             return 0, [], set()
 
         logger.info(
             "Detected %d deletions for source %s",
-            len(deleted_ids),
+            len(absent_doc_ids),
             source_id,
         )
 
         deleted_count = 0
         failed_deletions: list[FailedDoc] = []
         tombstoned_source_unit_ids: set[str] = set()
-        for doc_id in deleted_ids:
+        for doc_id in sorted(absent_doc_ids):
             title = doc_id
             try:
                 # Get existing document info before deletion
@@ -3591,7 +3644,7 @@ class GeneSyncOrchestrator:
                     source_unit=source_unit,
                     prior_unit_revision=prior_unit_revision,
                     prior_observation_revisions=prior_observation_revisions,
-                    reason="not_returned_by_authoritative_snapshot",
+                    reason="absent_from_source",
                 )
                 target_revision = tombstone.source_unit_revisions[0]
                 lifecycle_result = await self.memory_engine.apply_projected_tombstone(
@@ -3612,7 +3665,7 @@ class GeneSyncOrchestrator:
                         source_id=source_id,
                         deletion_context={
                             "deletion_kind": "source_absence",
-                            "reason": "not_returned_by_latest_successful_crawl",
+                            "reason": "proven_absent_by_latest_successful_sync",
                             "source_filter_summary": source_filter_summary,
                             "source_unit_id": source_unit.id,
                             "target_unit_revision_id": target_revision.id,
