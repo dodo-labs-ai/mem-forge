@@ -40,6 +40,7 @@ from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.retrieval.search import SearchEngine
 from memforge.server.source_admin_service import can_manage_source
+from memforge.storage.adapters.protocols import ActiveMemorySupportState
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from tests.unit_support_fixture import primary_reference, record_unit_support
@@ -1780,6 +1781,149 @@ async def test_retire_memory_route_audits_request_principal(db: Database, tmp_pa
     assert len(audit_rows) == 1
     assert audit_rows[0].actor_type == "user"
     assert audit_rows[0].actor_id == "andrew.sun01@sap.com"
+
+
+def _private_memory(mem_id: str, content: str, *, owner_user_id: str) -> Memory:
+    return replace(
+        _memory(mem_id, content),
+        visibility=Visibility.PRIVATE.value,
+        owner_user_id=owner_user_id,
+    )
+
+
+def _member_app(db: Database, tmp_path, *, user_id: str, workspace_role: str = "member"):
+    from memforge.server.admin_api import create_admin_app
+
+    return create_admin_app(
+        db=db,
+        config=_api_config(tmp_path),
+        principal_resolver=lambda _request: user_id,
+        workspace_role_resolver=lambda _request: workspace_role,
+    )
+
+
+@pytest.mark.asyncio
+async def test_retire_memory_route_hides_another_users_private_memory(db: Database, tmp_path):
+    memory = _private_memory("mem-retire-private", "Alice's private fact", owner_user_id="alice@example.test")
+    await db.insert_memory(memory)
+    app = _member_app(db, tmp_path, user_id="bob@example.test", workspace_role="workspace_admin")
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/memories/{memory.id}/retire",
+            json={"reason": "Not mine", "expected_content_hash": memory.content_hash},
+        )
+
+    assert response.status_code == 404
+    stored = await db.get_memory(memory.id)
+    assert stored is not None and stored.status == "active"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workspace_role", ["member", "workspace_admin"])
+async def test_purge_memory_route_hides_another_users_private_memory(
+    db: Database,
+    tmp_path,
+    workspace_role: str,
+):
+    memory = _private_memory("mem-purge-private", "Alice's private fact", owner_user_id="alice@example.test")
+    await db.insert_memory(memory)
+    app = _member_app(db, tmp_path, user_id="bob@example.test", workspace_role=workspace_role)
+
+    with TestClient(app) as client:
+        response = client.delete(f"/api/v1/memories/{memory.id}/purge")
+
+    assert response.status_code == 404
+    assert await db.get_memory(memory.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_purge_memory_route_requires_workspace_administrator_for_workspace_memory(db: Database, tmp_path):
+    memory = _memory("mem-purge-workspace", "Shared workspace fact")
+    await db.insert_memory(memory)
+    app = _member_app(db, tmp_path, user_id="bob@example.test")
+
+    with TestClient(app) as client:
+        response = client.delete(f"/api/v1/memories/{memory.id}/purge")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "workspace_admin_authority_required"
+    assert await db.get_memory(memory.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_purge_memory_route_lets_owner_purge_own_private_memory(db: Database, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "memforge.retrieval.embeddings.get_chroma_collection",
+        lambda **_kwargs: RecordingCollection(),
+    )
+    memory = _private_memory("mem-purge-own", "Bob's private fact", owner_user_id="bob@example.test")
+    await db.insert_memory(memory)
+    app = _member_app(db, tmp_path, user_id="bob@example.test")
+
+    with TestClient(app) as client:
+        response = client.delete(f"/api/v1/memories/{memory.id}/purge")
+
+    assert response.status_code == 200, response.text
+    assert await db.get_memory(memory.id) is None
+
+
+@pytest.mark.asyncio
+async def test_purge_memory_route_refuses_source_backed_memory(db: Database, tmp_path, monkeypatch):
+    memory = _memory("mem-purge-source-backed", "Fact a source still supports")
+    await db.insert_memory(memory)
+
+    async def supported(memory_ids):
+        return {
+            memory_id: ActiveMemorySupportState(
+                unit_ids=("eu-1",),
+                support_set_hash="support",
+                current_unit_ids=("eu-1",),
+                current_support_set_hash="support",
+            )
+            for memory_id in memory_ids
+        }
+
+    monkeypatch.setattr(db, "get_active_memory_support_states", supported)
+    app = _member_app(db, tmp_path, user_id="admin@example.test", workspace_role="workspace_admin")
+
+    with TestClient(app) as client:
+        response = client.delete(f"/api/v1/memories/{memory.id}/purge")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "source_backed_memory_requires_lifecycle_review"
+    assert await db.get_memory(memory.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_purge_memory_route_removes_retired_workspace_memory_and_audits_actor(
+    db: Database,
+    tmp_path,
+    monkeypatch,
+):
+    collection = RecordingCollection()
+    monkeypatch.setattr(
+        "memforge.retrieval.embeddings.get_chroma_collection",
+        lambda **_kwargs: collection,
+    )
+    memory = replace(_memory("mem-purge-retired", "Retired workspace fact"), status="retired")
+    await db.insert_memory(memory)
+    app = _member_app(db, tmp_path, user_id="admin@example.test", workspace_role="workspace_admin")
+
+    with TestClient(app) as client:
+        response = client.delete(f"/api/v1/memories/{memory.id}/purge")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"status": "purged", "memory_id": memory.id}
+    assert await db.get_memory(memory.id) is None
+    assert collection.deleted == [memory.id]
+    audit_rows = await db.list_memory_audit_events(
+        memory_id=memory.id,
+        event_type="memory_purge_committed",
+    )
+    assert len(audit_rows) == 1
+    assert audit_rows[0].actor_type == "user"
+    assert audit_rows[0].actor_id == "admin@example.test"
 
 
 @pytest.mark.asyncio
