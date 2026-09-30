@@ -59,6 +59,7 @@ export function Topbar({ onOpenNavigation }: { onOpenNavigation: () => void }) {
       </div>
 
       <div className="flex items-center gap-1">
+        {/* Deprecated (admin-ui-v1): the Theme and Notifications buttons have no handlers (ADR 0044). */}
         <Button type="button" variant="ghost" size="icon-sm" aria-label="Theme">
           <Sun className="size-4" />
         </Button>

@@ -27,6 +27,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.routing import APIRoute
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -670,6 +671,16 @@ async def _require_lifecycle_review_visibility(
 def _require_workspace_memory_administration(request: Request) -> None:
     if not can_manage_workspace(resolve_request_workspace_role(request)):
         raise HTTPException(status_code=403, detail="workspace_admin_authority_required")
+
+
+def _operation_id(route: APIRoute) -> str:
+    """Name an OpenAPI operation from the route name, path and first method in sorted order.
+
+    A route that serves several methods (GET and HEAD) gets the same id on
+    every run, so the published OpenAPI document is reproducible.
+    """
+    operation_id = re.sub(r"\W", "_", f"{route.name}{route.path_format}")
+    return f"{operation_id}_{sorted(route.methods)[0].lower()}"
 
 
 def _request_audit_context(request: Request) -> AuditContext:
@@ -1743,22 +1754,29 @@ class ResolvedProjectsResponse(BaseModel):
 # Wire/storage translation: `kind` ("normal" | "shared") rides over the wire,
 # `is_shared` lives in the column. Translation happens in `_project_to_response`
 # (storage to wire) and inline in the create/update handlers (wire to storage).
+# Deprecated (admin-ui-v1): ranking and access read only the reserved SHARED
+# key, so `kind` changes a label and nothing else. It is removed with the V1
+# admin UI, together with `is_shared` in storage (ADR 0044).
+# The schema flag marks the field in OpenAPI without a runtime warning on V1 calls.
+PROJECT_KIND_SCHEMA = {"deprecated": True}
+
+
 class ProjectCreateRequest(BaseModel):
     name: str
     key: str | None = None
-    kind: Literal["normal", "shared"] = "normal"
+    kind: Literal["normal", "shared"] = Field(default="normal", json_schema_extra=PROJECT_KIND_SCHEMA)
 
 
 class ProjectUpdateRequest(BaseModel):
     name: str | None = None
-    kind: Literal["normal", "shared"] | None = None
+    kind: Literal["normal", "shared"] | None = Field(default=None, json_schema_extra=PROJECT_KIND_SCHEMA)
 
 
 class ProjectResponse(BaseModel):
     id: str
     key: str
     name: str
-    kind: Literal["normal", "shared"]
+    kind: Literal["normal", "shared"] = Field(json_schema_extra=PROJECT_KIND_SCHEMA)
     created_at: str | None = None
 
 
@@ -4105,6 +4123,7 @@ def create_admin_app(
         version="0.1.0",
         description="Management API for the MemForge agent memory layer.",
         lifespan=lifespan,
+        generate_unique_id_function=_operation_id,
     )
     if db is not None:
         app.state.db = db
@@ -4991,7 +5010,11 @@ def create_admin_app(
 
     # -- Memory update (admin actions) --
 
-    @memory_router.put("/{memory_id}")
+    # Deprecated (admin-ui-v1): the V1 memory detail page retires through this
+    # route with a fixed reason and no content hash, visibility check or actor.
+    # The admin UI uses POST /memories/{id}/retire; this route is removed with
+    # the V1 admin UI (ADR 0044).
+    @memory_router.put("/{memory_id}", deprecated=True)
     async def update_memory(
         memory_id: str,
         req: MemoryUpdateRequest = Body(...),
