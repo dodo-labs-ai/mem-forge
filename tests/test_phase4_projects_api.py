@@ -557,6 +557,60 @@ def test_delete_real_project_rebuckets_to_unsorted(tmp_path):
         asyncio.run(database.close())
 
 
+class _EmptyCollection:
+    def __init__(self) -> None:
+        self.requested_ids: list[str] = []
+
+    def get(self, *, ids, include):
+        self.requested_ids.extend(ids)
+        return {"ids": [], "embeddings": [], "metadatas": []}
+
+
+def test_project_routes_take_vector_adapter_from_runtime_provider(tmp_path, monkeypatch):
+    """A runtime provider owns its vector backend; the admin routes never open Chroma."""
+    from memforge.storage.adapters.sqlite import build_sqlite_adapters
+
+    def refuse_chroma(**_kwargs):
+        raise AssertionError("admin routes must not open Chroma for a runtime provider")
+
+    monkeypatch.setattr("memforge.retrieval.embeddings.get_chroma_collection", refuse_chroma)
+    monkeypatch.setattr("memforge.runtime.get_chroma_collection", refuse_chroma)
+    collection = _EmptyCollection()
+
+    class ProviderOwnedVector:
+        def build_adapters(self, db, config, *, audit_logger=None):
+            assert isinstance(config, AppConfig)
+            return build_sqlite_adapters(db, collection, audit_logger=audit_logger)
+
+    app, database = _make_app(tmp_path, runtime_provider=ProviderOwnedVector())
+    try:
+        asyncio.run(
+            database.insert_memory(
+                Memory(
+                    id="m-pay",
+                    memory_type="fact",
+                    content="payroll fact",
+                    content_hash=content_hash("payroll fact"),
+                    visibility=Visibility.WORKSPACE.value,
+                    owner_user_id=None,
+                    project_key="PAY",
+                )
+            )
+        )
+
+        with TestClient(app) as client:
+            created = client.post("/api/v1/projects", json={"name": "Pay", "key": "PAY"})
+            assert created.status_code == 201, created.text
+            assert "PAY" in _projects_by_key(client)
+
+            deleted = client.delete(f"/api/v1/projects/{created.json()['id']}")
+            assert deleted.status_code == 200, deleted.text
+
+        assert collection.requested_ids == ["m-pay"]
+    finally:
+        asyncio.run(database.close())
+
+
 def test_delete_unknown_project_returns_404(tmp_path):
     app, database = _make_app(tmp_path)
     try:

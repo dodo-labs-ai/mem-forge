@@ -4059,14 +4059,9 @@ async def _build_memory_store(
     """Build a request-scoped memory store with effective embedding settings."""
 
     from memforge.memory.audit import MemoryAuditLogger
-    from memforge.retrieval.embeddings import get_chroma_collection
     from memforge.runtime import get_effective_llm_config
 
     llm = await get_effective_llm_config(db, config)
-    memory_collection = get_chroma_collection(
-        chroma_path=config.storage.chroma_path,
-        name="memories",
-    )
     embed_cfg = {
         "base_url": llm.embedding_base_url,
         "api_key": llm.embedding_api_key,
@@ -4075,11 +4070,7 @@ async def _build_memory_store(
     provider = runtime_provider or DefaultRuntimeProvider()
     default_audit_context = audit_context or AuditContext(actor_type="admin")
     audit_logger = MemoryAuditLogger(db, default_context=default_audit_context)
-    adapters = provider.build_adapters(
-        db,
-        memory_collection,
-        audit_logger=audit_logger,
-    )
+    adapters = provider.build_adapters(db, config, audit_logger=audit_logger)
     return MemoryStore(
         relational=adapters.relational,
         keyword=adapters.keyword,
@@ -4096,21 +4087,16 @@ async def _build_project_adapters(
 ):
     """Build the storage adapters for project CRUD requests.
 
-    The relational handle owns project rows; the vector handle is bound to
-    the same memories collection that the memory store rebuckets so the
-    delete handler can update both sides in lockstep.
+    The relational handle owns project rows; the vector handle is the same
+    one the runtime provider hands the memory store, so the delete handler
+    can update both sides in lockstep.
     """
     from memforge.memory.audit import AuditContext, MemoryAuditLogger
-    from memforge.retrieval.embeddings import get_chroma_collection
 
-    memory_collection = get_chroma_collection(
-        chroma_path=config.storage.chroma_path,
-        name="memories",
-    )
     provider = runtime_provider or DefaultRuntimeProvider()
     return provider.build_adapters(
         db,
-        memory_collection,
+        config,
         audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="admin")),
     )
 

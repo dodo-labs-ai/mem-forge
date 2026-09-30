@@ -113,6 +113,30 @@ async def test_sync_runtime_wires_structured_llm_client_into_memory_engine(db, t
 
 
 @pytest.mark.asyncio
+async def test_default_runtime_provider_binds_adapters_to_configured_chroma_collection(
+    db,
+    tmp_path,
+    monkeypatch,
+):
+    from memforge import runtime
+
+    collection = FakeCollection()
+    opened = []
+
+    def open_collection(**kwargs):
+        opened.append(kwargs)
+        return collection
+
+    monkeypatch.setattr(runtime, "get_chroma_collection", open_collection)
+    config = _config(tmp_path)
+
+    adapters = runtime.DefaultRuntimeProvider().build_adapters(db, config)
+
+    assert opened == [{"chroma_path": config.storage.chroma_path, "name": "memories"}]
+    assert adapters.vector.collection is collection
+
+
+@pytest.mark.asyncio
 async def test_default_runtime_provider_uses_one_structured_client_seam_for_search_and_sync(
     db,
     tmp_path,
