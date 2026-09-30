@@ -506,6 +506,10 @@ export interface SourceProjectsResponse {
  * Wire-side project kind. "shared" is team-wide (never penalised in ranking);
  * "normal" is a regular project bucket. Storage stores this as `is_shared` 0/1.
  */
+/**
+ * @deprecated admin-ui-v1: a label only; ranking reads the reserved SHARED key.
+ * Removed from the API with the V1 admin UI (ADR 0044).
+ */
 export type ProjectKind = "normal" | "shared";
 
 export interface Project {

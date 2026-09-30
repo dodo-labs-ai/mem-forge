@@ -827,6 +827,16 @@ class RelationListResponse(BaseModel):
     offset: int
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    token: str
+    expires_in: int = 86400
+
+
 class RelationDismissalRequest(BaseModel):
     """Dismiss the relation the caller sees, bound to both contents it was shown for."""
 
@@ -1535,22 +1545,29 @@ class ResolvedProjectsResponse(BaseModel):
 # Wire/storage translation: `kind` ("normal" | "shared") rides over the wire,
 # `is_shared` lives in the column. Translation happens in `_project_to_response`
 # (storage to wire) and inline in the create/update handlers (wire to storage).
+# Deprecated (admin-ui-v1): ranking and access read only the reserved SHARED
+# key, so `kind` changes a label and nothing else. It is removed with the V1
+# admin UI, together with `is_shared` in storage (ADR 0044).
+# The schema flag marks the field in OpenAPI without a runtime warning on V1 calls.
+PROJECT_KIND_SCHEMA = {"deprecated": True}
+
+
 class ProjectCreateRequest(BaseModel):
     name: str
     key: str | None = None
-    kind: Literal["normal", "shared"] = "normal"
+    kind: Literal["normal", "shared"] = Field(default="normal", json_schema_extra=PROJECT_KIND_SCHEMA)
 
 
 class ProjectUpdateRequest(BaseModel):
     name: str | None = None
-    kind: Literal["normal", "shared"] | None = None
+    kind: Literal["normal", "shared"] | None = Field(default=None, json_schema_extra=PROJECT_KIND_SCHEMA)
 
 
 class ProjectResponse(BaseModel):
     id: str
     key: str
     name: str
-    kind: Literal["normal", "shared"]
+    kind: Literal["normal", "shared"] = Field(json_schema_extra=PROJECT_KIND_SCHEMA)
     created_at: str | None = None
 
 
@@ -3955,14 +3972,6 @@ def create_admin_app(
     # -- Auth endpoints --
     auth_router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
-    class LoginRequest(BaseModel):
-        username: str
-        password: str
-
-    class LoginResponse(BaseModel):
-        token: str
-        expires_in: int = 86400
-
     @auth_router.post("/login", response_model=LoginResponse)
     async def login(req: LoginRequest, db: Database = Depends(get_db)):
         """Authenticate and return a JWT token."""
@@ -4746,7 +4755,11 @@ def create_admin_app(
 
     # -- Memory update (admin actions) --
 
-    @memory_router.put("/{memory_id}")
+    # Deprecated (admin-ui-v1): the V1 memory detail page retires through this
+    # route with a fixed reason and no content hash, visibility check or actor.
+    # The admin UI uses POST /memories/{id}/retire; this route is removed with
+    # the V1 admin UI (ADR 0044).
+    @memory_router.put("/{memory_id}", deprecated=True)
     async def update_memory(
         memory_id: str,
         req: MemoryUpdateRequest = Body(...),

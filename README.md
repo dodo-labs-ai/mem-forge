@@ -258,7 +258,8 @@ the client-side versus service-side design.
 
 ```text
 src/memforge/        Python service, CLI, pipeline, genes, plugin MCP proxy
-admin-ui/               React admin console
+admin/                  React admin UI, served at /v2/ during the V1 parallel run
+admin-ui/               V1 admin UI, removed after the parallel run (ADR 0044)
 integrations/           Codex and Claude Code plugin packages
 docs/design/            Design notes for memory extraction and agent sessions
 tests/                  Python tests

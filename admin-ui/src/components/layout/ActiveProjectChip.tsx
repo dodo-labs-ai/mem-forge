@@ -55,6 +55,7 @@ function ChipLabel({
   );
 }
 
+/** @deprecated admin-ui-v1: part of the active-project state, which changes no ranking (ADR 0044). */
 export function ActiveProjectChip() {
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState("");

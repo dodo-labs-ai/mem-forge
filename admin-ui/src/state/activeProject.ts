@@ -1,4 +1,7 @@
 /**
+ * @deprecated admin-ui-v1: the active project never reaches the server, so it
+ * changes no ranking. The admin UI drops it; delete with V1 (ADR 0044).
+ *
  * Sticky global UI state for the active project.
  *
  * The active project is the project the user is currently working in. The
