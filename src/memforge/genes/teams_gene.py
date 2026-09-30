@@ -29,6 +29,7 @@ import httpx
 
 from memforge.genes.base import Gene, SourceConfigurationError
 from memforge.genes.local_adapter_packages import (
+    decode_package,
     has_package_manifest,
     open_packaged_source_artifact,
     read_package_body,
@@ -57,6 +58,7 @@ from memforge.pipeline.normalizer_utils import html_to_markdown
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
     SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
+    RawSourceArtifact,
     SourceArtifactContractError,
     normalize_source_artifact_media_type,
     parse_source_artifact_content_length,
@@ -1236,17 +1238,10 @@ class TeamsGene(Gene):
         """Fetch full thread/block content."""
         if item.extra.get("package_uri") or item.extra.get("package_path"):
             body = read_package_body(self, item, source_label="Teams")
-            package = json.loads(body.decode("utf-8"))
-            raw_payload = package.get("raw_payload")
-            tombstone = isinstance(raw_payload, dict) and raw_payload.get("_tombstone") is True
-            return RawContent(
-                item=item,
-                body=body,
-                content_type="application/json",
-                authoritative_empty=tombstone,
-                empty_evidence=("teams_complete_conversation_poll_window_tombstone" if tombstone else None),
-                artifacts=source_artifacts_from_package(package),
-            )
+            package = decode_package(body, LOCAL_AGENT_TEAMS_PACKAGE_KIND)
+            if package is None:
+                raise ValueError(f"Teams package {item.item_id} is not a {LOCAL_AGENT_TEAMS_PACKAGE_KIND} package")
+            return _package_raw_content(item, body, package, artifacts=source_artifacts_from_package(package))
 
         conv_id = item.extra["conversation_id"]
         root_msg_id = item.extra["root_message_id"]
@@ -1312,6 +1307,12 @@ class TeamsGene(Gene):
             body=json.dumps(thread_data, default=str).encode("utf-8"),
             content_type="application/json",
         )
+
+    def raw_from_stored_input(self, item: ContentItem, body: bytes, content_type: str) -> RawContent:
+        package = decode_package(body, LOCAL_AGENT_TEAMS_PACKAGE_KIND)
+        if package is None:
+            return super().raw_from_stored_input(item, body, content_type)
+        return _package_raw_content(item, body, package)
 
     def open_source_artifact(self, artifact):
         """Open one service-owned Teams hosted-content input."""
@@ -1963,6 +1964,31 @@ class TeamsGene(Gene):
 # ============================================================================
 # Helpers
 # ============================================================================
+
+
+def _package_raw_content(
+    item: ContentItem,
+    body: bytes,
+    package: dict,
+    *,
+    artifacts: tuple[RawSourceArtifact, ...] = (),
+) -> RawContent:
+    """The raw content of one local-agent window package.
+
+    A tombstone package is the collector's proof, from a complete poll of the
+    conversation, that the window no longer has content.
+    """
+
+    raw_payload = package.get("raw_payload")
+    tombstone = isinstance(raw_payload, dict) and raw_payload.get("_tombstone") is True
+    return RawContent(
+        item=item,
+        body=body,
+        content_type="application/json",
+        authoritative_empty=tombstone,
+        empty_evidence="teams_complete_conversation_poll_window_tombstone" if tombstone else None,
+        artifacts=artifacts,
+    )
 
 
 def _validated_teams_message_page(data: object) -> list[dict]:

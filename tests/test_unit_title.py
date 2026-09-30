@@ -435,8 +435,10 @@ async def test_a_unit_whose_current_revision_stores_its_title_is_read_without_it
 
     db = await database_with_stored_title(tmp_path, monkeypatch, stored)
     try:
+        # A rediscovering Source reads the provider, so neither its Gene nor a projection runs.
         preview = await reprocess_preview(
-            db, None, source_id="src-jira", document_ids=("jira-SFPAY-180000",), rediscovers=True,
+            db, None, None, source_id="src-jira", document_ids=("jira-SFPAY-180000",), rediscovers=True,
+            projection_adapter=None, projection_scope={}, access_context={},
         )
     finally:
         await db.close()

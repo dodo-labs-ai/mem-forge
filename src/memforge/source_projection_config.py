@@ -121,6 +121,15 @@ def projection_scope_fingerprint(scope: Mapping[str, object]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def source_access_context(source: Mapping[str, Any]) -> dict[str, object]:
+    """Return the access context one configured Source projects its Units under."""
+
+    return {
+        "access_policy": str(source.get("access_policy") or "workspace"),
+        "owner_user_id": source.get("owner_user_id"),
+    }
+
+
 def projection_access_fingerprint(access_context: Mapping[str, object]) -> str:
     """Return the exact access identity embedded in Source Unit revisions."""
 

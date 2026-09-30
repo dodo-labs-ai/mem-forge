@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Genes decode stored input by the bytes themselves. A local-agent package is
+  recognized by its own `package_kind`, exactly that Gene's kind, never by
+  `item.extra.package_uri` or `package_path`, so a repository file that
+  happens to be JSON stays file text. What a package attests about its content
+  (an empty file, a tombstoned Teams window) is read back from the stored bytes
+  through `Gene.raw_from_stored_input`. Reprocess and its `dry_run` preview run
+  the same check (`project_stored_input`: normalize, attested content,
+  projection, committed location); a Unit that fails it is unavailable with
+  `stored_input_invalid` or `stored_input_incomplete` in both, and the run no
+  longer retries it. This repairs reprocess of the local-push GitHub inputs
+  that the ADR 0041 upgrade migrated with an empty `extra`. Cloud: arrives with
+  the pin; no HANA schema, protocol or configuration change, no data fix, no
+  resync. See the ADR 0041 amendment of 2026-09-30.
+
 - Candidate Admission judges value by one source-neutral definition
   (`candidate-admission-v5`): a supported Candidate is rejected as `low_value`
   when it is a record of what happened once, such as a status transition, an

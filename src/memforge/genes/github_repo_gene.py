@@ -17,6 +17,7 @@ import requests
 
 from memforge.genes.base import Gene
 from memforge.genes.local_adapter_packages import (
+    decode_package,
     has_package_manifest,
     open_packaged_source_artifact,
     package_manifest,
@@ -344,24 +345,10 @@ class GitHubRepoGene(Gene):
     async def fetch(self, item: ContentItem) -> RawContent:
         if item.extra.get("package_uri") or item.extra.get("package_path"):
             body = read_package_body(self, item, source_label="GitHub repository")
-            package = json.loads(body.decode("utf-8"))
-            semantic_markdown = _to_markdown(
-                package.get("content_type") or "text/markdown",
-                str(package.get("markdown") or ""),
-            )
-            authoritative_empty = not semantic_markdown.strip()
-            return RawContent(
-                item=item,
-                body=body,
-                content_type="application/json",
-                authoritative_empty=authoritative_empty,
-                empty_evidence=(
-                    "github_repo_package_attested_empty_file"
-                    if authoritative_empty
-                    else None
-                ),
-                artifacts=source_artifacts_from_package(package),
-            )
+            package = decode_package(body, GITHUB_REPO_PACKAGE_KIND)
+            if package is None:
+                raise ValueError(f"GitHub repository package {item.item_id} is not a {GITHUB_REPO_PACKAGE_KIND} package")
+            return _package_raw_content(item, body, package, artifacts=source_artifacts_from_package(package))
 
         try:
             validate_github_file_mode(item.extra.get("file_mode"), label=str(item.extra.get("relative_path")))
@@ -457,12 +444,22 @@ class GitHubRepoGene(Gene):
                 content_encoding=response.headers.get("content-encoding"),
             )
 
+    def raw_from_stored_input(self, item: ContentItem, body: bytes, content_type: str) -> RawContent:
+        package = decode_package(body, GITHUB_REPO_PACKAGE_KIND)
+        if package is None:
+            return super().raw_from_stored_input(item, body, content_type)
+        return _package_raw_content(item, body, package)
+
     async def normalize(self, raw: RawContent) -> NormalizedContent:
-        if raw.item.extra.get("package_uri") or raw.item.extra.get("package_path"):
-            package = json.loads(raw.body.decode("utf-8"))
-            markdown = _to_markdown(package.get("content_type") or "text/markdown", package.get("markdown") or "")
-            semantics = _semantics_from_package(package)
-            return NormalizedContent(item=raw.item, markdown_body=markdown, source_semantics=semantics)
+        # A local-push package carries the file and its repository; a
+        # cloud-pull body is the file itself, described by its discovered item.
+        package = decode_package(raw.body, GITHUB_REPO_PACKAGE_KIND)
+        if package is not None:
+            return NormalizedContent(
+                item=raw.item,
+                markdown_body=_package_markdown(package),
+                source_semantics=_semantics_from_package(package),
+            )
 
         text = decode_github_text(raw.body, label=str(raw.item.extra.get("relative_path") or raw.item.item_id))
         markdown = _to_markdown(raw.content_type, text)
@@ -788,6 +785,30 @@ def _package_matches_config(package: dict, config: dict) -> bool:
     if not github_path_in_scope(normalized_path, include_paths, exclude_paths):
         return False
     return github_extension_allowed(normalized_path, github_include_extensions(config))
+
+
+def _package_markdown(package: dict) -> str:
+    return _to_markdown(package.get("content_type") or "text/markdown", str(package.get("markdown") or ""))
+
+
+def _package_raw_content(
+    item: ContentItem,
+    body: bytes,
+    package: dict,
+    *,
+    artifacts: tuple[RawSourceArtifact, ...] = (),
+) -> RawContent:
+    """The raw content of one local-push package; the package attests an empty file."""
+
+    authoritative_empty = not _package_markdown(package).strip()
+    return RawContent(
+        item=item,
+        body=body,
+        content_type="application/json",
+        authoritative_empty=authoritative_empty,
+        empty_evidence="github_repo_package_attested_empty_file" if authoritative_empty else None,
+        artifacts=artifacts,
+    )
 
 
 def _semantics_from_package(package: dict) -> dict:

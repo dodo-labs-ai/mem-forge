@@ -28,7 +28,7 @@ from memforge.local_agent.source_contract import (
     local_agent_sync_operation,
     source_with_sync_inputs,
 )
-from memforge.source_projection_config import projection_access_fingerprint
+from memforge.source_projection_config import projection_access_fingerprint, source_access_context
 from memforge.source_projection import ProjectionScopeAttestation
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
@@ -1207,12 +1207,7 @@ class SourceSyncWorker:
                         source_id=run.source_id,
                         workspace_id=run.workspace_id,
                         snapshot_id=run.input_snapshot_id,
-                        expected_access_hash=projection_access_fingerprint(
-                            {
-                                "access_policy": str(source.get("access_policy") or "workspace"),
-                                "owner_user_id": source.get("owner_user_id"),
-                            }
-                        ),
+                        expected_access_hash=projection_access_fingerprint(source_access_context(source)),
                     )
                 source = source_with_sync_inputs(
                     source,
