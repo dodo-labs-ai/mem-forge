@@ -1,9 +1,12 @@
 import axios from "axios";
 import type { QueryClient } from "@tanstack/react-query";
 
+/** Host-level local-agent job control route served by the MemForge server. */
+export const LOCAL_AGENT_HOST_BASE_URL = "/api/cloud/local-agent";
+
 const STANDALONE_TARGET: WorkspaceApiTarget = Object.freeze({
   resourceBaseUrl: "/api/v1",
-  localAgentBaseUrl: "/api/v1/cloud/local-agent",
+  localAgentBaseUrl: LOCAL_AGENT_HOST_BASE_URL,
   workspaceId: "local",
 });
 

@@ -25,7 +25,6 @@ MEMBER_ROLE = "member"
 VIEWER_ROLE = "viewer"
 SELF_HOSTED_OWNER_ROLE = "owner"
 LOCAL_WORKSPACE_ROLE = SELF_HOSTED_OWNER_ROLE
-WORKSPACE_ADMINISTRATOR_ROLES = frozenset({SELF_HOSTED_OWNER_ROLE, WORKSPACE_ADMIN_ROLE})
 MANAGED_SOURCE_TYPES = frozenset({"agent_session"})
 
 
@@ -36,6 +35,11 @@ def normalize_workspace_role(role: str | None) -> str:
         if value in {SELF_HOSTED_OWNER_ROLE, WORKSPACE_ADMIN_ROLE, MEMBER_ROLE, VIEWER_ROLE}
         else MEMBER_ROLE
     )
+
+
+def can_manage_workspace(viewer_role: str) -> bool:
+    """Whether the role may change workspace-wide structure and memory."""
+    return viewer_role in {SELF_HOSTED_OWNER_ROLE, WORKSPACE_ADMIN_ROLE}
 
 
 def _is_managed_source_type(source_type: str) -> bool:

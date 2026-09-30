@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Sources sync only on their own schedules. The workspace-wide "sync every
+  active Source" schedule is removed: `GET/PUT /api/v1/schedule`, its scheduler
+  job and the `schedule_all` sync trigger no longer exist, and migration 108
+  drops the `schedule_config` table. Per-source schedules
+  (`/api/v1/sources/{source_id}/schedule`) are unchanged. Cloud: the workspace
+  store no longer needs `get_schedule_config` or `set_schedule_config`; Cloud
+  drops its `SCHEDULE_CONFIG` table together with the pin to this version.
+
 - Candidate Admission judges value by one source-neutral definition
   (`candidate-admission-v5`): a supported Candidate is rejected as `low_value`
   when it is a record of what happened once, such as a status transition, an
