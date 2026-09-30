@@ -3246,24 +3246,6 @@ async def test_admin_app_starts_embedded_source_sync_worker_when_enabled(db, tmp
     assert worker_task.cancelled()
 
 
-def test_schedule_trigger_uses_configured_daily_time():
-    from memforge.scheduler import build_schedule_trigger
-
-    trigger = build_schedule_trigger(
-        {
-            "enabled": True,
-            "frequency": "daily",
-            "time": "03:45",
-            "day_of_week": 2,
-            "timezone": "UTC",
-        }
-    )
-
-    fields = {field.name: str(field) for field in trigger.fields}
-    assert fields["hour"] == "3"
-    assert fields["minute"] == "45"
-
-
 def test_config_env_overrides_startup_runtime_values(monkeypatch, tmp_path):
     from memforge.config import load_config
 

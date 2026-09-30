@@ -1836,25 +1836,6 @@ class AgentHookContextRequest(BaseModel):
     include_recent_changes: bool = True
 
 
-# -- Schedule --
-
-
-class ScheduleConfigResponse(BaseModel):
-    enabled: bool = False
-    frequency: str = "daily"
-    time: str = "02:00"
-    day_of_week: int = 0
-    timezone: str = "UTC"
-
-
-class ScheduleConfigRequest(BaseModel):
-    enabled: bool = False
-    frequency: str = "daily"
-    time: str = "02:00"
-    day_of_week: int = 0
-    timezone: str = "UTC"
-
-
 # -- LLM Config --
 
 
@@ -3606,11 +3587,6 @@ def get_workspace_id(request: Request) -> str:
     return request.app.state.workspace_id
 
 
-def get_sync_scheduler(request: Request) -> SyncScheduler | None:
-    """FastAPI dependency: retrieve the app-scoped scheduler."""
-    return getattr(request.app.state, "sync_scheduler", None)
-
-
 def get_runtime_provider(request: Request) -> RuntimeProvider:
     """FastAPI dependency: retrieve the app-scoped runtime provider."""
     return request.app.state.runtime_provider
@@ -3851,15 +3827,6 @@ def create_admin_app(
             runtime_provider=runtime_provider,
             workspace_id=workspace_id,
         )
-        app.state.sync_scheduler = (
-            SyncScheduler(
-                db,
-                app.state.sync_service,
-                document_store=document_store or LocalDocumentStore(config.storage.docs_path),
-            )
-            if config.sync.scheduler_enabled
-            else None
-        )
         app.state.sync_worker = None
         app.state.evaluation_worker = None
         app.state.sync_worker_task = None
@@ -4080,7 +4047,6 @@ def create_admin_app(
     agent_session_router = APIRouter(prefix="/api/v1/agent-sessions", tags=["agent-sessions"])
     hook_router = APIRouter(prefix="/api/v1/hooks", tags=["hooks"])
     recent_change_router = APIRouter(prefix="/api/v1/recent-changes", tags=["recent-changes"])
-    schedule_router = APIRouter(prefix="/api/v1/schedule", tags=["schedule"])
     llm_router = APIRouter(prefix="/api/v1/llm-config", tags=["llm-config"])
     projects_router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
     local_agent_router = APIRouter(
@@ -8122,37 +8088,7 @@ def create_admin_app(
         )
 
     # ===================================================================
-    # 5. Schedule Endpoints
-    # ===================================================================
-
-    @schedule_router.get("")
-    async def get_schedule(db: Database = Depends(get_db)):
-        """Get the current sync schedule configuration."""
-        sched = await db.get_schedule_config()
-        return ScheduleConfigResponse(**sched)
-
-    @schedule_router.put("")
-    async def update_schedule(
-        req: ScheduleConfigRequest,
-        db: Database = Depends(get_db),
-        sync_scheduler: SyncScheduler | None = Depends(get_sync_scheduler),
-    ):
-        """Update the sync schedule configuration."""
-        await db.set_schedule_config(
-            {
-                "enabled": req.enabled,
-                "frequency": req.frequency,
-                "time": req.time,
-                "day_of_week": req.day_of_week,
-                "timezone": req.timezone,
-            }
-        )
-        if sync_scheduler:
-            await sync_scheduler.reload()
-        return {"ok": True}
-
-    # ===================================================================
-    # 6. LLM Config Endpoints
+    # 5. LLM Config Endpoints
     # ===================================================================
 
     @llm_router.get("")
@@ -9508,7 +9444,6 @@ def create_admin_app(
     app.include_router(agent_session_router)
     app.include_router(hook_router)
     app.include_router(recent_change_router)
-    app.include_router(schedule_router)
     app.include_router(llm_router)
     app.include_router(projects_router)
     app.include_router(local_agent_router)
