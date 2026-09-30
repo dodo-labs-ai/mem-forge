@@ -233,7 +233,7 @@ async def test_concept_revision_time_is_the_authorizing_event_time(bundle_stack,
 
     unit = await db.find_source_unit_by_document_id("src-agent-sessions-codex", result.concept_id)
     revisions = (await db.get_current_source_observation_revisions(unit.id)).values()
-    [body] = [revision for revision in revisions if revision.metadata.get("provider_key") != "$unit_identity"]
+    [body] = revisions
     # The submission time is when the window arrived, never the content's source time.
     assert body.observed_at == observed_at
     [relation_run] = await _relation_runs_for_memory(db, result.memory_id)

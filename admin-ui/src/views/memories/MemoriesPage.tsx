@@ -42,11 +42,12 @@ import {
 } from "@/api/projectKeys";
 import { MemoryFiltersPopover } from "./MemoryFiltersPopover";
 import { RELATION_LABEL_NAMES, relatedMemorySources } from "./relations";
+import { buildMemorySearchRequest, type MemorySearchScopeMode } from "./memorySearchRequest";
 
 const PAGE_PROJECT_ALL = "all";
 const SHARED_PROJECT_LABEL = "Shared";
-const PROJECT_SEARCH_SCOPE = "project";
-const RELEVANCE_SEARCH_SCOPE = "project-first";
+const PROJECT_SEARCH_SCOPE: MemorySearchScopeMode = "project";
+const RELEVANCE_SEARCH_SCOPE: MemorySearchScopeMode = "project-first";
 
 const TYPE_OPTIONS = [
   { value: "all", label: "All types" },
@@ -304,16 +305,14 @@ export function MemoriesPage() {
         // hard-restricts results to the selected project plus the shared bucket,
         // while the default leaves cross-project hits visible but down-weighted
         // by the ranker. All-project browsing flows through GET /memories.
-        const body = {
-          query: search || "",
-          memory_types: type !== "all" ? [type] : undefined,
-          sources: source !== "all" ? [source] : undefined,
-          status: status !== "all" ? status : undefined,
-          active_project: effectiveProjectKey,
-          scope_mode: narrowToggle ? PROJECT_SEARCH_SCOPE : RELEVANCE_SEARCH_SCOPE,
-          include_private: true,
-          top_k: LIST_PAGE_SIZE,
-        };
+        const body = buildMemorySearchRequest({
+          query: search,
+          type,
+          status,
+          source,
+          activeProject: effectiveProjectKey,
+          scopeMode: narrowToggle ? PROJECT_SEARCH_SCOPE : RELEVANCE_SEARCH_SCOPE,
+        });
         const response = await resourceClient.post<SearchResponse>("/memories/search", body);
         const rows = response.data.results.map(searchHitToMemoryRow);
         return {

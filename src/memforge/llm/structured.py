@@ -305,8 +305,8 @@ class CandidateAdmissionDecision(StructuredResponseModel):
     verdict: Literal["ADMITTED", "REJECTED"]
     reject_reason: Literal["evidence_incomplete", "low_value"] | None = Field(default=None, description=(
         "Required for REJECTED and null for ADMITTED: evidence_incomplete when the selected "
-        "Evidence does not completely support the claim, low_value when the claim preserves "
-        "no reusable knowledge."))
+        "Evidence does not completely support the claim, low_value when the claim is not "
+        "worth remembering by the Value definition."))
     duplicate_of: list[Annotated[str, Field(pattern=CANDIDATE_REF_PATTERN)]] = Field(
         default_factory=list, description=(
             "IDs from round_claims, other than this Candidate, that state the same knowledge."))
