@@ -21,6 +21,7 @@ import {
   SHARED_PROJECT_KEY,
   UNSORTED_PROJECT_KEY,
 } from "./projectKeys";
+import { sourceProjectBinding } from "./projectBinding";
 import type {
   GroupedSource,
   Project,
@@ -74,7 +75,7 @@ export function groupSourcesByProject(
   }
 
   for (const source of sources) {
-    const binding = source.project_binding ?? null;
+    const binding = sourceProjectBinding(source);
     if (!binding) {
       pushInto(null, { source, memory_count: source.memory_count ?? 0 });
       continue;

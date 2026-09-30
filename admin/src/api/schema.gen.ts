@@ -506,7 +506,7 @@ export interface paths {
          * Get Document Artifact
          * @description Serve an explicit artifact kind of the newest stored copy of a Document that has it.
          */
-        get: operations["get_document_artifact_api_v1_documents__doc_id__artifacts__kind__get"];
+        get: operations["get_document_artifact_api_v1_documents__doc_id__artifacts__kind__head"];
         put?: never;
         post?: never;
         delete?: never;
@@ -526,7 +526,7 @@ export interface paths {
          * Get Document Content
          * @description Serve normalized source content through the API for Docker/SaaS clients.
          */
-        get: operations["get_document_content_api_v1_documents__doc_id__content_get"];
+        get: operations["get_document_content_api_v1_documents__doc_id__content_head"];
         put?: never;
         post?: never;
         delete?: never;
@@ -546,7 +546,7 @@ export interface paths {
          * Get Document Pdf
          * @description Serve a stored source PDF through the API for Docker/SaaS clients.
          */
-        get: operations["get_document_pdf_api_v1_documents__doc_id__pdf_get"];
+        get: operations["get_document_pdf_api_v1_documents__doc_id__pdf_head"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1086,11 +1086,7 @@ export interface paths {
          */
         put: operations["update_memory_api_v1_memories__memory_id__put"];
         post?: never;
-        /**
-         * Delete Memory
-         * @description Soft-delete a memory (mark as retired and hide from search).
-         */
-        delete: operations["delete_memory_api_v1_memories__memory_id__delete"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1125,7 +1121,14 @@ export interface paths {
         post?: never;
         /**
          * Purge Memory
-         * @description Hard-purge a memory for privacy/compliance removal.
+         * @description Hard-purge a visible memory for privacy/compliance removal.
+         *
+         *     Purging is irreversible: a private memory can be purged only by its
+         *     owner, and a workspace memory only by a workspace administrator. A
+         *     memory that an active source still supports is refused, because the
+         *     next sync would extract it again; remove the content at the source or
+         *     retire the source instead. Everyday removal goes through
+         *     ``POST /memories/{memory_id}/retire``.
          */
         delete: operations["purge_memory_api_v1_memories__memory_id__purge_delete"];
         options?: never;
@@ -1401,30 +1404,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/schedule": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get Schedule
-         * @description Get the current sync schedule configuration.
-         */
-        get: operations["get_schedule_api_v1_schedule_get"];
-        /**
-         * Update Schedule
-         * @description Update the sync schedule configuration.
-         */
-        put: operations["update_schedule_api_v1_schedule_put"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/source-artifacts/{observation_revision_id}": {
         parameters: {
             query?: never;
@@ -1436,7 +1415,7 @@ export interface paths {
          * Get Source Artifact
          * @description Serve one exact current Artifact revision under source access.
          */
-        get: operations["get_source_artifact_api_v1_source_artifacts__observation_revision_id__get"];
+        get: operations["get_source_artifact_api_v1_source_artifacts__observation_revision_id__head"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1500,7 +1479,7 @@ export interface paths {
          * Get Source Unit Artifact
          * @description Serve an explicit artifact kind of the stored input of one Source Unit.
          */
-        get: operations["get_source_unit_artifact_api_v1_source_units__source_unit_id__artifacts__kind__get"];
+        get: operations["get_source_unit_artifact_api_v1_source_units__source_unit_id__artifacts__kind__head"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1520,7 +1499,7 @@ export interface paths {
          * Get Source Unit Content
          * @description Serve the normalized content one Source stored for its Unit.
          */
-        get: operations["get_source_unit_content_api_v1_source_units__source_unit_id__content_get"];
+        get: operations["get_source_unit_content_api_v1_source_units__source_unit_id__content_head"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1540,7 +1519,7 @@ export interface paths {
          * Get Source Unit Pdf
          * @description Serve the PDF one Source stored for its Unit.
          */
-        get: operations["get_source_unit_pdf_api_v1_source_units__source_unit_id__pdf_get"];
+        get: operations["get_source_unit_pdf_api_v1_source_units__source_unit_id__pdf_head"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2819,6 +2798,20 @@ export interface components {
             /** Enrichment Model */
             enrichment_model?: string | null;
         };
+        /** LocalAgentDaemonStatusResponse */
+        LocalAgentDaemonStatusResponse: {
+            /** Checked At */
+            checked_at: string;
+            /** Last Seen At */
+            last_seen_at: string | null;
+            /** Stale After Seconds */
+            stale_after_seconds: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "online" | "offline";
+        };
         /** LocalAgentJobCompleteRequest */
         LocalAgentJobCompleteRequest: {
             /** Attempt Count */
@@ -2855,6 +2848,23 @@ export interface components {
             /** Workspace Id */
             workspace_id?: string | null;
         };
+        /** LocalAgentJobCreateResponse */
+        LocalAgentJobCreateResponse: {
+            /** Coalesced */
+            coalesced: boolean;
+            /**
+             * Created At
+             * @description Present for sync jobs, which may coalesce into an existing job.
+             */
+            created_at?: string | null;
+            /** Job Id */
+            job_id: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "leased" | "succeeded" | "failed";
+        };
         /** LocalAgentJobHeartbeatRequest */
         LocalAgentJobHeartbeatRequest: {
             /** Attempt Count */
@@ -2886,6 +2896,77 @@ export interface components {
              * @default 0
              */
             wait_seconds: number;
+        };
+        /** LocalAgentJobListResponse */
+        LocalAgentJobListResponse: {
+            /** Data */
+            data: components["schemas"]["LocalAgentJobResponse"][];
+        };
+        /** LocalAgentJobResponse */
+        LocalAgentJobResponse: {
+            /** Attempt Count */
+            attempt_count: number;
+            /** Created At */
+            created_at: string;
+            /** Execution Owner User Id */
+            execution_owner_user_id: string;
+            /** Finished At */
+            finished_at: string | null;
+            /** Job Id */
+            job_id: string;
+            /** Last Error */
+            last_error: string | null;
+            /** Leased Until */
+            leased_until: string | null;
+            /** Next Attempt At */
+            next_attempt_at: string | null;
+            /** Operation */
+            operation: string;
+            /** Payload */
+            payload: {
+                [key: string]: unknown;
+            };
+            /**
+             * Result
+             * @description The daemon's report: sync progress while the job runs, then its completion result. Empty before the first report.
+             */
+            result: {
+                [key: string]: unknown;
+            };
+            /** Source Id */
+            source_id: string;
+            /** Source Type */
+            source_type: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "leased" | "succeeded" | "failed";
+            /** Updated At */
+            updated_at: string;
+            /** Workspace Id */
+            workspace_id: string;
+        };
+        /**
+         * LocalCollectionReceiptResponse
+         * @description Admission receipt for a sync that the execution owner's local daemon collects.
+         */
+        LocalCollectionReceiptResponse: {
+            /** Coalesced */
+            coalesced: boolean;
+            /** Job Id */
+            job_id: string;
+            /** Message */
+            message: string;
+            /** Ok */
+            ok: boolean;
+            /** Source Id */
+            source_id: string;
+            /**
+             * Status
+             * @constant
+             */
+            status: "queued";
         };
         /** LocalSourceManifestItemRequest */
         LocalSourceManifestItemRequest: {
@@ -4122,34 +4203,6 @@ export interface components {
             /** Why Human */
             why_human: string;
         };
-        /** ScheduleConfigRequest */
-        ScheduleConfigRequest: {
-            /**
-             * Day Of Week
-             * @default 0
-             */
-            day_of_week: number;
-            /**
-             * Enabled
-             * @default false
-             */
-            enabled: boolean;
-            /**
-             * Frequency
-             * @default daily
-             */
-            frequency: string;
-            /**
-             * Time
-             * @default 02:00
-             */
-            time: string;
-            /**
-             * Timezone
-             * @default UTC
-             */
-            timezone: string;
-        };
         /** SourceAccessTransitionRequest */
         SourceAccessTransitionRequest: {
             /**
@@ -4157,6 +4210,84 @@ export interface components {
              * @enum {string}
              */
             target_policy: "private" | "workspace";
+        };
+        /** SourceAccessTransitionResponse */
+        SourceAccessTransitionResponse: {
+            /** Completed At */
+            completed_at?: string | null;
+            /** Created At */
+            created_at: string;
+            /** Error Code */
+            error_code?: string | null;
+            /** Error Message */
+            error_message?: string | null;
+            /** Operation Id */
+            operation_id: string;
+            /**
+             * Previous Policy
+             * @enum {string}
+             */
+            previous_policy: "private" | "workspace";
+            /** Processed Memories */
+            processed_memories: number;
+            /** Source Id */
+            source_id: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "running" | "failed" | "completed" | "reverted";
+            /**
+             * Target Policy
+             * @enum {string}
+             */
+            target_policy: "private" | "workspace";
+            /** Total Memories */
+            total_memories: number;
+            /** Updated At */
+            updated_at: string;
+        };
+        /**
+         * SourceCapabilitiesResponse
+         * @description The viewer's authority over one Source; clients render row actions from it.
+         */
+        SourceCapabilitiesResponse: {
+            /** Can Change Access */
+            can_change_access: boolean;
+            /** Can Configure */
+            can_configure: boolean;
+            /** Can Configure Connection */
+            can_configure_connection: boolean;
+            /** Can Delete */
+            can_delete: boolean;
+            /** Can Force Resync */
+            can_force_resync: boolean;
+            /** Can Subscribe */
+            can_subscribe: boolean;
+            /** Can Sync */
+            can_sync: boolean;
+        };
+        /** SourceConnectionStatusResponse */
+        SourceConnectionStatusResponse: {
+            /** Reason */
+            reason?: ("authentication" | "configuration" | "identity_conflict") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "ready" | "action_required";
+        };
+        /** SourceExecutionResponse */
+        SourceExecutionResponse: {
+            /** Immutable Config Fields */
+            immutable_config_fields: string[];
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "server" | "local_agent";
+            /** Operation */
+            operation: string | null;
         };
         /** SourceFacetFilterRequest */
         SourceFacetFilterRequest: {
@@ -4174,6 +4305,38 @@ export interface components {
              * @enum {string}
              */
             sort_mode: "newest" | "name" | "recently_synced";
+        };
+        /** SourceListPreferencesResponse */
+        SourceListPreferencesResponse: {
+            /**
+             * Sort Mode
+             * @enum {string}
+             */
+            sort_mode: "newest" | "name" | "recently_synced";
+        };
+        /** SourceListResponse */
+        SourceListResponse: {
+            /** Data */
+            data: components["schemas"]["SourceResponse"][];
+        };
+        /** SourceOwnershipResponse */
+        SourceOwnershipResponse: {
+            /** Created By User Id */
+            created_by_user_id: string | null;
+            /** Execution Owner User Id */
+            execution_owner_user_id: string | null;
+            /** Owner User Id */
+            owner_user_id: string;
+            /**
+             * Viewer Relationship
+             * @enum {string}
+             */
+            viewer_relationship: "owner" | "workspace_admin" | "member" | "viewer";
+            /**
+             * Viewer Role
+             * @enum {string}
+             */
+            viewer_role: "owner" | "workspace_admin" | "member" | "viewer";
         };
         /** SourceProjectResponse */
         SourceProjectResponse: {
@@ -4203,10 +4366,140 @@ export interface components {
              */
             dry_run: boolean;
         };
+        /**
+         * SourceResponse
+         * @description One Source as the viewer sees it in the Source List.
+         */
+        SourceResponse: {
+            /**
+             * Access Policy
+             * @enum {string}
+             */
+            access_policy: "private" | "workspace";
+            /**
+             * Access State
+             * @enum {string}
+             */
+            access_state: "active" | "changing" | "orphaned_private";
+            access_transition: components["schemas"]["SourceAccessTransitionResponse"] | null;
+            capabilities: components["schemas"]["SourceCapabilitiesResponse"];
+            /**
+             * Client
+             * @description The agent client (for example codex or claude-code) of an agent-session Source; null otherwise.
+             */
+            client: string | null;
+            /**
+             * Config
+             * @description Redacted configuration; empty when the viewer cannot configure the Source.
+             */
+            config: {
+                [key: string]: unknown;
+            };
+            /** @description Readiness of a browser-session connection; present only for Sources that use one. */
+            connection_status?: components["schemas"]["SourceConnectionStatusResponse"] | null;
+            /** Created At */
+            created_at?: string | null;
+            /** Doc Count */
+            doc_count: number;
+            /** Enabled For Me */
+            enabled_for_me: boolean;
+            execution: components["schemas"]["SourceExecutionResponse"];
+            /** Id */
+            id: string;
+            /** Last Sync */
+            last_sync?: string | null;
+            /** Memory Count */
+            memory_count: number;
+            /** Name */
+            name: string;
+            /** Owner User Id */
+            owner_user_id: string;
+            ownership: components["schemas"]["SourceOwnershipResponse"];
+            /** Pinned For Me */
+            pinned_for_me: boolean;
+            /**
+             * Project Binding
+             * @description Project routing rule; null leaves the Source's Memories unmapped.
+             */
+            project_binding?: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "active" | "paused";
+            subscription: components["schemas"]["SourceSubscriptionResponse"];
+            sync: components["schemas"]["SourceSyncStatusResponse"] | null;
+            sync_schedule?: components["schemas"]["SourceSyncScheduleResponse"] | null;
+            /** Type */
+            type: string;
+        };
         /** SourceSubscriptionRequest */
         SourceSubscriptionRequest: {
             /** Enabled */
             enabled: boolean;
+        };
+        /** SourceSubscriptionResponse */
+        SourceSubscriptionResponse: {
+            /** Enabled */
+            enabled: boolean;
+        };
+        /** SourceSyncFailedDocResponse */
+        SourceSyncFailedDocResponse: {
+            /** Doc Id */
+            doc_id: string;
+            /** Error */
+            error: string;
+            /** Title */
+            title: string;
+        };
+        /** SourceSyncProgressAmountResponse */
+        SourceSyncProgressAmountResponse: {
+            /** Completed */
+            completed: number;
+            /** Total */
+            total?: number | null;
+            /**
+             * Unit
+             * @enum {string}
+             */
+            unit: "item" | "page" | "file" | "issue" | "message" | "conversation";
+        };
+        /** SourceSyncProgressCountsResponse */
+        SourceSyncProgressCountsResponse: {
+            /** Changed */
+            changed?: number | null;
+            /** Failed */
+            failed?: number | null;
+            /** Memories Created */
+            memories_created?: number | null;
+        };
+        /**
+         * SourceSyncProgressResponse
+         * @description The public sync progress snapshot (see ``normalize_sync_progress_snapshot``).
+         */
+        SourceSyncProgressResponse: {
+            counts?: components["schemas"]["SourceSyncProgressCountsResponse"] | null;
+            /**
+             * Phase
+             * @enum {string}
+             */
+            phase: "waiting_for_device" | "connecting" | "discovering" | "fetching" | "uploading" | "processing" | "recovering_derivations" | "reconciling";
+            progress?: components["schemas"]["SourceSyncProgressAmountResponse"] | null;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            source_time_range?: components["schemas"]["SourceSyncProgressTimeRangeResponse"] | null;
+        };
+        /** SourceSyncProgressTimeRangeResponse */
+        SourceSyncProgressTimeRangeResponse: {
+            /** End */
+            end?: string | null;
+            /** Start */
+            start?: string | null;
         };
         /** SourceSyncRequest */
         SourceSyncRequest: {
@@ -4232,6 +4525,29 @@ export interface components {
              * @constant
              */
             execution_kind: "source_sync_run";
+        };
+        /**
+         * SourceSyncRunReceiptResponse
+         * @description Admission receipt for a server-side sync run.
+         */
+        SourceSyncRunReceiptResponse: {
+            /** Coalesced */
+            coalesced: boolean;
+            /** Created At */
+            created_at: string;
+            /** Message */
+            message: string;
+            /** Ok */
+            ok: boolean;
+            /** Run Id */
+            run_id: string;
+            /** Source Id */
+            source_id: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "running" | "success" | "failed";
         };
         /** SourceSyncScheduleRequest */
         SourceSyncScheduleRequest: {
@@ -4262,6 +4578,68 @@ export interface components {
             next_run_at?: string | null;
             /** Updated At */
             updated_at?: string | null;
+        };
+        /**
+         * SourceSyncStatusResponse
+         * @description A Source's latest sync, read from one of three places.
+         *
+         *     An active durable run carries the run fields (``run_id``, ``trigger``,
+         *     ``force_full_sync``, ``created_at``, ``next_attempt_at``,
+         *     ``recovery_count``, ``progress_revision``, ``progress_updated_at``). A
+         *     sync running in this process carries its live counters (``phase``,
+         *     ``docs_*``, ``memories_*``, ``current_title``). The last recorded sync
+         *     carries its totals, ``run_id`` and ``failed_docs``. Fields outside the
+         *     chosen shape are absent.
+         */
+        SourceSyncStatusResponse: {
+            /** Created At */
+            created_at?: string | null;
+            /** Current Title */
+            current_title?: string | null;
+            /** Docs Failed */
+            docs_failed?: number | null;
+            /** Docs Processed */
+            docs_processed?: number | null;
+            /** Docs Stored */
+            docs_stored?: number | null;
+            /** Docs Total */
+            docs_total?: number | null;
+            /** Docs Updated */
+            docs_updated?: number | null;
+            /** Error Message */
+            error_message: string | null;
+            /** Failed Docs */
+            failed_docs?: components["schemas"]["SourceSyncFailedDocResponse"][] | null;
+            /** Finished At */
+            finished_at: string | null;
+            /** Force Full Sync */
+            force_full_sync?: boolean | null;
+            /** Memories Extracted */
+            memories_extracted?: number | null;
+            /** Memories Stored */
+            memories_stored?: number | null;
+            /** Next Attempt At */
+            next_attempt_at?: string | null;
+            /** Phase */
+            phase?: string | null;
+            progress: components["schemas"]["SourceSyncProgressResponse"] | null;
+            /** Progress Revision */
+            progress_revision?: number | null;
+            /** Progress Updated At */
+            progress_updated_at?: string | null;
+            /** Recovery Count */
+            recovery_count?: number | null;
+            /** Run Id */
+            run_id?: string | null;
+            /** Started At */
+            started_at: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "running" | "recovering" | "success" | "partial" | "failed";
+            /** Trigger */
+            trigger?: string | null;
         };
         /** StatsResponse */
         StatsResponse: {
@@ -4353,7 +4731,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["LocalAgentJobCreateResponse"];
                 };
             };
             /** @description Validation Error */
@@ -4382,7 +4760,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["LocalAgentJobListResponse"];
                 };
             };
         };
@@ -4536,7 +4914,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["LocalAgentDaemonStatusResponse"];
                 };
             };
         };
@@ -5140,7 +5518,7 @@ export interface operations {
             };
         };
     };
-    get_document_artifact_api_v1_documents__doc_id__artifacts__kind__get: {
+    get_document_artifact_api_v1_documents__doc_id__artifacts__kind__head: {
         parameters: {
             query?: never;
             header?: never;
@@ -5172,7 +5550,7 @@ export interface operations {
             };
         };
     };
-    get_document_content_api_v1_documents__doc_id__content_get: {
+    get_document_content_api_v1_documents__doc_id__content_head: {
         parameters: {
             query?: never;
             header?: never;
@@ -5203,7 +5581,7 @@ export interface operations {
             };
         };
     };
-    get_document_pdf_api_v1_documents__doc_id__pdf_get: {
+    get_document_pdf_api_v1_documents__doc_id__pdf_head: {
         parameters: {
             query?: never;
             header?: never;
@@ -6141,37 +6519,6 @@ export interface operations {
             };
         };
     };
-    delete_memory_api_v1_memories__memory_id__delete: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                memory_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     propose_memory_correction_route_api_v1_memories__memory_id__corrections_propose_post: {
         parameters: {
             query?: never;
@@ -6800,60 +7147,7 @@ export interface operations {
             };
         };
     };
-    get_schedule_api_v1_schedule_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    update_schedule_api_v1_schedule_put: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ScheduleConfigRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_source_artifact_api_v1_source_artifacts__observation_revision_id__get: {
+    get_source_artifact_api_v1_source_artifacts__observation_revision_id__head: {
         parameters: {
             query?: never;
             header?: never;
@@ -6899,7 +7193,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceListPreferencesResponse"];
                 };
             };
         };
@@ -6923,7 +7217,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceListPreferencesResponse"];
                 };
             };
             /** @description Validation Error */
@@ -6968,7 +7262,7 @@ export interface operations {
             };
         };
     };
-    get_source_unit_artifact_api_v1_source_units__source_unit_id__artifacts__kind__get: {
+    get_source_unit_artifact_api_v1_source_units__source_unit_id__artifacts__kind__head: {
         parameters: {
             query?: never;
             header?: never;
@@ -7000,7 +7294,7 @@ export interface operations {
             };
         };
     };
-    get_source_unit_content_api_v1_source_units__source_unit_id__content_get: {
+    get_source_unit_content_api_v1_source_units__source_unit_id__content_head: {
         parameters: {
             query?: never;
             header?: never;
@@ -7031,7 +7325,7 @@ export interface operations {
             };
         };
     };
-    get_source_unit_pdf_api_v1_source_units__source_unit_id__pdf_get: {
+    get_source_unit_pdf_api_v1_source_units__source_unit_id__pdf_head: {
         parameters: {
             query?: never;
             header?: never;
@@ -7077,7 +7371,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceListResponse"];
                 };
             };
         };
@@ -8029,7 +8323,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceSyncRunReceiptResponse"] | components["schemas"]["LocalCollectionReceiptResponse"];
                 };
             };
             /** @description Validation Error */

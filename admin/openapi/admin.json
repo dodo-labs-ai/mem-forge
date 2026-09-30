@@ -1622,6 +1622,45 @@
         "title": "LlmConfigRequest",
         "type": "object"
       },
+      "LocalAgentDaemonStatusResponse": {
+        "properties": {
+          "checked_at": {
+            "title": "Checked At",
+            "type": "string"
+          },
+          "last_seen_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Seen At"
+          },
+          "stale_after_seconds": {
+            "title": "Stale After Seconds",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "online",
+              "offline"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "last_seen_at",
+          "checked_at",
+          "stale_after_seconds"
+        ],
+        "title": "LocalAgentDaemonStatusResponse",
+        "type": "object"
+      },
       "LocalAgentJobCompleteRequest": {
         "properties": {
           "attempt_count": {
@@ -1714,6 +1753,47 @@
         "title": "LocalAgentJobCreateRequest",
         "type": "object"
       },
+      "LocalAgentJobCreateResponse": {
+        "properties": {
+          "coalesced": {
+            "title": "Coalesced",
+            "type": "boolean"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present for sync jobs, which may coalesce into an existing job.",
+            "title": "Created At"
+          },
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "leased",
+              "succeeded",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "status",
+          "coalesced"
+        ],
+        "title": "LocalAgentJobCreateResponse",
+        "type": "object"
+      },
       "LocalAgentJobHeartbeatRequest": {
         "properties": {
           "attempt_count": {
@@ -1772,6 +1852,187 @@
           }
         },
         "title": "LocalAgentJobLeaseRequest",
+        "type": "object"
+      },
+      "LocalAgentJobListResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/LocalAgentJobResponse"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "LocalAgentJobListResponse",
+        "type": "object"
+      },
+      "LocalAgentJobResponse": {
+        "properties": {
+          "attempt_count": {
+            "title": "Attempt Count",
+            "type": "integer"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "execution_owner_user_id": {
+            "title": "Execution Owner User Id",
+            "type": "string"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "leased_until": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leased Until"
+          },
+          "next_attempt_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Attempt At"
+          },
+          "operation": {
+            "title": "Operation",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "title": "Payload",
+            "type": "object"
+          },
+          "result": {
+            "additionalProperties": true,
+            "description": "The daemon's report: sync progress while the job runs, then its completion result. Empty before the first report.",
+            "title": "Result",
+            "type": "object"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "source_type": {
+            "title": "Source Type",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "leased",
+              "succeeded",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "workspace_id": {
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "workspace_id",
+          "source_id",
+          "source_type",
+          "operation",
+          "status",
+          "payload",
+          "execution_owner_user_id",
+          "result",
+          "last_error",
+          "next_attempt_at",
+          "leased_until",
+          "attempt_count",
+          "created_at",
+          "updated_at",
+          "finished_at"
+        ],
+        "title": "LocalAgentJobResponse",
+        "type": "object"
+      },
+      "LocalCollectionReceiptResponse": {
+        "description": "Admission receipt for a sync that the execution owner's local daemon collects.",
+        "properties": {
+          "coalesced": {
+            "title": "Coalesced",
+            "type": "boolean"
+          },
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "queued",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "message",
+          "source_id",
+          "job_id",
+          "status",
+          "coalesced"
+        ],
+        "title": "LocalCollectionReceiptResponse",
         "type": "object"
       },
       "LocalSourceManifestItemRequest": {
@@ -5517,37 +5778,6 @@
         "title": "ReviewPresentationResponse",
         "type": "object"
       },
-      "ScheduleConfigRequest": {
-        "properties": {
-          "day_of_week": {
-            "default": 0,
-            "title": "Day Of Week",
-            "type": "integer"
-          },
-          "enabled": {
-            "default": false,
-            "title": "Enabled",
-            "type": "boolean"
-          },
-          "frequency": {
-            "default": "daily",
-            "title": "Frequency",
-            "type": "string"
-          },
-          "time": {
-            "default": "02:00",
-            "title": "Time",
-            "type": "string"
-          },
-          "timezone": {
-            "default": "UTC",
-            "title": "Timezone",
-            "type": "string"
-          }
-        },
-        "title": "ScheduleConfigRequest",
-        "type": "object"
-      },
       "SourceAccessTransitionRequest": {
         "properties": {
           "target_policy": {
@@ -5563,6 +5793,221 @@
           "target_policy"
         ],
         "title": "SourceAccessTransitionRequest",
+        "type": "object"
+      },
+      "SourceAccessTransitionResponse": {
+        "properties": {
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          },
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "previous_policy": {
+            "enum": [
+              "private",
+              "workspace"
+            ],
+            "title": "Previous Policy",
+            "type": "string"
+          },
+          "processed_memories": {
+            "title": "Processed Memories",
+            "type": "integer"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "failed",
+              "completed",
+              "reverted"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "target_policy": {
+            "enum": [
+              "private",
+              "workspace"
+            ],
+            "title": "Target Policy",
+            "type": "string"
+          },
+          "total_memories": {
+            "title": "Total Memories",
+            "type": "integer"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "source_id",
+          "previous_policy",
+          "target_policy",
+          "status",
+          "total_memories",
+          "processed_memories",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "SourceAccessTransitionResponse",
+        "type": "object"
+      },
+      "SourceCapabilitiesResponse": {
+        "description": "The viewer's authority over one Source; clients render row actions from it.",
+        "properties": {
+          "can_change_access": {
+            "title": "Can Change Access",
+            "type": "boolean"
+          },
+          "can_configure": {
+            "title": "Can Configure",
+            "type": "boolean"
+          },
+          "can_configure_connection": {
+            "title": "Can Configure Connection",
+            "type": "boolean"
+          },
+          "can_delete": {
+            "title": "Can Delete",
+            "type": "boolean"
+          },
+          "can_force_resync": {
+            "title": "Can Force Resync",
+            "type": "boolean"
+          },
+          "can_subscribe": {
+            "title": "Can Subscribe",
+            "type": "boolean"
+          },
+          "can_sync": {
+            "title": "Can Sync",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "can_subscribe",
+          "can_configure",
+          "can_configure_connection",
+          "can_sync",
+          "can_force_resync",
+          "can_delete",
+          "can_change_access"
+        ],
+        "title": "SourceCapabilitiesResponse",
+        "type": "object"
+      },
+      "SourceConnectionStatusResponse": {
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "authentication",
+                  "configuration",
+                  "identity_conflict"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "enum": [
+              "ready",
+              "action_required"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "SourceConnectionStatusResponse",
+        "type": "object"
+      },
+      "SourceExecutionResponse": {
+        "properties": {
+          "immutable_config_fields": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Immutable Config Fields",
+            "type": "array"
+          },
+          "kind": {
+            "enum": [
+              "server",
+              "local_agent"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "operation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation"
+          }
+        },
+        "required": [
+          "kind",
+          "operation",
+          "immutable_config_fields"
+        ],
+        "title": "SourceExecutionResponse",
         "type": "object"
       },
       "SourceFacetFilterRequest": {
@@ -5630,6 +6075,99 @@
           "sort_mode"
         ],
         "title": "SourceListPreferenceRequest",
+        "type": "object"
+      },
+      "SourceListPreferencesResponse": {
+        "properties": {
+          "sort_mode": {
+            "enum": [
+              "newest",
+              "name",
+              "recently_synced"
+            ],
+            "title": "Sort Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sort_mode"
+        ],
+        "title": "SourceListPreferencesResponse",
+        "type": "object"
+      },
+      "SourceListResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SourceResponse"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "SourceListResponse",
+        "type": "object"
+      },
+      "SourceOwnershipResponse": {
+        "properties": {
+          "created_by_user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By User Id"
+          },
+          "execution_owner_user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Owner User Id"
+          },
+          "owner_user_id": {
+            "title": "Owner User Id",
+            "type": "string"
+          },
+          "viewer_relationship": {
+            "enum": [
+              "owner",
+              "workspace_admin",
+              "member",
+              "viewer"
+            ],
+            "title": "Viewer Relationship",
+            "type": "string"
+          },
+          "viewer_role": {
+            "enum": [
+              "owner",
+              "workspace_admin",
+              "member",
+              "viewer"
+            ],
+            "title": "Viewer Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "created_by_user_id",
+          "owner_user_id",
+          "execution_owner_user_id",
+          "viewer_role",
+          "viewer_relationship"
+        ],
+        "title": "SourceOwnershipResponse",
         "type": "object"
       },
       "SourceProjectResponse": {
@@ -5709,6 +6247,197 @@
         "title": "SourceReprocessRequest",
         "type": "object"
       },
+      "SourceResponse": {
+        "description": "One Source as the viewer sees it in the Source List.",
+        "properties": {
+          "access_policy": {
+            "enum": [
+              "private",
+              "workspace"
+            ],
+            "title": "Access Policy",
+            "type": "string"
+          },
+          "access_state": {
+            "enum": [
+              "active",
+              "changing",
+              "orphaned_private"
+            ],
+            "title": "Access State",
+            "type": "string"
+          },
+          "access_transition": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceAccessTransitionResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/SourceCapabilitiesResponse"
+          },
+          "client": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The agent client (for example codex or claude-code) of an agent-session Source; null otherwise.",
+            "title": "Client"
+          },
+          "config": {
+            "additionalProperties": true,
+            "description": "Redacted configuration; empty when the viewer cannot configure the Source.",
+            "title": "Config",
+            "type": "object"
+          },
+          "connection_status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceConnectionStatusResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Readiness of a browser-session connection; present only for Sources that use one."
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "doc_count": {
+            "title": "Doc Count",
+            "type": "integer"
+          },
+          "enabled_for_me": {
+            "title": "Enabled For Me",
+            "type": "boolean"
+          },
+          "execution": {
+            "$ref": "#/components/schemas/SourceExecutionResponse"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "last_sync": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Sync"
+          },
+          "memory_count": {
+            "title": "Memory Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "owner_user_id": {
+            "title": "Owner User Id",
+            "type": "string"
+          },
+          "ownership": {
+            "$ref": "#/components/schemas/SourceOwnershipResponse"
+          },
+          "pinned_for_me": {
+            "title": "Pinned For Me",
+            "type": "boolean"
+          },
+          "project_binding": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Project routing rule; null leaves the Source's Memories unmapped.",
+            "title": "Project Binding"
+          },
+          "status": {
+            "enum": [
+              "active",
+              "paused"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "subscription": {
+            "$ref": "#/components/schemas/SourceSubscriptionResponse"
+          },
+          "sync": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceSyncStatusResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sync_schedule": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceSyncScheduleResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "name",
+          "config",
+          "status",
+          "owner_user_id",
+          "access_policy",
+          "access_state",
+          "access_transition",
+          "doc_count",
+          "memory_count",
+          "sync",
+          "client",
+          "ownership",
+          "capabilities",
+          "execution",
+          "subscription",
+          "enabled_for_me",
+          "pinned_for_me"
+        ],
+        "title": "SourceResponse",
+        "type": "object"
+      },
       "SourceSubscriptionRequest": {
         "properties": {
           "enabled": {
@@ -5720,6 +6449,206 @@
           "enabled"
         ],
         "title": "SourceSubscriptionRequest",
+        "type": "object"
+      },
+      "SourceSubscriptionResponse": {
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "SourceSubscriptionResponse",
+        "type": "object"
+      },
+      "SourceSyncFailedDocResponse": {
+        "properties": {
+          "doc_id": {
+            "title": "Doc Id",
+            "type": "string"
+          },
+          "error": {
+            "title": "Error",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "doc_id",
+          "title",
+          "error"
+        ],
+        "title": "SourceSyncFailedDocResponse",
+        "type": "object"
+      },
+      "SourceSyncProgressAmountResponse": {
+        "properties": {
+          "completed": {
+            "title": "Completed",
+            "type": "integer"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          },
+          "unit": {
+            "enum": [
+              "item",
+              "page",
+              "file",
+              "issue",
+              "message",
+              "conversation"
+            ],
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "completed",
+          "unit"
+        ],
+        "title": "SourceSyncProgressAmountResponse",
+        "type": "object"
+      },
+      "SourceSyncProgressCountsResponse": {
+        "properties": {
+          "changed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Changed"
+          },
+          "failed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed"
+          },
+          "memories_created": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memories Created"
+          }
+        },
+        "title": "SourceSyncProgressCountsResponse",
+        "type": "object"
+      },
+      "SourceSyncProgressResponse": {
+        "description": "The public sync progress snapshot (see ``normalize_sync_progress_snapshot``).",
+        "properties": {
+          "counts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceSyncProgressCountsResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "phase": {
+            "enum": [
+              "waiting_for_device",
+              "connecting",
+              "discovering",
+              "fetching",
+              "uploading",
+              "processing",
+              "recovering_derivations",
+              "reconciling"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceSyncProgressAmountResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "source_time_range": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceSyncProgressTimeRangeResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "schema_version",
+          "phase"
+        ],
+        "title": "SourceSyncProgressResponse",
+        "type": "object"
+      },
+      "SourceSyncProgressTimeRangeResponse": {
+        "properties": {
+          "end": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End"
+          },
+          "start": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start"
+          }
+        },
+        "title": "SourceSyncProgressTimeRangeResponse",
         "type": "object"
       },
       "SourceSyncRequest": {
@@ -5798,6 +6727,56 @@
         "title": "SourceSyncRetryTarget",
         "type": "object"
       },
+      "SourceSyncRunReceiptResponse": {
+        "description": "Admission receipt for a server-side sync run.",
+        "properties": {
+          "coalesced": {
+            "title": "Coalesced",
+            "type": "boolean"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "success",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "message",
+          "source_id",
+          "run_id",
+          "status",
+          "created_at",
+          "coalesced"
+        ],
+        "title": "SourceSyncRunReceiptResponse",
+        "type": "object"
+      },
       "SourceSyncScheduleRequest": {
         "properties": {
           "enabled": {
@@ -5852,6 +6831,276 @@
           }
         },
         "title": "SourceSyncScheduleResponse",
+        "type": "object"
+      },
+      "SourceSyncStatusResponse": {
+        "description": "A Source's latest sync, read from one of three places.\n\nAn active durable run carries the run fields (``run_id``, ``trigger``,\n``force_full_sync``, ``created_at``, ``next_attempt_at``,\n``recovery_count``, ``progress_revision``, ``progress_updated_at``). A\nsync running in this process carries its live counters (``phase``,\n``docs_*``, ``memories_*``, ``current_title``). The last recorded sync\ncarries its totals, ``run_id`` and ``failed_docs``. Fields outside the\nchosen shape are absent.",
+        "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "current_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Title"
+          },
+          "docs_failed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Docs Failed"
+          },
+          "docs_processed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Docs Processed"
+          },
+          "docs_stored": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Docs Stored"
+          },
+          "docs_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Docs Total"
+          },
+          "docs_updated": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Docs Updated"
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          },
+          "failed_docs": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SourceSyncFailedDocResponse"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed Docs"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "force_full_sync": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Force Full Sync"
+          },
+          "memories_extracted": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memories Extracted"
+          },
+          "memories_stored": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memories Stored"
+          },
+          "next_attempt_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Attempt At"
+          },
+          "phase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phase"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceSyncProgressResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "progress_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Progress Revision"
+          },
+          "progress_updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Progress Updated At"
+          },
+          "recovery_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recovery Count"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "recovering",
+              "success",
+              "partial",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "trigger": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger"
+          }
+        },
+        "required": [
+          "status",
+          "started_at",
+          "finished_at",
+          "error_message",
+          "progress"
+        ],
+        "title": "SourceSyncStatusResponse",
         "type": "object"
       },
       "StatsResponse": {
@@ -6041,7 +7290,9 @@
           "201": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/LocalAgentJobCreateResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -6070,7 +7321,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/LocalAgentJobListResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -6268,7 +7521,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/LocalAgentDaemonStatusResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -7090,7 +8345,7 @@
     "/api/v1/documents/{doc_id}/artifacts/{kind}": {
       "get": {
         "description": "Serve an explicit artifact kind of the newest stored copy of a Document that has it.",
-        "operationId": "get_document_artifact_api_v1_documents__doc_id__artifacts__kind__get",
+        "operationId": "get_document_artifact_api_v1_documents__doc_id__artifacts__kind__head",
         "parameters": [
           {
             "in": "path",
@@ -7140,7 +8395,7 @@
     "/api/v1/documents/{doc_id}/content": {
       "get": {
         "description": "Serve normalized source content through the API for Docker/SaaS clients.",
-        "operationId": "get_document_content_api_v1_documents__doc_id__content_get",
+        "operationId": "get_document_content_api_v1_documents__doc_id__content_head",
         "parameters": [
           {
             "in": "path",
@@ -7181,7 +8436,7 @@
     "/api/v1/documents/{doc_id}/pdf": {
       "get": {
         "description": "Serve a stored source PDF through the API for Docker/SaaS clients.",
-        "operationId": "get_document_pdf_api_v1_documents__doc_id__pdf_get",
+        "operationId": "get_document_pdf_api_v1_documents__doc_id__pdf_head",
         "parameters": [
           {
             "in": "path",
@@ -8449,45 +9704,6 @@
       }
     },
     "/api/v1/memories/{memory_id}": {
-      "delete": {
-        "description": "Soft-delete a memory (mark as retired and hide from search).",
-        "operationId": "delete_memory_api_v1_memories__memory_id__delete",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "memory_id",
-            "required": true,
-            "schema": {
-              "title": "Memory Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Delete Memory",
-        "tags": [
-          "memories"
-        ]
-      },
       "get": {
         "description": "Get full memory detail including provenance (linked source documents).",
         "operationId": "get_memory_api_v1_memories__memory_id__get",
@@ -8634,7 +9850,7 @@
     },
     "/api/v1/memories/{memory_id}/purge": {
       "delete": {
-        "description": "Hard-purge a memory for privacy/compliance removal.",
+        "description": "Hard-purge a visible memory for privacy/compliance removal.\n\nPurging is irreversible: a private memory can be purged only by its\nowner, and a workspace memory only by a workspace administrator. A\nmemory that an active source still supports is refused, because the\nnext sync would extract it again; remove the content at the source or\nretire the source instead. Everyday removal goes through\n``POST /memories/{memory_id}/retire``.",
         "operationId": "purge_memory_api_v1_memories__memory_id__purge_delete",
         "parameters": [
           {
@@ -9636,68 +10852,10 @@
         ]
       }
     },
-    "/api/v1/schedule": {
-      "get": {
-        "description": "Get the current sync schedule configuration.",
-        "operationId": "get_schedule_api_v1_schedule_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Get Schedule",
-        "tags": [
-          "schedule"
-        ]
-      },
-      "put": {
-        "description": "Update the sync schedule configuration.",
-        "operationId": "update_schedule_api_v1_schedule_put",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ScheduleConfigRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Update Schedule",
-        "tags": [
-          "schedule"
-        ]
-      }
-    },
     "/api/v1/source-artifacts/{observation_revision_id}": {
       "get": {
         "description": "Serve one exact current Artifact revision under source access.",
-        "operationId": "get_source_artifact_api_v1_source_artifacts__observation_revision_id__get",
+        "operationId": "get_source_artifact_api_v1_source_artifacts__observation_revision_id__head",
         "parameters": [
           {
             "in": "path",
@@ -9743,7 +10901,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourceListPreferencesResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -9771,7 +10931,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourceListPreferencesResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -9837,7 +10999,7 @@
     "/api/v1/source-units/{source_unit_id}/artifacts/{kind}": {
       "get": {
         "description": "Serve an explicit artifact kind of the stored input of one Source Unit.",
-        "operationId": "get_source_unit_artifact_api_v1_source_units__source_unit_id__artifacts__kind__get",
+        "operationId": "get_source_unit_artifact_api_v1_source_units__source_unit_id__artifacts__kind__head",
         "parameters": [
           {
             "in": "path",
@@ -9887,7 +11049,7 @@
     "/api/v1/source-units/{source_unit_id}/content": {
       "get": {
         "description": "Serve the normalized content one Source stored for its Unit.",
-        "operationId": "get_source_unit_content_api_v1_source_units__source_unit_id__content_get",
+        "operationId": "get_source_unit_content_api_v1_source_units__source_unit_id__content_head",
         "parameters": [
           {
             "in": "path",
@@ -9928,7 +11090,7 @@
     "/api/v1/source-units/{source_unit_id}/pdf": {
       "get": {
         "description": "Serve the PDF one Source stored for its Unit.",
-        "operationId": "get_source_unit_pdf_api_v1_source_units__source_unit_id__pdf_get",
+        "operationId": "get_source_unit_pdf_api_v1_source_units__source_unit_id__pdf_head",
         "parameters": [
           {
             "in": "path",
@@ -9974,7 +11136,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourceListResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -11520,7 +12684,17 @@
           "202": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SourceSyncRunReceiptResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocalCollectionReceiptResponse"
+                    }
+                  ],
+                  "title": "Response Trigger Sync Api V1 Sources  Source Id  Sync Post"
+                }
               }
             },
             "description": "Successful Response"

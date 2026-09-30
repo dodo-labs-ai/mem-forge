@@ -4,8 +4,8 @@ interface OrganizableSource {
   id: string;
   name: string;
   type: string;
-  created_at: string;
-  last_sync: string | null;
+  created_at?: string | null;
+  last_sync?: string | null;
   pinned_for_me?: boolean;
   doc_count: number;
 }
@@ -33,7 +33,7 @@ function normalized(value: string): string {
   return value.trim().toLocaleLowerCase();
 }
 
-function timestamp(value: string | null): number {
+function timestamp(value: string | null | undefined): number {
   if (!value) return Number.NEGATIVE_INFINITY;
   const parsed = Date.parse(value);
   return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;

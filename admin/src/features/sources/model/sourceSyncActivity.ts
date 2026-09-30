@@ -70,7 +70,7 @@ export function sourceSyncActivityFromStatus(sync: SyncStatus): SourceSyncActivi
         ? "active"
         : sync.status,
     progress: sync.progress ?? undefined,
-    error: { message: sync.error_message, items: sync.failed_docs },
+    error: { message: sync.error_message, items: sync.failed_docs ?? undefined },
     startedAt: sync.started_at,
     updatedAt: sync.progress_updated_at,
     finishedAt: sync.finished_at,

@@ -1,21 +1,13 @@
 import type { paths } from "./schema.gen";
-import type {
-  LocalAgentDaemonStatus,
-  LocalAgentJobCreateResponse,
-  LocalAgentJobList,
-  SourceListPreferences,
-  SourceListResponse,
-  SourceSyncReceipt,
-} from "./responses";
+import type { LocalAgentJob } from "./responses";
 
-/** Declared JSON responses for operations whose generated type is unknown. */
+/**
+ * JSON responses the UI reads more precisely than the generated schema
+ * states. Keep this list short: a route belongs here only while its schema
+ * leaves part of the body free-form.
+ */
 interface ResponsePatches {
-  "/api/v1/sources": { get: SourceListResponse };
-  "/api/v1/source-list/preferences": { get: SourceListPreferences; put: SourceListPreferences };
-  "/api/v1/sources/{source_id}/sync": { post: SourceSyncReceipt };
-  "/api/cloud/local-agent/status": { get: LocalAgentDaemonStatus };
-  "/api/cloud/local-agent/jobs": { post: LocalAgentJobCreateResponse };
-  "/api/cloud/local-agent/jobs/current": { get: LocalAgentJobList };
+  "/api/cloud/local-agent/jobs/current": { get: { data: LocalAgentJob[] } };
 }
 
 /** Success statuses whose generated body is replaced by the declared one. */

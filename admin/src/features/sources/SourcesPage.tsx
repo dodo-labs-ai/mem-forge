@@ -36,6 +36,7 @@ import {
   type SourceFilter,
   type SourceRow,
 } from "./model/sourceRows";
+import { sourceProjectBinding } from "./model/projectBinding";
 import type { ResolvedBySource } from "./model/projectGrouping";
 import type { Source } from "./model/types";
 import { SOURCE_COLUMNS } from "./sourceColumns";
@@ -65,7 +66,7 @@ function useTypeLabels(): Record<string, string> {
 
 function useResolvedProjects(sources: Source[]): ResolvedBySource {
   const api = useApi();
-  const byField = sources.filter((source) => source.project_binding?.mode === "by_field");
+  const byField = sources.filter((source) => sourceProjectBinding(source)?.mode === "by_field");
   const results = useQueries({
     queries: byField.map((source) => ({
       queryKey: [...sourceKeys.all, "resolved-projects", source.id],
