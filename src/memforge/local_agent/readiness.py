@@ -8,9 +8,13 @@ class BrowserSessionStatus(TypedDict, total=False):
     principal_changed: bool
 
 
+SourceConnectionState = Literal["ready", "action_required"]
+SourceConnectionReason = Literal["authentication", "configuration", "identity_conflict"]
+
+
 class SourceConnectionStatus(TypedDict):
-    state: Literal["ready", "action_required"]
-    reason: NotRequired[Literal["authentication", "configuration", "identity_conflict"] | None]
+    state: SourceConnectionState
+    reason: NotRequired[SourceConnectionReason | None]
 
 
 def connection_status_from_browser_session(
