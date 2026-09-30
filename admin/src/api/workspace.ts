@@ -10,6 +10,8 @@ export interface WorkspaceTarget {
   localAgentBaseUrl: string;
   /** Sent as the `workspace_id` query parameter on resource routes. */
   workspaceId: string | null;
+  /** Name of the workspace, shown in the browser tab title. */
+  label?: string;
 }
 
 export const RESOURCE_PREFIX = "/api/v1";
@@ -31,7 +33,18 @@ function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
 }
 
-function sameTarget(a: WorkspaceTarget | null, b: WorkspaceTarget | null): boolean {
+function normalize(target: WorkspaceTarget | null): WorkspaceTarget | null {
+  return (
+    target && {
+      ...target,
+      resourceBaseUrl: trimTrailingSlash(target.resourceBaseUrl),
+      localAgentBaseUrl: trimTrailingSlash(target.localAgentBaseUrl),
+    }
+  );
+}
+
+/** Whether both targets send requests to the same workspace. */
+function sameRequests(a: WorkspaceTarget | null, b: WorkspaceTarget | null): boolean {
   if (a === null || b === null) return a === b;
   return (
     a.resourceBaseUrl === b.resourceBaseUrl &&
@@ -41,26 +54,24 @@ function sameTarget(a: WorkspaceTarget | null, b: WorkspaceTarget | null): boole
 }
 
 /**
- * Creates the workspace target holder. `onChange` runs after every real
- * change, so the caller can drop data cached for the previous workspace.
+ * Creates the workspace target holder. `onChange` runs whenever requests go to
+ * a different workspace, so the caller can drop data cached for the previous
+ * one; a new label alone only notifies subscribers.
  */
 export function createWorkspaceController(
   onChange: () => void,
   initial: WorkspaceTarget | null = STANDALONE_TARGET,
 ): WorkspaceController {
-  let target = initial;
+  let target = normalize(initial);
   const listeners = new Set<() => void>();
   return {
     current: () => target,
     setTarget(next) {
-      const normalized = next && {
-        resourceBaseUrl: trimTrailingSlash(next.resourceBaseUrl),
-        localAgentBaseUrl: trimTrailingSlash(next.localAgentBaseUrl),
-        workspaceId: next.workspaceId,
-      };
-      if (sameTarget(target, normalized)) return;
+      const normalized = normalize(next);
+      const requestsChanged = !sameRequests(target, normalized);
+      if (!requestsChanged && target?.label === normalized?.label) return;
       target = normalized;
-      onChange();
+      if (requestsChanged) onChange();
       listeners.forEach((listener) => listener());
     },
     subscribe(listener) {
