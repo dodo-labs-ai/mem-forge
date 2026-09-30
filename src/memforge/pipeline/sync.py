@@ -870,6 +870,7 @@ class GeneSyncOrchestrator:
         reused_projection_count = 0
         total_item_count = 0
         failure_retryable = True
+        absence_check_skipped_reason: str | None = None
         recovered_completed_results: tuple[dict[str, Any], ...] = ()
         recovered_deferred_results: tuple[dict[str, Any], ...] = ()
         recovered_failed_results: tuple[dict[str, Any], ...] = ()
@@ -1403,11 +1404,13 @@ class GeneSyncOrchestrator:
                 except Exception as exc:
                     # The run's content is committed; only the absence proof is
                     # missing, so every unlisted Document keeps its Support and
-                    # the next run lists again.
+                    # the next run lists again. The run records why, so its
+                    # sync activity shows that nothing was removed.
+                    absence_check_skipped_reason = str(exc) or type(exc).__name__
                     logger.warning(
                         "Absence check skipped for %s: its scope listing did not complete: %s",
                         source_id,
-                        exc,
+                        absence_check_skipped_reason,
                     )
 
             if absent_doc_ids is not None:
@@ -1597,6 +1600,7 @@ class GeneSyncOrchestrator:
             error_message=error_message,
             failed_docs=failed_docs,
             failure_retryable=failure_retryable,
+            absence_check_skipped_reason=absence_check_skipped_reason,
             runtime_bundles=tuple(runtime_bundles),
         )
 

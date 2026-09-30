@@ -25,11 +25,15 @@ export interface SourceSyncActivity {
   finishedAt?: string | null;
   nextAttemptAt?: string | null;
   retryTarget?: SourceSyncRetryTarget;
+  /** Why a finished run removed nothing although it was due to check for deleted items. */
+  absenceCheckSkippedReason?: string | null;
 }
 
 export interface SourceSyncPresentation {
   message: string;
   detail: string;
+  /** Something a finished run left undone that does not make it fail. */
+  notice?: string;
   configureScope?: boolean;
   completed?: number;
   total?: number;
@@ -79,6 +83,7 @@ export function sourceSyncActivityFromStatus(sync: SyncStatus): SourceSyncActivi
     nextAttemptAt: sync.next_attempt_at,
     retryTarget: sync.status === "pending" && sync.run_id
       ? { execution_kind: "source_sync_run", execution_id: sync.run_id } : undefined,
+    absenceCheckSkippedReason: sync.absence_check_skipped_reason,
   };
 }
 
@@ -215,11 +220,14 @@ export function presentSourceSyncActivity(
     };
     return { message: "Action needed", detail: safeFailureDetail(activity.error) };
   }
-  if (activity.state === "partial") {
-    return withProgress("Partially synced", activity.progress, fallbackItems);
-  }
-  if (activity.state === "success") {
-    return withProgress("Up to date", activity.progress, fallbackItems);
+  if (activity.state === "partial" || activity.state === "success") {
+    const presentation = withProgress(
+      activity.state === "partial" ? "Partially synced" : "Up to date",
+      activity.progress,
+      fallbackItems,
+    );
+    const reason = activity.absenceCheckSkippedReason?.trim();
+    return reason ? { ...presentation, notice: `Deletion check skipped: ${reason}` } : presentation;
   }
 
   const snapshot = activity.progress;

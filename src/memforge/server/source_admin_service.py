@@ -246,6 +246,7 @@ async def list_source_admin_rows(
                     "memories_extracted": latest.get("memories_extracted", 0),
                     "error_message": latest.get("error_message"),
                     "failed_docs": latest.get("failed_docs", []),
+                    "absence_check_skipped_reason": latest.get("absence_check_skipped_reason"),
                     "progress": {
                         "schema_version": 1,
                         "phase": "processing",

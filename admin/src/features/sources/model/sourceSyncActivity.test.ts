@@ -352,3 +352,28 @@ test("offers Sync now when nothing is queued or running", () => {
   }
   assert.deepEqual(sourceSyncControl(undefined, true), { label: "Starting", enabled: false });
 });
+
+test("notes a finished sync that skipped its deletion check", () => {
+  const finishedSync: SyncStatus = {
+    status: "success",
+    run_id: "ssr-2",
+    started_at: "2026-07-08T10:00:00Z",
+    finished_at: "2026-07-08T10:01:00Z",
+    error_message: null,
+    progress: { schema_version: 1, phase: "processing", progress: { completed: 3, unit: "issue" } },
+    absence_check_skipped_reason: "Jira search total changed during pagination",
+  };
+  assert.deepEqual(presentSourceSyncActivity(sourceSyncActivityFromStatus(finishedSync), "Jira", "issues"), {
+    message: "Up to date",
+    detail: "3 issues",
+    notice: "Deletion check skipped: Jira search total changed during pagination",
+  });
+  assert.equal(
+    presentSourceSyncActivity(
+      sourceSyncActivityFromStatus({ ...finishedSync, absence_check_skipped_reason: null }),
+      "Jira",
+      "issues",
+    ).notice,
+    undefined,
+  );
+});
