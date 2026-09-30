@@ -504,6 +504,20 @@ class NormalizedContent:
     source_semantics: dict = field(default_factory=dict)
 
 
+def require_attested_content(raw: RawContent, normalized: NormalizedContent) -> None:
+    """Refuse normalized content that is empty unless the provider attested it empty."""
+
+    if normalized.markdown_body and normalized.markdown_body.strip():
+        return
+    doc_id = raw.item.item_id
+    if raw.body.strip() and not raw.authoritative_empty:
+        raise ValueError(f"normalization produced empty content from a non-empty artifact: {doc_id}")
+    if not raw.authoritative_empty:
+        raise ValueError(f"provider did not attest authoritative empty content: {doc_id}")
+    if not str(raw.empty_evidence or "").strip():
+        raise ValueError(f"authoritative empty content is missing provider evidence: {doc_id}")
+
+
 SourceExecutionKind = Literal["server", "local_agent"]
 
 

@@ -232,6 +232,18 @@ class Gene(ABC):
             The raw bytes and content-type for downstream normalisation.
         """
 
+    def raw_from_stored_input(self, item: ContentItem, body: bytes, content_type: str) -> RawContent:
+        """Rebuild the raw content of one stored input for reprocessing.
+
+        Stored input keeps the bytes :meth:`fetch` returned, not the
+        attestations it made about them. A Gene whose bytes carry the
+        provider's own evidence (a local-agent package that records an empty
+        file or a tombstoned window) reads that evidence back from the bytes;
+        by default stored bytes attest nothing. Artifacts come from the
+        committed revision, never from here.
+        """
+        return RawContent(item=item, body=body, content_type=content_type)
+
     async def rediscover(self, item: ContentItem) -> ContentItem | None:
         """Return the provider's current item for one stored Document.
 

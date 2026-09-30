@@ -14,11 +14,14 @@ from fastapi.testclient import TestClient
 from memforge.config import AppConfig, SyncConfig
 from memforge.models import ContentItem, GeneMetadata, NormalizedContent, RawContent, SyncState
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+from memforge.pipeline.source_projection_adapters import DEFAULT_SOURCE_PROJECTION_ADAPTER
+from memforge.pipeline.stored_document import reprocess_preview
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
 from memforge.runtime import SourceSyncWorker, SyncService
 from memforge.source_activity import SourceSyncRunActive
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactDownload
 from memforge.source_projection import ProjectionScopeTransition
+from memforge.source_projection_config import canonical_projection_scope, source_access_context
 from memforge.storage.database import Database
 from memforge.storage.document_store import StoredDocumentArtifact
 from tests.test_sync_bookkeeping import (
@@ -65,6 +68,8 @@ class JiraGene:
 
     def __init__(self) -> None:
         self.provider_open = True
+        # Documents whose content normalizes to nothing without provider evidence.
+        self.unattested_empty: set[str] = set()
 
     def _provider(self) -> None:
         if not self.provider_open:
@@ -76,6 +81,9 @@ class JiraGene:
             name="jira", display_name="Jira", description="", default_sync_interval_minutes=60,
             auth_method="pat", data_shape="ticket",
         )
+
+    def raw_from_stored_input(self, item: ContentItem, body: bytes, content_type: str) -> RawContent:
+        return RawContent(item=item, body=body, content_type=content_type)
 
     def requires_pdf_artifact(self, **kwargs) -> bool:
         return False
@@ -118,6 +126,8 @@ class JiraGene:
         yield SourceArtifactDownload(chunks=chunks(), media_type="image/png", content_length=len(payload))
 
     async def normalize(self, raw):
+        if raw.item.item_id in self.unattested_empty:
+            return NormalizedContent(item=raw.item, markdown_body="")
         return NormalizedContent(item=raw.item, markdown_body=f"# {raw.item.title}\n\nBody")
 
 
@@ -264,6 +274,35 @@ async def test_stored_input_that_would_move_the_unit_fails_closed(db):
     assert harness.extractor.fragment_calls == []
 
 
+@pytest.mark.asyncio
+async def test_the_preview_refuses_each_unit_the_reprocess_refuses_for_the_same_reason(db):
+    harness = await synced(db)
+    harness.gene.unattested_empty.add(doc_id("PAY-1"))
+    await db.db.execute(
+        """UPDATE source_unit_inputs SET item_json = json_set(item_json, '$.source_url', ?)
+            WHERE source_id = ? AND document_id = ?""",
+        ("https://jira.example/browse/elsewhere", SOURCE_ID, doc_id("PAY-2")),
+    )
+    await db.db.commit()
+    source = await db.get_source(SOURCE_ID)
+
+    preview = await reprocess_preview(
+        db, harness.store, harness.gene, source_id=SOURCE_ID, document_ids=(doc_id("PAY-1"), doc_id("PAY-2")),
+        rediscovers=False, projection_adapter=DEFAULT_SOURCE_PROJECTION_ADAPTER,
+        projection_scope=canonical_projection_scope("jira", source["config"]),
+        access_context=source_access_context(source),
+    )
+    state = await harness.reprocess("PAY-1", "PAY-2")
+
+    refused = {doc_id("PAY-1"): "stored_input_invalid", doc_id("PAY-2"): "stored_input_incomplete"}
+    assert {unit.document_id: unit.reason for unit in preview.units} == refused
+    assert preview.available_unit_count == 0 and preview.estimated_model_calls == 0
+    assert {failed.doc_id: failed.error.split(":")[0] for failed in state.failed_docs} == refused
+    [invalid] = [unit for unit in preview.units if unit.reason == "stored_input_invalid"]
+    assert invalid.detail == f"normalization produced empty content from a non-empty artifact: {doc_id('PAY-1')}"
+    assert harness.engine.projected_lifecycle_calls == []
+
+
 class ConfluenceGene:
     """Places a child page under its parent only from the item metadata fetched with it."""
 
@@ -275,6 +314,9 @@ class ConfluenceGene:
             name="confluence", display_name="Confluence", description="", default_sync_interval_minutes=60,
             auth_method="pat", data_shape="document",
         )
+
+    def raw_from_stored_input(self, item: ContentItem, body: bytes, content_type: str) -> RawContent:
+        return RawContent(item=item, body=body, content_type=content_type)
 
     def requires_pdf_artifact(self, **kwargs) -> bool:
         return False

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -9,6 +11,7 @@ import requests
 from memforge.genes import GENE_REGISTRY
 from memforge.genes.github_repo_gene import GitHubRepoGene
 from memforge.github_repo_utils import build_github_repo_doc_id
+from memforge.models import ContentItem, RawContent, require_attested_content
 from memforge.source_artifacts import SourceArtifactContractError
 
 
@@ -574,6 +577,95 @@ async def test_local_push_discovers_and_normalizes_pushed_package(tmp_path):
     assert normalized.source_semantics["connection_mode"] == "local_push"
     assert normalized.source_semantics["repo_identifier"] == "github.example.test/payroll/architecture"
     assert normalized.source_semantics["relative_path"] == "README.md"
+
+
+def _local_push_package(**overrides) -> dict:
+    package = {
+        "package_kind": "github_repo_document",
+        "doc_id": "github-repo-src-doc",
+        "title": "Architecture README",
+        "source_url": "https://github.example.test/payroll/architecture/blob/main/README.md",
+        "last_modified": "2026-07-07T09:30:00+00:00",
+        "space_or_project": "payroll/architecture",
+        "version": "blob-sha-1",
+        "repo_url": "https://github.example.test/payroll/architecture",
+        "repo_host": "github.example.test",
+        "repo_owner": "payroll",
+        "repo_name": "architecture",
+        "repo_ref": "main",
+        "relative_path": "README.md",
+        "blob_sha": "blob-sha-1",
+        "content_type": "text/markdown",
+        "markdown": "# Architecture\n\nMemory source design.",
+    }
+    return {**package, **overrides}
+
+
+async def _discovered_package(tmp_path, package: dict) -> tuple[GitHubRepoGene, ContentItem, RawContent]:
+    (tmp_path / "github-repo-doc.json").write_text(json.dumps(package), encoding="utf-8")
+    gene = GitHubRepoGene(
+        config={
+            "connection_mode": "local_push",
+            "repo_url": "https://github.example.test/payroll/architecture",
+            "documents_dir": str(tmp_path),
+        },
+        source_id="src-github-repo",
+    )
+    [item] = [item async for item in gene.discover()]
+    return gene, item, await gene.fetch(item)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("markdown", ["# Architecture\n\nMemory source design.", ""])
+async def test_a_stored_package_is_read_by_its_own_kind_without_discovery_metadata(tmp_path, markdown):
+    gene, item, fetched = await _discovered_package(tmp_path, _local_push_package(markdown=markdown))
+    assert item.extra["package_path"]
+
+    # Stored input keeps the package bytes; its item may carry no discovery metadata.
+    stored_item = replace(item, extra={})
+    stored = gene.raw_from_stored_input(stored_item, fetched.body, "application/json")
+    from_fetch = await gene.normalize(fetched)
+    from_storage = await gene.normalize(stored)
+
+    assert from_storage.markdown_body == from_fetch.markdown_body == markdown
+    assert from_storage.source_semantics == from_fetch.source_semantics
+    assert from_storage.source_semantics["repo_identifier"] == "github.example.test/payroll/architecture"
+    assert (stored.authoritative_empty, stored.empty_evidence) == (fetched.authoritative_empty, fetched.empty_evidence)
+    require_attested_content(stored, from_storage)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("package_kind", [None, "teams_window_document"])
+async def test_a_json_repository_file_is_read_as_file_text(package_kind):
+    body = {"repo_url": "https://github.example.test/other/repo", "markdown": "not a package"}
+    if package_kind is not None:
+        body["package_kind"] = package_kind
+    item = ContentItem(
+        item_id="github-repo-src-config",
+        title="config",
+        source_url="https://github.example.test/payroll/architecture/blob/main/config.json",
+        last_modified=datetime(2026, 7, 7, tzinfo=timezone.utc),
+        content_type="application/json",
+        extra={
+            "connection_mode": "cloud_pull",
+            "repo_url": "https://github.example.test/payroll/architecture",
+            "relative_path": "config.json",
+        },
+    )
+    gene = GitHubRepoGene(
+        config={"connection_mode": "cloud_pull", "repo_url": "https://github.example.test/payroll/architecture"},
+        source_id="src-github-repo",
+    )
+    text = json.dumps(body).encode("utf-8")
+
+    stored = gene.raw_from_stored_input(item, text, "application/json")
+    normalized = await gene.normalize(stored)
+
+    assert (stored.authoritative_empty, stored.empty_evidence) == (False, None)
+    assert "not a package" in normalized.markdown_body
+    assert normalized.source_semantics["connection_mode"] == "cloud_pull"
+    assert normalized.source_semantics["repo_identifier"] == "github.example.test/payroll/architecture"
+    assert normalized.source_semantics["relative_path"] == "config.json"
 
 
 @pytest.mark.asyncio

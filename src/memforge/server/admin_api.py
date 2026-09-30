@@ -169,6 +169,7 @@ from memforge.runtime import (
     SyncService,
     SourcePausedError,
 )
+from memforge.pipeline.source_projection_adapters import DEFAULT_SOURCE_PROJECTION_ADAPTER
 from memforge.pipeline.stored_document import reprocess_preview
 from memforge.scheduler import SyncScheduler
 from memforge.source_secrets import (
@@ -183,7 +184,7 @@ from memforge.source_projection import (
     ProjectionScopeTransition,
     SourceUnitInventoryFilter,
 )
-from memforge.source_projection_config import projection_scope_transition_id
+from memforge.source_projection_config import projection_scope_transition_id, source_access_context
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.source_cleanup import SourceArtifactCleanupService
@@ -7665,9 +7666,25 @@ def create_admin_app(
             raise HTTPException(status_code=409, detail="projection_scope_transition_open")
         if req.dry_run:
             response.status_code = 200
+            source_config = source.get("config") or {}
+            try:
+                gene = create_gene(
+                    source["type"],
+                    decrypt_source_config_for_runtime(
+                        source_config,
+                        secret_fields=source_secret_fields(source["type"], GENE_REGISTRY),
+                    ),
+                    source_id=source_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            gene.bind_document_store(artifact_store)
             return asdict(await reprocess_preview(
-                db, artifact_store, source_id=source_id, document_ids=document_ids,
-                rediscovers=source_rediscovers_documents(source["type"], source.get("config") or {}),
+                db, artifact_store, gene, source_id=source_id, document_ids=document_ids,
+                rediscovers=source_rediscovers_documents(source["type"], source_config),
+                projection_adapter=DEFAULT_SOURCE_PROJECTION_ADAPTER,
+                projection_scope=_sync_scope_config(source["type"], source_config),
+                access_context=source_access_context(source),
             ))
         try:
             run = await sync_service.enqueue_reprocess(source_id, document_ids)

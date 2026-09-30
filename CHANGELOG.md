@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Genes decode stored input by the bytes themselves. A local-agent package is
+  recognized by its own `package_kind`, exactly that Gene's kind, never by
+  `item.extra.package_uri` or `package_path`, so a repository file that
+  happens to be JSON stays file text. What a package attests about its content
+  (an empty file, a tombstoned Teams window) is read back from the stored bytes
+  through `Gene.raw_from_stored_input`. Reprocess and its `dry_run` preview run
+  the same check (`project_stored_input`: normalize, attested content,
+  projection, committed location); a Unit that fails it is unavailable with
+  `stored_input_invalid` or `stored_input_incomplete` in both, and the run no
+  longer retries it. This repairs reprocess of the local-push GitHub inputs
+  that the ADR 0041 upgrade migrated with an empty `extra`. Cloud: arrives with
+  the pin; no HANA schema, protocol or configuration change, no data fix, no
+  resync. See the ADR 0041 amendment of 2026-09-30.
+
 - Sources sync only on their own schedules. The workspace-wide "sync every
   active Source" schedule is removed: `GET/PUT /api/v1/schedule`, its scheduler
   job and the `schedule_all` sync trigger no longer exist, and migration 108
