@@ -1099,3 +1099,92 @@ async def test_page_tree_rejects_page_without_stable_version():
     with pytest.raises(RuntimeError, match="version metadata"):
         _ = [item async for item in gene.discover()]
     assert gene.discovery_complete is False
+
+
+def _page_tree_gene(client) -> ConfluenceGene:
+    gene = ConfluenceGene(
+        config={"base_url": "https://wiki.example.com", "page_tree_root": "root", "include_children": True},
+        source_id="src-confluence",
+    )
+    gene._base_url = "https://wiki.example.com"
+    gene._api_prefix = "/wiki"
+    gene._client = client
+    return gene
+
+
+@pytest.mark.asyncio
+async def test_incremental_page_tree_discovery_lists_every_walked_page_as_a_query():
+    gene = _page_tree_gene(PageTreeClient())
+    gene.begin_discovery()
+
+    _ = [item async for item in gene.discover(since=datetime(2026, 5, 25, tzinfo=timezone.utc))]
+    listing = await gene.list_scope()
+
+    assert listing.kind.value == "query"
+    assert listing.doc_ids == {"confluence-root", "confluence-parent", "confluence-target"}
+
+
+@pytest.mark.asyncio
+async def test_preview_limited_discovery_does_not_list_the_scope():
+    gene = _page_tree_gene(PreviewLimitClient())
+    gene.config[PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY] = 1
+    gene.begin_discovery()
+
+    _ = [item async for item in gene.discover()]
+
+    assert await gene.list_scope() is None
+
+
+@pytest.mark.asyncio
+async def test_confirming_unlisted_pages_keeps_a_page_moved_out_of_the_tree():
+    reads: list[str] = []
+    # "moved" was moved out of the page tree, "deleted" is in the trash and
+    # "restricted" is refused for this one page.
+    status_by_page = {"moved": httpx.codes.OK, "deleted": httpx.codes.NOT_FOUND, "restricted": httpx.codes.FORBIDDEN}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        page_id = request.url.path.rsplit("/", 1)[-1]
+        reads.append(page_id)
+        status = status_by_page[page_id]
+        return httpx.Response(status, json=_page(page_id, "Page", "2026-05-20T00:00:00Z") if status == httpx.codes.OK else {})
+
+    gene = _page_tree_gene(httpx.AsyncClient(base_url="https://wiki.example.com", transport=httpx.MockTransport(handler)))
+    gene._request_limiter = None
+    items = [
+        ContentItem(
+            item_id=f"confluence-{page_id}",
+            title="Page",
+            source_url=f"https://wiki.example.com/pages/{page_id}",
+            last_modified=datetime(2026, 5, 20, tzinfo=timezone.utc),
+            extra={"page_id": page_id},
+        )
+        for page_id in status_by_page
+    ]
+    try:
+        absent = await gene.confirm_absent(items)
+    finally:
+        await gene._client.aclose()
+
+    assert absent == {"confluence-deleted"}
+    assert reads == list(status_by_page)
+
+
+@pytest.mark.asyncio
+async def test_confirming_unlisted_pages_fails_when_confluence_rejects_the_credential():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(httpx.codes.UNAUTHORIZED, json={})
+
+    gene = _page_tree_gene(httpx.AsyncClient(base_url="https://wiki.example.com", transport=httpx.MockTransport(handler)))
+    gene._request_limiter = None
+    item = ContentItem(
+        item_id="confluence-page",
+        title="Page",
+        source_url="https://wiki.example.com/pages/page",
+        last_modified=datetime(2026, 5, 20, tzinfo=timezone.utc),
+        extra={"page_id": "page"},
+    )
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await gene.confirm_absent([item])
+    finally:
+        await gene._client.aclose()
