@@ -795,3 +795,56 @@ async def test_local_push_discovery_enforces_max_files_on_current_scope(tmp_path
     await gene.authenticate()
     with pytest.raises(RuntimeError, match="max_files"):
         [item async for item in gene.discover()]
+
+
+@pytest.mark.asyncio
+async def test_incremental_cloud_pull_lists_the_whole_tree_as_an_existence_listing(monkeypatch):
+    monkeypatch.setattr("memforge.genes.github_repo_gene._RequestsAsyncClient", RepoApiClient)
+    gene = GitHubRepoGene(
+        config={
+            "connection_mode": "cloud_pull",
+            "repo_url": "https://github.example.test/payroll/architecture",
+            "ref": "main",
+            "include_extensions": ["md"],
+            "max_files": 10,
+        },
+        source_id="src-github-repo",
+    )
+
+    await gene.authenticate()
+    gene.begin_discovery()
+    _ = [item async for item in gene.discover(since=datetime(2026, 9, 30, tzinfo=timezone.utc))]
+    listing = await gene.list_scope()
+
+    assert listing.kind.value == "existence"
+    assert listing.doc_ids == {
+        build_github_repo_doc_id(
+            source_id="src-github-repo",
+            repo_url="https://github.example.test/payroll/architecture",
+            repo_ref="main",
+            relative_path=path,
+        )
+        for path in ("Payroll Processing/README.md", "Flexible Payroll/README.md", "Payroll Processing V2/Main Algorithm.md")
+    }
+
+
+@pytest.mark.asyncio
+async def test_cloud_pull_with_a_truncated_tree_lists_nothing(monkeypatch):
+    class TruncatedTreeClient(RepoApiClient):
+        async def get(self, url: str):
+            if url.endswith("/git/trees/tree-main?recursive=1"):
+                return GithubResponse({"tree": [], "truncated": True}, url=url)
+            return await super().get(url)
+
+    monkeypatch.setattr("memforge.genes.github_repo_gene._RequestsAsyncClient", TruncatedTreeClient)
+    gene = GitHubRepoGene(
+        config={"connection_mode": "cloud_pull", "repo_url": "https://github.example.test/payroll/architecture"},
+        source_id="src-github-repo",
+    )
+
+    await gene.authenticate()
+    gene.begin_discovery()
+    with pytest.raises(RuntimeError, match="truncated"):
+        _ = [item async for item in gene.discover()]
+
+    assert await gene.list_scope() is None

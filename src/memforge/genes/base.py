@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -28,6 +28,8 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+    ScopeListing,
+    ScopeListingKind,
     SourceUnitInput,
 )
 from memforge.source_artifacts import (
@@ -48,6 +50,8 @@ __all__ = [
     "ContentItem",
     "RawContent",
     "NormalizedContent",
+    "ScopeListing",
+    "ScopeListingKind",
 ]
 
 logger = logging.getLogger(__name__)
@@ -82,6 +86,8 @@ class Gene(ABC):
     - ``requires_pdf_artifact()`` -- whether a document must retain PDF provenance
     - ``rediscovers_documents()`` and ``rediscover()`` -- read one stored
       Document's current state from the provider by its id
+    - ``list_scope()`` and ``confirm_absent()`` -- list the configured scope
+      by identifier so a run can prove which Documents are gone (ADR 0045)
     """
 
     # ------------------------------------------------------------------
@@ -152,6 +158,7 @@ class Gene(ABC):
         self.source_id = source_id
         self._discovery_complete = False
         self._discovery_completion_reason = "discovery_not_started"
+        self._discovered_scope: ScopeListing | None = None
         self._log = logging.getLogger(f"{__name__}.{type(self).__name__}[{source_id}]")
 
     def begin_discovery(self) -> None:
@@ -159,6 +166,7 @@ class Gene(ABC):
 
         self._discovery_complete = False
         self._discovery_completion_reason = "discovery_incomplete"
+        self._discovered_scope = None
 
     def attest_discovery_complete(self, reason: str) -> None:
         """Record validated provider enumeration completion for this run."""
@@ -178,6 +186,47 @@ class Gene(ABC):
     @property
     def discovery_completion_reason(self) -> str:
         return self._discovery_completion_reason
+
+    def record_scope_listing(self, kind: ScopeListingKind, doc_ids: set[str] | frozenset[str]) -> None:
+        """Record that this run's discovery enumerated the whole configured scope.
+
+        A Gene whose discovery walks every item in scope on every run, and uses
+        ``since`` only to choose which items to yield, records the Document ids
+        it walked once the walk completed. :meth:`list_scope` returns them.
+        """
+
+        self._discovered_scope = ScopeListing(kind=kind, doc_ids=frozenset(doc_ids))
+
+    async def list_scope(self) -> ScopeListing | None:
+        """List every item in the configured scope by Document id, whatever ``since`` discovery used.
+
+        Called after this run's :meth:`discover`. The listing is identifiers
+        only: no content is fetched and no model is called. It is complete or
+        it is not returned: incomplete paging, a truncated result or a provider
+        error raises, and the run proves no absence. By default it is what this
+        run's discovery recorded with :meth:`record_scope_listing`; a Gene whose
+        discovery narrows by ``since`` at the provider lists its scope itself.
+
+        ``None`` means the Gene cannot list its scope, so no Document becomes
+        absent through a listing. Collected snapshots and conversation sources
+        prove absence their own way.
+        """
+
+        return self._discovered_scope
+
+    async def confirm_absent(self, items: Sequence[ContentItem]) -> frozenset[str]:
+        """Return the Document ids of the unlisted ``items`` that the provider no longer has.
+
+        Only a Gene whose listing is a :attr:`ScopeListingKind.QUERY` listing
+        implements it. Each item is rebuilt from its stored Document, as for
+        :meth:`rediscover`. An item is absent only when the provider reports it
+        not found or gone. An item the provider still returns is kept, whether
+        or not it still matches the configured query, and so is one the
+        provider refuses to show for permission reasons; authentication,
+        transport and other provider errors raise.
+        """
+
+        raise NotImplementedError(f"{type(self).__name__} cannot confirm absence by identifier")
 
     def bind_document_store(self, document_store: Any) -> None:
         """Bind the runtime document artifact store when a gene needs it."""

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +20,7 @@ import httpx
 
 from memforge.genes.atlassian_auth import (
     ATLASSIAN_ABSENT_STATUS_CODES,
+    atlassian_record_is_gone,
     atlassian_request_limiter,
     bearer_headers,
     request_with_rate_limit_retry,
@@ -47,6 +48,8 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+    ScopeListing,
+    ScopeListingKind,
 )
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
@@ -77,11 +80,18 @@ JIRA_SEARCH_FIELDS = ["*all"]
 JIRA_SEARCH_EXPAND = ["changelog", "renderedFields"]
 JIRA_INVENTORY_FIELDS = ["summary", "updated", "project"]
 JIRA_INVENTORY_MAX_RESULTS = 100
+# Listing and confirming the scope read identifiers only; id and key come with
+# every search result, and one small field keeps the response minimal.
+JIRA_IDENTITY_FIELDS = ["updated"]
+_ISSUE_DOC_ID_PREFIX = "jira-"
 LOCAL_AGENT_JIRA_PACKAGE_KIND = "jira_document"
 
 JIRA_QUERY_MODE_SIMPLE = "simple"
 JIRA_QUERY_MODE_ADVANCED = "advanced"
 _DEFAULT_ORDER_BY = "ORDER BY updated DESC"
+# The scope listing pages by key: an issue updated while the listing pages
+# keeps its place, so paging neither repeats nor skips it.
+_LISTING_ORDER_BY = "ORDER BY key ASC"
 _ORDER_BY_RE = re.compile(r"\border\s+by\b", re.IGNORECASE)
 
 
@@ -89,12 +99,13 @@ def _delta_clause(since: datetime) -> str:
     return f"updated >= '{since.strftime('%Y-%m-%d %H:%M')}'"
 
 
-def _augment_advanced_jql(raw_jql: str, since: datetime | None) -> str:
+def _augment_advanced_jql(raw_jql: str, since: datetime | None, order_by: str | None = None) -> str:
     """Use a user-authored JQL as-is, injecting the delta clause before ORDER BY.
 
-    The user's query is authoritative: its ORDER BY (or a default) is preserved,
-    and the incremental ``updated >=`` filter is AND-ed onto the where clause
-    (wrapped in parentheses so a top-level OR keeps its meaning).
+    The user's query is authoritative: its ORDER BY (or a default) is preserved
+    unless ``order_by`` replaces it, and the incremental ``updated >=`` filter
+    is AND-ed onto the where clause (wrapped in parentheses so a top-level OR
+    keeps its meaning).
     """
     query = raw_jql.strip()
     match = _ORDER_BY_RE.search(query)
@@ -107,18 +118,18 @@ def _augment_advanced_jql(raw_jql: str, since: datetime | None) -> str:
     if since:
         delta = _delta_clause(since)
         where = f"({where}) AND {delta}" if where else delta
-    return f"{where} {order}".strip()
+    return f"{where} {order_by or order}".strip()
 
 
-def _build_jql(config: dict, since: datetime | None) -> str:
+def _build_jql(config: dict, since: datetime | None, *, order_by: str | None = None) -> str:
     """Build the effective JQL for a sync from the source config.
 
     In ``advanced`` query mode the configured ``jql`` is authoritative. In
     ``simple`` mode the query is assembled from projects, issue types, and an
-    optional refine filter.
+    optional refine filter. ``order_by`` replaces the query's order.
     """
     if str(config.get("query_mode") or JIRA_QUERY_MODE_SIMPLE).strip().lower() == JIRA_QUERY_MODE_ADVANCED:
-        return _augment_advanced_jql(str(config.get("jql") or ""), since)
+        return _augment_advanced_jql(str(config.get("jql") or ""), since, order_by)
 
     projects = config.get("projects", [])
     if isinstance(projects, str):
@@ -133,8 +144,18 @@ def _build_jql(config: dict, since: datetime | None) -> str:
         jql += f" AND ({jql_filter})"
     if since:
         jql += f" AND {_delta_clause(since)}"
-    jql += f" {_DEFAULT_ORDER_BY}"
+    jql += f" {order_by or _DEFAULT_ORDER_BY}"
     return jql
+
+
+def _issue_doc_id(issue_key: str) -> str:
+    return f"{_ISSUE_DOC_ID_PREFIX}{issue_key}"
+
+
+def _issue_ref(item: ContentItem) -> str:
+    """The stored issue's stable id, or its key when the stored item does not record the id."""
+    ref = str(item.extra.get("issue_id") or item.extra.get("issue_key") or "").strip()
+    return ref or item.item_id.removeprefix(_ISSUE_DOC_ID_PREFIX)
 
 
 def _request_interval_seconds(config: dict) -> float:
@@ -287,7 +308,7 @@ def _issue_content_item(issue: dict, base_url: str) -> ContentItem:
         raise RuntimeError(f"Jira issue {key} updated timestamp has no timezone")
     assignee = fields.get("assignee") or {}
     return ContentItem(
-        item_id=f"jira-{key}",
+        item_id=_issue_doc_id(key),
         title=f"{key}: {fields.get('summary', 'Untitled')}",
         source_url=f"{base_url}/browse/{key}",
         last_modified=last_modified,
@@ -500,9 +521,7 @@ class JiraGene(Gene):
 
     async def rediscover(self, item: ContentItem) -> ContentItem | None:
         """Read one issue as discovery does, by its stable id when the stored item has it."""
-        issue_ref = str(item.extra.get("issue_id") or item.extra.get("issue_key") or "").strip()
-        if not issue_ref:
-            issue_ref = item.item_id.removeprefix("jira-")
+        issue_ref = _issue_ref(item)
         try:
             resp = await self._request(
                 "GET",
@@ -536,6 +555,56 @@ class JiraGene(Gene):
         ):
             yield item
 
+    async def list_scope(self) -> ScopeListing | None:
+        """List every issue the configured JQL matches now, without the ``since`` filter.
+
+        Discovery narrows the JQL by ``since`` at the provider, so the scope is
+        listed by its own identifier-only search, one request per
+        ``JIRA_INVENTORY_MAX_RESULTS`` issues. The JQL is a query: an issue it
+        no longer matches may still exist (:meth:`confirm_absent`).
+        """
+        if str(self.config.get("sync_mode") or "cloud").strip().lower() == "local_agent":
+            return None
+        doc_ids = {
+            _issue_doc_id(str(issue["key"]))
+            async for issue in self._search_issues(
+                _build_jql(self.config, None, order_by=_LISTING_ORDER_BY),
+                fields=JIRA_IDENTITY_FIELDS,
+                expand=None,
+                max_results=JIRA_INVENTORY_MAX_RESULTS,
+            )
+        }
+        return ScopeListing(kind=ScopeListingKind.QUERY, doc_ids=frozenset(doc_ids))
+
+    async def confirm_absent(self, items: Sequence[ContentItem]) -> frozenset[str]:
+        """Search the unlisted issues by id in batches; read each one the search does not return.
+
+        The batch search is not validated, so an id Jira does not know is
+        dropped from the result rather than failing the batch. Every issue the
+        search returns exists. One it does not return is read by id: Jira
+        answers not found both for a deleted issue and for one the credential
+        may no longer view, and either is absent to this Source.
+        """
+        absent: set[str] = set()
+        for start in range(0, len(items), JIRA_INVENTORY_MAX_RESULTS):
+            batch = items[start:start + JIRA_INVENTORY_MAX_RESULTS]
+            refs = {item.item_id: _issue_ref(item) for item in batch}
+            found: set[str] = set()
+            async for issue in self._search_issues(
+                f"issuekey in ({', '.join(refs.values())})",
+                fields=JIRA_IDENTITY_FIELDS,
+                expand=None,
+                max_results=JIRA_INVENTORY_MAX_RESULTS,
+                validate_query=False,
+            ):
+                found.update((str(issue["id"]), str(issue["key"])))
+            for doc_id, ref in refs.items():
+                if ref not in found and await atlassian_record_is_gone(
+                    self._request("GET", f"/rest/api/2/issue/{ref}", params={"fields": ",".join(JIRA_IDENTITY_FIELDS)})
+                ):
+                    absent.add(doc_id)
+        return frozenset(absent)
+
     async def _discover_remote_search(
         self,
         since: datetime | None,
@@ -545,7 +614,30 @@ class JiraGene(Gene):
         max_results: int,
         cache_hydrated: bool,
     ) -> AsyncIterator[ContentItem]:
-        jql = _build_jql(self.config, since)
+        async for issue in self._search_issues(
+            _build_jql(self.config, since),
+            fields=fields,
+            expand=expand,
+            max_results=max_results,
+        ):
+            item = _issue_content_item(issue, self._base_url)
+            if cache_hydrated:
+                self._hydrated_issues[str(issue["key"])] = issue
+            else:
+                item.extra["attest_materialized_revision"] = True
+            yield item
+        self.attest_discovery_complete("jira_search_total_exhausted")
+
+    async def _search_issues(
+        self,
+        jql: str,
+        *,
+        fields: list[str],
+        expand: list[str] | None,
+        max_results: int,
+        validate_query: bool = True,
+    ) -> AsyncIterator[dict]:
+        """Page one JQL search to its declared total, yielding each issue once, or raise."""
         seen_issue_ids: set[str] = set()
         seen_issue_keys: set[str] = set()
         expected_total: int | None = None
@@ -561,6 +653,8 @@ class JiraGene(Gene):
                 }
                 if expand:
                     request_body["expand"] = expand
+                if not validate_query:
+                    request_body["validateQuery"] = False
                 resp = await self._request(
                     "POST",
                     "/rest/api/2/search",
@@ -601,12 +695,7 @@ class JiraGene(Gene):
                     raise RuntimeError("Jira search returned duplicate issue identity")
                 seen_issue_ids.add(issue_id)
                 seen_issue_keys.add(key)
-                item = _issue_content_item(issue, self._base_url)
-                if cache_hydrated:
-                    self._hydrated_issues[key] = issue
-                else:
-                    item.extra["attest_materialized_revision"] = True
-                yield item
+                yield issue
 
             # Pagination
             if start_at + len(issues) >= total:
@@ -614,7 +703,6 @@ class JiraGene(Gene):
             start_at += len(issues)
         if len(seen_issue_ids) != (expected_total or 0):
             raise RuntimeError("Jira search unique issue count did not match total")
-        self.attest_discovery_complete("jira_search_total_exhausted")
 
     async def _request(
         self,
@@ -657,7 +745,7 @@ class JiraGene(Gene):
                 artifacts=source_artifacts_from_package(package),
             )
 
-        key = item.extra.get("issue_key", item.item_id.replace("jira-", ""))
+        key = item.extra.get("issue_key", item.item_id.removeprefix(_ISSUE_DOC_ID_PREFIX))
         hydrated_issue = getattr(self, "_hydrated_issues", {}).get(key)
         if isinstance(hydrated_issue, dict):
             payload = _issue_payload_from_search(hydrated_issue, self.config)

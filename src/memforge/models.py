@@ -504,6 +504,25 @@ class NormalizedContent:
     source_semantics: dict = field(default_factory=dict)
 
 
+class ScopeListingKind(str, Enum):
+    """What a Source's scope listing proves about an item it does not list (ADR 0045)."""
+
+    # The listing enumerates everything the provider holds at the configured
+    # location, such as a repository tree at a ref: an unlisted item is absent.
+    EXISTENCE = "existence"
+    # The listing is the result of a query, such as JQL or a Confluence page
+    # tree: an unlisted item may still exist and is confirmed by identifier.
+    QUERY = "query"
+
+
+@dataclass(frozen=True, slots=True)
+class ScopeListing:
+    """The Document ids of every item in a Source's configured scope, listed completely in one run."""
+
+    kind: ScopeListingKind
+    doc_ids: frozenset[str]
+
+
 def require_attested_content(raw: RawContent, normalized: NormalizedContent) -> None:
     """Refuse normalized content that is empty unless the provider attested it empty."""
 
