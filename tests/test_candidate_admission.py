@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from memforge.llm.structured import CandidateAdmissionResponse, StructuredLlmError
+from memforge.llm.structured import CandidateAdmissionDecision, CandidateAdmissionResponse, StructuredLlmError
 from memforge.memory.candidate_admission import CandidateAdmissionError, admit_candidates
 from memforge.models import RawMemory
 from memforge.pipeline.complete_support import COMPLETE_SUPPORT_DEFINITION
@@ -100,6 +100,29 @@ async def test_a_single_candidate_is_judged_with_exactly_its_selected_evidence()
     ]
     assert request["round_claims"] == [{"id": row["id"], "claim": MOST_SPECIFIC}]
     assert COMPLETE_SUPPORT_DEFINITION in client.prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_every_admission_request_judges_value_by_the_one_definition():
+    client = AdmissionClient()
+    await admit_candidates([candidate(MOST_SPECIFIC)], client=client, model="fixture", unit_title=None)
+
+    prompt = " ".join(client.prompts[0].split())
+    for line in (
+        "reject_reason low_value when it is not worth remembering by this definition:",
+        "Worth remembering (keep): knowledge someone will still need later to act on or understand a system, "
+        "product or process, and that holds apart from the one event that produced it.",
+        "Not worth remembering (drop): a record of what happened once, which nobody needs after the event.",
+        "Boundary: when an event establishes a lasting fact, the lasting fact is worth remembering (a decision "
+        "taken in a meeting is; an issue moving to Done is not). When unsure, keep.",
+        "Judge the knowledge a claim carries, not its tense or phrasing: a record stays a record when it is "
+        "phrased as a present fact. When a claim about a record also states a decision, a reason or a "
+        "requirement, judge it by that decision, reason or requirement. A claim that states what a system, "
+        "product, component or process is, does or requires is worth remembering, whatever source it comes from.",
+    ):
+        assert line in prompt
+    reject_reason = CandidateAdmissionDecision.model_fields["reject_reason"].description
+    assert "low_value when the claim is not worth remembering by the Value definition" in reject_reason
 
 
 @pytest.mark.asyncio
