@@ -18,7 +18,7 @@ import tempfile
 import time
 import unicodedata
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -44,6 +44,15 @@ from memforge.auth.jira_auth import (
     JiraPrincipalChangedError,
     canonical_jira_origin,
     effective_jira_auth_mode,
+)
+from memforge.evals.agent_evaluation import (
+    AgentAssessmentAnnotatorKind,
+    AgentAssessmentConfidence,
+    AgentAssessmentLabel,
+    AgentAssessmentStatus,
+    AgentIssueLabel,
+    OnlineEvaluationCoveragePolicy,
+    SourceEvaluationStatus,
 )
 from memforge.genes import (
     GENE_REGISTRY,
@@ -99,6 +108,7 @@ from memforge.memory.lifecycle_service import (
     MemoryLifecycleConflict,
     MemoryLifecycleNotFound,
     MemoryLifecycleService,
+    is_source_backed,
 )
 from memforge.memory.review_service import (
     ReviewAlreadyResolved,
@@ -122,6 +132,8 @@ from memforge.models import (
     ConfigField,
     ConfigFieldType,
     Memory,
+    MemoryRelationContext,
+    MemorySourceRef,
     MemoryStatus,
     MemoryType,
     MemoryReview,
@@ -189,6 +201,7 @@ from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.source_cleanup import SourceArtifactCleanupService
 from memforge.server.memory_admin_service import (
+    count_project_memories,
     list_memory_admin_page,
     pick_origin_source_type,
 )
@@ -265,24 +278,31 @@ LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES = {
 # Source lifecycle is deliberately closed for now. A paused source keeps its
 # configuration and existing memories but cannot accept new sync work.
 SOURCE_STATUSES = {SOURCE_ACTIVE_STATUS, SOURCE_PAUSED_STATUS}
+# What admin reads show unless the caller asks for another lifecycle status.
+ACTIVE_MEMORY_STATUSES = (MemoryStatus.ACTIVE.value,)
 
 
-def _workspace_default_scope(request: Request, *, include_private: bool):
+def _workspace_default_scope(
+    request: Request,
+    *,
+    include_private: bool,
+    allowed_statuses: tuple[str, ...] = ACTIVE_MEMORY_STATUSES,
+):
     """Build the workspace-default AccessScope for an admin-API HTTP read.
 
     The caller's identity is server-derived (``resolve_principal(request)``);
-    only the active status is allowed; private rows surface only when the
-    caller opts in via ``include_private``. Per-id and list readers do not
-    receive a request-time `scope_mode`, so the scope mode is fixed at
-    ``project-first``: cross-project rows stay visible and the ranker
-    handles the affinity weighting.
+    active Memories are read unless the caller names other statuses; private
+    rows surface only when the caller opts in via ``include_private``. Per-id
+    and list readers do not receive a request-time `scope_mode`, so the scope
+    mode is fixed at ``project-first``: cross-project rows stay visible and
+    the ranker handles the affinity weighting.
     """
     from memforge.storage.adapters.context import AccessScope
 
     return AccessScope(
         user_id=resolve_request_principal(request),
         include_private=include_private,
-        allowed_statuses=("active",),
+        allowed_statuses=allowed_statuses,
         active_project=None,
         scope_mode="project-first",
     )
@@ -636,6 +656,32 @@ async def _require_memory_review_visibility(
     return incumbent, challenger, tuple(related_memories)
 
 
+async def _memory_review_sources(
+    db: Database,
+    participants: Iterable[Memory],
+) -> list[dict[str, Any] | None]:
+    """Each Source behind the Review's participants, or None where the Source no longer exists."""
+    return [await db.get_source(source_id) for source_id in await _review_source_ids(db, list(participants))]
+
+
+def _can_decide_review(request: Request, sources: Iterable[Mapping[str, Any] | None]) -> bool:
+    """A decision changes Memories of every Source behind the Review, so the caller must manage each one."""
+    viewer_id = resolve_request_principal(request)
+    viewer_role = resolve_request_workspace_role(request)
+    return all(
+        source is not None and can_manage_source(dict(source), viewer_id=viewer_id, viewer_role=viewer_role)
+        for source in sources
+    )
+
+
+def _require_review_decision_authority(request: Request, sources: list[dict[str, Any]]) -> None:
+    """Enforce `_can_decide_review`; a Source the caller cannot see is reported as missing."""
+    for source in sources:
+        _require_source_discoverability(request, source)
+    if not _can_decide_review(request, sources):
+        raise _source_management_forbidden()
+
+
 async def _require_memory_review_management(
     request: Request,
     db: Database,
@@ -643,11 +689,11 @@ async def _require_memory_review_management(
 ) -> tuple[Memory, Memory, tuple[Memory, ...]]:
     participants = await _require_memory_review_visibility(request, db, review)
     incumbent, challenger, related = participants
-    for source_id in await _review_source_ids(db, [incumbent, challenger, *related]):
-        source = await db.get_source(source_id)
-        if source is None:
-            raise HTTPException(status_code=409, detail="Review source is unavailable")
-        _require_source_management(request, source)
+    sources = await _memory_review_sources(db, [incumbent, challenger, *related])
+    available = [source for source in sources if source is not None]
+    if len(available) != len(sources):
+        raise HTTPException(status_code=409, detail="Review source is unavailable")
+    _require_review_decision_authority(request, available)
     return participants
 
 
@@ -810,6 +856,9 @@ class MemoryEvidenceGroupDetail(BaseModel):
 RelationLabelLiteral = Literal["equivalent", "updates", "contradicts"]
 # A dismissal note is a short explanation, not a document.
 RELATION_DISMISSAL_NOTE_MAX_CHARS = 2000
+# Runtime events and assessments read per online evaluation window; a window
+# that reaches it reports partial counts.
+ONLINE_EVALUATION_ROW_LIMIT = 1000
 
 
 class MemorySourceRefDetail(BaseModel):
@@ -1035,14 +1084,20 @@ class MemoryResponse(BaseModel):
     # The originating agent client when provenance is submitted by a client
     # plugin (e.g. 'codex' or 'claude-code').
     origin_client: str | None = None
+    # The Sources this Memory comes from that the caller may read.
+    sources: list[MemorySourceRefDetail] = []
+    # The Cross-Document Relations current for the caller.
+    relations: list[MemoryRelationDetail] = []
 
 
 class MemoryDetailResponse(MemoryResponse):
     entity_refs: list[str] = []
     evidence: list[MemoryEvidenceGroupDetail] = []
-    relations: list[MemoryRelationDetail] = []
     relation_notice: str | None = None
     dismissed_relations: list[DismissedRelationDetail] = []
+    # Active Source Units support this Memory, so retiring it directly is
+    # refused; ``is_source_backed`` defines the rule.
+    source_backed: bool = False
 
 
 class MemoryListResponse(BaseModel):
@@ -1376,6 +1431,45 @@ class MemorySearchRequest(BaseModel):
             logger.info("Search request omitted active_project; falling back to flat workspace ranking.")
             self.scope_mode = "workspace"
         return self
+
+
+class MemorySearchResultDetail(BaseModel):
+    """One ranked Memory, as ``SearchResult`` (memforge.models) carries it."""
+
+    memory_id: str
+    memory_type: str
+    summary: str
+    relevance_score: float
+    corroborated_by: int
+    last_observed_at: str | None = None
+    freshness: str
+    relation_notice: str | None = None
+    relations: list[MemoryRelationDetail] = []
+    status: str
+    repo_identifier: str | None = None
+    follow_up: dict[str, str] | None = None
+    retrieval_evidence: dict[str, Any] | None = None
+
+
+class MemorySearchResponse(BaseModel):
+    """The search engine's result page.
+
+    The route leaves unset fields out, so a queryless listing and a ranked
+    search each keep their own shape: only a listing reports ``total_count``,
+    only a ranked search reports ``retrieval_intent``.
+    """
+
+    query_analysis: dict[str, Any]
+    retrieval_intent: dict[str, str | None] | None = None
+    results: list[MemorySearchResultDetail]
+    total_candidates: int
+    total_count: int | None = None
+    candidate_count_kind: Literal["exact", "windowed"]
+    ranking_window_size: int
+    limit: int
+    offset: int
+    has_more: bool
+    retrieval_time_ms: int
 
 
 # -- Entities --
@@ -1765,7 +1859,7 @@ PROJECT_KIND_SCHEMA = {"deprecated": True}
 class ProjectCreateRequest(BaseModel):
     name: str
     key: str | None = None
-    kind: Literal["normal", "shared"] = Field(default="normal", json_schema_extra=PROJECT_KIND_SCHEMA)
+    kind: Literal["normal", "shared"] | None = Field(default=None, json_schema_extra=PROJECT_KIND_SCHEMA)
 
 
 class ProjectUpdateRequest(BaseModel):
@@ -1781,10 +1875,45 @@ class ProjectResponse(BaseModel):
     created_at: str | None = None
 
 
+class ProjectListItemResponse(ProjectResponse):
+    memory_count: int = Field(
+        description=(
+            "Active memories in this project that the caller can see, including the caller's private memories."
+        )
+    )
+
+
+class ProjectListResponse(BaseModel):
+    data: list[ProjectListItemResponse]
+    can_manage: bool = Field(
+        description=(
+            "Whether the caller may create, rename and delete projects. Built-in projects are never renamed or deleted."
+        )
+    )
+
+
+class ProjectDeletionImpactResponse(BaseModel):
+    """What deleting the project changes, counted across the whole workspace."""
+
+    memory_count: int = Field(description="Memories in the project, in every status, that move to UNSORTED.")
+    source_count: int = Field(
+        description=(
+            "Sources that stop writing to the project. A fixed binding to it is removed; a field binding "
+            "drops its mappings to it, and its default moves to UNSORTED if it pointed to the project."
+        ),
+    )
+
+
 class ProjectDeleteResponse(BaseModel):
     id: str
     rebucketed_count: int
     rebucketed_memory_ids: list[str]
+    released_source_count: int = Field(
+        description=(
+            "Sources that stopped writing to the project. A fixed binding to it was removed; a field binding "
+            "dropped its mappings to it, and its default moved to UNSORTED if it pointed to the project."
+        ),
+    )
 
 
 class CreateSourceRequest(BaseModel):
@@ -2116,6 +2245,12 @@ class AgentHookContextRequest(BaseModel):
 
 
 class LlmConfigResponse(BaseModel):
+    writable: bool = Field(
+        description=(
+            "False when the deployment environment manages LLM settings "
+            "(MEMFORGE_LLM_CONFIG_WRITABLE), so updates are refused."
+        ),
+    )
     enrichment_model: str | None = None
     enrichment_base_url: str | None = None
     enrichment_api_key: str | None = None
@@ -2220,6 +2355,12 @@ class MemoryReviewResponse(BaseModel):
     refreshable: bool = False
     decision_fingerprint: str
     presentation: ReviewPresentationResponse
+    can_decide: bool = Field(
+        description=(
+            "Whether the caller has the authority to decide this Review: it manages every Source behind it. "
+            "The status says whether a decision is still open."
+        ),
+    )
 
 
 class MemoryReviewListItemResponse(MemoryReviewResponse):
@@ -2259,6 +2400,161 @@ class AgentEvaluationRunCreateRequest(BaseModel):
     replicate_count: int = Field(default=1, ge=1)
     baseline_run_id: str | None = None
     semantic_judge: dict[str, object] | None = None
+
+
+class AgentEvaluationScopeResponse(BaseModel):
+    kind: Literal["workspace"]
+    source_id: str | None
+    source_type: str | None
+
+
+class AgentEvaluationWindowResponse(BaseModel):
+    from_: str = Field(alias="from")
+    to: str
+    days: int
+
+
+class AgentEvaluationSummaryResponse(BaseModel):
+    """Occurrence counts over the effective assessments in the window."""
+
+    total_assessments: int
+    runtime_event_count: int
+    eligible_assessment_count: int
+    missing_assessment_count: int
+    action_issue_group_count: int
+    review_issue_group_count: int
+    source_count: int
+    affected_source_count: int = Field(
+        description="Sources with failures, checks needing review, or coverage gaps.",
+    )
+    label_counts: dict[str, int]
+    criterion_counts: dict[str, int]
+    status_counts: dict[str, int]
+    truncated: bool = Field(
+        description="True when the window reached ``row_limit``, so counts are partial.",
+    )
+    row_limit: int = Field(
+        description="The most runtime events, and the most assessments, that one window reads.",
+    )
+
+
+class AgentEvaluationCoverageResponse(BaseModel):
+    """How many expected checks have a matching completed assessment."""
+
+    policy: OnlineEvaluationCoveragePolicy
+    eligible_occurrences: int
+    assessed_occurrences: int
+    pending_occurrences: int
+    coverage_rate: float
+    oldest_pending_at: str | None
+    evaluator_failure_occurrences: int
+
+
+class AgentEvaluationCaseResponse(BaseModel):
+    """One example of an issue group: identifiers and versions only, no content."""
+
+    assessment_id: str
+    event_id: str
+    label: AgentIssueLabel
+    criterion: str
+    reason_code: str
+    occurred_at: str
+    occurrence_count: int
+    source_id: str
+    source_type: str
+    doc_id: str
+    source_unit_id: str
+    target_unit_revision_id: str
+    observation_id: str | None
+    observation_revision_id: str | None
+    projection_run_id: str
+    operation_id: str | None
+    execution_id: str | None
+    derivation_id: str | None
+    batch_id: str | None
+    trace_id: str | None
+    provider: str | None
+    model: str | None
+    contract_version: str | None
+    extraction_contract_version: str | None
+    deployment_revision: str | None
+
+
+class AgentEvaluationIssueGroupResponse(BaseModel):
+    """Failed or degraded checks that share a criterion, reason and evaluator version."""
+
+    group_id: str
+    label: AgentIssueLabel
+    criterion: str
+    reason_code: str
+    evaluator_name: str
+    evaluator_version: str
+    occurrence_count: int
+    distinct_event_count: int
+    criterion_occurrence_count: int
+    criterion_rate: float
+    affected_source_ids: list[str]
+    affected_source_count: int
+    source_types: list[str]
+    first_seen_at: str
+    last_seen_at: str
+    representative_cases: list[AgentEvaluationCaseResponse]
+
+
+class AgentEvaluationSourceHealthResponse(BaseModel):
+    source_id: str
+    name: str
+    type: str
+    source_status: str
+    evaluation_status: SourceEvaluationStatus
+    action_issue_group_count: int
+    review_issue_group_count: int
+    fail_occurrences: int
+    review_occurrences: int
+    coverage: AgentEvaluationCoverageResponse
+    last_event_at: str | None
+
+
+class AgentAssessmentResponse(BaseModel):
+    """One content-free assessment, as ``assessment_public_payload`` returns it."""
+
+    assessment_id: str
+    target_event_id: str | None
+    criterion: str
+    status: AgentAssessmentStatus
+    label: AgentAssessmentLabel | None
+    reason_code: str
+    annotator_kind: AgentAssessmentAnnotatorKind
+    evaluator_name: str
+    evaluator_version: str
+    created_at: str
+    target_result_id: str | None
+    target_candidate_id: str | None
+    annotator_id: str | None
+    content_policy_id: str | None
+    input_fingerprint: str | None
+    confidence: AgentAssessmentConfidence | None
+    reused_from_assessment_id: str | None
+    occurrence_count: int
+    schema_version: str
+
+
+class WorkspaceAgentEvaluationResponse(BaseModel):
+    """The online evaluation of the Sources the viewer can discover, over one window."""
+
+    scope: AgentEvaluationScopeResponse
+    window: AgentEvaluationWindowResponse
+    summary: AgentEvaluationSummaryResponse
+    coverage: AgentEvaluationCoverageResponse
+    issue_groups: list[AgentEvaluationIssueGroupResponse]
+    available_source_types: list[str]
+    sources: list[AgentEvaluationSourceHealthResponse]
+    runtime_events: list[dict[str, Any]] = Field(
+        description="The latest runtime events, as ``event_public_payload`` returns them.",
+    )
+    assessments: list[AgentAssessmentResponse] = Field(
+        description="The latest effective assessments, newest first.",
+    )
 
 
 class AgentEvaluationLangfusePolicyRequest(BaseModel):
@@ -2370,6 +2666,24 @@ def _api_key_last4(key: str | None) -> str | None:
     if not key:
         return None
     return key[-4:]
+
+
+def _llm_config_response(cfg: dict[str, Any], *, writable: bool) -> LlmConfigResponse:
+    enrichment_key = cfg.get("enrichment_api_key")
+    embedding_key = cfg.get("embedding_api_key")
+    return LlmConfigResponse(
+        writable=writable,
+        enrichment_model=cfg.get("enrichment_model"),
+        enrichment_base_url=cfg.get("enrichment_base_url"),
+        enrichment_api_key=_mask_api_key(enrichment_key),
+        enrichment_api_key_set=bool(enrichment_key),
+        enrichment_api_key_last4=_api_key_last4(enrichment_key),
+        embedding_model=cfg.get("embedding_model"),
+        embedding_base_url=cfg.get("embedding_base_url"),
+        embedding_api_key=_mask_api_key(embedding_key),
+        embedding_api_key_set=bool(embedding_key),
+        embedding_api_key_last4=_api_key_last4(embedding_key),
+    )
 
 
 def _is_running_in_container() -> bool:
@@ -3396,6 +3710,9 @@ def _memory_to_response(
     mem: Memory,
     origin_source_type: str | None = None,
     origin_client: str | None = None,
+    *,
+    sources: Sequence[MemorySourceRef] = (),
+    relations: Sequence[MemoryRelationContext] = (),
 ) -> MemoryResponse:
     """Convert a Memory dataclass to a Pydantic response model."""
     return MemoryResponse(
@@ -3421,6 +3738,8 @@ def _memory_to_response(
         updated_at=_dt_iso(mem.updated_at),
         origin_source_type=origin_source_type,
         origin_client=origin_client,
+        sources=[MemorySourceRefDetail(**asdict(source)) for source in sources],
+        relations=[MemoryRelationDetail(**asdict(relation)) for relation in relations],
     )
 
 
@@ -3445,6 +3764,7 @@ def _review_to_response(
     incumbent: Memory | None = None,
     challenger: Memory | None = None,
     related_challengers: tuple[Memory, ...] = (),
+    can_decide: bool,
 ) -> MemoryReviewResponse:
     return MemoryReviewResponse(
         id=review.id,
@@ -3468,6 +3788,7 @@ def _review_to_response(
                 source_backed_correction=review.expected_support_set_hash is not None,
             )
         ),
+        can_decide=can_decide,
     )
 
 
@@ -3558,6 +3879,40 @@ async def _build_memory_summary(
         evidence=evidence,
         created_at=_dt_iso(memory.created_at),
         updated_at=_dt_iso(memory.updated_at),
+    )
+
+
+async def _memory_review_detail_response(
+    db: Database,
+    review: MemoryReview,
+    *,
+    request: Request,
+    incumbent: Memory | None,
+    challenger: Memory | None,
+    related_challengers: tuple[Memory, ...],
+    config: AppConfig | None = None,
+    artifact_store: DocumentArtifactStore | None = None,
+) -> MemoryReviewDetailResponse:
+    participants = [memory for memory in (incumbent, challenger, *related_challengers) if memory is not None]
+    base = _review_to_response(
+        review,
+        incumbent=incumbent,
+        challenger=challenger,
+        related_challengers=related_challengers,
+        can_decide=_can_decide_review(request, await _memory_review_sources(db, participants)),
+    )
+
+    async def summary(memory: Memory | None) -> MemoryReviewMemorySummary | None:
+        return await _build_memory_summary(db, memory, request, config, artifact_store) if memory else None
+
+    return MemoryReviewDetailResponse(
+        **base.model_dump(),
+        incumbent=await summary(incumbent),
+        challenger=await summary(challenger),
+        related_challengers=[
+            await _build_memory_summary(db, related, request, config, artifact_store)
+            for related in related_challengers
+        ],
     )
 
 
@@ -3688,6 +4043,7 @@ async def _lifecycle_review_response(
         ),
         "incumbent": incumbent_summary,
         "challenger": challenger_summary,
+        "can_decide": _can_decide_review(request, [source]),
     }
     if detail:
         return MemoryReviewDetailResponse(**common, related_challengers=[])
@@ -3767,9 +4123,13 @@ def _derive_project_key(name: str) -> str:
     return (cleaned or _PROJECT_KEY_FALLBACK)[:_PROJECT_KEY_MAX_LENGTH]
 
 
-def _require_project_management(request: Request) -> None:
+def _can_manage_projects(request: Request) -> bool:
     """Projects shape the whole workspace, so only its admins may change them."""
-    if not can_manage_workspace(resolve_request_workspace_role(request)):
+    return can_manage_workspace(resolve_request_workspace_role(request))
+
+
+def _require_project_management(request: Request) -> None:
+    if not _can_manage_projects(request):
         raise HTTPException(
             status_code=403,
             detail={
@@ -4771,7 +5131,7 @@ def create_admin_app(
             logger.warning("Recent-memory listing failed: %s", exc, exc_info=True)
             raise HTTPException(status_code=503, detail=f"Recent-memory listing unavailable: {exc}") from exc
 
-    @memory_router.post("/search")
+    @memory_router.post("/search", response_model=MemorySearchResponse, response_model_exclude_unset=True)
     async def search_memories(
         req: MemorySearchRequest,
         request: Request,
@@ -4929,8 +5289,12 @@ def create_admin_app(
         config: AppConfig = Depends(get_config),
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
-        """Get full memory detail including provenance (linked source documents)."""
-        scope = _workspace_default_scope(request, include_private=True)
+        """Get full memory detail including provenance (linked source documents).
+
+        Every lifecycle status is readable, so a superseded, retired or
+        pending Memory still opens from the list, a review or its replacement.
+        """
+        scope = _lifecycle_visibility_scope(request)
         mem = await db.get_memory(memory_id)
         if not mem:
             raise HTTPException(status_code=404, detail="Memory not found")
@@ -4953,6 +5317,7 @@ def create_admin_app(
 
         origin_info = (await _origin_source_types(db, [memory_id])).get(memory_id, (None, None))
         origin_source_type, origin_client = origin_info
+        sources = (await db.get_memory_source_refs_many([memory_id], scope)).get(memory_id, ())
         relations = (await read_memory_relations(db, [memory_id], scope)).get(memory_id, ())
         dismissed = await dismissed_relation_views(
             db,
@@ -4993,6 +5358,8 @@ def create_admin_app(
             dismissed_relations=[DismissedRelationDetail(**asdict(item)) for item in dismissed],
             origin_source_type=origin_source_type,
             origin_client=origin_client,
+            sources=[MemorySourceRefDetail(**asdict(source)) for source in sources],
+            source_backed=await is_source_backed(db, memory_id),
         )
 
     # -- Memory update (admin actions) --
@@ -5443,12 +5810,20 @@ def create_admin_app(
         Filters: type (fact/decision/convention/procedure), status, source,
         project, free-text search. Supports limit/offset pagination.
 
+        Without ``status`` the list holds active Memories, so its total for a
+        project equals that project's ``memory_count``; ``status`` lists the
+        Memories in exactly that lifecycle status instead.
+
         The access predicate gates every row: workspace rows are visible
         across every project (the ranker handles project relevance, not
         the predicate), and the caller's own private rows surface only
         when ``include_private=True``.
         """
-        scope = _workspace_default_scope(request, include_private=include_private)
+        scope = _workspace_default_scope(
+            request,
+            include_private=include_private,
+            allowed_statuses=(normalize_memory_status(status),) if status else ACTIVE_MEMORY_STATUSES,
+        )
         page = await list_memory_admin_page(
             db,
             scope=scope,
@@ -5463,7 +5838,15 @@ def create_admin_app(
             offset=offset,
         )
         return MemoryListResponse(
-            data=[_memory_to_response(m, *page.origins.get(m.id, (None, None))) for m in page.memories],
+            data=[
+                _memory_to_response(
+                    m,
+                    *page.origins.get(m.id, (None, None)),
+                    sources=page.sources.get(m.id, ()),
+                    relations=page.relations.get(m.id, ()),
+                )
+                for m in page.memories
+            ],
             total=page.total,
             limit=limit,
             offset=offset,
@@ -5888,6 +6271,9 @@ def create_admin_app(
         """List search-eligible sources for MCP/source-id discovery."""
         return {"data": await _searchable_source_rows(request, db, sync_service=sync_service)}
 
+    def _online_evaluation_truncated(events: Sequence[object], assessments: Sequence[object]) -> bool:
+        return ONLINE_EVALUATION_ROW_LIMIT in (len(events), len(assessments))
+
     def _online_evaluation_window(days: int) -> tuple[datetime, datetime]:
         if not 1 <= days <= 90:
             raise HTTPException(status_code=400, detail="days must be between 1 and 90")
@@ -5917,7 +6303,7 @@ def create_admin_app(
                 source_id=source_id,
                 source_type=source_type,
                 newest_first=True,
-                limit=1000,
+                limit=ONLINE_EVALUATION_ROW_LIMIT,
             )
         )
         assessments = await db.list_agent_assessments(
@@ -5928,12 +6314,12 @@ def create_admin_app(
                 include_private=True,
                 source_id=source_id,
                 newest_first=True,
-                limit=1000,
+                limit=ONLINE_EVALUATION_ROW_LIMIT,
             )
         )
         return events, assessments
 
-    @evaluation_router.get("/online-overview")
+    @evaluation_router.get("/online-overview", response_model=WorkspaceAgentEvaluationResponse)
     async def get_workspace_agent_evaluation(
         request: Request,
         days: int = 1,
@@ -5989,7 +6375,8 @@ def create_admin_app(
             assessments,
         )
         summary = dict(view["summary"])
-        summary["truncated"] = len(events) == 1000 or len(assessments) == 1000
+        summary["truncated"] = _online_evaluation_truncated(events, assessments)
+        summary["row_limit"] = ONLINE_EVALUATION_ROW_LIMIT
         return {
             "scope": {
                 "kind": "workspace",
@@ -6036,7 +6423,8 @@ def create_admin_app(
         )
         view = build_source_online_evaluation_view(events, assessments)
         summary = dict(view["summary"])
-        summary["truncated"] = len(events) == 1000 or len(assessments) == 1000
+        summary["truncated"] = _online_evaluation_truncated(events, assessments)
+        summary["row_limit"] = ONLINE_EVALUATION_ROW_LIMIT
         return {
             "source_id": source_id,
             "window": {
@@ -6549,7 +6937,7 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_management(request, source)
+        _require_review_decision_authority(request, [source])
         review = await db.get_lifecycle_review(review_id)
         if review is None:
             raise HTTPException(status_code=404, detail="Lifecycle review not found")
@@ -8400,26 +8788,18 @@ def create_admin_app(
     # 5. LLM Config Endpoints
     # ===================================================================
 
-    @llm_router.get("")
-    async def get_llm_config(db: Database = Depends(get_db)):
+    @llm_router.get("", response_model=LlmConfigResponse)
+    async def get_llm_config(
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
         """Get LLM configuration. API keys are masked in the response."""
-        cfg = await db.get_llm_config()
-        enrichment_key = cfg.get("enrichment_api_key")
-        embedding_key = cfg.get("embedding_api_key")
-        return LlmConfigResponse(
-            enrichment_model=cfg.get("enrichment_model"),
-            enrichment_base_url=cfg.get("enrichment_base_url"),
-            enrichment_api_key=_mask_api_key(enrichment_key),
-            enrichment_api_key_set=bool(enrichment_key),
-            enrichment_api_key_last4=_api_key_last4(enrichment_key),
-            embedding_model=cfg.get("embedding_model"),
-            embedding_base_url=cfg.get("embedding_base_url"),
-            embedding_api_key=_mask_api_key(embedding_key),
-            embedding_api_key_set=bool(embedding_key),
-            embedding_api_key_last4=_api_key_last4(embedding_key),
+        return _llm_config_response(
+            await db.get_llm_config(),
+            writable=config.server.llm_config_writable,
         )
 
-    @llm_router.post("/probe")
+    @llm_router.post("/probe", response_model=LlmConfigProbeResponse)
     async def probe_llm_config(
         req: LlmConfigProbeRequest,
         db: Database = Depends(get_db),
@@ -8431,13 +8811,13 @@ def create_admin_app(
             api_key = current.get(f"{req.kind}_api_key")
         return await _probe_llm_models(base_url=req.base_url, api_key=api_key or None)
 
-    @llm_router.put("")
+    @llm_router.put("", response_model=LlmConfigResponse)
     async def update_llm_config(
         req: LlmConfigRequest,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
     ):
-        """Update LLM configuration."""
+        """Update LLM configuration and return the stored result."""
         if not config.server.llm_config_writable:
             raise HTTPException(
                 status_code=405,
@@ -8479,21 +8859,37 @@ def create_admin_app(
                 "embedding_api_key": _resolve_key("embedding_api_key"),
             }
         )
-        return {"ok": True}
+        return _llm_config_response(await db.get_llm_config(), writable=True)
 
     # ===================================================================
     # Projects
     # ===================================================================
 
-    @projects_router.get("", response_model=list[ProjectResponse])
+    @projects_router.get("", response_model=ProjectListResponse)
     async def list_projects_route(
+        request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
+        """List projects with the number of memories the caller can see in each."""
         adapters = await _build_project_adapters(db, config, runtime_provider)
         rows = await adapters.relational.list_projects()
-        return [_project_to_response(p) for p in rows]
+        memory_counts = await count_project_memories(
+            db,
+            scope=_workspace_default_scope(request, include_private=True),
+            project_keys=[project.key for project in rows],
+        )
+        return ProjectListResponse(
+            data=[
+                ProjectListItemResponse(
+                    **_project_to_response(project).model_dump(),
+                    memory_count=memory_counts[project.key],
+                )
+                for project in rows
+            ],
+            can_manage=_can_manage_projects(request),
+        )
 
     @projects_router.post("", response_model=ProjectResponse, status_code=201)
     async def create_project_route(
@@ -8519,7 +8915,7 @@ def create_admin_app(
         except ValueError:
             raise HTTPException(
                 status_code=409,
-                detail=f"project key {key!r} already exists",
+                detail=f"A project with the code {key} already exists. Pick another name or code.",
             )
         return _project_to_response(created)
 
@@ -8547,6 +8943,22 @@ def create_admin_app(
             raise HTTPException(status_code=404, detail="project not found")
         return _project_to_response(updated)
 
+    @projects_router.get("/{project_id}/deletion-impact", response_model=ProjectDeletionImpactResponse)
+    async def get_project_deletion_impact(
+        request: Request,
+        project_id: str,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+    ):
+        """Count what deleting the project changes, so the admin can confirm it knowingly."""
+        _require_project_management(request)
+        adapters = await _build_project_adapters(db, config, runtime_provider)
+        await _require_mutable_project(adapters.relational, project_id)
+        memory_ids = await adapters.relational.list_project_memory_ids(project_id)
+        released_source_ids = await adapters.relational.list_sources_released_by_project_deletion(project_id)
+        return ProjectDeletionImpactResponse(memory_count=len(memory_ids), source_count=len(released_source_ids))
+
     @projects_router.delete("/{project_id}", response_model=ProjectDeleteResponse)
     async def delete_project_route(
         request: Request,
@@ -8565,17 +8977,19 @@ def create_admin_app(
         memory_store = await _build_memory_store(db, config, runtime_provider)
         # Vector metadata moves first so a failure here aborts the
         # transaction with both stores still pointing at the original
-        # project. Only after the vector channel reports success do we
-        # commit the relational rebucket and drop the project row.
+        # project. Only after the vector channel reports success does the
+        # relational transaction rebucket the memories, release the Source
+        # bindings and drop the project row together.
         await memory_store.rebucket_project_memories(
             affected,
             UNSORTED_PROJECT_KEY,
         )
-        await adapters.relational.commit_project_deletion(project_id, affected)
+        released_source_ids = await adapters.relational.commit_project_deletion(project_id, affected)
         return ProjectDeleteResponse(
             id=project_id,
             rebucketed_count=len(affected),
             rebucketed_memory_ids=affected,
+            released_source_count=len(released_source_ids),
         )
 
     # ===================================================================
@@ -8696,6 +9110,7 @@ def create_admin_app(
                 incumbent=incumbent,
                 challenger=challenger,
                 related_challengers=related_challengers,
+                can_decide=_can_decide_review(request, visible_sources),
             )
             if normalized_status == "open" and base.is_stale:
                 continue
@@ -8858,33 +9273,15 @@ def create_admin_app(
             db,
             review,
         )
-        base = _review_to_response(
+        return await _memory_review_detail_response(
+            db,
             review,
+            request=request,
             incumbent=incumbent,
             challenger=challenger,
             related_challengers=related_memories,
-        )
-        incumbent_summary = (
-            await _build_memory_summary(db, incumbent, request, config, artifact_store)
-            if incumbent
-            else None
-        )
-        challenger_summary = (
-            await _build_memory_summary(db, challenger, request, config, artifact_store)
-            if challenger
-            else None
-        )
-        related_challengers = [
-            await _build_memory_summary(
-                db, related_memory, request, config, artifact_store
-            )
-            for related_memory in related_memories
-        ]
-        return MemoryReviewDetailResponse(
-            **base.model_dump(),
-            incumbent=incumbent_summary,
-            challenger=challenger_summary,
-            related_challengers=related_challengers,
+            config=config,
+            artifact_store=artifact_store,
         )
 
     @review_router.post("/{review_id}/refresh", response_model=MemoryReviewDetailResponse)
@@ -8915,7 +9312,7 @@ def create_admin_app(
         source = await db.get_source(source_id) if source_id else None
         if source is None:
             raise HTTPException(status_code=409, detail="Lifecycle review source is unavailable")
-        _require_source_management(request, source)
+        _require_review_decision_authority(request, [source])
         await _require_lifecycle_review_visibility(request, db, lifecycle_review)
         if lifecycle_review_decision_fingerprint(lifecycle_review) != req.expected_fingerprint:
             raise HTTPException(status_code=409, detail="Review decision fingerprint is stale")
@@ -9028,37 +9425,15 @@ def create_admin_app(
         review = result.review or await db.get_memory_review(review_id)
         assert review is not None
         _, _, related_after = await _require_memory_review_visibility(request, db, review)
-        base = _review_to_response(
+        return await _memory_review_detail_response(
+            db,
             review,
+            request=request,
             incumbent=result.incumbent,
             challenger=result.challenger,
             related_challengers=related_after,
-        )
-        incumbent_summary = (
-            await _build_memory_summary(
-                db, result.incumbent, request, config, artifact_store
-            )
-            if result.incumbent
-            else None
-        )
-        challenger_summary = (
-            await _build_memory_summary(
-                db, result.challenger, request, config, artifact_store
-            )
-            if result.challenger
-            else None
-        )
-        related_challenger_summaries = [
-            await _build_memory_summary(
-                db, related_memory, request, config, artifact_store
-            )
-            for related_memory in related_after
-        ]
-        return MemoryReviewDetailResponse(
-            **base.model_dump(),
-            incumbent=incumbent_summary,
-            challenger=challenger_summary,
-            related_challengers=related_challenger_summaries,
+            config=config,
+            artifact_store=artifact_store,
         )
 
     @review_router.post("/{review_id}/reject", response_model=MemoryReviewDetailResponse)
@@ -9142,37 +9517,15 @@ def create_admin_app(
         review = result.review or await db.get_memory_review(review_id)
         assert review is not None
         _, _, related_after = await _require_memory_review_visibility(request, db, review)
-        base = _review_to_response(
+        return await _memory_review_detail_response(
+            db,
             review,
+            request=request,
             incumbent=result.incumbent,
             challenger=result.challenger,
             related_challengers=related_after,
-        )
-        incumbent_summary = (
-            await _build_memory_summary(
-                db, result.incumbent, request, config, artifact_store
-            )
-            if result.incumbent
-            else None
-        )
-        challenger_summary = (
-            await _build_memory_summary(
-                db, result.challenger, request, config, artifact_store
-            )
-            if result.challenger
-            else None
-        )
-        related_challenger_summaries = [
-            await _build_memory_summary(
-                db, related_memory, request, config, artifact_store
-            )
-            for related_memory in related_after
-        ]
-        return MemoryReviewDetailResponse(
-            **base.model_dump(),
-            incumbent=incumbent_summary,
-            challenger=challenger_summary,
-            related_challengers=related_challenger_summaries,
+            config=config,
+            artifact_store=artifact_store,
         )
 
     async def _validate_review_manifest_decision(
@@ -9208,7 +9561,7 @@ def create_admin_app(
                         outcome="invalid",
                         message="Lifecycle Review source is unavailable",
                     )
-                _require_source_management(request, source)
+                _require_review_decision_authority(request, [source])
                 await _require_lifecycle_review_visibility(request, db, lifecycle_review)
                 fingerprint = lifecycle_review_decision_fingerprint(lifecycle_review)
                 if fingerprint != item.expected_fingerprint:

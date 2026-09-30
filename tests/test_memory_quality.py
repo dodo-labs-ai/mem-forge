@@ -91,6 +91,27 @@ def _config(tmp_path: Path) -> AppConfig:
     return config
 
 
+def _ranked_search_page(results: list) -> dict:
+    """A ranked search engine page, as ``SearchEngine.search`` returns it."""
+    return {
+        "query_analysis": {"detected_entities": [], "strategies_used": []},
+        "retrieval_intent": {
+            "requested_intent": None,
+            "resolved_intent": "general_hybrid",
+            "intent_source": "default",
+            "fallback_reason": None,
+        },
+        "results": results,
+        "total_candidates": len(results),
+        "candidate_count_kind": "windowed",
+        "ranking_window_size": len(results),
+        "limit": len(results),
+        "offset": 0,
+        "has_more": False,
+        "retrieval_time_ms": 1,
+    }
+
+
 async def _insert_document(
     db: Database,
     *,
@@ -480,7 +501,7 @@ async def test_memory_detail_represents_unprojected_legacy_provenance_without_re
 
     assert response.status_code == 200
     payload = response.json()
-    assert "sources" not in payload
+    assert payload["sources"] == [{"source_id": "src-confluence", "source_type": "confluence", "name": "Confluence"}]
     assert "evidence_artifacts" not in payload
     [group] = payload["evidence"]
     assert group["kind"] == "document"
@@ -1355,17 +1376,16 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
     class FakeSearchEngine:
         async def search(self, **kwargs):
             calls.append(kwargs)
-            return {
-                "query": kwargs["query"],
-                "results": [
+            return _ranked_search_page(
+                [
                     SearchResult(
                         memory_id="mem-proxy-search",
                         memory_type="fact",
                         summary="Proxy search stays service-owned.",
                         relevance_score=1.0,
                     )
-                ],
-            }
+                ]
+            )
 
     class FakeRuntimeProvider:
         async def build_search_engine(self, _db, _config, *, audit_logger=None):
@@ -1408,6 +1428,7 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
         }
     ]
     assert payload["results"][0]["memory_id"] == "mem-proxy-search"
+    assert "total_count" not in payload
     result = payload["results"][0]
     for field in ("source_doc_id", "source_doc_title", "source_url", "content_url", "pdf_url", "is_document_result"):
         assert field not in result
@@ -1564,6 +1585,61 @@ async def test_get_memory_sources_orders_extracted_before_corroborated(db: Datab
 
 
 @pytest.mark.asyncio
+async def test_admin_memory_search_response_keeps_each_page_shape(db: Database, tmp_path: Path):
+    from memforge.server.admin_api import create_admin_app
+
+    listing_page = {
+        "query_analysis": {"detected_entities": [], "strategies_used": ["source_time_listing"]},
+        "results": [
+            {
+                "memory_id": "mem-listed",
+                "memory_type": "procedure",
+                "summary": "Run cut-off after release.",
+                "relevance_score": 3.0,
+                "corroborated_by": 2,
+                "last_observed_at": "2026-09-22T09:14:00+00:00",
+                "freshness": "current",
+                "relation_notice": None,
+                "relations": [],
+                "status": "active",
+                "repo_identifier": None,
+                "follow_up": {"suggested_tool": "get_memory", "reason": "summary_may_omit_operational_steps"},
+                "retrieval_evidence": {"channels": ["source_time_listing"]},
+            }
+        ],
+        "total_candidates": 1,
+        "total_count": 1,
+        "candidate_count_kind": "exact",
+        "ranking_window_size": 1,
+        "limit": 3,
+        "offset": 0,
+        "has_more": False,
+        "retrieval_time_ms": 4,
+    }
+
+    class FakeSearchEngine:
+        async def search(self, **kwargs):
+            return listing_page
+
+    class FakeRuntimeProvider:
+        async def build_search_engine(self, _db, _config, *, audit_logger=None):
+            return FakeSearchEngine()
+
+    await db.upsert_source(
+        "src-handbook", "confluence", "Payroll handbook", "{}", access_policy="workspace", owner_user_id="dev"
+    )
+    app = create_admin_app(db=db, config=_config(tmp_path), runtime_provider=FakeRuntimeProvider())
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/memories/search",
+            json={"source_filter": {"source_ids": ["src-handbook"]}, "top_k": 3},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == listing_page
+
+
+@pytest.mark.asyncio
 async def test_admin_memory_search_validates_source_ids_without_hydrating_admin_rows(
     db: Database,
     tmp_path: Path,
@@ -1581,7 +1657,7 @@ async def test_admin_memory_search_validates_source_ids_without_hydrating_admin_
     class FakeSearchEngine:
         async def search(self, **kwargs):
             calls.append(kwargs)
-            return {"query": kwargs["query"], "results": []}
+            return _ranked_search_page([])
 
     class FakeRuntimeProvider:
         async def build_search_engine(self, _db, _config, *, audit_logger=None):

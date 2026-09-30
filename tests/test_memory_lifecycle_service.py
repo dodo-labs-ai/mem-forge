@@ -1630,7 +1630,8 @@ async def test_create_search_get_memory_round_trip_keeps_provenance_out_of_searc
     assert "User confirmed this after validating the payroll smoke flow." not in str(search_result)
     assert "sources" not in search_result
     detail = detail_response.json()
-    assert "sources" not in detail
+    assert detail["sources"] == [{"source_id": "user_memory", "source_type": "user_memory", "name": None}]
+    assert detail["source_backed"] is False
     assert "evidence_artifacts" not in detail
     assert detail["id"] == payload["memory_id"]
     assert detail["content"] == "Use canonical payroll trigger status fields."
@@ -1893,6 +1894,36 @@ async def test_purge_memory_route_refuses_source_backed_memory(db: Database, tmp
     assert response.status_code == 409
     assert response.json()["detail"] == "source_backed_memory_requires_lifecycle_review"
     assert await db.get_memory(memory.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_memory_detail_reports_source_backing_that_blocks_retiring(db: Database, tmp_path, monkeypatch):
+    backed = _memory("mem-detail-source-backed", "Fact a source still supports")
+    unbacked = _memory("mem-detail-unbacked", "Fact no source supports")
+    await db.insert_memory(backed)
+    await db.insert_memory(unbacked)
+
+    async def supported(memory_ids):
+        return {
+            memory_id: ActiveMemorySupportState(
+                unit_ids=("eu-1",) if memory_id == backed.id else (),
+                support_set_hash="support",
+                current_unit_ids=(),
+                current_support_set_hash="support",
+            )
+            for memory_id in memory_ids
+        }
+
+    monkeypatch.setattr(db, "get_active_memory_support_states", supported)
+    app = _member_app(db, tmp_path, user_id="bob@example.test")
+
+    with TestClient(app) as client:
+        backed_detail = client.get(f"/api/v1/memories/{backed.id}")
+        unbacked_detail = client.get(f"/api/v1/memories/{unbacked.id}")
+
+    assert backed_detail.status_code == 200, backed_detail.text
+    assert backed_detail.json()["source_backed"] is True
+    assert unbacked_detail.json()["source_backed"] is False
 
 
 @pytest.mark.asyncio

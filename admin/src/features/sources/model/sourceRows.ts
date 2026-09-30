@@ -1,5 +1,5 @@
 import { isLocalAgentBackedSource } from "./localAgentSources";
-import { SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY } from "./projectKeys";
+import { SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY } from "@/api";
 import { groupSourcesByProject, projectGroupKey, type ResolvedBySource } from "./projectGrouping";
 import { sourceAttention, type SourceAttention } from "./sourceAttention";
 import { organizeSourceGroups, type SourceListSortMode } from "./sourceListOrganization";

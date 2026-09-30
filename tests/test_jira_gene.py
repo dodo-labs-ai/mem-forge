@@ -1640,3 +1640,157 @@ async def test_discover_retries_on_transient_connect_error(monkeypatch):
         ("POST", "/rest/api/2/search"),
         ("POST", "/rest/api/2/search"),
     ]
+
+
+def _transport_gene(handler, config: dict | None = None) -> JiraGene:
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"], **(config or {})},
+        source_id="src-jira",
+    )
+    gene._client = httpx.AsyncClient(base_url="https://jira.example.test", transport=httpx.MockTransport(handler))
+    gene._base_url = "https://jira.example.test"
+    gene._request_limiter = None
+    gene._auth_mode = "pat"
+    gene._hydrated_issues = {}
+    return gene
+
+
+def _stored_issue(key: str, issue_id: str) -> ContentItem:
+    return ContentItem(
+        item_id=f"jira-{key}",
+        title=key,
+        source_url=f"https://jira.example.test/browse/{key}",
+        last_modified=datetime(2026, 5, 21, tzinfo=timezone.utc),
+        extra={"issue_id": issue_id, "issue_key": key},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "expected_jql"),
+    [
+        (
+            {},
+            "project in (PAY) AND issuetype in (Epic,Story,Bug,Task) ORDER BY key ASC",
+        ),
+        (
+            {"query_mode": "advanced", "jql": "project = PAY AND updated >= -30d ORDER BY updated DESC"},
+            "project = PAY AND updated >= -30d ORDER BY key ASC",
+        ),
+    ],
+    ids=["simple", "advanced"],
+)
+async def test_scope_listing_pages_the_configured_jql_without_since_by_identifier(config, expected_jql):
+    requests: list[dict] = []
+    page_size = 2
+    issues = [_jira_issue(f"PAY-{number}") for number in range(1, 4)]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        start = body["startAt"]
+        return httpx.Response(200, json=_search_page(issues[start:start + page_size], total=len(issues), start_at=start))
+
+    gene = _transport_gene(handler, config)
+    gene._hydrated_issues = {"PAY-9": {"cached": True}}
+    try:
+        listing = await gene.list_scope()
+    finally:
+        await gene._client.aclose()
+
+    assert listing.kind.value == "query"
+    assert listing.doc_ids == {"jira-PAY-1", "jira-PAY-2", "jira-PAY-3"}
+    assert {body["jql"] for body in requests} == {expected_jql}
+    assert all(body["fields"] == ["updated"] and "expand" not in body for body in requests)
+    # Discovery's hydrated issues are kept for this run's fetch.
+    assert gene._hydrated_issues == {"PAY-9": {"cached": True}}
+
+
+@pytest.mark.asyncio
+async def test_scope_listing_that_ends_before_its_total_raises():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return httpx.Response(200, json=_search_page([] if body["startAt"] else [_jira_issue("PAY-1")], total=2, start_at=body["startAt"]))
+
+    gene = _transport_gene(handler)
+    try:
+        with pytest.raises(RuntimeError, match="declared total"):
+            await gene.list_scope()
+    finally:
+        await gene._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_local_agent_jira_cannot_list_its_scope():
+    gene = JiraGene(config={"base_url": "https://jira.example.test", "sync_mode": "local_agent"}, source_id="src-jira")
+
+    assert await gene.list_scope() is None
+
+
+@pytest.mark.asyncio
+async def test_confirming_unlisted_issues_keeps_every_issue_jira_still_has():
+    searches: list[dict] = []
+    reads: list[str] = []
+    # PAY-1 is found by the batch search. PAY-2 is deleted, PAY-3 is refused
+    # for this one issue and PAY-4 is found when read by id.
+    status_by_id = {"100002": httpx.codes.NOT_FOUND, "100003": httpx.codes.FORBIDDEN, "100004": httpx.codes.OK}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/rest/api/2/search":
+            body = json.loads(request.content)
+            searches.append(body)
+            return httpx.Response(200, json=_search_page([_jira_issue("PAY-1")]))
+        issue_id = request.url.path.rsplit("/", 1)[-1]
+        reads.append(issue_id)
+        status = status_by_id[issue_id]
+        return httpx.Response(status, json=_jira_issue("PAY-4") if status == httpx.codes.OK else {"errorMessages": []})
+
+    gene = _transport_gene(handler)
+    items = [_stored_issue(f"PAY-{number}", str(100000 + number)) for number in range(1, 5)]
+    try:
+        absent = await gene.confirm_absent(items)
+    finally:
+        await gene._client.aclose()
+
+    assert absent == {"jira-PAY-2"}
+    assert [body["jql"] for body in searches] == ["issuekey in (100001, 100002, 100003, 100004)"]
+    assert searches[0]["validateQuery"] is False
+    assert reads == ["100002", "100003", "100004"]
+
+
+@pytest.mark.asyncio
+async def test_confirming_unlisted_issues_searches_in_batches_of_one_page():
+    from memforge.genes.jira_gene import JIRA_INVENTORY_MAX_RESULTS
+
+    batch_sizes: list[int] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        refs = body["jql"].removeprefix("issuekey in (").removesuffix(")").split(", ")
+        batch_sizes.append(len(refs))
+        return httpx.Response(200, json=_search_page([_jira_issue(f"PAY-{int(ref) - 100000}") for ref in refs]))
+
+    gene = _transport_gene(handler)
+    items = [_stored_issue(f"PAY-{number}", str(100000 + number)) for number in range(1, JIRA_INVENTORY_MAX_RESULTS + 2)]
+    try:
+        absent = await gene.confirm_absent(items)
+    finally:
+        await gene._client.aclose()
+
+    assert absent == frozenset()
+    assert batch_sizes == [JIRA_INVENTORY_MAX_RESULTS, 1]
+
+
+@pytest.mark.asyncio
+async def test_confirming_unlisted_issues_fails_when_jira_rejects_the_credential():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/rest/api/2/search":
+            return httpx.Response(200, json=_search_page([]))
+        return httpx.Response(httpx.codes.UNAUTHORIZED, json={"errorMessages": ["unauthorized"]})
+
+    gene = _transport_gene(handler)
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await gene.confirm_absent([_stored_issue("PAY-2", "100002")])
+    finally:
+        await gene._client.aclose()

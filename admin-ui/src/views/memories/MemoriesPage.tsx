@@ -8,6 +8,7 @@ import type {
   MemoryReviewListResponse,
   PaginatedResponse,
   Project,
+  ProjectList,
   RelationLabel,
   RelationPair,
   Source,
@@ -252,7 +253,7 @@ export function MemoriesPage() {
 
   const projectsQuery = useQuery<Project[]>({
     queryKey: ["projects"],
-    queryFn: () => resourceClient.get<Project[]>("/projects").then((response) => response.data),
+    queryFn: () => resourceClient.get<ProjectList>("/projects").then((response) => response.data.data),
   });
 
   const statsQuery = useQuery<Stats>({

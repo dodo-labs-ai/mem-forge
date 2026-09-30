@@ -821,14 +821,32 @@ class RelationalStore(Protocol):
         """
         ...
 
-    async def commit_project_deletion(self, project_id: str, affected_ids: Sequence[str]) -> None:
-        """Rebucket the named memories to UNSORTED and drop the project
-        row, in one transaction.
+    async def list_sources_released_by_project_deletion(self, project_id: str) -> list[str]:
+        """Return the ids of the Sources that deleting the project releases.
+
+        The same rule `commit_project_deletion` applies, so the count an
+        admin confirms is the set the deletion changes. Reserved keys
+        (SHARED, UNSORTED) raise `ValueError`; an unknown id raises
+        `LookupError`.
+        """
+        ...
+
+    async def commit_project_deletion(self, project_id: str, affected_ids: Sequence[str]) -> list[str]:
+        """Rebucket the named memories to UNSORTED, release the binding of
+        every Source that names the project, and drop the project row, in
+        one transaction.
 
         `affected_ids` is the same id list the caller already moved on
         the vector side, so the relational rebucket touches exactly the
-        rows the vector channel touched. Reserved keys (SHARED,
-        UNSORTED) raise `ValueError`.
+        rows the vector channel touched. The released Sources are chosen
+        and rewritten by `released_project_bindings`, read under the
+        transaction's lock: a fixed binding to the project is removed, a
+        field binding drops its mappings to the project and its default
+        moves to UNSORTED if it pointed there. A retired Source sends no
+        memories, and a binding that is not a JSON object routes none to
+        the project; both are left as stored. Returns the ids of the
+        released Sources. Reserved keys (SHARED, UNSORTED) raise
+        `ValueError`.
         """
         ...
 

@@ -15,6 +15,7 @@ import type {
   GeneConfigSchema,
   Project,
   ProjectBinding,
+  ProjectList,
   ProjectKind,
   SourceProjectsResponse,
 } from "@/api/types";
@@ -115,7 +116,7 @@ export function ProjectBindingFields({
   const projectsQuery = useQuery<Project[]>({
     queryKey: ["projects"],
     queryFn: () =>
-      resourceClient.get<Project[]>("/projects").then((response) => response.data),
+      resourceClient.get<ProjectList>("/projects").then((response) => response.data.data),
   });
   const projects = useMemo(() => projectsQuery.data ?? [], [projectsQuery.data]);
   const userProjects = useMemo(

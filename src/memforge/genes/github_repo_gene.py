@@ -59,6 +59,7 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+    ScopeListingKind,
 )
 from memforge.repo_identity import normalize_repo_identifier
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, latest_source_time
@@ -286,6 +287,7 @@ class GitHubRepoGene(Gene):
             normalize_github_relative_path(str(entry.get("path") or "")).rstrip("/"): entry
             for entry in entries
         }
+        listed_doc_ids: set[str] = set()
         for entry in selected:
             resolved = await self._resolve_repo_entry(
                 repo_ref,
@@ -305,13 +307,15 @@ class GitHubRepoGene(Gene):
                 raise RuntimeError(
                     f"GitHub symlink {path} selects a binary Artifact; symlinked Artifacts are unsupported"
                 )
+            doc_id = build_github_repo_doc_id(
+                source_id=self.source_id,
+                repo_url=repo_ref.repo_url,
+                repo_ref=ref,
+                relative_path=path,
+            )
+            listed_doc_ids.add(doc_id)
             yield ContentItem(
-                item_id=build_github_repo_doc_id(
-                    source_id=self.source_id,
-                    repo_url=repo_ref.repo_url,
-                    repo_ref=ref,
-                    relative_path=path,
-                ),
+                item_id=doc_id,
                 title=_title_from_path(path),
                 source_url=_file_url(repo_ref, ref, path),
                 # Discovery time. The file's source time is its commit time, read in fetch.
@@ -341,6 +345,9 @@ class GitHubRepoGene(Gene):
                 },
             )
         self.attest_discovery_complete("github_recursive_tree_exhausted")
+        # The tree at the collected commit is everything the repository holds
+        # in scope: a file it no longer lists was removed or renamed.
+        self.record_scope_listing(ScopeListingKind.EXISTENCE, listed_doc_ids)
 
     async def fetch(self, item: ContentItem) -> RawContent:
         if item.extra.get("package_uri") or item.extra.get("package_path"):

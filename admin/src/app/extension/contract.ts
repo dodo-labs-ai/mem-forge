@@ -69,6 +69,15 @@ export function isReservedSegment(segment: string): segment is ReservedRouteSegm
   return (RESERVED_ROUTE_SEGMENTS as readonly string[]).includes(segment);
 }
 
+/**
+ * Whether `pathname` is a product page rather than an extension page. Only
+ * product pages act on the selected workspace; extension pages such as Cloud
+ * admin are scoped to something else, like the organisation.
+ */
+export function isProductPath(pathname: string): boolean {
+  return isReservedSegment(topSegment(pathname));
+}
+
 /** Drops extension routes that would shadow a product page. */
 export function extensionRoutes(extension: AdminExtension | undefined): RouteObject[] {
   return (extension?.routes ?? []).filter((route) => !isReservedSegment(topSegment(route.path)));

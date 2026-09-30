@@ -34,6 +34,7 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+    ScopeListingKind,
 )
 from memforge.pipeline.normalizer_utils import annotate_code_blocks, html_to_markdown, strip_boilerplate
 from memforge.repo_identity import normalize_repo_identifier
@@ -256,6 +257,9 @@ class GitHubPagesGene(Gene):
                     yield item
             if _bool_config(self.config, "sitemap_authoritative", False):
                 self.attest_discovery_complete("github_pages_authoritative_sitemap_exhausted")
+                # The site declares its sitemap exhaustive: a page it no
+                # longer lists is no longer published.
+                self.record_scope_listing(ScopeListingKind.EXISTENCE, {item.item_id for item in sitemap_items})
             return
 
         async for item in self._discover_bfs(since):
@@ -428,7 +432,7 @@ class GitHubPagesGene(Gene):
         last_modified = _discovery_time(commit_time)
         version = blob_sha or last_modified.isoformat()
         return ContentItem(
-            item_id=f"github-pages-{hashlib.sha1(canonical_url.encode('utf-8')).hexdigest()}",
+            item_id=_page_doc_id(canonical_url),
             title=_title_from_url(canonical_url),
             source_url=canonical_url,
             last_modified=last_modified,
@@ -498,6 +502,9 @@ class GitHubPagesGene(Gene):
             )
             if _is_modified_since(item.last_modified, since):
                 yield item
+        # The branch tree is everything the repository publishes under the
+        # subtree: a page whose file it no longer holds is gone.
+        self.record_scope_listing(ScopeListingKind.EXISTENCE, {_page_doc_id(page_url) for page_url in page_urls})
 
     async def _default_branch(self, ref: "_RepoRef") -> str:
         response = await self._client.get(_repo_api_url(ref))
@@ -884,6 +891,10 @@ def _path_is_under(url: str, root_url: str) -> bool:
     return url_path.startswith(root_path)
 
 
+def _page_doc_id(canonical_url: str) -> str:
+    return f"github-pages-{hashlib.sha1(canonical_url.encode('utf-8')).hexdigest()}"
+
+
 def _content_item_from_url(url: str, headers: dict[str, str]) -> ContentItem:
     """A page item whose source time is the HTTP ``Last-Modified`` the site reports.
 
@@ -896,7 +907,7 @@ def _content_item_from_url(url: str, headers: dict[str, str]) -> ContentItem:
     last_modified = _discovery_time(header_time)
     etag = headers.get("etag") or headers.get("ETag") or ""
     return ContentItem(
-        item_id=f"github-pages-{hashlib.sha1(canonical_url.encode('utf-8')).hexdigest()}",
+        item_id=_page_doc_id(canonical_url),
         title=_title_from_url(canonical_url),
         source_url=canonical_url,
         last_modified=last_modified,

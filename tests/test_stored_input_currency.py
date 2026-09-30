@@ -13,7 +13,7 @@ import pytest
 
 from memforge.llm.structured import failure_retryable
 from memforge.memory.engine import SourceUnitLifecycleExecutionError
-from memforge.models import ContentItem, GeneMetadata, NormalizedContent, RawContent
+from memforge.models import ContentItem, GeneMetadata, NormalizedContent, RawContent, ScopeListing, ScopeListingKind
 from memforge.pipeline.source_projection_adapters import jira_changelog_semantic_class
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
 from memforge.source_activity import SourceActivityConflict
@@ -87,6 +87,15 @@ class JiraProvider:
         issue_key = item.extra["issue_key"]
         self.rediscovered.append(issue_key)
         return None if issue_key in self.removed else self._item(issue_key)
+
+    async def list_scope(self):
+        return ScopeListing(
+            kind=ScopeListingKind.QUERY,
+            doc_ids=frozenset(doc_id(key) for key in ISSUES if key not in self.removed),
+        )
+
+    async def confirm_absent(self, items):
+        return frozenset(item.item_id for item in items if item.extra["issue_key"] in self.removed)
 
     def payload(self, issue_key: str) -> bytes:
         histories = self.histories[issue_key]

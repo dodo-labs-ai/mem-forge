@@ -1,7 +1,6 @@
 import { Files, Plus } from "lucide-react";
-import { useMemo, useState } from "react";
-import { useQueries } from "@tanstack/react-query";
-import { unwrap, useApi } from "@/api";
+import { useRef, useState } from "react";
+import { useProjects } from "@/api";
 import { localSyncState, useLocalSyncStatus } from "@/features/local-sync";
 import { pluralize } from "@/lib/format";
 import {
@@ -19,13 +18,13 @@ import { Button } from "@/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/ui/select";
 import { errorMessage } from "@/lib/errors";
 import {
-  sourceKeys,
   useDeleteSource,
   useLocalSyncJobs,
-  useProjects,
+  useResolvedProjects,
   useSetSortMode,
   useSourceListPreferences,
   useSources,
+  useSourceTypeLabels,
 } from "./api";
 import { V1_SOURCES_PATH } from "./constants";
 import type { SourceListSortMode } from "./model/sourceListOrganization";
@@ -36,8 +35,6 @@ import {
   type SourceFilter,
   type SourceRow,
 } from "./model/sourceRows";
-import { sourceProjectBinding } from "./model/projectBinding";
-import type { ResolvedBySource } from "./model/projectGrouping";
 import type { Source } from "./model/types";
 import { SOURCE_COLUMNS } from "./sourceColumns";
 import { SourceTableContext } from "./sourceTableContext";
@@ -53,35 +50,6 @@ const DEFAULT_SORT: SourceListSortMode = "newest";
 /** "Needs you" cards shown above the table before the rest collapse into the filter. */
 const ATTENTION_CARD_LIMIT = 3;
 
-function useTypeLabels(): Record<string, string> {
-  const api = useApi();
-  const [genes] = useQueries({
-    queries: [{ queryKey: ["genes"], queryFn: () => unwrap(api.GET("/api/v1/genes")) }],
-  });
-  return useMemo(
-    () => Object.fromEntries((genes.data ?? []).map((gene) => [gene.name, gene.display_name])),
-    [genes.data],
-  );
-}
-
-function useResolvedProjects(sources: Source[]): ResolvedBySource {
-  const api = useApi();
-  const byField = sources.filter((source) => sourceProjectBinding(source)?.mode === "by_field");
-  const results = useQueries({
-    queries: byField.map((source) => ({
-      queryKey: [...sourceKeys.all, "resolved-projects", source.id],
-      queryFn: () =>
-        unwrap(api.GET("/api/v1/sources/{source_id}/projects/resolved", { params: { path: { source_id: source.id } } })),
-    })),
-  });
-  const resolved: ResolvedBySource = {};
-  results.forEach((result, index) => {
-    const source = byField[index];
-    if (source && result.data) resolved[source.id] = result.data.projects;
-  });
-  return resolved;
-}
-
 export function SourcesPage() {
   const sourcesQuery = useSources();
   const { jobs } = useLocalSyncJobs();
@@ -90,13 +58,14 @@ export function SourcesPage() {
   const setSortMode = useSetSortMode();
   const deleteSource = useDeleteSource();
   const daemonQuery = useLocalSyncStatus();
-  const typeLabels = useTypeLabels();
+  const typeLabels = useSourceTypeLabels();
   const resolvedBySource = useResolvedProjects(sourcesQuery.sources);
 
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<SourceFilter>("all");
   const [openRowKey, setOpenRowKey] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Source | null>(null);
+  const tableRef = useRef<HTMLDivElement>(null);
 
   const daemonState = localSyncState(daemonQuery);
   const daemon: LocalDaemonReadiness =
@@ -126,6 +95,12 @@ export function SourcesPage() {
     if (row) setOpenRowKey(row.key);
   }
   const actions = useSourceActions({ onViewDetails: viewDetails });
+
+  function showAllNeedingAttention() {
+    setSearch("");
+    setFilter("needs_you");
+    tableRef.current?.scrollIntoView({ block: "start" });
+  }
 
   const tableGroups: DataTableGroup<SourceRow>[] = groups.map((group) => ({
     id: group.key,
@@ -164,9 +139,16 @@ export function SourcesPage() {
 
       {attention.length > 0 ? (
         <section aria-label="Needs you" className="space-y-2">
-          <h2 className="text-sm font-semibold text-foreground">
-            Needs you <span className="font-normal text-muted-foreground">{attention.length}</span>
-          </h2>
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold text-foreground">
+              Needs you <span className="font-normal text-muted-foreground">{attention.length}</span>
+            </h2>
+            {attention.length > ATTENTION_CARD_LIMIT ? (
+              <Button size="sm" variant="link" onClick={showAllNeedingAttention}>
+                View all {attention.length}
+              </Button>
+            ) : null}
+          </div>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {attention.slice(0, ATTENTION_CARD_LIMIT).map(({ source, attention: item }) => (
               <ActionCard
@@ -193,7 +175,7 @@ export function SourcesPage() {
           action={<Button nativeButton={false} render={<a href={V1_SOURCES_PATH} />}>Add source</Button>}
         />
       ) : (
-        <div className="space-y-3">
+        <div ref={tableRef} className="scroll-mt-6 space-y-3">
           <FilterBar
             search={search}
             onSearchChange={setSearch}

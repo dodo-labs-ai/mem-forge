@@ -5,11 +5,6 @@ export interface NavItem {
   segment: ReservedRouteSegment;
   label: string;
   icon: LucideIcon;
-  /**
-   * Set while the page is not built in this app yet: the item opens the V1
-   * page at this path instead. Remove it when the page lands (ADR 0044).
-   */
-  v1Path?: string;
 }
 
 export interface NavGroup {
@@ -18,24 +13,24 @@ export interface NavGroup {
 }
 
 export const NAV_GROUPS: NavGroup[] = [
-  { title: "Knowledge", items: [{ segment: "memories", label: "Memories", icon: Brain, v1Path: "/memories" }] },
+  { title: "Knowledge", items: [{ segment: "memories", label: "Memories", icon: Brain }] },
   {
     title: "Curate",
     items: [
-      { segment: "review", label: "Review", icon: ShieldCheck, v1Path: "/review" },
-      { segment: "evaluation", label: "Evaluation", icon: Activity, v1Path: "/evaluation" },
+      { segment: "review", label: "Review", icon: ShieldCheck },
+      { segment: "evaluation", label: "Evaluation", icon: Activity },
     ],
   },
   {
     title: "Connect",
     items: [
       { segment: "sources", label: "Sources", icon: Files },
-      { segment: "projects", label: "Projects", icon: KanbanSquare, v1Path: "/projects" },
+      { segment: "projects", label: "Projects", icon: KanbanSquare },
     ],
   },
 ];
 
-export const SETTINGS_NAV_ITEM: NavItem = { segment: "settings", label: "Settings", icon: Settings, v1Path: "/settings" };
+export const SETTINGS_NAV_ITEM: NavItem = { segment: "settings", label: "Settings", icon: Settings };
 
 /** The page the app opens on. */
 export const HOME_SEGMENT: ReservedRouteSegment = "sources";

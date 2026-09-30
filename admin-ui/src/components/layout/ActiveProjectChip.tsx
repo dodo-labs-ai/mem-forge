@@ -5,7 +5,7 @@ import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 
 import { resourceClient } from "@/api/client";
 import { isReservedProjectKey } from "@/api/projectKeys";
-import type { Project } from "@/api/types";
+import type { Project, ProjectList } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
@@ -68,7 +68,7 @@ export function ActiveProjectChip() {
 
   const projectsQuery = useQuery<Project[]>({
     queryKey: ["projects"],
-    queryFn: () => resourceClient.get<Project[]>("/projects").then((r) => r.data),
+    queryFn: () => resourceClient.get<ProjectList>("/projects").then((r) => r.data.data),
   });
 
   const userProjects = useMemo(() => {

@@ -56,6 +56,8 @@ from memforge.models import (
     NormalizedContent,
     RawContent,
     RawMemory,
+    ScopeListing,
+    ScopeListingKind,
     SourceUnitInput,
     SyncState,
     FailedDoc,
@@ -2073,6 +2075,13 @@ class EmptyGene:
             yield ContentItem(item_id="never", title="never", updated_at=datetime.now(timezone.utc))
 
 
+class EmptyProviderGene(EmptyGene):
+    """A provider whose complete listing holds nothing."""
+
+    async def list_scope(self):
+        return ScopeListing(kind=ScopeListingKind.EXISTENCE, doc_ids=frozenset())
+
+
 class IncompleteEmptyGene(EmptyGene):
     discovery_complete = False
 
@@ -3627,6 +3636,13 @@ class BlockingFetchGene:
                 version=str(idx),
                 extra={"issue_id": str(100000 + idx), "issue_key": f"PAY-{idx}"},
             )
+
+    async def list_scope(self):
+        """Every issue discovery lists whatever ``since`` is: the whole provider."""
+        return ScopeListing(
+            kind=ScopeListingKind.EXISTENCE,
+            doc_ids=frozenset(f"jira-{idx}" for idx in range(self.item_count)),
+        )
 
     async def fetch(self, item):
         self.active_fetches += 1
@@ -6368,7 +6384,7 @@ async def test_deletion_failure_marks_sync_failed(db: Database):
     )
 
     state = await orchestrator.sync_gene(
-        gene=EmptyGene(),
+        gene=EmptyProviderGene(),
         source_name="Architecture",
         source_id=source_id,
     )
@@ -10817,6 +10833,12 @@ class _IssueGene(BlockingFetchGene):
         release.set()
         super().__init__(item_count=len(issues), release=release)
         self.issues = issues
+
+    async def list_scope(self):
+        return ScopeListing(
+            kind=ScopeListingKind.EXISTENCE,
+            doc_ids=frozenset(f"jira-{idx}" for idx in self.issues),
+        )
 
     async def discover(self, since=None):
         del since
