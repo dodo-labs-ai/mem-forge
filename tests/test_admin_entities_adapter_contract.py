@@ -87,9 +87,6 @@ class AdapterOnlyEntityDb:
             "target_name": self.entity.canonical_name,
         }
 
-    async def get_schedule_config(self) -> dict:
-        return {"enabled": False}
-
     async def claim_due_scheduled_sources(
         self,
         *,

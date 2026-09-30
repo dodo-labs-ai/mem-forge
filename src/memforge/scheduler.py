@@ -21,7 +21,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-SYNC_JOB_ID = "memforge-sync-all"
 EXPIRY_JOB_ID = "memforge-retire-expired"
 INDEX_HEALTH_JOB_ID = "memforge-index-health"
 SOURCE_SCHEDULE_SCAN_JOB_ID = "memforge-source-schedule-scan"
@@ -31,28 +30,8 @@ ARTIFACT_CLEANUP_JOB_ID = "memforge-artifact-cleanup"
 ARTIFACT_CLEANUP_BATCH_SIZE = 100
 
 
-def build_schedule_trigger(schedule: dict) -> CronTrigger:
-    raw_time = schedule.get("time") or "02:00"
-    hour_text, minute_text = raw_time.split(":", 1)
-    hour = int(hour_text)
-    minute = int(minute_text)
-    timezone = schedule.get("timezone") or "UTC"
-    frequency = schedule.get("frequency", "daily")
-
-    if frequency == "hourly":
-        return CronTrigger(minute=minute, timezone=timezone)
-    if frequency == "weekly":
-        return CronTrigger(
-            day_of_week=int(schedule.get("day_of_week", 0)),
-            hour=hour,
-            minute=minute,
-            timezone=timezone,
-        )
-    return CronTrigger(hour=hour, minute=minute, timezone=timezone)
-
-
 class SyncScheduler:
-    """Owns the APScheduler job that periodically syncs all active sources."""
+    """Owns the APScheduler jobs for due source syncs and workspace maintenance."""
 
     def __init__(
         self,
@@ -74,31 +53,6 @@ class SyncScheduler:
         self._ensure_source_schedule_scan_job()
         self._ensure_agent_runtime_retention_job()
         self._ensure_artifact_cleanup_job()
-        await self.reload()
-
-    async def reload(self) -> None:
-        if self.scheduler.get_job(SYNC_JOB_ID):
-            self.scheduler.remove_job(SYNC_JOB_ID)
-
-        schedule = await self.db.get_schedule_config()
-        if not schedule.get("enabled"):
-            return
-
-        self.scheduler.add_job(
-            self._run_tracked,
-            trigger=build_schedule_trigger(schedule),
-            id=SYNC_JOB_ID,
-            args=(self.sync_service.run_all_active_sources,),
-            replace_existing=True,
-            coalesce=True,
-            max_instances=1,
-        )
-        logger.info(
-            "Scheduled sync enabled: %s at %s %s",
-            schedule.get("frequency"),
-            schedule.get("time"),
-            schedule.get("timezone"),
-        )
 
     def _ensure_expiry_job(self) -> None:
         if self.scheduler.get_job(EXPIRY_JOB_ID):
