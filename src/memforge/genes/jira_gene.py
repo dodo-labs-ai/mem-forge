@@ -29,6 +29,7 @@ from memforge.genes.atlassian_auth import (
 )
 from memforge.genes.base import Gene
 from memforge.genes.local_adapter_packages import (
+    decode_package,
     has_package_manifest,
     open_packaged_source_artifact,
     package_manifest,
@@ -646,7 +647,9 @@ class JiraGene(Gene):
         """Fetch full issue data with comments and links."""
         if item.extra.get("package_uri") or item.extra.get("package_path"):
             body = read_package_body(self, item, source_label="Jira")
-            package = json.loads(body.decode("utf-8"))
+            package = decode_package(body, LOCAL_AGENT_JIRA_PACKAGE_KIND)
+            if package is None:
+                raise ValueError(f"Jira package {item.item_id} is not a {LOCAL_AGENT_JIRA_PACKAGE_KIND} package")
             return RawContent(
                 item=item,
                 body=body,

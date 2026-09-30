@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from memforge.config import AppConfig
 from memforge.github_repo_utils import build_github_repo_doc_id
 from memforge.local_agent.source_contract import source_with_sync_inputs
 from memforge.local_adapter import submit_github_repo_document
+from memforge.models import ContentItem, require_attested_content
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.source_artifacts import SourceArtifactContractError
@@ -775,6 +777,33 @@ def test_local_adapter_document_push_writes_package(tmp_path):
         assert normalized.markdown_body.startswith("# Cutoff")
     finally:
         asyncio.run(database.close())
+
+
+def test_a_stored_local_markdown_package_is_read_by_its_own_kind(tmp_path):
+    from memforge.genes.local_markdown_gene import LocalMarkdownGene
+
+    gene = LocalMarkdownGene({"documents_dir": str(tmp_path)}, "src-local")
+    item = ContentItem(
+        item_id="local-md-empty", title="Empty", source_url="", last_modified=datetime.now(timezone.utc),
+    )
+    package = {
+        "package_kind": "local_markdown_document",
+        "relative_path": "notes/empty.md",
+        "content_type": "text/markdown",
+        "markdown": "",
+    }
+
+    stored = gene.raw_from_stored_input(item, json.dumps(package).encode("utf-8"), "application/json")
+    normalized = asyncio.run(gene.normalize(stored))
+
+    require_attested_content(stored, normalized)
+    assert stored.empty_evidence == "local_markdown_package_attested_empty_file"
+    other_kind = gene.raw_from_stored_input(
+        item, json.dumps({**package, "package_kind": "github_repo_document"}).encode("utf-8"), "application/json",
+    )
+    assert (other_kind.authoritative_empty, other_kind.empty_evidence) == (False, None)
+    with pytest.raises(ValueError, match="not a local_markdown_document package"):
+        asyncio.run(gene.normalize(other_kind))
 
 
 def test_duplicate_local_package_attests_the_retained_artifact_not_the_new_upload(

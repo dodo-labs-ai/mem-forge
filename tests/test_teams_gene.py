@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -18,7 +19,7 @@ from memforge.genes.teams_gene import (
     _TeamsAPIClient,
     _group_into_blocks,
 )
-from memforge.models import ConfigFieldType
+from memforge.models import ConfigFieldType, require_attested_content
 from memforge.local_agent.source_contract import local_agent_semantic_input_sha256
 from memforge.local_agent.document_identity import build_teams_doc_id
 from memforge.local_agent.teams_ledger import build_teams_window_id
@@ -407,6 +408,22 @@ class TestMetadata:
         assert raw.empty_evidence == "teams_complete_conversation_poll_window_tombstone"
         assert normalized.markdown_body == ""
         assert normalized.source_semantics["tombstone_reason"] == raw_payload["tombstone_reason"]
+
+        # Stored input keeps the package bytes and an item without discovery
+        # metadata; the tombstone attests the empty window from the bytes alone.
+        stored_item = replace(items[0], extra={})
+        stored_raw = gene.raw_from_stored_input(stored_item, package_body, "application/json")
+        stored_normalized = await gene.normalize(stored_raw)
+        require_attested_content(stored_raw, stored_normalized)
+        assert (stored_raw.authoritative_empty, stored_raw.empty_evidence) == (
+            raw.authoritative_empty,
+            raw.empty_evidence,
+        )
+        assert stored_raw.artifacts == ()
+        assert stored_normalized.markdown_body == ""
+        # Bytes that are not a Teams window package attest nothing, even with a tombstone marker.
+        unpackaged = gene.raw_from_stored_input(stored_item, json.dumps(raw_payload).encode("utf-8"), "application/json")
+        assert (unpackaged.authoritative_empty, unpackaged.empty_evidence) == (False, None)
 
     def test_numeric_fields_use_integer_type(self):
         schema = TeamsGene.config_schema()

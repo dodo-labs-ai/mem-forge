@@ -16,6 +16,7 @@ from pathlib import Path
 
 from memforge.genes.base import Gene
 from memforge.genes.local_adapter_packages import (
+    decode_package,
     has_package_manifest,
     package_manifest,
     read_package_body,
@@ -61,6 +62,30 @@ def _to_markdown(content_type: str, body: str) -> str:
     if ctype == "application/json":
         return f"```json\n{body.strip()}\n```\n"
     return body
+
+
+def _local_markdown_package(body: bytes, doc_id: str) -> dict:
+    package = decode_package(body, LOCAL_MARKDOWN_PACKAGE_KIND)
+    if package is None:
+        raise ValueError(f"local markdown input {doc_id} is not a {LOCAL_MARKDOWN_PACKAGE_KIND} package")
+    return package
+
+
+def _package_markdown(package: dict) -> str:
+    return _to_markdown(package.get("content_type") or "text/markdown", str(package.get("markdown") or ""))
+
+
+def _package_raw_content(item: ContentItem, body: bytes, package: dict) -> RawContent:
+    """The raw content of one local markdown package; the package attests an empty file."""
+
+    authoritative_empty = not _package_markdown(package).strip()
+    return RawContent(
+        item=item,
+        body=body,
+        content_type="application/json",
+        authoritative_empty=authoritative_empty,
+        empty_evidence="local_markdown_package_attested_empty_file" if authoritative_empty else None,
+    )
 
 
 class LocalMarkdownGene(Gene):
@@ -165,29 +190,18 @@ class LocalMarkdownGene(Gene):
 
     async def fetch(self, item: ContentItem) -> RawContent:
         body = read_package_body(self, item, source_label="local markdown")
-        package = json.loads(body.decode("utf-8"))
-        content_type = package.get("content_type") or "text/markdown"
-        semantic_markdown = _to_markdown(
-            content_type,
-            str(package.get("markdown") or ""),
-        )
-        authoritative_empty = not semantic_markdown.strip()
-        return RawContent(
-            item=item,
-            body=body,
-            content_type="application/json",
-            authoritative_empty=authoritative_empty,
-            empty_evidence=(
-                "local_markdown_package_attested_empty_file"
-                if authoritative_empty
-                else None
-            ),
-        )
+        return _package_raw_content(item, body, _local_markdown_package(body, item.item_id))
+
+    def raw_from_stored_input(self, item: ContentItem, body: bytes, content_type: str) -> RawContent:
+        package = decode_package(body, LOCAL_MARKDOWN_PACKAGE_KIND)
+        if package is None:
+            return super().raw_from_stored_input(item, body, content_type)
+        return _package_raw_content(item, body, package)
 
     async def normalize(self, raw: RawContent) -> NormalizedContent:
-        package = json.loads(raw.body.decode("utf-8"))
+        package = _local_markdown_package(raw.body, raw.item.item_id)
         content_type = package.get("content_type") or "text/markdown"
-        markdown = _to_markdown(content_type, package.get("markdown", ""))
+        markdown = _package_markdown(package)
         return NormalizedContent(
             item=raw.item,
             markdown_body=markdown,

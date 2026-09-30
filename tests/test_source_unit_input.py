@@ -319,7 +319,9 @@ async def test_the_upgrade_gives_each_unit_the_input_its_own_source_wrote(tmp_pa
             # The team Unit's Document row was overwritten by the release Source, so it gets no input.
             assert await _unit_input(upgraded, TEAM, doc_id(ISSUE)) is None
             with pytest.raises(StoredDocumentUnavailable) as missing:
-                await load_stored_source_document(upgraded, store, source_id=TEAM, document_id=doc_id(ISSUE))
+                await load_stored_source_document(
+                    upgraded, store, workspace.provider, source_id=TEAM, document_id=doc_id(ISSUE),
+                )
             assert missing.value.reason is StoredDocumentUnavailableReason.RAW_CONTENT_MISSING
             columns = {row[1] for row in await upgraded.db.execute_fetchall("PRAGMA table_info(documents)")}
             assert columns.isdisjoint(LEGACY_STORED_INPUT_COLUMNS)
