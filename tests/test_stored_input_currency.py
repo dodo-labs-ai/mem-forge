@@ -61,6 +61,9 @@ class JiraProvider:
             auth_method="pat", data_shape="ticket",
         )
 
+    def raw_from_stored_input(self, item: ContentItem, body: bytes, content_type: str) -> RawContent:
+        return RawContent(item=item, body=body, content_type=content_type)
+
     def requires_pdf_artifact(self, **kwargs) -> bool:
         return False
 

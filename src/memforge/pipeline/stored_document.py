@@ -22,6 +22,13 @@ Source that stored its input and has not committed yet; reprocessing then
 projects and commits that content, as the next ordinary sync would. A Unit
 whose current revision has no stored input cannot be reprocessed from storage
 until the Source's next committed revision records one.
+
+The Gene reads the stored bytes by what they are, not by the discovery
+metadata stored beside them: a local-agent package names its own kind and
+carries its provider's evidence. Before anything is written, the stored input
+must normalize to content the provider attests and project to the location of
+the committed revision (:func:`project_stored_input`); the preview runs the same
+check, so it reports a Unit as processable only when the run can process it.
 """
 
 from __future__ import annotations
@@ -30,14 +37,27 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from memforge.models import ContentItem, DocumentRecord, RawContent, SourceUnitInput
+from memforge.models import (
+    ContentItem,
+    DocumentRecord,
+    NormalizedContent,
+    RawContent,
+    SourceUnitInput,
+    require_attested_content,
+)
 from memforge.source_artifacts import (
     SOURCE_ARTIFACT_OBSERVATION_TYPE,
     StoredSourceArtifact,
     source_artifact_revision_from_metadata,
     stored_source_artifact_from_observation,
 )
-from memforge.source_projection import SourceProjection
+from memforge.source_projection import (
+    ProjectionEnvelope,
+    ProjectionRequest,
+    ProjectionRunMode,
+    SourceProjection,
+    SourceProjectionAdapter,
+)
 from memforge.source_representation import current_representation_of
 
 if TYPE_CHECKING:
@@ -63,6 +83,9 @@ class StoredDocumentUnavailableReason(str, Enum):
     ARTIFACT_MISSING = "stored_artifact_missing"
     # The committed Artifact metadata cannot be read as an Artifact revision.
     ARTIFACT_INVALID = "stored_artifact_invalid"
+    # The stored input does not normalize to content its provider attests, or
+    # does not project.
+    INPUT_INVALID = "stored_input_invalid"
     # The stored input does not place the Unit where its committed revision does.
     INPUT_INCOMPLETE = "stored_input_incomplete"
     # The committed revision's current Observations cannot be authorized for extraction.
@@ -77,10 +100,16 @@ class StoredDocumentUnavailable(RuntimeError):
     # Retrying reads the same stored Document again.
     retryable = False
 
-    def __init__(self, reason: StoredDocumentUnavailableReason, document_id: str) -> None:
-        super().__init__(f"{reason.value}: {document_id}")
+    def __init__(
+        self,
+        reason: StoredDocumentUnavailableReason,
+        document_id: str,
+        detail: str | None = None,
+    ) -> None:
+        super().__init__(f"{reason.value}: {document_id}" + (f" ({detail})" if detail else ""))
         self.reason = reason
         self.document_id = document_id
+        self.detail = detail
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +178,7 @@ async def rediscover_source_document(
 async def load_stored_source_document(
     db: RelationalStore,
     document_store: DocumentStore,
+    gene: Gene,
     *,
     source_id: str,
     document_id: str,
@@ -172,10 +202,73 @@ async def load_stored_source_document(
     return StoredSourceDocument(
         unit_input=unit_input,
         item=item,
-        raw=RawContent(item=item, body=body, content_type=unit_input.raw_content_type),
+        raw=gene.raw_from_stored_input(item, body, unit_input.raw_content_type),
         artifacts=artifacts,
         committed=committed,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class StoredInputProjection:
+    normalized: NormalizedContent
+    projection: SourceProjection
+
+
+async def project_stored_input(
+    stored: StoredSourceDocument,
+    *,
+    gene: Gene,
+    projection_adapter: SourceProjectionAdapter,
+    projection_scope: dict[str, object],
+    access_context: dict[str, object],
+) -> StoredInputProjection:
+    """Normalize and project the stored input as a reprocess would, writing nothing.
+
+    The projection keeps the committed Unit's identity and cites its
+    Artifacts. Normalized content must be non-empty unless the provider
+    attested it empty, and the projection must place the Unit where its
+    committed revision does; otherwise the stored input does not describe the
+    Unit and it cannot be reprocessed from storage.
+    """
+
+    document_id = stored.item.item_id
+    committed_unit = stored.committed.source_units[0]
+    try:
+        normalized = await gene.normalize(stored.raw)
+        require_attested_content(stored.raw, normalized)
+        projection = await projection_adapter.project(
+            ProjectionEnvelope(
+                request=ProjectionRequest(
+                    run_id="projection-probe",
+                    source_id=stored.committed.source_id,
+                    source_type=gene.metadata().name,
+                    scope={
+                        "configured_scope": dict(projection_scope),
+                        "document_id": document_id,
+                        "authoritative_snapshot": False,
+                        "source_unit_id": committed_unit.id,
+                        "source_unit_provider_key": committed_unit.provider_key,
+                    },
+                    run_mode=ProjectionRunMode.FULL_SNAPSHOT,
+                    access_context=dict(access_context),
+                ),
+                item=stored.item,
+                raw=stored.raw,
+                normalized=normalized,
+                artifacts=stored.artifacts,
+            )
+        )
+    except Exception as exc:
+        # The same stored input fails the same way on every attempt.
+        raise StoredDocumentUnavailable(
+            StoredDocumentUnavailableReason.INPUT_INVALID, document_id, str(exc),
+        ) from exc
+    if (
+        projection.source_unit_revisions[0].location_hash
+        != stored.committed.source_unit_revisions[0].location_hash
+    ):
+        raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.INPUT_INCOMPLETE, document_id)
+    return StoredInputProjection(normalized=normalized, projection=projection)
 
 
 def _stored(document_store: DocumentStore, uri: str | None, media_type: str) -> bool:
@@ -226,6 +319,8 @@ class ReprocessUnitPreview:
     document_id: str
     available: bool
     reason: str | None = None
+    # What the reason's check found, when it says more than the reason.
+    detail: str | None = None
     source_unit_id: str | None = None
     unit_revision_id: str | None = None
     artifact_count: int | None = None
@@ -249,16 +344,23 @@ class ReprocessPreview:
 async def reprocess_preview(
     db: RelationalStore,
     document_store: DocumentStore,
+    gene: Gene,
     *,
     source_id: str,
     document_ids: tuple[str, ...],
     rediscovers: bool,
+    projection_adapter: SourceProjectionAdapter,
+    projection_scope: dict[str, object],
+    access_context: dict[str, object],
 ) -> ReprocessPreview:
     """Report what reprocessing these Documents would read, without writing anything.
 
     A Source that ``rediscovers`` its Documents reads them from the provider,
     so a Document needs no stored input; the preview does not contact the
-    provider. Counts come from each Unit's committed revision. ``estimated_model_calls``
+    provider. Any other Source's stored input goes through the reprocess's own
+    check (:func:`project_stored_input`), so a Unit the run would refuse is
+    reported unavailable for the same reason. Nothing calls a provider or a
+    model. Counts come from each Unit's committed revision. ``estimated_model_calls``
     is an estimate for approval, not a bound: one extraction item per
     ReadingGroup that holds authorized Primary content (the runner packs items
     into fewer requests), one Candidate admission request, one Relation request
@@ -286,7 +388,14 @@ async def reprocess_preview(
                 )
             else:
                 stored = await load_stored_source_document(
-                    db, document_store, source_id=source_id, document_id=document_id,
+                    db, document_store, gene, source_id=source_id, document_id=document_id,
+                )
+                await project_stored_input(
+                    stored,
+                    gene=gene,
+                    projection_adapter=projection_adapter,
+                    projection_scope=projection_scope,
+                    access_context=access_context,
                 )
                 committed = stored.committed
                 artifact_count = len(stored.artifacts)
@@ -295,7 +404,11 @@ async def reprocess_preview(
             if isinstance(authority, ProjectionEvidencePlanningFailure):
                 raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.EXTRACTION_UNPLANNABLE, document_id)
         except StoredDocumentUnavailable as exc:
-            units.append(ReprocessUnitPreview(document_id=document_id, available=False, reason=exc.reason.value))
+            units.append(
+                ReprocessUnitPreview(
+                    document_id=document_id, available=False, reason=exc.reason.value, detail=exc.detail,
+                )
+            )
             continue
         unit_revision = committed.source_unit_revisions[0]
         context = RevisionAssessmentContext(projection=committed, base=None, access_context_hash=source_id)

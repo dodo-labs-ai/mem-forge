@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from hashlib import sha256
 from pathlib import Path
@@ -27,6 +28,24 @@ def package_manifest(config: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(manifest, list):
         return []
     return [entry for entry in manifest if isinstance(entry, dict)]
+
+
+def decode_package(body: bytes, package_kind: str) -> dict[str, Any] | None:
+    """The local-agent package of ``package_kind`` that ``body`` holds, or ``None``.
+
+    A package names its own kind, so the stored bytes alone say how to read
+    them; the discovery metadata that located the package is not needed. Bytes
+    that are not a JSON object of exactly this kind (a repository file that
+    happens to be JSON, or another Source's package) are not this package.
+    """
+
+    try:
+        package = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(package, dict) or package.get("package_kind") != package_kind:
+        return None
+    return package
 
 
 def read_package_body(gene: Any, item: ContentItem, *, source_label: str) -> bytes:

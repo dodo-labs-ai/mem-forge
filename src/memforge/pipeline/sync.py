@@ -46,12 +46,16 @@ from memforge.llm.structured import (
 from memforge.llm.structured import failure_retryable as retries_failure
 from memforge.models import (
     ChangelogEntry,
+    ContentItem,
     DocumentRecord,
     FailedDoc,
     MemoryExtractionResult,
+    NormalizedContent,
+    RawContent,
     SourceUnitInput,
     SyncState,
     content_hash as compute_content_hash,
+    require_attested_content,
 )
 from memforge.pipeline.sync_memory import ProcessMemoryReclaimer, SyncMemoryObserver
 
@@ -107,9 +111,9 @@ from memforge.pipeline.extraction_contract import (
 from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot
 from memforge.pipeline.stored_document import (
     StoredDocumentUnavailable,
-    StoredDocumentUnavailableReason,
     StoredSourceDocument,
     load_stored_source_document,
+    project_stored_input,
     rediscover_source_document,
 )
 from memforge.pipeline.projection_images import (
@@ -117,7 +121,7 @@ from memforge.pipeline.projection_images import (
 )
 from memforge.source_access import memory_visibility_for_source_id
 from memforge.source_activity import SourceActivityLease
-from memforge.source_projection_config import canonical_projection_scope
+from memforge.source_projection_config import canonical_projection_scope, source_access_context
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time, reported_source_time
 
 if TYPE_CHECKING:
@@ -853,10 +857,7 @@ class GeneSyncOrchestrator:
             configured_source_type,
             (configured_source or {}).get("config") or {},
         )
-        configured_access_context = {
-            "access_policy": str((configured_source or {}).get("access_policy") or "workspace"),
-            "owner_user_id": (configured_source or {}).get("owner_user_id"),
-        }
+        configured_access_context = source_access_context(configured_source or {})
         scope_transition = await self.db.get_open_projection_scope_transition(source_id)
         if force_full_sync or reprocessing or scope_transition is not None:
             # Reuse is an ordinary incremental optimization only. Full syncs
@@ -904,7 +905,7 @@ class GeneSyncOrchestrator:
                             )
                         else:
                             stored = await load_stored_source_document(
-                                self.db, self.doc_store, source_id=source_id, document_id=doc_id,
+                                self.db, self.doc_store, gene, source_id=source_id, document_id=doc_id,
                             )
                             stored_documents[doc_id] = stored
                             item = stored.item
@@ -2161,110 +2162,28 @@ class GeneSyncOrchestrator:
                     **reclaim_result,
                 )
 
-    async def _process_item_admitted(
+    async def _project_fetched_item(
         self,
+        *,
         gene: Gene,
         item: ContentItem,
-        source_name: str,
+        raw: RawContent,
+        normalized: NormalizedContent,
         source_id: str,
-        run_id: str | None = None,
-        progress_callback: Callable[[dict], None] | None = None,
-        force_reprocess: bool = False,
-        projection_scope: dict[str, object] | None = None,
-        scope_transition: dict[str, object] | None = None,
-        projection_access_context: dict[str, object] | None = None,
-        projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
-        authoritative_snapshot: bool = False,
-        source_activity: SourceActivityLease | None = None,
-        source_unit_id_callback: Callable[[str], None] | None = None,
-        lifecycle_execution_owner_id: str | None = None,
-        lifecycle_attempt_count: int = 1,
-        source_unit_target_callback: Callable[[str, str], None] | None = None,
-        recovered_deferred_targets: frozenset[tuple[str, str]] = frozenset(),
-        reprocessing: bool = False,
-        stored_document: StoredSourceDocument | None = None,
-    ) -> dict:
-        """Process a single content item through the full pipeline.
+        source_type: str,
+        projection_scope: dict[str, object] | None,
+        scope_transition: dict[str, object] | None,
+        projection_access_context: dict[str, object] | None,
+        projection_scope_attestations: tuple[ProjectionScopeAttestation, ...],
+        authoritative_snapshot: bool,
+    ) -> tuple[SourceProjection, tuple[StoredSourceArtifact, ...]]:
+        """Project fetched content onto its Source Unit and store the Artifacts it returned.
 
-        ``reprocessing`` processes the Unit as an operator reprocess (see
-        :class:`SourceSyncMode`). A ``stored_document`` replaces the provider:
-        its stored raw content and committed Artifacts are the input, and
-        nothing is fetched or exported.
-
-        Steps:
-            1. Fetch raw content
-            2. Normalize to markdown
-            3. Compare the content hash and inspect stored artifacts
-            4. Store new or missing artifacts
-            5. Count tokens
-            6. Extract current Memory candidates once per bounded Source Unit batch
-            7. Reconcile lifecycle, batch-resolve candidate entity mentions, and persist
-            8. Record the changelog
-
-        Returns
-        -------
-        dict
-            Stats: ``{updated, memories_extracted}``.
+        The Unit is the Document's current Unit, a historical Unit it returns
+        to during a scope transition, or the predecessor of an attested rename.
         """
-        doc_id = item.item_id
-        stats = {
-            "updated": False,
-            "memories_extracted": 0,
-            "memory_supports_added": 0,
-            "memory_supports_updated": 0,
-            "memory_supports_removed": 0,
-            "source_unit_id": None,
-            "recovered_deferred_target": None,
-        }
 
-        # ------------------------------------------------------------------
-        # 1. Fetch raw content
-        # ------------------------------------------------------------------
-        if stored_document is None:
-            previous_input = await self._stored_unit_input(source_id, doc_id)
-            item.stored_extra = dict(previous_input.item.extra) if previous_input is not None else {}
-        raw = stored_document.raw if stored_document is not None else await gene.fetch(item)
-        logger.debug("Fetched %s (%d bytes)", doc_id, len(raw.body))
-        self._memory_sample(
-            "after_fetch",
-            source_id=source_id,
-            run_id=run_id,
-            doc_id=doc_id,
-            raw_bytes=len(raw.body),
-        )
-
-        # ------------------------------------------------------------------
-        # 2. Normalize to markdown
-        # ------------------------------------------------------------------
-        normalized = await gene.normalize(raw)
-        markdown_body = normalized.markdown_body
         stored_source_artifacts: tuple[StoredSourceArtifact, ...] = ()
-        self._memory_sample(
-            "after_normalize",
-            source_id=source_id,
-            run_id=run_id,
-            doc_id=doc_id,
-            content_chars=len(markdown_body or ""),
-        )
-
-        empty_content = not markdown_body or not markdown_body.strip()
-        if empty_content and raw.body.strip() and not raw.authoritative_empty:
-            raise ValueError(f"normalization produced empty content from a non-empty artifact: {doc_id}")
-        if empty_content and not raw.authoritative_empty:
-            raise ValueError(f"provider did not attest authoritative empty content: {doc_id}")
-        if empty_content and not str(raw.empty_evidence or "").strip():
-            raise ValueError(f"authoritative empty content is missing provider evidence: {doc_id}")
-        # ------------------------------------------------------------------
-        # 3. Project provider-native content into stable source lineage.
-        #
-        # A first in-memory projection gives us the stable Source Unit ID. We
-        # then load that unit's current revisions and build the authoritative
-        # delta before persisting the projection. No lifecycle decision is
-        # allowed to infer deletion from the enclosing sync's item list.
-        # ------------------------------------------------------------------
-        source_metadata = gene.metadata()
-        source_type = source_metadata.name
-        source_shape = source_metadata.data_shape
         async with self._db_lock:
             persisted_source_unit = await self.db.find_source_unit_by_document_id(
                 source_id,
@@ -2410,8 +2329,6 @@ class GeneSyncOrchestrator:
                 store=self.doc_store,
                 open_artifact=gene.open_source_artifact,
             )
-        elif stored_document is not None:
-            stored_source_artifacts = stored_document.artifacts
         if stored_source_artifacts:
             probe_scope.update(
                 {
@@ -2439,15 +2356,135 @@ class GeneSyncOrchestrator:
             )
             source_unit = projection_probe.source_units[0]
 
+        return projection_probe, stored_source_artifacts
+
+    async def _process_item_admitted(
+        self,
+        gene: Gene,
+        item: ContentItem,
+        source_name: str,
+        source_id: str,
+        run_id: str | None = None,
+        progress_callback: Callable[[dict], None] | None = None,
+        force_reprocess: bool = False,
+        projection_scope: dict[str, object] | None = None,
+        scope_transition: dict[str, object] | None = None,
+        projection_access_context: dict[str, object] | None = None,
+        projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
+        authoritative_snapshot: bool = False,
+        source_activity: SourceActivityLease | None = None,
+        source_unit_id_callback: Callable[[str], None] | None = None,
+        lifecycle_execution_owner_id: str | None = None,
+        lifecycle_attempt_count: int = 1,
+        source_unit_target_callback: Callable[[str, str], None] | None = None,
+        recovered_deferred_targets: frozenset[tuple[str, str]] = frozenset(),
+        reprocessing: bool = False,
+        stored_document: StoredSourceDocument | None = None,
+    ) -> dict:
+        """Process a single content item through the full pipeline.
+
+        ``reprocessing`` processes the Unit as an operator reprocess (see
+        :class:`SourceSyncMode`). A ``stored_document`` replaces the provider:
+        its stored raw content and committed Artifacts are the input, and
+        nothing is fetched or exported.
+
+        Steps:
+            1. Fetch raw content
+            2. Normalize to markdown
+            3. Compare the content hash and inspect stored artifacts
+            4. Store new or missing artifacts
+            5. Count tokens
+            6. Extract current Memory candidates once per bounded Source Unit batch
+            7. Reconcile lifecycle, batch-resolve candidate entity mentions, and persist
+            8. Record the changelog
+
+        Returns
+        -------
+        dict
+            Stats: ``{updated, memories_extracted}``.
+        """
+        doc_id = item.item_id
+        stats = {
+            "updated": False,
+            "memories_extracted": 0,
+            "memory_supports_added": 0,
+            "memory_supports_updated": 0,
+            "memory_supports_removed": 0,
+            "source_unit_id": None,
+            "recovered_deferred_target": None,
+        }
+
+        # ------------------------------------------------------------------
+        # 1. Fetch raw content
+        # ------------------------------------------------------------------
+        if stored_document is None:
+            previous_input = await self._stored_unit_input(source_id, doc_id)
+            item.stored_extra = dict(previous_input.item.extra) if previous_input is not None else {}
+        raw = stored_document.raw if stored_document is not None else await gene.fetch(item)
+        logger.debug("Fetched %s (%d bytes)", doc_id, len(raw.body))
+        self._memory_sample(
+            "after_fetch",
+            source_id=source_id,
+            run_id=run_id,
+            doc_id=doc_id,
+            raw_bytes=len(raw.body),
+        )
+
+        # ------------------------------------------------------------------
+        # 2. Normalize to markdown, and
+        # 3. project provider-native content into stable source lineage.
+        #
+        # A first in-memory projection gives us the stable Source Unit ID. We
+        # then load that unit's current revisions and build the authoritative
+        # delta before persisting the projection. No lifecycle decision is
+        # allowed to infer deletion from the enclosing sync's item list. A
+        # stored input is checked against its committed revision before
+        # anything is written, the same check the reprocess preview runs.
+        # ------------------------------------------------------------------
+        source_metadata = gene.metadata()
+        source_type = source_metadata.name
+        source_shape = source_metadata.data_shape
+        if stored_document is not None:
+            stored_projection = await project_stored_input(
+                stored_document,
+                gene=gene,
+                projection_adapter=self.source_projection_adapter,
+                projection_scope=dict(projection_scope or {}),
+                access_context=dict(projection_access_context or {}),
+            )
+            normalized = stored_projection.normalized
+            projection_probe = stored_projection.projection
+            stored_source_artifacts = stored_document.artifacts
+        else:
+            normalized = await gene.normalize(raw)
+            require_attested_content(raw, normalized)
+            projection_probe, stored_source_artifacts = await self._project_fetched_item(
+                gene=gene,
+                item=item,
+                raw=raw,
+                normalized=normalized,
+                source_id=source_id,
+                source_type=source_type,
+                projection_scope=projection_scope,
+                scope_transition=scope_transition,
+                projection_access_context=projection_access_context,
+                projection_scope_attestations=projection_scope_attestations,
+                authoritative_snapshot=authoritative_snapshot,
+            )
+        source_unit = projection_probe.source_units[0]
+        markdown_body = normalized.markdown_body
+        empty_content = not markdown_body.strip()
+        self._memory_sample(
+            "after_normalize",
+            source_id=source_id,
+            run_id=run_id,
+            doc_id=doc_id,
+            content_chars=len(markdown_body),
+        )
+
         if source_unit_id_callback is not None:
             source_unit_id_callback(source_unit.id)
         stats["source_unit_id"] = source_unit.id
-        if (
-            stored_document is not None
-            and projection_probe.source_unit_revisions[0].location_hash
-            != stored_document.committed.source_unit_revisions[0].location_hash
-        ):
-            raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.INPUT_INCOMPLETE, doc_id)
 
         current_target = (
             source_unit.id,

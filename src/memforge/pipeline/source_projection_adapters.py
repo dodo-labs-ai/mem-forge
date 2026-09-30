@@ -15,6 +15,8 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Mapping
 
+from memforge.genes.jira_gene import LOCAL_AGENT_JIRA_PACKAGE_KIND
+from memforge.genes.teams_gene import LOCAL_AGENT_TEAMS_PACKAGE_KIND
 from memforge.github_repo_utils import build_github_repo_doc_id
 from memforge.local_agent.source_contract import TEAMS_ROLLING_RETENTION_PRESETS
 from memforge.models import ContentItem, NormalizedContent, RawContent
@@ -657,7 +659,7 @@ def _provider_authoritative_unit_coverage(
     if (
         source_type == "teams"
         and isinstance(native, Mapping)
-        and native.get("package_kind") == "teams_window_document"
+        and native.get("package_kind") == LOCAL_AGENT_TEAMS_PACKAGE_KIND
         and isinstance(native.get("raw_payload"), Mapping)
     ):
         # A force-full local collection attempt is validated against its
@@ -860,7 +862,7 @@ def _project_native(
         )
     if source_type == "jira":
         data = native if isinstance(native, dict) else {}
-        if data.get("package_kind") and isinstance(data.get("raw_payload"), dict):
+        if data.get("package_kind") == LOCAL_AGENT_JIRA_PACKAGE_KIND and isinstance(data.get("raw_payload"), dict):
             data = data["raw_payload"]
         from memforge.local_agent.jira_contract import validate_jira_observation_identities
 
@@ -1064,7 +1066,7 @@ def _project_native(
         )
     if source_type == "teams":
         data = native if isinstance(native, dict) else {}
-        if data.get("package_kind") and isinstance(data.get("raw_payload"), dict):
+        if data.get("package_kind") == LOCAL_AGENT_TEAMS_PACKAGE_KIND and isinstance(data.get("raw_payload"), dict):
             data = data["raw_payload"]
         window_id = str(item.extra.get("window_id") or data.get("window_id") or item.item_id)
         conversation_id = str(item.extra.get("conversation_id") or data.get("conversation_id") or "")
