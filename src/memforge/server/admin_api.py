@@ -132,6 +132,7 @@ from memforge.models import (
     SourceExecutionKind,
     UNSORTED_PROJECT_KEY,
     VIRTUAL_DOCUMENT_SOURCE_IDS,
+    Visibility,
     canonicalize_entity_name,
 )
 from memforge.sync_progress import normalize_sync_progress_snapshot
@@ -277,8 +278,12 @@ def _workspace_default_scope(request: Request, *, include_private: bool):
     )
 
 
-def _review_visibility_scope(request: Request):
-    """Allow visible Review snapshots regardless of their lifecycle status."""
+def _lifecycle_visibility_scope(request: Request):
+    """Apply the caller's per-row access to Memories in every stored lifecycle status.
+
+    Reviews and purges act on retired, superseded, and quarantined rows as well
+    as active ones, so only the access predicate decides what the caller sees.
+    """
 
     from memforge.storage.adapters.context import AccessScope
 
@@ -614,7 +619,7 @@ async def _require_memory_review_visibility(
     visible = await _filter_visible_ids(
         db,
         participant_ids,
-        _review_visibility_scope(request),
+        _lifecycle_visibility_scope(request),
     )
     if visible != participant_ids:
         raise HTTPException(status_code=404, detail="Review not found")
@@ -648,10 +653,15 @@ async def _require_lifecycle_review_visibility(
     visible = await _filter_visible_ids(
         db,
         participant_ids,
-        _review_visibility_scope(request),
+        _lifecycle_visibility_scope(request),
     )
     if visible != set(participant_ids):
         raise HTTPException(status_code=404, detail="Review not found")
+
+
+def _require_workspace_memory_administration(request: Request) -> None:
+    if not can_manage_workspace(resolve_request_workspace_role(request)):
+        raise HTTPException(status_code=403, detail="workspace_admin_authority_required")
 
 
 def _request_audit_context(request: Request) -> AuditContext:
@@ -5128,42 +5138,42 @@ def create_admin_app(
             review_id=result.review_id,
         )
 
-    @memory_router.delete("/{memory_id}")
-    async def delete_memory(
-        memory_id: str,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
-    ):
-        """Soft-delete a memory (mark as retired and hide from search)."""
-        memory = await db.get_memory(memory_id)
-        if not memory:
-            raise HTTPException(status_code=404, detail="Memory not found")
-        memory_store = await _build_memory_store(db, config, runtime_provider)
-        try:
-            await memory_store.retire_memory(memory_id, reason="admin_hidden")
-        except ValueError as exc:
-            if "active source support" in str(exc):
-                raise HTTPException(
-                    status_code=409,
-                    detail="source_backed_memory_requires_lifecycle_review",
-                ) from exc
-            raise
-        return {"status": "deleted", "memory_id": memory_id}
-
     @memory_router.delete("/{memory_id}/purge")
     async def purge_memory(
         memory_id: str,
+        request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        """Hard-purge a memory for privacy/compliance removal."""
-        memory = await db.get_memory(memory_id)
-        if not memory:
-            raise HTTPException(status_code=404, detail="Memory not found")
+        """Hard-purge a visible memory for privacy/compliance removal.
 
-        memory_store = await _build_memory_store(db, config, runtime_provider)
+        Purging is irreversible: a private memory can be purged only by its
+        owner, and a workspace memory only by a workspace administrator. A
+        memory that an active source still supports is refused, because the
+        next sync would extract it again; remove the content at the source or
+        retire the source instead. Everyday removal goes through
+        ``POST /memories/{memory_id}/retire``.
+        """
+        visible = await _filter_visible_ids(db, [memory_id], _lifecycle_visibility_scope(request))
+        memory = await db.get_memory(memory_id) if memory_id in visible else None
+        if memory is None:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        if memory.visibility == Visibility.PRIVATE.value:
+            if memory.owner_user_id != resolve_request_principal(request):
+                raise HTTPException(status_code=403, detail="memory_owner_authority_required")
+        else:
+            _require_workspace_memory_administration(request)
+        support_state = (await db.get_active_memory_support_states((memory_id,)))[memory_id]
+        if support_state.unit_ids:
+            raise HTTPException(status_code=409, detail="source_backed_memory_requires_lifecycle_review")
+
+        memory_store = await _build_memory_store(
+            db,
+            config,
+            runtime_provider,
+            audit_context=_request_audit_context(request),
+        )
         purged = await memory_store.purge_memory(memory_id)
         if not purged:
             raise HTTPException(status_code=404, detail="Memory not found")
@@ -8367,7 +8377,7 @@ def create_admin_app(
             await _filter_visible_ids(
                 db,
                 review_memory_ids,
-                _review_visibility_scope(request),
+                _lifecycle_visibility_scope(request),
             )
             if review_memory_ids
             else set()
@@ -8498,7 +8508,7 @@ def create_admin_app(
                 await _filter_visible_ids(
                     db,
                     lifecycle_memory_ids,
-                    _review_visibility_scope(request),
+                    _lifecycle_visibility_scope(request),
                 )
                 if lifecycle_memory_ids
                 else set()
