@@ -66,6 +66,7 @@ from memforge.models import (
     MemorySource,
     MemorySourceRef,
     Project,
+    RESERVED_PROJECT_KEYS,
     ReplacementKind,
     SHARED_PROJECT_KEY,
     SourceArtifactCleanupTask,
@@ -16851,6 +16852,15 @@ class Database:
         name: str | None = None,
         is_shared: bool | None = None,
     ) -> Project | None:
+        """Rename a project or change its kind; `None` for an unknown id.
+
+        Reserved keys (SHARED, UNSORTED) raise `ValueError` whenever a
+        field is supplied, so the built-in buckets keep their name and
+        kind.
+        """
+        target = await self.get_project(project_id)
+        if target is None:
+            return None
         fields: list[str] = []
         params: list[Any] = []
         if name is not None:
@@ -16860,7 +16870,9 @@ class Database:
             fields.append("is_shared = ?")
             params.append(1 if is_shared else 0)
         if not fields:
-            return await self.get_project(project_id)
+            return target
+        if target.key in RESERVED_PROJECT_KEYS:
+            raise ValueError(f"project {target.key!r} is reserved and cannot be changed")
         params.append(project_id)
         async with self._write_lock:
             await self.db.execute(
@@ -16884,7 +16896,7 @@ class Database:
         target = await self.get_project(project_id)
         if target is None:
             raise LookupError(f"project {project_id!r} not found")
-        if target.key in (SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY):
+        if target.key in RESERVED_PROJECT_KEYS:
             raise ValueError(f"project {target.key!r} is reserved and cannot be deleted")
         affected_ids: list[str] = []
         async with self.db.execute("SELECT id FROM memories WHERE project_key = ?", (target.key,)) as cur:
@@ -16909,7 +16921,7 @@ class Database:
         target = await self.get_project(project_id)
         if target is None:
             return
-        if target.key in (SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY):
+        if target.key in RESERVED_PROJECT_KEYS:
             raise ValueError(f"project {target.key!r} is reserved and cannot be deleted")
         async with self._write_lock:
             if affected_ids:

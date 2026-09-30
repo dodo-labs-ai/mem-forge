@@ -10,6 +10,7 @@ import type { FormEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
 import { resourceClient } from "@/api/client";
+import { apiErrorMessage } from "@/api/errors";
 import type { Project, ProjectKind } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import {
@@ -25,13 +26,6 @@ import { Input } from "@/components/ui/input";
 interface EditFormState {
   name: string;
   shared: boolean;
-}
-
-function extractApiErrorDetail(error: unknown): string | null {
-  if (typeof error !== "object" || error === null) return null;
-  const candidate = error as { response?: { data?: { detail?: unknown } } };
-  const detail = candidate.response?.data?.detail;
-  return typeof detail === "string" ? detail : null;
 }
 
 export function ProjectEditDialog({
@@ -90,8 +84,7 @@ function ProjectEditForm({
       onClose();
     },
     onError: (error: unknown) => {
-      const detail = extractApiErrorDetail(error);
-      setErrorMessage(detail ?? "Failed to update project.");
+      setErrorMessage(apiErrorMessage(error) ?? "Failed to update project.");
     },
   });
 
