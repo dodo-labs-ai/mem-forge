@@ -32,6 +32,7 @@ const RESERVED_ROUTE_SEGMENTS = Object.freeze([
   "review",
   "entities",
   "sources",
+  /** @deprecated admin-ui-v1: the Scheduled Syncs page is not part of the admin UI (ADR 0044). */
   "schedules",
   "projects",
   "settings",
@@ -94,6 +95,7 @@ export interface ExtensionAccountSurface {
    * Replaces the default sidebar footer identity card. Extensions own the
    * full footer node, including any popover/menu attached to it.
    */
+  /** @deprecated admin-ui-v1: the admin UI keeps identity in the topbar account menu only (ADR 0044). */
   sidebarFooter?: () => ReactNode;
 }
 

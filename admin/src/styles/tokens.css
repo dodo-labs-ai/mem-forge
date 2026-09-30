@@ -1,0 +1,171 @@
+/*
+ * Graphite theme. Every color, radius and font the admin UI uses is defined
+ * here once; components read these through Tailwind utilities
+ * (`bg-surface`, `text-muted-foreground`, `text-tone-danger`, ...).
+ */
+:root {
+  color-scheme: light;
+
+  --canvas: #f4f5f7;
+  --background: #ffffff;
+  --foreground: #0f1115;
+  --surface: #ffffff;
+  --surface-subtle: #fafafb;
+  --sidebar: #fbfbfc;
+  --sidebar-foreground: #3a3f4a;
+  --sidebar-accent: #eceef1;
+  --sidebar-accent-foreground: #0f1115;
+  --sidebar-border: #e3e5ea;
+  --sidebar-primary: #0f1115;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-ring: #9ca3af;
+  --card: #ffffff;
+  --card-foreground: #0f1115;
+  --popover: #ffffff;
+  --popover-foreground: #0f1115;
+  --primary: #0f1115;
+  --primary-foreground: #ffffff;
+  --secondary: #eceef1;
+  --secondary-foreground: #0f1115;
+  --muted: #eef0f3;
+  --muted-foreground: #5b616e;
+  --subtle-foreground: #3a3f4a;
+  --accent: #eef0f3;
+  --accent-foreground: #0f1115;
+  --destructive: #dc2626;
+  --border: #e3e5ea;
+  --border-strong: #d5d8de;
+  --input: #d5d8de;
+  --ring: #9ca3af;
+  --brand: #f97316;
+
+  --tone-ok: #059669;
+  --tone-ok-foreground: #047857;
+  --tone-ok-soft: #ecfdf5;
+  --tone-live: #2563eb;
+  --tone-live-foreground: #1d4ed8;
+  --tone-live-soft: #eef3fd;
+  --tone-warn: #d97706;
+  --tone-warn-foreground: #92400e;
+  --tone-warn-soft: #fef3c7;
+  --tone-danger: #dc2626;
+  --tone-danger-foreground: #b91c1c;
+  --tone-danger-soft: #fef2f2;
+  --tone-idle: #9ca3af;
+  --tone-idle-foreground: #3a3f4a;
+  --tone-idle-soft: #eceef1;
+
+  --radius: 0.5rem;
+}
+
+.dark {
+  color-scheme: dark;
+
+  --canvas: #0b0c0f;
+  --background: #111318;
+  --foreground: #eceef1;
+  --surface: #15171c;
+  --surface-subtle: #1a1d23;
+  --sidebar: #0f1115;
+  --sidebar-foreground: #c3c7cf;
+  --sidebar-accent: #20232a;
+  --sidebar-accent-foreground: #f4f5f7;
+  --sidebar-border: #262a31;
+  --sidebar-primary: #f4f5f7;
+  --sidebar-primary-foreground: #0f1115;
+  --sidebar-ring: #5b616e;
+  --card: #15171c;
+  --card-foreground: #eceef1;
+  --popover: #1a1d23;
+  --popover-foreground: #eceef1;
+  --primary: #f4f5f7;
+  --primary-foreground: #0f1115;
+  --secondary: #20232a;
+  --secondary-foreground: #eceef1;
+  --muted: #20232a;
+  --muted-foreground: #9aa0ab;
+  --subtle-foreground: #c3c7cf;
+  --accent: #20232a;
+  --accent-foreground: #f4f5f7;
+  --destructive: #ef4444;
+  --border: #262a31;
+  --border-strong: #333842;
+  --input: #333842;
+  --ring: #5b616e;
+
+  --tone-ok: #10b981;
+  --tone-ok-foreground: #6ee7b7;
+  --tone-ok-soft: rgb(16 185 129 / 0.12);
+  --tone-live: #3b82f6;
+  --tone-live-foreground: #93c5fd;
+  --tone-live-soft: rgb(59 130 246 / 0.14);
+  --tone-warn: #f59e0b;
+  --tone-warn-foreground: #fcd34d;
+  --tone-warn-soft: rgb(245 158 11 / 0.14);
+  --tone-danger: #ef4444;
+  --tone-danger-foreground: #fca5a5;
+  --tone-danger-soft: rgb(239 68 68 / 0.14);
+  --tone-idle: #6b7280;
+  --tone-idle-foreground: #c3c7cf;
+  --tone-idle-soft: #20232a;
+}
+
+@theme inline {
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, monospace;
+  --font-heading: var(--font-sans);
+
+  --color-canvas: var(--canvas);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-surface-subtle: var(--surface-subtle);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-subtle-foreground: var(--subtle-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-brand: var(--brand);
+
+  --color-tone-ok: var(--tone-ok);
+  --color-tone-ok-foreground: var(--tone-ok-foreground);
+  --color-tone-ok-soft: var(--tone-ok-soft);
+  --color-tone-live: var(--tone-live);
+  --color-tone-live-foreground: var(--tone-live-foreground);
+  --color-tone-live-soft: var(--tone-live-soft);
+  --color-tone-warn: var(--tone-warn);
+  --color-tone-warn-foreground: var(--tone-warn-foreground);
+  --color-tone-warn-soft: var(--tone-warn-soft);
+  --color-tone-danger: var(--tone-danger);
+  --color-tone-danger-foreground: var(--tone-danger-foreground);
+  --color-tone-danger-soft: var(--tone-danger-soft);
+  --color-tone-idle: var(--tone-idle);
+  --color-tone-idle-foreground: var(--tone-idle-foreground);
+  --color-tone-idle-soft: var(--tone-idle-soft);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+}

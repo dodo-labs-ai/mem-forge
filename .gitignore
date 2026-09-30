@@ -19,6 +19,11 @@ node_modules/
 admin-ui/node_modules/
 admin-ui/dist/
 admin-ui/.tmp-test/
+admin/node_modules/
+admin/dist/
+admin/playwright-report/
+admin/test-results/
+admin/storybook-static/
 
 # Local runtime data and repository workspace configuration
 data/

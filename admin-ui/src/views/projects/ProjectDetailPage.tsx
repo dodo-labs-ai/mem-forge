@@ -28,6 +28,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { resourceClient } from "@/api/client";
+import { apiErrorMessage } from "@/api/errors";
 import type {
   Project,
   ResolvedProjectsResponse,
@@ -315,6 +316,15 @@ export function ProjectDetailPage() {
           </div>
         }
       />
+
+      {deleteProject.isError && (
+        <p
+          className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
+          role="alert"
+        >
+          {apiErrorMessage(deleteProject.error) ?? "Failed to delete project."}
+        </p>
+      )}
 
       <div className="grid gap-4 md:grid-cols-2">
         <DataSurface>
