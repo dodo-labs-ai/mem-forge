@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- The runtime provider owns its vector backend. `RuntimeProvider.build_adapters`
+  now takes `(db, config, *, audit_logger)` instead of a caller-opened
+  `memory_collection`, and the admin memory-store and project routes no longer
+  open Chroma themselves. `DefaultRuntimeProvider` opens the `memories`
+  collection under `storage.chroma_path` exactly as before, through the same
+  helper its search engine and sync runtime use, so OSS behavior and data are
+  unchanged. Cloud: a provider backed by HANA never opens a local Chroma store
+  on the container disk, including on every `/api/v1/projects` and memory
+  write request. Cloud's `CloudRuntimeProvider.build_adapters` takes the new
+  signature together with the pin to this version; no HANA schema, `sap/`
+  route or environment configuration change.
 - `GET /api/v1/projects` returns each project's `memory_count`: the active
   memories in that project the caller can see, including the caller's private
   ones and leaving out Sources the caller turned off. One grouped read,

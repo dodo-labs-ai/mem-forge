@@ -54,7 +54,7 @@ from memforge.source_activity import (
     SourceActivityLease,
 )
 from memforge.storage.document_store import LocalDocumentStore
-from memforge.storage.adapters.sqlite import build_sqlite_adapters
+from memforge.storage.adapters.sqlite import SqliteAdapters, build_sqlite_adapters
 from memforge.sync_progress import SourceSyncProgressAccumulator, source_sync_progress_from_pipeline
 
 if TYPE_CHECKING:
@@ -205,10 +205,16 @@ class RuntimeProvider(Protocol):
     def build_adapters(
         self,
         db: "Database",
-        memory_collection: Any,
+        config: AppConfig,
         *,
         audit_logger: MemoryAuditLogger | None = None,
-    ) -> Any: ...
+    ) -> Any:
+        """Return the relational, keyword, and vector adapters bound to ``db``.
+
+        The provider owns its vector backend, so callers never open a vector
+        collection themselves.
+        """
+        ...
 
     async def build_search_engine(
         self,
@@ -278,11 +284,11 @@ class DefaultRuntimeProvider:
     def build_adapters(
         self,
         db: "Database",
-        memory_collection: Any,
+        config: AppConfig,
         *,
         audit_logger: MemoryAuditLogger | None = None,
-    ) -> Any:
-        return build_sqlite_adapters(db, memory_collection, audit_logger=audit_logger)
+    ) -> SqliteAdapters:
+        return _build_default_adapters(db, config, audit_logger=audit_logger)
 
     async def build_search_engine(
         self,
@@ -555,6 +561,20 @@ def _retrieval_config_for_llm(config: AppConfig, llm: EffectiveLlmConfig):
     return replace(config.retrieval, rerank_model=llm.enrichment_model)
 
 
+def _build_default_adapters(
+    db: "Database",
+    config: AppConfig,
+    *,
+    audit_logger: MemoryAuditLogger | None,
+) -> SqliteAdapters:
+    """Bind the SQLite stores to the Memory Chroma collection at ``config.storage.chroma_path``."""
+    memory_collection = get_chroma_collection(
+        chroma_path=config.storage.chroma_path,
+        name="memories",
+    )
+    return build_sqlite_adapters(db, memory_collection, audit_logger=audit_logger)
+
+
 async def build_search_engine(
     db: "Database",
     config: AppConfig,
@@ -584,16 +604,12 @@ def _build_default_search_engine(
 ) -> Any:
     from memforge.retrieval.search import SearchEngine
 
-    memory_collection = get_chroma_collection(
-        chroma_path=config.storage.chroma_path,
-        name="memories",
-    )
     embed_cfg = {
         "base_url": llm.embedding_base_url,
         "api_key": llm.embedding_api_key,
         "model": llm.embedding_model,
     }
-    adapters = build_sqlite_adapters(db, memory_collection, audit_logger=audit_logger)
+    adapters = _build_default_adapters(db, config, audit_logger=audit_logger)
     return SearchEngine(
         relational=adapters.relational,
         keyword=adapters.keyword,
@@ -641,18 +657,14 @@ def _build_default_sync_runtime(
         structured_llm_client=structured_llm_client,
     )
 
-    memory_collection = get_chroma_collection(
-        chroma_path=config.storage.chroma_path,
-        name="memories",
-    )
     embed_cfg = {
         "base_url": llm.embedding_base_url,
         "api_key": llm.embedding_api_key,
         "model": llm.embedding_model,
     }
-    adapters = build_sqlite_adapters(
+    adapters = _build_default_adapters(
         db,
-        memory_collection,
+        config,
         audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="sync")),
     )
     memory_store = MemoryStore(
