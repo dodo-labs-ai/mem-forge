@@ -31,6 +31,7 @@ import pytest
 
 from memforge.models import (
     EntityAlias,
+    RESERVED_PROJECT_KEYS,
     SHARED_PROJECT_KEY,
     UNSORTED_PROJECT_KEY,
     Visibility,
@@ -689,6 +690,21 @@ class RelationalStoreContract:
         updated = await store.update_project(created.id, name="Pay v2")
         assert updated is not None
         assert updated.name == "Pay v2"
+
+    async def test_update_project_refuses_reserved_keys(self, adapters: ContractAdapters) -> None:
+        store = adapters.relational
+        existing = {p.key: p for p in await store.list_projects()}
+        for key in sorted(RESERVED_PROJECT_KEYS):
+            reserved = existing.get(key) or await store.create_project(
+                key=key,
+                name=key.title(),
+                is_shared=key == SHARED_PROJECT_KEY,
+            )
+            with pytest.raises(ValueError):
+                await store.update_project(reserved.id, name="Renamed")
+            with pytest.raises(ValueError):
+                await store.update_project(reserved.id, is_shared=not reserved.is_shared)
+            assert await store.get_project(reserved.id) == reserved
 
     async def test_list_project_memory_ids_returns_attached_rows(self, adapters: ContractAdapters) -> None:
         store = adapters.relational

@@ -25,9 +25,6 @@ def _config(tmp_path) -> AppConfig:
 
 def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
     class FakeSourceReader:
-        async def get_schedule_config(self) -> dict:
-            return {"enabled": False}
-
         async def claim_due_scheduled_sources(
             self,
             *,
@@ -91,7 +88,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
                     "docs_failed": 1,
                     "memories_extracted": 4,
                     "error_message": "one failed",
-                    "failed_docs": [{"doc_id": "doc-1", "error": "boom"}],
+                    "failed_docs": [{"doc_id": "doc-1", "title": "Design", "error": "boom"}],
                 }
             ]
 
@@ -158,7 +155,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
         "docs_failed": 1,
         "memories_extracted": 4,
         "error_message": "one failed",
-        "failed_docs": [{"doc_id": "doc-1", "error": "boom"}],
+        "failed_docs": [{"doc_id": "doc-1", "title": "Design", "error": "boom"}],
         "progress": {
             "schema_version": 1,
             "phase": "processing",
@@ -194,9 +191,6 @@ def test_source_list_projects_a_retried_sync_as_a_fresh_attempt(tmp_path):
     )
 
     class RetrySourceReader:
-        async def get_schedule_config(self) -> dict:
-            return {"enabled": False}
-
         async def claim_due_scheduled_sources(self, **_: object) -> list[dict]:
             return []
 
@@ -272,9 +266,6 @@ def test_source_list_projects_a_retried_sync_as_a_fresh_attempt(tmp_path):
 
 def test_source_projects_route_uses_storage_neutral_admin_reader(tmp_path):
     class FakeSourceReader:
-        async def get_schedule_config(self) -> dict:
-            return {"enabled": False}
-
         async def claim_due_scheduled_sources(
             self,
             *,
@@ -362,9 +353,6 @@ def test_source_agent_evaluation_route_is_bounded_and_storage_neutral(tmp_path):
     assessments = list(evaluate_runtime_events((event,)))
 
     class FakeSourceReader:
-        async def get_schedule_config(self) -> dict:
-            return {"enabled": False}
-
         async def claim_due_scheduled_sources(self, **_kwargs) -> list[dict]:
             return []
 
@@ -461,9 +449,6 @@ def test_source_agent_evaluation_route_groups_actionable_cases_and_preserves_sem
     ]
 
     class FakeSourceReader:
-        async def get_schedule_config(self) -> dict:
-            return {"enabled": False}
-
         async def claim_due_scheduled_sources(self, **_kwargs) -> list[dict]:
             return []
 
@@ -630,9 +615,6 @@ def test_workspace_agent_evaluation_route_aggregates_only_discoverable_sources(t
     ]
 
     class FakeWorkspaceEvaluationReader:
-        async def get_schedule_config(self) -> dict:
-            return {"enabled": False}
-
         async def claim_due_scheduled_sources(self, **_kwargs) -> list[dict]:
             return []
 
@@ -744,9 +726,6 @@ def test_workspace_agent_evaluation_route_filters_source_type_without_new_evalua
     assessments = list(evaluate_runtime_events(tuple(events)))
 
     class FakeWorkspaceEvaluationReader:
-        async def get_schedule_config(self) -> dict:
-            return {"enabled": False}
-
         async def claim_due_scheduled_sources(self, **_kwargs) -> list[dict]:
             return []
 
@@ -801,9 +780,6 @@ def test_source_schedule_routes_use_storage_neutral_store(tmp_path):
     class FakeSourceReader:
         def __init__(self) -> None:
             self.updated: tuple[str, bool, int] | None = None
-
-        async def get_schedule_config(self) -> dict:
-            return {"enabled": False}
 
         async def claim_due_scheduled_sources(
             self,
@@ -869,9 +845,6 @@ def test_source_schedule_routes_use_storage_neutral_store(tmp_path):
 
 def test_source_memory_lifecycle_route_exposes_durable_operator_axes(tmp_path):
     class FakeLifecycleStore:
-        async def get_schedule_config(self) -> dict:
-            return {"enabled": False}
-
         async def claim_due_scheduled_sources(self, **kwargs) -> list[dict]:
             return []
 
