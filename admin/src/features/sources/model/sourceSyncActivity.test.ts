@@ -8,11 +8,12 @@ import {
   sourceSyncActivityIsVisible,
   COMPLETED_SYNC_VISIBLE_MS,
 } from "./sourceSyncActivity";
+import { makeLocalAgentJob } from "@/test/sourceFixtures";
 import type { LocalAgentJob as LocalAgentJobStatusResponse, SyncStatus } from "./types";
 import { test } from "vitest";
 
 test("selects and presents source sync activity", () => {
-  const localJob: LocalAgentJobStatusResponse = {
+  const localJob = makeLocalAgentJob({
     job_id: "laj-1",
     operation: "teams_sync",
     status: "leased",
@@ -28,7 +29,7 @@ test("selects and presents source sync activity", () => {
       },
     },
     last_error: null,
-  };
+  });
 
   assert.deepEqual(
     presentSourceSyncActivity(sourceSyncActivityFromLocalJob(localJob), "Microsoft Teams", "conversations"),

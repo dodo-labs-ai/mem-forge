@@ -1,4 +1,5 @@
 import { isManagedSourceType } from "./managedSources";
+import { sourceProjectBinding } from "./projectBinding";
 import type { SourceReadiness } from "./sourceReadiness";
 import { presentSourceSyncActivity, type SourceSyncActivity } from "./sourceSyncActivity";
 import type { Source } from "./types";
@@ -137,7 +138,7 @@ export function sourceAttention({ source, readiness, activity, now = new Date() 
     };
   }
 
-  if (!source.project_binding && !isManagedSourceType(source.type)) {
+  if (!sourceProjectBinding(source) && !isManagedSourceType(source.type)) {
     return {
       reason: "unmapped",
       title: "No project",

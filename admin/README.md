@@ -43,8 +43,9 @@ feature only through its `index.ts`. ESLint enforces both.
    `index.ts`.
 2. Add it to `PRODUCT_ROUTES` in `src/app/router.tsx` and remove the item's
    `v1Path` in `src/app/navigation.ts`.
-3. If an endpoint has no response model, declare its response in
-   `src/api/responses.ts` and register it in `src/api/paths.ts`.
+3. If an endpoint the page uses has no response model, add one in
+   `src/memforge/server/admin_api.py` and run `npm run gen:api`. Declare
+   fields in `src/api/responses.ts` only where the schema is free-form.
 
 Use colors from `tokens.css` through Tailwind utilities (`bg-surface`,
 `text-tone-danger-foreground`) and never hard-code palette values. Show
