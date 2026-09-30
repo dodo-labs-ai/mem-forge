@@ -16,9 +16,10 @@
   Pages and Confluence list from the walk their discovery already makes; Jira
   lists with an identifier-only search ordered by key and confirms in
   unvalidated `issuekey in (...)` batches of a hundred, reading by id what the
-  search does not return. A listing that fails or is incomplete, and a
-  rejected credential, fail the run and remove nothing; a 403 for one item
-  keeps it. `source_run_projection_coverage` no longer takes `incremental`:
+  search does not return. A listing or confirmation that fails or is
+  incomplete removes nothing in that run, which still succeeds and logs the
+  skipped check; a rejected credential fails discovery and the run; a 403 for
+  one item keeps it. `source_run_projection_coverage` no longer takes `incremental`:
   discovery alone proves absence only for an authoritative snapshot or a
   complete discovery of a newly configured scope, and scope transitions are
   unchanged (ADR 0005). Force-full keeps meaning "re-read every Unit". Cloud:

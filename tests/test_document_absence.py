@@ -52,12 +52,15 @@ class JiraProject(BlockingFetchGene):
         self.listing_kind = listing_kind
         self.listing_error: Exception | None = None
         self.confirm_error: Exception | None = None
+        self.discovery_error: Exception | None = None
         self.seen_since: list[datetime | None] = []
         self.fetched: list[str] = []
         self.confirmed: list[str] = []
 
     async def discover(self, since=None):
         self.seen_since.append(since)
+        if self.discovery_error is not None:
+            raise self.discovery_error
         for number in sorted(self.in_query):
             if since is None or number in self.changed:
                 yield ContentItem(
@@ -210,7 +213,7 @@ async def test_an_issue_that_reenters_the_query_is_refreshed_and_a_later_deletio
 
 
 @pytest.mark.asyncio
-async def test_an_incomplete_listing_fails_the_run_and_removes_nothing(workspace):
+async def test_an_incomplete_listing_removes_nothing_and_the_run_still_succeeds(workspace):
     project = JiraProject(existing={0, 1})
     await _synced(workspace, project)
 
@@ -218,10 +221,13 @@ async def test_an_incomplete_listing_fails_the_run_and_removes_nothing(workspace
     project.listing_error = RuntimeError("Jira search total changed during pagination")
     state = await workspace.sync(project)
 
-    assert state.last_sync_status == "failed"
-    assert "total changed during pagination" in state.error_message
+    assert state.last_sync_status == "success"
     assert workspace.tombstoned() == []
     assert await workspace.held() == {"jira-0", "jira-1"}
+
+    project.listing_error = None
+    await workspace.sync(project)
+    assert workspace.tombstoned() == ["jira-1"]
 
 
 @pytest.mark.asyncio
@@ -230,13 +236,27 @@ async def test_a_rejected_credential_fails_the_run_and_removes_nothing(workspace
     await _synced(workspace, project)
 
     project.move_on(existing={0})
-    request = httpx.Request("GET", "https://jira.example/rest/api/2/issue/100001")
-    project.confirm_error = httpx.HTTPStatusError(
+    request = httpx.Request("GET", "https://jira.example/rest/api/2/search")
+    project.discovery_error = httpx.HTTPStatusError(
         "unauthorized", request=request, response=httpx.Response(httpx.codes.UNAUTHORIZED, request=request)
     )
     state = await workspace.sync(project)
 
     assert state.last_sync_status == "failed"
+    assert workspace.tombstoned() == []
+    assert await workspace.held() == {"jira-0", "jira-1"}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_confirmation_removes_nothing_and_the_run_still_succeeds(workspace):
+    project = JiraProject(existing={0, 1})
+    await _synced(workspace, project)
+
+    project.move_on(existing={0})
+    project.confirm_error = httpx.ConnectError("connection reset")
+    state = await workspace.sync(project)
+
+    assert state.last_sync_status == "success"
     assert workspace.tombstoned() == []
     assert await workspace.held() == {"jira-0", "jira-1"}
 
