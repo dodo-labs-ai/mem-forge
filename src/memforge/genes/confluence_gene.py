@@ -7,7 +7,7 @@ wiki pages into comprehensive markdown for memory extraction.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -17,6 +17,7 @@ import httpx
 
 from memforge.genes.atlassian_auth import (
     ATLASSIAN_ABSENT_STATUS_CODES,
+    atlassian_record_is_gone,
     atlassian_request_limiter,
     bearer_headers,
     get_with_rate_limit_retry,
@@ -37,6 +38,7 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+    ScopeListingKind,
     SourceUnitInput,
 )
 from memforge.pipeline.normalizer_utils import html_to_markdown, strip_boilerplate
@@ -60,6 +62,11 @@ __all__ = ["ConfluenceGene"]
 _PAGE_METADATA_EXPAND = "version,metadata.labels,space"
 # The only page status discovery lists; archived and trashed pages are not current.
 _CURRENT_PAGE_STATUS = "current"
+_PAGE_DOC_ID_PREFIX = "confluence-"
+
+
+def _page_doc_id(page_id: str) -> str:
+    return f"{_PAGE_DOC_ID_PREFIX}{page_id}"
 
 
 class ConfluenceGene(Gene):
@@ -324,6 +331,7 @@ class ConfluenceGene(Gene):
                 yield item
             if self._preview_discovery_limit() is None:
                 self.attest_discovery_complete("confluence_page_tree_exhausted")
+                self._record_walked_pages()
             return
 
         spaces = self._space_keys(self.config.get("spaces"))
@@ -334,6 +342,34 @@ class ConfluenceGene(Gene):
                 yield item
         if self._preview_discovery_limit() is None:
             self.attest_discovery_complete("confluence_spaces_exhausted")
+            self._record_walked_pages()
+
+    def _record_walked_pages(self) -> None:
+        """Record every page discovery walked, whatever ``since`` it yielded by.
+
+        A page tree or a space is a query: a page that was moved elsewhere, or
+        below a page with an excluded label, still exists, so an unlisted page
+        is confirmed by id (:meth:`confirm_absent`).
+        """
+
+        self.record_scope_listing(
+            ScopeListingKind.QUERY,
+            {_page_doc_id(page_id) for page_id in self._discovered_page_ids},
+        )
+
+    async def confirm_absent(self, items: Sequence[ContentItem]) -> frozenset[str]:
+        """Read each unlisted page by id; a page Confluence no longer returns is absent.
+
+        A page in the trash is not returned without asking for trashed content,
+        so a trashed page is absent as a deleted one is.
+        """
+
+        absent: set[str] = set()
+        for item in items:
+            page_id = str(item.extra.get("page_id") or item.item_id.removeprefix(_PAGE_DOC_ID_PREFIX))
+            if await atlassian_record_is_gone(self._get(f"{self._api_prefix}/rest/api/content/{page_id}")):
+                absent.add(item.item_id)
+        return frozenset(absent)
 
     @classmethod
     def rediscovers_documents(cls, config: Mapping[str, Any]) -> bool:
@@ -348,7 +384,7 @@ class ConfluenceGene(Gene):
         excluded label. A page carrying an excluded label is never listed.
         """
         self.normalize_config(self.config)
-        page_id = str(item.extra.get("page_id") or item.item_id.removeprefix("confluence-"))
+        page_id = str(item.extra.get("page_id") or item.item_id.removeprefix(_PAGE_DOC_ID_PREFIX))
         page_tree = self._effective_sync_mode(self.config) == "page_tree"
         expand = f"{_PAGE_METADATA_EXPAND},ancestors.metadata.labels" if page_tree else _PAGE_METADATA_EXPAND
         try:
@@ -527,7 +563,7 @@ class ConfluenceGene(Gene):
         space_key = page.get("space", {}).get("key", self.config.get("spaces", [""])[0] if self.config.get("spaces") else "")
 
         return ContentItem(
-            item_id=f"confluence-{page_id}",
+            item_id=_page_doc_id(page_id),
             title=page.get("title", "Untitled"),
             source_url=f"{self._base_url}{page.get('_links', {}).get('webui', '')}",
             last_modified=last_modified,
@@ -589,7 +625,7 @@ class ConfluenceGene(Gene):
 
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full page content (XHTML body)."""
-        page_id = item.extra.get("page_id", item.item_id.replace("confluence-", ""))
+        page_id = item.extra.get("page_id", item.item_id.removeprefix(_PAGE_DOC_ID_PREFIX))
         resp = await self._get(
             f"{self._api_prefix}/rest/api/content/{page_id}",
             params={
@@ -800,7 +836,7 @@ class ConfluenceGene(Gene):
 
     async def fetch_pdf(self, item: ContentItem) -> bytes | None:
         """Render Confluence export HTML to a local PDF."""
-        page_id = item.extra.get("page_id", item.item_id.replace("confluence-", ""))
+        page_id = item.extra.get("page_id", item.item_id.removeprefix(_PAGE_DOC_ID_PREFIX))
 
         try:
             return await export_confluence_page_pdf(

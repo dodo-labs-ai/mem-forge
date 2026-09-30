@@ -151,6 +151,34 @@ def _document_content_item(document: DocumentRecord) -> ContentItem:
     )
 
 
+async def stored_source_item(
+    db: RelationalStore,
+    *,
+    source_id: str,
+    document_id: str,
+) -> ContentItem:
+    """The item that describes one Document whose Unit is current, to ask its provider for it by id.
+
+    It is the item the Unit's stored input records, or, when the Unit has none,
+    the item the shared Document row describes.
+    """
+
+    unit = await db.find_source_unit_by_document_id(source_id, document_id, current_only=True)
+    if unit is None:
+        raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.SOURCE_UNIT_MISSING, document_id)
+    return await _unit_stored_item(db, source_unit_id=unit.id, document_id=document_id)
+
+
+async def _unit_stored_item(db: RelationalStore, *, source_unit_id: str, document_id: str) -> ContentItem:
+    unit_input = await db.get_source_unit_input(source_unit_id)
+    if unit_input is not None:
+        return unit_input.item
+    document = await db.get_document(document_id)
+    if document is None:
+        raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.DOCUMENT_MISSING, document_id)
+    return _document_content_item(document)
+
+
 async def rediscover_source_document(
     db: RelationalStore,
     gene: Gene,
@@ -161,14 +189,11 @@ async def rediscover_source_document(
     """Ask the provider for the current item of one Document whose Unit is current."""
 
     committed = await _committed_source_unit(db, source_id=source_id, document_id=document_id)
-    unit_input = await db.get_source_unit_input(committed.source_unit_revisions[0].source_unit_id)
-    if unit_input is not None:
-        stored_item = unit_input.item
-    else:
-        document = await db.get_document(document_id)
-        if document is None:
-            raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.DOCUMENT_MISSING, document_id)
-        stored_item = _document_content_item(document)
+    stored_item = await _unit_stored_item(
+        db,
+        source_unit_id=committed.source_unit_revisions[0].source_unit_id,
+        document_id=document_id,
+    )
     current = await gene.rediscover(stored_item)
     if current is None or current.item_id != document_id:
         raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.PROVIDER_DOCUMENT_MISSING, document_id)
