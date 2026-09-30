@@ -1394,11 +1394,21 @@ class GeneSyncOrchestrator:
             if absence_is_authoritative:
                 absent_doc_ids = indexed_doc_ids - crawled_doc_ids
             elif run_committed and not reprocessing and scope_transition is None:
-                absent_doc_ids = await self._absent_from_scope_listing(
-                    gene,
-                    source_id=source_id,
-                    indexed_doc_ids=indexed_doc_ids,
-                )
+                try:
+                    absent_doc_ids = await self._absent_from_scope_listing(
+                        gene,
+                        source_id=source_id,
+                        indexed_doc_ids=indexed_doc_ids,
+                    )
+                except Exception as exc:
+                    # The run's content is committed; only the absence proof is
+                    # missing, so every unlisted Document keeps its Support and
+                    # the next run lists again.
+                    logger.warning(
+                        "Absence check skipped for %s: its scope listing did not complete: %s",
+                        source_id,
+                        exc,
+                    )
 
             if absent_doc_ids is not None:
                 if progress_callback:
@@ -3508,7 +3518,7 @@ class GeneSyncOrchestrator:
         """The held Documents this run's scope listing proves the provider no longer has.
 
         ``None`` when the Gene cannot list its scope. A listing or confirmation
-        that fails raises, so the run fails and nothing is removed. An unlisted
+        that fails raises, and the caller removes nothing in this run. An unlisted
         Document of an existence listing is absent. One of a query listing is
         absent only when the provider reports it not found; one that still
         exists keeps its Unit and Support and is not refreshed while it stays
