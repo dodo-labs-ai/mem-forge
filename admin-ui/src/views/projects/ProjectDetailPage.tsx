@@ -17,20 +17,18 @@
  */
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQuery } from "@tanstack/react-query";
 import {
   ArrowLeft,
   Check,
   FolderKanban,
   FolderTree,
-  Loader2,
   Pencil,
-  Trash2,
 } from "lucide-react";
 import { resourceClient } from "@/api/client";
-import { apiErrorMessage } from "@/api/errors";
 import type {
   Project,
+  ProjectList,
   ResolvedProjectsResponse,
   Source,
   SourceResolvedProject,
@@ -46,6 +44,7 @@ import { Button } from "@/components/ui/button";
 import { isReservedProjectKey } from "@/api/projectKeys";
 import { useActiveProject } from "@/state/activeProject";
 import { isManagedSourceId, isManagedSourceType } from "../sources/managedSources";
+import { DeleteInNewAdminLink } from "./DeleteInNewAdminLink";
 import { ProjectEditDialog } from "./ProjectEditDialog";
 
 interface SourcesResponse {
@@ -56,10 +55,6 @@ function normalizeSources(payload: SourcesResponse | Source[] | undefined): Sour
   if (Array.isArray(payload)) return payload;
   if (Array.isArray(payload?.data)) return payload.data;
   return [];
-}
-
-interface DeleteProjectWireResponse {
-  id: string;
 }
 
 interface BoundSourceRow {
@@ -75,16 +70,14 @@ const BY_FIELD_BINDING_LABEL = "By field";
 export function ProjectDetailPage() {
   const params = useParams<{ key: string }>();
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
   const { activeProjectKey, setActiveProjectKey } = useActiveProject();
   const projectKey = params.key ?? "";
   const [editOpen, setEditOpen] = useState(false);
-  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
 
   const projectsQuery = useQuery<Project[]>({
     queryKey: ["projects"],
     queryFn: () =>
-      resourceClient.get<Project[]>("/projects").then((response) => response.data),
+      resourceClient.get<ProjectList>("/projects").then((response) => response.data.data),
   });
 
   const sourcesQuery = useQuery<SourcesResponse | Source[]>({
@@ -190,23 +183,6 @@ export function ProjectDetailPage() {
     [boundRows],
   );
 
-  const deleteProject = useMutation({
-    mutationFn: async (target: Project) => {
-      const response = await resourceClient.delete<DeleteProjectWireResponse>(
-        `/projects/${target.id}`,
-      );
-      return { project: target, payload: response.data };
-    },
-    onSuccess: ({ project: deleted }) => {
-      queryClient.invalidateQueries({ queryKey: ["projects"] });
-      queryClient.invalidateQueries({ queryKey: ["memories"] });
-      if (activeProjectKey === deleted.key) {
-        setActiveProjectKey(null);
-      }
-      navigate("/projects");
-    },
-  });
-
   const isLoading = projectsQuery.isLoading;
   const isError = projectsQuery.isError;
 
@@ -249,7 +225,6 @@ export function ProjectDetailPage() {
   const isReserved = isReservedProjectKey(project.key);
   const isShared = project.kind === "shared";
   const isActive = activeProjectKey === project.key;
-  const isDeleting = deleteProject.isPending;
 
   return (
     <div className="space-y-4">
@@ -298,33 +273,12 @@ export function ProjectDetailPage() {
                   <Pencil className="size-4" />
                   Edit
                 </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => setConfirmDeleteOpen(true)}
-                  disabled={isDeleting}
-                >
-                  {isDeleting ? (
-                    <Loader2 className="size-4 animate-spin" />
-                  ) : (
-                    <Trash2 className="size-4" />
-                  )}
-                  Delete
-                </Button>
+                <DeleteInNewAdminLink project={project} />
               </>
             )}
           </div>
         }
       />
-
-      {deleteProject.isError && (
-        <p
-          className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
-          role="alert"
-        >
-          {apiErrorMessage(deleteProject.error) ?? "Failed to delete project."}
-        </p>
-      )}
 
       <div className="grid gap-4 md:grid-cols-2">
         <DataSurface>
@@ -449,70 +403,6 @@ export function ProjectDetailPage() {
         />
       )}
 
-      {confirmDeleteOpen && (
-        <DeleteConfirmDialog
-          project={project}
-          memoryCount={totalProjectMemoryCount}
-          isDeleting={isDeleting}
-          onCancel={() => setConfirmDeleteOpen(false)}
-          onConfirm={() => {
-            setConfirmDeleteOpen(false);
-            deleteProject.mutate(project);
-          }}
-        />
-      )}
-    </div>
-  );
-}
-
-function DeleteConfirmDialog({
-  project,
-  memoryCount,
-  isDeleting,
-  onCancel,
-  onConfirm,
-}: {
-  project: Project;
-  memoryCount: number;
-  isDeleting: boolean;
-  onCancel: () => void;
-  onConfirm: () => void;
-}) {
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 p-4"
-      role="dialog"
-      aria-modal="true"
-    >
-      <div className="w-full max-w-md rounded-xl bg-card p-6 shadow-lg ring-1 ring-foreground/10">
-        <h2 className="text-base font-semibold">Delete project?</h2>
-        <p className="mt-2 text-sm text-muted-foreground">
-          {memoryCount > 0
-            ? `Project "${project.name}" will be deleted and ${memoryCount.toLocaleString()} ${
-                memoryCount === 1 ? "memory" : "memories"
-              } will move to the Unsorted project.`
-            : `Project "${project.name}" will be deleted. No memories are linked to it.`}
-        </p>
-        <div className="mt-4 flex justify-end gap-2">
-          <Button
-            type="button"
-            variant="outline"
-            onClick={onCancel}
-            disabled={isDeleting}
-          >
-            Cancel
-          </Button>
-          <Button
-            type="button"
-            variant="destructive"
-            onClick={onConfirm}
-            disabled={isDeleting}
-          >
-            {isDeleting && <Loader2 className="size-4 animate-spin" />}
-            Delete project
-          </Button>
-        </div>
-      </div>
     </div>
   );
 }

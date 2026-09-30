@@ -107,6 +107,18 @@ class ProposeMemoryCorrectionResult:
     review_id: str
 
 
+async def is_source_backed(db: Database, memory_id: str) -> bool:
+    """Whether active Source Units support the Memory, so retiring it directly is refused.
+
+    Such a Memory changes with its Sources or through a correction. A Managed
+    Capture claim retires through its own claim, whatever supports it.
+    """
+    if await db.get_agent_claim_by_memory_id(memory_id) is not None:
+        return False
+    support_state = (await db.get_active_memory_support_states((memory_id,)))[memory_id]
+    return bool(support_state.unit_ids)
+
+
 class MemoryLifecycleService:
     """Apply user-confirmed memory lifecycle actions through store primitives."""
 
@@ -185,8 +197,9 @@ class MemoryLifecycleService:
         memory = await self._active_target(memory_id, expected_content_hash=expected_content_hash)
         if memory.visibility == Visibility.PRIVATE.value and memory.owner_user_id != actor_user_id:
             raise MemoryLifecycleConflict("memory_owner_authority_required")
-        claim = await self.db.get_agent_claim_by_memory_id(memory.id)
-        if claim is not None:
+        if await is_source_backed(self.db, memory.id):
+            raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review")
+        if await self.db.get_agent_claim_by_memory_id(memory.id) is not None:
             try:
                 await AgentKnowledgeBundleService(
                     db=self.db,
@@ -200,9 +213,6 @@ class MemoryLifecycleService:
             except AgentClaimLifecycleConflict as exc:
                 raise MemoryLifecycleConflict(exc.code) from exc
             return RetireMemoryResult(memory_id=memory.id, status="retired")
-        support_state = (await self.db.get_active_memory_support_states((memory.id,)))[memory.id]
-        if support_state.unit_ids:
-            raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review")
         try:
             await self.memory_store.retire_memory(memory.id, reason=reason)
         except ValueError as exc:

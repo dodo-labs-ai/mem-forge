@@ -11,15 +11,15 @@ const CLOUD: AdminExtension = {
   reservedRouteRedirects: [{ from: "settings", to: "/cloud/settings" }],
 };
 
-test("names product pages built here, including their subpaths", () => {
+test("names every product page, including its subpaths", () => {
   expect(pageLabel("/sources", undefined)).toBe("Sources");
   expect(pageLabel("/sources/src-wiki", undefined)).toBe("Sources");
   expect(pageLabel("/sourcesx", undefined)).toBeUndefined();
-});
-
-test("does not name pages that V1 still serves", () => {
-  expect(pageLabel("/memories", undefined)).toBeUndefined();
-  expect(pageLabel("/settings", undefined)).toBeUndefined();
+  expect(pageLabel("/settings", undefined)).toBe("Settings");
+  expect(pageLabel("/memories/mem-1", undefined)).toBe("Memories");
+  expect(pageLabel("/review/rev-1", undefined)).toBe("Review");
+  expect(pageLabel("/evaluation", undefined)).toBe("Evaluation");
+  expect(pageLabel("/projects/PAY", undefined)).toBe("Projects");
 });
 
 test("names a redirected product page at the extension path it opens", () => {
@@ -31,8 +31,19 @@ test("names extension pages by the most specific navigation item", () => {
   expect(pageLabel("/cloud/workspaces/archived", CLOUD)).toBe("Archived workspaces");
 });
 
-test("joins the known parts of the title", () => {
-  expect(documentTitle("Sources", "Payroll")).toBe("Sources · Payroll · MemForge");
-  expect(documentTitle("Sources", undefined)).toBe("Sources · MemForge");
-  expect(documentTitle(undefined, undefined)).toBe("MemForge");
+test("names the workspace on product pages", () => {
+  expect(documentTitle("/sources", undefined, "Payroll")).toBe("Sources · Payroll · MemForge");
+  expect(documentTitle("/sources/src-wiki", CLOUD, "Payroll")).toBe("Sources · Payroll · MemForge");
+  expect(documentTitle("/sources", undefined, undefined)).toBe("Sources · MemForge");
+});
+
+test("leaves the workspace out on extension pages", () => {
+  expect(documentTitle("/cloud/workspaces", CLOUD, "Payroll")).toBe("Workspaces · MemForge");
+  expect(documentTitle("/cloud/settings", CLOUD, "Payroll")).toBe("Settings · MemForge");
+  expect(documentTitle("/cloud/account", CLOUD, "Payroll")).toBe("MemForge");
+});
+
+test("falls back to the app name on pages it cannot name", () => {
+  expect(documentTitle("/missing", undefined, "Payroll")).toBe("MemForge");
+  expect(documentTitle("/missing", undefined, undefined)).toBe("MemForge");
 });

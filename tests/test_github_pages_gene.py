@@ -618,6 +618,7 @@ async def test_subtree_discovery_prefers_sitemap_and_filters_to_root(monkeypatch
     assert items[0].extra["content_updated_at"] == "2026-05-25T00:00:00+00:00"
     assert items[0].version.startswith("sha256:")
     assert gene.discovery_complete is False
+    assert await gene.list_scope() is None
 
 
 @pytest.mark.asyncio
@@ -645,6 +646,7 @@ async def test_subtree_bfs_never_grants_source_wide_absence_authority(monkeypatc
 
     assert len(items) == 1
     assert gene.discovery_complete is False
+    assert await gene.list_scope() is None
 
 
 @pytest.mark.asyncio
@@ -691,10 +693,13 @@ async def test_subtree_sitemap_requires_explicit_authoritative_contract(monkeypa
     )
 
     await gene.authenticate()
-    _ = [item async for item in gene.discover()]
+    items = [item async for item in gene.discover()]
 
     assert gene.discovery_complete is True
     assert gene.discovery_completion_reason == "github_pages_authoritative_sitemap_exhausted"
+    listing = await gene.list_scope()
+    assert listing.kind.value == "existence"
+    assert listing.doc_ids == {item.item_id for item in items}
 
 
 @pytest.mark.asyncio
@@ -848,3 +853,29 @@ async def test_authoritative_empty_repository_backed_page_preserves_repo_identif
 
     assert normalized.markdown_body == ""
     assert normalized.source_semantics["repo_identifier"] == "github-pages.example.test/org/repo"
+
+
+@pytest.mark.asyncio
+async def test_incremental_github_pat_subtree_lists_every_page_the_branch_holds(monkeypatch):
+    RunbooksRepoApiClient.instances.clear()
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RunbooksRepoApiClient)
+    config = {
+        "auth_mode": "github_pat",
+        "pat": "github-secret",
+        "sync_mode": "subtree",
+        "root_url": "https://github.example.test/pages/example-org/runbooks/runbooks/Process%20Tracking",
+    }
+    full = GitHubPagesGene(config=dict(config), source_id="src-pages")
+    await full.authenticate()
+    every_page = {item.item_id async for item in full.discover()}
+    gene = GitHubPagesGene(config=dict(config), source_id="src-pages")
+    await gene.authenticate()
+    gene.begin_discovery()
+
+    changed = [item async for item in gene.discover(since=datetime(2100, 1, 1, tzinfo=timezone.utc))]
+    listing = await gene.list_scope()
+
+    assert changed == []
+    assert listing.kind.value == "existence"
+    assert listing.doc_ids == every_page
+    assert len(every_page) == 2

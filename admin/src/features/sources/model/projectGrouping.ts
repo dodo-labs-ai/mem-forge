@@ -1,5 +1,6 @@
 /**
- * Group sources into project buckets for the Sources page.
+ * Which sources send memories to which project: the project groups of the
+ * Sources page, and the per-project source lists of the Projects page.
  *
  * Ordering rule (deterministic):
  *   1. SHARED bucket (the team-wide project, if any sources land there)
@@ -20,8 +21,8 @@
 import {
   SHARED_PROJECT_KEY,
   UNSORTED_PROJECT_KEY,
-} from "./projectKeys";
-import { sourceProjectBinding } from "./projectBinding";
+} from "@/api";
+import { sourceProjectBinding, type ProjectBinding } from "./projectBinding";
 import type {
   GroupedSource,
   Project,
@@ -52,20 +53,21 @@ function isUsableKey(key: string | undefined | null): key is string {
   return typeof key === "string" && key.trim().length > 0;
 }
 
-export function groupSourcesByProject(
+/** A source that sends memories to one project, with the binding that sends them there. */
+export interface ProjectSource extends GroupedSource {
+  binding: ProjectBinding;
+}
+
+type BucketEntry = GroupedSource & { binding: ProjectBinding | null };
+
+/** Sources keyed by the project they send memories to; `null` holds the Unmapped ones. */
+function bucketSourcesByProject(
   sources: readonly Source[],
-  projects: readonly Project[],
   resolvedBySource: ResolvedBySource,
-): SourceProjectGroup[] {
-  const projectByKey = new Map<string, Project>();
-  for (const project of projects) {
-    projectByKey.set(project.key, project);
-  }
+): Map<string | null, BucketEntry[]> {
+  const buckets = new Map<string | null, BucketEntry[]>();
 
-  // Map<projectKey | null, GroupedSource[]>; null is the Unmapped bucket.
-  const buckets = new Map<string | null, GroupedSource[]>();
-
-  function pushInto(key: string | null, entry: GroupedSource): void {
+  function pushInto(key: string | null, entry: BucketEntry): void {
     const existing = buckets.get(key);
     if (existing) {
       existing.push(entry);
@@ -77,7 +79,7 @@ export function groupSourcesByProject(
   for (const source of sources) {
     const binding = sourceProjectBinding(source);
     if (!binding) {
-      pushInto(null, { source, memory_count: source.memory_count ?? 0 });
+      pushInto(null, { source, binding, memory_count: source.memory_count ?? 0 });
       continue;
     }
 
@@ -86,7 +88,7 @@ export function groupSourcesByProject(
       const key: string | null = isUsableKey(binding.project_key)
         ? binding.project_key.trim()
         : null;
-      pushInto(key, { source, memory_count: source.memory_count ?? 0 });
+      pushInto(key, { source, binding, memory_count: source.memory_count ?? 0 });
       continue;
     }
 
@@ -98,13 +100,42 @@ export function groupSourcesByProject(
       const fallback: string | null = isUsableKey(binding.default)
         ? binding.default.trim()
         : null;
-      pushInto(fallback, { source, memory_count: source.memory_count ?? 0 });
+      pushInto(fallback, { source, binding, memory_count: source.memory_count ?? 0 });
       continue;
     }
     for (const row of usableObserved) {
-      pushInto(row.project_key, { source, memory_count: row.memory_count });
+      pushInto(row.project_key, { source, binding, memory_count: row.memory_count });
     }
   }
+  return buckets;
+}
+
+/** The sources that send memories to each project, keyed by project key. Unbound sources are left out. */
+export function sourcesByProjectKey(
+  sources: readonly Source[],
+  resolvedBySource: ResolvedBySource,
+): Map<string, ProjectSource[]> {
+  const byKey = new Map<string, ProjectSource[]>();
+  for (const [key, entries] of bucketSourcesByProject(sources, resolvedBySource)) {
+    if (key === null) continue;
+    byKey.set(
+      key,
+      entries.filter((entry): entry is ProjectSource => entry.binding !== null),
+    );
+  }
+  return byKey;
+}
+
+export function groupSourcesByProject(
+  sources: readonly Source[],
+  projects: readonly Project[],
+  resolvedBySource: ResolvedBySource,
+): SourceProjectGroup[] {
+  const projectByKey = new Map<string, Project>();
+  for (const project of projects) {
+    projectByKey.set(project.key, project);
+  }
+  const buckets = bucketSourcesByProject(sources, resolvedBySource);
 
   const groups: SourceProjectGroup[] = [];
   for (const [key, entries] of buckets.entries()) {

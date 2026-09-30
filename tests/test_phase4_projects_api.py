@@ -73,7 +73,7 @@ def _as_role(role: str) -> dict[str, str]:
 
 
 def _projects_by_key(client: TestClient) -> dict[str, dict]:
-    return {p["key"]: p for p in client.get("/api/v1/projects").json()}
+    return {p["key"]: p for p in client.get("/api/v1/projects").json()["data"]}
 
 
 def test_create_list_update_round_trip(tmp_path):
@@ -90,7 +90,7 @@ def test_create_list_update_round_trip(tmp_path):
             assert created["kind"] == "normal"
             assert created["name"] == "Payroll"
 
-            listed = client.get("/api/v1/projects").json()
+            listed = client.get("/api/v1/projects").json()["data"]
             keys = {p["key"] for p in listed}
             assert {SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY, "PAYROLL"} <= keys
 
@@ -102,6 +102,49 @@ def test_create_list_update_round_trip(tmp_path):
             updated = patch.json()
             assert updated["name"] == "Pay"
             assert updated["kind"] == "shared"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_list_reports_the_memories_each_project_shows_the_caller(tmp_path):
+    app, database = _make_role_app(tmp_path)
+
+    def _memory(memory_id: str, project_key: str, **fields) -> Memory:
+        return Memory(
+            id=memory_id,
+            memory_type="fact",
+            content=memory_id,
+            content_hash=content_hash(memory_id),
+            project_key=project_key,
+            **fields,
+        )
+
+    async def _seed():
+        for memory in (
+            _memory("m-pay-1", "PAY"),
+            _memory("m-pay-2", "PAY"),
+            _memory("m-pay-mine", "PAY", visibility=Visibility.PRIVATE.value, owner_user_id="workspace-user"),
+            _memory("m-pay-theirs", "PAY", visibility=Visibility.PRIVATE.value, owner_user_id="someone-else"),
+            _memory("m-pay-retired", "PAY", status="retired"),
+            _memory("m-shared", SHARED_PROJECT_KEY),
+        ):
+            await database.insert_memory(memory)
+
+    asyncio.run(_seed())
+
+    try:
+        with TestClient(app) as client:
+            create = client.post(
+                "/api/v1/projects", json={"name": "Pay", "key": "PAY"}, headers=_as_role("workspace_admin")
+            )
+            assert create.status_code == 201, create.text
+            create = client.post(
+                "/api/v1/projects", json={"name": "Risk", "key": "RISK"}, headers=_as_role("workspace_admin")
+            )
+            assert create.status_code == 201, create.text
+
+            counts = {key: project["memory_count"] for key, project in _projects_by_key(client).items()}
+            assert counts == {"PAY": 3, "RISK": 0, SHARED_PROJECT_KEY: 1, UNSORTED_PROJECT_KEY: 0}
     finally:
         asyncio.run(database.close())
 
@@ -143,7 +186,7 @@ def test_duplicate_key_returns_conflict(tmp_path):
             assert first.status_code == 201
             second = client.post("/api/v1/projects", json={"name": "Pay"})
             assert second.status_code == 409
-            assert "already exists" in second.json()["detail"]
+            assert second.json()["detail"] == "A project with the code PAY already exists. Pick another name or code."
     finally:
         asyncio.run(database.close())
 
@@ -226,7 +269,7 @@ def test_non_admin_roles_cannot_change_projects(tmp_path, role):
 
             listed = client.get("/api/v1/projects", headers=_as_role(role))
             assert listed.status_code == 200
-            assert {p["key"]: p for p in listed.json()} == before
+            assert {p["key"]: p for p in listed.json()["data"]} == before
     finally:
         asyncio.run(database.close())
 
@@ -251,6 +294,216 @@ def test_workspace_admin_can_create_change_and_delete_projects(tmp_path):
             deleted = client.delete(f"/api/v1/projects/{project_id}", headers=admin)
             assert deleted.status_code == 200, deleted.text
             assert "PAY" not in _projects_by_key(client)
+    finally:
+        asyncio.run(database.close())
+
+
+@pytest.mark.parametrize("role", ["owner", "workspace_admin", "member", "viewer"])
+def test_list_reports_the_project_authority_the_write_routes_enforce(tmp_path, role):
+    app, database = _make_role_app(tmp_path)
+    try:
+        with TestClient(app) as client:
+            listed = client.get("/api/v1/projects", headers=_as_role(role))
+            assert listed.status_code == 200, listed.text
+
+            created = client.post("/api/v1/projects", json={"name": "Pay"}, headers=_as_role(role))
+            assert created.status_code in {201, 403}, created.text
+
+            assert listed.json()["can_manage"] is (created.status_code == 201)
+    finally:
+        asyncio.run(database.close())
+
+
+async def _seed_bound_sources(database: Database) -> None:
+    bindings = {
+        "src-fixed-pay": {"mode": "fixed", "project_key": "PAY"},
+        "src-fixed-risk": {"mode": "fixed", "project_key": "RISK"},
+        "src-field-pay": {
+            "mode": "by_field",
+            "field": "repo",
+            "map": {"payroll": "PAY", "risk-engine": "RISK"},
+            "default": "PAY",
+        },
+        "src-field-risk": {"mode": "by_field", "field": "repo", "map": {"risk-engine": "RISK"}, "default": "UNSORTED"},
+        "src-retired-pay": {"mode": "fixed", "project_key": "PAY"},
+        "src-unbound": None,
+    }
+    for source_id, binding in bindings.items():
+        await database.upsert_source(
+            id=source_id,
+            type="local_markdown",
+            name=source_id,
+            config_json="{}",
+            access_policy="private",
+            # Another user's private Source is released like any other.
+            owner_user_id="someone-else" if source_id == "src-field-pay" else "workspace-user",
+            # A retired Source writes no memories, so deletion leaves its binding as is.
+            status="retired" if source_id == "src-retired-pay" else None,
+            project_binding=binding,
+        )
+
+
+def test_delete_releases_every_source_binding_that_names_the_project(tmp_path):
+    app, database = _make_role_app(tmp_path)
+    admin = _as_role("workspace_admin")
+
+    async def _seed():
+        await _seed_bound_sources(database)
+        await database.insert_memory(
+            Memory(
+                id="m-pay-retired",
+                memory_type="fact",
+                content="retired payroll fact",
+                content_hash=content_hash("retired payroll fact"),
+                project_key="PAY",
+                status="retired",
+            )
+        )
+
+    asyncio.run(_seed())
+
+    try:
+        with TestClient(app) as client:
+            project_id = client.post("/api/v1/projects", json={"name": "Pay", "key": "PAY"}, headers=admin).json()["id"]
+
+            impact = client.get(f"/api/v1/projects/{project_id}/deletion-impact", headers=admin)
+            assert impact.status_code == 200, impact.text
+            assert impact.json() == {"memory_count": 1, "source_count": 2}
+
+            deleted = client.delete(f"/api/v1/projects/{project_id}", headers=admin)
+            assert deleted.status_code == 200, deleted.text
+            assert deleted.json()["released_source_count"] == 2
+            assert deleted.json()["rebucketed_memory_ids"] == ["m-pay-retired"]
+
+        async def _bindings():
+            return {source["id"]: source["project_binding"] for source in await database.list_sources()}
+
+        assert asyncio.run(_bindings()) == {
+            "src-fixed-pay": None,
+            "src-fixed-risk": {"mode": "fixed", "project_key": "RISK"},
+            "src-field-pay": {
+                "mode": "by_field",
+                "field": "repo",
+                "map": {"risk-engine": "RISK"},
+                "default": UNSORTED_PROJECT_KEY,
+            },
+            "src-field-risk": {
+                "mode": "by_field",
+                "field": "repo",
+                "map": {"risk-engine": "RISK"},
+                "default": "UNSORTED",
+            },
+            "src-unbound": None,
+        }
+        retired_source = asyncio.run(database.get_source("src-retired-pay"))
+        assert retired_source is not None
+        assert retired_source["project_binding"] == {"mode": "fixed", "project_key": "PAY"}
+        stored = asyncio.run(database.get_memory("m-pay-retired"))
+        assert stored is not None
+        assert stored.project_key == UNSORTED_PROJECT_KEY
+        assert stored.status == "retired"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_a_failed_relational_commit_keeps_the_sources_bound(tmp_path):
+    app, database = _make_role_app(tmp_path)
+    admin = _as_role("workspace_admin")
+    asyncio.run(_seed_bound_sources(database))
+
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            project_id = client.post("/api/v1/projects", json={"name": "Pay", "key": "PAY"}, headers=admin).json()["id"]
+            original_execute = database.db.execute
+
+            def _refuse_project_drop(sql, *args, **kwargs):
+                if sql.startswith("DELETE FROM projects"):
+                    raise RuntimeError("database offline")
+                return original_execute(sql, *args, **kwargs)
+
+            database.db.execute = _refuse_project_drop  # type: ignore[method-assign]
+            try:
+                assert client.delete(f"/api/v1/projects/{project_id}", headers=admin).status_code >= 500
+            finally:
+                database.db.execute = original_execute  # type: ignore[method-assign]
+
+            assert "PAY" in _projects_by_key(client)
+
+        source = asyncio.run(database.get_source("src-fixed-pay"))
+        assert source is not None
+        assert source["project_binding"] == {"mode": "fixed", "project_key": "PAY"}
+    finally:
+        asyncio.run(database.close())
+
+
+def test_delete_leaves_a_binding_that_is_not_a_json_object_as_stored(tmp_path):
+    app, database = _make_role_app(tmp_path)
+    admin = _as_role("workspace_admin")
+    unreadable = {"src-truncated": '{"mode": "fixed", "project_key": "PA', "src-list": '["PAY"]'}
+
+    async def _seed():
+        await _seed_bound_sources(database)
+        for source_id, stored in unreadable.items():
+            await database.upsert_source(
+                id=source_id,
+                type="local_markdown",
+                name=source_id,
+                config_json="{}",
+                access_policy="private",
+                owner_user_id="workspace-user",
+            )
+            await database.db.execute("UPDATE sources SET project_binding = ? WHERE id = ?", (stored, source_id))
+        await database.db.commit()
+
+    async def _stored_bindings() -> dict[str, str | None]:
+        async with database.db.execute("SELECT id, project_binding FROM sources") as cursor:
+            return {row["id"]: row["project_binding"] for row in await cursor.fetchall()}
+
+    asyncio.run(_seed())
+
+    try:
+        with TestClient(app) as client:
+            project_id = client.post("/api/v1/projects", json={"name": "Pay", "key": "PAY"}, headers=admin).json()["id"]
+
+            impact = client.get(f"/api/v1/projects/{project_id}/deletion-impact", headers=admin)
+            deleted = client.delete(f"/api/v1/projects/{project_id}", headers=admin)
+
+            assert impact.status_code == 200, impact.text
+            assert impact.json()["source_count"] == 2
+            assert deleted.status_code == 200, deleted.text
+            assert deleted.json()["released_source_count"] == 2
+            assert "PAY" not in _projects_by_key(client)
+
+        stored = asyncio.run(_stored_bindings())
+        assert {source_id: stored[source_id] for source_id in unreadable} == unreadable
+        assert stored["src-fixed-pay"] is None
+    finally:
+        asyncio.run(database.close())
+
+
+@pytest.mark.parametrize("role", ["member", "viewer"])
+def test_deletion_impact_needs_project_authority(tmp_path, role):
+    app, database = _make_role_app(tmp_path)
+    try:
+        with TestClient(app) as client:
+            project_id = client.post(
+                "/api/v1/projects", json={"name": "Pay"}, headers=_as_role("workspace_admin")
+            ).json()["id"]
+            resp = client.get(f"/api/v1/projects/{project_id}/deletion-impact", headers=_as_role(role))
+            assert resp.status_code == 403, resp.text
+            assert resp.json()["detail"]["error"] == "project_management_forbidden"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_deletion_impact_refuses_built_in_projects(tmp_path):
+    app, database = _make_app(tmp_path)
+    try:
+        with TestClient(app) as client:
+            shared_id = _projects_by_key(client)[SHARED_PROJECT_KEY]["id"]
+            resp = client.get(f"/api/v1/projects/{shared_id}/deletion-impact")
+            assert resp.status_code == 409, resp.text
+            assert resp.json()["detail"]["error"] == "reserved_project"
     finally:
         asyncio.run(database.close())
 
@@ -291,7 +544,7 @@ def test_delete_real_project_rebuckets_to_unsorted(tmp_path):
 
             # The project row is gone.
             assert client.get("/api/v1/projects").status_code == 200
-            keys = {p["key"] for p in client.get("/api/v1/projects").json()}
+            keys = set(_projects_by_key(client))
             assert "PAY" not in keys
 
         async def _verify_rebucket():
@@ -617,7 +870,7 @@ def test_delete_orders_vector_before_relational_commit(tmp_path):
                 MemoryStore.rebucket_project_memories = original  # type: ignore[assignment]
 
             # The project row still exists; the memory still points to PAY.
-            keys = {p["key"] for p in client.get("/api/v1/projects").json()}
+            keys = set(_projects_by_key(client))
             assert "PAY" in keys
 
         async def _verify_unmoved():

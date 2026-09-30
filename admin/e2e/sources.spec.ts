@@ -23,7 +23,7 @@ const SOURCE = {
 
 const RESPONSES: Record<string, unknown> = {
   "/api/v1/sources": { data: [SOURCE] },
-  "/api/v1/projects": [{ id: "p1", key: "PAY", name: "Payroll", kind: "normal" }],
+  "/api/v1/projects": { data: [{ id: "p1", key: "PAY", name: "Payroll", kind: "normal" }], can_manage: true },
   "/api/v1/genes": [{ name: "confluence", display_name: "Confluence" }],
   "/api/v1/source-list/preferences": { sort_mode: "name" },
   "/api/cloud/local-agent/status": { status: "offline", last_seen_at: null, checked_at: "", stale_after_seconds: 60 },

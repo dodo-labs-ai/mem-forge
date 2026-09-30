@@ -1,6 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
-const PREVIEW_PORT = 4175;
+const DEFAULT_PREVIEW_PORT = 4175;
+/** Set `ADMIN_E2E_PORT` to run the suite while the default port is taken. */
+const PREVIEW_PORT = Number(process.env.ADMIN_E2E_PORT ?? DEFAULT_PREVIEW_PORT);
 
 /**
  * Smoke tests run against the production build. Each test stubs the API with

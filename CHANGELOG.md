@@ -13,6 +13,122 @@
   write request. Cloud's `CloudRuntimeProvider.build_adapters` takes the new
   signature together with the pin to this version; no HANA schema, `sap/`
   route or environment configuration change.
+- `GET /api/v1/projects` returns each project's `memory_count`: the active
+  memories in that project the caller can see, including the caller's private
+  ones and leaving out Sources the caller turned off. One grouped read,
+  `count_memory_admin_projects(scope=...)`, joins `MemoryAdminPageReader` and
+  counts with exactly the predicates of `query_memory_admin_page`, so each
+  count equals the total the memory list reports for that project. Creating a
+  project no longer requires the deprecated `kind`, and a duplicate code is
+  refused with a sentence that names the code. The admin UI V2 Projects pages
+  use both. Cloud: the HANA workspace store must implement
+  `count_memory_admin_projects` (one `GROUP BY M.PROJECT_KEY` over the admin
+  list predicates) before it pins this change, or the project list fails.
+- The memory list and detail routes name each Memory's Sources and the
+  memory list carries its Cross-Document Relations, so the admin UI shows
+  project, source, access and relation hints on every row without a request
+  per Memory. `GET /api/v1/memories` rows and `GET /api/v1/memories/{id}` gain
+  `sources` (the caller-readable `MemorySourceRef`s, as related Memories
+  already report them) and the rows gain `relations`; the detail gains
+  `source_backed`, true when active Source Units support the Memory so
+  `POST /memories/{id}/retire` would refuse it. `POST /api/v1/memories/search`
+  declares its response model and leaves unset fields out, so its JSON is
+  unchanged for MCP proxies. Cloud: arrives with the pin; the list reads
+  `get_memory_source_refs_many` and `list_cross_document_relations`, and the
+  detail reads `get_agent_claim_by_memory_id` and
+  `get_active_memory_support_states`, all of which the HANA workspace store
+  already implements; no schema, protocol or configuration change.
+- `GET /api/v1/memories?status=...` lists the Memories in exactly that
+  lifecycle status (`pending_review`, `superseded`, `retired`, or the
+  `decayed` alias), and `GET /api/v1/memories/{id}` opens a Memory in any
+  lifecycle status, so the admin UI can filter by status, open a Memory that
+  waits for a review, and follow "Replaced by" links. Without `status` the
+  list still holds active Memories only, so its total matches each project's
+  `memory_count`. Visibility is unchanged: another user's private Memory stays
+  hidden in every status. Cloud: arrives with the pin; the HANA store reads
+  through `_hana_visible_sql`, which delegates to the OSS `visible_sql`, so it
+  follows the scope's statuses with no storage change.
+- `GET /api/v1/memory-reviews` items, `GET /api/v1/memory-reviews/{id}` and
+  the decision routes report `can_decide`: whether the caller manages every
+  Source behind the Review, so the admin UI shows a view-only Review up front
+  and leaves it out of bulk decisions. Every decision route checks the same
+  rule, and a Review with no configured Source stays decidable by anyone who
+  can see it. The list computes it from the Sources it already reads in one
+  `list_sources` call, with no read per Review. Cloud: arrives with the pin;
+  the flag is computed in the route from `get_source`, `list_sources` and
+  `get_memory_source_ids_many`, which the HANA store already implements, with
+  no storage change.
+- `GET /api/v1/projects` returns `{data, can_manage}` instead of a bare list.
+  `can_manage` says whether the caller may create, rename and delete projects,
+  from the same workspace-admin check the project write routes enforce, and
+  the admin UI V2 hides New project, Edit and Delete without it. The V1 admin
+  UI reads the list from `data`. Cloud: arrives with the pin and follows the
+  role the Cloud proxy stamps (`workspace_admin` may manage projects, `member`
+  and `viewer` may not); clients that read the list as an array must read
+  `data`.
+- Deleting a project also releases the Sources that write to it, so none
+  keeps writing new memories to the deleted key. In the same relational
+  transaction that moves the project's memories to UNSORTED and drops the row,
+  a fixed binding to the project is removed (the Source becomes unbound) and a
+  field binding drops its mappings to the project, with its default moving to
+  UNSORTED if it pointed there. Retired Sources are left as they are, and so is
+  a stored binding that is not a JSON object: it routes no memory to the
+  project, so it neither blocks the deletion nor gets rewritten. The memories
+  keep today's behaviour: they move to UNSORTED and are not retired.
+  `DELETE /api/v1/projects/{id}` reports `released_source_count`, and the new
+  admin-only `GET /api/v1/projects/{id}/deletion-impact` counts the memories
+  and Sources the delete changes across the workspace, so the admin UI V2 can
+  state both before a two-step confirmation that asks for the project code.
+  The V1 admin UI no longer deletes projects; its project list and detail link
+  to the project in V2 instead. `released_project_bindings` is the one rule
+  for which Sources a deletion releases: the new
+  `RelationalStore.list_sources_released_by_project_deletion` (behind the
+  impact count) and `RelationalStore.commit_project_deletion`, which now
+  returns the released Source ids, both apply it. Cloud: before it pins this
+  change, the HANA workspace store must implement
+  `list_sources_released_by_project_deletion` and release the bindings in its
+  `commit_project_deletion` transaction through `released_project_bindings`,
+  reading the live bound Sources `FOR UPDATE ... ORDER BY ID`, and return
+  their ids; no schema, `sap/` route or configuration change. The V1 link
+  opens `/v2/projects/<code>`, where Cloud already serves the V2 bundle.
+- `GET /api/v1/llm-config` reports `writable`, false when
+  `MEMFORGE_LLM_CONFIG_WRITABLE` hands LLM settings to the deployment
+  environment, and `PUT /api/v1/llm-config` returns the stored configuration
+  instead of `{"ok": true}`. Both routes and `POST /api/v1/llm-config/probe`
+  declare response models. Cloud: arrives with the pin; Cloud sets the flag to
+  false and its admin UI redirects Settings to `/cloud/settings`.
+- `GET /api/v1/agent-evaluations/online-overview` declares its response model,
+  and its `summary` and the per-Source `agent-evaluation` summary report
+  `row_limit`, the most runtime events and the most assessments one window
+  reads, so the admin UI states the bound `truncated` refers to. Cloud:
+  arrives with the pin; the HANA reads already honor the query limit.
+- Every sync of a document Source removes the Documents its provider no longer
+  has, whether the run is incremental, first or force-full, and never removes
+  one only because it left the configured query. After discovery each run
+  lists its configured scope by identifier, independent of `since`
+  (`Gene.list_scope()`), and the listing declares its kind. An existence
+  listing (the GitHub repository tree, the GitHub Pages repository tree or
+  declared exhaustive sitemap) makes an unlisted Document absent. A query
+  listing (Jira JQL, a Confluence page tree or space) confirms each unlisted
+  Document by id in the same run (`Gene.confirm_absent()`): only not found or
+  gone is absence, so an issue outside a relative-date window, a closed issue
+  or a page moved out of its tree keeps its Unit and Support. GitHub, GitHub
+  Pages and Confluence list from the walk their discovery already makes; Jira
+  lists with an identifier-only search ordered by key and confirms in
+  unvalidated `issuekey in (...)` batches of a hundred, reading by id what the
+  search does not return. A listing or confirmation that fails or is
+  incomplete removes nothing in that run, which still succeeds and logs the
+  skipped check; a rejected credential fails discovery and the run; a 403 for
+  one item keeps it. `source_run_projection_coverage` no longer takes `incremental`:
+  discovery alone proves absence only for an authoritative snapshot or a
+  complete discovery of a newly configured scope, and scope transitions are
+  unchanged (ADR 0005). Force-full keeps meaning "re-read every Unit". Cloud:
+  arrives with the pin; no HANA schema, protocol, configuration or `sap/` route
+  change. The first scheduled run after the pin retires what EU12 dev has
+  accumulated: 183 absent Units (169 renamed or moved files in one GitHub
+  repository, 9 GitHub Pages pages, 5 Confluence pages) and the 844 active
+  Memories whose last Support they hold; 678 unlisted Jira issues and 2
+  Confluence pages still exist and are kept. See ADR 0045.
 
 - Genes decode stored input by the bytes themselves. A local-agent package is
   recognized by its own `package_kind`, exactly that Gene's kind, never by

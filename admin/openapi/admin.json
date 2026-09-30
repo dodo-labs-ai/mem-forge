@@ -14,6 +14,568 @@
         "title": "AddAliasRequest",
         "type": "object"
       },
+      "AgentAssessmentResponse": {
+        "description": "One content-free assessment, as ``assessment_public_payload`` returns it.",
+        "properties": {
+          "annotator_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Annotator Id"
+          },
+          "annotator_kind": {
+            "enum": [
+              "code",
+              "llm",
+              "human"
+            ],
+            "title": "Annotator Kind",
+            "type": "string"
+          },
+          "assessment_id": {
+            "title": "Assessment Id",
+            "type": "string"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "enum": [
+                  "low",
+                  "medium",
+                  "high"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          },
+          "content_policy_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content Policy Id"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "criterion": {
+            "title": "Criterion",
+            "type": "string"
+          },
+          "evaluator_name": {
+            "title": "Evaluator Name",
+            "type": "string"
+          },
+          "evaluator_version": {
+            "title": "Evaluator Version",
+            "type": "string"
+          },
+          "input_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Fingerprint"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "enum": [
+                  "pass",
+                  "fail",
+                  "needs_review"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "occurrence_count": {
+            "title": "Occurrence Count",
+            "type": "integer"
+          },
+          "reason_code": {
+            "title": "Reason Code",
+            "type": "string"
+          },
+          "reused_from_assessment_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reused From Assessment Id"
+          },
+          "schema_version": {
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "completed",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "target_candidate_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Candidate Id"
+          },
+          "target_event_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Event Id"
+          },
+          "target_result_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Result Id"
+          }
+        },
+        "required": [
+          "assessment_id",
+          "target_event_id",
+          "criterion",
+          "status",
+          "label",
+          "reason_code",
+          "annotator_kind",
+          "evaluator_name",
+          "evaluator_version",
+          "created_at",
+          "target_result_id",
+          "target_candidate_id",
+          "annotator_id",
+          "content_policy_id",
+          "input_fingerprint",
+          "confidence",
+          "reused_from_assessment_id",
+          "occurrence_count",
+          "schema_version"
+        ],
+        "title": "AgentAssessmentResponse",
+        "type": "object"
+      },
+      "AgentEvaluationCaseResponse": {
+        "description": "One example of an issue group: identifiers and versions only, no content.",
+        "properties": {
+          "assessment_id": {
+            "title": "Assessment Id",
+            "type": "string"
+          },
+          "batch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Batch Id"
+          },
+          "contract_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contract Version"
+          },
+          "criterion": {
+            "title": "Criterion",
+            "type": "string"
+          },
+          "deployment_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deployment Revision"
+          },
+          "derivation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Derivation Id"
+          },
+          "doc_id": {
+            "title": "Doc Id",
+            "type": "string"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "execution_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Id"
+          },
+          "extraction_contract_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extraction Contract Version"
+          },
+          "label": {
+            "enum": [
+              "fail",
+              "needs_review"
+            ],
+            "title": "Label",
+            "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "observation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observation Id"
+          },
+          "observation_revision_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observation Revision Id"
+          },
+          "occurred_at": {
+            "title": "Occurred At",
+            "type": "string"
+          },
+          "occurrence_count": {
+            "title": "Occurrence Count",
+            "type": "integer"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "projection_run_id": {
+            "title": "Projection Run Id",
+            "type": "string"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "reason_code": {
+            "title": "Reason Code",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "source_type": {
+            "title": "Source Type",
+            "type": "string"
+          },
+          "source_unit_id": {
+            "title": "Source Unit Id",
+            "type": "string"
+          },
+          "target_unit_revision_id": {
+            "title": "Target Unit Revision Id",
+            "type": "string"
+          },
+          "trace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trace Id"
+          }
+        },
+        "required": [
+          "assessment_id",
+          "event_id",
+          "label",
+          "criterion",
+          "reason_code",
+          "occurred_at",
+          "occurrence_count",
+          "source_id",
+          "source_type",
+          "doc_id",
+          "source_unit_id",
+          "target_unit_revision_id",
+          "observation_id",
+          "observation_revision_id",
+          "projection_run_id",
+          "operation_id",
+          "execution_id",
+          "derivation_id",
+          "batch_id",
+          "trace_id",
+          "provider",
+          "model",
+          "contract_version",
+          "extraction_contract_version",
+          "deployment_revision"
+        ],
+        "title": "AgentEvaluationCaseResponse",
+        "type": "object"
+      },
+      "AgentEvaluationCoverageResponse": {
+        "description": "How many expected checks have a matching completed assessment.",
+        "properties": {
+          "assessed_occurrences": {
+            "title": "Assessed Occurrences",
+            "type": "integer"
+          },
+          "coverage_rate": {
+            "title": "Coverage Rate",
+            "type": "number"
+          },
+          "eligible_occurrences": {
+            "title": "Eligible Occurrences",
+            "type": "integer"
+          },
+          "evaluator_failure_occurrences": {
+            "title": "Evaluator Failure Occurrences",
+            "type": "integer"
+          },
+          "oldest_pending_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Pending At"
+          },
+          "pending_occurrences": {
+            "title": "Pending Occurrences",
+            "type": "integer"
+          },
+          "policy": {
+            "const": "semantic_evaluator_v1",
+            "title": "Policy",
+            "type": "string"
+          }
+        },
+        "required": [
+          "policy",
+          "eligible_occurrences",
+          "assessed_occurrences",
+          "pending_occurrences",
+          "coverage_rate",
+          "oldest_pending_at",
+          "evaluator_failure_occurrences"
+        ],
+        "title": "AgentEvaluationCoverageResponse",
+        "type": "object"
+      },
+      "AgentEvaluationIssueGroupResponse": {
+        "description": "Failed or degraded checks that share a criterion, reason and evaluator version.",
+        "properties": {
+          "affected_source_count": {
+            "title": "Affected Source Count",
+            "type": "integer"
+          },
+          "affected_source_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Affected Source Ids",
+            "type": "array"
+          },
+          "criterion": {
+            "title": "Criterion",
+            "type": "string"
+          },
+          "criterion_occurrence_count": {
+            "title": "Criterion Occurrence Count",
+            "type": "integer"
+          },
+          "criterion_rate": {
+            "title": "Criterion Rate",
+            "type": "number"
+          },
+          "distinct_event_count": {
+            "title": "Distinct Event Count",
+            "type": "integer"
+          },
+          "evaluator_name": {
+            "title": "Evaluator Name",
+            "type": "string"
+          },
+          "evaluator_version": {
+            "title": "Evaluator Version",
+            "type": "string"
+          },
+          "first_seen_at": {
+            "title": "First Seen At",
+            "type": "string"
+          },
+          "group_id": {
+            "title": "Group Id",
+            "type": "string"
+          },
+          "label": {
+            "enum": [
+              "fail",
+              "needs_review"
+            ],
+            "title": "Label",
+            "type": "string"
+          },
+          "last_seen_at": {
+            "title": "Last Seen At",
+            "type": "string"
+          },
+          "occurrence_count": {
+            "title": "Occurrence Count",
+            "type": "integer"
+          },
+          "reason_code": {
+            "title": "Reason Code",
+            "type": "string"
+          },
+          "representative_cases": {
+            "items": {
+              "$ref": "#/components/schemas/AgentEvaluationCaseResponse"
+            },
+            "title": "Representative Cases",
+            "type": "array"
+          },
+          "source_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Source Types",
+            "type": "array"
+          }
+        },
+        "required": [
+          "group_id",
+          "label",
+          "criterion",
+          "reason_code",
+          "evaluator_name",
+          "evaluator_version",
+          "occurrence_count",
+          "distinct_event_count",
+          "criterion_occurrence_count",
+          "criterion_rate",
+          "affected_source_ids",
+          "affected_source_count",
+          "source_types",
+          "first_seen_at",
+          "last_seen_at",
+          "representative_cases"
+        ],
+        "title": "AgentEvaluationIssueGroupResponse",
+        "type": "object"
+      },
       "AgentEvaluationLangfuseExportRequest": {
         "additionalProperties": false,
         "description": "Create one blinded reviewer task in an approved Langfuse queue.",
@@ -155,6 +717,229 @@
           "evaluator_version"
         ],
         "title": "AgentEvaluationRunCreateRequest",
+        "type": "object"
+      },
+      "AgentEvaluationScopeResponse": {
+        "properties": {
+          "kind": {
+            "const": "workspace",
+            "title": "Kind",
+            "type": "string"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          },
+          "source_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Type"
+          }
+        },
+        "required": [
+          "kind",
+          "source_id",
+          "source_type"
+        ],
+        "title": "AgentEvaluationScopeResponse",
+        "type": "object"
+      },
+      "AgentEvaluationSourceHealthResponse": {
+        "properties": {
+          "action_issue_group_count": {
+            "title": "Action Issue Group Count",
+            "type": "integer"
+          },
+          "coverage": {
+            "$ref": "#/components/schemas/AgentEvaluationCoverageResponse"
+          },
+          "evaluation_status": {
+            "enum": [
+              "attention",
+              "coverage_gap",
+              "review",
+              "healthy",
+              "no_data"
+            ],
+            "title": "Evaluation Status",
+            "type": "string"
+          },
+          "fail_occurrences": {
+            "title": "Fail Occurrences",
+            "type": "integer"
+          },
+          "last_event_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Event At"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "review_issue_group_count": {
+            "title": "Review Issue Group Count",
+            "type": "integer"
+          },
+          "review_occurrences": {
+            "title": "Review Occurrences",
+            "type": "integer"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "source_status": {
+            "title": "Source Status",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "name",
+          "type",
+          "source_status",
+          "evaluation_status",
+          "action_issue_group_count",
+          "review_issue_group_count",
+          "fail_occurrences",
+          "review_occurrences",
+          "coverage",
+          "last_event_at"
+        ],
+        "title": "AgentEvaluationSourceHealthResponse",
+        "type": "object"
+      },
+      "AgentEvaluationSummaryResponse": {
+        "description": "Occurrence counts over the effective assessments in the window.",
+        "properties": {
+          "action_issue_group_count": {
+            "title": "Action Issue Group Count",
+            "type": "integer"
+          },
+          "affected_source_count": {
+            "description": "Sources with failures, checks needing review, or coverage gaps.",
+            "title": "Affected Source Count",
+            "type": "integer"
+          },
+          "criterion_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Criterion Counts",
+            "type": "object"
+          },
+          "eligible_assessment_count": {
+            "title": "Eligible Assessment Count",
+            "type": "integer"
+          },
+          "label_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Label Counts",
+            "type": "object"
+          },
+          "missing_assessment_count": {
+            "title": "Missing Assessment Count",
+            "type": "integer"
+          },
+          "review_issue_group_count": {
+            "title": "Review Issue Group Count",
+            "type": "integer"
+          },
+          "row_limit": {
+            "description": "The most runtime events, and the most assessments, that one window reads.",
+            "title": "Row Limit",
+            "type": "integer"
+          },
+          "runtime_event_count": {
+            "title": "Runtime Event Count",
+            "type": "integer"
+          },
+          "source_count": {
+            "title": "Source Count",
+            "type": "integer"
+          },
+          "status_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Status Counts",
+            "type": "object"
+          },
+          "total_assessments": {
+            "title": "Total Assessments",
+            "type": "integer"
+          },
+          "truncated": {
+            "description": "True when the window reached ``row_limit``, so counts are partial.",
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "total_assessments",
+          "runtime_event_count",
+          "eligible_assessment_count",
+          "missing_assessment_count",
+          "action_issue_group_count",
+          "review_issue_group_count",
+          "source_count",
+          "affected_source_count",
+          "label_counts",
+          "criterion_counts",
+          "status_counts",
+          "truncated",
+          "row_limit"
+        ],
+        "title": "AgentEvaluationSummaryResponse",
+        "type": "object"
+      },
+      "AgentEvaluationWindowResponse": {
+        "properties": {
+          "days": {
+            "title": "Days",
+            "type": "integer"
+          },
+          "from": {
+            "title": "From",
+            "type": "string"
+          },
+          "to": {
+            "title": "To",
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "days"
+        ],
+        "title": "AgentEvaluationWindowResponse",
         "type": "object"
       },
       "AgentHookContextRequest": {
@@ -1550,6 +2335,88 @@
         "title": "LlmConfigProbeRequest",
         "type": "object"
       },
+      "LlmConfigProbeResponse": {
+        "properties": {
+          "latency_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latency Ms"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/LlmModelOption"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "models_supported": {
+            "default": false,
+            "title": "Models Supported",
+            "type": "boolean"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "stage": {
+            "anyOf": [
+              {
+                "enum": [
+                  "validation",
+                  "connect",
+                  "tls",
+                  "timeout",
+                  "auth",
+                  "http"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "suggested_base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suggested Base Url"
+          }
+        },
+        "required": [
+          "ok",
+          "message"
+        ],
+        "title": "LlmConfigProbeResponse",
+        "type": "object"
+      },
       "LlmConfigRequest": {
         "properties": {
           "embedding_api_key": {
@@ -1620,6 +2487,142 @@
           }
         },
         "title": "LlmConfigRequest",
+        "type": "object"
+      },
+      "LlmConfigResponse": {
+        "properties": {
+          "embedding_api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Embedding Api Key"
+          },
+          "embedding_api_key_last4": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Embedding Api Key Last4"
+          },
+          "embedding_api_key_set": {
+            "default": false,
+            "title": "Embedding Api Key Set",
+            "type": "boolean"
+          },
+          "embedding_base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Embedding Base Url"
+          },
+          "embedding_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Embedding Model"
+          },
+          "enrichment_api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enrichment Api Key"
+          },
+          "enrichment_api_key_last4": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enrichment Api Key Last4"
+          },
+          "enrichment_api_key_set": {
+            "default": false,
+            "title": "Enrichment Api Key Set",
+            "type": "boolean"
+          },
+          "enrichment_base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enrichment Base Url"
+          },
+          "enrichment_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enrichment Model"
+          },
+          "writable": {
+            "description": "False when the deployment environment manages LLM settings (MEMFORGE_LLM_CONFIG_WRITABLE), so updates are refused.",
+            "title": "Writable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "writable"
+        ],
+        "title": "LlmConfigResponse",
+        "type": "object"
+      },
+      "LlmModelOption": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "LlmModelOption",
         "type": "object"
       },
       "LocalAgentDaemonStatusResponse": {
@@ -2811,6 +3814,19 @@
             ],
             "title": "Retirement Reason"
           },
+          "source_backed": {
+            "default": false,
+            "title": "Source Backed",
+            "type": "boolean"
+          },
+          "sources": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemorySourceRefDetail"
+            },
+            "title": "Sources",
+            "type": "array"
+          },
           "status": {
             "title": "Status",
             "type": "string"
@@ -3639,6 +4655,14 @@
             ],
             "title": "Project Key"
           },
+          "relations": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryRelationDetail"
+            },
+            "title": "Relations",
+            "type": "array"
+          },
           "replacement_kind": {
             "anyOf": [
               {
@@ -3682,6 +4706,14 @@
               }
             ],
             "title": "Retirement Reason"
+          },
+          "sources": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemorySourceRefDetail"
+            },
+            "title": "Sources",
+            "type": "array"
           },
           "status": {
             "title": "Status",
@@ -3986,6 +5018,11 @@
       },
       "MemoryReviewDetailResponse": {
         "properties": {
+          "can_decide": {
+            "description": "Whether the caller has the authority to decide this Review: it manages every Source behind it. The status says whether a decision is still open.",
+            "title": "Can Decide",
+            "type": "boolean"
+          },
           "challenger": {
             "anyOf": [
               {
@@ -4178,13 +5215,19 @@
           "incumbent_memory_id",
           "challenger_memory_id",
           "decision_fingerprint",
-          "presentation"
+          "presentation",
+          "can_decide"
         ],
         "title": "MemoryReviewDetailResponse",
         "type": "object"
       },
       "MemoryReviewListItemResponse": {
         "properties": {
+          "can_decide": {
+            "description": "Whether the caller has the authority to decide this Review: it manages every Source behind it. The status says whether a decision is still open.",
+            "title": "Can Decide",
+            "type": "boolean"
+          },
           "challenger": {
             "anyOf": [
               {
@@ -4370,7 +5413,8 @@
           "incumbent_memory_id",
           "challenger_memory_id",
           "decision_fingerprint",
-          "presentation"
+          "presentation",
+          "can_decide"
         ],
         "title": "MemoryReviewListItemResponse",
         "type": "object"
@@ -4732,6 +5776,211 @@
         "title": "MemorySearchRequest",
         "type": "object"
       },
+      "MemorySearchResponse": {
+        "description": "The search engine's result page.\n\nThe route leaves unset fields out, so a queryless listing and a ranked\nsearch each keep their own shape: only a listing reports ``total_count``,\nonly a ranked search reports ``retrieval_intent``.",
+        "properties": {
+          "candidate_count_kind": {
+            "enum": [
+              "exact",
+              "windowed"
+            ],
+            "title": "Candidate Count Kind",
+            "type": "string"
+          },
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "limit": {
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "title": "Offset",
+            "type": "integer"
+          },
+          "query_analysis": {
+            "additionalProperties": true,
+            "title": "Query Analysis",
+            "type": "object"
+          },
+          "ranking_window_size": {
+            "title": "Ranking Window Size",
+            "type": "integer"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/MemorySearchResultDetail"
+            },
+            "title": "Results",
+            "type": "array"
+          },
+          "retrieval_intent": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retrieval Intent"
+          },
+          "retrieval_time_ms": {
+            "title": "Retrieval Time Ms",
+            "type": "integer"
+          },
+          "total_candidates": {
+            "title": "Total Candidates",
+            "type": "integer"
+          },
+          "total_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Count"
+          }
+        },
+        "required": [
+          "query_analysis",
+          "results",
+          "total_candidates",
+          "candidate_count_kind",
+          "ranking_window_size",
+          "limit",
+          "offset",
+          "has_more",
+          "retrieval_time_ms"
+        ],
+        "title": "MemorySearchResponse",
+        "type": "object"
+      },
+      "MemorySearchResultDetail": {
+        "description": "One ranked Memory, as ``SearchResult`` (memforge.models) carries it.",
+        "properties": {
+          "corroborated_by": {
+            "title": "Corroborated By",
+            "type": "integer"
+          },
+          "follow_up": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Follow Up"
+          },
+          "freshness": {
+            "title": "Freshness",
+            "type": "string"
+          },
+          "last_observed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Observed At"
+          },
+          "memory_id": {
+            "title": "Memory Id",
+            "type": "string"
+          },
+          "memory_type": {
+            "title": "Memory Type",
+            "type": "string"
+          },
+          "relation_notice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Relation Notice"
+          },
+          "relations": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryRelationDetail"
+            },
+            "title": "Relations",
+            "type": "array"
+          },
+          "relevance_score": {
+            "title": "Relevance Score",
+            "type": "number"
+          },
+          "repo_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repo Identifier"
+          },
+          "retrieval_evidence": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retrieval Evidence"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id",
+          "memory_type",
+          "summary",
+          "relevance_score",
+          "corroborated_by",
+          "freshness",
+          "status"
+        ],
+        "title": "MemorySearchResultDetail",
+        "type": "object"
+      },
       "MemorySourceRefDetail": {
         "properties": {
           "name": {
@@ -4908,14 +6157,20 @@
             "title": "Key"
           },
           "kind": {
-            "default": "normal",
-            "deprecated": true,
-            "enum": [
-              "normal",
-              "shared"
+            "anyOf": [
+              {
+                "enum": [
+                  "normal",
+                  "shared"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Kind",
-            "type": "string"
+            "deprecated": true,
+            "title": "Kind"
           },
           "name": {
             "title": "Name",
@@ -4944,14 +6199,113 @@
             },
             "title": "Rebucketed Memory Ids",
             "type": "array"
+          },
+          "released_source_count": {
+            "description": "Sources that stopped writing to the project. A fixed binding to it was removed; a field binding dropped its mappings to it, and its default moved to UNSORTED if it pointed to the project.",
+            "title": "Released Source Count",
+            "type": "integer"
           }
         },
         "required": [
           "id",
           "rebucketed_count",
-          "rebucketed_memory_ids"
+          "rebucketed_memory_ids",
+          "released_source_count"
         ],
         "title": "ProjectDeleteResponse",
+        "type": "object"
+      },
+      "ProjectDeletionImpactResponse": {
+        "description": "What deleting the project changes, counted across the whole workspace.",
+        "properties": {
+          "memory_count": {
+            "description": "Memories in the project, in every status, that move to UNSORTED.",
+            "title": "Memory Count",
+            "type": "integer"
+          },
+          "source_count": {
+            "description": "Sources that stop writing to the project. A fixed binding to it is removed; a field binding drops its mappings to it, and its default moves to UNSORTED if it pointed to the project.",
+            "title": "Source Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "memory_count",
+          "source_count"
+        ],
+        "title": "ProjectDeletionImpactResponse",
+        "type": "object"
+      },
+      "ProjectListItemResponse": {
+        "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "deprecated": true,
+            "enum": [
+              "normal",
+              "shared"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "memory_count": {
+            "description": "Active memories in this project that the caller can see, including the caller's private memories.",
+            "title": "Memory Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "key",
+          "name",
+          "kind",
+          "memory_count"
+        ],
+        "title": "ProjectListItemResponse",
+        "type": "object"
+      },
+      "ProjectListResponse": {
+        "properties": {
+          "can_manage": {
+            "description": "Whether the caller may create, rename and delete projects. Built-in projects are never renamed or deleted.",
+            "title": "Can Manage",
+            "type": "boolean"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectListItemResponse"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data",
+          "can_manage"
+        ],
+        "title": "ProjectListResponse",
         "type": "object"
       },
       "ProjectResponse": {
@@ -7243,6 +8597,74 @@
         ],
         "title": "ValidationError",
         "type": "object"
+      },
+      "WorkspaceAgentEvaluationResponse": {
+        "description": "The online evaluation of the Sources the viewer can discover, over one window.",
+        "properties": {
+          "assessments": {
+            "description": "The latest effective assessments, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/AgentAssessmentResponse"
+            },
+            "title": "Assessments",
+            "type": "array"
+          },
+          "available_source_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Available Source Types",
+            "type": "array"
+          },
+          "coverage": {
+            "$ref": "#/components/schemas/AgentEvaluationCoverageResponse"
+          },
+          "issue_groups": {
+            "items": {
+              "$ref": "#/components/schemas/AgentEvaluationIssueGroupResponse"
+            },
+            "title": "Issue Groups",
+            "type": "array"
+          },
+          "runtime_events": {
+            "description": "The latest runtime events, as ``event_public_payload`` returns them.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Runtime Events",
+            "type": "array"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/AgentEvaluationScopeResponse"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/AgentEvaluationSourceHealthResponse"
+            },
+            "title": "Sources",
+            "type": "array"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/AgentEvaluationSummaryResponse"
+          },
+          "window": {
+            "$ref": "#/components/schemas/AgentEvaluationWindowResponse"
+          }
+        },
+        "required": [
+          "scope",
+          "window",
+          "summary",
+          "coverage",
+          "issue_groups",
+          "available_source_types",
+          "sources",
+          "runtime_events",
+          "assessments"
+        ],
+        "title": "WorkspaceAgentEvaluationResponse",
+        "type": "object"
       }
     }
   },
@@ -7749,7 +9171,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceAgentEvaluationResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -9041,7 +10465,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/LlmConfigResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -9053,7 +10479,7 @@
         ]
       },
       "put": {
-        "description": "Update LLM configuration.",
+        "description": "Update LLM configuration and return the stored result.",
         "operationId": "update_llm_config_api_v1_llm_config_put",
         "requestBody": {
           "content": {
@@ -9069,7 +10495,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/LlmConfigResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -9109,7 +10537,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/LlmConfigProbeResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -9133,7 +10563,7 @@
     },
     "/api/v1/memories": {
       "get": {
-        "description": "List memories with pagination and filters.\n\nFilters: type (fact/decision/convention/procedure), status, source,\nproject, free-text search. Supports limit/offset pagination.\n\nThe access predicate gates every row: workspace rows are visible\nacross every project (the ranker handles project relevance, not\nthe predicate), and the caller's own private rows surface only\nwhen ``include_private=True``.",
+        "description": "List memories with pagination and filters.\n\nFilters: type (fact/decision/convention/procedure), status, source,\nproject, free-text search. Supports limit/offset pagination.\n\nWithout ``status`` the list holds active Memories, so its total for a\nproject equals that project's ``memory_count``; ``status`` lists the\nMemories in exactly that lifecycle status instead.\n\nThe access predicate gates every row: workspace rows are visible\nacross every project (the ranker handles project relevance, not\nthe predicate), and the caller's own private rows surface only\nwhen ``include_private=True``.",
         "operationId": "list_memories_api_v1_memories_get",
         "parameters": [
           {
@@ -9659,7 +11089,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/MemorySearchResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -9705,7 +11137,7 @@
     },
     "/api/v1/memories/{memory_id}": {
       "get": {
-        "description": "Get full memory detail including provenance (linked source documents).",
+        "description": "Get full memory detail including provenance (linked source documents).\n\nEvery lifecycle status is readable, so a superseded, retired or\npending Memory still opens from the list, a review or its replacement.",
         "operationId": "get_memory_api_v1_memories__memory_id__get",
         "parameters": [
           {
@@ -10445,17 +11877,14 @@
     },
     "/api/v1/projects": {
       "get": {
+        "description": "List projects with the number of memories the caller can see in each.",
         "operationId": "list_projects_route_api_v1_projects_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/ProjectResponse"
-                  },
-                  "title": "Response List Projects Route Api V1 Projects Get",
-                  "type": "array"
+                  "$ref": "#/components/schemas/ProjectListResponse"
                 }
               }
             },
@@ -10594,6 +12023,49 @@
           }
         },
         "summary": "Update Project Route",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/{project_id}/deletion-impact": {
+      "get": {
+        "description": "Count what deleting the project changes, so the admin can confirm it knowingly.",
+        "operationId": "get_project_deletion_impact_api_v1_projects__project_id__deletion_impact_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectDeletionImpactResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project Deletion Impact",
         "tags": [
           "projects"
         ]

@@ -22,6 +22,14 @@ interface ConfirmDialogProps {
   tone?: "default" | "danger";
   /** When set, the user must type this text before confirming. */
   confirmationText?: string;
+  /**
+   * When set with `confirmationText`, confirming takes two steps: the
+   * description comes first with this button, and the typed confirmation
+   * second, so the user reads the consequences before committing to them.
+   */
+  continueLabel?: string;
+  /** False while the description is not ready to act on, for example while it loads. */
+  ready?: boolean;
   /** Runs the action. The dialog stays open and shows the error if it throws. */
   onConfirm: () => Promise<unknown>;
 }
@@ -34,19 +42,27 @@ export function ConfirmDialog({
   confirmLabel,
   tone = "default",
   confirmationText,
+  continueLabel,
+  ready = true,
   onConfirm,
 }: ConfirmDialogProps) {
   const [typed, setTyped] = useState("");
+  const [continued, setContinued] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const confirmed = confirmationText === undefined || typed === confirmationText;
+  const reviewing = confirmationText !== undefined && continueLabel !== undefined && !continued;
+  const actionVariant = tone === "danger" ? "destructive" : "default";
+
+  function clear() {
+    setTyped("");
+    setContinued(false);
+    setError(null);
+  }
 
   function reset(nextOpen: boolean) {
     if (pending) return;
-    if (!nextOpen) {
-      setTyped("");
-      setError(null);
-    }
+    if (!nextOpen) clear();
     onOpenChange(nextOpen);
   }
 
@@ -55,7 +71,7 @@ export function ConfirmDialog({
     setError(null);
     try {
       await onConfirm();
-      setTyped("");
+      clear();
       onOpenChange(false);
     } catch (caught) {
       setError(errorMessage(caught));
@@ -71,7 +87,7 @@ export function ConfirmDialog({
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
-        {confirmationText !== undefined ? (
+        {confirmationText !== undefined && !reviewing ? (
           <div className="space-y-1.5">
             <Label htmlFor="confirm-dialog-text">
               Type <span className="font-mono font-medium">{confirmationText}</span> to confirm
@@ -81,6 +97,7 @@ export function ConfirmDialog({
               value={typed}
               onChange={(event) => setTyped(event.target.value)}
               autoComplete="off"
+              autoFocus={continueLabel !== undefined}
             />
           </div>
         ) : null}
@@ -93,13 +110,15 @@ export function ConfirmDialog({
           <Button variant="outline" onClick={() => reset(false)} disabled={pending}>
             Cancel
           </Button>
-          <Button
-            variant={tone === "danger" ? "destructive" : "default"}
-            onClick={confirm}
-            disabled={!confirmed || pending}
-          >
-            {confirmLabel}
-          </Button>
+          {reviewing ? (
+            <Button variant={actionVariant} onClick={() => setContinued(true)} disabled={!ready}>
+              {continueLabel}
+            </Button>
+          ) : (
+            <Button variant={actionVariant} onClick={confirm} disabled={!ready || !confirmed || pending}>
+              {confirmLabel}
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>

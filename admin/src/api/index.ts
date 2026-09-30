@@ -1,6 +1,17 @@
 export { ApiProvider, useApi, useWorkspaceTarget } from "./ApiProvider";
 export { createApiClient, unwrap, type ApiClient } from "./client";
-export { ApiError, NoWorkspaceError } from "./errors";
+export { ApiError, HTTP_STATUS, NoWorkspaceError, isApiErrorStatus } from "./errors";
+export {
+  RESERVED_PROJECT_KEYS,
+  SHARED_PROJECT_KEY,
+  UNSORTED_PROJECT_KEY,
+  isReservedProjectKey,
+  projectQueryKeys,
+  useProjectListQuery,
+  useProjects,
+  type ProjectList,
+  type ProjectListItem,
+} from "./projects";
 export {
   STANDALONE_TARGET,
   createWorkspaceController,

@@ -1,14 +1,18 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMemo } from "react";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { unwrap, useApi, type Source, type SourceListSortMode } from "@/api";
 import { localSyncKeys } from "@/features/local-sync";
 import { ACTIVE_POLL_MS } from "./constants";
+import type { SourceSyncRetryTarget } from "./model/sourceSyncActivity";
+import { sourceProjectBinding } from "./model/projectBinding";
+import { sourcesByProjectKey, type ResolvedBySource } from "./model/projectGrouping";
 import type { LocalAgentJob } from "./model/types";
 
 export const sourceKeys = {
   all: ["sources"] as const,
   list: ["sources", "list"] as const,
   preferences: ["sources", "preferences"] as const,
-  projects: ["projects", "list"] as const,
+  types: ["genes"] as const,
 };
 
 const EMPTY_SOURCES: Source[] = [];
@@ -49,12 +53,40 @@ export function useLocalSyncJobs() {
   return { ...query, jobs: query.data ?? EMPTY_JOBS };
 }
 
-export function useProjects() {
+/** Display names of source types, such as "Confluence" for `confluence`. */
+export function useSourceTypeLabels(): Record<string, string> {
   const api = useApi();
-  return useQuery({
-    queryKey: sourceKeys.projects,
-    queryFn: () => unwrap(api.GET("/api/v1/projects")),
+  const genes = useQuery({ queryKey: sourceKeys.types, queryFn: () => unwrap(api.GET("/api/v1/genes")) });
+  return useMemo(
+    () => Object.fromEntries((genes.data ?? []).map((gene) => [gene.name, gene.display_name])),
+    [genes.data],
+  );
+}
+
+/** The projects each field-bound source has sent memories to, as the server resolved them. */
+export function useResolvedProjects(sources: Source[]): ResolvedBySource {
+  const api = useApi();
+  const byField = sources.filter((source) => sourceProjectBinding(source)?.mode === "by_field");
+  const results = useQueries({
+    queries: byField.map((source) => ({
+      queryKey: [...sourceKeys.all, "resolved-projects", source.id],
+      queryFn: () =>
+        unwrap(api.GET("/api/v1/sources/{source_id}/projects/resolved", { params: { path: { source_id: source.id } } })),
+    })),
   });
+  const resolved: ResolvedBySource = {};
+  results.forEach((result, index) => {
+    const source = byField[index];
+    if (source && result.data) resolved[source.id] = result.data.projects;
+  });
+  return resolved;
+}
+
+/** The sources that send memories to each project, keyed by project key. */
+export function useProjectSources() {
+  const sourcesQuery = useSources();
+  const resolved = useResolvedProjects(sourcesQuery.sources);
+  return { ...sourcesQuery, byProject: sourcesByProjectKey(sourcesQuery.sources, resolved) };
 }
 
 export function useSourceListPreferences() {
@@ -118,12 +150,16 @@ export function useSetPaused() {
   );
 }
 
-/** Starts a sync on the server, or queues it for local sync when the source runs on a device. */
+/**
+ * Starts a sync on the server, or queues it for local sync when the source
+ * runs on a device. With a retry target it starts that queued retry now
+ * instead, so a waiting server run is not collected again from the device.
+ */
 export function useSyncSource() {
   const api = useApi();
-  return useSourceMutation((source: Source) => {
+  return useSourceMutation(({ source, retryTarget }: { source: Source; retryTarget?: SourceSyncRetryTarget }) => {
     const operation = source.execution?.kind === "local_agent" ? source.execution.operation : null;
-    if (operation) {
+    if (operation && retryTarget?.execution_kind !== "source_sync_run") {
       return unwrap(
         api.POST("/api/cloud/local-agent/jobs", {
           body: {
@@ -131,6 +167,7 @@ export function useSyncSource() {
             source_type: source.type,
             operation,
             payload: { force_full_sync: false },
+            retry_job_id: retryTarget?.execution_id,
           },
         }),
       );
@@ -138,7 +175,10 @@ export function useSyncSource() {
     return unwrap(
       api.POST("/api/v1/sources/{source_id}/sync", {
         params: { path: { source_id: source.id } },
-        body: { force_full_sync: false },
+        body: {
+          force_full_sync: false,
+          retry_target: retryTarget?.execution_kind === "source_sync_run" ? retryTarget : undefined,
+        },
       }),
     );
   });

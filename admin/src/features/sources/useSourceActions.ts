@@ -4,6 +4,7 @@ import { errorMessage } from "@/lib/errors";
 import { useSetPaused, useSetPinned, useSetUsedInSearches, useSyncSource } from "./api";
 import { V1_SOURCES_PATH } from "./constants";
 import type { SourceAttentionAction } from "./model/sourceAttention";
+import { sourceSyncControl, type SourceSyncActivity, type SourceSyncRetryTarget } from "./model/sourceSyncActivity";
 import type { Source } from "./model/types";
 
 /** Runs row and drawer actions, reporting the outcome in a toast. */
@@ -21,9 +22,16 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
   }
 
   return {
-    syncPending: (sourceId: string) => sync.isPending && sync.variables?.id === sourceId,
-    syncNow(source: Source) {
-      report(sync.mutateAsync(source), `Sync started for ${source.name}`, `Could not start a sync for ${source.name}`);
+    /** The sync button for a source, which reads Starting while this page's request for it is on its way. */
+    syncControl(source: Source, activity: SourceSyncActivity | undefined) {
+      return sourceSyncControl(activity, sync.isPending && sync.variables?.source.id === source.id);
+    },
+    syncNow(source: Source, retryTarget?: SourceSyncRetryTarget) {
+      report(
+        sync.mutateAsync({ source, retryTarget }),
+        retryTarget ? `Retry started for ${source.name}` : `Sync started for ${source.name}`,
+        retryTarget ? `Could not start the retry for ${source.name}` : `Could not start a sync for ${source.name}`,
+      );
     },
     togglePinned(source: Source) {
       const pinned = !source.pinned_for_me;
@@ -49,6 +57,7 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
         paused ? "Could not pause the source" : "Could not resume the source",
       );
     },
+    /** @deprecated admin-ui-v1: V2's own source setup dialogs replace this (ADR 0044). */
     openInV1() {
       window.location.assign(V1_SOURCES_PATH);
     },
