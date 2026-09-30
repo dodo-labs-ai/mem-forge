@@ -4,6 +4,7 @@ import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, FolderKanban, Loader2, Lock, Plus, Trash2 } from "lucide-react";
 import { resourceClient } from "@/api/client";
+import { apiErrorMessage } from "@/api/errors";
 import { RESERVED_PROJECT_KEYS, isReservedProjectKey } from "@/api/projectKeys";
 import type { Project, ProjectKind } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
@@ -91,8 +92,7 @@ function CreateProjectDialog({
       onOpenChange(false);
     },
     onError: (error: unknown) => {
-      const detail = extractApiErrorDetail(error);
-      setErrorMessage(detail ?? "Failed to create project.");
+      setErrorMessage(apiErrorMessage(error) ?? "Failed to create project.");
     },
   });
 
@@ -165,13 +165,6 @@ function CreateProjectDialog({
   );
 }
 
-function extractApiErrorDetail(error: unknown): string | null {
-  if (typeof error !== "object" || error === null) return null;
-  const candidate = error as { response?: { data?: { detail?: unknown } } };
-  const detail = candidate.response?.data?.detail;
-  return typeof detail === "string" ? detail : null;
-}
-
 interface DeleteSummary {
   name: string;
   movedCount: number;
@@ -212,6 +205,7 @@ export function ProjectsPage() {
     },
     onError: () => {
       setPendingDeleteKey(null);
+      setLastDeleteSummary(null);
     },
   });
 
@@ -244,6 +238,15 @@ export function ProjectsPage() {
           </Button>
         }
       />
+
+      {deleteProject.isError && (
+        <p
+          className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
+          role="alert"
+        >
+          {apiErrorMessage(deleteProject.error) ?? "Failed to delete project."}
+        </p>
+      )}
 
       {lastDeleteSummary && (
         <div

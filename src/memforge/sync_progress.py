@@ -3,24 +3,22 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal, get_args
 
 
-SYNC_PROGRESS_PHASES = frozenset(
-    {
-        "waiting_for_device",
-        "connecting",
-        "discovering",
-        "fetching",
-        "uploading",
-        "processing",
-        "recovering_derivations",
-        "reconciling",
-    }
-)
-SYNC_PROGRESS_UNITS = frozenset(
-    {"item", "page", "file", "issue", "message", "conversation"}
-)
+SyncProgressPhase = Literal[
+    "waiting_for_device",
+    "connecting",
+    "discovering",
+    "fetching",
+    "uploading",
+    "processing",
+    "recovering_derivations",
+    "reconciling",
+]
+SyncProgressUnit = Literal["item", "page", "file", "issue", "message", "conversation"]
+SYNC_PROGRESS_PHASES = frozenset(get_args(SyncProgressPhase))
+SYNC_PROGRESS_UNITS = frozenset(get_args(SyncProgressUnit))
 _SOURCE_PROGRESS_UNITS = {
     "confluence": "page",
     "github_pages": "page",

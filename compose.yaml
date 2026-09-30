@@ -42,7 +42,7 @@ services:
   admin-ui:
     build:
       context: .
-      dockerfile: admin-ui/Dockerfile
+      dockerfile: admin/Dockerfile
       args:
         DOCKERHUB_PREFIX: ${MEMFORGE_DOCKERHUB_PREFIX:-}
         NPM_REGISTRY: ${MEMFORGE_NPM_REGISTRY:-}

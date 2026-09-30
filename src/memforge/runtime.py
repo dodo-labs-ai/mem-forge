@@ -1495,16 +1495,6 @@ class SyncService:
             return False
         return not run.coalesced
 
-    async def run_all_active_sources(self) -> None:
-        sources = await self.db.list_sources()
-        for source in sources:
-            if source.get("status") != "active":
-                continue
-            try:
-                await self.enqueue_source(source["id"], trigger="schedule_all")
-            except SourceSyncUnsupportedError:
-                continue
-
     async def retire_expired_memories(self) -> int:
         runtime = await self.runtime_provider.build_sync_runtime(self.db, self.config)
         return await runtime.memory_store.retire_expired_memories()

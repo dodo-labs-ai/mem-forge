@@ -790,6 +790,8 @@ class RelationalStore(Protocol):
         """
         ...
 
+    # Deprecated (admin-ui-v1): `is_shared` only backs the V1 project label and
+    # is dropped from both project methods with the V1 admin UI (ADR 0044).
     async def create_project(self, *, key: str, name: str, is_shared: bool = False) -> Project: ...
     async def get_project(self, project_id: str) -> Project | None: ...
     async def list_projects(self) -> list[Project]: ...
@@ -799,7 +801,15 @@ class RelationalStore(Protocol):
         *,
         name: str | None = None,
         is_shared: bool | None = None,
-    ) -> Project | None: ...
+    ) -> Project | None:
+        """Rename a project or change its kind.
+
+        An unknown id returns `None`; a call with no fields returns the
+        project unchanged. Reserved keys (SHARED, UNSORTED) raise
+        `ValueError` whenever a field is supplied.
+        """
+        ...
+
     async def list_project_memory_ids(self, project_id: str) -> list[str]:
         """Return the memory ids attached to a project.
 
