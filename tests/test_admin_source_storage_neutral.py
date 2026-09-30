@@ -91,7 +91,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
                     "docs_failed": 1,
                     "memories_extracted": 4,
                     "error_message": "one failed",
-                    "failed_docs": [{"doc_id": "doc-1", "error": "boom"}],
+                    "failed_docs": [{"doc_id": "doc-1", "title": "Design", "error": "boom"}],
                 }
             ]
 
@@ -158,7 +158,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
         "docs_failed": 1,
         "memories_extracted": 4,
         "error_message": "one failed",
-        "failed_docs": [{"doc_id": "doc-1", "error": "boom"}],
+        "failed_docs": [{"doc_id": "doc-1", "title": "Design", "error": "boom"}],
         "progress": {
             "schema_version": 1,
             "phase": "processing",
