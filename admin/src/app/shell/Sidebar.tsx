@@ -3,9 +3,10 @@ import { cn } from "@/lib/cn";
 import { Separator } from "@/ui/separator";
 import { LocalSyncStatus } from "@/features/local-sync";
 import { BrandMark } from "../brand/BrandMark";
-import { reservedRedirect, type ExtensionNavItem } from "../extension/contract";
+import { findReservedRedirect, type ExtensionNavItem } from "../extension/contract";
 import { useExtension } from "../extension/ExtensionProvider";
 import { NAV_GROUPS, SETTINGS_NAV_ITEM, type NavItem } from "../navigation";
+import { APP_NAME } from "./pageTitle";
 
 const itemClass =
   "flex h-8 items-center gap-2.5 rounded-md px-2.5 text-sm text-sidebar-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-muted-foreground";
@@ -14,7 +15,8 @@ const activeClass = "bg-sidebar-accent font-medium text-sidebar-accent-foregroun
 function ProductNavLink({ item }: { item: NavItem }) {
   const extension = useExtension();
   const Icon = item.icon;
-  const redirect = reservedRedirect(extension, item.segment);
+  const redirect = findReservedRedirect(extension, item.segment);
+  if (redirect && !(redirect.visibleWhen?.() ?? true)) return null;
   if (item.v1Path !== undefined && redirect === undefined) {
     return (
       <a href={item.v1Path} className={itemClass}>
@@ -24,7 +26,7 @@ function ProductNavLink({ item }: { item: NavItem }) {
     );
   }
   return (
-    <NavLink to={redirect ?? `/${item.segment}`} className={({ isActive }) => cn(itemClass, isActive && activeClass)}>
+    <NavLink to={redirect?.to ?? `/${item.segment}`} className={({ isActive }) => cn(itemClass, isActive && activeClass)}>
       <Icon />
       <span className="flex-1 truncate">{item.label}</span>
     </NavLink>
@@ -65,7 +67,7 @@ export function Sidebar() {
     <aside className="flex h-full w-60 shrink-0 flex-col border-r border-sidebar-border bg-sidebar">
       <div className="flex h-14 items-center gap-2.5 px-4">
         <BrandMark className="size-7" />
-        <span className="text-[15px] font-semibold tracking-tight text-foreground">MemForge</span>
+        <span className="text-[15px] font-semibold tracking-tight text-foreground">{APP_NAME}</span>
       </div>
       <nav aria-label="Main" className="flex flex-1 flex-col gap-5 overflow-y-auto px-2.5 py-3">
         {NAV_GROUPS.map((group) => (

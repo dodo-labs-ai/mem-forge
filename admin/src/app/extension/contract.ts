@@ -41,6 +41,8 @@ export interface ExtensionReservedRouteRedirect {
   from: ReservedRouteSegment;
   /** Absolute path owned by the extension. */
   to: string;
+  /** Hides the product navigation item for users who cannot open `to`. The server still enforces access. */
+  visibleWhen?: () => boolean;
 }
 
 /**
@@ -72,9 +74,16 @@ export function extensionRoutes(extension: AdminExtension | undefined): RouteObj
   return (extension?.routes ?? []).filter((route) => !isReservedSegment(topSegment(route.path)));
 }
 
+export function findReservedRedirect(
+  extension: AdminExtension | undefined,
+  segment: ReservedRouteSegment,
+): ExtensionReservedRouteRedirect | undefined {
+  return extension?.reservedRouteRedirects?.find((redirect) => redirect.from === segment);
+}
+
 export function reservedRedirect(
   extension: AdminExtension | undefined,
   segment: ReservedRouteSegment,
 ): string | undefined {
-  return extension?.reservedRouteRedirects?.find((redirect) => redirect.from === segment)?.to;
+  return findReservedRedirect(extension, segment)?.to;
 }
