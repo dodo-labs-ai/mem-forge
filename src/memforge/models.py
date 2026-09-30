@@ -104,6 +104,9 @@ class Visibility(str, Enum):
 # helper code and tests never repeat the literal; the SQL migrations may inline them.
 SHARED_PROJECT_KEY = "SHARED"
 UNSORTED_PROJECT_KEY = "UNSORTED"
+# Built-in projects the system routes memories into. Their rows can be read
+# but never renamed, re-kinded, deleted, or created through the project API.
+RESERVED_PROJECT_KEYS = frozenset({SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY})
 
 
 @dataclass

@@ -125,6 +125,7 @@ from memforge.models import (
     MemoryType,
     MemoryReview,
     Project,
+    RESERVED_PROJECT_KEYS,
     ReviewKind,
     SourceSyncInput,
     SourceUnitInput,
@@ -190,6 +191,7 @@ from memforge.server.memory_admin_service import (
 )
 from memforge.server.source_admin_service import (
     can_manage_source,
+    can_manage_workspace,
     list_source_admin_rows,
     normalize_workspace_role,
 )
@@ -218,6 +220,7 @@ from memforge.local_agent.source_contract import (
     local_package_requires_source_time,
     validate_local_agent_replay_package,
 )
+from memforge.storage.adapters.protocols import RelationalStore
 from memforge.storage.admin_memory import MemoryAdminListFilters
 from memforge.storage.admin_source import (
     SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES,
@@ -419,7 +422,7 @@ class _RequestCorrectionAuthority:
         )
 
     def can_manage_workspace_memory(self) -> bool:
-        return self.workspace_role in {"owner", "workspace_admin"}
+        return can_manage_workspace(self.workspace_role)
 
 
 def _request_correction_authority(request: Request) -> _RequestCorrectionAuthority:
@@ -2078,25 +2081,6 @@ class AgentHookContextRequest(BaseModel):
     touched_files: list[str] = Field(default_factory=list)
     max_memories: int = 5
     include_recent_changes: bool = True
-
-
-# -- Schedule --
-
-
-class ScheduleConfigResponse(BaseModel):
-    enabled: bool = False
-    frequency: str = "daily"
-    time: str = "02:00"
-    day_of_week: int = 0
-    timezone: str = "UTC"
-
-
-class ScheduleConfigRequest(BaseModel):
-    enabled: bool = False
-    frequency: str = "daily"
-    time: str = "02:00"
-    day_of_week: int = 0
-    timezone: str = "UTC"
 
 
 # -- LLM Config --
@@ -3760,13 +3744,43 @@ def _derive_project_key(name: str) -> str:
 
     Uppercase A-Z, 0-9, single underscores, capped at
     `_PROJECT_KEY_MAX_LENGTH`. A name that derives to a reserved key
-    (SHARED, UNSORTED) collides with the seeded row and is rejected by
-    the create handler's UNIQUE-constraint path with HTTP 409.
+    (SHARED, UNSORTED) is rejected by the create handler with HTTP 409.
     """
     import re
 
     cleaned = re.sub(_PROJECT_KEY_ALLOWED_PATTERN, "_", name).strip("_").upper()
     return (cleaned or _PROJECT_KEY_FALLBACK)[:_PROJECT_KEY_MAX_LENGTH]
+
+
+def _require_project_management(request: Request) -> None:
+    """Projects shape the whole workspace, so only its admins may change them."""
+    if not can_manage_workspace(resolve_request_workspace_role(request)):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "project_management_forbidden",
+                "message": "Only a workspace admin can create, change, or delete projects.",
+            },
+        )
+
+
+def _reserved_project_conflict(key: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "reserved_project",
+            "message": f"{key} is a built-in project. It cannot be created, renamed, changed, or deleted.",
+        },
+    )
+
+
+async def _require_mutable_project(relational: RelationalStore, project_id: str) -> Project:
+    project = await relational.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    if project.key in RESERVED_PROJECT_KEYS:
+        raise _reserved_project_conflict(project.key)
+    return project
 
 
 def _project_to_response(project: Project) -> ProjectResponse:
@@ -3848,11 +3862,6 @@ def get_sync_service(request: Request) -> SyncService:
 def get_workspace_id(request: Request) -> str:
     """FastAPI dependency: retrieve the app-scoped durable run namespace."""
     return request.app.state.workspace_id
-
-
-def get_sync_scheduler(request: Request) -> SyncScheduler | None:
-    """FastAPI dependency: retrieve the app-scoped scheduler."""
-    return getattr(request.app.state, "sync_scheduler", None)
 
 
 def get_runtime_provider(request: Request) -> RuntimeProvider:
@@ -4095,15 +4104,6 @@ def create_admin_app(
             runtime_provider=runtime_provider,
             workspace_id=workspace_id,
         )
-        app.state.sync_scheduler = (
-            SyncScheduler(
-                db,
-                app.state.sync_service,
-                document_store=document_store or LocalDocumentStore(config.storage.docs_path),
-            )
-            if config.sync.scheduler_enabled
-            else None
-        )
         app.state.sync_worker = None
         app.state.evaluation_worker = None
         app.state.sync_worker_task = None
@@ -4316,7 +4316,6 @@ def create_admin_app(
     agent_session_router = APIRouter(prefix="/api/v1/agent-sessions", tags=["agent-sessions"])
     hook_router = APIRouter(prefix="/api/v1/hooks", tags=["hooks"])
     recent_change_router = APIRouter(prefix="/api/v1/recent-changes", tags=["recent-changes"])
-    schedule_router = APIRouter(prefix="/api/v1/schedule", tags=["schedule"])
     llm_router = APIRouter(prefix="/api/v1/llm-config", tags=["llm-config"])
     projects_router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
     local_agent_router = APIRouter(
@@ -8362,37 +8361,7 @@ def create_admin_app(
         )
 
     # ===================================================================
-    # 5. Schedule Endpoints
-    # ===================================================================
-
-    @schedule_router.get("")
-    async def get_schedule(db: Database = Depends(get_db)):
-        """Get the current sync schedule configuration."""
-        sched = await db.get_schedule_config()
-        return ScheduleConfigResponse(**sched)
-
-    @schedule_router.put("")
-    async def update_schedule(
-        req: ScheduleConfigRequest,
-        db: Database = Depends(get_db),
-        sync_scheduler: SyncScheduler | None = Depends(get_sync_scheduler),
-    ):
-        """Update the sync schedule configuration."""
-        await db.set_schedule_config(
-            {
-                "enabled": req.enabled,
-                "frequency": req.frequency,
-                "time": req.time,
-                "day_of_week": req.day_of_week,
-                "timezone": req.timezone,
-            }
-        )
-        if sync_scheduler:
-            await sync_scheduler.reload()
-        return {"ok": True}
-
-    # ===================================================================
-    # 6. LLM Config Endpoints
+    # 5. LLM Config Endpoints
     # ===================================================================
 
     @llm_router.get("")
@@ -8492,15 +8461,19 @@ def create_admin_app(
 
     @projects_router.post("", response_model=ProjectResponse, status_code=201)
     async def create_project_route(
+        request: Request,
         req: ProjectCreateRequest,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        adapters = await _build_project_adapters(db, config, runtime_provider)
+        _require_project_management(request)
         key = (req.key or _derive_project_key(req.name)).strip()
         if not key:
             raise HTTPException(status_code=400, detail="project key cannot be empty")
+        if key.upper() in RESERVED_PROJECT_KEYS:
+            raise _reserved_project_conflict(key.upper())
+        adapters = await _build_project_adapters(db, config, runtime_provider)
         try:
             created = await adapters.relational.create_project(
                 key=key,
@@ -8516,16 +8489,16 @@ def create_admin_app(
 
     @projects_router.patch("/{project_id}", response_model=ProjectResponse)
     async def update_project_route(
+        request: Request,
         project_id: str,
         req: ProjectUpdateRequest,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
+        _require_project_management(request)
         adapters = await _build_project_adapters(db, config, runtime_provider)
-        existing = await adapters.relational.get_project(project_id)
-        if existing is None:
-            raise HTTPException(status_code=404, detail="project not found")
+        await _require_mutable_project(adapters.relational, project_id)
         is_shared: bool | None = None
         if req.kind is not None:
             is_shared = req.kind == "shared"
@@ -8540,18 +8513,19 @@ def create_admin_app(
 
     @projects_router.delete("/{project_id}", response_model=ProjectDeleteResponse)
     async def delete_project_route(
+        request: Request,
         project_id: str,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
+        _require_project_management(request)
         adapters = await _build_project_adapters(db, config, runtime_provider)
+        await _require_mutable_project(adapters.relational, project_id)
         try:
             affected = await adapters.relational.list_project_memory_ids(project_id)
         except LookupError:
             raise HTTPException(status_code=404, detail="project not found")
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
         memory_store = await _build_memory_store(db, config, runtime_provider)
         # Vector metadata moves first so a failure here aborts the
         # transaction with both stores still pointing at the original
@@ -9753,7 +9727,6 @@ def create_admin_app(
     app.include_router(agent_session_router)
     app.include_router(hook_router)
     app.include_router(recent_change_router)
-    app.include_router(schedule_router)
     app.include_router(llm_router)
     app.include_router(projects_router)
     app.include_router(local_agent_router)
