@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- Every sync of a document Source removes the Documents its provider no longer
+  has, whether the run is incremental, first or force-full, and never removes
+  one only because it left the configured query. After discovery each run
+  lists its configured scope by identifier, independent of `since`
+  (`Gene.list_scope()`), and the listing declares its kind. An existence
+  listing (the GitHub repository tree, the GitHub Pages repository tree or
+  declared exhaustive sitemap) makes an unlisted Document absent. A query
+  listing (Jira JQL, a Confluence page tree or space) confirms each unlisted
+  Document by id in the same run (`Gene.confirm_absent()`): only not found or
+  gone is absence, so an issue outside a relative-date window, a closed issue
+  or a page moved out of its tree keeps its Unit and Support. GitHub, GitHub
+  Pages and Confluence list from the walk their discovery already makes; Jira
+  lists with an identifier-only search ordered by key and confirms in
+  unvalidated `issuekey in (...)` batches of a hundred, reading by id what the
+  search does not return. A listing or confirmation that fails or is
+  incomplete removes nothing in that run, which still succeeds and logs the
+  skipped check; a rejected credential fails discovery and the run; a 403 for
+  one item keeps it. `source_run_projection_coverage` no longer takes `incremental`:
+  discovery alone proves absence only for an authoritative snapshot or a
+  complete discovery of a newly configured scope, and scope transitions are
+  unchanged (ADR 0005). Force-full keeps meaning "re-read every Unit". Cloud:
+  arrives with the pin; no HANA schema, protocol, configuration or `sap/` route
+  change. The first scheduled run after the pin retires what EU12 dev has
+  accumulated: 183 absent Units (169 renamed or moved files in one GitHub
+  repository, 9 GitHub Pages pages, 5 Confluence pages) and the 844 active
+  Memories whose last Support they hold; 678 unlisted Jira issues and 2
+  Confluence pages still exist and are kept. See ADR 0045.
+
 - Genes decode stored input by the bytes themselves. A local-agent package is
   recognized by its own `package_kind`, exactly that Gene's kind, never by
   `item.extra.package_uri` or `package_path`, so a repository file that

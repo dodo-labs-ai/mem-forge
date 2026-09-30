@@ -1360,9 +1360,8 @@ def test_teams_window_attestation_proves_only_unit_snapshot_completeness() -> No
     assert projection.coverage is ProjectionCoverage.COMPLETE_SNAPSHOT
     assert (
         source_run_projection_coverage(
-            source_type="teams",
-            incremental=False,
             authoritative_snapshot=False,
+            scope_transition=False,
             discovery_complete=False,
         )
         is ProjectionCoverage.PARTIAL_PROJECTION
@@ -1764,32 +1763,27 @@ def test_teams_legacy_history_and_partition_fields_cannot_authorize_removal() ->
 
 
 @pytest.mark.parametrize(
-    ("source_type", "incremental", "authoritative_snapshot", "discovery_complete", "expected"),
+    ("authoritative_snapshot", "scope_transition", "discovery_complete", "expected"),
     [
-        ("confluence", False, False, True, ProjectionCoverage.COMPLETE_SNAPSHOT),
-        ("jira", False, False, True, ProjectionCoverage.COMPLETE_SNAPSHOT),
-        ("github_repo", False, False, True, ProjectionCoverage.COMPLETE_SNAPSHOT),
-        ("github_pages", False, False, True, ProjectionCoverage.COMPLETE_SNAPSHOT),
-        ("local_markdown", False, False, True, ProjectionCoverage.COMPLETE_SNAPSHOT),
-        ("confluence", False, False, False, ProjectionCoverage.PARTIAL_PROJECTION),
-        ("teams", False, False, False, ProjectionCoverage.PARTIAL_PROJECTION),
-        ("agent_session", False, False, False, ProjectionCoverage.PARTIAL_PROJECTION),
-        ("confluence", True, False, True, ProjectionCoverage.PARTIAL_PROJECTION),
-        ("teams", True, True, False, ProjectionCoverage.COMPLETE_SNAPSHOT),
+        (True, False, False, ProjectionCoverage.COMPLETE_SNAPSHOT),
+        (False, True, True, ProjectionCoverage.COMPLETE_SNAPSHOT),
+        (False, True, False, ProjectionCoverage.PARTIAL_PROJECTION),
+        # A complete discovery of an unchanged scope, first or force-full, is a
+        # query result; absence comes from the scope listing (ADR 0045).
+        (False, False, True, ProjectionCoverage.PARTIAL_PROJECTION),
+        (False, False, False, ProjectionCoverage.PARTIAL_PROJECTION),
     ],
 )
-def test_run_coverage_only_proves_absence_for_authoritative_discovery(
-    source_type: str,
-    incremental: bool,
+def test_run_discovery_proves_absence_only_for_a_snapshot_or_a_new_scope(
     authoritative_snapshot: bool,
+    scope_transition: bool,
     discovery_complete: bool,
     expected: ProjectionCoverage,
 ) -> None:
     assert (
         source_run_projection_coverage(
-            source_type=source_type,
-            incremental=incremental,
             authoritative_snapshot=authoritative_snapshot,
+            scope_transition=scope_transition,
             discovery_complete=discovery_complete,
         )
         is expected

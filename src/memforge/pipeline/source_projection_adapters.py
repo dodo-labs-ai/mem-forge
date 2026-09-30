@@ -102,23 +102,24 @@ _JIRA_OPERATIONAL_HISTORY_FIELDS = frozenset(
 
 def source_run_projection_coverage(
     *,
-    source_type: str | None = None,
-    incremental: bool,
     authoritative_snapshot: bool,
-    discovery_complete: bool = False,
+    scope_transition: bool,
+    discovery_complete: bool,
 ) -> ProjectionCoverage:
-    """Declare absence authority for a complete source discovery run."""
+    """What a run's discovery alone proves about the Documents it did not return.
 
-    del source_type
+    A submitted authoritative snapshot is the whole Source. A complete discovery
+    of a newly configured scope is the whole new scope: the user changed the
+    scope, so a Unit outside it is removed (ADR 0005). Any other discovery is
+    partial, whether or not ``since`` narrowed it, because a query result is
+    not proof that the provider no longer has an item; such a run removes only
+    what its scope listing proves absent (ADR 0045).
+    """
+
     if authoritative_snapshot:
         return ProjectionCoverage.COMPLETE_SNAPSHOT
-    if incremental:
-        return ProjectionCoverage.PARTIAL_PROJECTION
-    if discovery_complete:
+    if scope_transition and discovery_complete:
         return ProjectionCoverage.COMPLETE_SNAPSHOT
-    # Absence authority comes from run-scoped provider evidence, never from a
-    # source-type allowlist. Extension genes and conversational sources remain
-    # partial until they explicitly prove enumeration completion.
     return ProjectionCoverage.PARTIAL_PROJECTION
 
 

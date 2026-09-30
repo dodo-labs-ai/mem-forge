@@ -392,7 +392,7 @@ async def test_a_removed_document_that_returns_before_cleanup_keeps_its_objects(
     await workspace.add_source(TEAM, collected_locally=False)
     await workspace.sync(TEAM)
     workspace.provider.removed.add(ISSUE)
-    await workspace.sync(TEAM, force_full_sync=True)
+    await workspace.sync(TEAM)
     assert await _unit_input(workspace.db, TEAM, doc_id(ISSUE)) is None
     assert await workspace.db.list_source_artifact_cleanup_tasks(limit=10)
     workspace.provider.removed.clear()

@@ -28,6 +28,9 @@ ATLASSIAN_MAX_RETRY_DELAY_SECONDS = 60.0
 ATLASSIAN_TRANSPORT_RETRY_DELAY_SECONDS = 1.0
 # Responses that say the requested record does not exist (any longer).
 ATLASSIAN_ABSENT_STATUS_CODES = frozenset({httpx.codes.NOT_FOUND, httpx.codes.GONE})
+# A refusal to show one record the credential otherwise reads: the record may
+# still exist, so it is never taken as absence.
+ATLASSIAN_RECORD_FORBIDDEN_STATUS_CODE = httpx.codes.FORBIDDEN
 _ATLASSIAN_LIMITERS_LOCK = Lock()
 _ATLASSIAN_REQUEST_LIMITERS: dict[str, "AtlassianRequestLimiter"] = {}
 
@@ -91,6 +94,25 @@ class AtlassianRequestLimiter:
                 self._next_request_at = now + self._min_interval_seconds
                 if response_delay is not None:
                     self._next_request_at = max(self._next_request_at, now + max(response_delay, 0.0))
+
+
+async def atlassian_record_is_gone(read: Awaitable[httpx.Response]) -> bool:
+    """Whether reading one record by id shows that the provider no longer has it.
+
+    Only not found or gone is absence. A permission refusal for this record
+    keeps it; any other error raises, so the run proves nothing from it.
+    """
+
+    try:
+        await read
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status in ATLASSIAN_ABSENT_STATUS_CODES:
+            return True
+        if status == ATLASSIAN_RECORD_FORBIDDEN_STATUS_CODE:
+            return False
+        raise
+    return False
 
 
 def atlassian_request_limiter(
