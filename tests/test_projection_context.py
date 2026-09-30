@@ -24,7 +24,6 @@ from memforge.source_artifacts import (
     SourceArtifactSummary,
     StoredSourceArtifact,
 )
-from memforge.source_representation import UNIT_TITLE_OBSERVATION_TYPE
 from tests.llm_fixture import NoopMemoryExtractor
 
 
@@ -215,11 +214,10 @@ def _primary(requests):
 
 
 def _provider_revision(projection):
-    """The revision of the provider's first Observation; the Unit Title precedes it."""
-    observation_id = next(
-        item.id for item in projection.observations if item.observation_type != UNIT_TITLE_OBSERVATION_TYPE
+    """The revision of the provider's first Observation."""
+    return next(
+        item for item in projection.observation_revisions if item.observation_id == projection.observations[0].id
     )
-    return next(item for item in projection.observation_revisions if item.observation_id == observation_id)
 
 
 def _artifact_images(projection):
@@ -431,7 +429,7 @@ def test_v9_initial_tombstoned_message_has_no_primary_work(reprocess) -> None:
     )
 
     assert isinstance(authority, ExtractionAuthority)
-    assert set(authority.ranges_by_observation_id) == {projection.observations[0].id}
+    assert authority.ranges_by_observation_id == {}
     assert _requests(projection, reprocess=reprocess) == ()
 
 
@@ -570,10 +568,7 @@ def test_scoped_reprocess_authorizes_every_current_observation_without_a_delta()
     assert isinstance(authority, ExtractionAuthority)
     assert authority.ranges_by_observation_id == dict.fromkeys(item.id for item in current.observations)
     primary = _primary(_requests(current, base=initial, committed=_committed_snapshot(initial), reprocess=True))
-    # Every provider Observation is read; the Unit Title is never Primary.
-    assert {fragment.anchor.observation_id for fragment in primary} == {
-        item.id for item in current.observations if item.observation_type != UNIT_TITLE_OBSERVATION_TYPE
-    }
+    assert {fragment.anchor.observation_id for fragment in primary} == {item.id for item in current.observations}
 
 
 def test_every_eligible_image_is_primary_in_exactly_one_request_and_ineligible_originals_are_never_read() -> None:
@@ -655,12 +650,9 @@ def test_preceding_observation_is_the_reply_target_else_the_declared_predecessor
     assert preceding_observation_id(projection, by_key["msg-3"]) == by_key["msg-1"]
     assert preceding_observation_id(projection, by_key["msg-2"]) == by_key["msg-1"]
     assert preceding_observation_id(projection, by_key["msg-1"]) is None
-    assert preceding_observation_id(projection, by_key["$unit_identity"]) is None
 
     jira = _jira_projection(2)
-    core, first, second = (
-        item.id for item in jira.observations if item.observation_type != UNIT_TITLE_OBSERVATION_TYPE
-    )
+    core, first, second = (item.id for item in jira.observations)
     assert preceding_observation_id(jira, first) == core
     assert preceding_observation_id(jira, second) == first
 

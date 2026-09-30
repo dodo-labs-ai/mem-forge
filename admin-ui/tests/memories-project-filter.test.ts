@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 const memoriesSource = readFileSync("src/views/memories/MemoriesPage.tsx", "utf8");
+const memorySearchRequestSource = readFileSync(
+  "src/views/memories/memorySearchRequest.ts",
+  "utf8",
+);
 const memoryFiltersSource = readFileSync(
   "src/views/memories/MemoryFiltersPopover.tsx",
   "utf8",
@@ -38,7 +42,7 @@ assert.doesNotMatch(
 );
 
 assert.match(
-  memoriesSource,
+  memorySearchRequestSource,
   /include_private:\s*true,/,
   "the Memories page should include the current user's private rows, including agent-session memories",
 );

@@ -47,6 +47,7 @@ from memforge.source_derivation import (
     source_unit_derivation_context_from_payload,
 )
 from memforge.source_projection import SourceProjection, source_projection_from_payload
+from memforge.source_representation import current_representation_of
 
 
 OFFLINE_EVALUATION_SCHEMA_VERSION = "1"
@@ -923,17 +924,22 @@ class ProductionSourceUnitDerivationReplayExecutor:
             structured_llm_client=self._structured_llm_client,
         )
         context: RevisionAssessmentContext | None = None
+        read: SourceProjection | None = None
 
         def reading_context(work: ReplayedEvidenceWork) -> RevisionAssessmentContext:
-            """The one reading context of this case, shared by its planning and extraction."""
+            """The one reading context of this case, shared by its planning and extraction.
+
+            The pinned projection is read in the current representation.
+            """
 
             def unavailable(_observation_ids):
                 raise OfflineArtifactUnavailable("offline derivation requires pinned binary artifacts")
 
-            nonlocal context
-            if context is None or context.projection is not work.projection:
+            nonlocal context, read
+            if context is None or read is not work.projection:
+                read = work.projection
                 context = RevisionAssessmentContext(
-                    projection=work.projection,
+                    projection=current_representation_of(work.projection),
                     base=None,
                     access_context_hash=work.access_context_hash,
                     image_loader=unavailable,

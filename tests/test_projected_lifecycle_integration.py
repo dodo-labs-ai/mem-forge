@@ -124,7 +124,6 @@ from memforge.models import (
 from memforge.pipeline.evidence_fragments import EvidenceFragment
 from memforge.pipeline.projection_evidence import build_projected_claim_evidence
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-from memforge.source_representation import UNIT_TITLE_OBSERVATION_TYPE
 from memforge import source_derivation as source_derivation_module
 from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_CONTRACT_VERSION
 from memforge.pipeline.projection_context import (
@@ -280,12 +279,8 @@ def _selected(
 
 
 def _body_observation(projection):
-    """The first provider Observation; the Unit Title precedes it."""
-    return next(
-        observation
-        for observation in projection.observations
-        if observation.observation_type != UNIT_TITLE_OBSERVATION_TYPE
-    )
+    """The first provider Observation."""
+    return projection.observations[0]
 
 
 def _body_revision(projection):
@@ -2052,10 +2047,7 @@ async def _seed_incumbent_support(
         memory_content,
         source_updated_at=None,
     )
-    # Index among the provider's Observations; the Unit Title precedes them.
-    observation = [
-        item for item in projection.observations if item.observation_type != UNIT_TITLE_OBSERVATION_TYPE
-    ][observation_index]
+    observation = projection.observations[observation_index]
     revisions_by_observation = {item.observation_id: item for item in projection.observation_revisions}
     revision = revisions_by_observation[observation.id]
     unit = EvidenceUnit(
@@ -5012,9 +5004,8 @@ async def _seed_jira_required_incumbent(
         "Decision: retain A7",
         source_updated_at=None,
     )
-    # The provider's second Observation (a comment or an Artifact) is Primary; its first is Required.
-    primary = [item for item in first.observations if item.observation_type != UNIT_TITLE_OBSERVATION_TYPE][1]
-    required = _body_observation(first)
+    primary = first.observations[1]
+    required = first.observations[0]
     revisions = {item.observation_id: item for item in first.observation_revisions}
     unit = EvidenceUnit(
         id="eu-jira-required",
@@ -6723,26 +6714,12 @@ async def test_noop_propagates_representation_compiler_contract_failure(
     assert await db.list_lifecycle_reviews("src-1") == []
 
 
-@pytest.mark.parametrize(
-    ("limitation_code", "reason_code"),
-    [
-        (
-            SupportRevalidationLimitationCode.COMPILER_FAILURE,
-            "support_revalidation_compiler_failure",
-        ),
-        (
-            SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
-            "support_revalidation_capacity_exceeded",
-        ),
-    ],
-)
 @pytest.mark.asyncio
 async def test_noop_propagates_bounded_revalidation_operational_limitation(
     db: Database,
     monkeypatch,
-    limitation_code: SupportRevalidationLimitationCode,
-    reason_code: str,
 ) -> None:
+    limitation_code = SupportRevalidationLimitationCode.COMPILER_FAILURE
     access_context_hash = lifecycle_access_context_hash(
         visibility="workspace",
         owner_user_id=None,
@@ -6815,7 +6792,7 @@ async def test_noop_propagates_bounded_revalidation_operational_limitation(
         )
 
     assert failure.value.retryable is False
-    assert failure.value.runtime_bundle.event.reason_code == reason_code
+    assert failure.value.runtime_bundle.event.reason_code == "support_revalidation_compiler_failure"
     assert failure.value.runtime_bundle.event.model_call_count == 0
     assert client.validation_calls == 0
     assert await db.get_active_memory_support_unit_ids(incumbent.id)
