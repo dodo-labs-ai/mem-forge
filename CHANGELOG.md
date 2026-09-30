@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- The runtime provider owns its vector backend. `RuntimeProvider.build_adapters`
+  now takes `(db, config, *, audit_logger)` instead of a caller-opened
+  `memory_collection`, and the admin memory-store and project routes no longer
+  open Chroma themselves. `DefaultRuntimeProvider` opens the `memories`
+  collection under `storage.chroma_path` exactly as before, through the same
+  helper its search engine and sync runtime use, so OSS behavior and data are
+  unchanged. Cloud: a provider backed by HANA never opens a local Chroma store
+  on the container disk, including on every `/api/v1/projects` and memory
+  write request. Cloud's `CloudRuntimeProvider.build_adapters` takes the new
+  signature together with the pin to this version; no HANA schema, `sap/`
+  route or environment configuration change.
+
 - Genes decode stored input by the bytes themselves. A local-agent package is
   recognized by its own `package_kind`, exactly that Gene's kind, never by
   `item.extra.package_uri` or `package_path`, so a repository file that
