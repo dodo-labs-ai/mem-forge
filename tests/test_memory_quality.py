@@ -1690,7 +1690,7 @@ async def test_retire_memory_route_cleans_search_indexes(
     )
     collection = FakeCollection()
     monkeypatch.setattr(
-        "memforge.retrieval.embeddings.get_chroma_collection",
+        "memforge.runtime.get_chroma_collection",
         lambda **kwargs: collection,
     )
 
@@ -1723,7 +1723,7 @@ async def test_admin_pending_review_status_cleans_search_indexes(
     )
     collection = FakeCollection()
     monkeypatch.setattr(
-        "memforge.retrieval.embeddings.get_chroma_collection",
+        "memforge.runtime.get_chroma_collection",
         lambda **kwargs: collection,
     )
 

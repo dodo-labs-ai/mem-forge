@@ -1565,10 +1565,10 @@ async def test_create_search_get_memory_round_trip_keeps_provenance_out_of_searc
     monkeypatch.setattr("memforge.memory.store.MemoryStore._embed", fake_embed)
 
     class RoundTripRuntimeProvider:
-        def build_adapters(self, database, memory_collection, *, audit_logger=None):
+        def build_adapters(self, database, config, *, audit_logger=None):
             return build_sqlite_adapters(
                 database,
-                memory_collection,
+                RecordingCollection(),
                 audit_logger=audit_logger,
             )
 
@@ -1854,7 +1854,7 @@ async def test_purge_memory_route_requires_workspace_administrator_for_workspace
 @pytest.mark.asyncio
 async def test_purge_memory_route_lets_owner_purge_own_private_memory(db: Database, tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "memforge.retrieval.embeddings.get_chroma_collection",
+        "memforge.runtime.get_chroma_collection",
         lambda **_kwargs: RecordingCollection(),
     )
     memory = _private_memory("mem-purge-own", "Bob's private fact", owner_user_id="bob@example.test")
@@ -1903,7 +1903,7 @@ async def test_purge_memory_route_removes_retired_workspace_memory_and_audits_ac
 ):
     collection = RecordingCollection()
     monkeypatch.setattr(
-        "memforge.retrieval.embeddings.get_chroma_collection",
+        "memforge.runtime.get_chroma_collection",
         lambda **_kwargs: collection,
     )
     memory = replace(_memory("mem-purge-retired", "Retired workspace fact"), status="retired")
