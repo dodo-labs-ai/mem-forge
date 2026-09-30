@@ -6506,52 +6506,20 @@ async def test_sync_pipeline_can_delegate_terminal_result_persistence(db: Databa
 
 
 @pytest.mark.asyncio
-async def test_run_all_active_sources_enqueues_durable_runs(db: Database):
-    source_id = "src-scheduled-tracked"
-    await db.upsert_source(
-        id=source_id,
-        type="jira",
-        name="Scheduled Source",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
+async def test_migration_108_drops_workspace_wide_sync_schedule(db: Database):
+    await db.db.execute(
+        "CREATE TABLE schedule_config (id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0)"
     )
-    service = SyncService(db, AppConfig())
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 108")
+    await db.db.commit()
 
-    await service.run_all_active_sources()
-    run = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    await db._run_migrations()  # noqa: SLF001
+    await db._run_migrations()  # noqa: SLF001
 
-    assert run.source_id == source_id
-    assert run.status == "pending"
-    assert run.coalesced is True
-    assert service.tasks == {}
-
-
-@pytest.mark.asyncio
-async def test_run_all_active_sources_skips_sources_without_sync_execution(db: Database):
-    await db.upsert_source(
-        id="src-agent-session-no-sync",
-        type="agent_session",
-        name="Codex Session",
-        config_json="{}",
-        access_policy="private",
-        owner_user_id="dev",
-    )
-    await db.upsert_source(
-        id="src-server-sync",
-        type="jira",
-        name="Jira",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-
-    await SyncService(db, AppConfig()).run_all_active_sources()
-
-    assert (await db.get_latest_source_sync_run(source_id="src-agent-session-no-sync")) is None
-    run = await db.get_latest_source_sync_run(source_id="src-server-sync")
-    assert run is not None
-    assert run.status == "pending"
+    tables = {
+        row[0] for row in await db.db.execute_fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    assert "schedule_config" not in tables
 
 
 @pytest.mark.asyncio
@@ -7144,9 +7112,6 @@ async def test_scheduler_shutdown_waits_for_running_job() -> None:
     release = asyncio.Event()
 
     class BlockingDatabase:
-        async def get_schedule_config(self) -> dict:
-            return {"enabled": False}
-
         async def enqueue_due_local_agent_jobs(self, *, limit: int) -> list:
             assert limit == 50
             started.set()

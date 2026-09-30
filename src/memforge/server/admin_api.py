@@ -125,15 +125,21 @@ from memforge.models import (
     MemoryType,
     MemoryReview,
     Project,
+    RESERVED_PROJECT_KEYS,
     ReviewKind,
     SourceSyncInput,
     SourceUnitInput,
     SourceExecutionKind,
     UNSORTED_PROJECT_KEY,
     VIRTUAL_DOCUMENT_SOURCE_IDS,
+    Visibility,
     canonicalize_entity_name,
 )
-from memforge.sync_progress import normalize_sync_progress_snapshot
+from memforge.sync_progress import (
+    SyncProgressPhase,
+    SyncProgressUnit,
+    normalize_sync_progress_snapshot,
+)
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
     SOURCE_ARTIFACT_SPOOL_MEMORY_BYTES,
@@ -186,6 +192,7 @@ from memforge.server.memory_admin_service import (
 )
 from memforge.server.source_admin_service import (
     can_manage_source,
+    can_manage_workspace,
     list_source_admin_rows,
     normalize_workspace_role,
 )
@@ -194,7 +201,11 @@ from memforge.source_access_transition import (
     SourceAccessTransitionError,
     SourceAccessTransitionService,
 )
-from memforge.local_agent.readiness import connection_status_from_browser_session
+from memforge.local_agent.readiness import (
+    SourceConnectionReason,
+    SourceConnectionState,
+    connection_status_from_browser_session,
+)
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_SYNC_OPERATIONS,
     TEAMS_ROLLING_RETENTION_PRESETS,
@@ -210,6 +221,7 @@ from memforge.local_agent.source_contract import (
     local_package_requires_source_time,
     validate_local_agent_replay_package,
 )
+from memforge.storage.adapters.protocols import RelationalStore
 from memforge.storage.admin_memory import MemoryAdminListFilters
 from memforge.storage.admin_source import (
     SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES,
@@ -274,8 +286,12 @@ def _workspace_default_scope(request: Request, *, include_private: bool):
     )
 
 
-def _review_visibility_scope(request: Request):
-    """Allow visible Review snapshots regardless of their lifecycle status."""
+def _lifecycle_visibility_scope(request: Request):
+    """Apply the caller's per-row access to Memories in every stored lifecycle status.
+
+    Reviews and purges act on retired, superseded, and quarantined rows as well
+    as active ones, so only the access predicate decides what the caller sees.
+    """
 
     from memforge.storage.adapters.context import AccessScope
 
@@ -411,7 +427,7 @@ class _RequestCorrectionAuthority:
         )
 
     def can_manage_workspace_memory(self) -> bool:
-        return self.workspace_role in {"owner", "workspace_admin"}
+        return can_manage_workspace(self.workspace_role)
 
 
 def _request_correction_authority(request: Request) -> _RequestCorrectionAuthority:
@@ -611,7 +627,7 @@ async def _require_memory_review_visibility(
     visible = await _filter_visible_ids(
         db,
         participant_ids,
-        _review_visibility_scope(request),
+        _lifecycle_visibility_scope(request),
     )
     if visible != participant_ids:
         raise HTTPException(status_code=404, detail="Review not found")
@@ -645,10 +661,15 @@ async def _require_lifecycle_review_visibility(
     visible = await _filter_visible_ids(
         db,
         participant_ids,
-        _review_visibility_scope(request),
+        _lifecycle_visibility_scope(request),
     )
     if visible != set(participant_ids):
         raise HTTPException(status_code=404, detail="Review not found")
+
+
+def _require_workspace_memory_administration(request: Request) -> None:
+    if not can_manage_workspace(resolve_request_workspace_role(request)):
+        raise HTTPException(status_code=403, detail="workspace_admin_authority_required")
 
 
 def _request_audit_context(request: Request) -> AuditContext:
@@ -1502,20 +1523,197 @@ class SourceSyncScheduleRequest(BaseModel):
     )
 
 
+SourceAccessPolicyValue = Literal["private", "workspace"]
+SourceViewerRole = Literal["owner", "workspace_admin", "member", "viewer"]
+SourceSyncRunStatus = Literal["pending", "running", "success", "failed"]
+SourceSyncStatus = Literal["pending", "running", "recovering", "success", "partial", "failed"]
+LocalAgentJobStatus = Literal["queued", "leased", "succeeded", "failed"]
+
+
+class SourceSyncProgressAmountResponse(BaseModel):
+    completed: int
+    total: int | None = None
+    unit: SyncProgressUnit
+
+
+class SourceSyncProgressTimeRangeResponse(BaseModel):
+    start: str | None = None
+    end: str | None = None
+
+
+class SourceSyncProgressCountsResponse(BaseModel):
+    changed: int | None = None
+    failed: int | None = None
+    memories_created: int | None = None
+
+
+class SourceSyncProgressResponse(BaseModel):
+    """The public sync progress snapshot (see ``normalize_sync_progress_snapshot``)."""
+
+    schema_version: Literal[1]
+    phase: SyncProgressPhase
+    progress: SourceSyncProgressAmountResponse | None = None
+    source_time_range: SourceSyncProgressTimeRangeResponse | None = None
+    counts: SourceSyncProgressCountsResponse | None = None
+
+
+class SourceSyncFailedDocResponse(BaseModel):
+    doc_id: str
+    title: str
+    error: str
+
+
+class SourceSyncStatusResponse(BaseModel):
+    """A Source's latest sync, read from one of three places.
+
+    An active durable run carries the run fields (``run_id``, ``trigger``,
+    ``force_full_sync``, ``created_at``, ``next_attempt_at``,
+    ``recovery_count``, ``progress_revision``, ``progress_updated_at``). A
+    sync running in this process carries its live counters (``phase``,
+    ``docs_*``, ``memories_*``, ``current_title``). The last recorded sync
+    carries its totals, ``run_id`` and ``failed_docs``. Fields outside the
+    chosen shape are absent.
+    """
+
+    status: SourceSyncStatus
+    started_at: str | None
+    finished_at: str | None
+    error_message: str | None
+    progress: SourceSyncProgressResponse | None
+    run_id: str | None = None
+    trigger: str | None = None
+    force_full_sync: bool | None = None
+    created_at: str | None = None
+    next_attempt_at: str | None = None
+    recovery_count: int | None = None
+    progress_revision: int | None = None
+    progress_updated_at: str | None = None
+    phase: str | None = None
+    current_title: str | None = None
+    docs_processed: int | None = None
+    docs_total: int | None = None
+    docs_updated: int | None = None
+    docs_failed: int | None = None
+    docs_stored: int | None = None
+    memories_extracted: int | None = None
+    memories_stored: int | None = None
+    failed_docs: list[SourceSyncFailedDocResponse] | None = None
+
+
+class SourceAccessTransitionResponse(BaseModel):
+    operation_id: str
+    source_id: str
+    previous_policy: SourceAccessPolicyValue
+    target_policy: SourceAccessPolicyValue
+    status: Literal["queued", "running", "failed", "completed", "reverted"]
+    total_memories: int
+    processed_memories: int
+    error_code: str | None = None
+    error_message: str | None = None
+    created_at: str
+    updated_at: str
+    completed_at: str | None = None
+
+
+class SourceOwnershipResponse(BaseModel):
+    created_by_user_id: str | None
+    owner_user_id: str
+    execution_owner_user_id: str | None
+    viewer_role: SourceViewerRole
+    viewer_relationship: SourceViewerRole
+
+
+class SourceCapabilitiesResponse(BaseModel):
+    """The viewer's authority over one Source; clients render row actions from it."""
+
+    can_subscribe: bool
+    can_configure: bool
+    can_configure_connection: bool
+    can_sync: bool
+    can_force_resync: bool
+    can_delete: bool
+    can_change_access: bool
+
+
+class SourceExecutionResponse(BaseModel):
+    kind: Literal["server", "local_agent"]
+    operation: str | None
+    immutable_config_fields: list[str]
+
+
+class SourceSubscriptionResponse(BaseModel):
+    enabled: bool
+
+
+class SourceConnectionStatusResponse(BaseModel):
+    state: SourceConnectionState
+    reason: SourceConnectionReason | None = None
+
+
 class SourceResponse(BaseModel):
+    """One Source as the viewer sees it in the Source List."""
+
     id: str
     type: str
     name: str
-    config: dict
-    status: str
+    config: dict[str, Any] = Field(
+        description="Redacted configuration; empty when the viewer cannot configure the Source.",
+    )
+    status: Literal["active", "paused"]
     owner_user_id: str
-    access_policy: Literal["private", "workspace"]
+    access_policy: SourceAccessPolicyValue
     access_state: Literal["active", "changing", "orphaned_private"]
+    access_transition: SourceAccessTransitionResponse | None
     last_sync: str | None = None
-    doc_count: int = 0
+    doc_count: int
+    memory_count: int
     created_at: str | None = None
-    project_binding: dict | None = None
+    project_binding: dict[str, Any] | None = Field(
+        default=None,
+        description="Project routing rule; null leaves the Source's Memories unmapped.",
+    )
     sync_schedule: SourceSyncScheduleResponse | None = None
+    sync: SourceSyncStatusResponse | None
+    client: str | None = Field(
+        description="The agent client (for example codex or claude-code) of an agent-session Source; null otherwise.",
+    )
+    connection_status: SourceConnectionStatusResponse | None = Field(
+        default=None,
+        description="Readiness of a browser-session connection; present only for Sources that use one.",
+    )
+    ownership: SourceOwnershipResponse
+    capabilities: SourceCapabilitiesResponse
+    execution: SourceExecutionResponse
+    subscription: SourceSubscriptionResponse
+    enabled_for_me: bool
+    pinned_for_me: bool
+
+
+class SourceListResponse(BaseModel):
+    data: list[SourceResponse]
+
+
+class SourceSyncRunReceiptResponse(BaseModel):
+    """Admission receipt for a server-side sync run."""
+
+    ok: bool
+    message: str
+    source_id: str
+    run_id: str
+    status: SourceSyncRunStatus
+    created_at: str
+    coalesced: bool
+
+
+class LocalCollectionReceiptResponse(BaseModel):
+    """Admission receipt for a sync that the execution owner's local daemon collects."""
+
+    ok: bool
+    message: str
+    source_id: str
+    job_id: str
+    status: Literal["queued"]
+    coalesced: bool
 
 
 class SourceProjectResponse(BaseModel):
@@ -1636,11 +1834,60 @@ class LocalAgentJobCompleteRequest(BaseModel):
     error: str | None = Field(default=None, max_length=2000)
 
 
+class LocalAgentJobCreateResponse(BaseModel):
+    job_id: str
+    status: LocalAgentJobStatus
+    coalesced: bool
+    created_at: str | None = Field(
+        default=None,
+        description="Present for sync jobs, which may coalesce into an existing job.",
+    )
+
+
+class LocalAgentJobResponse(BaseModel):
+    job_id: str
+    workspace_id: str
+    source_id: str
+    source_type: str
+    operation: str
+    status: LocalAgentJobStatus
+    payload: dict[str, Any]
+    execution_owner_user_id: str
+    result: dict[str, Any] = Field(
+        description=(
+            "The daemon's report: sync progress while the job runs, then its completion result. "
+            "Empty before the first report."
+        ),
+    )
+    last_error: str | None
+    next_attempt_at: str | None
+    leased_until: str | None
+    attempt_count: int
+    created_at: str
+    updated_at: str
+    finished_at: str | None
+
+
+class LocalAgentJobListResponse(BaseModel):
+    data: list[LocalAgentJobResponse]
+
+
+class LocalAgentDaemonStatusResponse(BaseModel):
+    status: Literal["online", "offline"]
+    last_seen_at: str | None
+    checked_at: str
+    stale_after_seconds: int
+
+
 class SourceSubscriptionRequest(BaseModel):
     enabled: bool
 
 
 class SourceListPreferenceRequest(BaseModel):
+    sort_mode: SourceListSortMode
+
+
+class SourceListPreferencesResponse(BaseModel):
     sort_mode: SourceListSortMode
 
 
@@ -1851,25 +2098,6 @@ class AgentHookContextRequest(BaseModel):
     touched_files: list[str] = Field(default_factory=list)
     max_memories: int = 5
     include_recent_changes: bool = True
-
-
-# -- Schedule --
-
-
-class ScheduleConfigResponse(BaseModel):
-    enabled: bool = False
-    frequency: str = "daily"
-    time: str = "02:00"
-    day_of_week: int = 0
-    timezone: str = "UTC"
-
-
-class ScheduleConfigRequest(BaseModel):
-    enabled: bool = False
-    frequency: str = "daily"
-    time: str = "02:00"
-    day_of_week: int = 0
-    timezone: str = "UTC"
 
 
 # -- LLM Config --
@@ -3533,13 +3761,43 @@ def _derive_project_key(name: str) -> str:
 
     Uppercase A-Z, 0-9, single underscores, capped at
     `_PROJECT_KEY_MAX_LENGTH`. A name that derives to a reserved key
-    (SHARED, UNSORTED) collides with the seeded row and is rejected by
-    the create handler's UNIQUE-constraint path with HTTP 409.
+    (SHARED, UNSORTED) is rejected by the create handler with HTTP 409.
     """
     import re
 
     cleaned = re.sub(_PROJECT_KEY_ALLOWED_PATTERN, "_", name).strip("_").upper()
     return (cleaned or _PROJECT_KEY_FALLBACK)[:_PROJECT_KEY_MAX_LENGTH]
+
+
+def _require_project_management(request: Request) -> None:
+    """Projects shape the whole workspace, so only its admins may change them."""
+    if not can_manage_workspace(resolve_request_workspace_role(request)):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "project_management_forbidden",
+                "message": "Only a workspace admin can create, change, or delete projects.",
+            },
+        )
+
+
+def _reserved_project_conflict(key: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "reserved_project",
+            "message": f"{key} is a built-in project. It cannot be created, renamed, changed, or deleted.",
+        },
+    )
+
+
+async def _require_mutable_project(relational: RelationalStore, project_id: str) -> Project:
+    project = await relational.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    if project.key in RESERVED_PROJECT_KEYS:
+        raise _reserved_project_conflict(project.key)
+    return project
 
 
 def _project_to_response(project: Project) -> ProjectResponse:
@@ -3621,11 +3879,6 @@ def get_sync_service(request: Request) -> SyncService:
 def get_workspace_id(request: Request) -> str:
     """FastAPI dependency: retrieve the app-scoped durable run namespace."""
     return request.app.state.workspace_id
-
-
-def get_sync_scheduler(request: Request) -> SyncScheduler | None:
-    """FastAPI dependency: retrieve the app-scoped scheduler."""
-    return getattr(request.app.state, "sync_scheduler", None)
 
 
 def get_runtime_provider(request: Request) -> RuntimeProvider:
@@ -3868,15 +4121,6 @@ def create_admin_app(
             runtime_provider=runtime_provider,
             workspace_id=workspace_id,
         )
-        app.state.sync_scheduler = (
-            SyncScheduler(
-                db,
-                app.state.sync_service,
-                document_store=document_store or LocalDocumentStore(config.storage.docs_path),
-            )
-            if config.sync.scheduler_enabled
-            else None
-        )
         app.state.sync_worker = None
         app.state.evaluation_worker = None
         app.state.sync_worker_task = None
@@ -4089,7 +4333,6 @@ def create_admin_app(
     agent_session_router = APIRouter(prefix="/api/v1/agent-sessions", tags=["agent-sessions"])
     hook_router = APIRouter(prefix="/api/v1/hooks", tags=["hooks"])
     recent_change_router = APIRouter(prefix="/api/v1/recent-changes", tags=["recent-changes"])
-    schedule_router = APIRouter(prefix="/api/v1/schedule", tags=["schedule"])
     llm_router = APIRouter(prefix="/api/v1/llm-config", tags=["llm-config"])
     projects_router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
     local_agent_router = APIRouter(
@@ -5142,42 +5385,42 @@ def create_admin_app(
             review_id=result.review_id,
         )
 
-    @memory_router.delete("/{memory_id}")
-    async def delete_memory(
-        memory_id: str,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
-    ):
-        """Soft-delete a memory (mark as retired and hide from search)."""
-        memory = await db.get_memory(memory_id)
-        if not memory:
-            raise HTTPException(status_code=404, detail="Memory not found")
-        memory_store = await _build_memory_store(db, config, runtime_provider)
-        try:
-            await memory_store.retire_memory(memory_id, reason="admin_hidden")
-        except ValueError as exc:
-            if "active source support" in str(exc):
-                raise HTTPException(
-                    status_code=409,
-                    detail="source_backed_memory_requires_lifecycle_review",
-                ) from exc
-            raise
-        return {"status": "deleted", "memory_id": memory_id}
-
     @memory_router.delete("/{memory_id}/purge")
     async def purge_memory(
         memory_id: str,
+        request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        """Hard-purge a memory for privacy/compliance removal."""
-        memory = await db.get_memory(memory_id)
-        if not memory:
-            raise HTTPException(status_code=404, detail="Memory not found")
+        """Hard-purge a visible memory for privacy/compliance removal.
 
-        memory_store = await _build_memory_store(db, config, runtime_provider)
+        Purging is irreversible: a private memory can be purged only by its
+        owner, and a workspace memory only by a workspace administrator. A
+        memory that an active source still supports is refused, because the
+        next sync would extract it again; remove the content at the source or
+        retire the source instead. Everyday removal goes through
+        ``POST /memories/{memory_id}/retire``.
+        """
+        visible = await _filter_visible_ids(db, [memory_id], _lifecycle_visibility_scope(request))
+        memory = await db.get_memory(memory_id) if memory_id in visible else None
+        if memory is None:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        if memory.visibility == Visibility.PRIVATE.value:
+            if memory.owner_user_id != resolve_request_principal(request):
+                raise HTTPException(status_code=403, detail="memory_owner_authority_required")
+        else:
+            _require_workspace_memory_administration(request)
+        support_state = (await db.get_active_memory_support_states((memory_id,)))[memory_id]
+        if support_state.unit_ids:
+            raise HTTPException(status_code=409, detail="source_backed_memory_requires_lifecycle_review")
+
+        memory_store = await _build_memory_store(
+            db,
+            config,
+            runtime_provider,
+            audit_context=_request_audit_context(request),
+        )
         purged = await memory_store.purge_memory(memory_id)
         if not purged:
             raise HTTPException(status_code=404, detail="Memory not found")
@@ -5553,7 +5796,7 @@ def create_admin_app(
             items=items[: req.limit],
         )
 
-    @source_router.get("")
+    @source_router.get("", response_model=SourceListResponse, response_model_exclude_unset=True)
     async def list_sources(
         request: Request,
         db: Database = Depends(get_db),
@@ -6740,7 +6983,7 @@ def create_admin_app(
         )
         return {"operation_id": operation_id, "status": "queued"}
 
-    @source_list_router.get("/preferences")
+    @source_list_router.get("/preferences", response_model=SourceListPreferencesResponse)
     async def get_source_list_preferences(
         request: Request,
         db: Database = Depends(get_db),
@@ -6749,7 +6992,7 @@ def create_admin_app(
         sort_mode = await db.get_source_list_sort_mode(resolve_request_principal(request))
         return {"sort_mode": sort_mode}
 
-    @source_list_router.put("/preferences")
+    @source_list_router.put("/preferences", response_model=SourceListPreferencesResponse)
     async def set_source_list_preferences(
         request: Request,
         req: SourceListPreferenceRequest,
@@ -7193,7 +7436,11 @@ def create_admin_app(
             raise HTTPException(status_code=404, detail="Sync run not found")
         return {"run_id": run.run_id, "status": run.status}
 
-    @source_router.post("/{source_id}/sync", status_code=202)
+    @source_router.post(
+        "/{source_id}/sync",
+        status_code=202,
+        response_model=SourceSyncRunReceiptResponse | LocalCollectionReceiptResponse,
+    )
     async def trigger_sync(
         request: Request,
         source_id: str,
@@ -8135,37 +8382,7 @@ def create_admin_app(
         )
 
     # ===================================================================
-    # 5. Schedule Endpoints
-    # ===================================================================
-
-    @schedule_router.get("")
-    async def get_schedule(db: Database = Depends(get_db)):
-        """Get the current sync schedule configuration."""
-        sched = await db.get_schedule_config()
-        return ScheduleConfigResponse(**sched)
-
-    @schedule_router.put("")
-    async def update_schedule(
-        req: ScheduleConfigRequest,
-        db: Database = Depends(get_db),
-        sync_scheduler: SyncScheduler | None = Depends(get_sync_scheduler),
-    ):
-        """Update the sync schedule configuration."""
-        await db.set_schedule_config(
-            {
-                "enabled": req.enabled,
-                "frequency": req.frequency,
-                "time": req.time,
-                "day_of_week": req.day_of_week,
-                "timezone": req.timezone,
-            }
-        )
-        if sync_scheduler:
-            await sync_scheduler.reload()
-        return {"ok": True}
-
-    # ===================================================================
-    # 6. LLM Config Endpoints
+    # 5. LLM Config Endpoints
     # ===================================================================
 
     @llm_router.get("")
@@ -8265,15 +8482,19 @@ def create_admin_app(
 
     @projects_router.post("", response_model=ProjectResponse, status_code=201)
     async def create_project_route(
+        request: Request,
         req: ProjectCreateRequest,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        adapters = await _build_project_adapters(db, config, runtime_provider)
+        _require_project_management(request)
         key = (req.key or _derive_project_key(req.name)).strip()
         if not key:
             raise HTTPException(status_code=400, detail="project key cannot be empty")
+        if key.upper() in RESERVED_PROJECT_KEYS:
+            raise _reserved_project_conflict(key.upper())
+        adapters = await _build_project_adapters(db, config, runtime_provider)
         try:
             created = await adapters.relational.create_project(
                 key=key,
@@ -8289,16 +8510,16 @@ def create_admin_app(
 
     @projects_router.patch("/{project_id}", response_model=ProjectResponse)
     async def update_project_route(
+        request: Request,
         project_id: str,
         req: ProjectUpdateRequest,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
+        _require_project_management(request)
         adapters = await _build_project_adapters(db, config, runtime_provider)
-        existing = await adapters.relational.get_project(project_id)
-        if existing is None:
-            raise HTTPException(status_code=404, detail="project not found")
+        await _require_mutable_project(adapters.relational, project_id)
         is_shared: bool | None = None
         if req.kind is not None:
             is_shared = req.kind == "shared"
@@ -8313,18 +8534,19 @@ def create_admin_app(
 
     @projects_router.delete("/{project_id}", response_model=ProjectDeleteResponse)
     async def delete_project_route(
+        request: Request,
         project_id: str,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
+        _require_project_management(request)
         adapters = await _build_project_adapters(db, config, runtime_provider)
+        await _require_mutable_project(adapters.relational, project_id)
         try:
             affected = await adapters.relational.list_project_memory_ids(project_id)
         except LookupError:
             raise HTTPException(status_code=404, detail="project not found")
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
         memory_store = await _build_memory_store(db, config, runtime_provider)
         # Vector metadata moves first so a failure here aborts the
         # transaction with both stores still pointing at the original
@@ -8406,7 +8628,7 @@ def create_admin_app(
             await _filter_visible_ids(
                 db,
                 review_memory_ids,
-                _review_visibility_scope(request),
+                _lifecycle_visibility_scope(request),
             )
             if review_memory_ids
             else set()
@@ -8537,7 +8759,7 @@ def create_admin_app(
                 await _filter_visible_ids(
                     db,
                     lifecycle_memory_ids,
-                    _review_visibility_scope(request),
+                    _lifecycle_visibility_scope(request),
                 )
                 if lifecycle_memory_ids
                 else set()
@@ -9312,7 +9534,12 @@ def create_admin_app(
             "finished_at": job.get("finished_at"),
         }
 
-    @local_agent_router.post("/jobs", status_code=201)
+    @local_agent_router.post(
+        "/jobs",
+        status_code=201,
+        response_model=LocalAgentJobCreateResponse,
+        response_model_exclude_unset=True,
+    )
     async def create_local_agent_job(
         req: LocalAgentJobCreateRequest,
         request: Request,
@@ -9465,7 +9692,7 @@ def create_admin_app(
             )
         return {"ok": True, "job_id": job_id, "status": status}
 
-    @local_agent_router.get("/jobs/current")
+    @local_agent_router.get("/jobs/current", response_model=LocalAgentJobListResponse)
     async def read_current_local_agent_jobs(
         request: Request,
         db: Database = Depends(get_db),
@@ -9489,7 +9716,7 @@ def create_admin_app(
             raise HTTPException(status_code=404, detail="local_agent_job_not_found")
         return _shape_local_agent_job(job)
 
-    @local_agent_router.get("/status")
+    @local_agent_router.get("/status", response_model=LocalAgentDaemonStatusResponse)
     async def read_local_agent_status(
         request: Request,
         db: Database = Depends(get_db),
@@ -9521,7 +9748,6 @@ def create_admin_app(
     app.include_router(agent_session_router)
     app.include_router(hook_router)
     app.include_router(recent_change_router)
-    app.include_router(schedule_router)
     app.include_router(llm_router)
     app.include_router(projects_router)
     app.include_router(local_agent_router)

@@ -801,7 +801,15 @@ class RelationalStore(Protocol):
         *,
         name: str | None = None,
         is_shared: bool | None = None,
-    ) -> Project | None: ...
+    ) -> Project | None:
+        """Rename a project or change its kind.
+
+        An unknown id returns `None`; a call with no fields returns the
+        project unchanged. Reserved keys (SHARED, UNSORTED) raise
+        `ValueError` whenever a field is supplied.
+        """
+        ...
+
     async def list_project_memory_ids(self, project_id: str) -> list[str]:
         """Return the memory ids attached to a project.
 
