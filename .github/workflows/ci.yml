@@ -19,9 +19,31 @@ jobs:
       - run: uv build
       - run: uv run python scripts/verify_release_artifacts.py dist
       - run: uv run python scripts/sync_plugin_mcp_proxy.py --check
-      - run: uv run ruff check src tests scripts/sync_plugin_mcp_proxy.py
+      - run: uv run python scripts/export_openapi.py admin/openapi/admin.json --check
+      - run: uv run ruff check src tests scripts/sync_plugin_mcp_proxy.py scripts/export_openapi.py
       - run: uv run pytest -q -n 4 --dist worksteal --durations=25 --durations-min=0.2
 
+  admin:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: admin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.15.0"
+          cache: npm
+          cache-dependency-path: admin/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run check:api
+      - run: npm test
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+
+  # Deprecated (admin-ui-v1): remove this job with the V1 admin UI (ADR 0044).
   admin-ui:
     runs-on: ubuntu-latest
     defaults:

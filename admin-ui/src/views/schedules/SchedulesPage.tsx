@@ -157,6 +157,10 @@ function SourceRow({ source }: { source: Source }) {
   );
 }
 
+/**
+ * @deprecated admin-ui-v1: the admin UI shows frequency, next run and overdue
+ * state on each source row instead of a separate page (ADR 0044).
+ */
 export function SchedulesPage() {
   const queryClient = useQueryClient();
 
