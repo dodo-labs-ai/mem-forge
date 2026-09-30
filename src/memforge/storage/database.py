@@ -1873,15 +1873,6 @@ CREATE TABLE IF NOT EXISTS local_agent_heartbeats (
 -- ---------------------------------------------------------------
 -- Config singletons
 -- ---------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS schedule_config (
-    id          INTEGER PRIMARY KEY CHECK (id = 1),
-    enabled     INTEGER NOT NULL DEFAULT 0,
-    frequency   TEXT NOT NULL DEFAULT 'daily',
-    time        TEXT NOT NULL DEFAULT '02:00',
-    day_of_week INTEGER NOT NULL DEFAULT 0,
-    timezone    TEXT NOT NULL DEFAULT 'UTC'
-);
-
 CREATE TABLE IF NOT EXISTS llm_config (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
     enrichment_model    TEXT,
@@ -4522,6 +4513,12 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # (ADR 0043). The columns are dropped where a database created before
         # this version still has them.
         [],
+    ),
+    (
+        108,
+        "Remove the workspace-wide sync schedule",
+        # Sources sync on their own schedules only.
+        ["DROP TABLE IF EXISTS schedule_config"],
     ),
 ]
 
@@ -20796,50 +20793,6 @@ class Database:
             tuple(params),
         )
         return [self._row_to_agent_assessment(row) for row in rows]
-
-    # ==================================================================
-    # Config - schedule
-    # ==================================================================
-
-    async def get_schedule_config(self) -> dict:
-        async with self.db.execute("SELECT * FROM schedule_config WHERE id = 1") as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                return {
-                    "enabled": False,
-                    "frequency": "daily",
-                    "time": "02:00",
-                    "day_of_week": 0,
-                    "timezone": "UTC",
-                }
-            d = dict(row)
-            return {
-                "enabled": bool(d["enabled"]),
-                "frequency": d["frequency"],
-                "time": d["time"],
-                "day_of_week": d["day_of_week"],
-                "timezone": d.get("timezone", "UTC"),
-            }
-
-    async def set_schedule_config(self, config: dict) -> None:
-        async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO schedule_config (
-                    id, enabled, frequency, time, day_of_week, timezone
-                ) VALUES (1, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    enabled=excluded.enabled, frequency=excluded.frequency,
-                    time=excluded.time, day_of_week=excluded.day_of_week,
-                    timezone=excluded.timezone""",
-                (
-                    int(config.get("enabled", False)),
-                    config.get("frequency", "daily"),
-                    config.get("time", "02:00"),
-                    config.get("day_of_week", 0),
-                    config.get("timezone", "UTC"),
-                ),
-            )
-            await self.db.commit()
 
     # ==================================================================
     # Memory reviews
