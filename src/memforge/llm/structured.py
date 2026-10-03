@@ -137,7 +137,7 @@ def _structured_user_content(
 ) -> str | list[dict[str, object]]:
     if not images:
         return prompt
-    content: list[dict[str, object]] = [{"type": "text", "text": prompt}]
+    content: list[dict[str, object]] = []
     if isinstance(images, ArtifactImageDelivery):
         binding = dict(images.source_binding)
         for ordinal, view in enumerate(images.views, 1):
@@ -152,7 +152,9 @@ def _structured_user_content(
                     "This is a reading view, not independent Evidence."
                 ),
             }, {"type": "image_url", "image_url": {"url": f"data:{view.media_type};base64,{encoded}"}}))
+        content.append({"type": "text", "text": prompt})
         return content
+    content.append({"type": "text", "text": prompt})
     for image in images:
         encoded = base64.b64encode(image.body).decode("ascii")
         content.extend(

@@ -133,7 +133,9 @@ async def test_retry_native_fallback_preserves_exact_delivery_and_labels(authent
     assert image_sets[0] == image_sets[1] == image_sets[2] and len(image_sets[0]) == 7
     for call in calls:
         assert call["model"] == MODEL and call["max_tokens"] == 32768
-        labels = [b["text"] for b in call["messages"][0]["content"][1:] if b["type"] == "text"]
+        blocks = call["messages"][0]["content"]
+        assert blocks[-1]["type"] == "text" and "same prompt" in blocks[-1]["text"]
+        labels = [b["text"] for b in blocks[:-1] if b["type"] == "text"]
         assert len(labels) == 7 and "whole" in labels[0]
         assert all("not independent Evidence" in label and "authorized Artifact" in label for label in labels)
         assert all("Image evidence" not in label for label in labels)
