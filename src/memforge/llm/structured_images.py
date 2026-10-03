@@ -9,8 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from io import BytesIO
+from typing import TYPE_CHECKING
 
 from PIL import Image, ImageOps, UnidentifiedImageError
+
+if TYPE_CHECKING:
+    from memforge.llm.structured_image_delivery import ArtifactImageDelivery
 
 
 MAX_STRUCTURED_LLM_IMAGE_DIMENSION = 2000
@@ -69,9 +73,15 @@ class PreparedStructuredLlmImages:
 
 
 def prepare_structured_llm_images(
-    images: tuple[StructuredLlmImage, ...],
-) -> PreparedStructuredLlmImages:
+    images: tuple[StructuredLlmImage, ...] | "ArtifactImageDelivery",
+) -> PreparedStructuredLlmImages | "ArtifactImageDelivery":
     """Validate images and normalize only those outside the portable envelope."""
+
+    from memforge.llm.structured_image_delivery import ArtifactImageDelivery
+
+    if isinstance(images, ArtifactImageDelivery):
+        images.validate()
+        return images
 
     prepared: list[StructuredLlmImage] = []
     normalized_count = 0
