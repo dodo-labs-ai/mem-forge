@@ -18,7 +18,7 @@ from memforge.llm.structured_images import StructuredLlmImage, StructuredLlmImag
 if TYPE_CHECKING:
     from memforge.pipeline.projection_fragments import ProjectionFragmentCatalog
 
-PROFILE = "whole-complete-overlap-png-documented-standard-v1"
+PROFILE = "whole-complete-overlap-png-documented-standard-v2"
 DOCUMENTED_BOUNDS = dict(max_edge=1568, max_visual_tokens=1568, patch_edge=28)
 _BINDING_FIELDS = {"source_id", "source_unit_id", "source_unit_revision_id", "observation_id",
                    "observation_revision_id", "artifact_ref", "access_context_hash", "authority_hash", "source_sha256",
@@ -131,7 +131,8 @@ class ArtifactImageDelivery:
                 "max_images": self.max_images, "max_encoded_image_bytes": self.max_encoded_image_bytes,
                 "max_encoded_request_bytes": self.max_encoded_request_bytes,
                 "documented_bounds": dict(DOCUMENTED_BOUNDS), "overlap_fraction": 0.2,
-                "renderer_contract": "parent-artifact-rectangle-reading-view-v1",
+                "renderer_contract": "parent-artifact-rectangle-reading-view-v2",
+                "instruction_order": "views_before_query",
                 "capacity_evidence": "documented_only_route_unverified"}
 
     def validate(self, *, model: str | None = None, budget_identity: str | None = None) -> None:
