@@ -567,8 +567,13 @@ def test_unsafe_html_is_excluded_while_safe_sibling_remains_selectable() -> None
     assert "alert" not in str(catalog.model_payload())
 
 
-def test_html_comment_only_region_is_explicitly_unselectable() -> None:
-    content = "<!-- operational note -->"
+@pytest.mark.parametrize("content", [
+    "<!-- operational note -->",
+    '<!--\nclaim-marker\nid="claim-1"\n-->\n<!-- another marker -->',
+])
+def test_html_comments_are_nonselectable_framing_in_a_complete_document(content) -> None:
+    body = "A supported rule."
+    content += "\n\n" + body
     revision = _revision(content, MARKDOWN_PROFILE)
 
     catalog = compile_fragments(
@@ -576,8 +581,15 @@ def test_html_comment_only_region_is_explicitly_unselectable() -> None:
         (_authority(revision, EvidenceRole.PRIMARY),),
     )
 
-    assert catalog.fragments == ()
-    assert catalog.errors[0].code is FragmentCompilationErrorCode.UNSUPPORTED_HTML
+    assert [fragment.presentation_text for fragment in catalog.fragments] == [body]
+    assert catalog.errors == ()
+
+
+@pytest.mark.parametrize("content", ["<!-- <!-- nested -->", "<!-- unterminated", "<!-- note --!>"])
+def test_malformed_comment_is_not_accepted_as_complete_framing(content) -> None:
+    revision = _revision(content + "\n\nA supported rule.", MARKDOWN_PROFILE)
+    catalog = compile_fragments(revision, (_authority(revision, EvidenceRole.PRIMARY),))
+    assert catalog.errors
 
 
 def test_canonical_record_nested_markdown_maps_unicode_escape_to_raw_json() -> None:

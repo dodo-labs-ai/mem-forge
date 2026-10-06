@@ -5,6 +5,7 @@ from memforge.pipeline.revision_assessment import revision_inference_capability_
 import asyncio
 import gc
 import hashlib
+import html
 import json
 import sqlite3
 import weakref
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 from PIL import Image
+from markdown_it import MarkdownIt
 from apscheduler.triggers.date import DateTrigger
 
 import memforge.source_derivation as source_derivation_module
@@ -3579,6 +3581,7 @@ def _jira_raw_content(item: ContentItem) -> RawContent:
             "resolution": None,
             "updated": item.last_modified.isoformat(),
         },
+        "renderedFields": {"description": "<p>Body</p>"},
         "_comments": [],
         "_comments_included": True,
         "_comments_total": 0,
@@ -3589,6 +3592,11 @@ def _jira_raw_content(item: ContentItem) -> RawContent:
         body=json.dumps(payload).encode("utf-8"),
         content_type="application/json",
     )
+
+
+def _confluence_raw_content(item: ContentItem, markdown: str) -> RawContent:
+    """A synthetic provider storage snapshot matching the fixture's normalized body."""
+    return RawContent(item=item, body=MarkdownIt().render(markdown).encode(), content_type="text/html")
 
 
 class BlockingFetchGene:
@@ -4046,6 +4054,10 @@ class OrderedBlockingFetchGene(BlockingFetchGene):
 
 
 class PdfBackfillGene(BlockingFetchGene):
+    async def fetch(self, item):
+        await self.release.wait()
+        return _confluence_raw_content(item, f"# {item.title}\n\nBody")
+
     def requires_pdf_artifact(
         self,
         *,
@@ -4201,6 +4213,7 @@ class UpdatingTicketGene(UpdatingDocumentGene):
                         "resolution": None,
                         "updated": item.last_modified.isoformat(),
                     },
+                    "renderedFields": {"description": f"<p>{html.escape(self.markdown)}</p>"},
                     "_comments": [],
                     "_comments_included": True,
                     "_comments_total": 0,
@@ -4212,6 +4225,9 @@ class UpdatingTicketGene(UpdatingDocumentGene):
 
 
 class LargeConfluenceGene(UpdatingDocumentGene):
+    async def fetch(self, item):
+        return _confluence_raw_content(item, self.markdown)
+
     @classmethod
     def metadata(cls):
         return GeneMetadata(
@@ -4467,6 +4483,8 @@ async def _hold_document(
     raw = (
         _jira_raw_content(item)
         if source_type == "jira"
+        else _confluence_raw_content(item, markdown)
+        if source_type == "confluence"
         else RawContent(item=item, body=markdown.encode("utf-8"), content_type="text/markdown")
     )
     projection = project_source_item(
@@ -5656,7 +5674,8 @@ async def test_supported_configured_sources_reach_shared_lifecycle_execution_sea
         def metadata(cls):
             return replace(UpdatingDocumentGene.metadata(), name=source_type)
 
-    gene_type = UpdatingTicketGene if source_type == "jira" else SourceTypeGene
+    gene_type = (UpdatingTicketGene if source_type == "jira" else
+                 LargeConfluenceGene if source_type == "confluence" else SourceTypeGene)
     engine = RecordingMemoryEngine()
     state = await GeneSyncOrchestrator(
         db=db,
@@ -11689,7 +11708,7 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
            WHERE source_id = ? AND document_id = ?""",
         (
             "file:///tmp/Architecture/existing.raw",
-            "application/json",
+            "text/html",
             "file:///tmp/Architecture/existing.pdf",
             source_id,
             "jira-0",

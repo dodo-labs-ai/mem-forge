@@ -135,8 +135,9 @@ def _jira_payload(histories: list[dict], *, total: int | None = None) -> bytes:
                 "created": "2026-01-05T09:00:00.000+0000",
                 "updated": "2026-02-20T09:00:00.000+0000",
             },
+            "renderedFields": {"description": "<p>A7 stays for regular payroll.</p>"},
             "_comments": [
-                {"id": "c1", "body": "Agreed.", "created": "2026-02-01T09:00:00.000+0000",
+                {"id": "c1", "body": "Agreed.", "renderedBody": "<p>Agreed.</p>", "created": "2026-02-01T09:00:00.000+0000",
                  "updated": "2026-02-20T09:00:00.000+0000"},
             ],
             "_comments_included": True,
