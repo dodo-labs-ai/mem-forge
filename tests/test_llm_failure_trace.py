@@ -1,3 +1,5 @@
+
+from tests.evidence_display_fixture import evidence_displays
 import asyncio
 import json
 
@@ -120,6 +122,7 @@ def test_unknown_support_reference_identifies_exact_field_and_allowed_catalog(fi
     aliases = SupportWireAliases(SimpleNamespace(fragments=[SimpleNamespace(reference="f2", primary_eligible=True)]), [], {"work":"WRK-0000"})
     row = dict(work_id="WRK-0000", status="supported", primary_ref="PRM-0002", required_refs=[])
     row[field] = "PRM-0007" if field == "primary_ref" else ["PRM-0007"]
+    row["evidence_displays"] = evidence_displays(row["primary_ref"], row["required_refs"])
     with pytest.raises(ValueError) as error:
         aliases.decode(SupportAssessmentWireResponse.model_validate({"results":[row]}))
     expected = "results[0].primary_ref" if field == "primary_ref" else "results[0].required_refs[0]"
@@ -137,7 +140,8 @@ def test_unknown_primary_diagnostic_excludes_required_only_refs():
     aliases = SupportWireAliases(catalog, [], {"work":"WRK-0000"})
     with pytest.raises(ValueError) as error:
         aliases.decode(SupportAssessmentWireResponse.model_validate({"results":[dict(
-            work_id="WRK-0000", status="supported", primary_ref="PRM-0007", required_refs=[])]}))
+            work_id="WRK-0000", status="supported", primary_ref="PRM-0007", required_refs=[],
+            evidence_displays=evidence_displays("PRM-0007"))]}))
     assert error.value.allowed_refs == ["PRM-0002"]
 
 
@@ -235,7 +239,7 @@ async def test_optional_selector_correction_keeps_rejected_extraction_trace(monk
 
         async def correct_projection_fragment_selectors(self, *args, **kwargs):
             raise AssertionError("a correction that does not fit is never sent")
-    candidate = ProjectionFragmentMemoryCandidate(content="fixed claim", memory_type="fact", primary_ref="unknown")
+    candidate = ProjectionFragmentMemoryCandidate(content="fixed claim", memory_type="fact", primary_ref="unknown", evidence_displays=evidence_displays("unknown", ()))
     _, metrics = await correct_fragment_selectors_once([candidate], catalog=Catalog(), client=CorrectionClient(),
         extraction_prompt="original extraction", max_tokens=100, model=None, images=(), source_response=source_response)
     assert metrics["selector_correction_outcome"] == "capacity_skipped"
@@ -299,7 +303,7 @@ async def test_multiple_selector_errors_preserve_original_row_and_field_indices(
         async def correct_projection_fragment_selectors(self, *args, **kwargs):
             raise AssertionError("a correction that does not fit is never sent")
     candidates = [ProjectionFragmentMemoryCandidate(content=f"claim {i}", memory_type="fact", primary_ref="p2",
-        required_refs=["p2", f"unknown-{i}", f"unknown-{i}"]) for i in range(2)]
+        required_refs=["p2", f"unknown-{i}", f"unknown-{i}"], evidence_displays=evidence_displays("p2", ["p2", f"unknown-{i}", f"unknown-{i}"])) for i in range(2)]
     await correct_fragment_selectors_once(candidates, catalog=Catalog(), client=CorrectionClient(),
         extraction_prompt="original", max_tokens=100, model=None, images=(), source_response=original)
     errors = next(iter(sink.records.values()))["failures"]

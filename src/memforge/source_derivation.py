@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from memforge.memory.text_view import TextEvidenceView
+
 import hashlib
 import json
 import logging
@@ -84,6 +86,25 @@ _MAX_SAFE_DERIVATION_ERROR_FIELDS = 32
 _SELECTOR_NORMALIZATION_FINGERPRINT_LIMIT = 32
 
 logger = logging.getLogger(__name__)
+
+
+def require_source_derivation_ready_for_commit(
+    *, status: str, extraction_contract_version: str, terminal_reason_code: str | None,
+) -> None:
+    """A completed computation can still be a failed, noncommittable derivation.
+
+    Check under the store's commit fence. An already applied historical result
+    need not satisfy the current extraction policy; new commits must do so.
+    """
+    if (
+        status not in {SOURCE_DERIVATION_COMPLETED, SOURCE_DERIVATION_APPLIED}
+        or terminal_reason_code is not None
+        or (
+            status == SOURCE_DERIVATION_COMPLETED
+            and extraction_contract_version != PROJECTION_EXTRACTION_CONTRACT_VERSION
+        )
+    ):
+        raise ValueError("Source derivation is not ready for lifecycle commit")
 
 
 class SourceDerivationRecoveryDisposition(str, Enum):
@@ -269,7 +290,7 @@ class SourceUnitDerivationRequest:
     # is one durable derivation batch.
     plan_requests: Callable[
         [ExtractionAuthority],
-        Awaitable[ExtractionPlan],
+        Awaitable[ExtractionPlan | ProjectionEvidencePlanningFailure],
     ]
     extract_request: Callable[
         [ExtractionRequest],
@@ -433,6 +454,11 @@ class SourceUnitDeriver:
         )
         require_stored_revision_identity(request.projection, stored_revisions)
         planned_work = _plan_source_unit_derivation_work(request)
+        plan = None
+        if isinstance(planned_work, ExtractionAuthority):
+            plan = await request.plan_requests(planned_work)
+            if isinstance(plan, ProjectionEvidencePlanningFailure):
+                planned_work = plan
         authority_plan_identity = _authority_plan_identity(request)
         evidence_work_identity_hash = (
             None
@@ -512,7 +538,7 @@ class SourceUnitDeriver:
                 reused_batch_count=0,
                 executed_batch_count=0,
             )
-        plan = await request.plan_requests(planned_work)
+        assert isinstance(plan, ExtractionPlan)
         batches = plan.requests
         manifest = source_derivation_manifest(
             request.projection,
@@ -657,12 +683,17 @@ async def replay_source_unit_derivation(
     """
 
     planned_work = _plan_source_unit_derivation_work(request)
+    plan = None
+    if isinstance(planned_work, ExtractionAuthority):
+        plan = await request.plan_requests(planned_work)
+        if isinstance(plan, ProjectionEvidencePlanningFailure):
+            planned_work = plan
     if isinstance(planned_work, ProjectionEvidencePlanningFailure):
         return _planning_failure_extraction(
             planned_work,
             offline_replay=True,
         )
-    plan = await request.plan_requests(planned_work)
+    assert isinstance(plan, ExtractionPlan)
     results = await collect_bounded(
         plan.requests,
         request.extract_request,
@@ -1168,6 +1199,8 @@ def _resolved_evidence_selection_payload(
                 "presentation_sha256": part.presentation_sha256,
                 "excerpt": part.excerpt,
                 "artifact_metadata": dict(part.artifact_metadata),
+                "text_view": part.text_view.payload() if part.text_view else None,
+                "display_text": part.display_text,
             }
             for part in selection.parts
         ],
@@ -1201,6 +1234,8 @@ def _resolved_evidence_selection_from_payload(
                 raw_content_sha256=str(raw_part["raw_content_sha256"]),
                 presentation_sha256=str(raw_part["presentation_sha256"]),
                 excerpt=_optional_string(raw_part.get("excerpt")),
+                text_view=TextEvidenceView.from_payload(raw_part.get("text_view")),
+                display_text=_optional_string(raw_part.get("display_text")),
                 artifact_metadata=(
                     dict(raw_part["artifact_metadata"])
                     if isinstance(raw_part.get("artifact_metadata"), Mapping)
@@ -1343,17 +1378,25 @@ def assemble_source_derivation_results(
                 invalid_summary_count += 1
                 continue
             summaries_by_observation_id[observation_id] = summary
-    if failures:
-        first = failures[0]
+    incomplete = (
+        bool(plan.skipped_reading_groups)
+        or len(results) != len(plan.requests)
+        or bool(metrics["skipped_reading_group_count"])
+    )
+    if failures or incomplete:
+        first = failures[0] if failures else None
         return MemoryExtractionResult(
             protected_source_observation_ids=protected_observation_ids,
             error_type="source_derivation_work_failure",
-            error=first.error or first.error_type,
+            error=(first.error or first.error_type) if first else "The authorized extraction work is incomplete.",
             metadata={
                 **metrics,
                 "batch_count": len(results),
                 "failed_batch_count": len(failures),
                 "extracted_count_before_failure": len(memories),
+                "safe_error_code": (first.metadata.get("safe_error_code") if first else "EXTRACTION_WORK_INCOMPLETE"),
+                "safe_validation_fields": (first.metadata.get("safe_validation_fields", []) if first else []),
+                "lifecycle_mutation_skipped": True,
                 "discarded_invalid_artifact_summary_count": (invalid_summary_count),
             },
         )

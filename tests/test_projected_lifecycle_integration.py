@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from tests.evidence_display_fixture import evidence_displays
+
 import asyncio
 import hashlib
+from html import escape
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -36,6 +39,7 @@ from tests.revision_client_fixture import (
 import pytest
 from memforge.llm.structured import ChangeImpactWireResponse, SupportAssessmentWireResponse
 import pytest_asyncio
+from markdown_it import MarkdownIt
 
 
 from memforge.llm.structured import (
@@ -53,6 +57,7 @@ from memforge.evals.agent_evaluation import (
     record_quality_signal,
 )
 from memforge.memory.audit import MemoryAuditLogger
+from memforge.memory.candidate_admission import CandidateAdmissionError
 from memforge.memory.destructive_validation import KeptReason
 from memforge.memory.engine import (
     DeferredProjectedLifecycleHandle,
@@ -310,7 +315,7 @@ def _projection(
         version="2",
         extra={"page_id": page_id, "space_key": "ENG"},
     )
-    raw = RawContent(item=item, body=body.encode(), content_type="text/html")
+    raw = RawContent(item=item, body=MarkdownIt("commonmark").render(body).encode(), content_type="text/html")
     # As the Confluence Gene reports it: the page version time is the body's source time.
     normalized = NormalizedContent(
         item=item,
@@ -396,7 +401,8 @@ def _projection_with_artifact(
         item=item,
         raw=RawContent(
             item=item,
-            body=body.encode(),
+            # This provider returns storage XHTML, not the normalized fixture text.
+            body=MarkdownIt("commonmark").render(body).encode(),
             content_type="text/html",
         ),
         normalized=NormalizedContent(item=item, markdown_body=body),
@@ -419,6 +425,12 @@ def _projection_with_artifact(
         prior_unit_revision=prior,
         prior_observation_revisions=prior_observations,
     )
+
+
+def _fixture_jira_rendered_text(text: str) -> str | None:
+    if not text:
+        return None
+    return "<p>" + escape(text, quote=False).replace("\n", "<br/>") + "</p>"
 
 
 def _jira_projection(
@@ -456,7 +468,9 @@ def _jira_projection(
             "resolution": None,
             "updated": "2026-07-15T10:00:00Z",
         },
-        "_comments": [{"id": comment_id, "body": comment_body}],
+        "renderedFields": {"description": _fixture_jira_rendered_text(description)},
+        "_comments": [{"id": comment_id, "body": comment_body,
+                       "renderedBody": _fixture_jira_rendered_text(comment_body)}],
         "_comments_included": True,
         "_comments_total": 2 if comments_truncated else 1,
         "changelog": {"startAt": 0, "histories": [], "total": 0},
@@ -1422,7 +1436,7 @@ class _RecordingAddClient(RevisionClientFixture):
 
 
 class _RejectingAddClient(_RecordingAddClient):
-    """Rejects one Candidate for incomplete Evidence and admits the rest."""
+    """Rejects one low-value Candidate and admits the rest."""
 
     def __init__(self, incumbent_id: str, rejected_claim: str) -> None:
         super().__init__(incumbent_id)
@@ -1431,7 +1445,7 @@ class _RejectingAddClient(_RecordingAddClient):
     async def admit_candidates(self, prompt: str, **kwargs):
         del kwargs
         return CandidateAdmissionResponse(decisions=[
-            CandidateAdmissionDecision(candidate_id=row["id"], verdict="REJECTED", reject_reason="evidence_incomplete")
+            CandidateAdmissionDecision(candidate_id=row["id"], verdict="REJECTED", reject_reason="low_value")
             if row["claim"] == self.rejected_claim
             else CandidateAdmissionDecision(candidate_id=row["id"], verdict="ADMITTED")
             for row in admission_payload(prompt)["candidates"]
@@ -1505,13 +1519,13 @@ async def test_identical_admitted_candidates_merge_before_lifecycle_writes(
     )
     observation_id = _body_observation(projection).id
     canonical = RawMemory(
-        content=_body_revision(projection).content,
+        content="The payroll trigger remained OPEN and was not processed.",
         memory_type="fact",
         evidence_quote="The payroll trigger remained OPEN and was not processed.",
         source_observation_id=observation_id,
     )
     duplicate = RawMemory(
-        content="  # Page\n\nThe   payroll trigger remained OPEN and was not processed. ",
+        content="  The   payroll trigger remained OPEN and was not processed. ",
         memory_type="fact",
         evidence_quote="The payroll trigger remained OPEN and was not processed.",
         source_observation_id=observation_id,
@@ -1741,7 +1755,7 @@ async def test_entity_resolution_reads_each_mention_with_its_own_memory_text(db:
 
 
 @pytest.mark.asyncio
-async def test_a_candidate_whose_admission_stays_invalid_is_rejected_and_the_revision_commits(
+async def test_incomplete_admission_fails_revision_without_partial_memory_commit(
     db: Database,
 ) -> None:
     projection = _projection(
@@ -1759,7 +1773,8 @@ async def test_a_candidate_whose_admission_stays_invalid_is_rejected_and_the_rev
         structured_llm_client=client,
     )
 
-    stats = await engine.prepare_and_commit_projected_lifecycle(
+    with pytest.raises(CandidateAdmissionError):
+        await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
         raw_memories=_selected(projection, [
@@ -1786,16 +1801,11 @@ async def test_a_candidate_whose_admission_stays_invalid_is_rejected_and_the_rev
         source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
     )
 
-    assert [memory.content for memory in await db.list_memories()] == ["The trigger was not processed."]
+    assert await db.list_memories() == []
     # Both Candidates, then the one re-ask of the Candidate whose decision is missing.
     assert len(client.prompts) == 2
-    assert stats["candidate_admission_rejected_count"] == 1
-    [event] = await db.list_memory_audit_events(event_type="candidate_admission_rejected")
-    assert event.reason == "invalid_response"
-    assert event.payload["candidate_claim"] == "The trigger remained OPEN."
-    assert (await db.get_current_source_unit_revision(projection.source_units[0].id)).id == (
-        projection.source_unit_revisions[0].id
-    )
+    assert await db.list_memory_audit_events(event_type="candidate_admission_rejected") == []
+    assert await db.get_current_source_unit_revision(projection.source_units[0].id) is None
 
 
 class _SemanticEquivalentClient(RevisionClientFixture):
@@ -2456,6 +2466,13 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
         )
     ).attempt
     assert attempt.context.document == staged_document
+    # Stored completed work from the previous extraction policy cannot bypass
+    # recovery invalidation by going directly to the atomic commit boundary.
+    await db.db.execute(
+        "UPDATE source_derivation_attempts SET extraction_contract_version = ? WHERE id = ?",
+        ("projection-extraction-v12", attempt.id),
+    )
+    await db.db.commit()
     delta = second.deltas[0]
     scope = ReconciliationScope(
         id="scope-derivation-atomic",
@@ -2484,6 +2501,19 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
             access_context_hash="workspace-eng",
         ),
     )
+
+    with pytest.raises(ValueError, match="not ready for lifecycle commit"):
+        await db.apply_source_projection_lifecycle(
+            second, plan, document=staged_document, derivation_id=attempt.id,
+            derivation_context_identity_hash=attempt.context_identity_hash,
+        )
+    assert await db.get_document("confluence-123") == original_document
+    assert (await db.get_current_source_unit_revision(first.source_units[0].id)).id == first.source_unit_revisions[0].id
+    await db.db.execute(
+        "UPDATE source_derivation_attempts SET extraction_contract_version = ? WHERE id = ?",
+        (attempt.extraction_contract_version, attempt.id),
+    )
+    await db.db.commit()
 
     # Another writer advancing the Unit after planning must not be hidden by
     # record_source_projection() advancing it to the target before validation.
@@ -2895,7 +2925,14 @@ class _OversizedGroupExtractor(NoopMemoryExtractor):
 
 
 @pytest.mark.asyncio
-async def test_a_reading_group_beyond_capacity_is_skipped_and_the_derivation_completes(db: Database) -> None:
+async def test_a_reading_group_beyond_capacity_refuses_the_unit_and_preserves_support(db: Database) -> None:
+    base = _projection(run_id="projection-capacity-base", body="Rule one applies.\n")
+    await db.record_source_projection(base)
+    incumbent = await _seed_exact_incumbent_support(
+        db, projection=base, memory_id="mem-capacity", memory_content="Rule one applies.",
+    )
+    before_support = await active_support_evidence(db, incumbent.id)
+    before_projection = await db.get_current_source_unit_projection(base.source_units[0].id)
     body = f"Rule one applies.\n\n{_OversizedGroupExtractor.OVERSIZED}\n\nRule three applies.\n"
     projection = _projection(run_id="projection-extraction-capacity", body=body)
     document = await db.get_document("confluence-123")
@@ -2932,19 +2969,53 @@ async def test_a_reading_group_beyond_capacity_is_skipped_and_the_derivation_com
 
     first = await SourceUnitDeriver(db).derive(request())
 
-    assert first.extraction.error_type is None
+    assert first.extraction.error_type == "evidence_authority_planning_failed"
     assert first.derivation.status == "completed"
-    assert first.extraction.metadata["skipped_reading_group_count"] == 1
-    assert "Rule one applies." in read and "Rule three applies." in read
-    assert _OversizedGroupExtractor.OVERSIZED not in read
+    assert first.derivation.terminal_reason_code == "EXTRACTION_INPUT_CAPACITY_EXCEEDED"
+    assert first.derivation.batches == () and read == []
+    assert first.extraction.memories == []
+    assert first.extraction.metadata["lifecycle_mutation_skipped"]
+    assert await active_support_evidence(db, incumbent.id) == before_support
+    assert await db.get_current_source_unit_projection(base.source_units[0].id) == before_projection
 
-    # Recovering the derivation plans the same skip and reuses every completed batch.
+    # A direct/deferred commit cannot bypass the sync failure gate just because
+    # the empty failed computation is durably marked completed.
+    delta = projection.deltas[0]
+    plan = build_lifecycle_plan(
+        plan_id="plan-capacity-cannot-commit",
+        scope=ReconciliationScope(
+            id="scope-capacity-cannot-commit", source_id=projection.source_id,
+            source_unit_id=delta.source_unit_id,
+            base_unit_revision_id=delta.previous_unit_revision_id,
+            target_unit_revision_id=delta.current_unit_revision_id,
+        ),
+        gate_state=LifecycleGateState.GATED, operations=(), incumbents={},
+        source_support_unit_ids={}, all_active_support_unit_ids={}, support_set_hashes={},
+        observation_revision_ids=tuple(revision.id for revision in projection.observation_revisions),
+        defaults=NewMemoryDefaults(
+            visibility="workspace", owner_user_id=None, project_key="ENG",
+            repo_identifier=None, doc_id="confluence-123", source_type="confluence",
+            access_context_hash="access-extraction-capacity",
+        ),
+    )
+    with pytest.raises(ValueError, match="not ready for lifecycle commit"):
+        await db.apply_source_projection_lifecycle(
+            projection, plan, document=document, derivation_id=first.derivation.id,
+            derivation_context_identity_hash=first.derivation.context_identity_hash,
+        )
+    assert await active_support_evidence(db, incumbent.id) == before_support
+    assert await db.get_current_source_unit_projection(base.source_units[0].id) == before_projection
+
+    # The deterministic failed plan replays exactly, with no inference or commit.
     read.clear()
     again = await SourceUnitDeriver(db).derive(request())
 
     assert again.derivation.id == first.derivation.id
     assert again.executed_batch_count == 0 and read == []
-    assert again.extraction.metadata["skipped_reading_group_count"] == 1
+    assert again.extraction.error_type == first.extraction.error_type
+    assert again.derivation.terminal_reason_code == first.derivation.terminal_reason_code
+    assert await active_support_evidence(db, incumbent.id) == before_support
+    assert await db.get_current_source_unit_projection(base.source_units[0].id) == before_projection
 
 
 @pytest.mark.asyncio
@@ -4053,7 +4124,7 @@ async def test_projected_support_invariant_accepts_other_valid_same_source_unit(
         item=other_item,
         raw=RawContent(
             item=other_item,
-            body=other_body.encode(),
+            body=MarkdownIt("commonmark").render(other_body).encode(),
             content_type="text/html",
         ),
         normalized=NormalizedContent(
@@ -4703,7 +4774,9 @@ async def test_noop_revalidation_uses_bounded_fragment_refs_for_large_revision(
     assert stats["noop"] == 2
     assert stats["support_revalidation_work_item_count"] == 2
     assert stats["support_revalidation_model_call_count"] == 1
-    assert stats["support_revalidation_revision_index_count"] == len(second.observation_revisions)
+    assert stats["support_revalidation_revision_index_count"] == len({
+        revision.id for projection in (first, second) for revision in projection.observation_revisions
+    })
     assert stats["support_revalidation_supported_count"] == 2
     assert len(client.validation_prompts) == 2
     assert all(unrelated_marker in prompt for prompt in client.validation_prompts)
@@ -5243,7 +5316,7 @@ async def test_partial_jira_projection_keeps_a_validated_support_on_an_unreturne
         ),
     )
     catalog = context.catalog(context.full_fragments)
-    [fragment] = [fragment for fragment in catalog.fragments if fragment.presentation_text == evidence]
+    [fragment] = [fragment for fragment in catalog.fragments if fragment.presentation_text.endswith(evidence)]
     added = RawMemory(
         content=claim, memory_type="decision", evidence_quote=evidence,
         source_observation_id=fragment.anchor.observation_id,
@@ -5374,7 +5447,7 @@ async def test_only_admitted_candidates_reach_relation_and_rejections_add_nothin
     )
     [event] = await db.list_memory_audit_events(event_type="candidate_admission_rejected")
     assert event.payload["candidate_claim"] == rejected_claim
-    assert event.payload["reject_reason"] == "evidence_incomplete"
+    assert event.payload["reject_reason"] == "low_value"
     assert event.payload["target_unit_revision_id"] == second.source_unit_revisions[0].id
 
 
@@ -5572,6 +5645,7 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
         structured_llm_client=_SupportValidatingNoopClient(
             incumbent.id,
             supported=True,
+            evidence_quote="Decision: retain A7",
             required_evidence_quote="A7 remains limited to regular payroll runs.",
         ),
     )
@@ -5619,7 +5693,7 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
 
 
 @pytest.mark.asyncio
-async def test_noop_duplicate_required_refs_normalize_without_retry(
+async def test_noop_duplicate_required_refs_preserve_prior_support_as_unresolved(
     db: Database,
 ) -> None:
     await _set_fixture_source_type(db, "jira")
@@ -5629,6 +5703,7 @@ async def test_noop_duplicate_required_refs_normalize_without_retry(
     )
     await db.record_source_projection(first)
     incumbent = await _seed_jira_required_incumbent(db, first)
+    old_evidence = await active_support_evidence(db, incumbent.id, source_id="src-1")
     await db.enable_lifecycle_gate("src-1")
     second = _jira_projection(
         run_id="projection-jira-duplicate-selector-2",
@@ -5644,6 +5719,7 @@ async def test_noop_duplicate_required_refs_normalize_without_retry(
         structured_llm_client=_DuplicateRequiredSelectorClient(
             incumbent.id,
             supported=True,
+            evidence_quote="Decision: retain A7",
             required_evidence_quote=("A7 remains limited to regular payroll runs."),
         ),
     )
@@ -5664,10 +5740,46 @@ async def test_noop_duplicate_required_refs_normalize_without_retry(
     )
 
     assert stats["noop"] == 1
-    assert stats["support_revalidation_model_call_count"] == 1
+    assert stats["support_revalidation_model_call_count"] == 2
+    assert stats["support_revalidation_unresolved_invalid_response_count"] == 1
     evidence = await active_support_evidence(db, incumbent.id, source_id="src-1")
-    assert len([part for part in evidence if part.role is EvidenceRole.REQUIRED]) == 1
+    assert evidence == old_evidence
     assert await db.list_lifecycle_reviews("src-1") == []
+
+
+@pytest.mark.asyncio
+async def test_corrupt_pinned_support_aborts_revision_without_mutating_history(db: Database):
+    first = _projection(run_id="integrity-support-1", body="A7 is removed.\nEdition 1.")
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    await db.enable_lifecycle_gate("src-1")
+    second = _projection(
+        run_id="integrity-support-2", body="A7 is removed.\nEdition 2.",
+        prior=first.source_unit_revisions[0], prior_observations=_revisions_by_observation(first),
+    )
+    [stored] = await active_support_evidence(db, incumbent.id, source_id="src-1")
+    await db.db.execute("UPDATE evidence_references SET raw_content_sha256 = ? WHERE id = ?", ("0" * 64, stored.reference_id))
+    await db.db.commit()
+    before = await active_support_evidence(db, incumbent.id, source_id="src-1")
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters), db=db,
+        memory_store=_OutboxDrainer(db), structured_llm_client=_NoopClient(incumbent.id),
+    )
+    with pytest.raises(SourceUnitLifecycleExecutionError) as failure:
+        await engine.prepare_and_commit_projected_lifecycle(
+            projection=second, doc_id="confluence-123", raw_memories=[], doc_type="design-doc",
+            project_key="ENG", repo_identifier=None, document_content=_body_revision(second).content,
+            update_mode="diff_guided", changed_hunks="Edition changed", update_plan_stats=None,
+            source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            lifecycle_execution_owner_id="sync-integrity:lease-1",
+        )
+    assert failure.value.retryable is False
+    assert failure.value.runtime_bundle.event.reason_code == "support_revalidation_evidence_integrity"
+    assert failure.value.runtime_bundle.event.model_call_count == 0
+    assert (await db.get_current_source_unit_revision(first.source_units[0].id)).id == first.source_unit_revisions[0].id
+    assert await active_support_evidence(db, incumbent.id, source_id="src-1") == before
+    assert (await db.get_memory(incumbent.id)).status == "active"
 
 
 @pytest.mark.asyncio
@@ -5712,6 +5824,7 @@ async def test_noop_revalidates_revised_required_jira_description_in_partial_pro
         structured_llm_client=_SupportValidatingNoopClient(
             incumbent.id,
             supported=True,
+            evidence_quote="Decision: retain A7",
             required_evidence_quote=(
                 "A7 remains limited to regular payroll runs."
             ),
@@ -5796,6 +5909,7 @@ async def test_noop_uses_canonical_field_type_to_resolve_duplicate_text(
         structured_llm_client=_SupportValidatingNoopClient(
             incumbent.id,
             supported=True,
+            evidence_quote="Decision: retain A7",
             required_evidence_quote="Payroll",
         ),
     )
@@ -6493,6 +6607,7 @@ async def test_noop_preserves_multiple_required_parts_in_one_observation(
         structured_llm_client=_SupportValidatingNoopClient(
             incumbent.id,
             supported=True,
+            evidence_quote="Decision: retain A7",
             required_evidence_quotes=(
                 "A7 remains limited to regular payroll runs.",
                 "Payroll",
@@ -6605,10 +6720,8 @@ async def test_noop_resolves_decoded_canonical_quotes_to_raw_json_ranges(
         incumbent.id,
         source_id="src-1",
     )
-    assert {item.excerpt for item in evidence} == {
-        new_primary,
-        new_required,
-    }
+    assert {item.excerpt.removeprefix("Issue: PAY-12\nIssue ID: 10012\n").removeprefix("Issue: PAY-12\n").removeprefix("Description:\n")
+            for item in evidence} == {new_primary, new_required}
     current_revisions = {
         item.observation_id: item
         for item in second.observation_revisions
@@ -6619,7 +6732,7 @@ async def test_noop_resolves_decoded_canonical_quotes_to_raw_json_ranges(
         raw_slice = revision.content[
             item.anchor.range_start : item.anchor.range_end
         ]
-        assert "\\n" in raw_slice
+        assert "<br/>" in raw_slice
         assert '\\"A7\\"' in raw_slice
         assert item.raw_content_sha256 == hashlib.sha256(
             raw_slice.encode()
@@ -7552,6 +7665,14 @@ async def _attach_current_evidence_unit(
             support["created_at"],
         ),
     )
+    part_digest = evidence_part_set_digest((EvidenceReference(
+        role=EvidenceRole.PRIMARY, kind=EvidencePartKind(primary["part_kind"]),
+        anchor=SourceAnchor(kind=AnchorKind(primary["anchor_kind"]), observation_id=observation_id,
+                            observation_revision_id=revision_id, fragment_id=primary["fragment_id"],
+                            range_start=primary["range_start"], range_end=primary["range_end"]),
+        raw_content_sha256=primary["raw_content_sha256"],
+    ),))
+    await db.db.execute("UPDATE evidence_units SET part_set_digest = ? WHERE id = ?", (part_digest, evidence_unit_id))
     await db.db.commit()
 
 
@@ -9016,7 +9137,10 @@ async def test_reused_evidence_advances_only_support_validation_plan_across_revi
         appendix = replace(_body_observation(first), id="obs-appendix", provider_key="appendix")
         appendix_revision = replace(
             _body_revision(first), id=f"appendix-v{version}", observation_id=appendix.id,
-            semantic_hash=f"appendix-hash-{version}", content=f"Appendix edition {version}.",
+            semantic_hash=f"appendix-hash-{version}", content=json.dumps({
+                "title": "Appendix", "body": f"<p>Appendix edition {version}.</p>",
+                "representation": "confluence-page-storage:1",
+            }),
         )
         revision = replace(
             first.source_unit_revisions[0], id=f"baseline-unit-v{version}",
@@ -9132,7 +9256,7 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
                     results.append({
                         "work_id": work["work_id"], "status": "supported", "primary_ref": primary_ref,
                         "required_refs": [],
-                    })
+                     "evidence_displays": evidence_displays(primary_ref, [])})
                 elif payload["last"]:
                     results.append({"work_id": work["work_id"], "status": "unsupported"})
                 else:
@@ -9198,31 +9322,19 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
     if mixed_supports:
         prior_unit = await db.get_evidence_unit(old_support[0].evidence_unit_id)
         alternate = replace(prior_unit, id="eu-alternate-support", doc_revision_id=second.source_unit_revisions[0].id)
-        await db.upsert_evidence_unit(alternate)
-        revision = _body_revision(second)
-        start = revision.content.index(skipped_claim)
-        references = await db.record_evidence_references(alternate.id, (
+        selected = next(fragment for fragment in RevisionAssessmentContext(
+            projection=second, base=None, access_context_hash="fixture",
+        ).full_fragments if fragment.presentation_text == skipped_claim)
+        await record_unit_support(db, memory_id=skipped.id, unit=alternate, references=(
             EvidenceReference(
                 role=EvidenceRole.PRIMARY,
                 kind=EvidencePartKind.TEXT,
-                raw_content_sha256=old_support[0].raw_content_sha256,
-                anchor=SourceAnchor(
-                    kind=AnchorKind.REVISION_RANGE,
-                    observation_id=revision.observation_id,
-                    observation_revision_id=revision.id,
-                    range_start=start,
-                    range_end=start + len(skipped_claim),
-                ),
+                raw_content_sha256=selected.raw_content_sha256,
+                presentation_sha256=selected.presentation_sha256,
+                excerpt=selected.presentation_text,
+                text_view=selected.text_view,
+                anchor=selected.anchor,
             ),
-        ))
-        await db.upsert_evidence_unit(replace(alternate, part_set_digest=evidence_part_set_digest(references)))
-        await db.upsert_memory_unit_support_assertion(MemoryUnitSupportAssertion(
-            id=memory_unit_support_assertion_id(
-                memory_id=skipped.id, evidence_unit_id=alternate.id,
-                source_id="src-1", access_context_hash=alternate.access_context_hash,
-            ),
-            memory_id=skipped.id, evidence_unit_id=alternate.id,
-            source_id="src-1", access_context_hash=alternate.access_context_hash,
         ))
         old_support = await active_support_evidence(db, skipped.id, source_id="src-1")
         assert len({part.evidence_unit_id for part in old_support}) == 2

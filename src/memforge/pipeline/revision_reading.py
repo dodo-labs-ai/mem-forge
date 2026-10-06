@@ -36,6 +36,8 @@ class ReadingGroup:
     owner: str | None = None
     # An outermost list: its member Fragments are read as one unit.
     is_list: bool = False
+    # Source-declared governing structure, distinct from additional reading context.
+    governing_anchors: tuple[SourceAnchor, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +168,27 @@ def build_revision_reading_index(
         fields = canonical_record_field_ranges(revision)
         groups.extend(_canonical_context_groups(fields, ordered_fragments))
         for field in fields:
+            if (
+                field.descriptor.text_format is not None
+                and isinstance(field.value, str)
+                and field.string_boundaries is not None
+            ):
+                coordinates = _Coordinates(boundaries=field.string_boundaries)
+                for native in field.descriptor.text_format.parse(field.value).groups:
+                    start, end = coordinates.range(native.start, native.end)
+                    context = tuple(
+                        anchor
+                        for left, right in native.context_ranges
+                        for anchor in _anchors_in_range(
+                            ordered_fragments, *coordinates.range(left, right), exact=True,
+                        )
+                    )
+                    groups.append(ReadingGroup(
+                        kind="canonical-declared-text", range_start=start, range_end=end,
+                        trigger_anchors=_anchors_in_range(ordered_fragments, start, end),
+                        context_anchors=context, owner=field.descriptor.json_pointer,
+                        is_list=native.together, governing_anchors=context,
+                    ))
             if (
                 field.descriptor.nested_profile == "markdown-structural"
                 and isinstance(field.value, str)
@@ -334,6 +357,7 @@ def _heading_groups(
                 range_end=scope_end,
                 trigger_anchors=triggers,
                 context_anchors=_ordered_unique((*heading_anchors, *intro)),
+                governing_anchors=heading_anchors,
                 owner=owner,
             )
         )
@@ -366,6 +390,7 @@ def _list_groups(
                 range_end=container.end,
                 trigger_anchors=members,
                 context_anchors=_ordered_unique((*lead_in, *members)),
+                governing_anchors=lead_in,
                 owner=owner,
                 is_list=True,
             )
@@ -403,6 +428,7 @@ def _canonical_context_groups(
                 range_end=owner.end,
                 trigger_anchors=triggers,
                 context_anchors=contexts,
+                governing_anchors=contexts,
                 owner=owner.descriptor.json_pointer,
             )
         )

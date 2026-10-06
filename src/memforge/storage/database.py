@@ -7,6 +7,8 @@ FTS5 rows must be manually synced on insert/update/delete of memories.
 
 from __future__ import annotations
 
+from memforge.memory.text_view import TextEvidenceView
+
 import asyncio
 import hashlib
 import json
@@ -109,6 +111,7 @@ from memforge.memory.evidence import (
     ReviewCase,
     evidence_context_association_id,
     evidence_part_set_digest,
+    evidence_items_part_set_digest,
     evidence_unit_revision_lineage_is_valid,
     evidence_relation_retry_identity,
     evidence_reference_id_for,
@@ -238,6 +241,7 @@ from memforge.source_derivation import (
     memory_extraction_output_payload,
     memory_extraction_result_from_output_payload,
     output_payload_hash,
+    require_source_derivation_ready_for_commit,
     safe_derivation_error,
     source_derivation_document_identity_hash,
     source_derivation_projection_identity_hash,
@@ -1460,6 +1464,8 @@ CREATE TABLE IF NOT EXISTS evidence_references (
     presentation_sha256         TEXT,
     excerpt                     TEXT,
     artifact_metadata_json      TEXT NOT NULL DEFAULT '{}',
+    text_view_json              TEXT,
+    display_text                TEXT,
     created_at                  TEXT NOT NULL,
     CHECK (
         (role IN ('primary', 'required') AND evidence_unit_id IS NOT NULL)
@@ -4522,6 +4528,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # Sources sync on their own schedules only.
         ["DROP TABLE IF EXISTS schedule_config"],
     ),
+    (109, "Persist source-bound text interpretation on Evidence references", [
+        "ALTER TABLE evidence_references ADD COLUMN text_view_json TEXT",
+    ]),
+    (110, "Persist focused Evidence presentation separately from source excerpts", [
+        "ALTER TABLE evidence_references ADD COLUMN display_text TEXT",
+    ]),
+
 ]
 
 
@@ -4856,7 +4869,7 @@ class Database:
     async def _classify_jira_changelog_revisions_unlocked(self) -> int:
         """Give every stored Jira changelog revision the semantic class its content has."""
 
-        from memforge.pipeline.source_projection_adapters import jira_changelog_semantic_class
+        from memforge.source_adapters.jira import changelog_semantic_class as jira_changelog_semantic_class
 
         rows = await self.db.execute_fetchall(
             """SELECT sor.id, sor.content, sor.metadata_json
@@ -5016,7 +5029,7 @@ class Database:
         self,
     ) -> EvidenceProfileBackfillReport:
         from memforge.source_representation import (
-            representation_profile_for_observation_contract,
+            legacy_representation_profile_for_observation_contract,
         )
 
         async with self.db.execute(
@@ -5038,7 +5051,7 @@ class Database:
             if any(row[key] is not None for key in ("profile_name", "profile_version", "coordinate_space")):
                 unresolved.append(str(row["id"]))
                 continue
-            profile = representation_profile_for_observation_contract(
+            profile = legacy_representation_profile_for_observation_contract(
                 source_type=str(row["source_type"]),
                 observation_type=str(row["observation_type"]),
             )
@@ -7651,16 +7664,19 @@ class Database:
     async def get_memory_evidence_units(
         self,
         memory_id: str,
+        *, include_historical: bool = False,
+        context_reference_id: str | None = None,
     ) -> tuple[MemoryEvidenceUnitProjection, ...]:
         """Return one hash-verified grouped Evidence projection for get_memory."""
 
+        active_clause = "" if include_historical else " AND msa.active = 1"
         support_rows = await self.db.execute_fetchall(
-            """SELECT msa.id AS support_id, msa.evidence_unit_id,
+            f"""SELECT msa.id AS support_id, msa.evidence_unit_id, msa.active AS support_active,
                       eu.source_id, eu.source_type, eu.source_lineage_id,
-                      eu.doc_revision_id, eu.doc_id
+                      eu.doc_revision_id, eu.doc_id, eu.visibility, eu.owner_user_id, eu.part_set_digest
                  FROM memory_unit_support_assertions msa
                  JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
-                WHERE msa.memory_id = ? AND msa.active = 1
+                WHERE msa.memory_id = ?{active_clause}
                 ORDER BY msa.evidence_unit_id, msa.id""",
             (memory_id,),
         )
@@ -7671,6 +7687,10 @@ class Database:
                 unit_id,
                 {
                     "support_ids": [],
+                    "support_active": False,
+                    "visibility": str(row["visibility"]),
+                    "owner_user_id": row["owner_user_id"],
+                    "part_set_digest": row["part_set_digest"],
                     "source_id": str(row["source_id"]),
                     "source_type": str(row["source_type"]),
                     "source_unit_id": str(row["source_lineage_id"] or ""),
@@ -7689,15 +7709,18 @@ class Database:
             support_ids = header["support_ids"]
             assert isinstance(support_ids, list)
             support_ids.append(str(row["support_id"]))
+            header["support_active"] = header["support_active"] or bool(row["support_active"])
 
         projected: list[MemoryEvidenceUnitProjection] = []
+        text_indexes = {}
         for unit_id, header in sorted(grouped_headers.items()):
             supporting_rows = await self.db.execute_fetchall(
                 """SELECT er.*, eu.excerpt AS unit_excerpt,
                           so.observation_type, so.current_revision_id,
                           so.source_id AS observation_source_id,
                           so.source_unit_id AS observation_source_unit_id,
-                          sor.content, sor.metadata_json, sor.profile_name
+                          sor.content, sor.metadata_json, sor.profile_name, sor.profile_version,
+                          sor.coordinate_space, sor.representation_schema_name, sor.representation_schema_version
                      FROM evidence_references er
                      JOIN evidence_units eu ON eu.id = er.evidence_unit_id
                      JOIN source_observations so ON so.id = er.observation_id
@@ -7709,12 +7732,18 @@ class Database:
                              er.range_start, er.range_end, er.id""",
                 (unit_id,),
             )
-            context_rows = await self.db.execute_fetchall(
-                """SELECT er.*, NULL AS unit_excerpt,
+            # A retained association proves one requested Context reference,
+            # never a complete historical Context snapshot.
+            context_clause = (" AND association.evidence_reference_id = ?"
+                              if context_reference_id is not None else " AND association.active = 1")
+            context_params = (unit_id, context_reference_id) if context_reference_id is not None else (unit_id,)
+            context_rows = () if include_historical and context_reference_id is None else await self.db.execute_fetchall(
+                f"""SELECT er.*, NULL AS unit_excerpt,
                           so.observation_type, so.current_revision_id,
                           so.source_id AS observation_source_id,
                           so.source_unit_id AS observation_source_unit_id,
-                          sor.content, sor.metadata_json, sor.profile_name
+                          sor.content, sor.metadata_json, sor.profile_name, sor.profile_version,
+                          sor.coordinate_space, sor.representation_schema_name, sor.representation_schema_version
                      FROM evidence_context_associations association
                      JOIN evidence_references er
                        ON er.id = association.evidence_reference_id
@@ -7722,11 +7751,11 @@ class Database:
                      JOIN source_observation_revisions sor
                        ON sor.id = er.observation_revision_id
                     WHERE association.evidence_unit_id = ?
-                      AND association.active = 1
+                      {context_clause}
                       AND er.role = 'context'
                     ORDER BY er.observation_revision_id,
                              er.range_start, er.range_end, er.id""",
-                (unit_id,),
+                context_params,
             )
             supporting_items: list[MemoryEvidenceItemProjection] = []
             invalid_support = False
@@ -7740,14 +7769,25 @@ class Database:
                     break
                 try:
                     supporting_items.append(
-                        self._project_memory_evidence_item(row)
+                        self._project_memory_evidence_item(row, text_indexes=text_indexes)
                     )
-                except ValueError:
+                except ValueError as error:
+                    if row["text_view_json"]:
+                        raise ValueError("Pinned text Evidence integrity verification failed") from error
                     invalid_support = True
                     break
             if invalid_support or not supporting_items or sum(
                 item.role is EvidenceRole.PRIMARY for item in supporting_items
             ) != 1:
+                continue
+            try:
+                if evidence_items_part_set_digest(tuple(supporting_items)) != header["part_set_digest"]:
+                    if any(item.text_view for item in supporting_items):
+                        raise ValueError("Pinned text Evidence part-set integrity failed")
+                    continue
+            except ValueError:
+                if any(item.text_view for item in supporting_items):
+                    raise
                 continue
             context_items: list[MemoryEvidenceItemProjection] = []
             for row in context_rows:
@@ -7758,8 +7798,10 @@ class Database:
                 ):
                     continue
                 try:
-                    context_items.append(self._project_memory_evidence_item(row))
-                except ValueError:
+                    context_items.append(self._project_memory_evidence_item(row, text_indexes=text_indexes))
+                except ValueError as error:
+                    if row["text_view_json"]:
+                        raise ValueError("Pinned text Evidence integrity verification failed") from error
                     continue
             items = tuple(
                 sorted(
@@ -7792,18 +7834,20 @@ class Database:
                     source_unit_id=str(header["source_unit_id"]),
                     source_unit_revision_id=header["source_unit_revision_id"],
                     doc_id=header["doc_id"],
-                    current=all(
+                    current=bool(header["support_active"]) and all(
                         item.current
                         for item in items
                         if item.grants_support
                     ),
                     items=items,
+                    visibility=str(header["visibility"]),
+                    owner_user_id=header["owner_user_id"],
                 )
             )
         return tuple(projected)
 
     @staticmethod
-    def _project_memory_evidence_item(row) -> MemoryEvidenceItemProjection:
+    def _project_memory_evidence_item(row, *, text_indexes=None) -> MemoryEvidenceItemProjection:
         role = EvidenceRole(str(row["role"]))
         anchor = SourceAnchor(
             kind=AnchorKind(str(row["anchor_kind"])),
@@ -7858,6 +7902,7 @@ class Database:
                 kind=EvidencePartKind.ARTIFACT,
                 anchor=anchor,
                 excerpt=None,
+                display_text=row["display_text"],
                 raw_content_sha256=raw_digest,
                 presentation_sha256=presentation_digest,
                 current=current,
@@ -7889,11 +7934,38 @@ class Database:
         presentation_digest = hashlib.sha256(excerpt.encode("utf-8")).hexdigest()
         if row["presentation_sha256"] not in {None, presentation_digest}:
             raise ValueError("text Evidence presentation digest mismatch")
+        text_view = TextEvidenceView.from_payload(json.loads(row["text_view_json"]) if row["text_view_json"] else None)
+        if text_view is not None:
+            text_view.verify_origins(anchor, content)
+        from memforge.source_representation import representation_contract_for_profile
+        pinned_profile = _evidence_profile_from_storage_row(row)
+        interpretation_available = text_view is None or (
+            text_view.version == 1 and representation_contract_for_profile(pinned_profile) is not None)
+        if text_view is not None and interpretation_available:
+            from memforge.pipeline.evidence_fragments import build_revision_fragment_index, verify_text_evidence_view
+
+            revision = SourceObservationRevision(
+                id=anchor.observation_revision_id, observation_id=anchor.observation_id,
+                semantic_hash="pinned-delivery", content=content,
+                evidence_profile=pinned_profile)
+            text_indexes = text_indexes if text_indexes is not None else {}
+            if revision.id not in text_indexes:
+                index = build_revision_fragment_index(revision)
+                text_indexes[revision.id] = (index, {f.anchor: f for f in index.fragments})
+            index, selections = text_indexes[revision.id]
+            if anchor not in selections:
+                raise ValueError("pinned text view selection is unavailable")
+            verify_text_evidence_view(revision, index=index, selected_fragment=selections[anchor],
+                anchor=anchor, raw_content_sha256=raw_digest,
+                presentation_sha256=presentation_digest, excerpt=excerpt, text_view=text_view)
         return MemoryEvidenceItemProjection(
             reference_id=str(row["id"]),
             role=role,
             kind=EvidencePartKind.TEXT,
             anchor=anchor,
+            text_view=text_view,
+            interpretation_available=interpretation_available,
+            display_text=row["display_text"],
             excerpt=excerpt,
             raw_content_sha256=raw_digest,
             presentation_sha256=presentation_digest,
@@ -8505,6 +8577,8 @@ class Database:
                         else None
                     ),
                 ),
+                text_view=TextEvidenceView.from_payload(json.loads(row["text_view_json"]) if row["text_view_json"] else None),
+                display_text=row["display_text"],
                 raw_content_sha256=str(row["raw_content_sha256"]),
                 presentation_sha256=str(row["presentation_sha256"]),
                 excerpt=(str(row["excerpt"]) if row["excerpt"] is not None else None),
@@ -8640,6 +8714,8 @@ class Database:
                 presentation_sha256=item.presentation_sha256,
                 excerpt=item.excerpt,
                 artifact_metadata=dict(item.artifact_metadata),
+                text_view=item.text_view,
+                display_text=item.display_text,
             )
             for item in validated
         )
@@ -8665,8 +8741,8 @@ class Database:
                             observation_id, observation_revision_id, fragment_id,
                             range_start, range_end, raw_content_sha256,
                             presentation_sha256, excerpt, artifact_metadata_json,
-                            created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            created_at, text_view_json, display_text
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             item.id,
                             item.evidence_unit_id,
@@ -8687,6 +8763,8 @@ class Database:
                                 separators=(",", ":"),
                             ),
                             _now_iso(),
+                            json.dumps(item.text_view.payload(), sort_keys=True, separators=(",", ":")) if item.text_view else None,
+                            item.display_text,
                         ),
                     )
                     if item.role is EvidenceRole.CONTEXT:
@@ -8742,6 +8820,8 @@ class Database:
                 presentation_sha256=reference.presentation_sha256,
                 excerpt=reference.excerpt,
                 artifact_metadata=dict(reference.artifact_metadata),
+                text_view=reference.text_view,
+                display_text=reference.display_text,
             )
             for reference in references
         )
@@ -8781,8 +8861,8 @@ class Database:
                                observation_id, observation_revision_id, fragment_id,
                                range_start, range_end, raw_content_sha256,
                                presentation_sha256, excerpt, artifact_metadata_json,
-                               created_at
-                           ) VALUES (?, NULL, 'context', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               created_at, text_view_json, display_text
+                           ) VALUES (?, NULL, 'context', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             reference.id,
                             reference.kind.value if reference.kind is not None else None,
@@ -8801,6 +8881,8 @@ class Database:
                                 separators=(",", ":"),
                             ),
                             now,
+                            json.dumps(reference.text_view.payload(), sort_keys=True, separators=(",", ":")) if reference.text_view else None,
+                            reference.display_text,
                         ),
                     )
                     await self.db.execute(
@@ -8936,7 +9018,7 @@ class Database:
                            er.observation_id, er.observation_revision_id,
                            er.fragment_id, er.range_start, er.range_end,
                            er.raw_content_sha256, er.presentation_sha256,
-                           er.excerpt
+                           er.excerpt, er.text_view_json, er.display_text
                     FROM memory_unit_support_assertions msa
                     JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
                     LEFT JOIN lifecycle_plans lp ON lp.id = msa.validation_plan_id
@@ -8986,6 +9068,8 @@ class Database:
                             if row["excerpt"] is not None
                             else None
                         ),
+                        text_view=TextEvidenceView.from_payload(json.loads(row["text_view_json"]) if row["text_view_json"] else None),
+                        display_text=row["display_text"],
                         raw_content_sha256=(
                             str(row["raw_content_sha256"])
                             if row["raw_content_sha256"] is not None
@@ -9125,7 +9209,9 @@ class Database:
                                   target_unit_revision_id, status,
                                   projection_identity_hash,
                                   context_payload_json,
-                                  context_identity_hash
+                                  context_identity_hash,
+                                  extraction_contract_version,
+                                  terminal_reason_code
                            FROM source_derivation_attempts
                            WHERE id = ?""",
                         (derivation_id,),
@@ -9144,6 +9230,11 @@ class Database:
                         }
                     ):
                         raise ValueError("Source derivation is not ready for lifecycle commit")
+                    require_source_derivation_ready_for_commit(
+                        status=derivation["status"],
+                        extraction_contract_version=derivation["extraction_contract_version"],
+                        terminal_reason_code=derivation["terminal_reason_code"],
+                    )
                     if derivation["projection_identity_hash"] != (
                         source_derivation_projection_identity_hash(projection)
                     ):
@@ -9713,8 +9804,8 @@ class Database:
                     observation_id, observation_revision_id, fragment_id,
                     range_start, range_end, raw_content_sha256,
                     presentation_sha256, excerpt, artifact_metadata_json,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    created_at, text_view_json, display_text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     reference.id,
                     (
@@ -9739,6 +9830,8 @@ class Database:
                         separators=(",", ":"),
                     ),
                     now,
+                            json.dumps(reference.text_view.payload(), sort_keys=True, separators=(",", ":")) if reference.text_view else None,
+                            reference.display_text,
                 ),
             )
             if reference.role is EvidenceRole.CONTEXT:
@@ -14113,8 +14206,13 @@ class Database:
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]:
         results: list[MemorySource] = []
         async with self.db.execute(
-            """SELECT * FROM memory_sources
-               WHERE memory_id = ?
+            """SELECT ms.*, EXISTS (
+                   SELECT 1 FROM memory_unit_support_assertions msa
+                   JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+                   WHERE msa.memory_id = ms.memory_id
+                     AND eu.source_id = ms.source_id AND eu.doc_id = ms.doc_id
+               ) AS has_unit_support FROM memory_sources ms
+               WHERE ms.memory_id = ?
                ORDER BY
                    CASE WHEN support_kind = 'extracted' THEN 0 ELSE 1 END,
                    added_at DESC,
@@ -14134,6 +14232,7 @@ class Database:
                         support_kind=d.get("support_kind", "extracted"),
                         added_at=_parse_dt(d["added_at"]),
                         source_updated_at=_parse_dt(d.get("source_updated_at")),
+                        has_unit_support=bool(d["has_unit_support"]),
                     )
                 )
         return results

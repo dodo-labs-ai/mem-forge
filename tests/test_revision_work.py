@@ -1,5 +1,7 @@
 """Ordered Support reading contracts; fixture judgments are not model-accuracy evidence."""
 
+from tests.evidence_display_fixture import evidence_displays
+
 import json
 import logging
 from dataclasses import replace
@@ -43,7 +45,9 @@ class Client:
     """Support the release rule unless a complete exception has been read."""
 
     def __init__(self, limit=8000):
-        self.limit = limit
+        # Synthetic quotas preserve the source-data allowance when fixed instructions grow.
+        from memforge.pipeline.extraction_contract import EVIDENCE_DISPLAY_RULES
+        self.limit = limit + len(EVIDENCE_DISPLAY_RULES) + len("\nFor a supported result only:\n")
         self.prompts = []
         self.impact_prompts = []
         self.fail_at = None
@@ -223,6 +227,7 @@ async def test_unknown_selector_gets_one_local_correction_not_a_completed_receip
             for row in results:
                 if row["status"] == "supported":
                     row["primary_ref"] = "not-supplied"
+                    row["evidence_displays"] = evidence_displays(row["primary_ref"], row["required_refs"])
             return results
 
     client = InvalidClient()
@@ -238,6 +243,29 @@ async def test_unknown_selector_gets_one_local_correction_not_a_completed_receip
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("duplicates_primary", [True, False])
+async def test_duplicate_model_selectors_remain_explicitly_invalid(duplicates_primary):
+    class DuplicateClient(Client):
+        def judge(self, prompt):
+            results = super().judge(prompt)
+            other = next(ref for ref, text in readable(payload(prompt)) if text != RULE)
+            for row in results:
+                if row["status"] == "supported":
+                    repeated = row["primary_ref"] if duplicates_primary else other
+                    row["required_refs"] = [repeated, repeated]
+                    row["evidence_displays"] = evidence_displays(row["primary_ref"], row["required_refs"])
+            return results
+
+    client, store = DuplicateClient(), Store()
+    executor = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="duplicate-test")
+    [result] = (await executor.assess_many(work_items(CHANGED))).values()
+    assert (result.supported, result.unresolved, result.memory) == (None, "invalid_response", None)
+    assert len(client.prompts) == 2 and "<correction>" in client.prompts[-1]
+    assert "duplicate-free" in client.prompts[-1]
+    assert not executor.final_work_ids and not receipts(store)
+
+
+@pytest.mark.asyncio
 async def test_one_claim_whose_selection_stays_invalid_leaves_the_others_judged():
     class OneInvalidClient(Client):
         def judge(self, prompt):
@@ -245,6 +273,7 @@ async def test_one_claim_whose_selection_stays_invalid_leaves_the_others_judged(
             for row in results:
                 if row["work_id"] == "WRK-0001" and row["status"] == "supported":
                     row["primary_ref"] = "not-supplied"
+                    row["evidence_displays"] = evidence_displays(row["primary_ref"], row["required_refs"])
             return results
 
     client = OneInvalidClient()
@@ -440,6 +469,75 @@ async def test_witness_union_is_monotonic_and_rehydrated():
     for data in requests[1:]:
         assert data["works"][0]["previous_state"]["support_witness_refs"] == [first_ref]
         assert [first_ref, RULE] in [list(row[:2]) for row in data["carried_witness_catalog"]]
+
+
+@pytest.mark.asyncio
+async def test_carried_record_witnesses_keep_field_interpretation_across_requests():
+    from memforge.memory.evidence import ActiveSupportEvidence
+    from memforge.source_adapters.jira import CANONICAL_RECORD_SCHEMAS
+    from memforge.source_representation import representation_profile_for_observation_contract
+
+    _, current = revisions("unused", "unused")
+    record = json.dumps({"created": "2026-09-08", "items": [{
+        "field": "description", "fromString": "Two approvers.", "toString": "One approver.",
+    }]})
+    changed = replace(
+        current.observation_revisions[0], content=record,
+        evidence_profile=representation_profile_for_observation_contract(source_type="jira", observation_type="changelog"),
+    )
+    notes = replace(current.observation_revisions[1], id="rev-z-notes", content="\n\n".join(
+        f"Routine note {i}: unrelated maintenance information for the other observation."
+        for i in range(120)
+    ))
+    current = replace(
+        current, observation_revisions=(changed, notes),
+        source_unit_revisions=(replace(current.source_unit_revisions[0], observation_revision_ids=(changed.id, notes.id)),),
+    )
+    context = RevisionAssessmentContext(projection=current, base=None, access_context_hash="scope")
+    target = next(f for f in context.full_fragments if f.presentation_text.endswith("One approver."))
+    support = (ActiveSupportEvidence(
+        memory_id="memory", source_id="source-1", reference_id="e1", evidence_unit_id="eu1",
+        role=EvidenceRole.PRIMARY, anchor=target.anchor, excerpt=target.presentation_text,
+        raw_content_sha256=None, presentation_sha256=None,
+    ),)
+    item = SupportWorkItem("w0", replace(memory(), content="The recorded description changed to one approver."), support, context)
+
+    class RecordClient(Client):
+        def judge(self, prompt):
+            data = payload(prompt)
+            values = {suffix: ref for ref, text in readable(data)
+                      for suffix in ("Two approvers.", "One approver.") if text.endswith(suffix)}
+            current_refs = {row[0] for row in (
+                *data["current"]["primary_candidates"], *data["current"]["required_only_candidates"],
+            )}
+            return [
+                supported(w, values["One approver."]) if data["last"]
+                else continued(w, [ref for ref in values.values() if ref in current_refs])
+                for w in data["works"]
+            ]
+
+    client = RecordClient(limit=6500)
+    [result] = (await RevisionWorkExecutor(client=client, model="fixture").assess_many([item])).values()
+    assert result.supported and selected_texts(result) == [target.presentation_text]
+    requests = [payload(prompt) for prompt in client.prompts]
+    later = [data for data in requests if data["carried_witness_catalog"] and all(
+        not row[1].endswith(("Two approvers.", "One approver."))
+        for row in (*data["current"]["primary_candidates"], *data["current"]["required_only_candidates"])
+    )]
+    assert later, [(len(readable(data)), len(data["carried_witness_catalog"]), data["last"]) for data in requests]
+    interpretation = CANONICAL_RECORD_SCHEMAS["jira-changelog", 4].model_interpretation
+    for data in later:
+        rows = readable(data)
+        assert len({ref for ref, _ in rows}) == len(rows)
+        for text, field in (("Two approvers.", "/items/0/fromString"), ("One approver.", "/items/0/toString")):
+            [ref] = [ref for ref, value in rows if value.endswith(text)]
+            assert ref.startswith("PRM-")
+            [group] = [group for group in data["current"]["structural_groups"] if ref in group["refs"]]
+            assert group["field"] == field and group["format_interpretation"] == interpretation
+        unrelated_refs = {ref for ref, text in rows if text.startswith("Routine note")}
+        assert unrelated_refs
+        assert all("format_interpretation" not in group for group in data["current"]["structural_groups"]
+                   if unrelated_refs.intersection(group["refs"]))
 
 
 @pytest.mark.asyncio
@@ -679,11 +777,11 @@ async def test_jira_partial_projection_missing_comment_is_unresolved_without_a_c
     def support(text):
         fragment = next(
             f for f in RevisionAssessmentContext(projection=first, base=None, access_context_hash="scope").full_fragments
-            if f.presentation_text == text
+            if f.presentation_text.endswith(text)
         )
         return (ActiveSupportEvidence(
             memory_id=text, source_id="src-j", reference_id=text, evidence_unit_id=text, role=EvidenceRole.PRIMARY,
-            anchor=fragment.anchor, excerpt=text,
+            anchor=fragment.anchor, excerpt=fragment.presentation_text,
             raw_content_sha256=fragment.raw_content_sha256, presentation_sha256=fragment.presentation_sha256,
         ),)
 

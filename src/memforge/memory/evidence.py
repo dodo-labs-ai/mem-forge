@@ -9,6 +9,7 @@ from hashlib import sha256
 from typing import Any, Generic, Mapping, Protocol, TypeVar
 
 from memforge.source_projection import AnchorKind, SourceAnchor
+from memforge.memory.text_view import TextEvidenceView
 
 
 CandidateT = TypeVar("CandidateT")
@@ -104,10 +105,16 @@ class ResolvedEvidencePart:
     presentation_sha256: str
     excerpt: str | None = None
     artifact_metadata: Mapping[str, object] = field(default_factory=dict)
+    text_view: TextEvidenceView | None = None
+    display_text: str | None = None
 
     def __post_init__(self) -> None:
         if self.role not in {EvidenceRole.PRIMARY, EvidenceRole.REQUIRED}:
             raise ValueError("resolved Evidence parts must be Primary or Required")
+        if self.display_text is not None and (
+            not isinstance(self.display_text, str) or not self.display_text.strip()
+        ):
+            raise ValueError("Evidence display text must be nonempty text")
         for name, value in (
             ("raw_content_sha256", self.raw_content_sha256),
             ("presentation_sha256", self.presentation_sha256),
@@ -119,6 +126,10 @@ class ResolvedEvidencePart:
                 raise ValueError("text Evidence requires an exact range and excerpt")
             if self.artifact_metadata:
                 raise ValueError("text Evidence cannot carry Artifact metadata")
+            if self.text_view is not None:
+                self.text_view.validate_core(self.anchor)
+        elif self.text_view is not None:
+            raise ValueError("Artifact Evidence cannot carry a text view")
         elif self.anchor.kind is not AnchorKind.WHOLE_OBSERVATION:
             raise ValueError("Artifact Evidence requires a whole-Observation Anchor")
 
@@ -181,6 +192,8 @@ class EvidenceReference:
     presentation_sha256: str | None = None
     excerpt: str | None = None
     artifact_metadata: Mapping[str, object] = field(default_factory=dict)
+    text_view: TextEvidenceView | None = None
+    display_text: str | None = None
 
     @property
     def grants_support(self) -> bool:
@@ -242,8 +255,10 @@ class ActiveSupportEvidence:
     excerpt: str | None
     raw_content_sha256: str | None = None
     presentation_sha256: str | None = None
+    text_view: TextEvidenceView | None = None
     validation_plan_id: str | None = None
     validation_unit_revision_id: str | None = None
+    display_text: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +272,9 @@ class MemoryEvidenceItemProjection:
     presentation_sha256: str
     current: bool
     artifact_metadata: Mapping[str, object] = field(default_factory=dict)
+    text_view: TextEvidenceView | None = None
+    interpretation_available: bool = True
+    display_text: str | None = None
 
     @property
     def grants_support(self) -> bool:
@@ -274,6 +292,13 @@ class MemoryEvidenceUnitProjection:
     doc_id: str | None
     current: bool
     items: tuple[MemoryEvidenceItemProjection, ...]
+    visibility: str = "workspace"
+    owner_user_id: str | None = None
+
+    def visible_to(self, viewer_id: str | None) -> bool:
+        return self.visibility == "workspace" or (
+            self.visibility == "private" and bool(viewer_id) and self.owner_user_id == viewer_id
+        )
 
 
 def validate_evidence_references(
@@ -357,6 +382,9 @@ def evidence_part_set_digest(references: tuple[EvidenceReference, ...]) -> str:
         if identity in seen:
             raise ValueError("v2 Evidence part set contains a duplicate part")
         seen.add(identity)
+        if reference.text_view is not None:
+            reference.text_view.validate_core(anchor)
+            identity = (*identity, json.dumps(reference.text_view.payload(), sort_keys=True, separators=(",", ":")))
         parts.append(identity)
     canonical_parts = [list(part) for part in parts]
     canonical_parts.sort(
@@ -1082,3 +1110,14 @@ class MemoryRelationApplyService:
     def _memory_id_for_unit(unit: EvidenceUnit) -> str:
         digest = sha256(f"{unit.id}\x1f{LifecycleAction.CREATE_MEMORY.value}".encode("utf-8")).hexdigest()[:16]
         return f"mem-{digest}"
+
+
+def evidence_items_part_set_digest(items: tuple[MemoryEvidenceItemProjection, ...]) -> str:
+    """Verify projected supporting membership with the persisted Unit contract."""
+    return evidence_part_set_digest(tuple(
+        EvidenceReference(
+            id=item.reference_id, role=item.role, anchor=item.anchor, kind=item.kind,
+            raw_content_sha256=item.raw_content_sha256,
+            text_view=item.text_view,
+        ) for item in items if item.grants_support
+    ))

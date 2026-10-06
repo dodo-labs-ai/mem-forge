@@ -123,8 +123,9 @@ class ItemFailure:
     ``capacity_exceeded`` means the item alone exceeds the route's input
     capacity; ``invalid_response`` means the item's row stayed rejected after its
     re-ask, or a response that holds only this item could not be read into rows
-    after its correction; the caller's stage records
-    these two, and its Unit commits. The rest leave the Source Unit revision
+    after its correction. The caller owns the stage outcome: Support keeps an
+    unjudgeable incumbent, while incomplete Claim Extraction fails the Unit.
+    The rest leave the Source Unit revision
     uncommitted: ``deadline_exceeded`` and ``provider_error`` are transient and
     the sync retries them at once, while ``request_error``, a request that failed
     without a response to validate, is left for the next sync

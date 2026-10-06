@@ -85,6 +85,7 @@ def build_lifecycle_plan(
     incumbent_batch_size: int = 30,
     incumbent_authority_grants: Mapping[str, IncumbentAuthorityGrant] | None = None,
     coordinator_reviews: Sequence[LifecycleReview] = (),
+    unresolved_coordinator_review_ids: frozenset[str] = frozenset(),
 ) -> LifecyclePlan:
     """Build a complete plan without performing any storage mutation.
 
@@ -609,6 +610,7 @@ def build_lifecycle_plan(
         for review in coordinator_reviews
         if review.status is LifecycleReviewStatus.PENDING
         and review.id not in raised_review_ids
+        and review.id not in unresolved_coordinator_review_ids
         and review.incumbent_memory_id in incumbents
         and review.incumbent_memory_id not in undecided_ids
     )
@@ -813,5 +815,4 @@ def lifecycle_memory_version(memory: Memory) -> str:
         memory.content_hash,
         updated_at,
     )
-
 

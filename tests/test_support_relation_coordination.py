@@ -101,6 +101,41 @@ async def test_a_rejected_conflict_is_not_raised_again(db: Database) -> None:
 
 
 @pytest.mark.asyncio
+async def test_exact_review_refs_do_not_reuse_a_claim_after_external_qualification(db: Database) -> None:
+    page, memory = await seeded_page(db, TWO, RETENTION)
+    client = ScriptedClient(relations={(ONE, TWO): "contradicts"})
+    await page.commit(client, page.next(TWO, ONE, RETENTION), ONE)
+    [review] = await lifecycle_reviews(db, memory.id)
+    client.support_requests.clear()
+    client.verdicts[ONE] = [False]
+
+    stats = await page.commit(client, page.next(TWO, ONE, RETENTION, "The one-reviewer rule above is a proposal only."))
+
+    [closed] = await lifecycle_reviews(db, memory.id)
+    assert (closed.id, closed.status) == (review.id, LifecycleReviewStatus.STALE)
+    assert stats["coordinator_carried_conflict_count"] == 0
+    challenger_reads = [request for request in client.support_requests
+                        if any(work["claim"] == ONE for work in request["works"])]
+    assert challenger_reads
+    assert any("The one-reviewer rule above is a proposal only." in client.supplied_texts(request)
+               for request in challenger_reads)
+
+
+@pytest.mark.asyncio
+async def test_two_historical_review_occurrences_cannot_match_one_current_occurrence(db: Database) -> None:
+    page, memory = await seeded_page(db, TWO, RETENTION)
+    client = ScriptedClient(relations={(ONE, TWO): "contradicts"})
+    await page.commit(client, page.next(TWO, ONE, ONE, RETENTION), ONE)
+    [review] = await lifecycle_reviews(db, memory.id)
+
+    stats = await page.commit(client, page.next(TWO, ONE, RETENTION))
+
+    [preserved] = await lifecycle_reviews(db, memory.id)
+    assert (preserved.id, preserved.status) == (review.id, LifecycleReviewStatus.PENDING)
+    assert stats["coordinator_carried_conflict_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_an_unaffected_claim_contradicted_by_the_source_is_read_once_in_the_normal_order(db: Database) -> None:
     page, memory = await seeded_page(db, TWO, RETENTION)
     client = ScriptedClient(relations={(ONE, TWO): "contradicts"}, impact="unaffected")
@@ -412,7 +447,8 @@ async def test_a_partial_coverage_equivalent_rebinds_the_claim_after_one_recheck
     memory, first, second = await _jira_incumbent(db)
     claim = "A7 stays for regular payroll."
     client = ScriptedClient(
-        relations={(claim, memory.content): "equivalent"}, support_text={memory.content: claim},
+        relations={(claim, memory.content): "equivalent"},
+        support_text={memory.content: f"Issue: PAY-12\nIssue ID: 10012\nDescription:\n{claim}"},
     )
 
     stats = await _commit_jira(db, client, first, second, claim)
@@ -420,9 +456,13 @@ async def test_a_partial_coverage_equivalent_rebinds_the_claim_after_one_recheck
     assert stats["support_revalidation_unresolved_partial_coverage_count"] == 1
     assert stats["coordinator_recheck_count"] == 1 and stats["added"] == 0
     [recheck] = client.support_requests
-    assert client.supplied_texts(recheck) == [claim]
+    assert client.supplied_texts(recheck) == [
+        f"Issue: PAY-12\nIssue ID: 10012\nDescription:\n{claim}",
+        "Issue: PAY-12\nIssue id: 10012",
+        "Issue ID: 10012\nIssue key: PAY-12",
+    ]
     # The Support that had an UNKNOWN part is replaced by the returned description.
-    assert await support_texts(db, memory.id) == {claim}
+    assert await support_texts(db, memory.id) == {f"Issue: PAY-12\nIssue ID: 10012\nDescription:\n{claim}"}
     assert await lifecycle_reviews(db, memory.id) == []
 
 

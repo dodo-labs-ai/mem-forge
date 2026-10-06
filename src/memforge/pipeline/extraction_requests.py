@@ -5,7 +5,10 @@ import hashlib
 from memforge.llm.batch_runner import LlmBatchRunner
 from memforge.llm.structured import INPUT_CAPACITY_EXCEEDED
 from memforge.pipeline.memory_extractor import ExtractionReading, MemoryExtractor
-from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionPlan, ExtractionRequest
+from memforge.pipeline.projection_context import (
+    ExtractionAuthority, ExtractionPlan, ExtractionRequest,
+    ProjectionEvidencePlanningFailure, ProjectionEvidencePlanningFailureCode,
+)
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 
 
@@ -16,14 +19,13 @@ def plan_extraction_requests(
     extractor: MemoryExtractor,
     source_type: str,
     doc_type: str,
-) -> ExtractionPlan:
+) -> ExtractionPlan | ProjectionEvidencePlanningFailure:
     """Pack every ReadingGroup that holds authorized Primary into the fewest requests that fit.
 
     An update authorizes only its changed structures, so it reads those
     ReadingGroups; a first import or reprocess reads every ReadingGroup. There is
-    no cost comparison with another reading scope and no truncation: a
-    ReadingGroup that alone exceeds the route's capacity is skipped with a
-    diagnostic, and every other group is planned.
+    no cost comparison with another reading scope and no truncation. Any group
+    that cannot fit alone rejects the complete plan before inference or staging.
     """
 
     reading = ExtractionReading.of_authority(context, authority, source_type=source_type, doc_type=doc_type)
@@ -36,6 +38,15 @@ def plan_extraction_requests(
             item_ids, output_tokens=extractor.fragment_output_tokens, fits=runner.fits,
         ),
     )
+    if planned.unfit:
+        reading.report_unread(dict.fromkeys(planned.unfit, INPUT_CAPACITY_EXCEEDED))
+        return ProjectionEvidencePlanningFailure(
+            code=ProjectionEvidencePlanningFailureCode.EXTRACTION_INPUT_CAPACITY_EXCEEDED,
+            observation_id=None,
+            observation_revision_id=None,
+            representation_profile=None,
+            authorized_structure_count=len(reading.items),
+        )
     source_unit_id = context.projection.source_units[0].id
     requests = []
     for entry in planned.requests:
@@ -51,10 +62,9 @@ def plan_extraction_requests(
             )
         )
 
-    unfit = set(planned.unfit)
     expected = {
         fragment.anchor
-        for item_id, group in reading.items.items() if item_id not in unfit
+        for group in reading.items.values()
         for fragment in group if fragment.primary_eligible
     }
     actual = [
@@ -65,4 +75,4 @@ def plan_extraction_requests(
     ]
     if len(actual) != len(set(actual)) or set(actual) != expected:
         raise ValueError("extraction request authority coverage mismatch")
-    return ExtractionPlan(tuple(requests), reading.report_skipped(dict.fromkeys(planned.unfit, INPUT_CAPACITY_EXCEEDED)))
+    return ExtractionPlan(tuple(requests))

@@ -1116,6 +1116,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/memories/{memory_id}/evidence/{evidence_unit_id}/references/{reference_id}/resource": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Memory Evidence Resource
+         * @description Read verified stored citations and the complete immutable Unit source material.
+         */
+        get: operations["get_memory_evidence_resource_api_v1_memories__memory_id__evidence__evidence_unit_id__references__reference_id__resource_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/memories/{memory_id}/evidence/{evidence_unit_id}/resource": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Memory Evidence Resource
+         * @description Read verified stored citations and the complete immutable Unit source material.
+         */
+        get: operations["get_memory_evidence_resource_api_v1_memories__memory_id__evidence__evidence_unit_id__resource_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/memories/{memory_id}/purge": {
         parameters: {
             query?: never;
@@ -3672,6 +3712,8 @@ export interface components {
              * @enum {string}
              */
             kind: "evidence_unit" | "document";
+            /** Resource Url */
+            resource_url?: string | null;
             /** Source Id */
             source_id: string;
             /** Source Type */
@@ -3699,6 +3741,13 @@ export interface components {
             evidence_reference_id?: string | null;
             /** Excerpt */
             excerpt?: string | null;
+            /** Fragment Id */
+            fragment_id?: string | null;
+            /**
+             * Interpretation Available
+             * @default true
+             */
+            interpretation_available: boolean;
             /**
              * Kind
              * @enum {string}
@@ -3716,6 +3765,8 @@ export interface components {
             range_start?: number | null;
             /** Raw Content Sha256 */
             raw_content_sha256?: string | null;
+            /** Resource Url */
+            resource_url?: string | null;
             /**
              * Role
              * @enum {string}
@@ -3723,6 +3774,12 @@ export interface components {
             role: "primary" | "required" | "context";
             /** Support Contribution */
             support_contribution: boolean;
+            /** Text */
+            text?: string | null;
+            /** Text View */
+            text_view?: {
+                [key: string]: unknown;
+            } | null;
         };
         /** MemoryLifecycleResponse */
         MemoryLifecycleResponse: {
@@ -7089,6 +7146,73 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MemoryCorrectionProposalResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_memory_evidence_resource_api_v1_memories__memory_id__evidence__evidence_unit_id__references__reference_id__resource_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                memory_id: string;
+                evidence_unit_id: string;
+                reference_id: string | null;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_memory_evidence_resource_api_v1_memories__memory_id__evidence__evidence_unit_id__resource_get: {
+        parameters: {
+            query?: {
+                reference_id?: string | null;
+            };
+            header?: never;
+            path: {
+                memory_id: string;
+                evidence_unit_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
                 };
             };
             /** @description Validation Error */
