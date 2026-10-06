@@ -899,7 +899,8 @@ class ToolClient:
                     "Use a relative MemForge /api/v1/source-units/{source_unit_id} or "
                     "/api/v1/documents/{doc_id} URL ending in /content, /pdf or "
                     "/artifacts/{kind}, or /api/v1/source-artifacts/{observation_revision_id} "
-                    "URL, or an absolute URL under MEMFORGE_API_URL."
+                    "URL, /api/v1/memories/{memory_id}/evidence/{evidence_unit_id}/resource, "
+                    "or an absolute URL under MEMFORGE_API_URL."
                 ),
             }
 
@@ -975,6 +976,9 @@ class ToolClient:
                     "hint": "Use mode=file for large or binary artifacts.",
                     "max_bytes": max_bytes,
                 }
+            _verify_resource_integrity(
+                headers, observed_size=len(data), observed_sha256=hashlib.sha256(data).hexdigest(),
+            )
             if mode == "base64":
                 return {**metadata, "data_base64": base64.b64encode(data).decode("ascii")}
             if not _is_text_content_type(content_type):
@@ -984,6 +988,11 @@ class ToolClient:
                     "hint": "Use mode=file or mode=base64 for binary artifacts.",
                 }
             text = data.decode("utf-8", errors="replace")
+            if target.kind == "evidence_unit" and len(text) > max_chars:
+                return {
+                    **metadata, "error": "pinned Evidence exceeds max_chars", "truncated": True,
+                    "hint": "Use mode=file or increase max_chars for the complete JSON resource.",
+                }
             return {**metadata, "text": text[:max_chars], "truncated": len(text) > max_chars}
 
     def _fetch_resource_file(self, target: ResourceTarget) -> dict[str, Any]:
@@ -1103,6 +1112,18 @@ def _parse_resource_url(
     parts = [unquote(part) for part in path.strip("/").split("/") if part]
     if any(part in {".", ".."} or "/" in part or "\\" in part for part in parts):
         return None
+    if (len(parts) == 9 and parts[:3] == ["api", "v1", "memories"]
+            and parts[4] == "evidence" and parts[6] == "references" and parts[8] == "resource"):
+        return ResourceTarget(
+            parts[7], "evidence_unit", path,
+            request_url_for_path(path[len("/api/v1"):]), identity_key="evidence_reference_id",
+        )
+    if (len(parts) == 7 and parts[:3] == ["api", "v1", "memories"]
+            and parts[4] == "evidence" and parts[6] == "resource"):
+        return ResourceTarget(
+            parts[5], "evidence_unit", path,
+            request_url_for_path(path[len("/api/v1"):]), identity_key="evidence_unit_id",
+        )
     stored_content_identity = _STORED_CONTENT_RESOURCE_IDENTITY.get(tuple(parts[:3]))
     if stored_content_identity is not None:
         request_url = request_url_for_path(path[len("/api/v1") :])

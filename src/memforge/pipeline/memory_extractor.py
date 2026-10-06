@@ -13,7 +13,6 @@ from memforge.config import DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
 from memforge.evals.agent_evaluation import QualitySignal, record_quality_signal
 from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import (
-    INPUT_CAPACITY_EXCEEDED,
     LiteLlmStructuredClient,
     ProjectionFragmentMemoryExtractionResponse,
     StructuredLlmConfig,
@@ -22,12 +21,11 @@ from memforge.llm.structured import (
 from memforge.models import MemoryExtractionResult, RawMemory
 from memforge.pipeline.extraction_contract import (
     DURABLE_MEMORY_QUALITY_RULES,
+    EVIDENCE_DISPLAY_RULES,
+    MEMORY_CLAIM_EVIDENCE_RULES,
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
 )
-from memforge.pipeline.fragment_selector_correction import (
-    correct_fragment_selectors_once,
-    normalize_fragment_selector_refs,
-)
+
 from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
     ProjectionFragmentCatalog,
@@ -51,31 +49,27 @@ PROJECTION_FRAGMENT_EXTRACTION_PROMPT = """You are extracting durable atomic kno
 
 <source_type>{source_type}</source_type>
 <doc_type>{doc_type}</doc_type>
-{unit_title}Catalog rows are [ref, exact source text, optional metadata]. Headings are ordinary selectable Fragments.
+{unit_title}Catalog rows are [ref, faithful source view, optional metadata]. Headings are ordinary selectable Fragments.
 Preserve table column/row associations, list order, code indentation and explicit exceptions.
-A table ref contains the complete table; read its headers before asserting a cell value.
+Each ref covers its supplied selection, which may be one row or a larger structure.
+Read the supplied labels and structural context before interpreting a value;
+do not assume that one ref covers the entire document or table.
 A figure preserves its image link and caption together. Only a supplied image Artifact
 ref proves image contents; a caption or URL alone never proves unseen image details.
-Canonical fromString is the previous value; toString is the new value. Select the
-field-name/time refs when needed to state the change accurately.
-Structural groups describe ancestry, not additional Evidence. When a heading defines claim scope, select its current ref as Required.
+Use the adapter's format_interpretation to read source-specific field meanings.
+Structural groups describe ancestry, not additional Evidence. Authored scope must
+remain in the claim; select its ref only when it adds relevant evidence.
 Only the following application-owned Evidence Fragments may support a Memory:
 <evidence_fragment_catalog digest="{catalog_digest}">
 {fragment_catalog}
 </evidence_fragment_catalog>
 
-Each Memory must contain exactly:
-- "content": one self-contained durable claim
-- "memory_type": one of "fact", "decision", "convention", "procedure"
-- "entity_refs": entity names copied from supporting Fragments
-- "valid_from": YYYY-MM-DD or null
-- "valid_until": YYYY-MM-DD or null
-- "primary_ref": exactly one `pNNNNNN` ref from `primary_candidates` that directly states the claim
-- "required_refs": a duplicate-free list of presented `pNNNNNN` or `rNNNNNN` refs without which the claim would be invalid or ambiguous
+Use the supplied response schema. Within each Memory choose primary_ref, write
+final content and metadata, then select required_refs in the same response.
 
-Do not return Evidence text, quotes, Observation or Revision IDs, offsets, hashes, profile names, catalog digests, Context refs, or lifecycle actions. Split a candidate that would otherwise need multiple independently claim-bearing Primary refs.
+Do not return Observation or Revision IDs, offsets, hashes, profile names, catalog digests, Context refs, or lifecycle actions. Split a candidate that would otherwise need multiple independently claim-bearing Primary refs.
 
-""" + DURABLE_MEMORY_QUALITY_RULES + """`required_only_candidates` may be selected as Required but never as Primary. If a durable claim is stated only by required_only_candidates, return an empty memories array. Fragment refs are valid only in this catalog. Never invent or transform a ref.
+""" + MEMORY_CLAIM_EVIDENCE_RULES + DURABLE_MEMORY_QUALITY_RULES + EVIDENCE_DISPLAY_RULES + """`required_only_candidates` may be selected as Required but never as Primary. Do not originate a Memory whose central assertion is stated only by required_only_candidates; preserve other useful claims with eligible Primary evidence. Fragment refs are valid only in this catalog. Never invent or transform a ref.
 
 Return ONLY a JSON object with a "memories" array. Use {{"memories": []}} when there are no memories."""
 
@@ -122,16 +116,16 @@ class ExtractionReading:
             doc_type=doc_type,
         )
 
-    def report_skipped(self, reasons: Mapping[str, str]) -> tuple[str, ...]:
+    def report_unread(self, reasons: Mapping[str, str]) -> tuple[str, ...]:
         """Report the items that cannot be read even alone, each with its reason; return their labels in reading order."""
         source_unit_id = self.context.projection.source_units[0].id
-        skipped = tuple((reading_group_label(group), reasons[item_id]) for item_id, group in self.items.items() if item_id in reasons)
-        for label, reason in skipped:
+        unread = tuple((reading_group_label(group), reasons[item_id]) for item_id, group in self.items.items() if item_id in reasons)
+        for label, reason in unread:
             logger.warning(
-                "extraction_reading_group_skipped source_unit_id=%s reading_group=%s reason=%s",
+                "extraction_reading_group_unread source_unit_id=%s reading_group=%s reason=%s",
                 source_unit_id, label, reason,
             )
-        return tuple(label for label, _reason in skipped)
+        return tuple(label for label, _reason in unread)
 
     def catalog_for(self, item_ids) -> ProjectionFragmentCatalog:
         """The catalog of one request that reads these items."""
@@ -233,8 +227,8 @@ class MemoryExtractor:
         Each ReadingGroup that holds authorized Primary is one runner item, so a
         request that times out, exceeds capacity or keeps returning invalid
         output is halved and resent. A ReadingGroup that alone exceeds the
-        route's capacity, or whose output alone stays invalid, is skipped with a
-        diagnostic, and the other groups' Candidates are kept.
+        route's capacity, or whose output alone stays invalid, fails the complete
+        extraction work; no successful subset is returned.
         """
 
         if not self.structured_llm_client:
@@ -293,31 +287,34 @@ class MemoryExtractor:
             return MemoryExtractionResult(
                 error_type="unexpected_error", error=str(error), metadata={**metrics, **elapsed()},
             )
-        # An item that cannot be read even alone is skipped; a transient failure fails the work.
+        if set(outcomes) != set(reading.items):
+            return MemoryExtractionResult(
+                error_type="projection_extraction_incomplete",
+                error="The authorized ReadingGroups were not completely accounted for.",
+                metadata={**metrics, **elapsed(), "safe_error_code": "EXTRACTION_WORK_INCOMPLETE"},
+            )
+        # The runner's classification still belongs to its task. Extraction
+        # requires every authorized group; Support's unjudgeable KEEP is unchanged.
         failures = {item_id: outcome for item_id, outcome in outcomes.items() if isinstance(outcome, ItemFailure)}
-        failure = next((outcome for outcome in failures.values() if not outcome.unjudgeable), None)
+        failure = next(iter(failures.values()), None)
         if failure is not None:
             error = failure.error
             validation_fields = error.validation_fields if isinstance(error, StructuredLlmError) else ()
             return MemoryExtractionResult(
                 error_type="structured_llm_error",
-                error=str(error),
+                error=str(error) if error is not None else "An authorized ReadingGroup could not be processed.",
                 metadata={
                     **metrics,
                     **elapsed(),
                     "safe_error_code": failure.error_code,
+                    "failed_reading_group_count": len(failures),
                     "safe_validation_fields": [
                         {"location": location, "type": rule_type}
                         for location, rule_type in validation_fields
                     ],
                 },
             )
-        skipped = reading.report_skipped({
-            item_id: INPUT_CAPACITY_EXCEEDED if outcome.category == "capacity_exceeded" else outcome.category
-            for item_id, outcome in failures.items()
-        })
-
-        responses = dict(chunks[0] for item_id, chunks in outcomes.items() if item_id not in failures)
+        responses = dict(chunks[0] for chunks in outcomes.values())
         memories: list[RawMemory] = []
         resolution = _SelectionResolution()
         image_count = image_bytes = 0
@@ -325,30 +322,28 @@ class MemoryExtractor:
             request, request_catalog = rendered[tuple(item_ids)]
             image_count += len(request.images)
             image_bytes += sum(len(image.body) for image in request.images)
-            candidates, correction_metrics = await correct_fragment_selectors_once(
-                response.memories, catalog=request_catalog, client=self.structured_llm_client,
-                extraction_prompt=request.prompt, max_tokens=request.max_tokens, model=self.model,
-                images=request.images, source_response=response,
-            )
-            resolution.add_correction(correction_metrics)
             memories.extend(resolution.resolve(
-                candidates, catalog=request_catalog,
+                response.memories, catalog=request_catalog,
                 prompt_hash=hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
                 returned=len(response.memories),
             ))
-        return MemoryExtractionResult(
-            memories=memories,
-            metadata={
-                **metrics,
-                **elapsed(),
-                "structured_llm_calls": runner.stats.calls + resolution.correction["selector_correction_calls"],
-                "extraction_request_count": len(responses),
-                "skipped_reading_group_count": len(skipped),
-                "image_count": image_count,
-                "image_bytes": image_bytes,
-                **resolution.metrics(),
-            },
-        )
+        metadata = {
+            **metrics,
+            **elapsed(),
+            "structured_llm_calls": runner.stats.calls,
+            "extraction_request_count": len(responses),
+            "skipped_reading_group_count": 0,
+            "image_count": image_count,
+            "image_bytes": image_bytes,
+            **resolution.metrics(),
+        }
+        if resolution.returned != resolution.resolved:
+            return MemoryExtractionResult(
+                error_type="projection_extraction_incomplete",
+                error="Some extracted claims could not be bound to authentic Evidence.",
+                metadata={**metadata, "safe_error_code": "EXTRACTION_EVIDENCE_UNRESOLVED"},
+            )
+        return MemoryExtractionResult(memories=memories, metadata=metadata)
 
 
 class _SelectionResolution:
@@ -358,32 +353,11 @@ class _SelectionResolution:
         self.returned = 0
         self.resolved = 0
         self.rejection_counts: dict[str, int] = {}
-        self.normalization_count = 0
-        self.normalization_fingerprints: list[str] = []
-        self.correction: dict[str, int] = {
-            "selector_correction_calls": 0,
-            "selector_correction_candidate_count": 0,
-            "selector_correction_recovered_count": 0,
-        }
-        self.correction_outcomes: list[str] = []
-
-    def add_correction(self, metrics: dict) -> None:
-        for key in self.correction:
-            self.correction[key] += int(metrics.get(key, 0) or 0)
-        self.correction_outcomes.append(str(metrics["selector_correction_outcome"]))
-
     def resolve(self, candidates, *, catalog, prompt_hash: str, returned: int) -> list[RawMemory]:
         self.returned += returned
         memories = []
         for candidate_index, candidate in enumerate(candidates):
-            normalized_required, removed_ref_count, repair_fingerprint = normalize_fragment_selector_refs(
-                candidate_index=candidate_index,
-                primary_ref=candidate.primary_ref,
-                required_refs=candidate.required_refs,
-            )
-            self.normalization_count += removed_ref_count
-            if repair_fingerprint is not None:
-                self.normalization_fingerprints.append(repair_fingerprint)
+            normalized_required = candidate.required_refs
             candidate_hash = catalog.selection_fingerprint(
                 candidate_content_hash=hashlib.sha256(candidate.content.encode("utf-8")).hexdigest(),
                 primary_ref=candidate.primary_ref,
@@ -393,6 +367,7 @@ class _SelectionResolution:
                 selection = catalog.resolve_selection(
                     primary_ref=candidate.primary_ref,
                     required_refs=normalized_required,
+                    display_text_by_ref={display.ref: display.text for display in candidate.evidence_displays},
                 )
             except FragmentSelectionError as error:
                 self.rejection_counts[error.code.value] = self.rejection_counts.get(error.code.value, 0) + 1
@@ -409,12 +384,8 @@ class _SelectionResolution:
             record_quality_signal(
                 QualitySignal(
                     event_name="evidence_admission_outcome",
-                    outcome="degraded" if removed_ref_count else "expected",
-                    reason_code=(
-                        "fragment_selector_normalized"
-                        if removed_ref_count
-                        else "fragment_selection_resolved"
-                    ),
+                    outcome="expected",
+                    reason_code="fragment_selection_resolved",
                     prompt_hash=prompt_hash,
                     candidate_hash=candidate_hash,
                 )
@@ -441,20 +412,7 @@ class _SelectionResolution:
 
     def metrics(self) -> dict[str, object]:
         return {
-            **self.correction,
-            "selector_correction_outcome": next(
-                (outcome for outcome in self.correction_outcomes if outcome != "not_needed"), "not_needed",
-            ),
             "resolved_fragment_selection_count": self.resolved,
             "rejected_fragment_selection_count": self.returned - self.resolved,
             "fragment_selection_rejection_counts": self.rejection_counts,
-            **(
-                {
-                    "selector_normalized_candidate_count": len(self.normalization_fingerprints),
-                    "selector_normalization_count": self.normalization_count,
-                    "selector_normalization_fingerprints": self.normalization_fingerprints,
-                }
-                if self.normalization_fingerprints
-                else {}
-            ),
         }

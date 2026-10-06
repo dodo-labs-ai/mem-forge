@@ -11,8 +11,8 @@ if TYPE_CHECKING:
 
 from memforge.pipeline.evidence_fragments import (
     EvidenceFragment,
-    canonical_nested_changed_raw_ranges,
-    canonical_record_field_ranges,
+    canonical_record_changed_raw_ranges,
+    changed_interpretation_ranges,
     canonical_record_is_tombstoned,
     revision_changed_structural_ranges,
 )
@@ -26,7 +26,7 @@ from memforge.source_projection import (
 )
 
 
-PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 6
+PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +97,7 @@ class ProjectionEvidencePlanningFailureCode(str, Enum):
     EVIDENCE_WORK_IDENTITY_INCOMPLETE = "EVIDENCE_WORK_IDENTITY_INCOMPLETE"
     REPRESENTATION_PROFILE_UNSUPPORTED = "REPRESENTATION_PROFILE_UNSUPPORTED"
     REPROCESS_AUTHORIZATION_MISSING = "REPROCESS_AUTHORIZATION_MISSING"
+    EXTRACTION_INPUT_CAPACITY_EXCEEDED = "EXTRACTION_INPUT_CAPACITY_EXCEEDED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,45 +240,15 @@ def plan_projection_evidence_work(
                 if canonical_record_is_tombstoned(revision):
                     authority[anchor.observation_id] = ()
                     continue
-                base_fields = {
-                    item.descriptor.json_pointer: item
-                    for item in canonical_record_field_ranges(base_revision)
-                }
-                target_fields = canonical_record_field_ranges(revision)
+                changed_ranges = canonical_record_changed_raw_ranges(base_revision, revision)
             except ValueError:
                 return ProjectionEvidencePlanningFailure(
-                    code=(
-                        ProjectionEvidencePlanningFailureCode.CANONICAL_FIELD_MAPPING_INVALID
-                    ),
+                    code=ProjectionEvidencePlanningFailureCode.CANONICAL_FIELD_MAPPING_INVALID,
                     observation_id=revision.observation_id,
                     observation_revision_id=revision.id,
                     representation_profile=profile.name,
                 )
-            changed_ranges = []
-            for item in target_fields:
-                base_field = base_fields.get(item.descriptor.json_pointer)
-                if (
-                    base_field is not None
-                    and base_field.comparison_value == item.comparison_value
-                ):
-                    continue
-                if base_field is not None and item.descriptor.nested_profile:
-                    try:
-                        changed_ranges.extend(
-                            canonical_nested_changed_raw_ranges(base_field, item)
-                        )
-                    except ValueError:
-                        return ProjectionEvidencePlanningFailure(
-                            code=(
-                                ProjectionEvidencePlanningFailureCode.CANONICAL_FIELD_MAPPING_INVALID
-                            ),
-                            observation_id=revision.observation_id,
-                            observation_revision_id=revision.id,
-                            representation_profile=profile.name,
-                        )
-                else:
-                    changed_ranges.append((item.start, item.end))
-            authority[anchor.observation_id] = tuple(changed_ranges)
+            authority[anchor.observation_id] = tuple(dict.fromkeys(changed_ranges))
             continue
         if profile.name not in {
             "markdown-structural",
@@ -295,10 +266,10 @@ def plan_projection_evidence_work(
                 representation_profile=profile.name,
             )
         try:
-            authority[anchor.observation_id] = revision_changed_structural_ranges(
-                base_revision,
-                revision,
-            )
+            authority[anchor.observation_id] = tuple(dict.fromkeys((
+                *revision_changed_structural_ranges(base_revision, revision),
+                *changed_interpretation_ranges(base_revision, revision),
+            )))
         except ValueError:
             return ProjectionEvidencePlanningFailure(
                 code=(

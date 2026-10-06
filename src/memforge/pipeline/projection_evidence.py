@@ -91,6 +91,8 @@ def build_projected_claim_evidence(
                 presentation_sha256=reference.presentation_sha256,
                 excerpt=reference.excerpt,
                 artifact_metadata=dict(reference.artifact_metadata),
+                text_view=reference.text_view,
+                display_text=reference.display_text,
             )
             references_by_id.setdefault(str(persisted.id), persisted)
         claim_hash = content_hash(raw.content.strip())
@@ -171,6 +173,8 @@ def _materialize_claim_evidence(
                 presentation_sha256=part.presentation_sha256,
                 excerpt=part.excerpt,
                 artifact_metadata=dict(part.artifact_metadata),
+                text_view=part.text_view,
+                display_text=part.display_text,
             )
         )
     supporting_tuple = tuple(supporting)

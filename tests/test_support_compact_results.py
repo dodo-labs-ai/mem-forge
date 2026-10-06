@@ -1,4 +1,6 @@
 """Compact transport retains exact Support coverage and evidence authority."""
+
+from tests.evidence_display_fixture import evidence_displays
 import json
 from types import SimpleNamespace
 
@@ -11,7 +13,7 @@ from memforge.pipeline.support_wire import SupportWireAliases
 SUPPORTED = {
     'work_id': 'WRK-0001', 'status': 'supported', 'primary_ref': 'PRM-0002',
     'required_refs': ['REQ-0003'],
-}
+ "evidence_displays": evidence_displays('PRM-0002', ['REQ-0003'])}
 CONTINUE = {
     'work_id': 'WRK-0001', 'status': 'continue',
     'witness_delta': {'support_witness_refs': ['PRM-0002'], 'opposing_witness_refs': ['REQ-0003']},
@@ -30,13 +32,13 @@ def row_schema(status):
     return next(v for v in schema['$defs'].values() if v.get('properties', {}).get('status', {}).get('const') == status)
 
 
-def test_supported_row_has_no_prose_and_decodes_to_canonical_refs():
+def test_supported_row_has_only_bound_presentation_and_decodes_to_canonical_refs():
     result = SupportAssessmentWireResponse.model_validate({'results': [SUPPORTED]})
     row = wire().decode(result).results[0]
     assert row.work_id == 'w000001' and row.primary_ref == 'p000002'
     assert row.required_refs == ['r000003']
     success = row_schema('supported')
-    assert set(success['properties']) == {'work_id', 'status', 'primary_ref', 'required_refs'}
+    assert set(success['properties']) == {'work_id', 'status', 'primary_ref', 'required_refs', 'evidence_displays'}
     assert success['additionalProperties'] is False
     with pytest.raises(ValidationError):
         SupportAssessmentWireResponse.model_validate({'results': [{**SUPPORTED, 'reason': 'A long explanation'}]})
@@ -71,7 +73,8 @@ def test_every_schema_property_is_required_for_strict_transport():
 async def test_live_client_contract_uses_compact_schema_and_rejects_truncated_json(monkeypatch):
     from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError
     from tests.test_structured_llm import CompletionResponse, set_native_schema_support
-    reply = CompletionResponse(json.dumps({'results': [{**SUPPORTED, 'required_refs': []}]}))
+    reply = CompletionResponse(json.dumps({'results': [{**SUPPORTED, 'required_refs': [],
+        'evidence_displays': evidence_displays(SUPPORTED['primary_ref'])}]}))
     seen = []
     async def completion(**kwargs):
         seen.append(kwargs)
@@ -96,6 +99,7 @@ async def test_correction_log_names_the_rule_class_without_source_content(caplog
         def judge(self, prompt):
             results = super().judge(prompt)
             results[0]['primary_ref'] = 'PRM-9999'
+            results[0]['evidence_displays'] = evidence_displays('PRM-9999', results[0]['required_refs'])
             return results
     executor = RevisionWorkExecutor(client=WrongRef(limit=50000), model='gpt-4o', store=Store(), derivation_id='root')
     [result] = (await executor.assess_many(work_items(CHANGED))).values()

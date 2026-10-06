@@ -105,6 +105,7 @@ export interface MemoryEvidenceArtifact {
 }
 
 export interface MemoryEvidenceItem {
+  text?: string | null;
   authority: "revision_pinned" | "application_document";
   evidence_reference_id: string | null;
   role: "primary" | "required" | "context";

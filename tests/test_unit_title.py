@@ -6,6 +6,8 @@ current representation only.
 """
 
 import json
+from hashlib import sha256
+from html import escape
 from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -79,7 +81,9 @@ def jira(summary="Payroll run fails", *, issue_type=None, description="Payroll c
     }
     payload = {
         "id": "180000", "key": "SFPAY-180000", "fields": fields,
-        "_comments": [{"id": "501", "body": COMMENT}], "_comments_included": True,
+        "renderedFields": {"description": f"<p>{escape(description)}</p>" if description else None},
+        "_comments": [{"id": "501", "body": COMMENT, "renderedBody": f"<p>{escape(COMMENT)}</p>"}],
+        "_comments_included": True,
         "_comments_total": 2 if comments_truncated else 1,
         "changelog": {"startAt": 0, "histories": [], "total": 0},
         **({"_comments_truncated": {"returned": 1, "total": 2}} if comments_truncated else {}),
@@ -180,7 +184,8 @@ def title_part(stored):
             kind=AnchorKind.REVISION_RANGE, observation_id=revision.observation_id,
             observation_revision_id=revision.id, range_start=0, range_end=len(revision.content),
         ),
-        excerpt=revision.content, raw_content_sha256="stored-title", presentation_sha256="stored-title",
+        excerpt=revision.content, raw_content_sha256=sha256(revision.content.encode()).hexdigest(),
+        presentation_sha256=sha256(revision.content.encode()).hexdigest(),
     )
 
 
@@ -299,7 +304,7 @@ def test_the_stored_unit_title_is_outside_the_current_representation():
 
 
 @pytest.mark.asyncio
-async def test_a_unit_that_stored_its_title_moves_to_a_title_free_revision_and_rebinds_without_a_model_call():
+async def test_a_retired_title_support_stays_unresolved_without_a_model_call():
     stored = with_stored_title(jira())
     current = jira(prior=stored, run_id="run-2")
     delta = current.deltas[0]
@@ -325,19 +330,17 @@ async def test_a_unit_that_stored_its_title_moves_to_a_title_free_revision_and_r
     named = (support_part(current, COMMENT), title_part(stored))
     revision_plan = plan_supports(context, named)
     [support] = revision_plan.supports
-    # The part on the stored title is dropped, neither REMOVED nor UNKNOWN.
-    assert [part.status for part in support.parts] == [EvidenceCorrespondence.EXACT_UNCHANGED]
-    assert support.route is SupportRoute.REBIND_SUPPORT
+    assert [part.status for part in support.parts] == [EvidenceCorrespondence.EXACT_UNCHANGED, EvidenceCorrespondence.UNKNOWN]
+    assert support.route is SupportRoute.UNRESOLVED_PARTIAL_COVERAGE
+    assert support.parts[1].evidence is named[1]
     assert revision_plan.changes == ()
 
     client = NoModelClient()
     [result] = (await RevisionWorkExecutor(client=client, model="fixture").assess_many(
         [SupportWorkItem("w0", memory(), named, context)],
     )).values()
-    assert result.supported and result.rebound
-    assert [part.anchor.observation_id for part in result.memory.resolved_evidence_selection.parts] == [
-        support.parts[0].evidence.anchor.observation_id,
-    ]
+    assert result.supported is None and not result.rebound
+    assert result.unresolved == "partial_coverage" and result.memory is None
 
 
 def test_a_unit_whose_prior_revision_held_only_its_title_is_compared_with_that_revision():
@@ -480,7 +483,7 @@ def test_a_stored_payload_whose_delta_added_the_title_is_read_with_only_its_cont
     }
 
 
-def test_evidence_on_the_stored_title_is_dropped_by_its_own_revision_without_a_baseline():
+def test_retired_title_evidence_stays_unresolved_even_without_a_baseline():
     stored = with_stored_title(jira())
     current = jira(prior=stored, run_id="run-2")
     [title_revision] = [revision for revision in stored.observation_revisions if not in_current_representation(revision)]
@@ -491,12 +494,12 @@ def test_evidence_on_the_stored_title_is_dropped_by_its_own_revision_without_a_b
     )
     [support] = plan_supports(context, named).supports
 
-    # An operator reprocess reads the whole Unit, and the old title is no prior Evidence of it.
-    assert [part.evidence.reference_id for part in support.parts] == ["e1"]
-    assert support.route is SupportRoute.SUPPORT_ASSESSMENT
+    assert [part.evidence.reference_id for part in support.parts] == ["e1", "e-title"]
+    assert support.parts[1].status is EvidenceCorrespondence.UNKNOWN
+    assert support.route is SupportRoute.UNRESOLVED_PARTIAL_COVERAGE
 
 
-def test_a_support_whose_primary_part_is_dropped_is_assessed_not_rebound():
+def test_a_retired_primary_keeps_the_whole_support_unresolved():
     stored = with_stored_title(jira())
     current = jira(prior=stored, run_id="run-2")
     context = RevisionAssessmentContext(projection=current, base=stored, access_context_hash="scope")
@@ -505,9 +508,11 @@ def test_a_support_whose_primary_part_is_dropped_is_assessed_not_rebound():
 
     [only_title, with_required] = plan_supports(context, (primary_on_title,), (primary_on_title, required)).supports
 
-    assert only_title.parts == () and only_title.route is SupportRoute.SUPPORT_ASSESSMENT
-    assert [part.status for part in with_required.parts] == [EvidenceCorrespondence.EXACT_UNCHANGED]
-    assert with_required.route is SupportRoute.SUPPORT_ASSESSMENT
+    assert [part.status for part in only_title.parts] == [EvidenceCorrespondence.UNKNOWN]
+    assert only_title.parts[0].evidence is primary_on_title
+    assert only_title.route is SupportRoute.UNRESOLVED_PARTIAL_COVERAGE
+    assert [part.status for part in with_required.parts] == [EvidenceCorrespondence.UNKNOWN, EvidenceCorrespondence.EXACT_UNCHANGED]
+    assert with_required.route is SupportRoute.UNRESOLVED_PARTIAL_COVERAGE
 
 
 @pytest.mark.asyncio
@@ -593,8 +598,9 @@ async def test_the_unit_title_is_shown_in_every_support_step_and_change_impact_r
     class ReadingClient(Client):
         def judge(self, prompt):
             data = json.loads(prompt.split("<assessment>")[1].split("</assessment>")[0])
-            rows = [*data["current"]["primary_candidates"], *data["current"]["required_only_candidates"]]
-            comment = next((row[0] for row in rows if row[1] == COMMENT), None)
+            rows = [*data["current"]["primary_candidates"], *data["current"]["required_only_candidates"],
+                    *data["carried_witness_catalog"]]
+            comment = next((row[0] for row in rows if COMMENT in row[1]), None)
             return [
                 supported(work, comment) if comment and work["may_conclude"] else continued(work)
                 for work in data["works"]
@@ -616,7 +622,7 @@ async def test_the_unit_title_is_shown_in_every_support_step_and_change_impact_r
     assert all(block in prompt for prompt in (*client.impact_prompts, *client.prompts))
 
 
-def test_a_teams_window_keeps_its_unit_title_as_it_grows_and_a_renamed_chat_needs_no_revision():
+def test_a_teams_window_keeps_its_title_as_it_grows_and_renamed_source_framing_changes_revision():
     first = teams([FIRST_MESSAGE])
     grown = teams([FIRST_MESSAGE, LATER_MESSAGE], prior=first, run_id="run-2")
     renamed = teams([FIRST_MESSAGE], conversation_name="Payroll Core", prior=first, run_id="run-3")
@@ -625,5 +631,11 @@ def test_a_teams_window_keeps_its_unit_title_as_it_grows_and_a_renamed_chat_need
         "Teams conversation\nConversation type: group_chat\nConversation: Payroll Dev\nFrom: 2026-09-29T02:39:00+00:00"
     )
     assert grown.unit_title == first.unit_title
-    assert renamed.source_unit_revisions[0].id == first.source_unit_revisions[0].id
+    assert renamed.source_unit_revisions[0].id != first.source_unit_revisions[0].id
+    assert renamed.deltas[0].requires_extraction
+    first_record = json.loads(first.observation_revisions[0].content)
+    renamed_record = json.loads(renamed.observation_revisions[0].content)
+    assert first_record["content"] == renamed_record["content"] == COMMENT
+    assert first_record["conversation_name"] == "Payroll Dev"
+    assert renamed_record["conversation_name"] == "Payroll Core"
     assert "Conversation: Payroll Core" in render_unit_title(renamed.unit_title)

@@ -1,5 +1,7 @@
 """Claim Extraction reads whole ReadingGroups that hold authorized Primary, through the runner."""
 
+from tests.evidence_display_fixture import evidence_displays
+
 import json
 import re
 from dataclasses import replace
@@ -16,11 +18,13 @@ from memforge.llm.structured import (
     StructuredLlmError,
 )
 from memforge.pipeline.extraction_requests import plan_extraction_requests
-from memforge.pipeline.memory_extractor import MemoryExtractor
-from memforge.pipeline.projection_context import ExtractionAuthority, plan_projection_evidence_work
+from memforge.pipeline.memory_extractor import ExtractionReading, MemoryExtractor
+from memforge.pipeline.projection_context import (
+    ExtractionAuthority, ProjectionEvidencePlanningFailure, ProjectionEvidencePlanningFailureCode, plan_projection_evidence_work,
+)
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.source_projection_adapters import project_source_item
-from tests.test_projection_context import _committed_snapshot, _confluence_projection, _jira_projection, _requests
+from tests.test_projection_context import _committed_snapshot, _normalized_document_projection, _jira_projection, _requests
 from tests.test_projection_fragments import _projection
 from tests.test_revision_work import Client
 
@@ -37,7 +41,7 @@ def bounded_output(extractor, catalog):
 def extraction_plan(projection, authority, *, extractor, base=None):
     context = RevisionAssessmentContext(projection=projection, base=base, access_context_hash="scope")
     return plan_extraction_requests(
-        context, authority, extractor=extractor, source_type="confluence", doc_type="document",
+        context, authority, extractor=extractor, source_type=projection.source_type, doc_type="document",
     )
 
 
@@ -73,7 +77,7 @@ def test_large_complete_table_reaches_actual_request_budget(representation, rows
     else:
         table = "<table><tr><th>Rule</th><th>Sandbox</th><th>Small Box</th></tr>" + "".join(
             f"<tr><td>Approval {row}</td><td>Yes</td><td>No</td></tr>" for row in range(rows)) + "</table>"
-    projection = _confluence_projection("Before the table.\n\n" + table + "\n\nAfter the table.")
+    projection = _normalized_document_projection("Before the table.\n\n" + table + "\n\nAfter the table.")
 
     for window in (100_000, 8_000):
         client = LiteLlmStructuredClient(StructuredLlmConfig(
@@ -81,20 +85,14 @@ def test_large_complete_table_reaches_actual_request_budget(representation, rows
             max_input_tokens=window, context_window_tokens=window, max_output_tokens=1024))
         extractor = MemoryExtractor(model=client.config.model, structured_llm_client=client)
         if window == 8_000:
-            # A ReadingGroup that alone exceeds the route is skipped with a diagnostic, never truncated;
-            # the other groups are still planned.
+            # One unfit group refuses the entire authority; no successful subset.
             with caplog.at_level("WARNING", logger="memforge.pipeline.memory_extractor"):
                 extraction = extraction_plan(projection, whole(projection), extractor=extractor)
-            [skipped] = extraction.skipped_reading_groups
-            assert skipped.startswith(body_id(projection) + ":")
-            planned = [f.presentation_text.strip() for f in primary(extraction.requests)]
-            assert {"Before the table.", "After the table."} <= set(planned)
-            assert not any("table" in f.fragment_type for f in primary(extraction.requests))
-            source_unit_id = projection.source_units[0].id
-            assert (
-                f"extraction_reading_group_skipped source_unit_id={source_unit_id} reading_group={skipped} "
-                f"reason={INPUT_CAPACITY_EXCEEDED}"
-            ) in caplog.text
+            assert isinstance(extraction, ProjectionEvidencePlanningFailure)
+            assert extraction.code is ProjectionEvidencePlanningFailureCode.EXTRACTION_INPUT_CAPACITY_EXCEEDED
+            assert extraction.authorized_structure_count >= 3
+            assert "extraction_reading_group_unread" in caplog.text
+            assert f"reason={INPUT_CAPACITY_EXCEEDED}" in caplog.text
             continue
         requests = plan(projection, whole(projection), extractor=extractor)
         tables = [f for f in primary(requests) if "table" in f.fragment_type]
@@ -102,7 +100,7 @@ def test_large_complete_table_reaches_actual_request_budget(representation, rows
         context = RevisionAssessmentContext(projection=projection, base=None, access_context_hash="scope")
         for request in requests:
             prompt = MemoryExtractor.projection_fragment_prompt(
-                request.catalog, source_type="confluence", doc_type="document", revision_context=context,
+                request.catalog, source_type=projection.source_type, doc_type="document", revision_context=context,
             )
             assert client.request_fits(prompt, response_format=ProjectionFragmentMemoryExtractionResponse,
                                        max_tokens=bounded_output(extractor, request.catalog))
@@ -114,12 +112,26 @@ def test_first_import_streams_every_reading_group_through_complete_requests():
     projection = _projection(primary_content=body, context_content="Country: US.\n")
     client = Client(limit=12000)
     extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=client)
+    context = RevisionAssessmentContext(projection=projection, base=None, access_context_hash="scope")
+    reading = ExtractionReading.of_authority(
+        context, whole(projection), source_type=projection.source_type, doc_type="document",
+    )
+    # This fixture must fit every complete group, while requiring multiple
+    # requests; its character quota includes the current instruction overhead.
+    def single_group_cost(item_id):
+        catalog = reading.catalog_for((item_id,))
+        prompt = extractor.projection_fragment_prompt(
+            catalog, source_type=projection.source_type,
+            doc_type="document", revision_context=context,
+        )
+        return len(prompt) + bounded_output(extractor, catalog) // 8
+
+    client.limit = max(single_group_cost(item_id) for item_id in reading.items) + 256
     requests = plan(projection, whole(projection), extractor=extractor)
 
     assert len(requests) > 2
     anchors = [fragment.anchor for fragment in primary(requests)]
     assert len(anchors) == len(set(anchors))
-    context = RevisionAssessmentContext(projection=projection, base=None, access_context_hash="scope")
     assert set(anchors) == {fragment.anchor for fragment in context.full_fragments}
     for request in requests:
         # The heading scopes every paragraph under it; outside its own request it is Required-only.
@@ -136,8 +148,8 @@ def test_update_reads_only_changed_structures_with_their_reading_group_context()
         "# Approvals\n\nIntro for approvals.\n\nOld unrelated details.\n\nTwo reviewers approve releases.\n\n"
         "# Rollout\n\nRollout starts {day}.\n"
     )
-    initial = _confluence_projection(sections.format(day="Monday"))
-    target = _updated_confluence(initial, sections.format(day="Tuesday"))
+    initial = _normalized_document_projection(sections.format(day="Monday"))
+    target = _updated_normalized_document(initial, sections.format(day="Tuesday"))
     [request] = _requests(target, base=initial, committed=_committed_snapshot(initial))
     read = texts(request)
 
@@ -152,8 +164,8 @@ def test_update_reads_only_changed_structures_with_their_reading_group_context()
 
 
 def test_a_changed_list_item_reads_its_whole_list_but_authorizes_only_the_changed_item():
-    initial = _confluence_projection("Approvals need:\n\n- one reviewer\n- a ticket\n- a rollback plan\n")
-    target = _updated_confluence(initial, "Approvals need:\n\n- two reviewers\n- a ticket\n- a rollback plan\n")
+    initial = _normalized_document_projection("Approvals need:\n\n- one reviewer\n- a ticket\n- a rollback plan\n")
+    target = _updated_normalized_document(initial, "Approvals need:\n\n- two reviewers\n- a ticket\n- a rollback plan\n")
     [request] = _requests(target, base=initial, committed=_committed_snapshot(initial))
     read = " ".join(texts(request))
 
@@ -235,7 +247,7 @@ async def test_a_multi_item_request_that_times_out_is_halved_and_every_item_comp
                 raise StructuredLlmError("timed out", terminal_category="deadline_exceeded", error_code="timeout")
             ref, text = rows[0][0], rows[0][1]
             return ProjectionFragmentMemoryExtractionResponse.model_validate({"memories": [
-                {"content": text, "memory_type": "fact", "primary_ref": ref, "required_refs": []},
+                {"content": text, "memory_type": "fact", "primary_ref": ref, "required_refs": [], "evidence_displays": evidence_displays(ref, [])},
             ]})
 
     client = TimingOutClient()
@@ -254,7 +266,7 @@ async def test_a_multi_item_request_that_times_out_is_halved_and_every_item_comp
 
 
 @pytest.mark.asyncio
-async def test_a_reading_group_the_provider_rejects_alone_is_skipped_and_the_others_are_kept(caplog):
+async def test_a_reading_group_the_provider_rejects_alone_fails_complete_work():
     projection = _projection(
         primary_content="Rule one applies.\n\nRule two is far too large.\n", context_content="Country: US.\n",
     )
@@ -271,27 +283,23 @@ async def test_a_reading_group_the_provider_rejects_alone_is_skipped_and_the_oth
                 )
             ref, text = rows[0][0], rows[0][1]
             return ProjectionFragmentMemoryExtractionResponse.model_validate({"memories": [
-                {"content": text.strip(), "memory_type": "fact", "primary_ref": ref, "required_refs": []},
+                {"content": text.strip(), "memory_type": "fact", "primary_ref": ref, "required_refs": [], "evidence_displays": evidence_displays(ref, [])},
             ]})
 
     extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=OverflowingClient(limit=40000))
     [request] = plan(projection, ExtractionAuthority({body_id(projection): None}), extractor=extractor)
-    with caplog.at_level("WARNING", logger="memforge.pipeline.memory_extractor"):
-        result = await extractor.extract_projection_fragment_memories(
-            request.catalog, source_type="confluence", revision_context=context,
-        )
+    result = await extractor.extract_projection_fragment_memories(
+        request.catalog, source_type="confluence", revision_context=context,
+    )
 
-    assert result.error_type is None
-    assert [memory.content for memory in result.memories] == ["Rule one applies."]
-    assert result.metadata["skipped_reading_group_count"] == 1
-    assert (
-        f"extraction_reading_group_skipped source_unit_id={projection.source_units[0].id} "
-        f"reading_group={body_id(projection)}:"
-    ) in caplog.text
+    assert result.error_type == "structured_llm_error"
+    assert result.memories == []
+    assert result.metadata["failed_reading_group_count"] == 1
+    assert result.metadata["safe_error_code"] == INPUT_CAPACITY_EXCEEDED
 
 
 @pytest.mark.asyncio
-async def test_a_reading_group_whose_output_stays_invalid_is_skipped_and_the_others_are_kept(caplog):
+async def test_a_reading_group_whose_output_stays_invalid_fails_complete_work():
     projection = _projection(
         primary_content="Rule one applies.\n\nRule two confuses the model.\n", context_content="Country: US.\n",
     )
@@ -308,25 +316,23 @@ async def test_a_reading_group_whose_output_stays_invalid_is_skipped_and_the_oth
                 )
             ref, text = rows[0][0], rows[0][1]
             return ProjectionFragmentMemoryExtractionResponse.model_validate({"memories": [
-                {"content": text.strip(), "memory_type": "fact", "primary_ref": ref, "required_refs": []},
+                {"content": text.strip(), "memory_type": "fact", "primary_ref": ref, "required_refs": [], "evidence_displays": evidence_displays(ref, [])},
             ]})
 
     extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=MalformedClient(limit=40000))
     [request] = plan(projection, ExtractionAuthority({body_id(projection): None}), extractor=extractor)
-    with caplog.at_level("WARNING", logger="memforge.pipeline.memory_extractor"):
-        result = await extractor.extract_projection_fragment_memories(
-            request.catalog, source_type="confluence", revision_context=context,
-        )
+    result = await extractor.extract_projection_fragment_memories(
+        request.catalog, source_type="confluence", revision_context=context,
+    )
 
-    assert result.error_type is None
-    assert [memory.content for memory in result.memories] == ["Rule one applies."]
-    assert result.metadata["skipped_reading_group_count"] == 1
-    [record] = [r.getMessage() for r in caplog.records if r.getMessage().startswith("extraction_reading_group_skipped")]
-    assert f"reading_group={body_id(projection)}:" in record and record.endswith("reason=invalid_response")
+    assert result.error_type == "structured_llm_error"
+    assert result.memories == []
+    assert result.metadata["failed_reading_group_count"] == 1
+    assert result.metadata["safe_error_code"] == "ValueError"
 
 
-def _updated_confluence(initial, body):
-    """The next revision of ``initial``'s page with this body."""
+def _updated_normalized_document(initial, body):
+    """The next revision of the declared normalized document."""
     item = ContentItem(
         item_id="confluence-42",
         title="Large design",
@@ -337,10 +343,10 @@ def _updated_confluence(initial, body):
     )
     return project_source_item(
         source_id="src-c",
-        source_type="confluence",
+        source_type="validation_normalized_document",
         run_id="run-c-update",
         item=item,
-        raw=RawContent(item=item, body=body.encode(), content_type="text/html"),
+        raw=RawContent(item=item, body=body.encode(), content_type="text/markdown"),
         normalized=NormalizedContent(item=item, markdown_body=body),
         prior_unit_revision=initial.source_unit_revisions[0],
         prior_observation_revisions={revision.observation_id: revision for revision in initial.observation_revisions},

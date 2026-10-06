@@ -56,8 +56,10 @@ def _jira_projection(comment_count: int = 3):
             "resolution": None,
             "updated": "2026-07-15T00:00:00Z",
         },
+        "renderedFields": {"description": "<p>A7 processing context</p>"},
         "_comments": [
-            {"id": str(500 + index), "body": f"Reply {index}: retain A7"}
+            {"id": str(500 + index), "body": f"Reply {index}: retain A7",
+             "renderedBody": f"<p>Reply {index}: retain A7</p>"}
             for index in range(comment_count)
         ],
         "_comments_included": True,
@@ -76,7 +78,8 @@ def _jira_projection(comment_count: int = 3):
     )
 
 
-def _confluence_projection(body: str):
+def _normalized_document_projection(body: str):
+    """Source-neutral Markdown controls; never pretend these are native storage XML."""
     item = ContentItem(
         item_id="confluence-42",
         title="Large design",
@@ -87,10 +90,10 @@ def _confluence_projection(body: str):
     )
     return project_source_item(
         source_id="src-c",
-        source_type="confluence",
+        source_type="validation_normalized_document",
         run_id="run-c",
         item=item,
-        raw=RawContent(item=item, body=body.encode(), content_type="text/html"),
+        raw=RawContent(item=item, body=body.encode(), content_type="text/markdown"),
         normalized=NormalizedContent(item=item, markdown_body=body),
     )
 
@@ -241,10 +244,10 @@ The rollout starts on Monday.
         "The rollout starts on Monday.",
         "The rollout starts on Tuesday.",
     )
-    initial = _confluence_projection(initial_body)
+    initial = _normalized_document_projection(initial_body)
     target = project_source_item(
         source_id="src-c",
-        source_type="confluence",
+        source_type="validation_normalized_document",
         run_id="run-c-incremental",
         item=replace(
             ContentItem(
@@ -267,7 +270,7 @@ The rollout starts on Monday.
                 extra={"page_id": "42", "space_key": "ENG"},
             ),
             body=target_body.encode(),
-            content_type="text/html",
+            content_type="text/markdown",
         ),
         normalized=NormalizedContent(
             item=ContentItem(
@@ -320,6 +323,7 @@ def test_v9_incremental_canonical_record_authorizes_only_changed_registered_fiel
             "resolution": None,
             "updated": "2026-07-16T00:00:00Z",
         },
+        "renderedFields": {"description": "<p>A7 processing requires approval</p>"},
         "_comments": [],
         "_comments_included": True,
         "_comments_total": 0,
@@ -348,7 +352,9 @@ def test_v9_incremental_canonical_record_authorizes_only_changed_registered_fiel
         for fragment in _primary(_requests(target, base=initial, committed=_committed_snapshot(initial)))
     ]
 
-    assert primary_text == ["A7 processing requires approval"]
+    assert len(primary_text) == 1
+    assert primary_text[0].endswith("A7 processing requires approval")
+    assert "Issue: PAY-12" in primary_text[0]
 
 
 @pytest.mark.parametrize("changed", ["Rollout starts Tuesday.", "| Rule | Result |\n| --- | --- |\n" + "| approval | required |\n" * 2_000])
@@ -378,7 +384,9 @@ def test_v9_incremental_nested_canonical_text_keeps_unchanged_paragraph_non_prim
     assert changed.strip() in primary_text
     assert "Historical context remains." not in primary_text
     assert len(primary) == 1
-    assert primary[0].presentation_text.strip() == changed.strip()
+    assert primary[0].presentation_text.strip().endswith(changed.strip())
+    assert "Message created:" in primary[0].presentation_text
+    assert primary[0].text_view is not None
 
 
 @pytest.mark.parametrize("reprocess", [False, True])
@@ -437,14 +445,14 @@ def test_v9_batches_keep_one_crossing_markdown_structure_complete() -> None:
     prefix = ("Short paragraph.\n\n" * 3_100)
     code_block = "```text\n" + ("x" * 12_000) + "\n```\n"
     body = prefix + code_block
-    projection = _confluence_projection(body)
+    projection = _normalized_document_projection(body)
 
     catalogs = [request.catalog for request in _requests(projection)]
 
     assert all(catalog.usable for catalog in catalogs)
     revision_content = _provider_revision(projection).content
     code_start = revision_content.index("```text")
-    code_end = len(revision_content)
+    code_end = revision_content.index("\n```", code_start) + len("\n```")
     code_fragments = [
         fragment
         for catalog in catalogs
@@ -454,12 +462,13 @@ def test_v9_batches_keep_one_crossing_markdown_structure_complete() -> None:
     assert len(code_fragments) == 1
     assert code_fragments[0].anchor.range_start == code_start
     assert code_fragments[0].anchor.range_end == code_end
+    assert revision_content[code_start:code_end] == code_block.rstrip("\n")
 
 
 def test_v9_incremental_oversized_structure_keeps_only_changed_primary_authority() -> None:
     initial_body = "# Decision\n\n```text\nsmall\n```\n"
     target_body = "# Decision\n\n```text\n" + ("x" * 90_000) + "\n```\n"
-    initial = _confluence_projection(initial_body)
+    initial = _normalized_document_projection(initial_body)
     target_item = ContentItem(
         item_id="confluence-42",
         title="Large design",
@@ -470,13 +479,13 @@ def test_v9_incremental_oversized_structure_keeps_only_changed_primary_authority
     )
     target = project_source_item(
         source_id="src-c",
-        source_type="confluence",
+        source_type="validation_normalized_document",
         run_id="run-c-oversized-incremental",
         item=target_item,
         raw=RawContent(
             item=target_item,
             body=target_body.encode(),
-            content_type="text/html",
+            content_type="text/markdown",
         ),
         normalized=NormalizedContent(item=target_item, markdown_body=target_body),
         prior_unit_revision=initial.source_unit_revisions[0],
@@ -516,7 +525,7 @@ print("safe")
 
 <section><p>Raw HTML block</p></section>
 """
-    projection = _confluence_projection(body)
+    projection = _normalized_document_projection(body)
 
     catalogs = [request.catalog for request in _requests(projection)]
 
@@ -710,5 +719,3 @@ def test_source_projection_attaches_summary_only_to_exact_image_revision() -> No
     )
     with pytest.raises(ValueError, match="must be unique"):
         with_source_artifact_summaries(projection, (summary, summary))
-
-

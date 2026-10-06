@@ -310,10 +310,19 @@ def test_changelog_delta_keeps_before_after_field_identity_and_event_context():
     context = RevisionAssessmentContext(projection=new, base=old, access_context_hash="scope")
     current, removed_fragments = context.delta_fragments()
     removed = [context.removed_entry(fragment) for fragment in removed_fragments]
-    removed_claim = next(f for f in removed if f["text"] == "Three approvers.")
+    removed_claim = next(f for f in removed if f["text"].endswith("Three approvers."))
+    assert removed_claim["text"] == (
+        "Change recorded: 2026-09-08\nChanged field: description\nNew value:\nThree approvers."
+    )
     assert removed_claim["field"] == "/items/0/toString"
     assert removed_claim["context"] == {"/created": "2026-09-08", "/items/0/field": "description"}
-    fragment = next(f for f in current if f.presentation_text == "One approver.")
+    from memforge.source_adapters.jira import CANONICAL_RECORD_SCHEMAS
+    interpretation = CANONICAL_RECORD_SCHEMAS["jira-changelog", 4].model_interpretation
+    assert removed_claim["format_interpretation"] == interpretation
+    fragment = next(f for f in current if f.presentation_text.endswith("One approver."))
+    assert fragment.presentation_text == (
+        "Change recorded: 2026-09-08\nChanged field: description\nNew value:\nOne approver."
+    )
     revision = context.current[fragment.anchor.observation_id]
     expansion = context.reading_index(revision).expand([fragment])
     added = {
@@ -321,8 +330,12 @@ def test_changelog_delta_keeps_before_after_field_identity_and_event_context():
         for f in expansion.fragments
         if f.anchor in expansion.context_anchors
     }
-    assert added == {"# US payroll", "description", "2026-09-08"}
+    assert added == {"Change recorded: 2026-09-08\nChanged field: description", "2026-09-08"}
     payload = _reading_source(context, context.catalog(()), [{**removed_claim, "ref": "d000001"}])
     assert payload["removed_historical"][0][2] == {
         "field": "/items/0/toString", "context": removed_claim["context"],
+        "format_interpretation": interpretation,
     }
+    current_payload = _reading_source(context, context.catalog(current), [])
+    assert all(group["format_interpretation"] == interpretation
+               for group in current_payload["current"]["structural_groups"])

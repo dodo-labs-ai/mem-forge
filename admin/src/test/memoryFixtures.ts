@@ -72,6 +72,7 @@ export function makeMemoryDetail(overrides: Partial<Schemas["MemoryDetailRespons
             role: "primary",
             kind: "text",
             support_contribution: true,
+            interpretation_available: true,
             anchor_kind: "text_range",
             current: true,
             excerpt: "Cut-off is uniform across Default, Deviating and On-Demand lifecycle types.",

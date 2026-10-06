@@ -749,8 +749,12 @@ class JiraGene(Gene):
         hydrated_issue = getattr(self, "_hydrated_issues", {}).get(key)
         if isinstance(hydrated_issue, dict):
             payload = _issue_payload_from_search(hydrated_issue, self.config)
-            if payload.get("_comments_truncated"):
-                await self._top_up_truncated_comments(key, payload)
+            from memforge.source_adapters.jira import comment_requires_rendering
+
+            if payload.get("_comments_truncated") or any(
+                comment_requires_rendering(comment) for comment in payload.get("_comments", [])
+            ):
+                await self._fetch_comment_snapshot(key, payload)
             getattr(self, "_hydrated_issues", {}).pop(key, None)
             artifacts = await self._fetch_source_artifacts(payload)
             return RawContent(
@@ -778,7 +782,7 @@ class JiraGene(Gene):
             comments_resp = await self._request(
                 "GET",
                 f"/rest/api/2/issue/{key}/comment",
-                params={"maxResults": COMMENT_MAX_RESULTS},
+                params={"maxResults": COMMENT_MAX_RESULTS, "expand": "renderedBody"},
             )
             comment_data = comments_resp.json()
             data["_comments"] = self._validated_comment_page(comment_data)
@@ -972,11 +976,11 @@ class JiraGene(Gene):
                 f"Jira issue {key} changed during materialization; retry inventory"
             )
 
-    async def _top_up_truncated_comments(self, key: str, payload: dict) -> None:
+    async def _fetch_comment_snapshot(self, key: str, payload: dict) -> None:
         comments_resp = await self._request(
             "GET",
             f"/rest/api/2/issue/{key}/comment",
-            params={"maxResults": COMMENT_MAX_RESULTS},
+            params={"maxResults": COMMENT_MAX_RESULTS, "expand": "renderedBody"},
         )
         comment_data = comments_resp.json()
         comments = self._validated_comment_page(comment_data)

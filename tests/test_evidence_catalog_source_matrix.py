@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from html import escape
 
 import pytest
 
@@ -130,6 +131,8 @@ def _projection_inputs(
         item_id = "confluence-42"
         source_url = "https://confluence.example.test/pages/42"
         extra = {"page_id": "42", "space_key": "ENG"}
+        raw_value = f"<p>{escape(rule)}</p>"
+        content_type = "text/html"
         target_observation_type = "page_body"
     elif source_type == "jira":
         item_id = "jira-PAY-12"
@@ -148,7 +151,7 @@ def _projection_inputs(
                 "resolution": None,
                 "updated": "2026-08-12T10:00:00Z",
             },
-            "_comments": [{"id": "501", "body": rule}],
+            "_comments": [{"id": "501", "body": rule, "renderedBody": f"<p>{escape(rule)}</p>"}],
             "_comments_included": True,
             "_comments_total": 1,
             "changelog": {"startAt": 0, "histories": [], "total": 0},
@@ -242,5 +245,3 @@ def _projection_inputs(
         NormalizedContent(item=item, markdown_body=markdown),
         target_observation_type,
     )
-
-

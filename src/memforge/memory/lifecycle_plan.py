@@ -627,6 +627,8 @@ def lifecycle_plan_to_payload(plan: LifecyclePlan) -> dict[str, object]:
                 "presentation_sha256": item.presentation_sha256,
                 "excerpt": item.excerpt,
                 "artifact_metadata": dict(item.artifact_metadata),
+                "text_view": item.text_view.payload() if item.text_view else None,
+                "display_text": item.display_text,
                 "anchor": {
                     "kind": item.anchor.kind.value,
                     "observation_id": item.anchor.observation_id,

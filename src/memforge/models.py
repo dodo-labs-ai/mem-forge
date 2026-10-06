@@ -244,6 +244,7 @@ class MemorySource:
     support_kind: str = "extracted"
     added_at: datetime | None = None
     source_updated_at: datetime | None = None
+    has_unit_support: bool = False
 
 
 @dataclass

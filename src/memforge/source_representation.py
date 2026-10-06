@@ -6,6 +6,21 @@ from dataclasses import dataclass, replace
 from typing import Mapping
 
 from memforge.source_artifacts import SOURCE_ARTIFACT_OBSERVATION_TYPE
+from memforge.source_adapters.contracts import (
+    CanonicalRecordField,
+    CanonicalRecordSchema,
+    EvidenceRepresentationContract,
+)
+from memforge.source_adapters.jira import (
+    CANONICAL_RECORD_SCHEMAS as JIRA_RECORD_SCHEMAS,
+    CURRENT_OBSERVATION_PROFILES as JIRA_OBSERVATION_PROFILES,
+    LEGACY_OBSERVATION_PROFILES as JIRA_LEGACY_PROFILES,
+)
+from memforge.source_adapters.teams import CANONICAL_RECORD_SCHEMAS as TEAMS_RECORD_SCHEMAS
+from memforge.source_adapters.confluence import (
+    CANONICAL_RECORD_SCHEMAS as CONFLUENCE_RECORD_SCHEMAS,
+    LEGACY_OBSERVATION_PROFILES as CONFLUENCE_LEGACY_PROFILES,
+)
 from memforge.source_projection import (
     EvidenceCoordinateSpace,
     EvidenceRepresentationProfile,
@@ -40,112 +55,37 @@ class EvidenceProfileBackfillReport:
     unresolved_revision_ids: tuple[str, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class CanonicalRecordField:
-    json_pointer: str
-    nested_profile: str | None = None
-    comparison_keys: tuple[str, ...] = ()
-    contextual: bool = False
-
-    def __post_init__(self) -> None:
-        if self.nested_profile not in {None, "markdown-structural", "plain-text"}:
-            raise ValueError("unsupported nested canonical-record text profile")
-
-
-@dataclass(frozen=True, slots=True)
-class CanonicalRecordSchema:
-    name: str
-    version: int
-    fields: tuple[CanonicalRecordField, ...]
-    tombstone_pointer: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class EvidenceRepresentationContract:
-    profile: EvidenceRepresentationProfile
-    canonical_schema: CanonicalRecordSchema | None = None
-
-    def __post_init__(self) -> None:
-        if (self.profile.name == "canonical-record") != (self.canonical_schema is not None):
-            raise ValueError("canonical schema ownership must match the representation profile")
-
-
-def _canonical_record_profile(schema_name: str) -> EvidenceRepresentationProfile:
+def _canonical_record_profile(schema_name: str, schema_version: int = 1) -> EvidenceRepresentationProfile:
     return EvidenceRepresentationProfile(
         name="canonical-record",
         version=1,
         coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
         schema_name=schema_name,
-        schema_version=1,
+        schema_version=schema_version,
     )
 
 
 _REPRESENTATION_CONTRACTS: Mapping[tuple[str, str], EvidenceRepresentationProfile] = {
-    ("confluence", "page_body"): MARKDOWN_STRUCTURAL_PROFILE,
-    ("jira", "issue_core"): _canonical_record_profile("jira-issue-core"),
-    ("jira", "comment"): _canonical_record_profile("jira-comment"),
-    ("jira", "changelog"): _canonical_record_profile("jira-changelog"),
+    ("confluence", "page_body"): _canonical_record_profile("confluence-page-storage"),
+    **JIRA_OBSERVATION_PROFILES,
     ("github_repo", "file_content"): MARKDOWN_STRUCTURAL_PROFILE,
     ("github_pages", "page_content"): MARKDOWN_STRUCTURAL_PROFILE,
     ("local_markdown", "file_content"): MARKDOWN_STRUCTURAL_PROFILE,
-    ("teams", "message"): _canonical_record_profile("teams-message"),
+    ("teams", "message"): _canonical_record_profile("teams-message", 2),
     ("agent_session", "session_summary"): MARKDOWN_STRUCTURAL_PROFILE,
     ("agent_session", "agent_concept"): MARKDOWN_STRUCTURAL_PROFILE,
 }
 
 _CANONICAL_RECORD_SCHEMAS: Mapping[tuple[str, int], CanonicalRecordSchema] = {
-    ("jira-issue-core", 1): CanonicalRecordSchema(
-        name="jira-issue-core",
-        version=1,
-        fields=(
-            CanonicalRecordField("/summary"),
-            CanonicalRecordField("/description", nested_profile="markdown-structural"),
-            CanonicalRecordField(
-                "/status",
-                comparison_keys=("id", "key", "name", "value"),
-            ),
-            CanonicalRecordField(
-                "/priority",
-                comparison_keys=("id", "key", "name", "value"),
-            ),
-            CanonicalRecordField(
-                "/assignee",
-                comparison_keys=(
-                    "accountId",
-                    "id",
-                    "key",
-                    "name",
-                    "displayName",
-                ),
-            ),
-            CanonicalRecordField("/labels"),
-            CanonicalRecordField(
-                "/resolution",
-                comparison_keys=("id", "key", "name", "value"),
-            ),
-        ),
-    ),
-    ("jira-comment", 1): CanonicalRecordSchema(
-        name="jira-comment",
-        version=1,
-        fields=(CanonicalRecordField("/body", nested_profile="markdown-structural"),),
-    ),
-    ("jira-changelog", 1): CanonicalRecordSchema(
-        name="jira-changelog",
-        version=1,
-        fields=(
-            CanonicalRecordField("/created", contextual=True),
-            CanonicalRecordField("/items/*/field", contextual=True),
-            CanonicalRecordField("/items/*/fromString", nested_profile="markdown-structural"),
-            CanonicalRecordField("/items/*/toString", nested_profile="markdown-structural"),
-        ),
-    ),
-    ("teams-message", 1): CanonicalRecordSchema(
-        name="teams-message",
-        version=1,
-        fields=(CanonicalRecordField("/content", nested_profile="markdown-structural"),),
-        tombstone_pointer="/deleted",
-    ),
+    **JIRA_RECORD_SCHEMAS,
+    **TEAMS_RECORD_SCHEMAS,
+    **CONFLUENCE_RECORD_SCHEMAS,
+}
+
+_LEGACY_OBSERVATION_PROFILES = {
+    **CONFLUENCE_LEGACY_PROFILES,
+    **JIRA_LEGACY_PROFILES,
+    ("teams", "message"): _canonical_record_profile("teams-message", 1),
 }
 
 
@@ -183,6 +123,7 @@ _SUPPORTED_REPRESENTATION_CONTRACTS: Mapping[
         BINARY_ARTIFACT_PROFILE,
         PLAIN_TEXT_PROFILE,
         *_REPRESENTATION_CONTRACTS.values(),
+        *(_canonical_record_profile(name, version) for name, version in _CANONICAL_RECORD_SCHEMAS),
     }
 }
 
@@ -201,7 +142,7 @@ def in_current_representation(revision: SourceObservationRevision) -> bool:
     Revisions are compared with a new projection only when both sides are in the
     current representation. A stored revision in a profile no adapter projects is
     outside it: no later Unit revision carries it, it is no change of the Unit,
-    and Evidence on it is dropped when the Support is rebound. A revision stored
+    and Evidence on it remains unavailable for correspondence. A revision stored
     before profiles were recorded counts as current.
     """
 
@@ -262,3 +203,15 @@ def representation_profile_for_observation_contract(
         # The extension-safe projection fallback is explicitly normalized Markdown.
         return MARKDOWN_STRUCTURAL_PROFILE
     return _REPRESENTATION_CONTRACTS.get((source_type, observation_type))
+
+
+def legacy_representation_profile_for_observation_contract(
+    *, source_type: str, observation_type: str,
+) -> EvidenceRepresentationProfile | None:
+    """A known pre-profile writing contract, independent of today's adapter."""
+    return _LEGACY_OBSERVATION_PROFILES.get(
+        (source_type, observation_type),
+        representation_profile_for_observation_contract(
+            source_type=source_type, observation_type=observation_type,
+        ),
+    )
