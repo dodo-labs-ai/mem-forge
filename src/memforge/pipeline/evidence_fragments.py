@@ -41,7 +41,7 @@ from memforge.source_representation import (
 )
 
 
-COMPILER_CONTRACT_VERSION = 8
+COMPILER_CONTRACT_VERSION = 9
 DEFAULT_MAX_FRAGMENTS = 2_048
 DEFAULT_MAX_PRESENTATION_CHARS = 120_000
 _SUPPORTING_ROLES = frozenset({EvidenceRole.PRIMARY, EvidenceRole.REQUIRED})
@@ -1302,6 +1302,10 @@ def _html_candidates(
 ) -> tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]]:
     parser = _OffsetHTMLParser(source)
     parser.close_checked()
+    # Valid comments are framing, with no selectable text. Their presence must
+    # not make an otherwise complete Markdown representation fail verification.
+    if parser.failure is None and re.fullmatch(r"(?:\s*<!--(?:(?!-->|<!--).)*-->\s*)+", source, re.DOTALL):
+        return (), ()
     if parser.failure is not None:
         if parser.internal_failure:
             return (), (
