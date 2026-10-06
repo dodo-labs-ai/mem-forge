@@ -120,7 +120,7 @@ WORKSPACE_BACKLOG_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 WORKSPACE_BACKLOG_EXPIRED = "workspace_backlog_expired"
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.63"
+PLUGIN_VERSION = "0.1.64"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
