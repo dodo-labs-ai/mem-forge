@@ -91,6 +91,15 @@ class DocumentStore(Protocol):
     def read_artifact(self, uri: str) -> bytes: ...
     def open_artifact(self, uri: str) -> ContextManager[BinaryIO]: ...
     def delete_artifact(self, uri: str) -> None: ...
+    def belongs_to_document(self, uri: str | None, *, source_id: str, doc_id: str) -> bool:
+        """Whether ``uri`` names an object stored under this Source's keys for this Document.
+
+        Raw, normalized and PDF objects of a Document are written under
+        ``{source}/{document identity}/``, and a Document uses only the objects
+        stored there: an object anywhere else belongs to another Document or
+        another Source.
+        """
+        ...
 
 
 class LocalDocumentStore:
@@ -127,6 +136,15 @@ class LocalDocumentStore:
 
     def _document_dir(self, source_id: str, doc_id: str) -> Path:
         return self._root / slugify(source_id) / document_artifact_identity(doc_id)
+
+    def belongs_to_document(self, uri: str | None, *, source_id: str, doc_id: str) -> bool:
+        """Whether ``uri`` is a file directly inside this Source's directory for the Document."""
+        if not uri:
+            return False
+        candidate = Path(uri).expanduser()
+        if not candidate.is_absolute():
+            candidate = self._root / candidate
+        return candidate.resolve().parent == self._document_dir(source_id, doc_id).expanduser().resolve()
 
     def _doc_stem(self, title: str) -> str:
         return slugify(title)

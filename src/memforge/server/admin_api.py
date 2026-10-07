@@ -4477,7 +4477,10 @@ def create_admin_app(
         nonlocal owned_db
 
         if db is None:
-            owned_db = Database(config.storage.db_path)
+            owned_db = Database(
+                config.storage.db_path,
+                document_store=document_store or LocalDocumentStore(config.storage.docs_path),
+            )
             await owned_db.connect()
             app.state.db = owned_db
         else:
