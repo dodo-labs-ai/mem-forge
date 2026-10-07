@@ -124,7 +124,7 @@ class ItemFailure:
     capacity; ``invalid_response`` means the item's row stayed rejected after its
     re-ask, or a response that holds only this item could not be read into rows
     after its correction. The caller owns the stage outcome: Support keeps an
-    unjudgeable incumbent, while incomplete Claim Extraction fails the Unit.
+    unjudgeable incumbent; Claim Extraction skips the unjudgeable ReadingGroup.
     The rest leave the Source Unit revision
     uncommitted: ``deadline_exceeded`` and ``provider_error`` are transient and
     the sync retries them at once, while ``request_error``, a request that failed
@@ -305,7 +305,11 @@ class LlmBatchRunner:
         for outcome in outcomes:
             for item_id, result in outcome.items():
                 if isinstance(result, ItemFailure):
-                    failures.setdefault(item_id, result)
+                    prior = failures.get(item_id)
+                    # An execution failure anywhere prevents the stage from
+                    # treating this item as a local, unjudgeable skip.
+                    if prior is None or (prior.unjudgeable and not result.unjudgeable):
+                        failures[item_id] = result
                 else:
                     chunks[item_id].append(result)
         return {

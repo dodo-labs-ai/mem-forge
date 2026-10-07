@@ -227,8 +227,9 @@ class MemoryExtractor:
         Each ReadingGroup that holds authorized Primary is one runner item, so a
         request that times out, exceeds capacity or keeps returning invalid
         output is halved and resent. A ReadingGroup that alone exceeds the
-        route's capacity, or whose output alone stays invalid, fails the complete
-        extraction work; no successful subset is returned.
+        route's capacity, or whose output alone stays invalid, is diagnosed and
+        skipped. An execution or Evidence-binding error fails the work without
+        returning a successful subset.
         """
 
         if not self.structured_llm_client:
@@ -293,10 +294,8 @@ class MemoryExtractor:
                 error="The authorized ReadingGroups were not completely accounted for.",
                 metadata={**metrics, **elapsed(), "safe_error_code": "EXTRACTION_WORK_INCOMPLETE"},
             )
-        # The runner's classification still belongs to its task. Extraction
-        # requires every authorized group; Support's unjudgeable KEEP is unchanged.
         failures = {item_id: outcome for item_id, outcome in outcomes.items() if isinstance(outcome, ItemFailure)}
-        failure = next(iter(failures.values()), None)
+        failure = next((outcome for outcome in failures.values() if not outcome.unjudgeable), None)
         if failure is not None:
             error = failure.error
             validation_fields = error.validation_fields if isinstance(error, StructuredLlmError) else ()
@@ -314,7 +313,8 @@ class MemoryExtractor:
                     ],
                 },
             )
-        responses = dict(chunks[0] for chunks in outcomes.values())
+        skipped = reading.report_unread({item_id: outcome.error_code for item_id, outcome in failures.items()})
+        responses = dict(chunks[0] for chunks in outcomes.values() if not isinstance(chunks, ItemFailure))
         memories: list[RawMemory] = []
         resolution = _SelectionResolution()
         image_count = image_bytes = 0
@@ -332,7 +332,7 @@ class MemoryExtractor:
             **elapsed(),
             "structured_llm_calls": runner.stats.calls,
             "extraction_request_count": len(responses),
-            "skipped_reading_group_count": 0,
+            "skipped_reading_group_count": len(skipped),
             "image_count": image_count,
             "image_bytes": image_bytes,
             **resolution.metrics(),

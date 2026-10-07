@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from memforge.llm.structured import ClaimRevisionWireResponse, StructuredLlmError
+from memforge.llm.structured import CandidateAdmissionResponse, ClaimRevisionWireResponse, StructuredLlmError, SupportAssessmentWireResponse
 from memforge.memory.coordinator_review import coordinator_review_id
 from memforge.memory.lifecycle_plan import LifecycleReviewStatus
 from memforge.memory.lifecycle_review import (
@@ -40,6 +40,39 @@ from tests.unit_support_fixture import active_support_evidence
 
 # Bounds how long one line waits to see the other start; a serial implementation never does.
 _CONCURRENCY_TIMEOUT_S = 5
+
+
+@pytest.mark.asyncio
+async def test_local_admission_skip_and_unresolved_support_commit_independent_memory(db: Database) -> None:
+    """An omitted admission row cannot erase an independently unjudgeable incumbent."""
+    from tests.llm_fixture import admission_payload
+
+    page, incumbent = await seeded_page(db, TWO, RETENTION)
+
+    class LocalFailureClient(ScriptedClient):
+        async def admit_candidates(self, prompt, **kwargs):
+            response = await super().admit_candidates(prompt, **kwargs)
+            payload = admission_payload(prompt)
+            skipped_ids = {row["id"] for row in payload["candidates"] if row["claim"] == RETENTION}
+            return CandidateAdmissionResponse(decisions=[d for d in response.decisions if d.candidate_id not in skipped_ids])
+
+        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+            if response_format is SupportAssessmentWireResponse:
+                raise StructuredLlmError("fixture invalid Support", terminal_category="invalid_response", error_code="output_invalid")
+            return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
+
+    target = page.next("Reviewer policy is under discussion.", RETENTION, AUDIT)
+    stats = await page.commit(LocalFailureClient(), target, RETENTION, AUDIT)
+
+    current = await db.get_current_source_unit_revision(page.unit_id)
+    assert current.id == target.source_unit_revisions[0].id
+    assert {(m.id, m.content) for m in await db.list_memories(status="active")} >= {(incumbent.id, TWO)}
+    assert sorted(m.content for m in await db.list_memories(status="active")) == sorted([TWO, AUDIT])
+    assert stats["candidate_admission_rejected_count"] == 1
+    assert stats["support_revalidation_unresolved_invalid_response_count"] == 1
+    [event] = await db.list_memory_audit_events(event_type="candidate_admission_rejected")
+    assert event.payload["reject_reason"] == "invalid_response"
+    assert await support_texts(db, incumbent.id) == {TWO}
 
 
 @pytest.mark.asyncio

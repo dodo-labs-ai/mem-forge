@@ -1378,11 +1378,7 @@ def assemble_source_derivation_results(
                 invalid_summary_count += 1
                 continue
             summaries_by_observation_id[observation_id] = summary
-    incomplete = (
-        bool(plan.skipped_reading_groups)
-        or len(results) != len(plan.requests)
-        or bool(metrics["skipped_reading_group_count"])
-    )
+    incomplete = len(results) != len(plan.requests)
     if failures or incomplete:
         first = failures[0] if failures else None
         return MemoryExtractionResult(

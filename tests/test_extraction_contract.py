@@ -66,7 +66,7 @@ def _planned_requests(projection, authority):
 def test_extraction_contract_version_is_pinned_into_derivation_identity() -> None:
     # Stored derivations and batch ids hash this value; changing it supersedes
     # every stored derivation instead of resuming it.
-    assert PROJECTION_EXTRACTION_CONTRACT_VERSION == "projection-extraction-v21"
+    assert PROJECTION_EXTRACTION_CONTRACT_VERSION == "projection-extraction-v22"
 
 
 @pytest.mark.parametrize("status,version,reason,ready", (
@@ -109,7 +109,7 @@ def test_extraction_prompt_carries_the_durable_memory_quality_contract() -> None
     ))
 
 
-@pytest.mark.parametrize("failure", ("plan_gap", "runtime_gap", "missing_result", "typed_failure"))
+@pytest.mark.parametrize("failure", ("missing_result", "typed_failure"))
 def test_unit_aggregation_refuses_incomplete_work_and_preserves_typed_failure(failure):
     from memforge.models import RawMemory
     from memforge.source_derivation import assemble_source_derivation_results, safe_derivation_error
@@ -117,10 +117,8 @@ def test_unit_aggregation_refuses_incomplete_work_and_preserves_typed_failure(fa
 
     projection = _projection()
     [request] = _planned_requests(projection, ExtractionAuthority({"obs-primary": None}))
-    plan = ExtractionPlan((request,), ("unread-group",) if failure == "plan_gap" else ())
+    plan = ExtractionPlan((request,))
     complete = MemoryExtractionResult(memories=[RawMemory(content="Use approval before release.", memory_type="fact")])
-    if failure == "runtime_gap":
-        complete.metadata["skipped_reading_group_count"] = 1
     results = () if failure == "missing_result" else (complete,)
     if failure == "typed_failure":
         results = (MemoryExtractionResult(
@@ -134,6 +132,24 @@ def test_unit_aggregation_refuses_incomplete_work_and_preserves_typed_failure(fa
     if failure == "typed_failure":
         _, code, fields = safe_derivation_error(result)
         assert code == "INPUT_CAPACITY_EXCEEDED" and fields == (("memories.0.content", "missing"),)
+
+
+@pytest.mark.parametrize("stage", ("planning", "execution"))
+def test_accounted_local_skips_preserve_successful_extraction(stage):
+    from memforge.models import RawMemory
+    from memforge.source_derivation import assemble_source_derivation_results
+    from tests.test_projection_fragments import _projection
+
+    projection = _projection()
+    [request] = _planned_requests(projection, ExtractionAuthority({"obs-primary": None}))
+    plan = ExtractionPlan((request,), ("unread-group",) if stage == "planning" else ())
+    memory = RawMemory(content="Use approval before release.", memory_type="fact")
+    complete = MemoryExtractionResult(memories=[memory])
+    if stage == "execution":
+        complete.metadata["skipped_reading_group_count"] = 1
+    result = assemble_source_derivation_results(projection=projection, plan=plan, results=(complete,))
+    assert result.error_type is None and result.memories == [memory]
+    assert result.metadata["skipped_reading_group_count"] == 1
 
 
 def test_complete_empty_claim_response_is_valid_unit_success():
