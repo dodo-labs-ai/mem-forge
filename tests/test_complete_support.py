@@ -66,7 +66,7 @@ def test_support_assessment_uses_whole_support_and_admission_has_no_entailment_r
 def test_the_definition_raises_every_contract_whose_result_it_defines():
     assert REVISION_SUPPORT_CONTRACT == "revision-support-v11"
     assert SUPPORT_ASSESSMENT_CONTRACT == "support-ordered-reading-v9"
-    assert CANDIDATE_ADMISSION_CONTRACT == "candidate-admission-v6"
+    assert CANDIDATE_ADMISSION_CONTRACT == "candidate-admission-v7"
 
 
 @pytest.mark.asyncio

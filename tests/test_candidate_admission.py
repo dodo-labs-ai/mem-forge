@@ -258,7 +258,7 @@ async def test_no_candidates_need_no_model_call():
                                           "duplicate_of": ["CND-0099"]}, id="duplicate-outside-round"),
     ],
 )
-async def test_a_candidate_whose_admission_stays_invalid_fails_complete_work(judge, request):
+async def test_a_candidate_whose_admission_stays_invalid_is_skipped_locally(judge, request):
     unknown_id = request.node.callspec.id == "unknown-id"
     unjudged = candidate(MOST_SPECIFIC)
     judged = candidate(INDEPENDENT)
@@ -267,22 +267,26 @@ async def test_a_candidate_whose_admission_stays_invalid_fails_complete_work(jud
         return judge(row, round_claims) if round_claims.get(row["id"]) == MOST_SPECIFIC else admitted(row, round_claims)
 
     client = AdmissionClient(answer)
-    with pytest.raises(CandidateAdmissionError):
-        await admit_candidates([unjudged, judged], client=client, model="fixture", unit_title=None)
+    result = await admit_candidates([unjudged, judged], client=client, model="fixture", unit_title=None)
+    assert result.admitted == (judged,)
+    assert [(r.candidate, r.reject_reason) for r in result.rejected] == [(unjudged, "invalid_response")]
+    assert result.merged_count == 0
     assert client.calls == (5 if unknown_id else 2)
 
 
 
 @pytest.mark.asyncio
-async def test_a_candidate_that_alone_exceeds_capacity_fails_complete_work():
+async def test_a_candidate_that_alone_exceeds_capacity_is_skipped_locally():
     oversized = candidate(MOST_SPECIFIC)
     judged = candidate(INDEPENDENT)
 
     def fits(payload):
         return all(row["claim"] != MOST_SPECIFIC for row in payload["candidates"])
 
-    with pytest.raises(CandidateAdmissionError):
-        await admit_candidates([oversized, judged], client=AdmissionClient(fits=fits), model="fixture", unit_title=None)
+    result = await admit_candidates([oversized, judged], client=AdmissionClient(fits=fits), model="fixture", unit_title=None)
+    assert result.admitted == (judged,)
+    assert [(r.candidate, r.reject_reason) for r in result.rejected] == [(oversized, "capacity_exceeded")]
+    assert result.merged_count == 0
 
 
 

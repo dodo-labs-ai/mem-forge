@@ -25,7 +25,7 @@ from tests.revision_client_fixture import (
     RevisionClientFixture,
 )
 from tests.test_projected_lifecycle_integration import (
-    _OutboxDrainer,
+    _AuditedOutboxDrainer,
     _candidate_retriever,
     _jira_projection,
     _projection,
@@ -103,7 +103,7 @@ def coordination_engine(db: Database, client, memory_store=None) -> MemoryEngine
     return MemoryEngine(
         cross_document_candidates=_candidate_retriever(build_sqlite_adapters(db, object())),
         db=db,
-        memory_store=memory_store or _OutboxDrainer(db),
+        memory_store=memory_store or _AuditedOutboxDrainer(db),
         structured_llm_client=client,
     )
 

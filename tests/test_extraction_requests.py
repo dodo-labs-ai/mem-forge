@@ -20,7 +20,7 @@ from memforge.llm.structured import (
 from memforge.pipeline.extraction_requests import plan_extraction_requests
 from memforge.pipeline.memory_extractor import ExtractionReading, MemoryExtractor
 from memforge.pipeline.projection_context import (
-    ExtractionAuthority, ProjectionEvidencePlanningFailure, ProjectionEvidencePlanningFailureCode, plan_projection_evidence_work,
+    ExtractionAuthority, plan_projection_evidence_work,
 )
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.source_projection_adapters import project_source_item
@@ -85,12 +85,13 @@ def test_large_complete_table_reaches_actual_request_budget(representation, rows
             max_input_tokens=window, context_window_tokens=window, max_output_tokens=1024))
         extractor = MemoryExtractor(model=client.config.model, structured_llm_client=client)
         if window == 8_000:
-            # One unfit group refuses the entire authority; no successful subset.
+            # A whole unfit group is diagnosed; independent groups remain planned.
             with caplog.at_level("WARNING", logger="memforge.pipeline.memory_extractor"):
                 extraction = extraction_plan(projection, whole(projection), extractor=extractor)
-            assert isinstance(extraction, ProjectionEvidencePlanningFailure)
-            assert extraction.code is ProjectionEvidencePlanningFailureCode.EXTRACTION_INPUT_CAPACITY_EXCEEDED
-            assert extraction.authorized_structure_count >= 3
+            assert len(extraction.skipped_reading_groups) == 1
+            assert [f.presentation_text.strip() for f in primary(extraction.requests)] == [
+                "Before the table.", "After the table.",
+            ]
             assert "extraction_reading_group_unread" in caplog.text
             assert f"reason={INPUT_CAPACITY_EXCEEDED}" in caplog.text
             continue
@@ -266,7 +267,7 @@ async def test_a_multi_item_request_that_times_out_is_halved_and_every_item_comp
 
 
 @pytest.mark.asyncio
-async def test_a_reading_group_the_provider_rejects_alone_fails_complete_work():
+async def test_a_reading_group_the_provider_rejects_alone_is_skipped_locally():
     projection = _projection(
         primary_content="Rule one applies.\n\nRule two is far too large.\n", context_content="Country: US.\n",
     )
@@ -292,14 +293,13 @@ async def test_a_reading_group_the_provider_rejects_alone_fails_complete_work():
         request.catalog, source_type="confluence", revision_context=context,
     )
 
-    assert result.error_type == "structured_llm_error"
-    assert result.memories == []
-    assert result.metadata["failed_reading_group_count"] == 1
-    assert result.metadata["safe_error_code"] == INPUT_CAPACITY_EXCEEDED
+    assert result.error_type is None
+    assert [m.content for m in result.memories] == ["Rule one applies."]
+    assert result.metadata["skipped_reading_group_count"] == 1
 
 
 @pytest.mark.asyncio
-async def test_a_reading_group_whose_output_stays_invalid_fails_complete_work():
+async def test_a_reading_group_whose_output_stays_invalid_is_skipped_locally():
     projection = _projection(
         primary_content="Rule one applies.\n\nRule two confuses the model.\n", context_content="Country: US.\n",
     )
@@ -325,10 +325,9 @@ async def test_a_reading_group_whose_output_stays_invalid_fails_complete_work():
         request.catalog, source_type="confluence", revision_context=context,
     )
 
-    assert result.error_type == "structured_llm_error"
-    assert result.memories == []
-    assert result.metadata["failed_reading_group_count"] == 1
-    assert result.metadata["safe_error_code"] == "ValueError"
+    assert result.error_type is None
+    assert [m.content for m in result.memories] == ["Rule one applies."]
+    assert result.metadata["skipped_reading_group_count"] == 1
 
 
 def _updated_normalized_document(initial, body):

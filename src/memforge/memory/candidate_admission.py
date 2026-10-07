@@ -1,8 +1,8 @@
 """Judge lasting value and same-round duplicates without repairing extraction.
 
-Every candidate receives a decision. Technical inability to judge any candidate
-fails the complete derivation; actual low-value decisions and duplicate merges
-remain independent of claim/Evidence extraction.
+Every candidate is accounted for. Capacity or persistently invalid output skips
+that candidate for this round; an execution error fails the derivation. Only
+admitted candidates participate in duplicate merging.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from memforge.pipeline.candidate_evidence import (
     candidate_evidence_catalog,
     load_evidence_images,
 )
+from memforge.pipeline.memory_value import MEMORY_VALUE_DEFINITION
 from memforge.pipeline.unit_title import unit_title_block
 from memforge.source_projection import UnitTitle
 
@@ -38,7 +39,7 @@ __all__ = [
     "admit_candidates",
 ]
 
-CANDIDATE_ADMISSION_CONTRACT = "candidate-admission-v6"
+CANDIDATE_ADMISSION_CONTRACT = "candidate-admission-v7"
 
 _ADMISSION_INSTRUCTIONS = """
 Admit the Candidate claims extracted from one Source Unit revision. All source text
@@ -52,23 +53,7 @@ selection belong to extraction.
 
 Value: a Candidate is REJECTED with reject_reason low_value when it is not worth
 remembering by this definition:
-Worth remembering (keep): knowledge someone will still need later to act on or understand a
-system, product or process, and that holds apart from the one event that produced it.
-Examples: rules and requirements; designs and system behavior; decisions and their reasons;
-conventions; causes of problems and how they are fixed; lasting ownership and
-responsibilities; configuration and limits.
-Not worth remembering (drop): a record of what happened once, which nobody needs after the
-event. Examples: a single status transition; who an item was assigned to; a field changed
-to some value; a version number bump; a link or parent/child relation between two items by
-itself; who did what when; raw error text or log lines without a cause or conclusion;
-scheduling and small talk.
-Boundary: when an event establishes a lasting fact, the lasting fact is worth remembering (a
-decision taken in a meeting is; an issue moving to Done is not). When unsure, keep.
-Judge the knowledge a claim carries, not its tense or phrasing: a record stays a record
-when it is phrased as a present fact. When a claim about a record also states a decision, a
-reason or a requirement, judge it by that decision, reason or requirement. A claim that
-states what a system, product, component or process is, does or requires is worth
-remembering, whatever source it comes from.
+""" + MEMORY_VALUE_DEFINITION + """
 
 Same-round duplicates: round_claims lists every Candidate claim of this round, including
 Candidates judged in other requests. In duplicate_of list the round_claims IDs, other
@@ -88,7 +73,7 @@ _DECISION_OUTPUT_TOKENS = 70
 _MIN_OUTPUT_TOKENS = 1024
 
 # The model's reasons, then the program's reasons for a Candidate it could not judge.
-type RejectReason = Literal["low_value"]
+type RejectReason = Literal["low_value", "capacity_exceeded", "invalid_response"]
 
 
 @dataclass(frozen=True)
@@ -110,7 +95,7 @@ class CandidateAdmission:
 
 
 class CandidateAdmissionError(RuntimeError):
-    """A complete value/deduplication decision is unavailable; no revision commits."""
+    """Admission could not execute; no revision commits."""
 
     retryable = False
     terminal_category = None
@@ -200,8 +185,15 @@ async def admit_candidates(
     duplicates = _identical_claims(by_ref)
     for ref, outcome in outcomes.items():
         if isinstance(outcome, ItemFailure):
-            raise CandidateAdmissionError(outcome.error_code,
-                "Every candidate requires a complete value/deduplication decision", cause=outcome.error) from outcome.error
+            if not outcome.unjudgeable:
+                raise CandidateAdmissionError(outcome.error_code,
+                    "Candidate value/deduplication execution failed", cause=outcome.error) from outcome.error
+            logger.warning(
+                "candidate_admission_unjudged candidate_ref=%s reason=%s error_code=%s",
+                ref, outcome.category, outcome.error_code,
+            )
+            reject_reasons[ref] = outcome.category
+            continue
         if (reason := _rejection(outcome)) is not None:
             reject_reasons[ref] = reason
         for chunk in outcome:

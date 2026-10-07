@@ -81,8 +81,8 @@ class ExtractionPlan:
 
     A ReadingGroup that with its reading context alone exceeds the route's
     capacity is skipped with a diagnostic; the other groups are extracted and
-    the revision commits. Its knowledge is extracted again only when its
-    structure changes again.
+    the revision commits. Its knowledge is extracted again only on a later
+    structure change or an explicit reprocess.
     """
 
     requests: tuple[ExtractionRequest, ...]

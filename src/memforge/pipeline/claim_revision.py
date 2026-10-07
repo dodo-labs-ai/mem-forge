@@ -85,8 +85,9 @@ async def assess_claim_pairs(
     """Discover edges for every admitted candidate against every incumbent without synthesizing missing edges.
 
     The request carries no Support result and asks for no Evidence judgment:
-    candidate admission already checked each candidate's Evidence, and only
-    SupportRelationCoordinator combines relations with Support. Each NEW candidate is one work
+    extraction bound each candidate to authentic selected Evidence; admission
+    checked value and duplicates. Only SupportRelationCoordinator combines
+    relations with incumbent Support. Each NEW candidate is one work
     item; the incumbents are its shared context.
     A candidate whose incumbents do not fit one request reads them in
     consecutive chunks, and its per-chunk rows are merged here. A candidate that

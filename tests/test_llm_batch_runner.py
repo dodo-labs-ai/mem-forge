@@ -199,6 +199,27 @@ async def test_a_single_item_that_still_fails_returns_a_typed_failure(error, cat
     assert runner.stats.failed_requests == 1
 
 
+@pytest.mark.parametrize("execution_first", (False, True))
+@pytest.mark.parametrize("category", ("provider_error", "deadline_exceeded", "request_error"))
+async def test_context_execution_failure_dominates_unjudgeable_in_either_order(execution_first, category):
+    invalid = StructuredLlmError("invalid part", terminal_category="invalid_response", error_code=OUTPUT_INVALID)
+    execution = StructuredLlmError("execution part", terminal_category=category, error_code="fixture_execution")
+    errors = (execution, invalid) if execution_first else (invalid, execution)
+
+    def respond(prompt):
+        [part] = prompt_parts(prompt)
+        raise errors[int(part[1:])]
+
+    # Exactly one item plus one context part fits, forcing real context planning.
+    client = FixtureBudgetClient(respond=respond, input_tokens=3)
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+    result = await runner.run_items(item_task(client, ids(1), context=parts(2)))
+    failure = result["i00"]
+    assert failure.error is execution and not failure.unjudgeable
+    assert [prompt_parts(prompt) for prompt in client.prompts] == [["p0"], ["p1"]]
+    assert runner.stats.failed_requests == 2
+
+
 async def test_an_item_that_alone_exceeds_capacity_fails_without_a_call():
     client = FixtureBudgetClient(respond=answer, input_tokens=1)
     runner = LlmBatchRunner(client, model=FIXTURE_MODEL)

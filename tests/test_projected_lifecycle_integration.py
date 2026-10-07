@@ -1570,6 +1570,9 @@ class _AdmissionClient(FixtureBudgetClient):
     async def admit_candidates(self, prompt: str, *, max_tokens: int, model=None, images=()):
         return await self.call(prompt, max_tokens=max_tokens, model=model)
 
+    def input_policy_identity_for(self, model=None):
+        return f"fixture-admission:{self.input_tokens}:{self.output_tokens}:{model}"
+
 
 class _FailingOutboxDrainer(_OutboxDrainer):
     async def attempt_lifecycle_vector_delivery(self, lifecycle_plan_id: str) -> LifecycleVectorDeliveryResult:
@@ -1828,7 +1831,7 @@ async def test_entity_resolution_reads_each_mention_with_its_own_memory_text(db:
 
 
 @pytest.mark.asyncio
-async def test_incomplete_admission_fails_revision_without_partial_memory_commit(
+async def test_unjudgeable_admission_commits_independent_candidate_and_audit(
     db: Database,
 ) -> None:
     projection = _projection(
@@ -1846,8 +1849,7 @@ async def test_incomplete_admission_fails_revision_without_partial_memory_commit
         structured_llm_client=client,
     )
 
-    with pytest.raises(CandidateAdmissionError):
-        await engine.prepare_and_commit_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
         raw_memories=_selected(projection, [
@@ -1874,11 +1876,49 @@ async def test_incomplete_admission_fails_revision_without_partial_memory_commit
         source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
     )
 
-    assert await db.list_memories() == []
+    assert [m.content for m in await db.list_memories()] == ["The trigger was not processed."]
+    assert stats["candidate_admission_rejected_count"] == 1
     # Both Candidates, then the one re-ask of the Candidate whose decision is missing.
     assert len(client.prompts) == 2
-    assert await db.list_memory_audit_events(event_type="candidate_admission_rejected") == []
+    [event] = await db.list_memory_audit_events(event_type="candidate_admission_rejected")
+    assert event.payload["reject_reason"] == "invalid_response"
+    current = await db.get_current_source_unit_revision(projection.source_units[0].id)
+    assert current.id == projection.source_unit_revisions[0].id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("execution_first", (False, True))
+async def test_mixed_admission_chunk_failure_leaves_revision_uncommitted(db: Database, execution_first: bool):
+    from tests.test_candidate_admission import AdmissionClient, MOST_SPECIFIC, INDEPENDENT, admitted
+
+    projection = _projection(run_id="projection-mixed-admission-error", body=f"{MOST_SPECIFIC}\n\n{INDEPENDENT}")
+    execution = StructuredLlmError("fixture unavailable", terminal_category="provider_error", error_code="fixture_provider_error")
+    invalid = StructuredLlmError("fixture invalid", terminal_category="invalid_response", error_code="output_invalid")
+
+    def judge(row, round_claims):
+        if row["claim"] == MOST_SPECIFIC:
+            first_context = MOST_SPECIFIC in round_claims.values()
+            raise execution if first_context == execution_first else invalid
+        return admitted(row, round_claims)
+
+    client = AdmissionClient(judge, fits=lambda payload: len(payload["candidates"]) == len(payload["round_claims"]) == 1)
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(build_sqlite_adapters(db, object())),
+        db=db, memory_store=_AuditedOutboxDrainer(db), structured_llm_client=client,
+    )
+    with pytest.raises(CandidateAdmissionError) as raised:
+        await engine.prepare_and_commit_projected_lifecycle(
+            projection=projection, doc_id="confluence-123",
+            raw_memories=_selected(projection, [RawMemory(content=c, memory_type="fact", evidence_quote=c)
+                                               for c in (MOST_SPECIFIC, INDEPENDENT)]),
+            doc_type="document", project_key="ENG", repo_identifier=None,
+            document_content=_body_revision(projection).content, update_mode="full_document",
+            changed_hunks=None, update_plan_stats=None, source_updated_at=None,
+        )
+    assert raised.value.__cause__ is execution
+    assert await db.list_memories() == []
     assert await db.get_current_source_unit_revision(projection.source_units[0].id) is None
+    assert await db.list_memory_audit_events(event_type="candidate_admission_rejected") == []
 
 
 class _SemanticEquivalentClient(RevisionClientFixture):
@@ -2723,9 +2763,11 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("unjudgeable", (False, True))
 async def test_the_commit_gate_requires_the_revisions_candidate_admission_work(
     db: Database,
     monkeypatch: pytest.MonkeyPatch,
+    unjudgeable: bool,
 ) -> None:
     projection = _projection(run_id="projection-admission-gate", body="A7 is removed.")
     document = await db.get_document("confluence-123")
@@ -2773,7 +2815,7 @@ async def test_the_commit_gate_requires_the_revisions_candidate_admission_work(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_AuditedOutboxDrainer(db),
-        structured_llm_client=AdmittingClient(),
+        structured_llm_client=_AdmissionClient() if unjudgeable else AdmittingClient(),
     )
 
     await engine.prepare_and_commit_projected_lifecycle(
@@ -2796,6 +2838,10 @@ async def test_the_commit_gate_requires_the_revisions_candidate_admission_work(
     assert {kinds[work_id] for work_id in required} == {"candidate_admission"}
     [committed] = await db.list_source_derivation_attempts(source_id="src-1")
     assert committed.status == "applied"
+    if unjudgeable:
+        assert await db.list_memories() == []
+        [event] = await db.list_memory_audit_events(event_type="candidate_admission_rejected")
+        assert event.payload["reject_reason"] == "invalid_response"
 
 
 @pytest.mark.asyncio
@@ -2998,7 +3044,7 @@ class _OversizedGroupExtractor(NoopMemoryExtractor):
 
 
 @pytest.mark.asyncio
-async def test_a_reading_group_beyond_capacity_refuses_the_unit_and_preserves_support(db: Database) -> None:
+async def test_skipped_extraction_group_reuses_work_and_commits_independent_memory(db: Database) -> None:
     base = _projection(run_id="projection-capacity-base", body="Rule one applies.\n")
     await db.record_source_projection(base)
     incumbent = await _seed_exact_incumbent_support(
@@ -3007,16 +3053,21 @@ async def test_a_reading_group_beyond_capacity_refuses_the_unit_and_preserves_su
     before_support = await active_support_evidence(db, incumbent.id)
     before_projection = await db.get_current_source_unit_projection(base.source_units[0].id)
     body = f"Rule one applies.\n\n{_OversizedGroupExtractor.OVERSIZED}\n\nRule three applies.\n"
-    projection = _projection(run_id="projection-extraction-capacity", body=body)
+    projection = _projection(run_id="projection-extraction-capacity", body=body,
+        prior=base.source_unit_revisions[0],
+        prior_observations={r.observation_id: r for r in base.observation_revisions})
     document = await db.get_document("confluence-123")
     assert document is not None
     read: list[str] = []
 
     async def extract(batch):
         read.extend(f.presentation_text.strip() for f in batch.catalog.fragments if f.primary_eligible)
-        return MemoryExtractionResult(memories=[])
+        return MemoryExtractionResult(memories=_selected(projection, [
+            RawMemory(content="Rule three applies.", memory_type="fact", evidence_quote="Rule three applies.")
+        ]) if any(f.presentation_text.strip() == "Rule three applies." and f.primary_eligible for f in batch.catalog.fragments) else [])
 
     def request():
+        from tests.test_projection_context import _committed_snapshot
         return SourceUnitDerivationRequest(
             projection=projection,
             context=SourceUnitDerivationContext(
@@ -3038,48 +3089,22 @@ async def test_a_reading_group_beyond_capacity_refuses_the_unit_and_preserves_su
             max_concurrent=1,
             access_context_hash="access-extraction-capacity",
             inference_capability_hash="inference-extraction-capacity",
+            committed_base_snapshot=_committed_snapshot(base),
         )
 
     first = await SourceUnitDeriver(db).derive(request())
 
-    assert first.extraction.error_type == "evidence_authority_planning_failed"
+    assert first.extraction.error_type is None
     assert first.derivation.status == "completed"
-    assert first.derivation.terminal_reason_code == "EXTRACTION_INPUT_CAPACITY_EXCEEDED"
-    assert first.derivation.batches == () and read == []
-    assert first.extraction.memories == []
-    assert first.extraction.metadata["lifecycle_mutation_skipped"]
+    assert first.derivation.terminal_reason_code is None
+    assert first.derivation.batches and _OversizedGroupExtractor.OVERSIZED not in read
+    assert "Rule three applies." in read
+    assert [m.content for m in first.extraction.memories] == ["Rule three applies."]
+    assert first.extraction.metadata["skipped_reading_group_count"] == 1
     assert await active_support_evidence(db, incumbent.id) == before_support
     assert await db.get_current_source_unit_projection(base.source_units[0].id) == before_projection
 
-    # A direct/deferred commit cannot bypass the sync failure gate just because
-    # the empty failed computation is durably marked completed.
-    delta = projection.deltas[0]
-    plan = build_lifecycle_plan(
-        plan_id="plan-capacity-cannot-commit",
-        scope=ReconciliationScope(
-            id="scope-capacity-cannot-commit", source_id=projection.source_id,
-            source_unit_id=delta.source_unit_id,
-            base_unit_revision_id=delta.previous_unit_revision_id,
-            target_unit_revision_id=delta.current_unit_revision_id,
-        ),
-        gate_state=LifecycleGateState.GATED, operations=(), incumbents={},
-        source_support_unit_ids={}, all_active_support_unit_ids={}, support_set_hashes={},
-        observation_revision_ids=tuple(revision.id for revision in projection.observation_revisions),
-        defaults=NewMemoryDefaults(
-            visibility="workspace", owner_user_id=None, project_key="ENG",
-            repo_identifier=None, doc_id="confluence-123", source_type="confluence",
-            access_context_hash="access-extraction-capacity",
-        ),
-    )
-    with pytest.raises(ValueError, match="not ready for lifecycle commit"):
-        await db.apply_source_projection_lifecycle(
-            projection, plan, document=document, derivation_id=first.derivation.id,
-            derivation_context_identity_hash=first.derivation.context_identity_hash,
-        )
-    assert await active_support_evidence(db, incumbent.id) == before_support
-    assert await db.get_current_source_unit_projection(base.source_units[0].id) == before_projection
-
-    # The deterministic failed plan replays exactly, with no inference or commit.
+    # Completed independent extraction is reusable before its one lifecycle commit.
     read.clear()
     again = await SourceUnitDeriver(db).derive(request())
 
@@ -3089,6 +3114,30 @@ async def test_a_reading_group_beyond_capacity_refuses_the_unit_and_preserves_su
     assert again.derivation.terminal_reason_code == first.derivation.terminal_reason_code
     assert await active_support_evidence(db, incumbent.id) == before_support
     assert await db.get_current_source_unit_projection(base.source_units[0].id) == before_projection
+
+
+    # One canonical engine commit must still assess old Support independently.
+    from tests.coordination_fixture import ScriptedClient
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(build_sqlite_adapters(db, object())),
+        db=db, memory_store=_AuditedOutboxDrainer(db), structured_llm_client=ScriptedClient(),
+    )
+    stats = await engine.prepare_and_commit_projected_lifecycle(
+        projection=projection, doc_id=document.doc_id, raw_memories=again.extraction.memories,
+        doc_type="confluence", project_key="ENG", repo_identifier=None,
+        document_content=body, update_mode="full_document", changed_hunks=None,
+        update_plan_stats=None, source_updated_at=None, document=document,
+        derivation_id=first.derivation.id,
+    )
+    assert stats["added"] == 1
+    assert sorted(m.content for m in await db.list_memories(status="active")) == [
+        "Rule one applies.", "Rule three applies.",
+    ]
+    current = await db.get_current_source_unit_revision(base.source_units[0].id)
+    assert current.id == projection.source_unit_revisions[0].id
+    attempts = await db.list_source_derivation_attempts(source_id=projection.source_id)
+    assert next(row for row in attempts if row.id == first.derivation.id).status == "applied"
+    assert {p.excerpt for p in await active_support_evidence(db, incumbent.id)} == {"Rule one applies."}
 
 
 @pytest.mark.asyncio
