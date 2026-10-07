@@ -1,25 +1,21 @@
 """Provider adapters that project fetched Gene items into stable source lineage.
 
-Genes remain responsible for authentication and provider I/O.  This module is
-the provider-specific end of the lifecycle seam: it turns native payloads into
-provider-neutral Source Units, Observations, immutable revisions, relations,
-and deltas.  Downstream extraction and lifecycle code never branches on these
-source types.
+Genes remain responsible for authentication and provider I/O. Source adapters
+own native payload interpretation. This module turns their declarations into
+Source Units, Observations, immutable revisions, relations, and deltas.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from dataclasses import replace
 from typing import Mapping
 
-from memforge.genes.jira_gene import LOCAL_AGENT_JIRA_PACKAGE_KIND
-from memforge.genes.teams_gene import LOCAL_AGENT_TEAMS_PACKAGE_KIND
-from memforge.github_repo_utils import build_github_repo_doc_id
-from memforge.local_agent.source_contract import TEAMS_ROLLING_RETENTION_PRESETS
 from memforge.models import ContentItem, NormalizedContent, RawContent
+from memforge.source_adapters.contracts import (
+    _ObservationInput, _NativeProjection, _UnitEndpoint, _unit_title, _canonical_json,
+)
 from memforge.source_projection import (
     AnchorKind,
     DeltaAxis,
@@ -34,15 +30,12 @@ from memforge.source_projection import (
     SourceProjection,
     ProjectionScopeTransition,
     SourceRelation,
-    SourceRelationType,
     SourceUnit,
     SourceUnitRevision,
-    UnitTitle,
 )
 from memforge.source_time import (
     SOURCE_UPDATED_AT_KEY,
     latest_source_time,
-    reported_source_time,
 )
 from memforge.source_representation import (
     in_current_representation,
@@ -50,7 +43,6 @@ from memforge.source_representation import (
 )
 from memforge.source_projection_config import (
     projection_access_fingerprint,
-    projection_scope_fingerprint,
 )
 from memforge.source_artifacts import (
     SOURCE_ARTIFACT_OBSERVATION_TYPE,
@@ -69,34 +61,6 @@ BUILTIN_SPECIALIZED_SOURCE_TYPES = frozenset(
         "local_markdown",
         "teams",
         "agent_session",
-    }
-)
-
-# The Jira fields that make up an issue's core Observation.
-_JIRA_CORE_FIELDS = (
-    "summary",
-    "description",
-    "status",
-    "priority",
-    "assignee",
-    "labels",
-    "resolution",
-)
-
-_JIRA_OPERATIONAL_HISTORY_FIELDS = frozenset(
-    {
-        "assignee",
-        "due date",
-        "duedate",
-        "fix version",
-        "fix version/s",
-        "fixversion",
-        "labels",
-        "priority",
-        "rank",
-        "resolution",
-        "sprint",
-        "status",
     }
 )
 
@@ -123,56 +87,13 @@ def source_run_projection_coverage(
     return ProjectionCoverage.PARTIAL_PROJECTION
 
 
-@dataclass(frozen=True, slots=True)
-class _ObservationInput:
-    """One Observation as the provider payload gives it.
-
-    ``observed_at`` is the source's own time for this content (design 0.9):
-    when the provider last changed it, or ``None`` when the provider records
-    no usable time. It is never a discovery, fetch, submission or sync time.
-    """
-
-    observation_type: str
-    provider_key: str
-    content: str
-    semantic_value: object
-    locator: Mapping[str, object]
-    observed_at: str | None = None
-    metadata: Mapping[str, object] = field(default_factory=dict)
-    semantic_hash: str | None = None
-
-    def __post_init__(self) -> None:
-        # One UTC form for every provider's time, whatever format it reported.
-        object.__setattr__(self, "observed_at", reported_source_time(self.observed_at))
 
 
 _REVISION_SEMANTIC_METADATA_KEYS = ("claim_evidence_scope",)
 
 
-def _unit_title(kind: str, *fields: tuple[str, object]) -> UnitTitle:
-    """Name a Unit by the values present in its provider payload; absent values are omitted, never guessed."""
-    return UnitTitle(
-        kind=kind,
-        fields=tuple(
-            (name, " ".join(str(value).split()))
-            for name, value in fields
-            if value is not None and str(value).strip()
-        ),
-    )
 
 
-@dataclass(frozen=True, slots=True)
-class _NativeProjection:
-    """One provider payload as a Source Unit, its Observations and its Unit Title."""
-
-    unit_type: str
-    provider_key: str
-    observations: tuple[_ObservationInput, ...]
-    relations: tuple[tuple[SourceRelationType, str, str, str | None, Mapping[str, object]], ...]
-    coverage: ProjectionCoverage
-    locator: Mapping[str, object]
-    # None only when the payload tombstones the whole Unit.
-    title: UnitTitle | None
 
 
 def _observation_semantic_hash(value: _ObservationInput) -> str:
@@ -214,61 +135,16 @@ class GeneSourceProjectionAdapter:
             scope_attestations=request.scope_attestations,
         )
 
-    def reconciliation_coverage(
-        self,
-        *,
-        source_type: str,
-        transition: ProjectionScopeTransition,
-        current_units: tuple[SourceUnit, ...],
-        run_attestations: tuple[ProjectionScopeAttestation, ...] = (),
+    def reconciliation_coverage(self, *, source_type: str, transition: ProjectionScopeTransition,
+        current_units: tuple[SourceUnit, ...], run_attestations: tuple[ProjectionScopeAttestation, ...] = (),
     ) -> ProjectionCoverage | None:
-        """Return scoped absence proof after provider tombstones were applied."""
-
+        """Dispatch scoped absence proof to its source owner."""
         if source_type != "teams":
             return None
-        selector_fields = {
-            "conversation_ids",
-            "channels",
-            "group_chats",
-            "individual_chats",
-        }
-        supported_fields = selector_fields | {"rolling_retention_days"}
-        changed_fields = {
-            key
-            for key in set(transition.previous_scope) | set(transition.target_scope)
-            if transition.previous_scope.get(key) != transition.target_scope.get(key)
-        }
-        if not changed_fields or not changed_fields.issubset(supported_fields):
-            return None
-        from memforge.local_agent.source_contract import (
-            canonical_teams_conversation_ids,
-        )
+        from memforge.source_adapters.teams import reconciliation_coverage
 
-        try:
-            target_conversations = set(
-                canonical_teams_conversation_ids(
-                    transition.target_scope,
-                    require_nonempty=True,
-                )
-            )
-        except ValueError:
-            return None
-        if not _teams_run_attests_target_scope(
-            transition=transition,
-            target_conversations=target_conversations,
-            run_attestations=run_attestations,
-        ):
-            return None
-        current_window_units = tuple(unit for unit in current_units if unit.unit_type == "teams_window")
-        if any(unit.unit_type != "teams_window" for unit in current_units):
-            return None
-        if (changed_fields & selector_fields or target_conversations) and not all(
-            str(unit.locator.get("conversation_id") or "").strip() in target_conversations
-            for unit in current_window_units
-        ):
-            return None
-
-        return ProjectionCoverage.TOMBSTONED_DELTA
+        return reconciliation_coverage(transition=transition, current_units=current_units,
+            run_attestations=run_attestations)
 
 
 DEFAULT_SOURCE_PROJECTION_ADAPTER = GeneSourceProjectionAdapter()
@@ -539,12 +415,14 @@ def project_source_item(
         value.provider_key: observation.id for value, observation in zip(observations_input, observations, strict=True)
     }
 
-    def endpoint(value: str) -> str:
+    def endpoint(value: str | _UnitEndpoint) -> str:
+        if isinstance(value, _UnitEndpoint):
+            return _stable_id("unit", source_id, value.unit_type, value.provider_key)
         if value == "$unit":
             return unit_id
         if value in observation_ids_by_provider_key:
             return observation_ids_by_provider_key[value]
-        return _relation_endpoint(source_id, unit_type, value)
+        return _stable_id("obs", source_id, unit_type, value)
 
     relations = tuple(
         SourceRelation(
@@ -629,178 +507,16 @@ def project_source_unit_tombstone(
 
 
 def _provider_authoritative_unit_coverage(
-    *,
-    source_type: str,
-    native: object,
-    coverage: ProjectionCoverage,
-    projected_scope: Mapping[str, object],
-    scope_attestations: tuple[ProjectionScopeAttestation, ...],
+    *, source_type: str, native: object, coverage: ProjectionCoverage,
+    projected_scope: Mapping[str, object], scope_attestations: tuple[ProjectionScopeAttestation, ...],
 ) -> ProjectionCoverage:
-    """Apply run authority only where the provider unit contract supports it."""
+    """Dispatch source-owned collection completeness policy."""
+    if source_type == "teams":
+        from memforge.source_adapters.teams import authoritative_unit_coverage
 
-    configured_scope = projected_scope.get("configured_scope")
-    teams_native = (
-        native.get("raw_payload")
-        if isinstance(native, Mapping) and isinstance(native.get("raw_payload"), Mapping)
-        else native
-    )
-    if (
-        source_type == "teams"
-        and isinstance(teams_native, Mapping)
-        and teams_native.get("tombstone_reason") == "outside_rolling_retention"
-        and not _teams_retention_attestation_is_valid(
-            native=teams_native,
-            configured_scope=(configured_scope if isinstance(configured_scope, Mapping) else {}),
-            run_attestations=scope_attestations,
-        )
-    ):
-        raise ValueError("Teams rolling-retention tombstone lacks complete run-scoped coverage evidence")
-    if coverage.proves_absence or projected_scope.get("authoritative_snapshot") is not True:
-        return coverage
-    if (
-        source_type == "teams"
-        and isinstance(native, Mapping)
-        and native.get("package_kind") == LOCAL_AGENT_TEAMS_PACKAGE_KIND
-        and isinstance(native.get("raw_payload"), Mapping)
-    ):
-        # A force-full local collection attempt is validated against its
-        # immutable package manifest before replay. That source-wide proof also
-        # makes each canonical window package a complete snapshot of its unit.
-        return ProjectionCoverage.COMPLETE_SNAPSHOT
+        return authoritative_unit_coverage(native=native, coverage=coverage,
+            projected_scope=projected_scope, scope_attestations=scope_attestations)
     return coverage
-
-
-def _teams_run_attests_target_scope(
-    *,
-    transition: ProjectionScopeTransition,
-    target_conversations: set[str],
-    run_attestations: tuple[ProjectionScopeAttestation, ...],
-) -> bool:
-    """Require one exact, successful, same-attempt poll per target conversation."""
-
-    return _teams_attestations_cover_target_scope(
-        target_scope=transition.target_scope,
-        target_conversations=target_conversations,
-        expected_transition_id=transition.id,
-        run_attestations=run_attestations,
-    )
-
-
-def _teams_attestations_cover_target_scope(
-    *,
-    target_scope: Mapping[str, object],
-    target_conversations: set[str],
-    expected_transition_id: str | None,
-    run_attestations: tuple[ProjectionScopeAttestation, ...],
-) -> bool:
-    target_fingerprint = projection_scope_fingerprint(target_scope)
-    expected_conversations = sorted(target_conversations)
-    by_conversation: dict[str, ProjectionScopeAttestation] = {}
-    attempt_ids: set[str] = set()
-    for attestation in run_attestations:
-        conversation_id = attestation.subject_key.strip()
-        target_values = attestation.evidence.get("target_subject_keys")
-        poll = attestation.evidence.get("poll")
-        attempt_id = attestation.collection_attempt_id.strip()
-        if (
-            attestation.subject_type != "conversation"
-            or conversation_id not in target_conversations
-            or attestation.transition_id != expected_transition_id
-            or attestation.target_scope_fingerprint != target_fingerprint
-            or target_values != expected_conversations
-            or not attempt_id
-            or not isinstance(poll, Mapping)
-            or not _teams_poll_attestation_is_valid(poll, conversation_id)
-        ):
-            return False
-        if conversation_id in by_conversation:
-            return False
-        by_conversation[conversation_id] = attestation
-        attempt_ids.add(attempt_id)
-    return set(by_conversation) == target_conversations and len(attempt_ids) == 1
-
-
-def _teams_poll_attestation_is_valid(
-    poll: Mapping[str, object],
-    conversation_id: str,
-) -> bool:
-    if (
-        str(poll.get("raw_conversation_id") or "").strip() != conversation_id
-        or str(poll.get("access_probe_status") or "").strip().lower() != "ok"
-    ):
-        return False
-    stop_reason = str(poll.get("stop_reason") or "").strip()
-    if stop_reason == "no_backward_link":
-        return poll.get("pagination_complete") is True
-    if stop_reason != "cutoff_reached":
-        return False
-    covered_from = _normalized_utc_timestamp(poll.get("absence_covered_from"))
-    covered_to = _normalized_utc_timestamp(poll.get("absence_covered_to"))
-    return bool(covered_from and covered_to and covered_from <= covered_to)
-
-
-def _teams_retention_attestation_is_valid(
-    *,
-    native: Mapping[str, object],
-    configured_scope: Mapping[str, object],
-    run_attestations: tuple[ProjectionScopeAttestation, ...],
-) -> bool:
-    conversation_id = str(native.get("conversation_id") or "").strip()
-    cutoff = _normalized_utc_timestamp(native.get("rolling_retention_cutoff"))
-    observed_to = _normalized_utc_timestamp(native.get("prior_observed_to"))
-    try:
-        retention_days = int(configured_scope.get("rolling_retention_days") or 0)
-    except (TypeError, ValueError):
-        return False
-    if (
-        retention_days not in TEAMS_ROLLING_RETENTION_PRESETS
-        or not conversation_id
-        or not cutoff
-        or not observed_to
-        or observed_to >= cutoff
-    ):
-        return False
-    from memforge.local_agent.source_contract import canonical_teams_conversation_ids
-
-    try:
-        target_conversations = set(canonical_teams_conversation_ids(configured_scope, require_nonempty=True))
-    except ValueError:
-        return False
-    transition_ids = {item.transition_id for item in run_attestations}
-    if len(transition_ids) != 1 or not _teams_attestations_cover_target_scope(
-        target_scope=configured_scope,
-        target_conversations=target_conversations,
-        expected_transition_id=next(iter(transition_ids)),
-        run_attestations=run_attestations,
-    ):
-        return False
-    target_fingerprint = projection_scope_fingerprint(configured_scope)
-    matches = [
-        item
-        for item in run_attestations
-        if item.subject_type == "conversation"
-        and item.subject_key == conversation_id
-        and item.target_scope_fingerprint == target_fingerprint
-        and _normalized_utc_timestamp(item.evidence.get("rolling_retention_cutoff")) == cutoff
-    ]
-    if len(matches) != 1:
-        return False
-    return all(
-        _normalized_utc_timestamp(item.evidence.get("rolling_retention_cutoff")) == cutoff
-        for item in run_attestations
-    )
-
-
-def _normalized_utc_timestamp(value: object) -> str | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def _project_native(
@@ -814,373 +530,33 @@ def _project_native(
     # The source time of a Unit whose body is one Observation, as the Gene reports it.
     body_time = normalized.source_semantics.get(SOURCE_UPDATED_AT_KEY)
     if source_type == "confluence":
-        page_id = str(item.extra.get("page_id") or item.item_id.removeprefix("confluence-"))
-        parent_id = str(item.extra.get("parent_page_id") or "")
-        relations = ()
-        if parent_id:
-            relations = (
-                (
-                    SourceRelationType.CONTAINED_BY,
-                    "$unit",
-                    f"confluence_page:{parent_id}",
-                    f"{page_id}:parent",
-                    {},
-                ),
-            )
-        semantic_body = native if isinstance(native, str) else normalized.markdown_body
-        display_body = str(normalized.source_semantics.get("semantic_markdown") or normalized.markdown_body)
-        semantic_value = {
-            "title": item.title,
-            "body": semantic_body,
-        }
-        semantic_content = f"# {item.title}\n\n{display_body}".strip()
-        return _NativeProjection(
-            unit_type="confluence_page",
-            provider_key=page_id,
-            observations=(
-                _ObservationInput(
-                    "page_body",
-                    f"{page_id}:body",
-                    semantic_content,
-                    semantic_value,
-                    {},
-                    body_time,
-                ),
-            ),
-            relations=relations,
-            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
-            locator={
-                "page_id": page_id,
-                "space_key": item.extra.get("space_key") or item.space_or_project,
-                "parent_page_id": parent_id or None,
-                "url": item.source_url,
-            },
-            title=_unit_title(
-                "Confluence page",
-                ("Space", item.extra.get("space_key") or item.space_or_project),
-                ("Title", item.title),
-            ),
-        )
+        from memforge.source_adapters.confluence import project_native
+
+        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
     if source_type == "jira":
-        data = native if isinstance(native, dict) else {}
-        if data.get("package_kind") == LOCAL_AGENT_JIRA_PACKAGE_KIND and isinstance(data.get("raw_payload"), dict):
-            data = data["raw_payload"]
-        from memforge.local_agent.jira_contract import validate_jira_observation_identities
+        from memforge.source_adapters.jira import project_native
 
-        validate_jira_observation_identities(data)
-        fields = data.get("fields") if isinstance(data.get("fields"), dict) else {}
-        raw_issue_id = data.get("id") or item.extra.get("issue_id")
-        issue_id = str(raw_issue_id or "").strip()
-        if not issue_id.isdigit():
-            raise ValueError("jira projection requires immutable numeric issue id")
-        issue_key = str(data.get("key") or item.extra.get("issue_key") or item.item_id)
-        core_value = {name: fields.get(name) for name in _JIRA_CORE_FIELDS}
-        changelog = data.get("changelog") if isinstance(data.get("changelog"), dict) else {}
-        raw_histories = changelog.get("histories", [])
-        histories = raw_histories if isinstance(raw_histories, list) else []
-        changelog_total = changelog.get("total")
-        changelog_complete = not data.get("_changelog_truncated") and not (
-            isinstance(changelog_total, int) and changelog_total > len(histories)
-        )
-        inputs = [
-            _ObservationInput(
-                "issue_core",
-                f"{issue_id}:core",
-                _canonical_json(core_value),
-                core_value,
-                {"issue_key": issue_key},
-                _jira_core_revised_at(
-                    fields,
-                    histories,
-                    # A payload without a changelog says nothing about core changes.
-                    changelog_complete=changelog_complete and isinstance(data.get("changelog"), dict),
-                ),
-            )
-        ]
-        relations: list[tuple[SourceRelationType, str, str, str | None, Mapping[str, object]]] = []
-        previous_key = f"{issue_id}:core"
-        comments = data.get("_comments") if isinstance(data.get("_comments"), list) else []
-        for comment in comments:
-            if not isinstance(comment, dict):
-                continue
-            comment_id = str(comment["id"])
-            body = comment.get("body")
-            semantic_comment = {"body": body, "attachments": comment.get("attachments")}
-            inputs.append(
-                _ObservationInput(
-                    "comment",
-                    comment_id,
-                    _canonical_json(semantic_comment),
-                    semantic_comment,
-                    {"issue_key": issue_key},
-                    str(comment.get("updated") or comment.get("created") or "") or None,
-                    {"claim_evidence_scope": "atomic"},
-                )
-            )
-            relations.append((SourceRelationType.PRECEDES, previous_key, comment_id, None, {}))
-            previous_key = comment_id
-        for history in histories:
-            if not isinstance(history, dict):
-                continue
-            history_id = str(history["id"])
-            inputs.append(
-                _ObservationInput(
-                    "changelog",
-                    history_id,
-                    _canonical_json(history),
-                    history,
-                    {"issue_key": issue_key},
-                    str(history.get("created") or "") or None,
-                    {
-                        "semantic_class": jira_changelog_semantic_class(
-                            history
-                        )
-                    },
-                )
-            )
-        coverage = (
-            ProjectionCoverage.PARTIAL_PROJECTION
-            if data.get("_comments_truncated") or not changelog_complete
-            else ProjectionCoverage.COMPLETE_SNAPSHOT
-        )
-        return _NativeProjection(
-            unit_type="jira_issue",
-            provider_key=issue_id,
-            observations=tuple(inputs),
-            relations=tuple(relations),
-            coverage=coverage,
-            locator={"issue_id": issue_id, "issue_key": issue_key, "url": item.source_url},
-            title=_unit_title(
-                "Jira issue",
-                ("Key", issue_key),
-                ("Type", _provider_name(fields.get("issuetype"))),
-                ("Summary", fields.get("summary")),
-            ),
-        )
+        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
     if source_type == "github_repo":
-        semantics = normalized.source_semantics
-        repo = "/".join(
-            value
-            for value in (
-                str(item.extra.get("repo_owner") or semantics.get("repo_owner") or ""),
-                str(item.extra.get("repo_name") or semantics.get("repo_name") or ""),
-            )
-            if value
-        ) or str(item.extra.get("repo_url") or semantics.get("repo_url") or item.space_or_project)
-        path = str(item.extra.get("relative_path") or semantics.get("relative_path") or item.item_id)
-        rename_attested = (
-            item.extra.get("rename_evidence_authoritative") is True
-            or semantics.get("rename_evidence_authoritative") is True
-        )
-        previous = (
-            item.extra.get("previous_filename") or semantics.get("previous_filename")
-            if rename_attested
-            else None
-        )
-        explicit_lineage = item.extra.get("file_lineage_id") or semantics.get("file_lineage_id")
-        # Git/GitHub does not expose an immutable file id. Built-in cloud-pull
-        # and local-push connectors therefore define path as file identity.
-        # Rename continuity is optional and accepted only when a provider
-        # adapter explicitly attests authoritative rename evidence (for
-        # example, a validated Compare API `renamed` record). Never infer a
-        # move from a matching blob SHA because copy+delete is ambiguous.
-        lineage = str(explicit_lineage or previous or path)
-        relations = ()
-        if previous:
-            predecessor_document_id = item.extra.get("previous_document_id") or semantics.get("previous_document_id")
-            repo_url = str(item.extra.get("repo_url") or semantics.get("repo_url") or "")
-            repo_ref = str(item.extra.get("repo_ref") or semantics.get("repo_ref") or "")
-            if not predecessor_document_id and repo_url and repo_ref:
-                predecessor_document_id = build_github_repo_doc_id(
-                    source_id=source_id,
-                    repo_url=repo_url,
-                    repo_ref=repo_ref,
-                    relative_path=str(previous),
-                )
-            relations = (
-                (
-                    SourceRelationType.RENAMED_FROM,
-                    "$unit",
-                    f"github_file:{repo}:{previous}",
-                    None,
-                    ({"predecessor_document_id": str(predecessor_document_id)} if predecessor_document_id else {}),
-                ),
-            )
-        return _NativeProjection(
-            unit_type="github_file",
-            provider_key=f"{repo}:{lineage}",
-            observations=(
-                _ObservationInput(
-                    "file_content",
-                    "content",
-                    normalized.markdown_body,
-                    normalized.markdown_body,
-                    {"path": path},
-                    body_time,
-                ),
-            ),
-            relations=relations,
-            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
-            locator={"repository": repo, "path": path, "ref": item.extra.get("repo_ref"), "url": item.source_url},
-            title=_unit_title(
-                "GitHub file",
-                ("Repository", repo),
-                ("Path", path),
-                ("Ref", item.extra.get("repo_ref") or semantics.get("repo_ref")),
-            ),
-        )
-    if source_type == "github_pages":
-        canonical_url = str(
-            item.extra.get("canonical_url") or normalized.source_semantics.get("canonical_url") or item.source_url
-        )
-        semantic_value = native if isinstance(native, str) else normalized.markdown_body
-        semantic_content = normalized.markdown_body
-        return _NativeProjection(
-            unit_type="rendered_page",
-            provider_key=canonical_url,
-            observations=(
-                _ObservationInput("page_content", "content", semantic_content, semantic_value, {}, body_time),
-            ),
-            relations=(),
-            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
-            locator={"canonical_url": canonical_url, "title": item.title},
-            title=_unit_title("GitHub Pages page", ("Title", item.title), ("URL", canonical_url)),
-        )
-    if source_type == "local_markdown":
-        data = native if isinstance(native, dict) else {}
-        vault = str(data.get("vault_id") or item.space_or_project or "default")
-        path = str(data.get("relative_path") or item.extra.get("relative_path") or item.item_id)
-        lineage = str(data.get("file_lineage_id") or item.extra.get("file_lineage_id") or path)
-        body = str(data.get("markdown") or normalized.markdown_body)
-        return _NativeProjection(
-            unit_type="local_file",
-            provider_key=f"{vault}:{lineage}",
-            observations=(_ObservationInput("file_content", "content", body, body, {"path": path}, body_time),),
-            relations=(),
-            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
-            locator={"vault_id": vault, "path": path, "url": item.source_url},
-            title=_unit_title(
-                "Markdown file",
-                ("Vault", data.get("vault_id") or item.space_or_project),
-                ("Path", path),
-            ),
-        )
-    if source_type == "teams":
-        data = native if isinstance(native, dict) else {}
-        if data.get("package_kind") == LOCAL_AGENT_TEAMS_PACKAGE_KIND and isinstance(data.get("raw_payload"), dict):
-            data = data["raw_payload"]
-        window_id = str(item.extra.get("window_id") or data.get("window_id") or item.item_id)
-        conversation_id = str(item.extra.get("conversation_id") or data.get("conversation_id") or "")
-        from memforge.local_agent.teams_contract import (
-            teams_message_source_time,
-            validate_teams_canonical_messages,
-        )
+        from memforge.source_adapters.github_repo import project_native
 
-        messages = data.get("messages") if isinstance(data.get("messages"), list) else []
-        if messages:
-            messages = list(validate_teams_canonical_messages(messages))
-        inputs = []
-        relations = []
-        previous_key = None
-        for message in messages:
-            message_id = str(message["id"])
-            semantic_message = {
-                "content": message.get("content"),
-                "attachments": message.get("attachments"),
-                "deleted": message.get("deletedDateTime") or message.get("deleted_at"),
-            }
-            inputs.append(
-                _ObservationInput(
-                    "message",
-                    message_id,
-                    _canonical_json(semantic_message),
-                    semantic_message,
-                    {"conversation_id": conversation_id},
-                    teams_message_source_time(message),
-                    {"claim_evidence_scope": "atomic"},
-                )
-            )
-            reply_to = message.get("reply_to_id") or message.get("replyToId")
-            if reply_to:
-                relations.append((SourceRelationType.REPLIES_TO, message_id, str(reply_to), None, {}))
-            elif previous_key:
-                relations.append((SourceRelationType.PRECEDES, previous_key, message_id, None, {}))
-            previous_key = message_id
-        coverage = (
-            ProjectionCoverage.COMPLETE_SNAPSHOT
-            if data.get("authoritative_snapshot") or data.get("_authoritative_snapshot")
-            else ProjectionCoverage.PARTIAL_PROJECTION
-        )
-        observed_times = sorted(
-            str(message.get("time") or "").strip()
-            for message in messages
-            if isinstance(message, dict) and str(message.get("time") or "").strip()
-        )
-        observed_from = str(
-            item.extra.get("block_start")
-            or data.get("first_message_time")
-            or data.get("prior_observed_from")
-            or (observed_times[0] if observed_times else "")
-        ).strip()
-        observed_to = str(
-            item.extra.get("block_end")
-            or data.get("last_message_time")
-            or data.get("prior_observed_to")
-            or (observed_times[-1] if observed_times else "")
-        ).strip()
-        observed_from = _normalized_utc_timestamp(observed_from) or observed_from
-        observed_to = _normalized_utc_timestamp(observed_to) or observed_to
-        locator = {
-            "conversation_id": conversation_id,
-            "window_id": window_id,
-            "observed_from": observed_from or None,
-            "observed_to": observed_to or None,
-            "url": item.source_url,
-        }
-        tombstoned = data.get("_tombstone") is True
-        if tombstoned:
-            locator["tombstone_reason"] = data.get("tombstone_reason")
-        return _NativeProjection(
-            unit_type="teams_window",
-            provider_key=window_id,
-            observations=tuple(inputs),
-            relations=tuple(relations),
-            coverage=coverage,
-            locator=locator,
-            # A tombstoned window has no live Unit left to name. A live window is named by its
-            # conversation and its start; its end moves with every new message, so it is no part of the name.
-            title=None if tombstoned else _unit_title(
-                "Teams conversation",
-                ("Conversation type", data.get("conversation_type")),
-                ("Team", data.get("team_name")),
-                ("Conversation", data.get("conversation_name") or data.get("channel_name")),
-                ("From", observed_from),
-            ),
-        )
+        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
+    if source_type == "github_pages":
+        from memforge.source_adapters.github_pages import project_native
+
+        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
+    if source_type == "local_markdown":
+        from memforge.source_adapters.local_markdown import project_native
+
+        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
+    if source_type == "teams":
+        from memforge.source_adapters.teams import project_native
+
+        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
     if source_type == "agent_session":
-        data = native if isinstance(native, dict) else {}
-        receipt = data.get("receipt") if isinstance(data.get("receipt"), dict) else {}
-        window_id = str(data.get("doc_id") or item.item_id)
-        body = str(data.get("markdown") or normalized.markdown_body)
-        return _NativeProjection(
-            unit_type="agent_session_window",
-            provider_key=window_id,
-            observations=(_ObservationInput("session_summary", window_id, body, body, {}, body_time),),
-            relations=(),
-            coverage=ProjectionCoverage.PARTIAL_PROJECTION,
-            locator={
-                "client": receipt.get("client"),
-                "session_id": receipt.get("session_id"),
-                "history_window_kind": receipt.get("history_window_kind"),
-                "url": item.source_url,
-            },
-            title=_unit_title(
-                "Agent session",
-                ("Client", receipt.get("client")),
-                ("Window", receipt.get("history_window_kind")),
-                ("Title", item.title),
-            ),
-        )
+        from memforge.source_adapters.agent_session import project_native
+
+        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
     # Extension-safe fallback for document-like genes that have not yet opted
     # into a richer native projection.  It deliberately claims only partial
     # coverage, so it can drive semantic change detection but can never prove
@@ -1202,61 +578,6 @@ def _project_native(
     )
 
 
-def _provider_name(value: object) -> object:
-    """A provider object's display name, such as a Jira issue type's name."""
-
-    return value.get("name") if isinstance(value, Mapping) else value
-
-
-def _jira_core_revised_at(
-    fields: Mapping[str, object],
-    histories: list[object],
-    *,
-    changelog_complete: bool,
-) -> str | None:
-    """When the issue's core fields last changed, from the issue's own records.
-
-    The latest changelog entry that touches a core field gives the time; an
-    issue whose complete changelog never touches one has kept its core since
-    ``fields.created``. A truncated changelog may omit the latest core change,
-    so the time is unknown. ``fields.updated`` is not used: comments and other
-    fields move it too.
-    """
-
-    if not changelog_complete:
-        return None
-    core_fields = frozenset(_JIRA_CORE_FIELDS)
-    core_change_times = [
-        history.get("created")
-        for history in histories
-        if isinstance(history, Mapping)
-        and any(
-            isinstance(entry, Mapping)
-            and str(entry.get("fieldId") or entry.get("field") or "").strip().lower() in core_fields
-            for entry in (history.get("items") if isinstance(history.get("items"), list) else [])
-        )
-    ]
-    if core_change_times:
-        return latest_source_time(core_change_times)
-    return reported_source_time(fields.get("created"))
-
-
-def jira_changelog_semantic_class(history: Mapping[str, object]) -> str:
-    """Classify one Jira changelog entry from its fields; stored revisions carry the result."""
-
-    items = history.get("items")
-    history_items = items if isinstance(items, list) else []
-    fields = {
-        " ".join(str(item.get("field") or "").strip().lower().split())
-        for item in history_items
-        if isinstance(item, Mapping)
-    }
-    fields.discard("")
-    if fields and fields.issubset({"attachment"}):
-        return "attachment_event"
-    if fields and fields.issubset(_JIRA_OPERATIONAL_HISTORY_FIELDS):
-        return "operational_transition"
-    return "domain_transition"
 
 
 def _native_payload(raw: RawContent) -> object:
@@ -1267,17 +588,6 @@ def _native_payload(raw: RawContent) -> object:
         except json.JSONDecodeError:
             return text
     return text
-
-
-def _relation_endpoint(source_id: str, unit_type: str, provider_key: str) -> str:
-    endpoint_type, separator, endpoint_key = provider_key.partition(":")
-    if separator and endpoint_type in {"confluence_page", "github_file"}:
-        return _stable_id("unit", source_id, endpoint_type, endpoint_key)
-    return _stable_id("obs", source_id, unit_type, provider_key)
-
-
-def _canonical_json(value: object) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
 def _canonical_hash(value: object) -> str:

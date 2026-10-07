@@ -43,6 +43,21 @@ test("shows the memory's details, relations and evidence", async () => {
   expect(within(evidence).getByRole("link", { name: "Open content" })).toBeInTheDocument();
 });
 
+test("shows focused evidence text and keeps the complete source available on expansion", async () => {
+  const user = userEvent.setup();
+  const memory = makeMemoryDetail();
+  const item = memory.evidence![0]!.items[0]!;
+  item.text = "Cut-off applies uniformly to the three lifecycle types.";
+  renderDetail(memory);
+  const evidence = await screen.findByRole("region", { name: "Evidence" });
+  expect(within(evidence).getByText(item.text)).toBeVisible();
+  const source = within(evidence).getByText(item.excerpt!);
+  expect(source).not.toBeVisible();
+  await user.click(within(evidence).getByText("Source evidence"));
+  expect(source).toBeVisible();
+  expect(evidence).not.toHaveTextContent("LLM");
+});
+
 test("a source-backed memory offers Retire only with the reason it cannot", async () => {
   const user = userEvent.setup();
   renderDetail(makeMemoryDetail({ source_backed: true }));

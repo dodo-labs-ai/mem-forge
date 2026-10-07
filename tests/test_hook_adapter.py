@@ -930,7 +930,7 @@ def test_packaged_plugin_version_is_consistent():
     import tomllib
 
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.63"
+    version = "0.1.64"
     package = tomllib.loads((root / "pyproject.toml").read_text())
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
@@ -4029,6 +4029,7 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
             {
                 "kind": "document",
                 "evidence_unit_id": None,
+                "support_ids": [],
                 "source_id": "src-jira",
                 "source_type": "jira",
                 "doc_id": "jira-SFPAY-179397",
@@ -4342,14 +4343,7 @@ def test_mcp_proxy_preserves_claim_local_evidence_on_get_memory(monkeypatch):
 
     [group] = result["evidence"]
     assert group["document"]["content_url"] == "/api/v1/documents/doc-1/content"
-    assert group["items"][0]["artifact"] == {
-        "summary": "Architecture diagram showing the request flow.",
-        "evidence_role": "primary",
-        "filename": "diagram.png",
-        "content_type": "image/png",
-        "size_bytes": 3,
-        "url": "/api/v1/source-artifacts/obsrev-1",
-    }
+    assert group["items"][0]["artifact"] == artifact
 
 
 def test_mcp_proxy_returns_source_artifact_as_native_image_content(monkeypatch):

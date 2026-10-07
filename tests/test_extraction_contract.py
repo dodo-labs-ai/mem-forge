@@ -25,6 +25,7 @@ from memforge.source_derivation import (
     SourceUnitDerivationRequest,
     SourceUnitDeriver,
     _planning_failure_extraction,
+    require_source_derivation_ready_for_commit,
     source_derivation_manifest,
 )
 from memforge.pipeline.extraction_requests import plan_extraction_requests
@@ -65,16 +66,29 @@ def _planned_requests(projection, authority):
 def test_extraction_contract_version_is_pinned_into_derivation_identity() -> None:
     # Stored derivations and batch ids hash this value; changing it supersedes
     # every stored derivation instead of resuming it.
-    assert PROJECTION_EXTRACTION_CONTRACT_VERSION == "projection-extraction-v11"
+    assert PROJECTION_EXTRACTION_CONTRACT_VERSION == "projection-extraction-v22"
 
 
+@pytest.mark.parametrize("status,version,reason,ready", (
+    ("completed", PROJECTION_EXTRACTION_CONTRACT_VERSION, None, True),
+    ("completed", PROJECTION_EXTRACTION_CONTRACT_VERSION, "EXTRACTION_INPUT_CAPACITY_EXCEEDED", False),
+    ("completed", "projection-extraction-v12", None, False),
+    ("retryable_failure", PROJECTION_EXTRACTION_CONTRACT_VERSION, None, False),
+    ("pending", PROJECTION_EXTRACTION_CONTRACT_VERSION, None, False),
+    ("applied", "projection-extraction-v12", None, True),
+))
+def test_derivation_commit_readiness_distinguishes_failed_or_old_work_from_applied_history(status, version, reason, ready):
+    if ready:
+        require_source_derivation_ready_for_commit(status=status, extraction_contract_version=version, terminal_reason_code=reason)
+    else:
+        with pytest.raises(ValueError, match="not ready for lifecycle commit"):
+            require_source_derivation_ready_for_commit(status=status, extraction_contract_version=version, terminal_reason_code=reason)
 def test_extraction_prompt_carries_the_durable_memory_quality_contract() -> None:
     required_rules = (
-        "PREFER EMPTY",
-        "CODE-RECOVERABLE FACTS ARE NOT MEMORIES",
+        "Worth remembering (keep):",
+        "When unsure, keep.",
         "ONE CLAIM, ONE MEMORY",
-        "FOLD REJECTED ALTERNATIVES INTO THE CHOSEN DECISION",
-        "FUTURE USEFULNESS CHECK",
+        "Fold a rejected alternative into the chosen decision",
         "NO META-MEMORIES",
         "OPERATIONAL DOES NOT MEAN TRANSIENT",
         "For each candidate, preserve the language of its owned source evidence.",
@@ -85,6 +99,69 @@ def test_extraction_prompt_carries_the_durable_memory_quality_contract() -> None
     assert DURABLE_MEMORY_QUALITY_RULES in PROJECTION_FRAGMENT_EXTRACTION_PROMPT
     for rule in required_rules:
         assert rule in DURABLE_MEMORY_QUALITY_RULES
+    from memforge.memory.candidate_admission import _ADMISSION_INSTRUCTIONS
+    from memforge.pipeline.memory_value import MEMORY_VALUE_DEFINITION
+
+    assert MEMORY_VALUE_DEFINITION in DURABLE_MEMORY_QUALITY_RULES
+    assert MEMORY_VALUE_DEFINITION in _ADMISSION_INSTRUCTIONS
+    assert all(obsolete not in DURABLE_MEMORY_QUALITY_RULES for obsolete in (
+        "PREFER EMPTY", "CODE-RECOVERABLE", "six months", "in under a minute",
+    ))
+
+
+@pytest.mark.parametrize("failure", ("missing_result", "typed_failure"))
+def test_unit_aggregation_refuses_incomplete_work_and_preserves_typed_failure(failure):
+    from memforge.models import RawMemory
+    from memforge.source_derivation import assemble_source_derivation_results, safe_derivation_error
+    from tests.test_projection_fragments import _projection
+
+    projection = _projection()
+    [request] = _planned_requests(projection, ExtractionAuthority({"obs-primary": None}))
+    plan = ExtractionPlan((request,))
+    complete = MemoryExtractionResult(memories=[RawMemory(content="Use approval before release.", memory_type="fact")])
+    results = () if failure == "missing_result" else (complete,)
+    if failure == "typed_failure":
+        results = (MemoryExtractionResult(
+            error_type="structured_llm_error", error="Fixture provider error",
+            metadata={"safe_error_code": "INPUT_CAPACITY_EXCEEDED",
+                      "safe_validation_fields": [{"location": "memories.0.content", "type": "missing"}]},
+        ),)
+    result = assemble_source_derivation_results(projection=projection, plan=plan, results=results)
+    assert result.error_type == "source_derivation_work_failure" and result.memories == []
+    assert result.metadata["lifecycle_mutation_skipped"]
+    if failure == "typed_failure":
+        _, code, fields = safe_derivation_error(result)
+        assert code == "INPUT_CAPACITY_EXCEEDED" and fields == (("memories.0.content", "missing"),)
+
+
+@pytest.mark.parametrize("stage", ("planning", "execution"))
+def test_accounted_local_skips_preserve_successful_extraction(stage):
+    from memforge.models import RawMemory
+    from memforge.source_derivation import assemble_source_derivation_results
+    from tests.test_projection_fragments import _projection
+
+    projection = _projection()
+    [request] = _planned_requests(projection, ExtractionAuthority({"obs-primary": None}))
+    plan = ExtractionPlan((request,), ("unread-group",) if stage == "planning" else ())
+    memory = RawMemory(content="Use approval before release.", memory_type="fact")
+    complete = MemoryExtractionResult(memories=[memory])
+    if stage == "execution":
+        complete.metadata["skipped_reading_group_count"] = 1
+    result = assemble_source_derivation_results(projection=projection, plan=plan, results=(complete,))
+    assert result.error_type is None and result.memories == [memory]
+    assert result.metadata["skipped_reading_group_count"] == 1
+
+
+def test_complete_empty_claim_response_is_valid_unit_success():
+    from memforge.source_derivation import assemble_source_derivation_results
+    from tests.test_projection_fragments import _projection
+
+    projection = _projection()
+    [request] = _planned_requests(projection, ExtractionAuthority({"obs-primary": None}))
+    result = assemble_source_derivation_results(
+        projection=projection, plan=ExtractionPlan((request,)), results=(MemoryExtractionResult(memories=[]),),
+    )
+    assert result.error_type is None and result.memories == []
 
 
 def test_v9_derivation_identity_binds_access_and_inference_capability() -> None:

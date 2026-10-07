@@ -7,6 +7,7 @@ import io
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -516,6 +517,50 @@ async def test_memory_detail_represents_unprojected_legacy_provenance_without_re
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("same_revision", [True, False])
+async def test_pinned_evidence_does_not_link_to_another_revisions_latest_input(
+    db: Database, tmp_path: Path, monkeypatch, same_revision: bool,
+) -> None:
+    from memforge.memory.evidence import EvidencePartKind, EvidenceRole, MemoryEvidenceItemProjection, MemoryEvidenceUnitProjection
+    from memforge.server.admin_api import create_admin_app
+    from memforge.source_projection import AnchorKind, SourceAnchor
+
+    docs_dir = tmp_path / "memforge" / "documents"
+    docs_dir.mkdir(parents=True)
+    markdown = docs_dir / "latest.md"
+    markdown.write_text("Latest page content.")
+    doc = await _insert_document(db, doc_id="pinned-link", normalized_content_uri=str(markdown))
+    memory = await _insert_memory(db, mem_id="mem-pinned-link", content="Historical rule.")
+    await db.add_memory_source(memory.id, doc.doc_id, "confluence", excerpt="Historical rule.", source_updated_at=None)
+    unit = await db.find_source_unit_by_document_id(doc.source, doc.doc_id)
+    stored = await db.get_source_unit_input(unit.id)
+    excerpt = "Historical rule."
+    digest = hashlib.sha256(excerpt.encode()).hexdigest()
+    group = MemoryEvidenceUnitProjection(
+        evidence_unit_id="eu-pinned", support_ids=("support-pinned",), source_id=doc.source,
+        source_type="confluence", source_unit_id=unit.id,
+        source_unit_revision_id=stored.unit_revision_id if same_revision else "historical-unit-revision",
+        doc_id=doc.doc_id, current=True,
+        items=(MemoryEvidenceItemProjection(
+            reference_id="ref-pinned", role=EvidenceRole.PRIMARY, kind=EvidencePartKind.TEXT,
+            anchor=SourceAnchor(kind=AnchorKind.REVISION_RANGE, observation_id="obs", observation_revision_id="historical",
+                                range_start=0, range_end=len(excerpt)),
+            excerpt=excerpt, raw_content_sha256=digest, presentation_sha256=digest, current=True,
+        ),),
+    )
+    monkeypatch.setattr(db, "get_memory_evidence_units", AsyncMock(return_value=[group]))
+
+    with TestClient(create_admin_app(db=db, config=_config(tmp_path))) as client:
+        response = client.get(f"/api/v1/memories/{memory.id}")
+
+    assert response.status_code == 200
+    [evidence] = response.json()["evidence"]
+    assert evidence["items"][0]["excerpt"] == excerpt
+    assert evidence["document"]["source_url"] == doc.source_url
+    assert evidence["document"]["content_url"] == (f"/api/v1/source-units/{unit.id}/content" if same_revision else None)
+
+
+@pytest.mark.asyncio
 async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Database, tmp_path: Path):
     from memforge.server.admin_api import create_admin_app
 
@@ -593,6 +638,8 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
 ) -> None:
     from memforge.server.admin_api import create_admin_app
     from memforge.storage.document_store import LocalDocumentStore
+    from memforge.memory.evidence import EvidenceReference, EvidenceRole, EvidencePartKind, evidence_part_set_digest
+    from memforge.source_projection import SourceAnchor, AnchorKind
 
     class StreamingOnlyLocalDocumentStore(LocalDocumentStore):
         def read_artifact(self, uri: str) -> bytes:
@@ -746,6 +793,14 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
            VALUES (?, ?, ?, ?, ?, 1, ?)""",
         ("support-image", memory.id, "evidence-image", "src-confluence", "access-hash", now),
     )
+    page_digest = hashlib.sha256(b"The page provides the primary claim.").hexdigest()
+    page_anchor = SourceAnchor(kind=AnchorKind.WHOLE_OBSERVATION, observation_id="obs-page", observation_revision_id="obsrev-page")
+    part_digest = evidence_part_set_digest(tuple(
+        EvidenceReference(role=role, kind=EvidencePartKind.TEXT, anchor=page_anchor, raw_content_sha256=page_digest)
+        for role in (EvidenceRole.PRIMARY, EvidenceRole.REQUIRED)
+    ))
+    await db.db.execute("UPDATE evidence_references SET part_kind = 'text', raw_content_sha256 = ? WHERE evidence_unit_id = 'evidence-image'", (page_digest,))
+    await db.db.execute("UPDATE evidence_units SET part_set_digest = ? WHERE id = 'evidence-image'", (part_digest,))
     await db.db.commit()
 
     app = create_admin_app(db=db, config=config, document_store=document_store)

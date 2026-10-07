@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from html import escape
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -69,8 +70,13 @@ def _jira_payload(
     histories: list[dict] | None = None,
     changelog_total: int | None = None,
 ) -> dict:
-    comments = list(comments or [])
-    histories = list(histories or [])
+    # This fixture represents an explicit provider HTML response, not a runtime
+    # renderer inference. Native fixture bodies are literal prose here.
+    comments = [
+        {"renderedBody": f"<p>{escape(comment.get('body') or '')}</p>", **comment}
+        for comment in (comments or [])
+    ]
+    histories = [{"items": [], **history} for history in (histories or [])]
     payload = {
         "id": "10012",
         "key": "PAY-12",
@@ -93,6 +99,10 @@ def _jira_payload(
             "histories": histories,
             "total": len(histories) if changelog_total is None else changelog_total,
         },
+    }
+    description = payload["fields"]["description"]
+    payload["renderedFields"] = {
+        "description": f"<p>{escape(description)}</p>" if description else description,
     }
     if payload["_comments_total"] > len(comments):
         payload["_comments_truncated"] = {
@@ -162,6 +172,8 @@ def test_confluence_page_id_is_unit_and_parent_is_location_only() -> None:
     assert moved.deltas[0].axes == frozenset({DeltaAxis.LOCATION})
     assert moved.deltas[0].requires_extraction is False
     assert moved.relations[0].relation_type is SourceRelationType.CONTAINED_BY
+    assert moved.relations[0].from_id == first.source_units[0].id
+    assert moved.relations[0].to_id == _stable_id("unit", "src-c", "confluence_page", "200")
 
 
 def test_binary_artifact_revision_is_bound_to_parent_observation_and_exact_hash() -> None:
@@ -430,7 +442,10 @@ def test_confluence_operational_display_header_does_not_trigger_extraction() -> 
         prior_observation_revisions={revision.observation_id: revision for revision in first.observation_revisions},
     )
 
-    assert later.observation_revisions[0].content == "# Title\n\nKeep A7."
+    assert json.loads(later.observation_revisions[0].content) == {
+        "title": "Title", "body": "<p>Keep A7.</p>",
+        "representation": "confluence-page-storage:1",
+    }
     assert later.deltas[0].axes == frozenset()
     assert later.deltas[0].requires_extraction is False
 
@@ -846,7 +861,7 @@ def test_jira_projection_types_changelog_semantics_for_generic_quality_policy() 
 
 
 @pytest.mark.parametrize("source_type", ["jira", "teams"])
-def test_operational_message_metadata_does_not_create_semantic_revision(source_type: str) -> None:
+def test_authenticated_message_framing_creates_a_revision(source_type: str) -> None:
     if source_type == "jira":
         item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
         first_payload = _jira_payload(
@@ -858,6 +873,7 @@ def test_operational_message_metadata_does_not_create_semantic_revision(source_t
                 {
                     "id": "501",
                     "body": "Keep A7",
+                    "renderedBody": "<p>Keep A7</p>",
                     "updated": "2026-07-15T10:00:00Z",
                     "author": {"displayName": "Renamed User"},
                 }
@@ -907,10 +923,10 @@ def test_operational_message_metadata_does_not_create_semantic_revision(source_t
         },
     )
 
-    assert second.source_unit_revisions[0].id == first.source_unit_revisions[0].id
-    assert second.observation_revisions == first.observation_revisions
-    assert second.deltas[0].axes == frozenset()
-    assert second.deltas[0].requires_extraction is False
+    assert second.source_unit_revisions[0].id != first.source_unit_revisions[0].id
+    assert second.observation_revisions != first.observation_revisions
+    assert second.deltas[0].axes == frozenset({DeltaAxis.SEMANTIC})
+    assert second.deltas[0].requires_extraction is True
 
 
 @pytest.mark.parametrize("source_type", ["jira", "teams"])
@@ -1134,6 +1150,30 @@ def test_document_and_append_sources_use_stable_provider_units(
     assert projection.observations[0].observation_type == expected_observation_type
 
 
+@pytest.mark.parametrize("receipt", [
+    None, "invalid", {}, {"client": "codex", "session_id": "s:1", "history_window_kind": "summary"},
+])
+def test_session_window_projection_preserves_receipt_and_partial_coverage(receipt) -> None:
+    item = _item()
+    raw, normalized = _inputs(item, {"doc_id": "window:1", "receipt": receipt, "markdown": "Authored summary."})
+    projection = project_source_item(
+        source_id="src-session", source_type="agent_session", run_id="run-session",
+        item=item, raw=raw, normalized=normalized,
+    )
+    expected_receipt = receipt if isinstance(receipt, dict) else {}
+    unit = projection.source_units[0]
+    assert unit.id == _stable_id("unit", "src-session", "agent_session_window", "window:1")
+    assert unit.locator == {
+        "document_id": item.item_id,
+        "client": expected_receipt.get("client"),
+        "session_id": expected_receipt.get("session_id"),
+        "history_window_kind": expected_receipt.get("history_window_kind"),
+        "url": item.source_url,
+    }
+    assert projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION
+    assert projection.observation_revisions[0].content == "Authored summary."
+
+
 @pytest.mark.parametrize("source_type", ["github_repo", "local_markdown"])
 def test_file_move_with_provider_lineage_preserves_observation_identity(source_type: str) -> None:
     first_extra = {"relative_path": "old/design.md", "file_lineage_id": "file-77"}
@@ -1241,6 +1281,8 @@ def test_attested_github_compare_previous_filename_preserves_unit_without_daemon
 
     assert moved.source_units[0].id == first.source_units[0].id
     assert moved.deltas[0].axes == frozenset({DeltaAxis.LOCATION})
+    assert moved.relations[0].from_id == moved.source_units[0].id
+    assert moved.relations[0].to_id == first.source_units[0].id
 
     ordinary_item = _item(
         item_id="file-new",
@@ -1832,7 +1874,7 @@ def test_every_builtin_gene_has_an_explicit_projection_contract() -> None:
 @pytest.mark.parametrize(
     ("source_type", "observation_type", "profile_name", "schema_name", "coordinate_space"),
     [
-        ("confluence", "page_body", "markdown-structural", None, EvidenceCoordinateSpace.UNICODE_SCALAR),
+        ("confluence", "page_body", "canonical-record", "confluence-page-storage", EvidenceCoordinateSpace.UNICODE_SCALAR),
         ("jira", "issue_core", "canonical-record", "jira-issue-core", EvidenceCoordinateSpace.UNICODE_SCALAR),
         ("jira", "comment", "canonical-record", "jira-comment", EvidenceCoordinateSpace.UNICODE_SCALAR),
         ("jira", "changelog", "canonical-record", "jira-changelog", EvidenceCoordinateSpace.UNICODE_SCALAR),

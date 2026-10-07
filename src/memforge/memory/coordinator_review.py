@@ -11,16 +11,21 @@ while every part of that Evidence is still exactly current.
 
 from __future__ import annotations
 
+from memforge.memory.text_view import TextEvidenceView
+
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import date
 
 from memforge.memory.candidate_admission import normalized_claim
-from memforge.memory.evidence import EvidenceRole, RelationDirection
+from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole, RelationDirection
 from memforge.memory.lifecycle_plan import LifecycleReview, LifecycleReviewStatus, lifecycle_stable_id
 from memforge.memory.relation_classifier import MemoryRelationType
-from memforge.models import CoordinatorProposal, RawMemory, content_hash
-from memforge.pipeline.projection_fragments import ProjectionFragmentCatalog
-from memforge.pipeline.support_reading import exact_evidence_selection
+from memforge.models import CoordinatorProposal, Memory, RawMemory, content_hash
+from memforge.pipeline.support_reading import EvidenceCorrespondence, correspond_evidence, exact_evidence_selection
+from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+from memforge.pipeline.support_reading import SupportWorkItem
+from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.pipeline.support_relation_coordinator import RelationLedgerEntry
 
 COORDINATOR_REVIEW_ORIGIN = "support_relation_coordinator"
@@ -58,6 +63,13 @@ def staged_candidate(raw: RawMemory) -> dict[str, object]:
                 "observation_id": part.anchor.observation_id,
                 "raw_content_sha256": part.raw_content_sha256,
                 "presentation_sha256": part.presentation_sha256,
+                "observation_revision_id": part.anchor.observation_revision_id,
+                "anchor_kind": part.anchor.kind.value,
+                "range_start": part.anchor.range_start,
+                "range_end": part.anchor.range_end,
+                "fragment_id": part.anchor.fragment_id,
+                "excerpt": part.excerpt,
+                "text_view": part.text_view.payload() if part.text_view else None,
             }
             for part in selection.parts
         ],
@@ -76,33 +88,87 @@ class CarriedConflict:
     rejection_rebind: RawMemory | None = None
 
 
-def carried_conflicts(
-    reviews: Sequence[LifecycleReview], catalog: ProjectionFragmentCatalog,
-) -> tuple[CarriedConflict, ...]:
+@dataclass(frozen=True)
+class CarriedReviews:
+    conflicts: tuple[CarriedConflict, ...]
+    unresolved_review_ids: frozenset[str]
+
+
+async def carried_conflicts(
+    reviews: Sequence[LifecycleReview], context: RevisionAssessmentContext,
+    *, evaluator, context_for_review,
+) -> CarriedReviews:
     """The pending conflicts among one Source Unit's coordinator Reviews whose staged Candidate is exactly current.
 
     An update extracts only changed structures, so an unchanged Candidate is not
-    extracted again and Relation cannot raise its conflict. Its exact Evidence
-    proves the Candidate still stands, so the conflict enters the coordinator
-    again. A Candidate whose Evidence changed was extracted again if it still
-    holds; otherwise its conflict is gone.
+    extracted again and Relation cannot raise its conflict. Correspondence only
+    locates its Evidence. The ordinary fixed-claim revision work then validates
+    the whole Candidate against changes since the Review was staged. An
+    unjudgeable Candidate preserves its Review without entering the ledger.
     """
     carried = []
+    unresolved = set()
+    work = []
+    staged_claims = {}
     for review in reviews:
         if review.status is not LifecycleReviewStatus.PENDING:
             continue
         staged = review.staged_evidence
-        candidate = _current_candidate(staged.get("candidate"), catalog)
+        candidate, verifiable = _current_candidate(staged.get("candidate"), context)
+        if not verifiable:
+            unresolved.add(review.id)
         if candidate is None:
             continue
-        carried.append(CarriedConflict(
+        rejection, rejection_verifiable = _current_candidate(staged.get("rejection_candidate"), context)
+        if staged.get("rejection_candidate") is not None and not rejection_verifiable:
+            unresolved.add(review.id)
+        conflict = CarriedConflict(
             memory_id=review.incumbent_memory_id,
             proposal=CoordinatorProposal(str(staged.get("proposal"))),
             candidate=candidate,
             reason=review.reason or "",
-            rejection_rebind=_current_candidate(staged.get("rejection_candidate"), catalog),
+            rejection_rebind=rejection,
+        )
+        baseline_context = await context_for_review(review)
+        for name, raw in (("candidate", candidate), ("rejection", rejection)):
+            if raw is None:
+                continue
+            work_id = f"review-{review.id}-{name}"
+            fixed = Memory(
+                id=work_id, content=raw.content, content_hash=content_hash(raw.content),
+                memory_type=raw.memory_type, entity_refs=list(raw.entity_refs),
+                valid_from=date.fromisoformat(raw.valid_from) if raw.valid_from else None,
+                valid_until=date.fromisoformat(raw.valid_until) if raw.valid_until else None,
+            )
+            parts = tuple(ActiveSupportEvidence(
+                memory_id=work_id, source_id=context.projection.source_id,
+                reference_id=f"{work_id}-{index}", evidence_unit_id=work_id,
+                role=part.role, anchor=part.anchor, excerpt=part.excerpt,
+                raw_content_sha256=part.raw_content_sha256, presentation_sha256=part.presentation_sha256,
+                text_view=part.text_view,
+            ) for index, part in enumerate(raw.resolved_evidence_selection.parts))
+            work.append(SupportWorkItem(work_id, fixed, parts, baseline_context))
+        staged_claims[review.id] = conflict
+    assessed = await evaluator.assess_many(work) if work else {}
+    for review_id, conflict in staged_claims.items():
+        candidate = assessed[f"review-{review_id}-candidate"]
+        if candidate.supported is None:
+            unresolved.add(review_id)
+            continue
+        if not candidate.supported:
+            continue
+        rejection = None
+        if conflict.rejection_rebind is not None:
+            outcome = assessed[f"review-{review_id}-rejection"]
+            if outcome.supported is None:
+                unresolved.add(review_id)
+            elif outcome.supported:
+                rejection = replace(outcome.memory, entity_refs=conflict.rejection_rebind.entity_refs)
+        carried.append(replace(
+            conflict, candidate=replace(candidate.memory, entity_refs=conflict.candidate.entity_refs),
+            rejection_rebind=rejection,
         ))
-    return tuple(carried)
+    return CarriedReviews(tuple(carried), frozenset(unresolved))
 
 
 @dataclass(frozen=True)
@@ -160,22 +226,58 @@ def carry_into_ledger(
     return CarriedLedger(tuple(merged), tuple(ledger), frozenset(carried))
 
 
-def _current_candidate(value: object, catalog: ProjectionFragmentCatalog) -> RawMemory | None:
+def _current_candidate(value: object, context: RevisionAssessmentContext) -> tuple[RawMemory | None, bool]:
     if not isinstance(value, Mapping):
-        return None
+        return None, False
+    if any(not isinstance(value.get(name), str) or not value[name].strip() for name in ("content", "memory_type")):
+        return None, False
+    try:
+        for name in ("valid_from", "valid_until"):
+            if value.get(name) is not None:
+                date.fromisoformat(value[name])
+    except (TypeError, ValueError):
+        return None, False
     evidence = value.get("evidence")
     if not isinstance(evidence, Sequence) or not evidence:
-        return None
-    selection = exact_evidence_selection(catalog, [
-        (
-            EvidenceRole(str(part["role"])),
-            (str(part["observation_id"]), str(part["raw_content_sha256"]), str(part["presentation_sha256"])),
-        )
-        for part in evidence
-        if isinstance(part, Mapping)
-    ])
+        return None, False
+    # Legacy digest-only staging cannot prove the old occurrence. Keep its
+    # existing Review, but never manufacture a pin from a current match.
+    if any(not isinstance(part, Mapping) or not part.get("observation_revision_id") or not part.get("anchor_kind") for part in evidence):
+        return None, False
+    try:
+        parts = [ActiveSupportEvidence(
+            memory_id="staged", source_id=context.projection.source_id,
+            reference_id=f"staged-{index}", evidence_unit_id="staged",
+            role=EvidenceRole(str(part["role"])),
+            anchor=SourceAnchor(
+                kind=AnchorKind(str(part["anchor_kind"])),
+                observation_id=str(part["observation_id"]),
+                observation_revision_id=str(part["observation_revision_id"]),
+                range_start=part.get("range_start"), range_end=part.get("range_end"),
+                fragment_id=part.get("fragment_id"),
+            ),
+            excerpt=part.get("excerpt"), raw_content_sha256=part.get("raw_content_sha256"),
+            presentation_sha256=part.get("presentation_sha256"),
+            text_view=TextEvidenceView.from_payload(part.get("text_view")),
+        ) for index, part in enumerate(evidence)]
+    except (ValueError, TypeError, KeyError):
+        return None, False
+    if any(part.anchor.observation_revision_id not in context.revisions for part in parts):
+        return None, False
+    if any(part.role not in {EvidenceRole.PRIMARY, EvidenceRole.REQUIRED} for part in parts):
+        return None, False
+    correspondences = correspond_evidence(context, parts)
+    if any(item.status in {EvidenceCorrespondence.UNKNOWN, EvidenceCorrespondence.AMBIGUOUS} for item in correspondences):
+        return None, False
+    if any(
+        (target := context.current.get(part.anchor.observation_id)) is not None
+        and context.revisions[part.anchor.observation_revision_id].evidence_profile != target.evidence_profile
+        for part in parts
+    ):
+        return None, False
+    selection = exact_evidence_selection(context, parts)
     if selection is None:
-        return None
+        return None, True
     primary = next(part for part in selection.parts if part.role is EvidenceRole.PRIMARY)
     return RawMemory(
         content=str(value["content"]),
@@ -190,7 +292,7 @@ def _current_candidate(value: object, catalog: ProjectionFragmentCatalog) -> Raw
             part.anchor.observation_id for part in selection.parts if part.role is EvidenceRole.REQUIRED
         )),
         resolved_evidence_selection=selection,
-    )
+    ), True
 
 
 def _optional_text(value: object) -> str | None:

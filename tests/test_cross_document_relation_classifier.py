@@ -524,16 +524,16 @@ async def test_subject_shows_readable_record_fields_and_the_observation_revision
 
     assert subject.document_title == "PAY-1: Rename"
     assert subject.evidence_time == "2026-03-26"
-    assert subject.evidence == (
-        "created: 2026-03-25T23:30:00.000-0800\n"
-        "items/0/field: status\n"
-        "items/0/fromString: Open\n"
-        "items/0/toString: Closed",
-        "assignee: accountId=acc-1, displayName=Dev\n"
-        "description: The enumeration is **RETRO_CHAIN**.\n"
-        "labels: payroll\n"
-        "summary: Rename the enumeration",
-    )
+    history_text, core_text = subject.evidence
+    assert "Change recorded: 2026-03-25T23:30:00.000-0800" in history_text
+    assert "Change author: Dev" in history_text
+    assert "Changed field: status" in history_text
+    assert "Previous value:\nOpen" in history_text
+    assert "New value:\nClosed" in history_text
+    assert "assignee: accountId=acc-1, displayName=Dev" in core_text
+    assert "Description:\nThe enumeration is **RETRO_CHAIN**." in core_text
+    assert "labels: payroll" in core_text
+    assert "Summary: Rename the enumeration" in core_text
     assert "avatar" not in json.dumps(subject.to_manifest())
 
 
@@ -568,15 +568,19 @@ async def test_record_fields_keep_each_array_item_together_and_skip_empty_values
 
     subject = (await load_relation_subjects(store, (_memory("mem-jira"),)))["mem-jira"]
 
-    assert subject.evidence == (
-        "created: 2026-04-27T04:22:39.861+0000\n"
-        "items/0/field: Defect Review Status\n"
-        "items/0/toString: Fixed\n"
-        "items/1/field: status\n"
-        "items/1/fromString: Work In Progress\n"
-        "items/1/toString: Resolved",
-        "summary: Improper error message",
-    )
+    history_text, core_text = subject.evidence
+    first, second = history_text.split("items/1/field:", 1)
+    assert "Changed field: Defect Review Status" in first
+    assert "New value:\nFixed" in first
+    assert "items/0/fromString" not in first
+    assert "Previous value:" not in first
+    assert "Changed field: status" in second
+    assert "Previous value:\nWork In Progress" in second
+    assert "New value:\nResolved" in second
+    assert "Fixed" not in second
+    assert core_text == "summary: Summary: Improper error message"
+    assert "labels:" not in core_text
+
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,8 @@ strings (for example ``{"memories": "[...]"}``). The structured schemas must
 decode those before validation so a stringified container still parses.
 """
 
+from tests.evidence_display_fixture import evidence_displays
+
 from memforge.llm.structured import (
     ProjectionFragmentMemoryCandidate,
     ProjectionFragmentMemoryExtractionResponse,
@@ -13,8 +15,7 @@ from memforge.llm.structured import (
 def test_memories_stringified_array_is_decoded():
     payload = {
         "memories": (
-            '[{"content": "pay-api uses PostgreSQL 15", "memory_type": "fact", '
-            '"primary_ref": "P1"}]'
+            '[{"content": "pay-api uses PostgreSQL 15", "memory_type": "fact", "primary_ref": "P1", "evidence_displays": [{"ref": "P1", "text": "Fixture evidence."}]}]'
         )
     }
     parsed = ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
@@ -29,7 +30,7 @@ def test_native_array_is_unchanged():
                 "content": "x",
                 "memory_type": "fact",
                 "primary_ref": "P1",
-            }
+             "evidence_displays": evidence_displays("P1", ())}
         ]
     }
     parsed = ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
@@ -44,7 +45,7 @@ def test_nested_stringified_list_field_is_decoded():
                 "memory_type": "fact",
                 "primary_ref": "P1",
                 "entity_refs": '["pay-api", "postgresql"]',
-            }
+             "evidence_displays": evidence_displays("P1", ())}
         ]
     }
     parsed = ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
@@ -57,7 +58,7 @@ def test_string_scalar_field_is_not_decoded():
             "content": "[brackets] in text",
             "memory_type": "fact",
             "primary_ref": "P1",
-        }
+         "evidence_displays": evidence_displays("P1", ())}
     )
     assert cand.content == "[brackets] in text"
 

@@ -829,13 +829,18 @@ class MemoryEvidenceItemDetail(BaseModel):
     observation_id: str | None = None
     observation_revision_id: str | None = None
     anchor_kind: str
+    fragment_id: str | None = None
     range_start: int | None = None
     range_end: int | None = None
     excerpt: str | None = None
     raw_content_sha256: str | None = None
+    text: str | None = None
     presentation_sha256: str | None = None
+    text_view: dict[str, Any] | None = None
+    interpretation_available: bool = True
     current: bool
     artifact: MemoryEvidenceArtifactDetail | None = None
+    resource_url: str | None = None
 
 
 class MemoryEvidenceGroupDetail(BaseModel):
@@ -850,6 +855,7 @@ class MemoryEvidenceGroupDetail(BaseModel):
     document: MemoryEvidenceDocumentDetail | None = None
     current: bool
     items: list[MemoryEvidenceItemDetail]
+    resource_url: str | None = None
 
 
 # The labels a stored relation can have; none is never stored.
@@ -3507,7 +3513,12 @@ def _memory_evidence_unit_detail(
     group,
     *,
     document: MemoryEvidenceDocumentDetail | None,
+    memory_id: str,
 ) -> MemoryEvidenceGroupDetail:
+    resource_url = (
+        "/api/v1/memories/" + quote(memory_id, safe="")
+        + "/evidence/" + quote(group.evidence_unit_id, safe="") + "/resource"
+    )
     items: list[MemoryEvidenceItemDetail] = []
     for item in group.items:
         artifact = None
@@ -3545,13 +3556,19 @@ def _memory_evidence_unit_detail(
                 observation_id=item.anchor.observation_id,
                 observation_revision_id=item.anchor.observation_revision_id,
                 anchor_kind=item.anchor.kind.value,
+                fragment_id=item.anchor.fragment_id,
                 range_start=item.anchor.range_start,
                 range_end=item.anchor.range_end,
                 excerpt=item.excerpt,
+                text=item.display_text if item.display_text is not None else item.excerpt,
                 raw_content_sha256=item.raw_content_sha256,
                 presentation_sha256=item.presentation_sha256,
+                text_view=item.text_view.payload() if item.text_view else None,
+                interpretation_available=item.interpretation_available,
                 current=item.current,
                 artifact=artifact,
+                resource_url=(resource_url.removesuffix("/resource") + "/references/"
+                              + quote(item.reference_id, safe="") + "/resource"),
             )
         )
     return MemoryEvidenceGroupDetail(
@@ -3566,6 +3583,7 @@ def _memory_evidence_unit_detail(
         document=document,
         current=group.current,
         items=items,
+        resource_url=resource_url,
     )
 
 
@@ -3621,6 +3639,8 @@ async def _memory_evidence_details(
     details: list[MemoryEvidenceGroupDetail] = []
     seen_source_keys: set[tuple[str, str]] = set()
     for group in await db.get_memory_evidence_units(memory_id):
+        if not group.visible_to(resolve_request_principal(request)):
+            continue
         source = await db.get_source(group.source_id)
         if source is None:
             continue
@@ -3638,19 +3658,29 @@ async def _memory_evidence_details(
         if group.doc_id is not None:
             seen_source_keys.add((group.source_id, group.doc_id))
             doc = await db.get_document(group.doc_id)
+            unit_input = await db.get_source_unit_input(group.source_unit_id)
+            if unit_input is not None and unit_input.unit_revision_id != group.source_unit_revision_id:
+                # A latest-input document link is navigation, not proof of this
+                # historical Evidence. Keep the pinned excerpt, never substitute
+                # another revision as its supporting content/PDF.
+                unit_input = None
             document = _memory_evidence_document_detail(
                 group.doc_id,
                 doc,
                 source_row,
-                await db.get_source_unit_input(group.source_unit_id),
+                unit_input,
                 config,
                 artifact_store,
             )
         details.append(
-            _memory_evidence_unit_detail(group, document=document)
+            _memory_evidence_unit_detail(group, document=document, memory_id=memory_id)
         )
 
     for source_row in raw_sources:
+        if source_row.has_unit_support:
+            # Unit-backed provenance is emitted only through the verified Unit,
+            # including its complete supporting parts and visibility checks.
+            continue
         source_id = str(source_row.source_id)
         key = (source_id, source_row.doc_id)
         if key in seen_source_keys:
@@ -5280,6 +5310,71 @@ def create_admin_app(
         if not restored:
             raise HTTPException(status_code=404, detail="Relation dismissal not found")
         return RelationRestoreResponse(restored_dismissal_ids=[item.id for item in restored])
+
+    @memory_router.get("/{memory_id}/evidence/{evidence_unit_id}/resource")
+    @memory_router.get("/{memory_id}/evidence/{evidence_unit_id}/references/{reference_id}/resource")
+    async def get_memory_evidence_resource(
+        memory_id: str, evidence_unit_id: str, request: Request,
+        db: Database = Depends(get_db),
+        reference_id: str | None = None,
+    ):
+        """Read verified stored citations and the complete immutable Unit source material."""
+        if memory_id not in await _filter_visible_ids(db, [memory_id], _lifecycle_visibility_scope(request)):
+            raise HTTPException(status_code=404, detail="Evidence not found")
+        group = next((unit for unit in await db.get_memory_evidence_units(
+                         memory_id, include_historical=True, context_reference_id=reference_id)
+                      if unit.evidence_unit_id == evidence_unit_id), None)
+        if group is None or not group.visible_to(resolve_request_principal(request)):
+            raise HTTPException(status_code=404, detail="Evidence not found")
+        if reference_id is not None and not any(item.reference_id == reference_id for item in group.items):
+            raise HTTPException(status_code=404, detail="Evidence not found")
+        source = await db.get_source(group.source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="Evidence not found")
+        _require_source_discoverability(request, source)
+        try:
+            pinned = (await db.get_source_unit_revision_projection(group.source_unit_id, group.source_unit_revision_id)
+                      if group.source_unit_revision_id is not None else None)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "pinned_evidence_unavailable", "reason": "The historical Unit manifest is invalid.",
+            }) from exc
+        if (pinned is None or pinned.source_id != group.source_id
+                or len(pinned.source_unit_revisions) != 1
+                or pinned.source_unit_revisions[0].id != group.source_unit_revision_id
+                or pinned.source_unit_revisions[0].source_unit_id != group.source_unit_id):
+            raise HTTPException(status_code=409, detail={
+                "code": "pinned_evidence_unavailable", "reason": "The exact historical Unit is unavailable.",
+            })
+        member_ids = {revision.id for revision in pinned.observation_revisions}
+        if any(item.anchor.observation_revision_id not in member_ids
+               for item in group.items if item.grants_support):
+            raise HTTPException(status_code=409, detail={
+                "code": "pinned_evidence_unavailable", "reason": "A supporting part is outside its Unit revision.",
+            })
+        material = {revision.id: revision for revision in pinned.observation_revisions}
+        context_revision_ids = {item.anchor.observation_revision_id for item in group.items if not item.grants_support}
+        material.update(await db.get_source_observation_revisions(context_revision_ids))
+        if not context_revision_ids <= material.keys():
+            raise HTTPException(status_code=409, detail={"code": "pinned_evidence_unavailable"})
+        payload = {
+            "memory_id": memory_id,
+            "selected_reference_id": reference_id,
+            "evidence": _memory_evidence_unit_detail(group, document=None, memory_id=memory_id).model_dump(),
+            "source_material": [{
+                "observation_id": revision.observation_id,
+                "observation_revision_id": revision.id,
+                "content": revision.content,
+                "representation_profile": _json_ready(revision.evidence_profile),
+                "support_unit_member": revision.id in member_ids,
+            } for revision in sorted(material.values(), key=lambda item: item.id)],
+        }
+        body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return Response(content=body, media_type="application/json", headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-SHA256": hashlib.sha256(body).hexdigest(),
+            "Content-Disposition": _inline_content_disposition(f"evidence-{evidence_unit_id}.json"),
+        })
 
     @memory_router.get("/{memory_id}", response_model=MemoryDetailResponse)
     async def get_memory(

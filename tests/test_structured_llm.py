@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.evidence_display_fixture import evidence_displays
+
 import asyncio
 import base64
 import gc
@@ -73,14 +75,14 @@ def test_projection_fragment_schemas_describe_catalog_role_constraints() -> None
 
     for schema, definition_name in schemas:
         properties = schema["$defs"][definition_name]["properties"]
-        assert properties["primary_ref"]["description"] == (
-            "Exactly one reference copied unchanged from primary_candidates; "
-            "never select from required_only_candidates."
-        )
-        assert properties["required_refs"]["description"] == (
-            "A duplicate-free list of references copied unchanged from "
-            "primary_candidates or required_only_candidates; do not repeat primary_ref."
-        )
+        primary_description = properties["primary_ref"]["description"].lower()
+        assert "copied unchanged from primary_candidates" in primary_description
+        assert "never select from required_only_candidates" in primary_description
+        assert "central conclusion" in primary_description
+        required_description = properties["required_refs"]["description"].lower()
+        for rule in ("duplicate-free", "primary_candidates or required_only_candidates",
+                     "do not repeat primary_ref", "additional contribution", "best effort", "[] is valid"):
+            assert rule in required_description
 
 
 class ChoiceMessage:
@@ -216,7 +218,7 @@ async def test_structured_llm_metrics_scope_isolates_concurrent_source_units(
         await asyncio.sleep(0)
         response = CompletionResponse(
             '{"memories":[{"content":"A durable fact.","memory_type":"fact",'
-            '"primary_ref":"P1"}]}'
+            '"primary_ref":"P1","evidence_displays":[{"ref":"P1","text":"Fixture evidence."}]}]}'
         )
         token_count = 11 if "source-a" in prompt else 23
         response.usage = {
@@ -288,7 +290,7 @@ def test_agent_session_authority_decision_holds_only_the_authority_kind():
 def test_memory_extraction_response_rejects_top_level_array():
     with pytest.raises(ValidationError):
         ProjectionFragmentMemoryExtractionResponse.model_validate(
-            [{"content": "Fact", "memory_type": "fact", "primary_ref": "P1"}]
+            [{"content": "Fact", "memory_type": "fact", "primary_ref": "P1", "evidence_displays": evidence_displays("P1", ())}]
         )
 
 
@@ -344,7 +346,7 @@ async def test_litellm_structured_client_uses_response_schema_for_memory_extract
         calls.append(kwargs)
         return CompletionResponse(
             '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact",'
-            '"primary_ref":"P1"}]}'
+            '"primary_ref":"P1","evidence_displays":[{"ref":"P1","text":"Fixture evidence."}]}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -629,7 +631,7 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
         calls.append(kwargs)
         return CompletionResponse(
             '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact",'
-            '"primary_ref":"P1"}]}'
+            '"primary_ref":"P1","evidence_displays":[{"ref":"P1","text":"Fixture evidence."}]}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -674,7 +676,7 @@ async def test_litellm_structured_client_supports_prompt_template_transport(
         calls.append(kwargs)
         return CompletionResponse(
             '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact",'
-            '"primary_ref":"P1"}]}'
+            '"primary_ref":"P1","evidence_displays":[{"ref":"P1","text":"Fixture evidence."}]}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -831,7 +833,7 @@ async def test_litellm_structured_client_repairs_invalid_json_backslash_escapes(
     async def fake_acompletion(**kwargs):
         return CompletionResponse(
             r'{"memories":[{"content":"Use regex \s+ for whitespace.","memory_type":"fact",'
-            r'"primary_ref":"P1"}]}'
+            r'"primary_ref":"P1","evidence_displays":[{"ref":"P1","text":"Fixture evidence."}]}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -862,7 +864,7 @@ async def test_litellm_structured_client_repairs_unescaped_quotes_without_changi
         return CompletionResponse(
             '{"memories":[{"content":"Use "规则" for validation.",'
             '"memory_type":"procedure",'
-            '"entity_refs":[],"primary_ref":"P1"}]}'
+            '"entity_refs":[],"primary_ref":"P1","evidence_displays":[{"ref":"P1","text":"Fixture evidence."}]}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -945,7 +947,7 @@ async def test_litellm_structured_client_rejects_quote_repair_when_schema_is_inv
         calls.append(kwargs)
         return CompletionResponse(
             '{"memories":[{"content":"Use "规则" for validation.",'
-            '"memory_type":"unsupported","primary_ref":"P1"}]}'
+            '"memory_type":"unsupported","primary_ref":"P1","evidence_displays":[{"ref":"P1","text":"Fixture evidence."}]}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -1049,7 +1051,7 @@ async def test_litellm_structured_client_reports_content_free_validation_fields(
         return CompletionResponse(
             '{"memories":[{"content":"secret source text",'
             '"memory_type":"unsupported",'
-            '"entity_refs":[],"primary_ref":"P1"}]}'
+            '"entity_refs":[],"primary_ref":"P1","evidence_displays":[{"ref":"P1","text":"Fixture evidence."}]}]}'
         )
 
     monkeypatch.setattr(
@@ -1179,7 +1181,7 @@ async def test_litellm_structured_client_falls_back_once_to_json_text(monkeypatc
             raise first_error
         return CompletionResponse(
             '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact",'
-            '"primary_ref":"P1"}]}'
+            '"primary_ref":"P1","evidence_displays":[{"ref":"P1","text":"Fixture evidence."}]}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -1309,13 +1311,13 @@ async def test_litellm_structured_client_repairs_invalid_json_fallback_with_vali
                 '{"memories":[{"content":"A durable constraint.",'
                 '"memory_type":"unsupported",'
                 '"entity_refs":[],"valid_from":null,"valid_until":null,'
-                '"primary_ref":"p000001","required_refs":[]}]}'
+                '"primary_ref":"p000001","required_refs":[],"evidence_displays":[{"ref":"p000001","text":"Fixture evidence."}]}]}'
             )
         return CompletionResponse(
             '{"memories":[{"content":"A durable constraint.",'
             '"memory_type":"convention",'
             '"entity_refs":[],"valid_from":null,"valid_until":null,'
-            '"primary_ref":"p000001","required_refs":[]}]}'
+            '"primary_ref":"p000001","required_refs":[],"evidence_displays":[{"ref":"p000001","text":"Fixture evidence."}]}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -1368,13 +1370,13 @@ async def test_litellm_structured_client_repairs_invalid_json_first_response(
                 '{"memories":[{"content":"A durable constraint.",'
                 '"memory_type":"unsupported",'
                 '"entity_refs":[],"valid_from":null,"valid_until":null,'
-                '"primary_ref":"p000001","required_refs":[]}]}'
+                '"primary_ref":"p000001","required_refs":[],"evidence_displays":[{"ref":"p000001","text":"Fixture evidence."}]}]}'
             )
         return CompletionResponse(
             '{"memories":[{"content":"A durable constraint.",'
             '"memory_type":"convention",'
             '"entity_refs":[],"valid_from":null,"valid_until":null,'
-            '"primary_ref":"p000001","required_refs":[]}]}'
+            '"primary_ref":"p000001","required_refs":[],"evidence_displays":[{"ref":"p000001","text":"Fixture evidence."}]}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -1456,7 +1458,7 @@ async def test_litellm_structured_client_bounds_schema_repair_diagnostics(
             "valid_until": None,
             "primary_ref": "p000001",
             "required_refs": [],
-        }
+         "evidence_displays": evidence_displays("p000001", [])}
         for index in range(9)
     ]
 
@@ -1605,7 +1607,7 @@ async def test_litellm_structured_client_shares_one_transport_retry_budget_acros
             return CompletionResponse("{}")
         return CompletionResponse(
             '{"memories":[{"content":"A durable fact.","memory_type":"fact",'
-            '"primary_ref":"P1"}]}'
+            '"primary_ref":"P1","evidence_displays":[{"ref":"P1","text":"Fixture evidence."}]}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -1639,7 +1641,7 @@ async def test_litellm_structured_client_aggregates_available_usage_without_esti
     telemetry: list[StructuredLlmCallTelemetry] = []
     response = CompletionResponse(
         '{"memories":[{"content":"A durable fact.","memory_type":"fact",'
-        '"primary_ref":"P1"}]}'
+        '"primary_ref":"P1","evidence_displays":[{"ref":"P1","text":"Fixture evidence."}]}]}'
     )
     response.usage = {
         "prompt_tokens": 11,
