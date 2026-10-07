@@ -1,213 +1,43 @@
 # MemForge
 
-<p align="center">
-  <img src=".github/assets/memforge-banner.png" alt="MemForge - Agent memory layer" width="100%">
-</p>
+**Help agents remember the decisions behind your work.**
 
-<p align="center">
+A memory layer for AI agents, with source citations and rechecking when
+connected documents change.
+
+MemForge builds it from Confluence, Jira, GitHub, Teams and your agents'
+sessions. Source sync rechecks affected memories against new revisions. The
+packaged agent integrations support Claude Code and Codex.
+
+<p>
   <a href="https://github.com/shno-labs/mem-forge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/shno-labs/mem-forge/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="Python 3.12+" src="https://img.shields.io/badge/python-3.12%2B-3776AB">
   <img alt="License Apache 2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
   <img alt="Status alpha" src="https://img.shields.io/badge/status-alpha-f59e0b">
-  <img alt="Code style Ruff" src="https://img.shields.io/badge/code%20style-ruff-111827">
 </p>
 
-*Self-evolving, evidence-based agent memory layer for Codex, Claude Code, and development teams.*
 
-> **Status:** alpha. APIs, storage formats, and integration packaging may change
-> while the project settles.
 
-MemForge is a self-evolving memory layer for AI coding agents. It
-turns scattered team context into structured, source-traced memories that agents
-can search, verify, and reuse.
+> **Status: alpha.** APIs, storage formats and plugin packaging may change.
+> The open-source build runs for one user on one machine.
 
-It connects to the systems teams already use, such as Confluence, Jira,
-GitHub Pages, Microsoft Teams, and long coding-agent sessions. On each
-sync, MemForge extracts durable facts, decisions, procedures, and conventions
-while preserving source evidence and history.
+## Quick start
 
-AI coding assistants often start each session blind to institutional context.
-MemForge bridges that gap through MCP-enabled agent plugins, an admin API, and
-integrations, with review flows for superseded facts and notices when documents
-conflict or one updates another.
-
-## What It Does
-
-- Ingests source context from genes such as wiki pages, issue trackers,
-  GitHub Pages, Teams exports, and Codex and Claude Code session windows.
-- Extracts durable facts, decisions, procedures, and conventions with quality
-  gates before persistence.
-- Stores memory, provenance, review state, full-text search, and vector search
-  in a local or self-hosted service.
-- Ships thin MCP proxies for Codex, Claude Code, and other clients so agents
-  can search, inspect provenance, and cache source artifacts locally while the
-  service owns memory logic.
-- Provides a React admin UI for source management, review queues, memory detail,
-  entity browsing, and runtime settings.
-
-Built-in genes today: `confluence`, `jira`, `github_pages`, `teams`,
-`agent_session`, and `local_markdown`.
-
-## Integrations
-
-MemForge connects the systems where team context is created with the agents that
-need it during real work. Instead of rediscovering context every session, source
-systems sync into evidence-backed memories that agents can retrieve when they
-matter.
-
-### Agent Integrations
-
-Once installed, each plugin gives your agent a two-way memory loop out of the
-box: it can pull source-traced context while you code, and MemForge can turn
-useful work from the session into new memories afterward.
-
-**Supported today:** <img alt="Codex" src="https://api.iconify.design/simple-icons:openai.svg?color=%23000000" width="18"> **Codex** &nbsp;&nbsp; <img alt="Claude Code" src="https://api.iconify.design/simple-icons:claude.svg?color=%23D97757" width="18"> **Claude Code**
-
-### Memory Sources
-
-| Source | What MemForge captures |
-| --- | --- |
-| <img alt="Confluence" src="https://api.iconify.design/simple-icons:confluence.svg?color=%23172B4D" width="18"> **Confluence** | Pages, runbooks, architecture decisions, and exported PDFs. Reprocessed when source content changes. |
-| <img alt="Jira" src="https://api.iconify.design/simple-icons:jira.svg?color=%230052CC" width="18"> **Jira** | Issues, delivery outcomes, and conventions that outlive a ticket. |
-| <img alt="GitHub" src="https://api.iconify.design/simple-icons:github.svg?color=%23181717" width="18"> **GitHub Pages** | Published docs and design references from static project sites. |
-| <img alt="Microsoft Teams" src="https://api.iconify.design/simple-icons:microsoftteams.svg?color=%236264A7" width="18"> **Teams** | Decisions, significant discussions, and follow-ups from team conversations. |
-| <img alt="Local Repository" src="https://api.iconify.design/simple-icons:obsidian.svg?color=%237C3AED" width="18"> **Local Repository** | Any local folder or repo synced via the CLI (Obsidian vaults, plain folders). Markdown, text, JSON, and HTML files become source-traced memories, on demand or on a schedule. See [docs/local-repo-sync.md](docs/local-repo-sync.md). |
-
-More source connectors are in development, including Slack, Outlook,
-and custom team systems. Cursor and other agent runtimes can follow the same
-integration pattern. Built-in support today is the set listed above.
-
-## Architecture
-
-```mermaid
-flowchart LR
-  Agent["Agent client\nCodex / Claude Code"]
-  Adapter["Thin adapter\nhooks + local MCP proxy"]
-  API["MemForge API"]
-  Pipeline["Extraction pipeline\nquality + reconciliation"]
-  Store["SQLite + FTS\nChroma vectors"]
-  UI["Admin UI"]
-
-  Agent --> Adapter
-  Adapter -->|"redacted windows"| API
-  API --> Pipeline
-  Pipeline --> Store
-  UI --> API
-  Agent -->|"MCP tool calls"| Adapter
-  Adapter -->|"search / get_memory / artifacts"| API
-```
-
-Client adapters collect bounded, redacted evidence windows and upload them to
-`POST /api/v1/agent-sessions/windows`. The service canonicalizes the window,
-checks which user messages carry durable authority, and patches the user's
-private Agent Knowledge directly. This keeps agent clients portable across local
-and future hosted deployments.
-
-For MCP, Codex and Claude Code talk to a plugin-local proxy over stdio. That
-proxy calls the self-hosted or hosted MemForge API over HTTP(S), so search and
-provenance logic stay service-owned while `get_resource(mode="file")` can still
-return a real path on the agent machine.
-
-## Quick Start
-
-Requirements:
-
-- Docker with a current Compose v2
+You need Docker with Compose v2 and a model API key (Anthropic for extraction by
+default, OpenAI for embeddings).
 
 ```bash
-git clone https://github.com/shno-labs/mem-forge.git
-cd mem-forge
-
+git clone https://github.com/shno-labs/mem-forge.git && cd mem-forge
+cp .env.example .env   # set MEMFORGE_ENRICHMENT_API_KEY and MEMFORGE_EMBEDDING_API_KEY
 docker compose up --build
 ```
 
-Open `http://localhost:5174`. The compose stack starts the MemForge API, serves
-the admin UI, and keeps local data in the `memforge-data` Docker volume. Copy
-`.env.example` to `.env` when you want to set model keys or local overrides.
-The OSS public beta has no built-in request authentication, so Docker publishes
-both the UI and API on host loopback only. Browser, CLI, local-agent daemon, and
-host-side Codex or Claude clients can connect from the same machine; other LAN
-devices cannot. A client in another container has its own `localhost` and needs
-an explicitly configured host/container route rather than a wider host binding.
-If Docker Hub is slow or blocked in your network, set
-`MEMFORGE_DOCKERHUB_PREFIX` in `.env` to a mirror prefix such as
-`docker.m.daocloud.io/library/`, then rerun the same command.
-For restricted or slow registry networks, use the bundled mirror profile:
+The admin UI is at http://localhost:5174. Then install the agent plugin:
 
-```bash
-docker compose --env-file .env.mirrors.example up --build
+```text
+# Claude Code (inside a session)
+/plugin marketplace add shno-labs/mem-forge
+/plugin install memory@memforge
 ```
-
-The API image uses WeasyPrint for Confluence PDF export and does not require a
-browser runtime.
-When an agent needs backing source content from a Docker-hosted service, it
-should call `get-memory` for provenance and then read the returned `content_url`
-or `pdf_url` through MemForge's artifact endpoints instead of depending on
-service-local filesystem paths.
-
-For detailed setup, configuration, and first-source examples, see
-[docs/quickstart.md](docs/quickstart.md).
-
-The complete docs map is in [docs/README.md](docs/README.md).
-
-Install the host-side CLI in an isolated environment when you want to query a
-running MemForge service or run local-source adapters from this machine:
-
-```bash
-pipx install memforge-ai
-memforge --help
-```
-
-`memforge-ai` is the Python distribution name; the installed command and import
-package remain `memforge`.
-
-Configure the current target and install the local collection daemon as a login
-user service with one guided command:
-
-```bash
-# Guided setup; press Enter to use the local self-hosted target
-memforge setup
-
-# Or configure a hosted target; the token is prompted and saved in the OS keyring
-memforge setup --api-url https://memory.example.com
-```
-
-With no active target, the guided command prompts for the API URL and offers the
-local self-hosted endpoint as its default. MemForge discovers the exact origin's
-edition, authentication requirement, API base, and health path from
-`/.well-known/memforge`; it does not infer service type from the hostname.
-
-The setup command manages launchd on macOS and the systemd user manager on
-Linux. Use `memforge daemon status`, `check`, `restart`, `logs`, `stop`, `start`,
-and `uninstall` for subsequent operations; users do not need to write native
-service files or keep a terminal open. Status and check include the
-server-observed heartbeat, so users can prove connectivity before scheduling or
-triggering a source sync.
-
-You can also exercise the same read path from the CLI:
-
-```bash
-memforge
-memforge search "docker artifact provenance"
-memforge get-memory mem-123
-memforge get-resource /api/documents/doc-456/pdf --mode file
-```
-
-The CLI uses `MEMFORGE_API_URL` and optional `MEMFORGE_API_TOKEN` when set;
-otherwise it targets the local Admin API port from config.
-The bare interactive CLI requires Node.js on `PATH`; MemForge prepares the
-packaged Clack menu in a user cache on first use, so no manual `cd cli &&
-npm install` step is required.
-
-## Plugin Installation
-
-Installable plugin packages live under:
-
-- [integrations/codex/memforge-memory](integrations/codex/memforge-memory)
-- [integrations/claude-code/memforge-memory](integrations/claude-code/memforge-memory)
-
-Add this repository as a marketplace and install the plugin (no checkout
-required; the marketplace is fetched directly from GitHub):
 
 ```bash
 # Codex
@@ -215,102 +45,138 @@ codex plugin marketplace add shno-labs/mem-forge
 codex plugin add memory@memforge
 ```
 
-```text
-# Claude Code (run inside an active Claude Code session)
-/plugin marketplace add shno-labs/mem-forge
-/plugin install memory@memforge
-```
-
-For normal self-hosted use, the plugin talks to the running MemForge API at
-`http://127.0.0.1:8765`. Set `MEMFORGE_API_URL` and optional
-`MEMFORGE_API_TOKEN` only when pointing the plugin at another local or hosted
-service. The same `/api/v1` contract is used by self-hosted and Cloud. MCP
-offers `list_workspaces`; every other tool accepts an optional `workspace_id`.
-Installable clients resolve a user-confirmed local project binding and send it
-as an explicit selector. Omission is safe only when exactly one accessible
-workspace remains. Self-hosted exposes the single readable workspace id `local`.
-
-```bash
-export MEMFORGE_API_URL=https://api.example.memforge
-export MEMFORGE_API_TOKEN=...
-```
-
-After installing, talk to your agent like a teammate with project memory:
+Start a new agent session. Hooks upload eligible session windows, and your
+agent can search memory. See [plugin routing](docs/quickstart.md#plugin-routing)
+when using a hosted endpoint or more than one workspace:
 
 ```text
-I'm about to change the agent-session capture flow.
-Check MemForge for the decisions, conventions, and source evidence that matter.
-If a memory points to a backing page or PDF, inspect it when the original context
-could change your recommendation.
+Before changing the capture flow, check MemForge for decisions and conventions
+that apply, and show the evidence for any you rely on.
 ```
 
-The plugin returns compact memory cards from search. Agents call `get_memory`
-for source provenance, then use its Document `content_url`/`pdf_url` or
-revision-pinned `evidence_artifacts[].url` links with `get_resource` when they
-need more than the memory card.
+To add Confluence, Jira or other sources, open **Sources** in the admin UI. The
+[quickstart](docs/quickstart.md) covers model settings, local folders, the host
+CLI and network details.
 
-Both plugins follow the same MemForge boundary: the local agent gets useful
-memory in the moment, while the service owns extraction, provenance, and review.
-See [docs/integrations/agent-clients.md](docs/integrations/agent-clients.md) for
-the client-side versus service-side design.
+## Why MemForge
 
-## Project Layout
+**Your sessions and your team's docs, in one memory.** Agent plugins capture
+sessions through lifecycle hooks; today that is Claude Code and Codex. MemForge
+keeps the decisions, conventions and corrections that you stated, not
+everything the agent said. Every connected agent reads and writes the same
+store, so a decision made in Claude Code is available in Codex. Session
+memories are private to the person who had the session. Document sources sit in the same store and come back from
+the same `search` call.
 
-```text
-src/memforge/        Python service, CLI, pipeline, genes, plugin MCP proxy
-admin/                  React admin UI, served at /v2/ during the V1 parallel run
-admin-ui/               V1 admin UI, removed after the parallel run (ADR 0044)
-integrations/           Codex and Claude Code plugin packages
-docs/design/            Design notes for memory extraction and agent sessions
-tests/                  Python tests
+**Recheck knowledge as sources change.** A successful source sync evaluates
+changed Evidence and the memories it supports. Supported memories can be kept;
+updates may replace or retire a memory, or await a Review. Unresolved support
+is preserved rather than treated as proof that a memory is false. Previous
+versions retain their lifecycle history. Across documents, `equivalent`,
+`updates` and `contradicts` relations help agents see competing knowledge.
+
+**Readable Evidence with traceable sources.** `get_memory` returns Evidence
+details, including citation text or excerpts and available source links. Readable text can be focused wording
+produced by the model; it is not always a verbatim quotation. Source-backed
+citations retain revision and range locators where available, and
+`get_resource` opens the pinned citation material or backing artifact. Managed
+session Evidence points to the generated concept document; raw conversation
+windows are not retained.
+
+**Self-hosted and open source.** Apache-2.0. The service and local data run from
+`docker compose up` on your machine (SQLite, FTS5 and Chroma). You bring your
+own model endpoints and keys; configured providers receive inference inputs.
+Session text is redacted in the plugin and again in the service.
+
+## How it works
+
+```mermaid
+flowchart LR
+  subgraph You["Your machine"]
+    CC["Claude Code / Codex"]
+    Plugin["MemForge plugin<br/>hooks + MCP proxy"]
+  end
+  Docs["Confluence, Jira, GitHub,<br/>Teams, local Markdown"]
+  API["MemForge API"]
+  Extract["Extract memories<br/>with source Evidence"]
+  Recheck["Plan updates and Reviews<br/>relate across documents"]
+  Store[("SQLite + FTS5<br/>Chroma")]
+
+  CC --> Plugin
+  Plugin -- "redacted session windows" --> API
+  Docs -- "sync" --> API
+  API --> Extract --> Recheck --> Store
+  Plugin -- "search / get_memory / get_resource" --> API
+  API -- "read" --> Store
 ```
 
-## Development
+1. **Capture.** Plugin hooks upload bounded, redacted windows of each session.
+   Connectors sync documents on demand or on a schedule.
+2. **Extract.** An LLM turns each source into short memories (facts, decisions,
+   procedures, conventions), with selected supporting Evidence.
+3. **Reconcile.** When a source changes, affected memories are re-checked
+   against the new revision, and new memories are compared with related ones
+   from other documents.
+4. **Recall.** Agents call MCP tools: `search` for memory cards, `get_memory`
+   for evidence and relations, `get_resource` for the backing document. You
+   can also ask the agent to create, correct or retire a memory; the plugin
+   tells the agent to confirm with you before it writes.
 
-Requirements:
+More detail: [architecture](docs/architecture.md) and
+[agent client integration](docs/integrations/agent-clients.md).
 
-- Python 3.12 or newer
-- Node.js 20 or newer
-- `uv` recommended for Python dependency management
+## How it compares
 
-Common commands:
+These projects address related needs with different data models. The following
+summary uses their public documentation checked on October 7, 2026; it is not a
+quality or latency benchmark. Corrections are welcome with a source link.
 
-```bash
-uv sync --extra dev
-cp .env.example .env
-uv run memforge api
-```
+| | MemForge | Mem0 | Zep / Graphiti | claude-mem | Unblocked |
+| --- | --- | --- | --- | --- | --- |
+| Main focus | Source-backed Memory and coding-session knowledge | Memory APIs for applications and agents | Temporal context graphs | Persistent coding-session observations | Context from connected engineering tools |
+| Source input | Confluence, Jira, GitHub, Teams, local files and plugin session windows | Application-provided content and integrations | Episodes supplied through APIs, loaders or MCP | Coding-agent hooks | Code, tickets, documents, conversations and other connected tools |
+| Changing knowledge | Recheck Source revisions; retain lifecycle history and gated Reviews | v3 extraction adds facts with temporal context; manual update/delete APIs are separate | Facts have temporal validity and old facts can be invalidated | Session observations and retrieval | Reconciles sources using context, recency and authority signals |
+| Evidence | Readable citation text and backing source links; pinned locators where available | Consult the selected library or Platform API contract | Source episodes and temporal facts | Observation identifiers | Citations to files, PRs, tickets and documents |
+| Open-source option | Apache-2.0 local service | Apache-2.0 library; hosted Platform is separate | Apache-2.0 Graphiti; hosted Zep is separate | Apache-2.0 local service | Hosted product |
 
-In another terminal:
+<details>
+<summary>Sources for this table</summary>
 
-```bash
-cd admin-ui
-npm ci
-npm run dev
-```
+- Mem0: [README](https://github.com/mem0ai/mem0), [OSS v3 migration](https://docs.mem0.ai/migration/oss-v2-to-v3), [Platform v3 migration](https://docs.mem0.ai/migration/platform-v2-to-v3), [Claude Code plugin](https://docs.mem0.ai/integrations/claude-code), [pricing](https://mem0.ai/pricing)
+- Zep / Graphiti: [Graphiti README](https://github.com/getzep/graphiti), [edge model](https://github.com/getzep/graphiti/blob/main/graphiti_core/edges.py), [Community Edition notice](https://blog.getzep.com/announcing-a-new-direction-for-zeps-open-source-strategy/), [Zep Ingest](https://help.getzep.com/zep-ingest), [pricing](https://www.getzep.com/pricing)
+- claude-mem: [README](https://github.com/thedotmack/claude-mem), [search tools](https://docs.claude-mem.ai/usage/search-tools.md)
+- Unblocked: [product overview](https://getunblocked.com/ai-info/), [context engine](https://getunblocked.com/blog/inside-the-unblocked-context-engine/), [MCP](https://getunblocked.com/unblocked-mcp/), [pricing](https://getunblocked.com/pricing/)
 
-Before opening a pull request:
+</details>
 
-```bash
-uv run ruff check src tests
-uv run pytest -q
+## Sources
 
-cd admin-ui
-npm ci
-npm run lint
-npm test
-npm run build
-```
+| Source | What is synced |
+| --- | --- |
+| Claude Code, Codex | Decisions, conventions and corrections from your sessions (private to you) |
+| Confluence | Pages, including exported PDFs; accepts a root, space or page URL |
+| Jira | Tickets, decisions and work items |
+| GitHub Repository | Repository files from GitHub or GitHub Enterprise, scoped by folders and file types |
+| GitHub Pages | Rendered documentation pages |
+| Microsoft Teams | Channel messages, group chats and direct messages |
+| Local Repository | Markdown, text, JSON and HTML files from a local folder or repo, uploaded by the local daemon ([guide](docs/local-repo-sync.md)) |
 
-The same checks are wired in GitHub Actions. See
-[CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+## Status and limits
 
-## Status
+- Alpha. Expect breaking changes to APIs, storage and plugin packaging.
+- The open-source build is single-user, has no authentication, and binds to
+  `127.0.0.1` only. Do not expose it on a network.
+- Model extraction and semantic judgments can miss useful knowledge or make
+  mistakes. Check the cited Evidence before relying on a consequential claim.
+- An extraction model is required; without one, syncs store content but create
+  no memories.
 
-MemForge is alpha software. The local/self-hosted path is the primary target
-today. The agent-session boundary is designed so the same adapters can point at
-a hosted service later without teaching the service to read local transcript
-files.
+## Documentation
+
+- [Quickstart](docs/quickstart.md): setup, models, plugins, sources, CLI,
+  development from source
+- [Docs index](docs/README.md): architecture, API, design notes and ADRs
+- [Contributing](CONTRIBUTING.md)
 
 ## License
 
