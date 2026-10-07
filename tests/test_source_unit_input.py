@@ -122,13 +122,14 @@ class Workspace:
 
 @pytest.fixture
 async def workspace(tmp_path):
-    database = Database(str(tmp_path / "unit-input.db"))
+    store = ReadRecordingDocumentStore(str(tmp_path / "documents"))
+    database = Database(str(tmp_path / "unit-input.db"), document_store=store)
     await database.connect()
     NoopMemoryEngine.db = database
     try:
         yield Workspace(
             db=database,
-            store=ReadRecordingDocumentStore(str(tmp_path / "documents")),
+            store=store,
             provider=JiraProvider(),
             engine=RecordingMemoryEngine(),
         )

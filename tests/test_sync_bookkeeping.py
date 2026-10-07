@@ -123,7 +123,7 @@ from tests.unit_support_fixture import active_support_evidence
 
 @pytest.fixture
 async def db(tmp_path):
-    database = Database(str(tmp_path / "sync-bookkeeping.db"))
+    database = Database(str(tmp_path / "sync-bookkeeping.db"), document_store=StubDocumentStore())
     await database.connect()
     NoopMemoryEngine.db = database
     try:
@@ -2684,6 +2684,9 @@ class StubDocumentStore:
     def read_normalized(self, uri):
         return self.normalized_content.get(uri)
 
+    def belongs_to_document(self, uri, *, source_id, doc_id):
+        return bool(uri) and f"/{source_id}/{doc_id}/" in uri
+
     def store_source_artifact(
         self,
         *,
@@ -4466,6 +4469,7 @@ async def _hold_document(
     normalized_content_uri: str | None = None,
     pdf_content_uri: str | None = None,
     item_extra: dict | None = None,
+    run_id: str | None = None,
 ) -> SourceUnitInput:
     """Record the Source's Unit for a Document, with the stored input a sync records."""
 
@@ -4490,7 +4494,7 @@ async def _hold_document(
     projection = project_source_item(
         source_id=source_id,
         source_type=source_type,
-        run_id=f"projection-fixture:{source_id}:{doc_id}",
+        run_id=run_id or f"projection-fixture:{source_id}:{doc_id}",
         item=item,
         raw=raw,
         normalized=NormalizedContent(item=item, markdown_body=markdown),
@@ -11655,7 +11659,7 @@ async def test_existing_confluence_pdf_uri_is_preserved_when_unchanged_export_is
     )
     await db.db.execute(
         "UPDATE source_unit_inputs SET pdf_content_uri = ? WHERE source_id = ? AND document_id = ?",
-        ("file:///tmp/Architecture/existing.pdf", source_id, "jira-0"),
+        (f"file:///tmp/{source_id}/jira-0/existing.pdf", source_id, "jira-0"),
     )
     await db.db.commit()
     release = asyncio.Event()
@@ -11680,7 +11684,7 @@ async def test_existing_confluence_pdf_uri_is_preserved_when_unchanged_export_is
     assert state.last_sync_status == "success"
     assert state.docs_updated == 0
     assert stored is not None
-    assert stored.pdf_content_uri == "file:///tmp/Architecture/existing.pdf"
+    assert stored.pdf_content_uri == f"file:///tmp/{source_id}/jira-0/existing.pdf"
 
 
 @pytest.mark.asyncio
@@ -11696,7 +11700,7 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
         title="Jira 0",
         markdown=markdown,
         version="0",
-        normalized_content_uri="file:///tmp/Architecture/existing.md",
+        normalized_content_uri=f"file:///tmp/{source_id}/jira-0/existing.md",
         projection_source_type="confluence",
         # The gene reports this space and URL, so the committed revision is the one it projects.
         source_url="https://jira.example/browse/0",
@@ -11707,9 +11711,9 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
            SET raw_content_uri = ?, raw_content_type = ?, pdf_content_uri = ?
            WHERE source_id = ? AND document_id = ?""",
         (
-            "file:///tmp/Architecture/existing.raw",
+            f"file:///tmp/{source_id}/jira-0/existing.raw",
             "text/html",
-            "file:///tmp/Architecture/existing.pdf",
+            f"file:///tmp/{source_id}/jira-0/existing.pdf",
             source_id,
             "jira-0",
         ),
@@ -11737,9 +11741,9 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
     assert state.last_sync_status == "success"
     assert state.docs_updated == 0
     assert stored is not None
-    assert stored.raw_content_uri == "file:///tmp/Architecture/existing.raw"
-    assert stored.normalized_content_uri == "file:///tmp/Architecture/existing.md"
-    assert stored.pdf_content_uri == "file:///tmp/Architecture/existing.pdf"
+    assert stored.raw_content_uri == f"file:///tmp/{source_id}/jira-0/existing.raw"
+    assert stored.normalized_content_uri == f"file:///tmp/{source_id}/jira-0/existing.md"
+    assert stored.pdf_content_uri == f"file:///tmp/{source_id}/jira-0/existing.pdf"
 
 
 @pytest.mark.asyncio
@@ -12013,3 +12017,64 @@ async def test_reused_projection_remains_complete_snapshot_membership_for_deleti
     assert await db.get_document("jira-0") is not None
     assert await db.get_document("jira-removed") is None
     assert [doc_id for doc_id, _ in memory_store.calls] == ["jira-removed"]
+
+
+@pytest.mark.asyncio
+async def test_unchanged_document_writes_again_the_objects_it_does_not_own(db: Database):
+    source_id = "src-unchanged-foreign-artifacts"
+    markdown = "# Jira 0\n\nBody"
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="jira-0",
+        title="Jira 0",
+        markdown=markdown,
+        version="0",
+        # A title-keyed object from before objects were keyed by Document.
+        normalized_content_uri=f"stub-doc://{source_id}/existing.md",
+        projection_source_type="confluence",
+        source_url="https://jira.example/browse/0",
+        space_or_project="PAY",
+    )
+    await db.db.execute(
+        """UPDATE source_unit_inputs
+           SET raw_content_uri = ?, raw_content_type = ?, pdf_content_uri = ?
+           WHERE source_id = ? AND document_id = ?""",
+        (
+            "file:///tmp/src-other/jira-0/existing.raw",
+            "application/json",
+            f"file:///tmp/{source_id}/jira-1/existing.pdf",
+            source_id,
+            "jira-0",
+        ),
+    )
+    await db.db.commit()
+    release = asyncio.Event()
+    release.set()
+    doc_store = StubDocumentStore()
+
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=PdfBackfillGene(item_count=1, release=release),
+        source_name="Architecture",
+        source_id=source_id,
+    )
+
+    stored = await _unit_input(db, source_id, "jira-0")
+    assert state.last_sync_status == "success"
+    assert state.docs_updated == 0
+    assert stored is not None
+    assert doc_store.normalized_store_calls == 1
+    for uri in (stored.raw_content_uri, stored.normalized_content_uri, stored.pdf_content_uri):
+        assert doc_store.belongs_to_document(uri, source_id=source_id, doc_id="jira-0")
+
+
+    assert await db.list_source_artifact_cleanup_tasks(source_id=source_id) == []

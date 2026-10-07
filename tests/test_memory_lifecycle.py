@@ -8,12 +8,13 @@ import pytest
 
 from memforge.models import DocumentRecord, Memory, SyncState, content_hash
 from memforge.storage.database import Database
+from memforge.storage.document_store import LocalDocumentStore
 from tests.test_sync_bookkeeping import _hold_document, _release_document
 
 
 @pytest.fixture
 async def db(tmp_path):
-    database = Database(str(tmp_path / "lifecycle.db"))
+    database = Database(str(tmp_path / "lifecycle.db"), document_store=LocalDocumentStore(str(tmp_path / "documents")))
     await database.connect()
     yield database
     await database.close()
@@ -226,11 +227,11 @@ class TestSupportAwareRetirement:
             LocalDocumentStore(str(tmp_path / "current-documents")),
         ).run_pending(limit=10)
 
-        assert processed == 1
+        assert processed == 0
         assert await db.list_source_artifact_cleanup_tasks(limit=10) == []
 
     @pytest.mark.asyncio
-    async def test_document_deletion_uses_the_same_artifact_cleanup_outbox(self, db):
+    async def test_document_deletion_uses_the_same_artifact_cleanup_outbox(self, db, tmp_path):
         source_id = "src-document-cleanup"
         now = datetime.now(timezone.utc)
         await db.upsert_source(
@@ -253,6 +254,9 @@ class TestSupportAwareRetirement:
             )
         )
 
+        artifact_uri = LocalDocumentStore(str(tmp_path / "documents")).store_normalized(
+            source_id, "doc-document-cleanup", "Architecture", "# Architecture"
+        )
         await _hold_document(
             db,
             source_id=source_id,
@@ -263,14 +267,14 @@ class TestSupportAwareRetirement:
             version="1",
             source_url="https://wiki.example.test/doc-document-cleanup",
             space_or_project="SFPAY",
-            normalized_content_uri="object-store://workspace/documents/src-document-cleanup/page.md",
+            normalized_content_uri=artifact_uri,
         )
         await _release_document(db, source_id=source_id, source_type="confluence", doc_id="doc-document-cleanup")
         await db.delete_projected_document("doc-document-cleanup", source_id=source_id)
 
         tasks = await db.list_source_artifact_cleanup_tasks(limit=10)
         assert [(task.source_id, task.artifact_uri) for task in tasks] == [
-            (source_id, "object-store://workspace/documents/src-document-cleanup/page.md")
+            (source_id, artifact_uri)
         ]
 
     @pytest.mark.asyncio
@@ -463,3 +467,32 @@ class TestHardPurge:
         assert stored_dependent.replacement_reason is None
         assert stored_dependent.replacement_kind is None
         assert stored_dependent.retirement_reason == "privacy_removed"
+
+
+@pytest.mark.parametrize("ownership", ["owned", "sibling", "other_source", "no_store"])
+@pytest.mark.parametrize("operation", ["replace", "delete"])
+@pytest.mark.asyncio
+async def test_document_file_release_requires_ownership(tmp_path, ownership, operation):
+    store = LocalDocumentStore(str(tmp_path / "documents"))
+    uri = store.store_normalized(
+        "src-other" if ownership == "other_source" else "src-1",
+        "sibling" if ownership == "sibling" else "doc-1", "old", "Original",
+    )
+    database = Database(str(tmp_path / "contract.db"), document_store=None if ownership == "no_store" else store)
+    await database.connect()
+    try:
+        await _insert_doc(database, "doc-1")
+        args = dict(source_id="src-1", source_type="confluence", doc_id="doc-1", title="Document",
+                    source_url="https://wiki.example/doc-1", space_or_project="TEST")
+        await _hold_document(database, **args, markdown="Original", version="1", normalized_content_uri=uri)
+        if operation == "replace":
+            owned = store.store_normalized("src-1", "doc-1", "new", "New")
+            await _hold_document(database, **args, markdown="New", version="2", normalized_content_uri=owned, run_id="replacement-run")
+        else:
+            await _release_document(database, source_id="src-1", source_type="confluence", doc_id="doc-1")
+            await database.delete_projected_document("doc-1", source_id="src-1")
+        tasks = await database.list_source_artifact_cleanup_tasks(limit=10)
+        assert [t.artifact_uri for t in tasks] == ([uri] if ownership == "owned" else [])
+        assert store.read_artifact(uri) == b"Original"
+    finally:
+        await database.close()
