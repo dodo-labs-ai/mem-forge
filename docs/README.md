@@ -9,6 +9,8 @@ Start here if you are new to the repository:
   storage, retrieval, MCP tools, and admin UI boundaries.
 - [Source sync to Memory](design/source-sync-to-memory.md): complete lifecycle,
   model responsibilities, scenarios, and current-versus-target implementation review.
+- [Architecture decision log](adr/README.md): shared decisions, amendments and
+  links to their rationale.
 - [Agent client integrations](integrations/agent-clients.md): Codex and Claude
   Code adapter responsibilities, MCP request flow, and service boundaries.
 - [Python distribution release](releasing-python-distribution.md): package
