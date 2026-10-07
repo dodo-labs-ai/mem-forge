@@ -71,6 +71,8 @@ from memforge.models import (
     Project,
     RESERVED_PROJECT_KEYS,
     ReplacementKind,
+    ReviewKind,
+    ReviewStatus,
     SHARED_PROJECT_KEY,
     SourceArtifactCleanupTask,
     SourceDeletionResult,
@@ -133,12 +135,15 @@ from memforge.memory.lifecycle_plan import (
     ProjectedSupportInvariantError,
     ProjectedLifecycleBlocker,
     ProjectedLifecycleDeferredError,
+    LIFECYCLE_REVIEW_CANDIDATE_KEY,
     LifecycleReview,
+    LifecycleReviewQueueEntry,
     LifecycleReviewStatus,
     LifecycleVectorOperation,
     LifecycleVectorTask,
     LifecycleVectorTaskStatus,
     lifecycle_plan_to_payload,
+    lifecycle_review_candidate_memory_id,
     pending_review_contested_supports,
     plan_requires_complete_current_support,
     plan_skips_support_revalidation,
@@ -280,6 +285,7 @@ from memforge.source_artifacts import (
     SourceArtifactRevision,
     source_artifact_revision_from_metadata,
 )
+from memforge.storage.adapters.context import AccessScope
 from memforge.storage.admin_memory import (
     MemoryAdminListFilters,
     MemoryAdminQueryPage,
@@ -10364,6 +10370,84 @@ class Database:
             tuple(params),
         )
         return [self._row_to_lifecycle_review(row) for row in rows]
+
+    async def list_lifecycle_review_queue_entries(
+        self,
+        source_id: str | None = None,
+        *,
+        status: LifecycleReviewStatus | None = None,
+        memory_ids: Sequence[str] | None = None,
+    ) -> list[LifecycleReviewQueueEntry]:
+        """Every matching Lifecycle Review, newest first, without its staged evidence.
+
+        The candidate Memory is read from the staged evidence inside the query,
+        so the evidence itself never leaves the database.
+        """
+
+        if memory_ids is not None:
+            ids = tuple(dict.fromkeys(memory_id for memory_id in memory_ids if memory_id))
+            if not ids:
+                return []
+            if len(ids) > STORAGE_BIND_CHUNK_SIZE:
+                by_id: dict[str, LifecycleReviewQueueEntry] = {}
+                for offset in range(0, len(ids), STORAGE_BIND_CHUNK_SIZE):
+                    entries = await self.list_lifecycle_review_queue_entries(
+                        source_id, status=status, memory_ids=ids[offset : offset + STORAGE_BIND_CHUNK_SIZE],
+                    )
+                    by_id.update((entry.id, entry) for entry in entries)
+                return sorted(by_id.values(), key=lambda entry: (entry.created_at or "", entry.id), reverse=True)
+        conditions: list[str] = []
+        params: list[object] = [f"$.{LIFECYCLE_REVIEW_CANDIDATE_KEY}"]
+        if source_id is not None:
+            conditions.append("lp.source_id = ?")
+            params.append(source_id)
+        if status is not None:
+            conditions.append("lr.status = ?")
+            params.append(status.value)
+        if memory_ids is not None:
+            placeholders = ", ".join("?" for _ in ids)
+            conditions.append(f"lr.incumbent_memory_id IN ({placeholders})")
+            params.extend(ids)
+        query = (
+            "SELECT lr.id, lr.status, lr.incumbent_memory_id, lr.created_at, lp.source_id AS source_id, "
+            "json_extract(lr.staged_evidence_json, ?) AS candidate_memory_id "
+            "FROM lifecycle_reviews lr JOIN lifecycle_plans lp ON lp.id = lr.lifecycle_plan_id"
+        )
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY lr.created_at DESC, lr.id DESC"
+        rows = await self.db.execute_fetchall(query, tuple(params))
+        return [
+            LifecycleReviewQueueEntry(
+                id=row["id"],
+                status=LifecycleReviewStatus(row["status"]),
+                incumbent_memory_id=row["incumbent_memory_id"],
+                candidate_memory_id=lifecycle_review_candidate_memory_id(
+                    {LIFECYCLE_REVIEW_CANDIDATE_KEY: row["candidate_memory_id"]}
+                ),
+                source_id=row["source_id"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    async def list_lifecycle_reviews_by_ids(self, review_ids: Sequence[str]) -> list[LifecycleReview]:
+        """The Lifecycle Reviews with these ids, in the order given; unknown ids are left out."""
+
+        ordered_ids = tuple(dict.fromkeys(str(review_id) for review_id in review_ids if review_id))
+        by_id: dict[str, LifecycleReview] = {}
+        for offset in range(0, len(ordered_ids), STORAGE_BIND_CHUNK_SIZE):
+            chunk = ordered_ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = await self.db.execute_fetchall(
+                "SELECT lr.*, lp.source_id AS source_id FROM lifecycle_reviews lr "
+                f"JOIN lifecycle_plans lp ON lp.id = lr.lifecycle_plan_id WHERE lr.id IN ({placeholders})",
+                chunk,
+            )
+            for row in rows:
+                review = self._row_to_lifecycle_review(row)
+                by_id[review.id] = review
+        return [by_id[review_id] for review_id in ordered_ids if review_id in by_id]
 
     async def count_lifecycle_reviews(
         self,
@@ -21291,6 +21375,46 @@ class Database:
             async for row in cursor:
                 results.append(self._row_to_review(row))
         return results
+
+    async def filter_visible_ids(self, ids: Sequence[str], scope: AccessScope) -> set[str]:
+        """Return caller-visible ids through the canonical Memory predicate."""
+        ordered_ids = tuple(dict.fromkeys(ids))
+        visible: set[str] = set()
+        predicate, predicate_params = visible_sql(scope, "m")
+        for offset in range(0, len(ordered_ids), STORAGE_BIND_CHUNK_SIZE):
+            chunk = ordered_ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = await self.db.execute_fetchall(
+                f"SELECT m.id FROM memories m WHERE m.id IN ({placeholders}) AND {predicate}",
+                (*chunk, *predicate_params),
+            )
+            visible.update(row["id"] for row in rows)
+        return visible
+
+    async def list_pending_memory_reviews_for_memories(self, memory_ids: Sequence[str]) -> list[MemoryReview]:
+        """All pending supersede candidates involving the requested Memories."""
+        ids = tuple(dict.fromkeys(memory_id for memory_id in memory_ids if memory_id))
+        reviews: dict[str, MemoryReview] = {}
+        for offset in range(0, len(ids), STORAGE_BIND_CHUNK_SIZE):
+            chunk = ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = await self.db.execute_fetchall(
+                f"""SELECT mr.* FROM memory_reviews mr
+                    WHERE mr.status = ? AND mr.kind = ? AND (
+                        mr.incumbent_memory_id IN ({placeholders})
+                        OR mr.challenger_memory_id IN ({placeholders})
+                        OR EXISTS (
+                            SELECT 1 FROM memory_review_related_challengers rc
+                            WHERE rc.review_id = mr.id
+                              AND rc.challenger_memory_id IN ({placeholders})
+                        )
+                    ) ORDER BY mr.created_at DESC, mr.id DESC""",
+                (ReviewStatus.PENDING.value, ReviewKind.SUPERSEDE.value, *chunk, *chunk, *chunk),
+            )
+            for row in rows:
+                review = self._row_to_review(row)
+                reviews[review.id] = review
+        return list(reviews.values())
 
     async def count_memory_reviews(
         self,

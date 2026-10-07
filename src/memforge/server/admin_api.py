@@ -99,9 +99,11 @@ from memforge.memory.lifecycle import normalize_memory_status
 from memforge.memory.lifecycle_plan import (
     LifecycleGate,
     LifecycleGateState,
+    LifecycleMutationType,
     LifecyclePlan,
     LifecycleReview,
     LifecycleReviewStatus,
+    lifecycle_review_candidate_memory_id,
 )
 from memforge.memory.lifecycle_service import (
     MaintenanceClosureEntry,
@@ -200,6 +202,10 @@ from memforge.source_projection_config import projection_scope_transition_id, so
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.source_cleanup import SourceArtifactCleanupService
+from memforge.server.review_admin_service import (
+    QueuedMemoryReview, QueuedLifecycleReview, ReviewQueue,
+    is_memory_review_stale, read_open_review_ids, read_review_queue, review_access_scope, review_is_visible,
+)
 from memforge.server.memory_admin_service import (
     count_project_memories,
     list_memory_admin_page,
@@ -280,6 +286,8 @@ LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES = {
 SOURCE_STATUSES = {SOURCE_ACTIVE_STATUS, SOURCE_PAUSED_STATUS}
 # What admin reads show unless the caller asks for another lifecycle status.
 ACTIVE_MEMORY_STATUSES = (MemoryStatus.ACTIVE.value,)
+MAX_REVIEW_PAGE_SIZE = 500
+"""The most Reviews one page of the Review queue returns."""
 
 
 def _workspace_default_scope(
@@ -309,21 +317,8 @@ def _workspace_default_scope(
 
 
 def _lifecycle_visibility_scope(request: Request):
-    """Apply the caller's per-row access to Memories in every stored lifecycle status.
-
-    Reviews and purges act on retired, superseded, and quarantined rows as well
-    as active ones, so only the access predicate decides what the caller sees.
-    """
-
-    from memforge.storage.adapters.context import AccessScope
-
-    return AccessScope(
-        user_id=resolve_request_principal(request),
-        include_private=True,
-        allowed_statuses=("active", "pending_review", "superseded", "retired"),
-        active_project=None,
-        scope_mode="project-first",
-    )
+    """Reviews and purges use caller access independently of lifecycle page filters."""
+    return review_access_scope(resolve_request_principal(request))
 
 
 def _inline_content_disposition(filename: str) -> str:
@@ -651,7 +646,8 @@ async def _require_memory_review_visibility(
         participant_ids,
         _lifecycle_visibility_scope(request),
     )
-    if visible != participant_ids:
+    sources = await _memory_review_sources(db, [incumbent, challenger, *related_memories])
+    if not review_is_visible(tuple(participant_ids), visible, sources, scope=_lifecycle_visibility_scope(request)):
         raise HTTPException(status_code=404, detail="Review not found")
     return incumbent, challenger, tuple(related_memories)
 
@@ -711,7 +707,9 @@ async def _require_lifecycle_review_visibility(
         participant_ids,
         _lifecycle_visibility_scope(request),
     )
-    if visible != set(participant_ids):
+    participants = await db.list_memories_by_ids(participant_ids)
+    sources = await _memory_review_sources(db, participants)
+    if not review_is_visible(participant_ids, visible, sources, scope=_lifecycle_visibility_scope(request)):
         raise HTTPException(status_code=404, detail="Review not found")
 
 
@@ -1094,6 +1092,9 @@ class MemoryResponse(BaseModel):
     sources: list[MemorySourceRefDetail] = []
     # The Cross-Document Relations current for the caller.
     relations: list[MemoryRelationDetail] = []
+    # The pending Review a Memory in ``pending_review`` waits for, so the
+    # Memory opens straight into its decision.
+    open_review_id: str | None = None
 
 
 class MemoryDetailResponse(MemoryResponse):
@@ -3743,6 +3744,7 @@ def _memory_to_response(
     *,
     sources: Sequence[MemorySourceRef] = (),
     relations: Sequence[MemoryRelationContext] = (),
+    open_review_id: str | None = None,
 ) -> MemoryResponse:
     """Convert a Memory dataclass to a Pydantic response model."""
     return MemoryResponse(
@@ -3770,22 +3772,8 @@ def _memory_to_response(
         origin_client=origin_client,
         sources=[MemorySourceRefDetail(**asdict(source)) for source in sources],
         relations=[MemoryRelationDetail(**asdict(relation)) for relation in relations],
+        open_review_id=open_review_id,
     )
-
-
-def _is_review_stale(review: MemoryReview, incumbent: Memory | None, challenger: Memory | None) -> bool:
-    """Detect drift between the review's pinned timestamps and current memories."""
-    if review.status != "pending":
-        return False
-    if incumbent is None or challenger is None:
-        return True
-    actual_incumbent = incumbent.updated_at.isoformat() if incumbent.updated_at else None
-    actual_challenger = challenger.updated_at.isoformat() if challenger.updated_at else None
-    if review.expected_incumbent_updated_at is not None and review.expected_incumbent_updated_at != actual_incumbent:
-        return True
-    if review.expected_challenger_updated_at is not None and review.expected_challenger_updated_at != actual_challenger:
-        return True
-    return False
 
 
 def _review_to_response(
@@ -3810,7 +3798,7 @@ def _review_to_response(
         replacement_kind=review.replacement_kind,
         created_at=_dt_iso(review.created_at),
         resolved_at=_dt_iso(review.resolved_at),
-        is_stale=_is_review_stale(review, incumbent, challenger),
+        is_stale=is_memory_review_stale(review, incumbent, challenger),
         decision_fingerprint=memory_review_decision_fingerprint(review, related_challengers),
         presentation=_presentation_response(
             present_memory_review(
@@ -3969,29 +3957,24 @@ def _build_memory_review_list_summary(
 def _lifecycle_candidate_payload(
     staged_evidence: Mapping[str, object],
 ) -> tuple[str | None, Mapping[str, object] | None]:
-    candidate_id = staged_evidence.get("replacement_memory_id")
-    if not isinstance(candidate_id, str) or not candidate_id:
-        candidate_id = None
+    """The candidate Memory a Lifecycle Review proposes: its id, and the content it would have."""
     candidate = staged_evidence.get("candidate")
     candidate_payload = candidate if isinstance(candidate, Mapping) else None
     proposed = staged_evidence.get("proposed_mutations")
     if isinstance(proposed, list):
-        for raw in proposed:
-            if not isinstance(raw, Mapping):
-                continue
-            mutation_type = raw.get("mutation_type")
-            if mutation_type not in {"create_memory", "reactivate_memory"}:
-                continue
-            raw_id = raw.get("memory_id")
-            if isinstance(raw_id, str) and raw_id:
-                candidate_id = raw_id
-            payload = raw.get("payload")
-            if isinstance(payload, Mapping):
-                memory_payload = payload.get("memory")
-                if isinstance(memory_payload, Mapping):
-                    candidate_payload = memory_payload
-            break
-    return candidate_id, candidate_payload
+        creation = next(
+            (
+                raw
+                for raw in proposed
+                if isinstance(raw, Mapping) and raw.get("mutation_type") == LifecycleMutationType.CREATE_MEMORY.value
+            ),
+            None,
+        )
+        payload = creation.get("payload") if creation is not None else None
+        memory_payload = payload.get("memory") if isinstance(payload, Mapping) else None
+        if isinstance(memory_payload, Mapping):
+            candidate_payload = memory_payload
+    return lifecycle_review_candidate_memory_id(staged_evidence), candidate_payload
 
 
 async def _lifecycle_review_response(
@@ -4078,6 +4061,100 @@ async def _lifecycle_review_response(
     if detail:
         return MemoryReviewDetailResponse(**common, related_challengers=[])
     return MemoryReviewListItemResponse(**common)
+
+
+async def _review_queue_page(
+    request: Request,
+    db: Database,
+    queue: ReviewQueue,
+    page: Sequence[QueuedMemoryReview | QueuedLifecycleReview],
+) -> list[MemoryReviewListItemResponse]:
+    """Read the Reviews on one page in full and shape them for the queue."""
+    memory_page = [queued for queued in page if isinstance(queued, QueuedMemoryReview)]
+    lifecycle_page = [queued for queued in page if isinstance(queued, QueuedLifecycleReview)]
+    lifecycle_reviews = (
+        {review.id: review for review in await db.list_lifecycle_reviews_by_ids([q.entry.id for q in lifecycle_page])}
+        if lifecycle_page
+        else {}
+    )
+    shown_ids = (
+        *(
+            memory_id
+            for queued in memory_page
+            for memory_id in (
+                queued.review.incumbent_memory_id,
+                queued.review.challenger_memory_id,
+                *queued.related_challenger_ids,
+            )
+        ),
+        *(queued.entry.incumbent_memory_id for queued in lifecycle_page),
+    )
+    unread_ids = tuple(dict.fromkeys(memory_id for memory_id in shown_ids if memory_id not in queue.memories))
+    memories = {
+        **queue.memories,
+        **({memory.id: memory for memory in await db.list_memories_by_ids(unread_ids)} if unread_ids else {}),
+    }
+    origin_ids = tuple(
+        dict.fromkeys(
+            memory_id
+            for queued in memory_page
+            for memory_id in (queued.review.incumbent_memory_id, queued.review.challenger_memory_id)
+        )
+    )
+    origins = await _origin_source_types(db, list(origin_ids)) if origin_ids else {}
+
+    def summary(memory: Memory) -> MemoryReviewMemorySummary:
+        origin_source_type, origin_client = origins.get(memory.id, (None, None))
+        return _build_memory_review_list_summary(
+            memory,
+            origin_source_type=origin_source_type,
+            origin_client=origin_client,
+        )
+
+    responses: list[MemoryReviewListItemResponse] = []
+    for queued in page:
+        if isinstance(queued, QueuedLifecycleReview):
+            lifecycle_review = lifecycle_reviews.get(queued.entry.id)
+            if lifecycle_review is not None:
+                responses.append(
+                    await _lifecycle_review_response(
+                        db,
+                        lifecycle_review,
+                        queued.source,
+                        request=request,
+                        detail=False,
+                        memory_cache=memories,
+                    )
+                )
+            continue
+        review = queued.review
+        incumbent = memories.get(review.incumbent_memory_id)
+        challenger = memories.get(review.challenger_memory_id)
+        related_challengers = tuple(
+            memories[memory_id] for memory_id in queued.related_challenger_ids if memory_id in memories
+        )
+        if incumbent is None or challenger is None or len(related_challengers) != len(queued.related_challenger_ids):
+            continue
+        base = _review_to_response(
+            review,
+            incumbent=incumbent,
+            challenger=challenger,
+            related_challengers=related_challengers,
+            can_decide=_can_decide_review(request, queued.sources),
+        )
+        only_source = queued.sources[0] if len(queued.sources) == 1 else None
+        responses.append(
+            MemoryReviewListItemResponse(
+                **{
+                    **base.model_dump(),
+                    "source_id": str(only_source["id"]) if only_source is not None else None,
+                    "source_name": str(only_source["name"]) if only_source is not None else None,
+                },
+                incumbent=summary(incumbent),
+                challenger=summary(challenger),
+            )
+        )
+    return responses
 
 
 async def _build_memory_store(
@@ -5455,6 +5532,7 @@ def create_admin_app(
             origin_client=origin_client,
             sources=[MemorySourceRefDetail(**asdict(source)) for source in sources],
             source_backed=await is_source_backed(db, memory_id),
+            open_review_id=(await read_open_review_ids(db, [mem], scope=_lifecycle_visibility_scope(request))).get(memory_id),
         )
 
     # -- Memory update (admin actions) --
@@ -5939,6 +6017,7 @@ def create_admin_app(
                     *page.origins.get(m.id, (None, None)),
                     sources=page.sources.get(m.id, ()),
                     relations=page.relations.get(m.id, ()),
+                    open_review_id=page.open_reviews.get(m.id),
                 )
                 for m in page.memories
             ],
@@ -7032,13 +7111,13 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        _require_review_decision_authority(request, [source])
         review = await db.get_lifecycle_review(review_id)
         if review is None:
             raise HTTPException(status_code=404, detail="Lifecycle review not found")
         if review.source_id != source_id:
             raise HTTPException(status_code=404, detail="Lifecycle review not found")
         await _require_lifecycle_review_visibility(request, db, review)
+        _require_review_decision_authority(request, [source])
         if lifecycle_review_decision_fingerprint(review) != expected_fingerprint:
             raise HTTPException(status_code=409, detail="Review decision fingerprint is stale")
         target_status = (
@@ -9101,228 +9180,29 @@ def create_admin_app(
         offset: int = 0,
         db: Database = Depends(get_db),
     ):
-        """List caller-visible Reviews with an exact post-stale-filter total."""
-        from memforge.memory.lifecycle_plan import LifecycleReviewStatus
+        """List caller-visible Reviews with an exact post-stale-filter total.
 
-        if limit < 1 or limit > 500:
-            raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
+        Eligibility is evaluated across every matching candidate before exact
+        pagination. Lifecycle staged evidence is hydrated only for this page;
+        Memory version reads and queue enumeration still grow with the queue.
+        """
+        if limit < 1 or limit > MAX_REVIEW_PAGE_SIZE:
+            raise HTTPException(status_code=400, detail=f"limit must be between 1 and {MAX_REVIEW_PAGE_SIZE}")
         if offset < 0:
             raise HTTPException(status_code=400, detail="offset must not be negative")
         if status not in {None, "all", "open", "pending", "stale", "approved", "rejected"}:
             raise HTTPException(status_code=400, detail="unsupported review status")
 
-        normalized_status = status if status and status != "all" else None
-        include_legacy = origin in {None, "memory"}
-        include_lifecycle = origin in {None, "lifecycle"}
-        reviews: list[MemoryReview] = []
-        if include_legacy:
-            review_statuses = ("pending", "stale") if normalized_status == "stale" else (normalized_status,)
-            for review_status in review_statuses:
-                review_offset = 0
-                while True:
-                    chunk = await db.list_memory_reviews(
-                        status=review_status,
-                        kind=ReviewKind.SUPERSEDE.value,
-                        limit=500,
-                        offset=review_offset,
-                    )
-                    reviews.extend(chunk)
-                    if len(chunk) < 500:
-                        break
-                    review_offset += len(chunk)
-
-        related_by_review: dict[str, list[str]] = {}
-        if reviews:
-            related_rows = await db.list_memory_review_related_challengers_many([review.id for review in reviews])
-            for related in related_rows:
-                related_by_review.setdefault(related.review_id, []).append(related.challenger_memory_id)
-        review_memory_ids = tuple(
-            dict.fromkeys(
-                memory_id
-                for review in reviews
-                for memory_id in (
-                    review.incumbent_memory_id,
-                    review.challenger_memory_id,
-                    *related_by_review.get(review.id, ()),
-                )
-            )
+        queue = await read_review_queue(
+            db,
+            scope=_lifecycle_visibility_scope(request),
+            status=status if status and status != "all" else None,
+            origin=origin,
+            source_id=source_id,
         )
-        review_memories = {memory.id: memory for memory in await db.list_memories_by_ids(review_memory_ids)}
-        visible_memory_ids = (
-            await _filter_visible_ids(
-                db,
-                review_memory_ids,
-                _lifecycle_visibility_scope(request),
-            )
-            if review_memory_ids
-            else set()
-        )
-        memory_source_ids = await db.get_memory_source_ids_many(review_memory_ids) if review_memory_ids else {}
-        origins = await _origin_source_types(db, review_memory_ids) if review_memory_ids else {}
-        sources_by_id = {str(source["id"]): source for source in await db.list_sources()}
-        responses: list[MemoryReviewListItemResponse] = []
-        for review in reviews:
-            incumbent = review_memories.get(review.incumbent_memory_id)
-            challenger = review_memories.get(review.challenger_memory_id)
-            if incumbent is None or challenger is None:
-                continue
-            related_challengers = tuple(
-                review_memories[memory_id]
-                for memory_id in related_by_review.get(review.id, ())
-                if memory_id in review_memories
-            )
-            participant_ids = {
-                incumbent.id,
-                challenger.id,
-                *(memory.id for memory in related_challengers),
-            }
-            if len(related_challengers) != len(related_by_review.get(review.id, ())):
-                continue
-            if not participant_ids.issubset(visible_memory_ids):
-                continue
-            review_source_ids = tuple(
-                dict.fromkeys(
-                    source_id_value
-                    for memory_id in participant_ids
-                    for source_id_value in memory_source_ids.get(memory_id, ())
-                )
-            )
-            if source_id is not None and source_id not in review_source_ids:
-                continue
-            visible_sources = [
-                source
-                for review_source_id in review_source_ids
-                if (source := sources_by_id.get(review_source_id)) is not None
-                and source_is_discoverable(
-                    source,
-                    viewer_id=resolve_request_principal(request),
-                )
-            ]
-            if len(visible_sources) != len(review_source_ids):
-                continue
-            base = _review_to_response(
-                review,
-                incumbent=incumbent,
-                challenger=challenger,
-                related_challengers=related_challengers,
-                can_decide=_can_decide_review(request, visible_sources),
-            )
-            if normalized_status == "open" and base.is_stale:
-                continue
-            if normalized_status == "stale" and review.status != "stale" and not base.is_stale:
-                continue
-            incumbent_origin = origins.get(incumbent.id, (None, None)) if incumbent else (None, None)
-            challenger_origin = origins.get(challenger.id, (None, None)) if challenger else (None, None)
-            incumbent_summary = (
-                _build_memory_review_list_summary(
-                    incumbent,
-                    origin_source_type=incumbent_origin[0],
-                    origin_client=incumbent_origin[1],
-                )
-                if incumbent
-                else None
-            )
-            challenger_summary = (
-                _build_memory_review_list_summary(
-                    challenger,
-                    origin_source_type=challenger_origin[0],
-                    origin_client=challenger_origin[1],
-                )
-                if challenger
-                else None
-            )
-            responses.append(
-                MemoryReviewListItemResponse(
-                    **{
-                        **base.model_dump(),
-                        "source_id": (str(visible_sources[0]["id"]) if len(visible_sources) == 1 else None),
-                        "source_name": (str(visible_sources[0]["name"]) if len(visible_sources) == 1 else None),
-                    },
-                    incumbent=incumbent_summary,
-                    challenger=challenger_summary,
-                )
-            )
-
-        lifecycle_status = None
-        if normalized_status == "open":
-            lifecycle_status = LifecycleReviewStatus.PENDING
-        elif normalized_status:
-            try:
-                lifecycle_status = LifecycleReviewStatus(normalized_status)
-            except ValueError:
-                lifecycle_status = None
-        if include_lifecycle:
-            lifecycle_reviews = []
-            lifecycle_offset = 0
-            while True:
-                chunk = await db.list_lifecycle_reviews(
-                    source_id=source_id,
-                    status=lifecycle_status,
-                    limit=500,
-                    offset=lifecycle_offset,
-                    newest_first=True,
-                )
-                lifecycle_reviews.extend(chunk)
-                if len(chunk) < 500:
-                    break
-                lifecycle_offset += len(chunk)
-            lifecycle_memory_ids = tuple(
-                dict.fromkeys(
-                    memory_id
-                    for review in lifecycle_reviews
-                    for memory_id in (
-                        review.incumbent_memory_id,
-                        _lifecycle_candidate_payload(review.staged_evidence)[0],
-                    )
-                    if memory_id
-                )
-            )
-            lifecycle_memory_cache = {
-                memory.id: memory for memory in await db.list_memories_by_ids(lifecycle_memory_ids)
-            }
-            visible_lifecycle_memory_ids = (
-                await _filter_visible_ids(
-                    db,
-                    lifecycle_memory_ids,
-                    _lifecycle_visibility_scope(request),
-                )
-                if lifecycle_memory_ids
-                else set()
-            )
-            for review in lifecycle_reviews:
-                source = sources_by_id.get(review.source_id or "")
-                if source is None:
-                    continue
-                if not source_is_discoverable(
-                    source,
-                    viewer_id=resolve_request_principal(request),
-                ):
-                    continue
-                candidate_id, _ = _lifecycle_candidate_payload(review.staged_evidence)
-                participant_ids = {review.incumbent_memory_id}
-                if candidate_id in lifecycle_memory_cache:
-                    participant_ids.add(candidate_id)
-                if not participant_ids.issubset(visible_lifecycle_memory_ids):
-                    continue
-                responses.append(
-                    await _lifecycle_review_response(
-                        db,
-                        review,
-                        source,
-                        request=request,
-                        detail=False,
-                        memory_cache=lifecycle_memory_cache,
-                    )
-                )
-
-        responses.sort(
-            key=lambda item: (item.created_at or "", item.id),
-            reverse=True,
-        )
-        total = len(responses)
         return MemoryReviewListResponse(
-            data=responses[offset : offset + limit],
-            total=total,
+            data=await _review_queue_page(request, db, queue, queue.entries[offset : offset + limit]),
+            total=len(queue.entries),
             limit=limit,
             offset=offset,
         )
@@ -9407,8 +9287,8 @@ def create_admin_app(
         source = await db.get_source(source_id) if source_id else None
         if source is None:
             raise HTTPException(status_code=409, detail="Lifecycle review source is unavailable")
-        _require_review_decision_authority(request, [source])
         await _require_lifecycle_review_visibility(request, db, lifecycle_review)
+        _require_review_decision_authority(request, [source])
         if lifecycle_review_decision_fingerprint(lifecycle_review) != req.expected_fingerprint:
             raise HTTPException(status_code=409, detail="Review decision fingerprint is stale")
         incumbent = await db.get_memory(lifecycle_review.incumbent_memory_id)
@@ -9656,8 +9536,8 @@ def create_admin_app(
                         outcome="invalid",
                         message="Lifecycle Review source is unavailable",
                     )
-                _require_review_decision_authority(request, [source])
                 await _require_lifecycle_review_visibility(request, db, lifecycle_review)
+                _require_review_decision_authority(request, [source])
                 fingerprint = lifecycle_review_decision_fingerprint(lifecycle_review)
                 if fingerprint != item.expected_fingerprint:
                     return MemoryReviewDecisionResult(
@@ -9730,7 +9610,7 @@ def create_admin_app(
                         status=memory_review.status,
                         message=f"Review is already {memory_review.status}",
                     )
-                if _is_review_stale(memory_review, incumbent, challenger):
+                if is_memory_review_stale(memory_review, incumbent, challenger):
                     return MemoryReviewDecisionResult(
                         review_id=item.review_id,
                         decision=item.decision,

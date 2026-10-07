@@ -75,15 +75,14 @@ interface MemoryListViewProps {
   state: MemoriesPageState;
   onStateChange: (state: MemoriesPageState, options?: { replace?: boolean }) => void;
   viewSwitch: ReactNode;
-  reviewByMemory: ReadonlyMap<string, string>;
   projects: readonly Project[];
   sources: readonly SourceOption[];
 }
 
-export function MemoryListView({ state, onStateChange, viewSwitch, reviewByMemory, projects, sources }: MemoryListViewProps) {
+export function MemoryListView({ state, onStateChange, viewSwitch, projects, sources }: MemoryListViewProps) {
   const navigate = useNavigate();
   const request = memoryListRequest(state);
-  const list = useMemoryList(request, reviewByMemory);
+  const list = useMemoryList(request);
   const page = list.page;
   const projectOptions = projectFilterOptions(projects);
   const sourceOptions = sources.map((source) => ({ value: source.id, label: source.name }));

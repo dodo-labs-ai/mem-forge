@@ -3707,6 +3707,17 @@
             "title": "Memory Type",
             "type": "string"
           },
+          "open_review_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Open Review Id"
+          },
           "origin_client": {
             "anyOf": [
               {
@@ -4671,6 +4682,17 @@
           "memory_type": {
             "title": "Memory Type",
             "type": "string"
+          },
+          "open_review_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Open Review Id"
           },
           "origin_client": {
             "anyOf": [
@@ -11680,7 +11702,7 @@
     },
     "/api/v1/memory-reviews": {
       "get": {
-        "description": "List caller-visible Reviews with an exact post-stale-filter total.",
+        "description": "List caller-visible Reviews with an exact post-stale-filter total.\n\nEligibility is evaluated across every matching candidate before exact\npagination. Lifecycle staged evidence is hydrated only for this page;\nMemory version reads and queue enumeration still grow with the queue.",
         "operationId": "list_memory_reviews_api_v1_memory_reviews_get",
         "parameters": [
           {

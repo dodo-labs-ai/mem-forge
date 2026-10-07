@@ -8,7 +8,7 @@ import { MEMORIES_PATH } from "@/lib/paths";
 import { BackLink, EmptyState, PropertyList, type Property } from "@/patterns";
 import { Button, buttonVariants } from "@/ui/button";
 import { Skeleton } from "@/ui/skeleton";
-import { useMemory, useOpenReviews } from "./api";
+import { useMemory } from "./api";
 import { DetailCard } from "./DetailCard";
 import { EvidenceSection } from "./EvidenceSection";
 import { LifecycleCard } from "./LifecycleCard";
@@ -93,7 +93,6 @@ function DetailSkeleton() {
 export function MemoryDetailPage() {
   const { memoryId = "" } = useParams<{ memoryId: string }>();
   const memoryQuery = useMemory(memoryId);
-  const reviews = useOpenReviews();
   const projects = useProjects();
   const typeLabels = useSourceTypeLabels();
 
@@ -156,7 +155,7 @@ export function MemoryDetailPage() {
             <MemoryTypeBadge type={memory.memory_type} />
             <MemoryStatusLabel status={memory.status} />
             <div className="ml-auto">
-              <MemoryActions memory={memory} reviewId={reviews.reviewByMemory.get(memory.id)} />
+              <MemoryActions memory={memory} />
             </div>
           </div>
           <h1 className="text-xl leading-snug font-semibold tracking-tight text-foreground">{memory.content}</h1>

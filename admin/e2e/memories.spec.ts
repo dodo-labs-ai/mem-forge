@@ -69,7 +69,7 @@ const RESPONSES: Record<string, (url: URL) => unknown> = {
     ],
     total: 1,
   }),
-  "/api/v1/memory-reviews": () => ({ data: [], total: 0, limit: 500, offset: 0 }),
+  "/api/v1/memory-reviews": () => ({ data: [], total: 0, limit: 1, offset: 0 }),
   "/api/v1/memories/relations": (url) => {
     const label = url.searchParams.get("label");
     if (url.searchParams.get("limit") === "1") return { data: [], total: RELATION_TOTALS[label ?? ""] ?? 0, limit: 1, offset: 0 };
@@ -123,7 +123,7 @@ test("the conflicts card opens the Relations view on conflicts", async ({ page }
   await stubApi(page);
   await page.goto("/v2/memories");
 
-  await page.getByRole("link", { name: "Show conflicts" }).click();
+  await page.getByRole("link", { name: "Show conflict", exact: true }).click();
   await expect(page).toHaveURL(/\/v2\/memories\?view=relations&relation=contradicts$/);
   await expect(page.getByRole("table", { name: "Relations" }).getByText("Conflict", { exact: true })).toBeVisible();
 });

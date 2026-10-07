@@ -1,4 +1,3 @@
-import { memoryStatus } from "./memoryPresentation";
 import { memoryPath, reviewPath } from "@/lib/paths";
 import type { Memory, MemoryRelation, MemorySearchHit, MemorySourceRef } from "./types";
 
@@ -26,7 +25,7 @@ export interface MemoryRow {
   /** When the Memory was created, or last observed for a ranked search result. */
   seenAt: string | null;
   relationHints: RelationHint[];
-  /** Where opening the row goes: the pending review for a Memory that waits for one, else its detail. */
+  /** Where opening the row goes: the review a listed Memory waits for, else its detail. */
   target: string;
 }
 
@@ -43,12 +42,7 @@ export function relationHints(memoryId: string, relations: readonly MemoryRelati
   return hints;
 }
 
-function rowTarget(memoryId: string, status: string, reviewByMemory: ReadonlyMap<string, string>): string {
-  const reviewId = memoryStatus(status) === "pending_review" ? reviewByMemory.get(memoryId) : undefined;
-  return reviewId ? reviewPath(reviewId) : memoryPath(memoryId);
-}
-
-export function memoryRow(memory: Memory, reviewByMemory: ReadonlyMap<string, string>): MemoryRow {
+export function memoryRow(memory: Memory): MemoryRow {
   const relations = memory.relations ?? [];
   return {
     id: memory.id,
@@ -63,11 +57,12 @@ export function memoryRow(memory: Memory, reviewByMemory: ReadonlyMap<string, st
     supportCount: memory.corroboration_count,
     seenAt: memory.created_at ?? null,
     relationHints: relationHints(memory.id, relations),
-    target: rowTarget(memory.id, memory.status, reviewByMemory),
+    target: memory.open_review_id ? reviewPath(memory.open_review_id) : memoryPath(memory.id),
   };
 }
 
-export function searchHitRow(hit: MemorySearchHit, reviewByMemory: ReadonlyMap<string, string>): MemoryRow {
+/** A ranked search result opens its detail, which links to any review the Memory waits for. */
+export function searchHitRow(hit: MemorySearchHit): MemoryRow {
   return {
     id: hit.memory_id,
     content: hit.summary,
@@ -77,7 +72,7 @@ export function searchHitRow(hit: MemorySearchHit, reviewByMemory: ReadonlyMap<s
     supportCount: hit.corroborated_by,
     seenAt: hit.last_observed_at ?? null,
     relationHints: relationHints(hit.memory_id, hit.relations ?? []),
-    target: rowTarget(hit.memory_id, hit.status, reviewByMemory),
+    target: memoryPath(hit.memory_id),
   };
 }
 
