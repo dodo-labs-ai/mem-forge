@@ -11,6 +11,8 @@ from typing import Protocol
 
 from memforge.memory.cross_document_relation_reader import RelationReadStore, read_memory_relations
 from memforge.storage.adapters.context import AccessScope
+from memforge.server.review_admin_service import read_open_review_ids
+from memforge.storage.admin_review import ReviewAdminReader
 from memforge.storage.admin_memory import (
     MemoryAdminListFilters,
     MemoryAdminPage,
@@ -18,8 +20,8 @@ from memforge.storage.admin_memory import (
 )
 
 
-class MemoryAdminListStore(MemoryAdminPageReader, RelationReadStore, Protocol):
-    """Reads one admin list page with each Memory's origin, Sources and relations."""
+class MemoryAdminListStore(MemoryAdminPageReader, RelationReadStore, ReviewAdminReader, Protocol):
+    """Reads one admin list page with each Memory's origin, Sources, relations and open Review."""
 
 
 def pick_origin_source_type(
@@ -58,6 +60,7 @@ async def list_memory_admin_page(
         },
         sources=await reader.get_memory_source_refs_many(memory_ids, scope),
         relations=await read_memory_relations(reader, memory_ids, scope),
+        open_reviews=await read_open_review_ids(reader, page.memories, scope=scope),
     )
 
 

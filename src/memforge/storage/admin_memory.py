@@ -32,6 +32,8 @@ class MemoryAdminPage:
     origins: dict[str, tuple[str | None, str | None]]
     sources: Mapping[str, tuple[MemorySourceRef, ...]]
     relations: Mapping[str, tuple[MemoryRelationContext, ...]]
+    open_reviews: Mapping[str, str]
+    """The pending Review each listed Memory that waits for review takes part in."""
 
 
 @runtime_checkable

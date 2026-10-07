@@ -32,14 +32,8 @@ async function copyLink() {
   }
 }
 
-interface MemoryActionsProps {
-  memory: MemoryDetail;
-  /** The open review this memory waits for. */
-  reviewId: string | undefined;
-}
-
 /** At most one primary action for the memory's state, and a menu of the rest. */
-export function MemoryActions({ memory, reviewId }: MemoryActionsProps) {
+export function MemoryActions({ memory }: { memory: MemoryDetail }) {
   const [dialog, setDialog] = useState<"correct" | "retire" | null>(null);
   const status = memoryStatus(memory.status);
   const retireBlocked = retireBlockedReason(memory);
@@ -52,8 +46,8 @@ export function MemoryActions({ memory, reviewId }: MemoryActionsProps) {
           Propose correction
         </Button>
       ) : null}
-      {status === "pending_review" && reviewId ? (
-        <Link to={reviewPath(reviewId)} className={buttonVariants()}>
+      {status === "pending_review" && memory.open_review_id ? (
+        <Link to={reviewPath(memory.open_review_id)} className={buttonVariants()}>
           <ArrowRight />
           Open review
         </Link>

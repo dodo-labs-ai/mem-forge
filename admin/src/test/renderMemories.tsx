@@ -2,7 +2,6 @@ import { STANDALONE_TARGET, type components } from "@/api";
 import { MemoriesRoutes } from "@/features/memories";
 import type { Route as FakeRoute } from "./fakeApi";
 import { makeMemory } from "./memoryFixtures";
-import { makeReviewListItem } from "./reviewFixtures";
 import { renderRoutes } from "./renderRoutes";
 
 type Memory = components["schemas"]["MemoryResponse"];
@@ -17,7 +16,12 @@ export const RELATION_TOTALS: Record<string, number> = { contradicts: 12, update
 export const WORKSPACE_MEMORIES: Memory[] = [
   makeMemory({ relations: [] }),
   makeMemory({ id: "mem-private", content: "Prefer merge over rebase.", visibility: "private", sources: [] }),
-  makeMemory({ id: "mem-pending", content: "Clear the blocker hint first.", status: "pending_review" }),
+  makeMemory({
+    id: "mem-pending",
+    content: "Clear the blocker hint first.",
+    status: "pending_review",
+    open_review_id: "rev-pending",
+  }),
 ];
 
 /**
@@ -47,12 +51,7 @@ export function memoriesRoutes(overrides: Record<string, FakeRoute> = {}): Recor
       ],
       total: 3761,
     }),
-    "GET /api/v1/memory-reviews": () => ({
-      data: [makeReviewListItem({ id: "rev-pending", challenger_memory_id: "mem-pending" })],
-      total: 5,
-      limit: 500,
-      offset: 0,
-    }),
+    "GET /api/v1/memory-reviews": () => ({ data: [], total: 5, limit: 1, offset: 0 }),
     "GET /api/v1/memories/relations": (request) => {
       const label = new URL(request.url).searchParams.get("label");
       return { data: [], total: label ? (RELATION_TOTALS[label] ?? 0) : 0, limit: 1, offset: 0 };

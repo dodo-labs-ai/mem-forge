@@ -166,6 +166,33 @@ class LifecycleReview:
     source_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class LifecycleReviewQueueEntry:
+    """What the Review queue needs to place, filter and count one Lifecycle Review.
+
+    It leaves out the staged evidence, which only the Reviews on the page shown
+    need.
+    """
+
+    id: str
+    status: LifecycleReviewStatus
+    incumbent_memory_id: str
+    candidate_memory_id: str | None
+    source_id: str | None
+    created_at: str | None
+
+
+LIFECYCLE_REVIEW_CANDIDATE_KEY = "replacement_memory_id"
+"""The staged evidence key naming the Memory a Lifecycle Review proposes in place of its incumbent."""
+
+
+def lifecycle_review_candidate_memory_id(staged_evidence: Mapping[str, object]) -> str | None:
+    """The Memory a Lifecycle Review proposes in place of its incumbent, if it proposes one."""
+
+    candidate_id = staged_evidence.get(LIFECYCLE_REVIEW_CANDIDATE_KEY)
+    return candidate_id if isinstance(candidate_id, str) and candidate_id else None
+
+
 class IncumbentDisposition(str, Enum):
     KEEP = "keep"
     REMOVE_SUPPORT = "remove_support"
