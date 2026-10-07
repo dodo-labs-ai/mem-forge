@@ -1,0 +1,1116 @@
+{
+  "contract_commit": "de0cead2555722a210bf2c947292dce86aec6877",
+  "cases": [
+    {
+      "source": "jira",
+      "input": "<p>Only after approval.</p><pre class=\"code-html\">&lt;form role=\"region\"&gt;&lt;layout sap</pre>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 27,
+            "kind": "p",
+            "presentation": "Only after approval.",
+            "content_value": "[[\"p\",[],[[\"text\",\"Only after approval.\"]]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 27,
+            "end": 96,
+            "kind": "pre",
+            "presentation": "Code (language: html):\n<form role=\"region\"><layout sap",
+            "content_value": "[[\"pre\",[[\"language\",\"html\"]],[[\"text\",\"<form role=\\\"region\\\"><layout sap\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p>Scope.</p><pre class=\"code-html\"><span class=\"code-tag\">&lt;form role=<span class=\"code-quote\">\"region\"</span>&gt;</span>&lt;layout sap</pre>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 13,
+            "kind": "p",
+            "presentation": "Scope.",
+            "content_value": "[[\"p\",[],[[\"text\",\"Scope.\"]]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 13,
+            "end": 144,
+            "kind": "pre",
+            "presentation": "Code (language: html):\n<form role=\"region\"><layout sap",
+            "content_value": "[[\"pre\",[[\"language\",\"html\"]],[[\"text\",\"<form role=\\\"region\\\"><layout sap\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p>New unrelated paragraph.</p><p>Scope.</p><pre class=\"code-html\">&lt;form role=\"region\"&gt;&lt;layout sap</pre>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 31,
+            "kind": "p",
+            "presentation": "New unrelated paragraph.",
+            "content_value": "[[\"p\",[],[[\"text\",\"New unrelated paragraph.\"]]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 31,
+            "end": 44,
+            "kind": "p",
+            "presentation": "Scope.",
+            "content_value": "[[\"p\",[],[[\"text\",\"Scope.\"]]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 44,
+            "end": 113,
+            "kind": "pre",
+            "presentation": "Code (language: html):\n<form role=\"region\"><layout sap",
+            "content_value": "[[\"pre\",[[\"language\",\"html\"]],[[\"text\",\"<form role=\\\"region\\\"><layout sap\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p><del>Use A.</del> Use <a href=\"https://example.test/B\">B</a>.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 68,
+            "kind": "p",
+            "presentation": "[deleted: Use A.] Use B (https://example.test/B).",
+            "content_value": "[[\"p\",[],[[\"del\",[],[[\"text\",\"Use A.\"]]],[\"text\",\" Use \"],[\"a\",[[\"href\",\"https://example.test/B\"]],[[\"text\",\"B\"]]],[\"text\",\".\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p><span class=\"image-wrap\" style=\"\"><a id=\"33_thumb\" href=\"/attachment/33/design.png\" file-preview-id=\"33\" file-preview-title=\"design.png\"><img src=\"/thumbnail/33.png\" role=\"presentation\" style=\"border: 0px solid black\"/></a></span></p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 237,
+            "kind": "p",
+            "presentation": "design.png (/attachment/33/design.png; attachment: 33)",
+            "content_value": "[[\"p\",[],[[\"a\",[[\"file-preview-id\",\"33\"],[\"file-preview-title\",\"design.png\"],[\"href\",\"/attachment/33/design.png\"]],[[\"img\",[[\"src\",\"/thumbnail/33.png\"]],[]]]]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<table><tr><th>Period</th><th>Allowed</th></tr><tr><td>Current</td><td>No</td></tr></table><ol start=\"3\"><li>Approval</li><li value=\"7\">Execute</li></ol>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 7,
+            "end": 47,
+            "kind": "table-header",
+            "presentation": "Period: Period\nAllowed: Allowed",
+            "content_value": "[[\"tr\",[],[[\"th\",[],[[\"text\",\"Period\"]]],[\"th\",[],[[\"text\",\"Allowed\"]]]]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 47,
+            "end": 83,
+            "kind": "table-row",
+            "presentation": "Period: Current\nAllowed: No",
+            "content_value": "[[\"tr\",[],[[\"td\",[],[[\"text\",\"Current\"]]],[\"td\",[],[[\"text\",\"No\"]]]]]]",
+            "interpretation_origins": [
+              {
+                "start": 7,
+                "end": 47,
+                "content_value": "[[\"tr\",[],[[\"th\",[],[[\"text\",\"Period\"]]],[\"th\",[],[[\"text\",\"Allowed\"]]]]]]"
+              }
+            ]
+          },
+          {
+            "start": 91,
+            "end": 153,
+            "kind": "ol",
+            "presentation": "3. Approval\n7. Execute",
+            "content_value": "[[\"ol\",[[\"start\",\"3\"]],[[\"li\",[],[[\"text\",\"Approval\"]]],[\"li\",[[\"value\",\"7\"]],[[\"text\",\"Execute\"]]]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": [
+          {
+            "start": 47,
+            "end": 83,
+            "context_ranges": [
+              [
+                7,
+                47
+              ]
+            ],
+            "together": false
+          }
+        ]
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<pre>&lt;form role=\"region\"&gt;&lt;layout new</pre>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 51,
+            "kind": "pre",
+            "presentation": "<form role=\"region\"><layout new",
+            "content_value": "[[\"pre\",[],[[\"text\",\"<form role=\\\"region\\\"><layout new\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p>Use B.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 13,
+            "kind": "p",
+            "presentation": "Use B.",
+            "content_value": "[[\"p\",[],[[\"text\",\"Use B.\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p>Rule</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 11,
+            "kind": "p",
+            "presentation": "Rule",
+            "content_value": "[[\"p\",[],[[\"text\",\"Rule\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p><del>Resolved</del> Still pending.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 41,
+            "kind": "p",
+            "presentation": "[deleted: Resolved] Still pending.",
+            "content_value": "[[\"p\",[],[[\"del\",[],[[\"text\",\"Resolved\"]]],[\"text\",\" Still pending.\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p>A<b> B </b>C</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 19,
+            "kind": "p",
+            "presentation": "A B C",
+            "content_value": "[[\"p\",[],[[\"text\",\"A\"],[\"strong\",[],[[\"text\",\" B \"]]],[\"text\",\"C\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p>A<b>B</b>C</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 17,
+            "kind": "p",
+            "presentation": "ABC",
+            "content_value": "[[\"p\",[],[[\"text\",\"A\"],[\"strong\",[],[[\"text\",\"B\"]]],[\"text\",\"C\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p>Unchanged.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 17,
+            "kind": "p",
+            "presentation": "Unchanged.",
+            "content_value": "[[\"p\",[],[[\"text\",\"Unchanged.\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p>Text</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 11,
+            "kind": "p",
+            "presentation": "Text",
+            "content_value": "[[\"p\",[],[[\"text\",\"Text\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p>Use <tt>a  b &lt;x&gt;</tt> at <a title=\"Other title\" href=\"/guide\">the guide</a>.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 89,
+            "kind": "p",
+            "presentation": "Use a  b <x> at the guide (/guide; title: Other title).",
+            "content_value": "[[\"p\",[],[[\"text\",\"Use \"],[\"code\",[],[[\"text\",\"a  b <x>\"]]],[\"text\",\" at \"],[\"a\",[[\"href\",\"/guide\"],[\"title\",\"Other title\"]],[[\"text\",\"the guide\"]]],[\"text\",\".\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p>Use <tt>a b &lt;x&gt;</tt> at <a title=\"Other title\" href=\"/guide\">the guide</a>.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 88,
+            "kind": "p",
+            "presentation": "Use a b <x> at the guide (/guide; title: Other title).",
+            "content_value": "[[\"p\",[],[[\"text\",\"Use \"],[\"code\",[],[[\"text\",\"a b <x>\"]]],[\"text\",\" at \"],[\"a\",[[\"href\",\"/guide\"],[\"title\",\"Other title\"]],[[\"text\",\"the guide\"]]],[\"text\",\".\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p>A&#66; <a href=\"/rule\" title=\"Rule\">Rule</a></p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 51,
+            "kind": "p",
+            "presentation": "AB Rule (/rule)",
+            "content_value": "[[\"p\",[],[[\"text\",\"AB \"],[\"a\",[[\"href\",\"/rule\"],[\"title\",\"Rule\"]],[[\"text\",\"Rule\"]]]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p>AB <a title=\"Rule\" href=\"/rule\">Rule</a></p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 47,
+            "kind": "p",
+            "presentation": "AB Rule (/rule)",
+            "content_value": "[[\"p\",[],[[\"text\",\"AB \"],[\"a\",[[\"href\",\"/rule\"],[\"title\",\"Rule\"]],[[\"text\",\"Rule\"]]]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p>Stale</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 12,
+            "kind": "p",
+            "presentation": "Stale",
+            "content_value": "[[\"p\",[],[[\"text\",\"Stale\"]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<h2>Eligibility</h2><p>Only after cutoff &amp; approval.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 20,
+            "kind": "h2",
+            "presentation": "Eligibility",
+            "content_value": "[\"h2\",[],[[\"text\",\"Eligibility\"]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 20,
+            "end": 60,
+            "kind": "p",
+            "presentation": "Only after cutoff & approval.",
+            "content_value": "[\"p\",[],[[\"text\",\"Only after cutoff & approval.\"]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": [
+          {
+            "start": 0,
+            "end": 60,
+            "context_ranges": [
+              [
+                0,
+                20
+              ]
+            ],
+            "together": false
+          }
+        ]
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<table><tr><th>Case</th><th>Expected behavior</th><th>Result</th></tr><tr><td>14</td><td>Late hire is rejected only for the current period.</td><td><ac:structured-macro ac:name=\"status\" ac:macro-id=\"a\"><ac:parameter ac:name=\"title\">Failed</ac:parameter><ac:parameter ac:name=\"colour\">Red</ac:parameter></ac:structured-macro><ac:structured-macro ac:name=\"jira\"><ac:parameter ac:name=\"key\">PAY-42</ac:parameter><ac:parameter ac:name=\"server\">Payroll</ac:parameter></ac:structured-macro></td></tr></table>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 7,
+            "end": 70,
+            "kind": "table-header",
+            "presentation": "Case: Case\nExpected behavior: Expected behavior\nResult: Result",
+            "content_value": "[\"tr\",[],[[\"th\",[],[[\"text\",\"Case\"]]],[\"th\",[],[[\"text\",\"Expected behavior\"]]],[\"th\",[],[[\"text\",\"Result\"]]]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 70,
+            "end": 494,
+            "kind": "table-row",
+            "presentation": "Case: 14\nExpected behavior: Late hire is rejected only for the current period.\nResult: Status: Failed (colour: Red)\nIssue: PAY-42 (server: Payroll)",
+            "content_value": "[\"tr\",[],[[\"td\",[],[[\"text\",\"14\"]]],[\"td\",[],[[\"text\",\"Late hire is rejected only for the current period.\"]]],[\"td\",[],[[\"ac:structured-macro\",[[\"ac:name\",\"status\"]],[[\"ac:parameter\",[[\"ac:name\",\"title\"]],[[\"text\",\"Failed\"]]],[\"ac:parameter\",[[\"ac:name\",\"colour\"]],[[\"text\",\"Red\"]]]]],[\"ac:structured-macro\",[[\"ac:name\",\"jira\"]],[[\"ac:parameter\",[[\"ac:name\",\"key\"]],[[\"text\",\"PAY-42\"]]],[\"ac:parameter\",[[\"ac:name\",\"server\"]],[[\"text\",\"Payroll\"]]]]]]]]]",
+            "interpretation_origins": [
+              {
+                "start": 7,
+                "end": 70,
+                "content_value": "[\"tr\",[],[[\"th\",[],[[\"text\",\"Case\"]]],[\"th\",[],[[\"text\",\"Expected behavior\"]]],[\"th\",[],[[\"text\",\"Result\"]]]]]"
+              }
+            ]
+          }
+        ],
+        "groups": [
+          {
+            "start": 70,
+            "end": 494,
+            "context_ranges": [
+              [
+                7,
+                70
+              ]
+            ],
+            "together": false
+          }
+        ]
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<p>Intro.</p><p><ac:structured-macro ac:name=\"status\" ac:macro-id=\"old\"><ac:parameter ac:name=\"title\">Passed</ac:parameter></ac:structured-macro></p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 13,
+            "kind": "p",
+            "presentation": "Intro.",
+            "content_value": "[\"p\",[],[[\"text\",\"Intro.\"]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 13,
+            "end": 149,
+            "kind": "p",
+            "presentation": "Status: Passed",
+            "content_value": "[\"p\",[],[[\"ac:structured-macro\",[[\"ac:name\",\"status\"]],[[\"ac:parameter\",[[\"ac:name\",\"title\"]],[[\"text\",\"Passed\"]]]]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<table><tr><th>Period</th><th>Allowed</th></tr><tr><td>Current</td><td>No</td></tr></table>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 7,
+            "end": 47,
+            "kind": "table-header",
+            "presentation": "Period: Period\nAllowed: Allowed",
+            "content_value": "[\"tr\",[],[[\"th\",[],[[\"text\",\"Period\"]]],[\"th\",[],[[\"text\",\"Allowed\"]]]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 47,
+            "end": 83,
+            "kind": "table-row",
+            "presentation": "Period: Current\nAllowed: No",
+            "content_value": "[\"tr\",[],[[\"td\",[],[[\"text\",\"Current\"]]],[\"td\",[],[[\"text\",\"No\"]]]]]",
+            "interpretation_origins": [
+              {
+                "start": 7,
+                "end": 47,
+                "content_value": "[\"tr\",[],[[\"th\",[],[[\"text\",\"Period\"]]],[\"th\",[],[[\"text\",\"Allowed\"]]]]]"
+              }
+            ]
+          }
+        ],
+        "groups": [
+          {
+            "start": 47,
+            "end": 83,
+            "context_ranges": [
+              [
+                7,
+                47
+              ]
+            ],
+            "together": false
+          }
+        ]
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<p>Stable rule.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 19,
+            "kind": "p",
+            "presentation": "Stable rule.",
+            "content_value": "[\"p\",[],[[\"text\",\"Stable rule.\"]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<pre>    if x:\n        y()\n</pre>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 33,
+            "kind": "pre",
+            "presentation": "Preformatted text:\n    if x:\n        y()\n",
+            "content_value": "[\"pre\",[],[[\"text\",\"    if x:\\n        y()\\n\"]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<p>Generated by the deployment process.<ac:structured-macro ac:name=\"toc\" ac:macro-id=\"directory\"><ac:parameter ac:name=\"minLevel\">2</ac:parameter><ac:parameter ac:name=\"include\">Eligibility.*</ac:parameter></ac:structured-macro>Only for approved runs.</p><h2>Page Properties</h2><p>Approval remains required.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 256,
+            "kind": "p",
+            "presentation": "Generated by the deployment process.\nOnly for approved runs.",
+            "content_value": "[\"p\",[],[[\"text\",\"Generated by the deployment process.\"],[\"ac:structured-macro\",[[\"ac:name\",\"toc\"]],[[\"ac:parameter\",[[\"ac:name\",\"minLevel\"]],[[\"text\",\"2\"]]],[\"ac:parameter\",[[\"ac:name\",\"include\"]],[[\"text\",\"Eligibility.*\"]]]]],[\"text\",\"Only for approved runs.\"]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 256,
+            "end": 280,
+            "kind": "h2",
+            "presentation": "Page Properties",
+            "content_value": "[\"h2\",[],[[\"text\",\"Page Properties\"]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 280,
+            "end": 313,
+            "kind": "p",
+            "presentation": "Approval remains required.",
+            "content_value": "[\"p\",[],[[\"text\",\"Approval remains required.\"]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": [
+          {
+            "start": 256,
+            "end": 313,
+            "context_ranges": [
+              [
+                256,
+                280
+              ]
+            ],
+            "together": false
+          }
+        ]
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<p><ac:structured-macro ac:name=\"jira\"><ac:parameter ac:name=\"key\">PAY-42</ac:parameter><ac:parameter ac:name=\"serverId\">first-origin</ac:parameter><ac:parameter ac:name=\"columnIds\">issuekey,summary</ac:parameter></ac:structured-macro></p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 239,
+            "kind": "p",
+            "presentation": "Issue: PAY-42",
+            "content_value": "[\"p\",[],[[\"ac:structured-macro\",[[\"ac:name\",\"jira\"]],[[\"ac:parameter\",[[\"ac:name\",\"key\"]],[[\"text\",\"PAY-42\"]]],[\"ac:parameter\",[[\"ac:name\",\"serverId\"]],[[\"text\",\"first-origin\"]]],[\"ac:parameter\",[[\"ac:name\",\"columnIds\"]],[[\"text\",\"issuekey,summary\"]]]]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<p><code><strong>A7</strong> &amp; B</code></p><ac:structured-macro ac:name=\"code\"><ac:parameter ac:name=\"language\">xml</ac:parameter><ac:plain-text-body><![CDATA[<rule>&amp;</rule>]]></ac:plain-text-body></ac:structured-macro>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 47,
+            "kind": "p",
+            "presentation": "A7 & B",
+            "content_value": "[\"p\",[],[[\"code\",[],[[\"strong\",[],[[\"text\",\"A7\"]]],[\"text\",\" & B\"]]]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 47,
+            "end": 227,
+            "kind": "ac:structured-macro",
+            "presentation": "Code\nlanguage: xml\n<rule>&amp;</rule>\n",
+            "content_value": "[\"ac:structured-macro\",[[\"ac:name\",\"code\"]],[[\"ac:parameter\",[[\"ac:name\",\"language\"]],[[\"text\",\"xml\"]]],[\"ac:plain-text-body\",[],[[\"literal\",\"<rule>&amp;</rule>\"]]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<table><tr><th>Rule</th></tr><tr><td>Approval required.</td></tr></table>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 7,
+            "end": 29,
+            "kind": "table-header",
+            "presentation": "Rule: Rule",
+            "content_value": "[\"tr\",[],[[\"th\",[],[[\"text\",\"Rule\"]]]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 29,
+            "end": 65,
+            "kind": "table-row",
+            "presentation": "Rule: Approval required.",
+            "content_value": "[\"tr\",[],[[\"td\",[],[[\"text\",\"Approval required.\"]]]]]",
+            "interpretation_origins": [
+              {
+                "start": 7,
+                "end": 29,
+                "content_value": "[\"tr\",[],[[\"th\",[],[[\"text\",\"Rule\"]]]]]"
+              }
+            ]
+          }
+        ],
+        "groups": [
+          {
+            "start": 29,
+            "end": 65,
+            "context_ranges": [
+              [
+                7,
+                29
+              ]
+            ],
+            "together": false
+          }
+        ]
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<p>Inserted.</p><p>Stable rule.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 16,
+            "kind": "p",
+            "presentation": "Inserted.",
+            "content_value": "[\"p\",[],[[\"text\",\"Inserted.\"]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 16,
+            "end": 35,
+            "kind": "p",
+            "presentation": "Stable rule.",
+            "content_value": "[\"p\",[],[[\"text\",\"Stable rule.\"]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<p>AB stays required.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 25,
+            "kind": "p",
+            "presentation": "AB stays required.",
+            "content_value": "[\"p\",[],[[\"text\",\"AB stays required.\"]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<p>Inserted.</p><p>A&#66; stays required.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 16,
+            "kind": "p",
+            "presentation": "Inserted.",
+            "content_value": "[\"p\",[],[[\"text\",\"Inserted.\"]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 16,
+            "end": 45,
+            "kind": "p",
+            "presentation": "AB stays required.",
+            "content_value": "[\"p\",[],[[\"text\",\"AB stays required.\"]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<table><tr><th>Case</th><th>Period</th><th>Result</th></tr><tr><td rowspan=\"2\">14</td><td>Current</td><td>No</td></tr><tr><td colspan=\"2\">Next period</td></tr></table>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 7,
+            "end": 59,
+            "kind": "table-header",
+            "presentation": "Case: Case\nPeriod: Period\nResult: Result",
+            "content_value": "[\"tr\",[],[[\"th\",[],[[\"text\",\"Case\"]]],[\"th\",[],[[\"text\",\"Period\"]]],[\"th\",[],[[\"text\",\"Result\"]]]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 59,
+            "end": 118,
+            "kind": "table-row",
+            "presentation": "Case: 14\nPeriod: Current\nResult: No",
+            "content_value": "[\"tr\",[],[[\"td\",[[\"rowspan\",\"2\"]],[[\"text\",\"14\"]]],[\"td\",[],[[\"text\",\"Current\"]]],[\"td\",[],[[\"text\",\"No\"]]]]]",
+            "interpretation_origins": [
+              {
+                "start": 7,
+                "end": 59,
+                "content_value": "[\"tr\",[],[[\"th\",[],[[\"text\",\"Case\"]]],[\"th\",[],[[\"text\",\"Period\"]]],[\"th\",[],[[\"text\",\"Result\"]]]]]"
+              }
+            ]
+          },
+          {
+            "start": 118,
+            "end": 159,
+            "kind": "table-row",
+            "presentation": "Case: 14 [cell from row 2]\nPeriod / Result (columns 2–3): Next period",
+            "content_value": "[\"tr\",[],[[\"td\",[[\"colspan\",\"2\"]],[[\"text\",\"Next period\"]]]]]",
+            "interpretation_origins": [
+              {
+                "start": 7,
+                "end": 59,
+                "content_value": "[\"tr\",[],[[\"th\",[],[[\"text\",\"Case\"]]],[\"th\",[],[[\"text\",\"Period\"]]],[\"th\",[],[[\"text\",\"Result\"]]]]]"
+              },
+              {
+                "start": 63,
+                "end": 86,
+                "content_value": "[\"td\",[[\"rowspan\",\"2\"]],[[\"text\",\"14\"]]]"
+              }
+            ]
+          }
+        ],
+        "groups": [
+          {
+            "start": 59,
+            "end": 118,
+            "context_ranges": [
+              [
+                7,
+                59
+              ]
+            ],
+            "together": false
+          },
+          {
+            "start": 118,
+            "end": 159,
+            "context_ranges": [
+              [
+                7,
+                59
+              ]
+            ],
+            "together": false
+          }
+        ]
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<p><del>Use A.</del> Use B.</p><ol start=\"3\"><li>First<ul><li>Nested</li></ul></li><li value=\"7\">Second</li></ol>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 31,
+            "kind": "p",
+            "presentation": "[Deleted text: Use A.] Use B.",
+            "content_value": "[\"p\",[],[[\"del\",[],[[\"text\",\"Use A.\"]]],[\"text\",\" Use B.\"]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 31,
+            "end": 113,
+            "kind": "ol",
+            "presentation": "3. First\n  - Nested\n7. Second",
+            "content_value": "[\"ol\",[[\"start\",\"3\"]],[[\"li\",[],[[\"text\",\"First\"],[\"ul\",[],[[\"li\",[],[[\"text\",\"Nested\"]]]]]]],[\"li\",[[\"value\",\"7\"]],[[\"text\",\"Second\"]]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<ac:structured-macro ac:name=\"info\"><ac:rich-text-body><table><tr><th>Period</th><th>Allowed</th></tr><tr><td>Current</td><td>No</td></tr></table><ac:image ac:alt=\"Target design\" ac:title=\"Proposed\"><ri:attachment ri:filename=\"design.png\"/></ac:image></ac:rich-text-body></ac:structured-macro>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 293,
+            "kind": "ac:structured-macro",
+            "presentation": "info\nRow 1:\nPeriod: Period\nAllowed: Allowed\nRow 2:\nPeriod: Current\nAllowed: No\n[attachment: filename=design.png] [alt: Target design] [title: Proposed]",
+            "content_value": "[\"ac:structured-macro\",[[\"ac:name\",\"info\"]],[[\"ac:rich-text-body\",[],[[\"table\",[],[[\"tr\",[],[[\"th\",[],[[\"text\",\"Period\"]]],[\"th\",[],[[\"text\",\"Allowed\"]]]]],[\"tr\",[],[[\"td\",[],[[\"text\",\"Current\"]]],[\"td\",[],[[\"text\",\"No\"]]]]]]],[\"ac:image\",[[\"ac:alt\",\"Target design\"],[\"ac:title\",\"Proposed\"]],[[\"ri:attachment\",[[\"ri:filename\",\"design.png\"]],[]]]]]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<table><caption>Proposed cases only.</caption><tr><th>Period</th><th>Allowed</th></tr><tr><td>Current</td><td>No</td></tr></table>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 7,
+            "end": 46,
+            "kind": "caption",
+            "presentation": "Proposed cases only.",
+            "content_value": "[\"caption\",[],[[\"text\",\"Proposed cases only.\"]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 46,
+            "end": 86,
+            "kind": "table-header",
+            "presentation": "Period: Period\nAllowed: Allowed",
+            "content_value": "[\"tr\",[],[[\"th\",[],[[\"text\",\"Period\"]]],[\"th\",[],[[\"text\",\"Allowed\"]]]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 86,
+            "end": 122,
+            "kind": "table-row",
+            "presentation": "Period: Current\nAllowed: No",
+            "content_value": "[\"tr\",[],[[\"td\",[],[[\"text\",\"Current\"]]],[\"td\",[],[[\"text\",\"No\"]]]]]",
+            "interpretation_origins": [
+              {
+                "start": 46,
+                "end": 86,
+                "content_value": "[\"tr\",[],[[\"th\",[],[[\"text\",\"Period\"]]],[\"th\",[],[[\"text\",\"Allowed\"]]]]]"
+              }
+            ]
+          }
+        ],
+        "groups": [
+          {
+            "start": 86,
+            "end": 122,
+            "context_ranges": [
+              [
+                46,
+                86
+              ],
+              [
+                7,
+                46
+              ]
+            ],
+            "together": false
+          }
+        ]
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<div style=\"color:red\"><p>Use B.</p></div>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 42,
+            "kind": "div",
+            "presentation": "Use B.\n [style: color:red]",
+            "content_value": "[\"div\",[[\"style\",\"color:red\"]],[[\"p\",[],[[\"text\",\"Use B.\"]]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<p><ac:structured-macro ac:name=\"toc\"/></p><h1>Scope</h1><p>Only after approval.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 43,
+            "end": 57,
+            "kind": "h1",
+            "presentation": "Scope",
+            "content_value": "[\"h1\",[],[[\"text\",\"Scope\"]]]",
+            "interpretation_origins": []
+          },
+          {
+            "start": 57,
+            "end": 84,
+            "kind": "p",
+            "presentation": "Only after approval.",
+            "content_value": "[\"p\",[],[[\"text\",\"Only after approval.\"]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": [
+          {
+            "start": 43,
+            "end": 84,
+            "context_ranges": [
+              [
+                43,
+                57
+              ]
+            ],
+            "together": false
+          }
+        ]
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<ac:rich-text-body><p>Hidden rule.</p></ac:rich-text-body>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 58,
+            "kind": "ac:rich-text-body",
+            "presentation": "Hidden rule.",
+            "content_value": "[\"ac:rich-text-body\",[],[[\"p\",[],[[\"text\",\"Hidden rule.\"]]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<ac:parameter ac:name=\"unsupported\">Only after approval.</ac:parameter>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 71,
+            "kind": "ac:parameter",
+            "presentation": "Only after approval.",
+            "content_value": "[\"ac:parameter\",[[\"ac:name\",\"unsupported\"]],[[\"text\",\"Only after approval.\"]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<p>Inserted elsewhere.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 26,
+            "kind": "p",
+            "presentation": "Inserted elsewhere.",
+            "content_value": "[\"p\",[],[[\"text\",\"Inserted elsewhere.\"]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "confluence",
+      "input": "<p>Safe rule.</p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 17,
+            "kind": "p",
+            "presentation": "Safe rule.",
+            "content_value": "[\"p\",[],[[\"text\",\"Safe rule.\"]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p><a class=\" external-link \" href=\"https://example.com\">Rule</a></p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 69,
+            "kind": "p",
+            "presentation": "Rule (https://example.com)",
+            "content_value": "[[\"p\",[],[[\"a\",[[\"class\",\"external-link\"],[\"href\",\"https://example.com\"]],[[\"text\",\"Rule\"]]]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p><a class=\"external-link external-link\" href=\"https://example.com\">Rule</a></p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 81,
+            "kind": "p",
+            "presentation": "Rule (https://example.com)",
+            "content_value": "[[\"p\",[],[[\"a\",[[\"class\",\"external-link external-link\"],[\"href\",\"https://example.com\"]],[[\"text\",\"Rule\"]]]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    },
+    {
+      "source": "jira",
+      "input": "<p><a class=\"external-link\texternal-link\" href=\"https://example.com\">Rule</a></p>",
+      "parsed": {
+        "fragments": [
+          {
+            "start": 0,
+            "end": 81,
+            "kind": "p",
+            "presentation": "Rule (https://example.com)",
+            "content_value": "[[\"p\",[],[[\"a\",[[\"class\",\"external-link external-link\"],[\"href\",\"https://example.com\"]],[[\"text\",\"Rule\"]]]]]]",
+            "interpretation_origins": []
+          }
+        ],
+        "groups": []
+      }
+    }
+  ]
+}

@@ -17,7 +17,30 @@ from memforge.source_adapters.contracts import (
 )
 
 
-_VOID = {"br", "hr", "img", "col", "ri:user", "ri:page", "ri:attachment", "ri:url"}
+_VOID = {"br", "hr", "img", "col", "ri:user", "ri:page", "ri:attachment", "ri:url", "ac:emoticon"}
+
+
+@dataclass(frozen=True, slots=True)
+class _NativeElement:
+    attributes: frozenset[str] = frozenset()
+    transparent: bool = False
+    children: frozenset[str] | None = None
+
+
+_NATIVE_ELEMENTS = {
+    "ac:layout": _NativeElement(transparent=True, children=frozenset({"ac:layout-section"})),
+    "ac:layout-section": _NativeElement(frozenset({"ac:type"}), True, frozenset({"ac:layout-cell"})),
+    "ac:layout-cell": _NativeElement(transparent=True),
+    "ac:inline-comment-marker": _NativeElement(frozenset({"ac:ref"}), True),
+    "ac:task-list": _NativeElement(transparent=True, children=frozenset({"ac:task"})),
+    "ac:task": _NativeElement(children=frozenset({"ac:task-id", "ac:task-status", "ac:task-body"})),
+    "ac:task-id": _NativeElement(),
+    "ac:task-status": _NativeElement(),
+    "ac:task-body": _NativeElement(),
+    "ac:emoticon": _NativeElement(frozenset({"ac:name"})),
+}
+_LAYOUT_CELLS = {"single": 1, "two_equal": 2, "two_left_sidebar": 2, "two_right_sidebar": 2,
+                 "three_equal": 3, "three_with_sidebars": 3}
 _TAGS = {
     "p", "div", "span", "strong", "b", "em", "i", "u", "s", "del", "sup", "sub",
     "a", "br", "hr", "pre", "code", "blockquote", "ul", "ol", "li", "table",
@@ -26,18 +49,29 @@ _TAGS = {
     "ac:link", "ac:link-body", "ac:plain-text-link-body", "ac:image",
     "ac:structured-macro", "ac:parameter", "ac:plain-text-body", "ac:rich-text-body",
     "ri:user", "ri:page", "ri:attachment", "ri:url",
+} | _NATIVE_ELEMENTS.keys()
+
+
+@dataclass(frozen=True, slots=True)
+class _Macro:
+    parameters: frozenset[str]
+    body: str
+    identity: str | None = None
+
+
+_MACROS = {
+    "toc": _Macro(frozenset({"type", "outline", "style", "indent", "separator", "minLevel", "maxLevel",
+                            "include", "exclude", "printable", "class", "absoluteUrl"}), "none"),
+    "status": _Macro(frozenset({"title", "colour"}), "none", "title"),
+    "jira": _Macro(frozenset({"key", "server", "serverId", "columnIds", "columns", "showSummary"}), "none", "key"),
+    "code": _Macro(frozenset({"language", "title", "collapse", "linenumbers", "firstline", "theme"}), "literal"),
+    **{name: _Macro(frozenset({"title", "icon"}), "rich") for name in ("info", "note", "warning", "tip")},
+    "panel": _Macro(frozenset({"title", "borderStyle", "borderColor", "borderWidth", "bgColor", "titleBGColor", "titleColor"}), "rich"),
+    "expand": _Macro(frozenset({"title"}), "rich"),
+    "noformat": _Macro(frozenset(), "literal"),
+    "excerpt": _Macro(frozenset({"hidden", "name", "output-type"}), "local"),
 }
-_MACRO_PARAMETERS = {
-    "toc": {"type", "outline", "style", "indent", "separator", "minLevel", "maxLevel",
-            "include", "exclude", "printable", "class", "absoluteUrl"},
-    "status": {"title", "colour"},
-    "jira": {"key", "server", "serverId", "columnIds", "columns", "showSummary"},
-    "code": {"language", "title", "collapse", "linenumbers", "firstline", "theme"},
-    "info": {"title", "icon"}, "note": {"title", "icon"}, "warning": {"title", "icon"},
-    "tip": {"title", "icon"}, "panel": {"title", "borderStyle", "borderColor", "borderWidth",
-                                            "bgColor", "titleBGColor", "titleColor"},
-    "expand": {"title"}, "noformat": set(),
-}
+_EXTERNAL_MACROS = {"include", "children", "excerpt-include"}
 # These identify a rendered macro instance, not its authored content. No other
 # attribute is erased from comparison material.
 _INSTANCE_ATTRIBUTES = {"ac:macro-id"}
@@ -140,6 +174,21 @@ class _StorageParser(HTMLParser):
         self.close()
         if len(self.stack) != 1:
             raise ValueError("unclosed Confluence storage element")
+        for node in _nodes(self.root):
+            rule = _NATIVE_ELEMENTS.get(node.tag)
+            if rule is None:
+                continue
+            if set(node.attrs) - rule.attributes:
+                raise ValueError(f"unsupported Confluence attributes on {node.tag}")
+            if rule.children is not None and any(
+                isinstance(child, _Text) and child.value.strip()
+                or isinstance(child, _Node) and child.tag not in rule.children for child in node.children
+            ):
+                raise ValueError(f"unclassified Confluence content in {node.tag}")
+            if node.tag == "ac:layout-section":
+                cells = _LAYOUT_CELLS.get(node.attrs.get("ac:type", ""))
+                if cells is None or sum(isinstance(child, _Node) for child in node.children) != cells:
+                    raise ValueError("Confluence layout has inconsistent cell coverage")
         return self.root
 
 
@@ -150,11 +199,16 @@ def _nodes(node: _Node):
             yield from _nodes(child)
 
 
-def _canonical(node: _Node | _Text):
-    if isinstance(node, _Text):
-        return ("literal" if node.literal else "text", node.value)
+def _canonical_children(node):
     children = []
-    for child in node.children:
+    def authored_children(parent):
+        for child in parent.children:
+            rule = _NATIVE_ELEMENTS.get(child.tag) if isinstance(child, _Node) else None
+            if rule and rule.transparent:
+                yield from authored_children(child)
+            else:
+                yield child
+    for child in authored_children(node):
         value = _canonical(child)
         # Entity spelling and CDATA boundaries can split one text value into
         # parser callbacks; callback boundaries are not authored structures.
@@ -162,10 +216,16 @@ def _canonical(node: _Node | _Text):
             children[-1] = (value[0], children[-1][1] + value[1])
         else:
             children.append(value)
+    return children
+
+
+def _canonical(node: _Node | _Text):
+    if isinstance(node, _Text):
+        return ("literal" if node.literal else "text", node.value)
     return (
         node.tag,
         sorted((key, value) for key, value in node.attrs.items() if key not in _INSTANCE_ATTRIBUTES),
-        children,
+        _canonical_children(node),
     )
 
 
@@ -175,35 +235,40 @@ def _content(node: _Node) -> str:
 
 def _macro(node: _Node) -> str:
     name = node.attrs.get("ac:name", "")
-    if name not in _MACRO_PARAMETERS:
+    if name in _EXTERNAL_MACROS:
+        raise ValueError(f"Confluence macro {name} requires content outside this immutable snapshot")
+    rule = _MACROS.get(name)
+    if rule is None:
         raise ValueError(f"unsupported Confluence macro: {name}")
     parameters = [child for child in node.children if isinstance(child, _Node) and child.tag == "ac:parameter"]
     names = [child.attrs.get("ac:name", "") for child in parameters]
-    if len(set(names)) != len(names) or set(names) - _MACRO_PARAMETERS[name]:
+    if len(set(names)) != len(names) or set(names) - rule.parameters:
         raise ValueError("unsupported or duplicate Confluence macro parameter")
     if any(set(child.attrs) != {"ac:name"} or any(isinstance(c, _Node) for c in child.children) for child in parameters):
         raise ValueError("Confluence macro parameter is not a declared scalar")
-    if name in {"status", "jira"} and ("title" if name == "status" else "key") not in names:
+    if rule.identity is not None and rule.identity not in names:
         raise ValueError("Confluence status/issue macro lacks its identity parameter")
     bodies = [child for child in node.children if isinstance(child, _Node) and child.tag in {"ac:plain-text-body", "ac:rich-text-body"}]
     if any(isinstance(child, _Text) and child.value.strip() for child in node.children):
         raise ValueError("unclassified Confluence macro text")
     if any(isinstance(child, _Node) and child.tag not in {"ac:parameter", "ac:plain-text-body", "ac:rich-text-body"} for child in node.children):
         raise ValueError("unclassified Confluence macro child")
-    if name in {"code", "noformat"}:
+    if rule.body == "literal":
         if len(bodies) != 1 or bodies[0].tag != "ac:plain-text-body" or any(
             not isinstance(child, _Text) or not child.literal for child in bodies[0].children
         ):
             raise ValueError("Confluence literal macro must have one CDATA body")
-    elif name in {"status", "jira", "toc"} and bodies:
+    elif rule.body == "none" and bodies:
         raise ValueError("unexpected Confluence bodyless macro body")
-    elif name not in {"status", "jira", "toc"} and (len(bodies) != 1 or bodies[0].tag != "ac:rich-text-body"):
+    elif rule.body != "none" and (len(bodies) != 1 or bodies[0].tag != "ac:rich-text-body"):
         raise ValueError("Confluence container macro must have one rich-text body")
     if name == "toc":
         # Native TOC has no authored body: its output repeats page headings.
         # The immutable input retains its configuration; headings remain selectable.
         return ""
     values = {key: _render(value) for key, value in zip(names, parameters, strict=True)}
+    if rule.body == "local":
+        return _render(bodies[0])
     if name == "jira":
         # Keep a supplied instance name; omit opaque server IDs and column controls.
         # A native issue key proves neither an unseen summary nor issue status.
@@ -225,6 +290,19 @@ def _render(node: _Node | _Text) -> str:
     if node.tag == "ac:structured-macro":
         text = _macro(node)
         return text + "\n"
+    if node.tag == "ac:emoticon":
+        name = node.attrs.get("ac:name")
+        if not name or node.children:
+            raise ValueError("Confluence emoticon lacks a scalar identity")
+        return f"[Emoticon: {name}]"
+    if node.tag == "ac:task":
+        fields = {child.tag: child for child in node.children if isinstance(child, _Node)}
+        if len(fields) != sum(isinstance(child, _Node) for child in node.children) or not {"ac:task-status", "ac:task-body"} <= fields.keys():
+            raise ValueError("Confluence task lacks unique status and body")
+        state = _render(fields["ac:task-status"]).strip()
+        if state not in {"complete", "incomplete"}:
+            raise ValueError("unsupported Confluence task status")
+        return f"Task ({state}): {_render(fields['ac:task-body']).strip()}\n"
     if node.tag == "br":
         return "\n"
     if node.tag == "hr":
@@ -410,9 +488,15 @@ def parse_storage(source: str) -> ParsedDeclaredText:
                 if isinstance(child, _Node) and child.tag == "caption":
                     add(child)
             return
-        if node.tag == "div" and not node.attrs:
+        rule = _NATIVE_ELEMENTS.get(node.tag)
+        if rule and rule.transparent or node.tag == "div" and not node.attrs:
             for child in node.children:
                 select(child)
+        elif node.tag == "ac:structured-macro" and _MACROS[node.attrs["ac:name"]].body == "local":
+            for child in node.children:
+                if isinstance(child, _Node) and child.tag == "ac:rich-text-body":
+                    for authored in child.children:
+                        select(authored)
         else:
             add(node)
 
@@ -429,8 +513,10 @@ def parse_storage(source: str) -> ParsedDeclaredText:
                     ((lead.start, lead.end),), together=True))
     fragments.sort(key=lambda item: (item.start, item.end))
     headings = [item for item in fragments if re.fullmatch(r"h[1-6]", item.kind)]
+    cells = [node for node in _nodes(root) if node.tag == "ac:layout-cell"]
     for index, heading in enumerate(headings):
-        end = next((item.start for item in headings[index + 1:] if item.kind <= heading.kind), len(source))
+        containing_end = min((cell.end for cell in cells if cell.start <= heading.start < cell.end), default=len(source))
+        end = next((item.start for item in headings[index + 1:] if item.kind <= heading.kind and item.start < containing_end), containing_end)
         groups.append(DeclaredTextGroup(heading.start, end, ((heading.start, heading.end),)))
     return ParsedDeclaredText(tuple(fragments), tuple(groups))
 

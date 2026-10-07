@@ -1435,6 +1435,79 @@ class _RecordingAddClient(RevisionClientFixture):
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_support", [False, True])
+async def test_duplicate_growth_preserves_independent_work_and_atomic_support(
+    db: Database, fail_support: bool,
+) -> None:
+    """Occurrence ambiguity is assessed without starving independent new authority."""
+    incumbent_claim = "Approval is required before release."
+    new_claim = "Rule B requires a separate compatibility check."
+    first = _projection(run_id="duplicate-base", body=incumbent_claim)
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        db=db, memory_store=_OutboxDrainer(db),
+        cross_document_candidates=_candidate_retriever(adapters),
+        structured_llm_client=AdmittingClient(),
+    )
+    common = dict(
+        doc_id="confluence-123", doc_type="design-doc", project_key="ENG",
+        repo_identifier=None, changed_hunks=None, update_plan_stats=None,
+        source_updated_at=datetime(2026, 10, 7, tzinfo=timezone.utc),
+    )
+    await engine.prepare_and_commit_projected_lifecycle(
+        **common, projection=first, document_content=incumbent_claim,
+        raw_memories=_selected(first, [RawMemory(content=incumbent_claim, memory_type="fact")]),
+        update_mode="full_document",
+    )
+    [incumbent] = await db.list_memories()
+    await db.enable_lifecycle_gate("src-1")
+    body = f"{incumbent_claim}\n\n{incumbent_claim}\n\n{new_claim}"
+    second = _projection(
+        run_id="duplicate-target", body=body, prior=first.source_unit_revisions[0],
+        prior_observations={r.observation_id: r for r in first.observation_revisions},
+    )
+
+    class ReadingClient(_RecordingAddClient):
+        current_readings: list[dict]
+
+        def __init__(self):
+            super().__init__(incumbent.id)
+            self.current_readings = []
+
+        async def assess_support(self, prompt, **kwargs):
+            payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
+            self.current_readings.append(payload["current"])
+            if fail_support:
+                raise RuntimeError("controlled required Support failure")
+            return await super().assess_support(prompt, **kwargs)
+
+    client = ReadingClient()
+    # Use a fresh engine so every coordinator consumes the same current client.
+    engine = MemoryEngine(
+        db=db, memory_store=_OutboxDrainer(db),
+        cross_document_candidates=_candidate_retriever(adapters), structured_llm_client=client,
+    )
+    kwargs = dict(
+        **common, projection=second, document_content=body, update_mode="diff_guided",
+        raw_memories=_selected(second, [RawMemory(content=new_claim, memory_type="fact")], base=first),
+    )
+    if fail_support:
+        with pytest.raises(RuntimeError, match="controlled required Support failure"):
+            await engine.prepare_and_commit_projected_lifecycle(**kwargs)
+    else:
+        stats = await engine.prepare_and_commit_projected_lifecycle(**kwargs)
+        assert stats["added"] == 1
+    assert client.current_readings
+    current_rows = [row for reading in client.current_readings for row in reading["primary_candidates"]]
+    assert sum(row[1] == incumbent_claim for row in current_rows) == 2
+    current_revision = await db.get_current_source_unit_revision(first.source_units[0].id)
+    assert current_revision.id == (first if fail_support else second).source_unit_revisions[0].id
+    active = await db.list_memories()
+    assert {m.content for m in active} == ({incumbent_claim} if fail_support else {incumbent_claim, new_claim})
+    assert (await db.get_memory(incumbent.id)).status == "active"
+
+
 class _RejectingAddClient(_RecordingAddClient):
     """Rejects one low-value Candidate and admits the rest."""
 

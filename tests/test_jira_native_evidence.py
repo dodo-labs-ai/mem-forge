@@ -293,7 +293,7 @@ def test_adapter_owns_history_classification_and_core_field_time():
 def test_history_parent_population_change_keeps_all_current_value_views(old_count, new_count):
     from memforge.pipeline.revision_assessment import RevisionAssessmentContext
     from memforge.pipeline.projection_context import (
-        CommittedSourceUnitSnapshot, ExtractionAuthority, ProjectionEvidencePlanningFailure,
+        CommittedSourceUnitSnapshot, ExtractionAuthority,
         plan_projection_evidence_work,
     )
     item = {'field': 'description', 'fromString': 'Previous rule.', 'toString': 'New rule.'}
@@ -309,4 +309,6 @@ def test_history_parent_population_change_keeps_all_current_value_views(old_coun
     plan = plan_projection_evidence_work(target,
         committed_base_snapshot=CommittedSourceUnitSnapshot(base.source_unit_revisions[0], base.observation_revisions),
         reprocess_all_current_observations=False)
-    assert isinstance(plan, ProjectionEvidencePlanningFailure if new_count > old_count else ExtractionAuthority)
+    assert isinstance(plan, ExtractionAuthority)
+    assert not any(plan.authorizes(f) for f in context.full_fragments
+                   if any(f.presentation_text.endswith(value) for value in ('Previous rule.', 'New rule.')))

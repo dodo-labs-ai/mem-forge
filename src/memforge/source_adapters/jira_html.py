@@ -27,12 +27,49 @@ _TAGS = {
     "p", "div", "span", "b", "strong", "i", "em", "u", "s", "del", "strike",
     "sup", "sub", "a", "br", "hr", "img", "pre", "code", "tt", "blockquote",
     "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6", "table", "thead",
-    "tbody", "tfoot", "tr", "th", "td", "colgroup", "col", "caption",
+    "tbody", "tfoot", "tr", "th", "td", "colgroup", "col", "caption", "font",
 }
 _CODE_SPAN_CLASSES = {"code-tag", "code-quote", "code-keyword", "code-comment"}
-_CODE_DIV_CLASSES = {frozenset({"code", "panel"}), frozenset({"codeContent", "panelContent"})}
 _ALIASES = {"b": "strong", "i": "em", "s": "del", "strike": "del", "tt": "code"}
 _BLOCKS = {"root", "p", "div", "blockquote", "li", "td", "th", "caption", "h1", "h2", "h3", "h4", "h5", "h6"}
+
+
+@dataclass(frozen=True, slots=True)
+class _Decoration:
+    """Provider rendering controls whose authored children retain their meaning."""
+
+    transparent: bool = False
+    style_properties: frozenset[str] = frozenset()
+    retain_class: bool = False
+    erase_literal_class: str | None = None
+
+
+_PANEL_STYLE = frozenset({"border-width", "border-style", "border-color"})
+_DECORATIONS = {
+    ("div", frozenset({"code", "panel"})): _Decoration(True, _PANEL_STYLE),
+    ("div", frozenset({"codeContent", "panelContent"})): _Decoration(True, _PANEL_STYLE),
+    ("div", frozenset({"preformatted", "panel"})): _Decoration(True, _PANEL_STYLE),
+    ("div", frozenset({"preformattedContent", "panelContent"})): _Decoration(True, _PANEL_STYLE),
+    ("div", frozenset({"panel"})): _Decoration(True, _PANEL_STYLE),
+    ("div", frozenset({"panelContent"})): _Decoration(True, _PANEL_STYLE),
+    ("div", frozenset({"table-wrap"})): _Decoration(True),
+    ("table", frozenset({"confluenceTable"})): _Decoration(),
+    ("th", frozenset({"confluenceTh"})): _Decoration(),
+    ("td", frozenset({"confluenceTd"})): _Decoration(),
+    ("a", frozenset({"external-link"})): _Decoration(retain_class=True, erase_literal_class="external-link"),
+    ("a", frozenset({"user-hover"})): _Decoration(),
+    ("span", frozenset({"image-wrap"})): _Decoration(True),
+    ("img", frozenset({"emoticon"})): _Decoration(retain_class=True),
+}
+_ATTRIBUTES = {
+    "a": {"href", "title", "class", "target", "rel", "id", "file-preview-id", "file-preview-title", "file-preview-type", "data-username"},
+    "img": {"src", "alt", "title", "role", "style", "class"},
+    "font": {"color", "face", "size"},
+    "pre": {"class"}, "span": {"class"}, "div": {"class", "style"},
+    "table": {"class"}, "ol": {"start"}, "li": {"value"},
+    "th": {"rowspan", "colspan", "scope", "class"}, "td": {"rowspan", "colspan", "class"},
+}
+_NAVIGATION_REL = {"nofollow", "noopener", "noreferrer"}
 
 
 @dataclass(slots=True)
@@ -136,32 +173,26 @@ def _validate_attributes(node, *, literal=False):
     """Only attested decoration or explicitly rendered semantic controls are supported."""
     literal = literal or node.tag in {"pre", "code", "tt"}
     attrs = {key: value for key, value in node.attrs.items() if key not in {"class", "style"} or value.strip()}
-    allowed = {
-        "a": {"href", "title", "class", "target", "rel", "id", "file-preview-id", "file-preview-title", "file-preview-type"},
-        "img": {"src", "alt", "title", "role", "style"},
-        "pre": {"class"}, "span": {"class"}, "div": {"class", "style"},
-        "ol": {"start"}, "li": {"value"},
-        "th": {"rowspan", "colspan", "scope"}, "td": {"rowspan", "colspan"},
-    }.get(node.tag, set())
+    allowed = _ATTRIBUTES.get(node.tag, set())
     if set(attrs) - allowed:
         raise ValueError(f"unsupported Jira rendered HTML attributes on {node.tag}")
     classes = _classes(node)
     if "class" in attrs:
         supported_class = (
-            node.tag == "a" and classes == {"external-link"}
-            or node.tag == "span" and classes == {"image-wrap"}
+            (node.tag, classes) in _DECORATIONS
             or node.tag == "span" and literal and classes <= _CODE_SPAN_CLASSES
-            or node.tag == "div" and classes in _CODE_DIV_CLASSES
             or node.tag == "pre" and re.fullmatch(r"code-[\w+-]+", attrs["class"])
         )
         if not supported_class:
             raise ValueError(f"unsupported Jira rendered HTML class on {node.tag}")
     if "style" in attrs:
         style = attrs["style"].replace(" ", "")
-        supported_style = (
-            node.tag == "div" and classes in _CODE_DIV_CLASSES and style == "border-width:1px;"
-            or node.tag == "img" and attrs.get("role") == "presentation" and style == "border:0pxsolidblack"
-        )
+        decoration = _DECORATIONS.get((node.tag, classes))
+        declarations = [part.strip() for part in style.split(";") if part.strip()]
+        supported_style = bool(decoration and declarations and all(
+            ":" in part and part.split(":", 1)[0] in decoration.style_properties
+            and part.split(":", 1)[1] for part in declarations
+        )) or node.tag == "img" and attrs.get("role") == "presentation" and style == "border:0pxsolidblack"
         if not supported_style:
             raise ValueError(f"unsupported Jira rendered HTML style on {node.tag}")
     if node.tag == "a":
@@ -169,8 +200,10 @@ def _validate_attributes(node, *, literal=False):
             raise ValueError("unsupported Jira rendered HTML anchor identity")
         if attrs.get("target", "_self") not in {"_self", "_blank", "_parent", "_top"}:
             raise ValueError("unsupported Jira rendered HTML link target")
-        if set(attrs.get("rel", "").split()) - {"nofollow", "noopener", "noreferrer"}:
+        if classes != {"user-hover"} and set(attrs.get("rel", "").split()) - _NAVIGATION_REL:
             raise ValueError("unsupported Jira rendered HTML link relationship")
+        if "data-username" in attrs and classes != {"user-hover"}:
+            raise ValueError("Jira author identity requires a rendered mention")
     if node.tag == "img" and attrs.get("role", "presentation") != "presentation":
         raise ValueError("unsupported Jira rendered HTML image role")
     if node.tag == "th" and attrs.get("scope", "col") != "col":
@@ -188,24 +221,23 @@ def _transparent(node, *, literal=False):
         classes = _classes(node)
         if literal and classes and classes <= _CODE_SPAN_CLASSES:
             return set(node.attrs) <= {"class"}
-        if classes == {"image-wrap"}:
-            return set(node.attrs) <= {"class", "style"} and not node.attrs.get("style", "").strip()
     if node.tag == "div":
         if not attrs:
             return True
-        if _classes(node) in _CODE_DIV_CLASSES:
-            return set(node.attrs) <= {"class", "style"} and node.attrs.get("style", "").replace(" ", "") in {"", "border-width:1px;"}
-    return False
+    decoration = _DECORATIONS.get((node.tag, _classes(node)))
+    return bool(decoration and decoration.transparent and set(attrs) <= {"class", "style"})
 
 
 def _attributes(node):
     attrs = {key: value for key, value in node.attrs.items() if key not in {"class", "style"} or value.strip()}
+    decoration = _DECORATIONS.get((node.tag, _classes(node)))
+    if decoration and (not decoration.retain_class or attrs.get("class") == decoration.erase_literal_class):
+        attrs.pop("class", None)
     if node.tag == "a":
-        if attrs.get("class") == "external-link":
-            attrs.pop("class")
         # Navigation/browser safety controls do not alter the linked identity.
-        for name in ("target", "rel"):
-            attrs.pop(name, None)
+        attrs.pop("target", None)
+        if _classes(node) != {"user-hover"}:
+            attrs.pop("rel", None)
         if attrs.get("file-preview-id") and attrs.get("id") == attrs["file-preview-id"] + "_thumb":
             attrs.pop("id")
     if node.tag == "pre" and re.fullmatch(r"code-[\w+-]+", attrs.get("class", "")):
@@ -272,6 +304,10 @@ def _render(node):
             if descriptions:
                 label += " — " + " / ".join(descriptions)
         details = []
+        if _classes(node) == {"user-hover"}:
+            identity = node.attrs.get("data-username") or node.attrs.get("rel")
+            if identity:
+                details.append(f"user: {identity}")
         if node.attrs.get("file-preview-id"):
             details.append(f"attachment: {node.attrs['file-preview-id']}")
         if node.attrs.get("file-preview-type"):
@@ -286,6 +322,8 @@ def _render(node):
         return f"[deleted: {text}]"
     if node.tag in {"sup", "sub"}:
         return f"[{node.tag}: {text}]"
+    if node.tag == "font":
+        return text + " [" + "; ".join(f"{key}: {value}" for key, value in sorted(node.attrs.items())) + "]" if node.attrs else text
     if node.tag in {"ol", "ul"}:
         try:
             number = int(node.attrs.get("start", "1"))

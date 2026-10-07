@@ -66,7 +66,7 @@ def _planned_requests(projection, authority):
 def test_extraction_contract_version_is_pinned_into_derivation_identity() -> None:
     # Stored derivations and batch ids hash this value; changing it supersedes
     # every stored derivation instead of resuming it.
-    assert PROJECTION_EXTRACTION_CONTRACT_VERSION == "projection-extraction-v20"
+    assert PROJECTION_EXTRACTION_CONTRACT_VERSION == "projection-extraction-v21"
 
 
 @pytest.mark.parametrize("status,version,reason,ready", (
