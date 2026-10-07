@@ -140,13 +140,23 @@ def _unit_title(kind: str, *fields: tuple[str, object]) -> UnitTitle:
 
 
 @dataclass(frozen=True, slots=True)
+class _UnitEndpoint:
+    """An adapter-declared relation target outside the projected Unit."""
+
+    unit_type: str
+    provider_key: str
+
+
+@dataclass(frozen=True, slots=True)
 class _NativeProjection:
     """One provider payload as a Source Unit, its Observations and its Unit Title."""
 
     unit_type: str
     provider_key: str
     observations: tuple[_ObservationInput, ...]
-    relations: tuple[tuple[SourceRelationType, str, str, str | None, Mapping[str, object]], ...]
+    relations: tuple[
+        tuple[SourceRelationType, str | _UnitEndpoint, str | _UnitEndpoint, str | None, Mapping[str, object]], ...
+    ]
     coverage: ProjectionCoverage
     locator: Mapping[str, object]
     # None only when the payload tombstones the whole Unit.
@@ -163,12 +173,6 @@ def _normalized_utc_timestamp(value: object) -> str | None:
     if parsed.tzinfo is None:
         return None
     return parsed.astimezone(timezone.utc).isoformat()
-
-
-def _provider_name(value: object) -> object:
-    """A provider object's display name, such as a Jira issue type's name."""
-
-    return value.get("name") if isinstance(value, Mapping) else value
 
 
 def _canonical_json(value: object) -> str:

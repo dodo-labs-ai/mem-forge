@@ -267,10 +267,15 @@ def comment_requires_rendering(comment: Mapping[str, object]) -> bool:
     """Whether an inline native comment needs the explicit renderedBody expansion."""
     return bool(comment.get("body")) and not isinstance(comment.get("renderedBody"), str)
 
+def _provider_name(value: object) -> object:
+    """Read the supplied display name of a Jira field object."""
+    return value.get("name") if isinstance(value, Mapping) else value
+
+
 def project_native(*, source_id, item, native, normalized):
     """Build provider identity, immutable Observations, relations and coverage."""
     from memforge.source_projection import ProjectionCoverage, SourceRelationType
-    from memforge.source_adapters.contracts import _ObservationInput, _NativeProjection, _unit_title, _canonical_json, _provider_name
+    from memforge.source_adapters.contracts import _ObservationInput, _NativeProjection, _unit_title, _canonical_json
     from memforge.genes.jira_gene import LOCAL_AGENT_JIRA_PACKAGE_KIND
 
     data = native if isinstance(native, dict) else {}

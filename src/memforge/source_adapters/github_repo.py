@@ -6,7 +6,7 @@ def project_native(*, source_id, item, native, normalized):
     """Build provider identity, immutable Observations, relations and coverage."""
     from memforge.source_projection import ProjectionCoverage, SourceRelationType
     from memforge.source_time import SOURCE_UPDATED_AT_KEY
-    from memforge.source_adapters.contracts import _ObservationInput, _NativeProjection, _unit_title
+    from memforge.source_adapters.contracts import _ObservationInput, _NativeProjection, _UnitEndpoint, _unit_title
     from memforge.github_repo_utils import build_github_repo_doc_id
 
     body_time = normalized.source_semantics.get(SOURCE_UPDATED_AT_KEY)
@@ -53,7 +53,7 @@ def project_native(*, source_id, item, native, normalized):
             (
                 SourceRelationType.RENAMED_FROM,
                 "$unit",
-                f"github_file:{repo}:{previous}",
+                _UnitEndpoint("github_file", f"{repo}:{previous}"),
                 None,
                 ({"predecessor_document_id": str(predecessor_document_id)} if predecessor_document_id else {}),
             ),
