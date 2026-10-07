@@ -172,6 +172,8 @@ def test_confluence_page_id_is_unit_and_parent_is_location_only() -> None:
     assert moved.deltas[0].axes == frozenset({DeltaAxis.LOCATION})
     assert moved.deltas[0].requires_extraction is False
     assert moved.relations[0].relation_type is SourceRelationType.CONTAINED_BY
+    assert moved.relations[0].from_id == first.source_units[0].id
+    assert moved.relations[0].to_id == _stable_id("unit", "src-c", "confluence_page", "200")
 
 
 def test_binary_artifact_revision_is_bound_to_parent_observation_and_exact_hash() -> None:
@@ -1148,6 +1150,30 @@ def test_document_and_append_sources_use_stable_provider_units(
     assert projection.observations[0].observation_type == expected_observation_type
 
 
+@pytest.mark.parametrize("receipt", [
+    None, "invalid", {}, {"client": "codex", "session_id": "s:1", "history_window_kind": "summary"},
+])
+def test_session_window_projection_preserves_receipt_and_partial_coverage(receipt) -> None:
+    item = _item()
+    raw, normalized = _inputs(item, {"doc_id": "window:1", "receipt": receipt, "markdown": "Authored summary."})
+    projection = project_source_item(
+        source_id="src-session", source_type="agent_session", run_id="run-session",
+        item=item, raw=raw, normalized=normalized,
+    )
+    expected_receipt = receipt if isinstance(receipt, dict) else {}
+    unit = projection.source_units[0]
+    assert unit.id == _stable_id("unit", "src-session", "agent_session_window", "window:1")
+    assert unit.locator == {
+        "document_id": item.item_id,
+        "client": expected_receipt.get("client"),
+        "session_id": expected_receipt.get("session_id"),
+        "history_window_kind": expected_receipt.get("history_window_kind"),
+        "url": item.source_url,
+    }
+    assert projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION
+    assert projection.observation_revisions[0].content == "Authored summary."
+
+
 @pytest.mark.parametrize("source_type", ["github_repo", "local_markdown"])
 def test_file_move_with_provider_lineage_preserves_observation_identity(source_type: str) -> None:
     first_extra = {"relative_path": "old/design.md", "file_lineage_id": "file-77"}
@@ -1255,6 +1281,8 @@ def test_attested_github_compare_previous_filename_preserves_unit_without_daemon
 
     assert moved.source_units[0].id == first.source_units[0].id
     assert moved.deltas[0].axes == frozenset({DeltaAxis.LOCATION})
+    assert moved.relations[0].from_id == moved.source_units[0].id
+    assert moved.relations[0].to_id == first.source_units[0].id
 
     ordinary_item = _item(
         item_id="file-new",

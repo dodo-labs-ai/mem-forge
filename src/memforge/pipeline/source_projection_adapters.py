@@ -1,10 +1,8 @@
 """Provider adapters that project fetched Gene items into stable source lineage.
 
-Genes remain responsible for authentication and provider I/O.  This module is
-the provider-specific end of the lifecycle seam: it turns native payloads into
-provider-neutral Source Units, Observations, immutable revisions, relations,
-and deltas.  Downstream extraction and lifecycle code never branches on these
-source types.
+Genes remain responsible for authentication and provider I/O. Source adapters
+own native payload interpretation. This module turns their declarations into
+Source Units, Observations, immutable revisions, relations, and deltas.
 """
 
 from __future__ import annotations
@@ -16,7 +14,7 @@ from typing import Mapping
 
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.source_adapters.contracts import (
-    _ObservationInput, _NativeProjection, _unit_title, _canonical_json,
+    _ObservationInput, _NativeProjection, _UnitEndpoint, _unit_title, _canonical_json,
 )
 from memforge.source_projection import (
     AnchorKind,
@@ -417,12 +415,14 @@ def project_source_item(
         value.provider_key: observation.id for value, observation in zip(observations_input, observations, strict=True)
     }
 
-    def endpoint(value: str) -> str:
+    def endpoint(value: str | _UnitEndpoint) -> str:
+        if isinstance(value, _UnitEndpoint):
+            return _stable_id("unit", source_id, value.unit_type, value.provider_key)
         if value == "$unit":
             return unit_id
         if value in observation_ids_by_provider_key:
             return observation_ids_by_provider_key[value]
-        return _relation_endpoint(source_id, unit_type, value)
+        return _stable_id("obs", source_id, unit_type, value)
 
     relations = tuple(
         SourceRelation(
@@ -554,29 +554,9 @@ def _project_native(
 
         return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
     if source_type == "agent_session":
-        data = native if isinstance(native, dict) else {}
-        receipt = data.get("receipt") if isinstance(data.get("receipt"), dict) else {}
-        window_id = str(data.get("doc_id") or item.item_id)
-        body = str(data.get("markdown") or normalized.markdown_body)
-        return _NativeProjection(
-            unit_type="agent_session_window",
-            provider_key=window_id,
-            observations=(_ObservationInput("session_summary", window_id, body, body, {}, body_time),),
-            relations=(),
-            coverage=ProjectionCoverage.PARTIAL_PROJECTION,
-            locator={
-                "client": receipt.get("client"),
-                "session_id": receipt.get("session_id"),
-                "history_window_kind": receipt.get("history_window_kind"),
-                "url": item.source_url,
-            },
-            title=_unit_title(
-                "Agent session",
-                ("Client", receipt.get("client")),
-                ("Window", receipt.get("history_window_kind")),
-                ("Title", item.title),
-            ),
-        )
+        from memforge.source_adapters.agent_session import project_native
+
+        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
     # Extension-safe fallback for document-like genes that have not yet opted
     # into a richer native projection.  It deliberately claims only partial
     # coverage, so it can drive semantic change detection but can never prove
@@ -608,15 +588,6 @@ def _native_payload(raw: RawContent) -> object:
         except json.JSONDecodeError:
             return text
     return text
-
-
-def _relation_endpoint(source_id: str, unit_type: str, provider_key: str) -> str:
-    endpoint_type, separator, endpoint_key = provider_key.partition(":")
-    if separator and endpoint_type in {"confluence_page", "github_file"}:
-        return _stable_id("unit", source_id, endpoint_type, endpoint_key)
-    return _stable_id("obs", source_id, unit_type, provider_key)
-
-
 
 
 def _canonical_hash(value: object) -> str:

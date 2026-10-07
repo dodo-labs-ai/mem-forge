@@ -37,7 +37,7 @@ def project_native(*, source_id, item, native, normalized):
     """Build provider identity, immutable Observations, relations and coverage."""
     from memforge.source_projection import ProjectionCoverage, SourceRelationType
     from memforge.source_time import SOURCE_UPDATED_AT_KEY
-    from memforge.source_adapters.contracts import _ObservationInput, _NativeProjection, _unit_title, _canonical_json
+    from memforge.source_adapters.contracts import _ObservationInput, _NativeProjection, _UnitEndpoint, _unit_title, _canonical_json
 
     body_time = normalized.source_semantics.get(SOURCE_UPDATED_AT_KEY)
     page_id = str(item.extra.get("page_id") or item.item_id.removeprefix("confluence-"))
@@ -48,7 +48,7 @@ def project_native(*, source_id, item, native, normalized):
             (
                 SourceRelationType.CONTAINED_BY,
                 "$unit",
-                f"confluence_page:{parent_id}",
+                _UnitEndpoint("confluence_page", parent_id),
                 f"{page_id}:parent",
                 {},
             ),
