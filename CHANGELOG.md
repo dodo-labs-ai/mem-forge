@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Review queues and Memory `open_review_id` links share caller-scoped
+  participant and Source visibility and pinned-version checks. A hidden or
+  dynamically stale newer Review cannot displace an older eligible Review.
+  Candidate lookup covers every pending Review involving the waiting Memories
+  on the requested page, including related challengers; read paths never change
+  durable Review status. SQLite and HANA implement the same candidate contract.
+- Review pages hydrate staged Lifecycle evidence only for the requested page,
+  and the V2 waiting count requests one item. Exact totals still evaluate all
+  matching candidates and participant versions; backend work grows with queue
+  size. Memory navigation no longer downloads the full Review queue.
+
 - The runtime provider owns its vector backend. `RuntimeProvider.build_adapters`
   now takes `(db, config, *, audit_logger)` instead of a caller-opened
   `memory_collection`, and the admin memory-store and project routes no longer

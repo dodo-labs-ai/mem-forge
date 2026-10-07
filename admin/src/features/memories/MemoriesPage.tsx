@@ -6,7 +6,7 @@ import { REVIEW_PATH } from "@/lib/paths";
 import { PageHeader } from "@/patterns";
 import { Button } from "@/ui/button";
 import { Tabs, TabsList, TabsTrigger } from "@/ui/tabs";
-import { useMemoryStats, useOpenReviews, useRefreshMemories, useRelationCounts } from "./api";
+import { useMemoryStats, useOpenReviewCount, useRefreshMemories, useRelationCounts } from "./api";
 import { MemoryListView } from "./MemoryListView";
 import { MemoryStatCards } from "./MemoryStatCards";
 import { MemoryTableContext } from "./memoryTableContext";
@@ -27,7 +27,7 @@ export function MemoriesPage() {
   const [params, setParams] = useSearchParams();
   const state = readPageState(params);
   const stats = useMemoryStats();
-  const reviews = useOpenReviews();
+  const openReviews = useOpenReviewCount();
   const relationCounts = useRelationCounts();
   const projects = useProjects();
   const { sources } = useSources();
@@ -66,7 +66,7 @@ export function MemoriesPage() {
 
       <MemoryStatCards
         stats={stats.data}
-        openReviews={reviews.total}
+        openReviews={openReviews.total}
         relationCounts={relationCounts.counts}
         reviewQueuePath={REVIEW_PATH}
         conflictsPath={CONFLICTS_SEARCH}
@@ -80,7 +80,6 @@ export function MemoriesPage() {
             state={state}
             onStateChange={update}
             viewSwitch={viewSwitch}
-            reviewByMemory={reviews.reviewByMemory}
             projects={projects.data ?? EMPTY_LIST}
             sources={sources}
           />

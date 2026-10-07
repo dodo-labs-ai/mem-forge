@@ -1,10 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { makeMemory, makeRelatedMemory, makeRelation } from "@/test/memoryFixtures";
-import { makeReviewListItem } from "@/test/reviewFixtures";
 import { memoryRow, relationHints, searchHitRow, sourceName, sourceSummary } from "./memoryRows";
-import { reviewIdByMemoryId } from "./reviews";
-
-const NO_REVIEWS = new Map<string, string>();
 
 describe("relation hints", () => {
   test("count conflicts and point an updated memory to the newer one", () => {
@@ -27,7 +23,7 @@ describe("relation hints", () => {
 
 describe("memory rows", () => {
   test("carry project, access and sources from the admin listing", () => {
-    const row = memoryRow(makeMemory({ visibility: "private" }), NO_REVIEWS);
+    const row = memoryRow(makeMemory({ visibility: "private" }));
     expect(row.context).toEqual({
       projectKey: "PAY",
       isPrivate: true,
@@ -36,13 +32,12 @@ describe("memory rows", () => {
     expect(row.target).toBe("/memories/mem-cutoff");
   });
 
-  test("open the pending review of a memory that waits for one", () => {
-    const reviews = reviewIdByMemoryId([makeReviewListItem({ id: "rev-9", challenger_memory_id: "mem-cutoff" })]);
-    expect(memoryRow(makeMemory({ status: "pending_review" }), reviews).target).toBe("/review/rev-9");
-    expect(memoryRow(makeMemory({ status: "active" }), reviews).target).toBe("/memories/mem-cutoff");
+  test("open the review a memory waits for", () => {
+    expect(memoryRow(makeMemory({ status: "pending_review", open_review_id: "rev-9" })).target).toBe("/review/rev-9");
+    expect(memoryRow(makeMemory({ status: "active" })).target).toBe("/memories/mem-cutoff");
   });
 
-  test("from ranked search have no context", () => {
+  test("from ranked search have no context and open the memory", () => {
     const row = searchHitRow(
       {
         memory_id: "mem-hit",
@@ -52,23 +47,18 @@ describe("memory rows", () => {
         corroborated_by: 1,
         last_observed_at: "2026-09-29T08:00:00Z",
         freshness: "current",
-        status: "active",
+        status: "pending_review",
         relations: [makeRelation()],
       },
-      NO_REVIEWS,
     );
-    expect(row).toMatchObject({ id: "mem-hit", context: null, supportCount: 1, seenAt: "2026-09-29T08:00:00Z" });
+    expect(row).toMatchObject({
+      id: "mem-hit",
+      context: null,
+      supportCount: 1,
+      seenAt: "2026-09-29T08:00:00Z",
+      target: "/memories/mem-hit",
+    });
     expect(row.relationHints).toEqual([{ kind: "conflicts", count: 1, target: "/memories/mem-hit" }]);
-  });
-});
-
-describe("reviews by memory", () => {
-  test("point both sides of a review to it and keep the first review", () => {
-    const byMemory = reviewIdByMemoryId([
-      makeReviewListItem({ id: "rev-1", incumbent_memory_id: "mem-a", challenger_memory_id: "mem-b" }),
-      makeReviewListItem({ id: "rev-2", incumbent_memory_id: "mem-b", challenger_memory_id: null }),
-    ]);
-    expect(Object.fromEntries(byMemory)).toEqual({ "mem-a": "rev-1", "mem-b": "rev-1" });
   });
 });
 
