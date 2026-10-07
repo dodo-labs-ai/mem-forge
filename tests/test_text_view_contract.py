@@ -149,7 +149,6 @@ def test_sqlite_delivery_preserves_view_and_history_but_rejects_corrupt_origins(
 def test_duplicate_population_reads_all_current_without_inventing_removed_occurrence(source_type, old_count, new_count):
     from tests.test_jira_native_evidence import projection as jira_projection
     from memforge.source_representation import MARKDOWN_STRUCTURAL_PROFILE, PLAIN_TEXT_PROFILE
-    from memforge.pipeline.projection_context import ProjectionEvidencePlanningFailure
 
     def make(count, prior=None):
         native = '<p>Same rule.</p>' * count
@@ -175,11 +174,8 @@ def test_duplicate_population_reads_all_current_without_inventing_removed_occurr
     plan = plan_projection_evidence_work(target,
         committed_base_snapshot=CommittedSourceUnitSnapshot(base.source_unit_revisions[0], base.observation_revisions),
         reprocess_all_current_observations=False)
-    if new_count > old_count:
-        assert isinstance(plan, ProjectionEvidencePlanningFailure)
-    else:
-        assert isinstance(plan, ExtractionAuthority)
-        assert not any(plan.authorizes(f) for f in relevant(context.full_fragments))
+    assert isinstance(plan, ExtractionAuthority)
+    assert not any(plan.authorizes(f) for f in relevant(context.full_fragments))
     if new_count:
         old_fragments = relevant(build_revision_fragment_index(base.observation_revisions[0]).fragments)
         parts = tuple(ActiveSupportEvidence(memory_id='m', source_id=base.source_id,

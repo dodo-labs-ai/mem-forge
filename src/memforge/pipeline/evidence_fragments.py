@@ -41,7 +41,7 @@ from memforge.source_representation import (
 )
 
 
-COMPILER_CONTRACT_VERSION = 9
+COMPILER_CONTRACT_VERSION = 10
 DEFAULT_MAX_FRAGMENTS = 2_048
 DEFAULT_MAX_PRESENTATION_CHARS = 120_000
 _SUPPORTING_ROLES = frozenset({EvidenceRole.PRIMARY, EvidenceRole.REQUIRED})
@@ -161,10 +161,8 @@ def _changed_material_keys(base_counts, target_counts, *, purpose):
     """
     if purpose not in {"authority", "current", "removed"}:
         raise ValueError("unknown source comparison purpose")
-    if purpose == "authority" and any(
-        0 < base_counts[key] < count for key, count in target_counts.items()
-    ):
-        raise ValueError("new repeated material has no stable occurrence identity")
+    # Multiplicity changes require reading all current copies, but authorize no
+    # arbitrary copy as a new assertion. Independent new material remains work.
     return {key for key, count in target_counts.items()
             if base_counts[key] == 0 or (purpose == "current" and base_counts[key] != count)}
 
