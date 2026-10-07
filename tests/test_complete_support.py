@@ -1,9 +1,6 @@
-"""Complete Support: one definition, shared by Support Assessment and Candidate Admission.
+"""Whole Support uses immutable source framing; admission judges value and duplicates.
 
-A claim is completely supported only when every specific it states is in, or
-follows directly from, its selected Evidence. Fixture judgments here apply that
-definition to show what the pipeline supplies to the reading and what an
-UNSUPPORTED answer does; they are not model-accuracy evidence.
+Fixture judgments test supplied evidence and lifecycle consequences, not model accuracy.
 """
 
 from __future__ import annotations
@@ -43,45 +40,37 @@ ISSUE_KEY = re.compile(r"\b[A-Z][A-Z0-9]*-\d+\b")
 FIRST_COMMIT_AT = datetime(2026, 9, 25, tzinfo=timezone.utc)
 
 
-def test_complete_support_names_every_kind_of_specific_a_claim_can_state():
+def test_whole_support_preserves_material_claim_qualifications_and_source_scope():
     definition = " ".join(COMPLETE_SUPPORT_DEFINITION.split())
-    for specific in (
-        "names of people, systems and things", "identifiers", "quantities", "dates and times", "statuses",
-        "conditions and scope",
-    ):
+    for specific in ("conditions", "exceptions", "scope", "modality", "attribution", "effective boundaries"):
         assert specific in definition
-    assert "neither the Evidence nor the unit_title contains, is not supported" in definition
-    assert "even when the rest of the claim matches" in definition
+    assert "changes outside selected refs" in definition
+    assert "omission alone does not prove" in definition
 
 
-def test_a_claim_may_state_every_unit_title_value_and_the_unit_title_is_never_evidence():
-    definition = " ".join(COMPLETE_SUPPORT_DEFINITION.split())
-    title = " ".join(UNIT_TITLE_DEFINITION.split())
-    for text in (definition, title):
-        assert "key, type, summary, title or path" in text
-    assert "appears in that Evidence or in the unit_title" in definition
-    assert "The unit_title is never Evidence" in definition
-    assert "never Evidence" in title
-    assert "Apart from the Unit's own earlier names, an identifier that neither the unit_title nor the Evidence " \
-        "contains, such as another Unit's key, is not supported." in definition
-    assert "selected Evidence (evidence_refs into evidence_catalog, one Primary and any Required parts), read with " \
-        "the unit_title, completely supports the entire claim" in " ".join(candidate_admission._ADMISSION_INSTRUCTIONS.split())
+def test_display_title_cannot_substantiate_claim_facts():
+    assert "display-only" in COMPLETE_SUPPORT_DEFINITION
+    assert "not source Evidence" in UNIT_TITLE_DEFINITION
+    assert "cannot substantiate claim facts" in UNIT_TITLE_DEFINITION
+    assert "authenticated source fact or referent" in COMPLETE_SUPPORT_DEFINITION
 
 
-def test_support_assessment_and_admission_share_the_one_definition_and_change_impact_does_not_use_it():
+def test_support_assessment_uses_whole_support_and_admission_has_no_entailment_repair():
     assert revision_work.ASSESS_PROMPT.count(COMPLETE_SUPPORT_DEFINITION) == 1
-    assert candidate_admission._ADMISSION_INSTRUCTIONS.count(COMPLETE_SUPPORT_DEFINITION) == 1
+    assert COMPLETE_SUPPORT_DEFINITION not in candidate_admission._ADMISSION_INSTRUCTIONS
+    assert "Same-round duplicates" in candidate_admission._ADMISSION_INSTRUCTIONS
+    assert "Never rewrite or merge claim text" in candidate_admission._ADMISSION_INSTRUCTIONS
     assert COMPLETE_SUPPORT_DEFINITION not in revision_work.CHANGE_IMPACT_PROMPT
 
 
 def test_the_definition_raises_every_contract_whose_result_it_defines():
-    assert REVISION_SUPPORT_CONTRACT == "revision-support-v8"
-    assert SUPPORT_ASSESSMENT_CONTRACT == "support-ordered-reading-v6"
-    assert CANDIDATE_ADMISSION_CONTRACT == "candidate-admission-v5"
+    assert REVISION_SUPPORT_CONTRACT == "revision-support-v11"
+    assert SUPPORT_ASSESSMENT_CONTRACT == "support-ordered-reading-v9"
+    assert CANDIDATE_ADMISSION_CONTRACT == "candidate-admission-v7"
 
 
 @pytest.mark.asyncio
-async def test_every_support_reading_and_admission_request_carries_the_definition():
+async def test_support_reads_full_contract_and_value_admission_receives_authenticated_source():
     client = Client(limit=16000)
     await RevisionWorkExecutor(client=client, model="fixture").assess_many(
         work_items("Two reviewers approve US releases.\n\nRelease notes are published weekly.\n"),
@@ -100,33 +89,31 @@ async def test_every_support_reading_and_admission_request_carries_the_definitio
         resolved_evidence_selection=catalog.resolve_selection(primary_ref=decision.reference),
     )], client=admission, model="fixture", unit_title=projection.unit_title)
     [prompt] = admission.prompts
-    assert COMPLETE_SUPPORT_DEFINITION in prompt
+    assert COMPLETE_SUPPORT_DEFINITION not in prompt
+    assert f"Issue: {TITLE_KEY}" in prompt
     assert f"<unit_title>\n{render_unit_title(projection.unit_title)}\n</unit_title>" in prompt
 
 
 class _IdentifierReadingClient(ScriptedClient):
-    """Judges Support by the definition: every issue key the claim names must be the Unit Title's key."""
+    """Fixture judgment reads the immutable comment issue key, independent of display aliases."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self.titles_read: list[str] = []
+        self.source_keys_read: list[set[str]] = []
 
     async def assess_support(self, prompt, **kwargs):
         payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
         rows = [*payload["current"]["primary_candidates"], *payload["current"]["required_only_candidates"]]
         decision = next(row for row in rows if row[0].startswith("PRM-") and DECISION in row[1])
-        if "<unit_title>" not in prompt:
-            return FixtureSupport(status="unsupported", primary_ref=decision[0])
-        title = prompt.split("<unit_title>\n", 1)[1].split("\n</unit_title>", 1)[0]
-        self.titles_read.append(title)
-        [title_key] = re.findall(r"^Key: (\S+)$", title, flags=re.MULTILINE)
+        source_keys = set(ISSUE_KEY.findall(decision[1]))
+        self.source_keys_read.append(source_keys)
         named = set(ISSUE_KEY.findall(payload["claim"]))
-        status = "supported" if named == {title_key} else "unsupported"
+        status = "supported" if named == source_keys else "unsupported"
         return FixtureSupport(status=status, primary_ref=decision[0])
 
 
 def _claim(content: str) -> RawMemory:
-    """A claim whose Evidence is the decision comment; the key it names is the Unit Title's to confirm."""
+    """A claim whose Evidence is an issue-framed immutable decision comment."""
     return RawMemory(content=content, memory_type="decision", evidence_quote=DECISION)
 
 
@@ -141,7 +128,7 @@ async def _commit(db: Database, client, projection, claims, *, day: int, **optio
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("correction", [False, True], ids=["retired", "superseded"])
-async def test_a_reprocessed_claim_naming_another_identifier_than_its_unit_title_is_unsupported(
+async def test_reprocessed_claim_naming_another_identifier_than_immutable_source_is_unsupported(
     db: Database, correction: bool,
 ) -> None:
     await _set_fixture_source_type(db, "jira")
@@ -168,8 +155,7 @@ async def test_a_reprocessed_claim_naming_another_identifier_than_its_unit_title
     )
 
     assert stats["support_revalidation_reprocess_count"] == 1
-    # The reading supplied the Unit Title, whose key contradicts the key the claim names.
-    assert client.titles_read and all(f"Key: {TITLE_KEY}" in title for title in client.titles_read)
+    assert client.source_keys_read and all(keys == {TITLE_KEY} for keys in client.source_keys_read)
     old = await db.get_memory(memory.id)
     if correction:
         assert stats["superseded"] == 1 and old.status == "superseded"

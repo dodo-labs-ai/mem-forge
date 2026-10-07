@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.evidence_display_fixture import evidence_displays
+
 from tests.revision_client_fixture import RevisionClientFixture
 
 import hashlib
@@ -712,7 +714,7 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
                         memory_type="convention",
                         primary_ref=primary.reference,
                         required_refs=[],
-                    )
+                     evidence_displays=evidence_displays(primary.reference, []))
                 ]
             )
 
@@ -840,7 +842,7 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
                         memory_type="convention",
                         primary_ref=updated_primary.reference,
                         required_refs=[],
-                    )
+                     evidence_displays=evidence_displays(updated_primary.reference, []))
                 ]
             )
 

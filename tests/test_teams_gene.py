@@ -1358,6 +1358,8 @@ class TestFetch:
             _msg("root", "Alice", "Question about API", NOW - timedelta(minutes=10)),
             _msg("r1", "Bob", "Here's the answer", NOW),
         ]
+        thread_msgs[1]["parentMessageId"] = "root"
+        thread_msgs[1]["rootMessageId"] = "root"
         gene._client.get_thread_messages = AsyncMock(return_value=thread_msgs)
 
         from memforge.models import ContentItem
@@ -1383,6 +1385,8 @@ class TestFetch:
         assert len(data["messages"]) == 2
         assert "Alice" in data["participants"]
         assert "Bob" in data["participants"]
+        assert data["messages"][1]["parentMessageId"] == "root"
+        assert data["messages"][1]["rootMessageId"] == "root"
 
 
 # ---------------------------------------------------------------------------

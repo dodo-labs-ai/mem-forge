@@ -130,5 +130,8 @@ class SupportWireAliases:
                 "work_id": work_id,
                 "primary_ref": self._ref(row.primary_ref, f"{at}.primary_ref", allowed=self._primary_ids),
                 "required_refs": self._refs(row.required_refs, f"{at}.required_refs"),
+                "evidence_displays": [display.model_copy(update={
+                    "ref": self._ref(display.ref, f"{at}.evidence_displays[{index}].ref"),
+                }) for index, display in enumerate(row.evidence_displays)],
             })
         return row.model_copy(update={"work_id": work_id})

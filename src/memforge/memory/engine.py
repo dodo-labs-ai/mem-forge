@@ -154,6 +154,7 @@ class _PreparedLifecyclePlanInputs:
     defaults: NewMemoryDefaults
     evidence_units: tuple[EvidenceUnit, ...]
     evidence_references: tuple[EvidenceReference, ...]
+    unresolved_coordinator_review_ids: frozenset[str] = frozenset()
 
 
 @dataclass(slots=True)
@@ -452,6 +453,9 @@ class MemoryEngine:
                     SupportRevalidationLimitationCode.COMPILER_FAILURE: (
                         "support_revalidation_compiler_failure"
                     ),
+                    SupportRevalidationLimitationCode.EVIDENCE_INTEGRITY: (
+                        "support_revalidation_evidence_integrity"
+                    ),
                 }[exc.code]
                 if isinstance(exc, SupportRevalidationLimitation)
                 else None
@@ -621,6 +625,7 @@ class MemoryEngine:
             coordinator_reviews=await self._coordinator_reviews(
                 source_unit_id=inputs.scope.source_unit_id, incumbent_ids=incumbent_ids,
             ),
+            unresolved_coordinator_review_ids=inputs.unresolved_coordinator_review_ids,
         )
 
     def _prepared_runtime_bundle(
@@ -942,6 +947,7 @@ class MemoryEngine:
                 target_unit_revision_id=scope.target_unit_revision_id,
                 operation_input_hash=operation_input_hash, execution_owner_id=lifecycle_execution_owner_id))
         _runtime_context.incumbent_count = len(incumbents)
+        unresolved_coordinator_review_ids = frozenset()
         _runtime_context.stage = "candidate_admission"
         evidence_image_loader = _projection_evidence_image_loader(projection, self.document_store)
         admission = await admit_candidates(
@@ -1062,7 +1068,7 @@ class MemoryEngine:
                         projection=projection, base=baseline, access_context_hash=access_context_hash,
                         image_loader=evidence_image_loader, indexes=assessment_context.indexes,
                         known_observations=base.observations if base is not None else (),
-                        evidence_revisions=evidence_revisions,
+                        evidence_revisions=tuple(assessment_context.revisions.values()),
                     )
                 contexts_by_revision = {base.source_unit_revisions[0].id: assessment_context} if base else {}
                 for memory in model_incumbents:
@@ -1192,10 +1198,43 @@ class MemoryEngine:
                             source_unit_id=scope.source_unit_id,
                             incumbent_ids=tuple(memory.id for memory in model_incumbents),
                         )
+                        staged_revision_ids = {
+                            str(part["observation_revision_id"])
+                            for review in unit_reviews
+                            for name in ("candidate", "rejection_candidate")
+                            for part in (review.staged_evidence.get(name) or {}).get("evidence", ())
+                            if isinstance(part, Mapping) and part.get("observation_revision_id")
+                        }
+                        missing = staged_revision_ids - set(assessment_context.revisions)
+                        if missing:
+                            assessment_context.revisions.update(await self.db.get_source_observation_revisions(missing))
+                    async def context_for_review(review):
+                        # The existing Plan names the complete revision where this
+                        # staged claim last stood. The incumbent's newer baseline
+                        # is not a validation baseline for the challenger.
+                        payload = await self.db.get_lifecycle_plan_payload(review.lifecycle_plan_id)
+                        review_scope = payload.get("scope", {}) if isinstance(payload, Mapping) else {}
+                        baseline_id = review_scope.get("target_unit_revision_id")
+                        historical = None
+                        if (review_scope.get("source_id") == projection.source_id
+                                and review_scope.get("source_unit_id") == scope.source_unit_id
+                                and baseline_id):
+                            historical = await self.db.get_source_unit_revision_projection(scope.source_unit_id, baseline_id)
+                            if (historical is not None and (historical.source_id != projection.source_id
+                                    or len(historical.source_unit_revisions) != 1
+                                    or historical.source_unit_revisions[0].source_unit_id != scope.source_unit_id
+                                    or historical.source_unit_revisions[0].id != baseline_id)):
+                                historical = None
+                        # No proven baseline means ordinary full-current assessment.
+                        return assessment_context_for(historical)
+
+                    carried = await carried_conflicts(
+                        unit_reviews, assessment_context, evaluator=evaluator, context_for_review=context_for_review,
+                    ) if unit_reviews else None
+                    unresolved_coordinator_review_ids = carried.unresolved_review_ids if carried else frozenset()
                     ledger = carry_into_ledger(
                         filtered_memories, relation.entries,
-                        carried_conflicts(unit_reviews, assessment_context.catalog(assessment_context.full_fragments))
-                        if unit_reviews else (),
+                        carried.conflicts if carried else (),
                     )
                     stats["coordinator_carried_conflict_count"] = len(ledger.carried_pairs)
                     result = await join_support_and_relation(
@@ -1508,6 +1547,7 @@ class MemoryEngine:
                 defaults=defaults,
                 evidence_units=projected_evidence.units,
                 evidence_references=projected_evidence.references,
+                unresolved_coordinator_review_ids=unresolved_coordinator_review_ids,
             ),
             document=document,
             unit_input=unit_input,

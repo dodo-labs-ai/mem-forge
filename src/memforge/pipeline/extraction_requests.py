@@ -5,7 +5,9 @@ import hashlib
 from memforge.llm.batch_runner import LlmBatchRunner
 from memforge.llm.structured import INPUT_CAPACITY_EXCEEDED
 from memforge.pipeline.memory_extractor import ExtractionReading, MemoryExtractor
-from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionPlan, ExtractionRequest
+from memforge.pipeline.projection_context import (
+    ExtractionAuthority, ExtractionPlan, ExtractionRequest,
+)
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 
 
@@ -21,9 +23,9 @@ def plan_extraction_requests(
 
     An update authorizes only its changed structures, so it reads those
     ReadingGroups; a first import or reprocess reads every ReadingGroup. There is
-    no cost comparison with another reading scope and no truncation: a
-    ReadingGroup that alone exceeds the route's capacity is skipped with a
-    diagnostic, and every other group is planned.
+    no cost comparison with another reading scope and no truncation. A group
+    that cannot fit alone is diagnosed and skipped; independent groups remain
+    planned. The revision's incumbent Support work is assessed separately.
     """
 
     reading = ExtractionReading.of_authority(context, authority, source_type=source_type, doc_type=doc_type)
@@ -36,6 +38,7 @@ def plan_extraction_requests(
             item_ids, output_tokens=extractor.fragment_output_tokens, fits=runner.fits,
         ),
     )
+    skipped = reading.report_unread(dict.fromkeys(planned.unfit, INPUT_CAPACITY_EXCEEDED))
     source_unit_id = context.projection.source_units[0].id
     requests = []
     for entry in planned.requests:
@@ -51,10 +54,9 @@ def plan_extraction_requests(
             )
         )
 
-    unfit = set(planned.unfit)
     expected = {
         fragment.anchor
-        for item_id, group in reading.items.items() if item_id not in unfit
+        for item_id, group in reading.items.items() if item_id not in planned.unfit
         for fragment in group if fragment.primary_eligible
     }
     actual = [
@@ -65,4 +67,4 @@ def plan_extraction_requests(
     ]
     if len(actual) != len(set(actual)) or set(actual) != expected:
         raise ValueError("extraction request authority coverage mismatch")
-    return ExtractionPlan(tuple(requests), reading.report_skipped(dict.fromkeys(planned.unfit, INPUT_CAPACITY_EXCEEDED)))
+    return ExtractionPlan(tuple(requests), skipped)

@@ -20,6 +20,7 @@ from memforge.pipeline.evidence_fragments import (
     RevisionFragmentIndex,
     build_revision_fragment_index,
     canonical_record_field_ranges,
+    canonical_record_changed_raw_ranges,
     canonical_record_is_tombstoned,
     revision_changed_structural_ranges,
     revision_structural_ranges,
@@ -37,15 +38,15 @@ from memforge.pipeline.projection_fragments import (
     _compose_projection_fragment_catalog,
 )
 from memforge.source_projection import SourceAnchor, SourceObservationRevision, SourceProjection
-from memforge.source_representation import in_current_representation
+from memforge.source_representation import in_current_representation, representation_contract_for_profile
 
 # Versions how a fixed Support is revalidated against a revision: it enters the
 # reconciliation manifest and each revalidated Support's ``support_validation``.
-REVISION_SUPPORT_CONTRACT = "revision-support-v8"
+REVISION_SUPPORT_CONTRACT = "revision-support-v11"
 # Versions how revision Fragments are compiled into catalogs, what every
 # reading adds as context, and Claim Extraction's reading scope. Every catalog
 # this context composes, for extraction or for Support, carries it in its identity.
-REVISION_INPUT_POLICY = "revision-input-v8"
+REVISION_INPUT_POLICY = "revision-input-v10"
 
 
 def reading_group_label(fragments) -> str:
@@ -90,23 +91,15 @@ class SupportAssessment:
     complete_read: bool = False
 
 
-def _changed_ranges(base: SourceObservationRevision, target: SourceObservationRevision):
+def _changed_ranges(base: SourceObservationRevision, target: SourceObservationRevision, *, purpose="current"):
     if base.id == target.id:
         return ()
     profile = target.evidence_profile
     if base.evidence_profile == profile and profile is not None:
         if profile.name in {"markdown-structural", "plain-text"}:
-            return revision_changed_structural_ranges(base, target)
+            return revision_changed_structural_ranges(base, target, purpose=purpose)
         if profile.name == "canonical-record":
-            previous = {
-                field.descriptor.json_pointer: field.comparison_value for field in canonical_record_field_ranges(base)
-            }
-            return tuple(
-                (field.start, field.end)
-                for field in canonical_record_field_ranges(target)
-                if field.descriptor.json_pointer not in previous
-                or previous[field.descriptor.json_pointer] != field.comparison_value
-            )
+            return canonical_record_changed_raw_ranges(base, target, purpose=purpose)
     return None
 
 
@@ -140,7 +133,7 @@ class RevisionAssessmentContext:
         a stored one read through ``current_representation_of``. The baseline is
         compared in the current representation only: a baseline revision outside it
         is no previous content. Every revision known here outside it is ``retired``,
-        so Evidence on it is dropped.
+        so Evidence on it remains unavailable for correspondence.
         """
         self.projection = projection
         self.base = base
@@ -148,6 +141,7 @@ class RevisionAssessmentContext:
         self.images = images
         self.image_loader = image_loader
         self.indexes: dict[str, RevisionFragmentIndex] = indexes if indexes is not None else {}
+        self._selection_indexes = {}
         self.reading_indexes = {}
         self._images = {}
         self.current = {
@@ -156,6 +150,12 @@ class RevisionAssessmentContext:
             if r.id in projection.source_unit_revisions[0].observation_revision_ids
         }
         baseline = base.observation_revisions if base else ()
+        # Evidence may predate the Support's last validation baseline. Keep its
+        # exact immutable revision, rather than substituting baseline or latest.
+        self.revisions = {
+            revision.id: revision
+            for revision in (*evidence_revisions, *baseline, *projection.observation_revisions)
+        }
         self.retired = frozenset(r.id for r in (*baseline, *evidence_revisions) if not in_current_representation(r))
         observations = {o.id: o for o in (*known_observations, *(base.observations if base else ()))}
         observations.update({o.id: o for o in projection.observations})
@@ -187,6 +187,13 @@ class RevisionAssessmentContext:
             for revision in (*self.previous.values(), *self.current.values())
             if revision.evidence_profile and revision.evidence_profile.name == "canonical-record"
         }
+        self.format_interpretations = {}
+        for revision in (*self.previous.values(), *self.current.values()):
+            contract = representation_contract_for_profile(revision.evidence_profile)
+            if contract is not None and contract.canonical_schema is not None:
+                interpretation = contract.canonical_schema.model_interpretation
+                if interpretation:
+                    self.format_interpretations[revision.id] = interpretation
         # Both sides, so removed old text keeps its heading path too.
         for revision in {r.id: r for r in (*self.previous.values(), *self.current.values())}.values():
             if revision.evidence_profile and revision.evidence_profile.name == "markdown-structural":
@@ -288,7 +295,9 @@ class RevisionAssessmentContext:
         payload["structural_groups"] = tuple(
             {"source": aliases[observation, revision], "refs": refs,
              **({"heading_context": headings} if headings else {}),
-             **({"field": field} if field is not None else {})}
+             **({"field": field} if field is not None else {}),
+             **({"format_interpretation": interpretation}
+                if (interpretation := self.format_interpretations.get(revision)) else {})}
             for (observation, revision, headings, field), refs in groups.items()
         )
         return payload
@@ -305,6 +314,21 @@ class RevisionAssessmentContext:
                 )
             self.indexes[revision.id] = index
         return self.indexes[revision.id]
+
+    def selection_index(self, revision):
+        """Exact anchors and bilateral material occurrences, indexed once per revision."""
+        if revision.id not in self._selection_indexes:
+            anchors = {}
+            material = {}
+            for fragment in self.index(revision).fragments:
+                anchors.setdefault(fragment.anchor, []).append(fragment)
+                key = (fragment.kind, fragment.fragment_type, fragment.content_value)
+                material.setdefault(key, []).append(fragment)
+            self._selection_indexes[revision.id] = (
+                {key: tuple(value) for key, value in anchors.items()},
+                {key: tuple(value) for key, value in material.items()},
+            )
+        return self._selection_indexes[revision.id]
 
     def reading_index(self, revision):
         """Reuse one exact-revision structural reading index for this operation."""
@@ -378,7 +402,7 @@ class RevisionAssessmentContext:
             current = self.current.get(key)
             if key in self.members and current is None and key not in self.tombstoned:
                 continue
-            ranges = _changed_ranges(current, old) if current else None
+            ranges = _changed_ranges(current, old, purpose="removed") if current else None
             removed.extend(f for f in self.index(old).fragments if _in_ranges(f, ranges))
         self._delta = tuple(changed), tuple(removed)
         return self._delta
@@ -391,4 +415,6 @@ class RevisionAssessmentContext:
             "revision_id": anchor.observation_revision_id,
             "text": fragment.presentation_text,
             **self.canonical_context(fragment),
+            **({"format_interpretation": interpretation}
+               if (interpretation := self.format_interpretations.get(anchor.observation_revision_id)) else {}),
         }

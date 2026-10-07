@@ -40,6 +40,7 @@ from memforge.source_projection import (
 from memforge.models import DocumentRecord, Memory, MemorySource
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.storage.database import Database, MIGRATIONS
+from memforge.source_representation import representation_profile_for_observation_contract
 
 
 MARKDOWN_PROFILE = EvidenceRepresentationProfile(
@@ -47,12 +48,13 @@ MARKDOWN_PROFILE = EvidenceRepresentationProfile(
     version=1,
     coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
 )
+PAGE_PROFILE = representation_profile_for_observation_contract(source_type="confluence", observation_type="page_body")
 TEAMS_PROFILE = EvidenceRepresentationProfile(
     name="canonical-record",
     version=1,
     coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
     schema_name="teams-message",
-    schema_version=1,
+    schema_version=2,
 )
 
 
@@ -87,10 +89,10 @@ def _projection() -> SourceProjection:
         id="obsrev-page-1-v2",
         observation_id=observation.id,
         semantic_hash="body-hash-v2",
-        content="new body",
+        content=json.dumps({"title": "Page", "body": "<p>new body</p>", "representation": "confluence-page-storage:1"}),
         observed_at="2026-07-15T00:00:00Z",
         metadata={"version": 2},
-        evidence_profile=MARKDOWN_PROFILE,
+        evidence_profile=PAGE_PROFILE,
     )
     unit = SourceUnit(
         id="unit-page-1",
@@ -472,7 +474,7 @@ async def test_carried_revision_uses_persisted_profile_in_new_run_payload(db: Da
 
     restored = await db.get_source_projection(carried.run_id)
     assert restored is not None
-    assert restored.observation_revisions[0].evidence_profile == MARKDOWN_PROFILE
+    assert restored.observation_revisions[0].evidence_profile == PAGE_PROFILE
 
     await db.record_source_projection(carried)
 
@@ -515,8 +517,8 @@ async def test_carried_revision_rejects_payload_or_source_unit_mismatch(db: Data
         id="obsrev-other",
         observation_id=other_observation.id,
         semantic_hash="other-hash",
-        content="Other body",
-        evidence_profile=MARKDOWN_PROFILE,
+        content=json.dumps({"title": "Other", "body": "<p>Other body</p>", "representation": "confluence-page-storage:1"}),
+        evidence_profile=PAGE_PROFILE,
     )
     other_unit = SourceUnit("unit-other", "src-other", "confluence_page", "other")
     other_projection = SourceProjection(
@@ -585,6 +587,40 @@ async def test_historical_projection_retry_treats_missing_profile_as_null(db: Da
     await db.db.commit()
 
     await db.record_source_projection(legacy_projection)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observation_type,schema_name", (
+    ("issue_core", "jira-issue-core"),
+    ("comment", "jira-comment"),
+    ("changelog", "jira-changelog"),
+))
+async def test_legacy_jira_profile_backfill_keeps_original_format_and_content(db, observation_type, schema_name):
+    await db.upsert_source(id="src-jira", type="jira", name="Jira", config_json="{}",
+                           access_policy="workspace", owner_user_id="owner-1")
+    now = "2026-10-03T00:00:00+00:00"
+    await db.db.execute(
+        "INSERT INTO source_units (id,source_id,unit_type,provider_key,locator_json,updated_at) VALUES (?,?,?,?,?,?)",
+        ("legacy-jira-unit", "src-jira", "jira_issue", "10012", "{}", now),
+    )
+    await db.db.execute(
+        "INSERT INTO source_observations (id,source_id,source_unit_id,observation_type,provider_key,locator_json,current_revision_id,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+        ("legacy-jira-observation", "src-jira", "legacy-jira-unit", observation_type, "10012:part", "{}", "legacy-jira-revision", now),
+    )
+    content = '{"body":"**Authored Markdown** <form>"}'
+    await db.db.execute(
+        "INSERT INTO source_observation_revisions (id,observation_id,semantic_hash,content,metadata_json,created_at) VALUES (?,?,?,?,?,?)",
+        ("legacy-jira-revision", "legacy-jira-observation", "historical-hash", content, "{}", now),
+    )
+    await db.db.commit()
+    report = await db.backfill_evidence_representation_profiles()
+    assert report.backfilled_revision_count == 1
+    revisions = await db.get_current_source_observation_revisions("legacy-jira-unit")
+    revision = revisions["legacy-jira-observation"]
+    assert revision.content == content and revision.semantic_hash == "historical-hash"
+    assert revision.evidence_profile.schema_name == schema_name
+    assert revision.evidence_profile.schema_version == 1
+    assert representation_profile_for_observation_contract(source_type="jira", observation_type=observation_type).schema_version == 4
 
 
 @pytest.mark.asyncio

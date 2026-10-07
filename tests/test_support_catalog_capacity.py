@@ -1,5 +1,7 @@
 """Model-wire and real request-budget boundaries; no provider or source writes."""
 
+from tests.evidence_display_fixture import evidence_displays
+
 import json
 from types import SimpleNamespace
 
@@ -68,16 +70,18 @@ def test_aliases_preserve_text_and_role_eligibility_and_expand_four_digits():
     ])
     wire = SupportWireAliases(catalog, [], {'canonical-task': 'WRK-10000'})
     row = {'work_id': 'WRK-10000', 'status': 'supported', 'primary_ref': 'PRM-0068',
-           'required_refs': ['REQ-10000']}
+           'required_refs': ['REQ-10000'], "evidence_displays": evidence_displays('PRM-0068', ['REQ-10000'])}
     decoded = wire.decode(SupportAssessmentWireResponse.model_validate({'results': [row]})).results[0]
     assert decoded.work_id == 'canonical-task' and decoded.primary_ref == 'p000068'
     assert decoded.required_refs == ['r010000']
     # A Primary-eligible ref can also be selected as Required.
     row['required_refs'] = ['PRM-0068']
+    row['evidence_displays'] = evidence_displays(row['primary_ref'], row['required_refs'])
     assert wire.decode(SupportAssessmentWireResponse.model_validate({'results': [row]})).results[0].required_refs == [
         'p000068'
     ]
     row['primary_ref'] = 'REQ-10000'
+    row['evidence_displays'] = evidence_displays(row['primary_ref'], row['required_refs'])
     with pytest.raises(Exception, match='REQ-10000') as exc:
         wire.decode(SupportAssessmentWireResponse.model_validate({'results': [row]}))
     assert 'r010000' not in str(exc.value)
@@ -94,6 +98,7 @@ async def test_wire_id_text_is_not_rewritten_and_unknown_namespace_fails_closed(
         def judge(self, prompt):
             results = super().judge(prompt)
             results[0]['primary_ref'] = 'p000001'
+            results[0]['evidence_displays'] = evidence_displays('p000001', results[0]['required_refs'])
             return results
     items = work_items('Two reviewers approve US releases.\n\nLiteral p000001 and w000068 are source text.')
     client, store = CanonicalIDClient(limit=50000), Store()
@@ -113,7 +118,7 @@ async def test_valid_support_json_with_incomplete_transport_is_rejected(monkeypa
     response = CompletionResponse(json.dumps({'results': [{
         'work_id': 'WRK-0000', 'status': 'supported', 'primary_ref': 'PRM-0001',
         'required_refs': [],
-    }]}))
+     "evidence_displays": evidence_displays('PRM-0001', [])}]}))
     if signal == 'refusal':
         response.choices[0].message.refusal = 'refused'
     elif signal == 'stop_max_tokens':

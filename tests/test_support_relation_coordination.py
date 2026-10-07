@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from memforge.llm.structured import ClaimRevisionWireResponse, StructuredLlmError
+from memforge.llm.structured import CandidateAdmissionResponse, ClaimRevisionWireResponse, StructuredLlmError, SupportAssessmentWireResponse
 from memforge.memory.coordinator_review import coordinator_review_id
 from memforge.memory.lifecycle_plan import LifecycleReviewStatus
 from memforge.memory.lifecycle_review import (
@@ -40,6 +40,39 @@ from tests.unit_support_fixture import active_support_evidence
 
 # Bounds how long one line waits to see the other start; a serial implementation never does.
 _CONCURRENCY_TIMEOUT_S = 5
+
+
+@pytest.mark.asyncio
+async def test_local_admission_skip_and_unresolved_support_commit_independent_memory(db: Database) -> None:
+    """An omitted admission row cannot erase an independently unjudgeable incumbent."""
+    from tests.llm_fixture import admission_payload
+
+    page, incumbent = await seeded_page(db, TWO, RETENTION)
+
+    class LocalFailureClient(ScriptedClient):
+        async def admit_candidates(self, prompt, **kwargs):
+            response = await super().admit_candidates(prompt, **kwargs)
+            payload = admission_payload(prompt)
+            skipped_ids = {row["id"] for row in payload["candidates"] if row["claim"] == RETENTION}
+            return CandidateAdmissionResponse(decisions=[d for d in response.decisions if d.candidate_id not in skipped_ids])
+
+        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+            if response_format is SupportAssessmentWireResponse:
+                raise StructuredLlmError("fixture invalid Support", terminal_category="invalid_response", error_code="output_invalid")
+            return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
+
+    target = page.next("Reviewer policy is under discussion.", RETENTION, AUDIT)
+    stats = await page.commit(LocalFailureClient(), target, RETENTION, AUDIT)
+
+    current = await db.get_current_source_unit_revision(page.unit_id)
+    assert current.id == target.source_unit_revisions[0].id
+    assert {(m.id, m.content) for m in await db.list_memories(status="active")} >= {(incumbent.id, TWO)}
+    assert sorted(m.content for m in await db.list_memories(status="active")) == sorted([TWO, AUDIT])
+    assert stats["candidate_admission_rejected_count"] == 1
+    assert stats["support_revalidation_unresolved_invalid_response_count"] == 1
+    [event] = await db.list_memory_audit_events(event_type="candidate_admission_rejected")
+    assert event.payload["reject_reason"] == "invalid_response"
+    assert await support_texts(db, incumbent.id) == {TWO}
 
 
 @pytest.mark.asyncio
@@ -98,6 +131,41 @@ async def test_a_rejected_conflict_is_not_raised_again(db: Database) -> None:
     assert (kept.id, kept.status) == (review.id, LifecycleReviewStatus.REJECTED)
     assert stats["pending_review"] == 0 and stats["added"] == 0
     assert [(item.id, item.status) for item in await db.list_memories()] == [(memory.id, "active")]
+
+
+@pytest.mark.asyncio
+async def test_exact_review_refs_do_not_reuse_a_claim_after_external_qualification(db: Database) -> None:
+    page, memory = await seeded_page(db, TWO, RETENTION)
+    client = ScriptedClient(relations={(ONE, TWO): "contradicts"})
+    await page.commit(client, page.next(TWO, ONE, RETENTION), ONE)
+    [review] = await lifecycle_reviews(db, memory.id)
+    client.support_requests.clear()
+    client.verdicts[ONE] = [False]
+
+    stats = await page.commit(client, page.next(TWO, ONE, RETENTION, "The one-reviewer rule above is a proposal only."))
+
+    [closed] = await lifecycle_reviews(db, memory.id)
+    assert (closed.id, closed.status) == (review.id, LifecycleReviewStatus.STALE)
+    assert stats["coordinator_carried_conflict_count"] == 0
+    challenger_reads = [request for request in client.support_requests
+                        if any(work["claim"] == ONE for work in request["works"])]
+    assert challenger_reads
+    assert any("The one-reviewer rule above is a proposal only." in client.supplied_texts(request)
+               for request in challenger_reads)
+
+
+@pytest.mark.asyncio
+async def test_two_historical_review_occurrences_cannot_match_one_current_occurrence(db: Database) -> None:
+    page, memory = await seeded_page(db, TWO, RETENTION)
+    client = ScriptedClient(relations={(ONE, TWO): "contradicts"})
+    await page.commit(client, page.next(TWO, ONE, ONE, RETENTION), ONE)
+    [review] = await lifecycle_reviews(db, memory.id)
+
+    stats = await page.commit(client, page.next(TWO, ONE, RETENTION))
+
+    [preserved] = await lifecycle_reviews(db, memory.id)
+    assert (preserved.id, preserved.status) == (review.id, LifecycleReviewStatus.PENDING)
+    assert stats["coordinator_carried_conflict_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -412,7 +480,8 @@ async def test_a_partial_coverage_equivalent_rebinds_the_claim_after_one_recheck
     memory, first, second = await _jira_incumbent(db)
     claim = "A7 stays for regular payroll."
     client = ScriptedClient(
-        relations={(claim, memory.content): "equivalent"}, support_text={memory.content: claim},
+        relations={(claim, memory.content): "equivalent"},
+        support_text={memory.content: f"Issue: PAY-12\nIssue ID: 10012\nDescription:\n{claim}"},
     )
 
     stats = await _commit_jira(db, client, first, second, claim)
@@ -420,9 +489,13 @@ async def test_a_partial_coverage_equivalent_rebinds_the_claim_after_one_recheck
     assert stats["support_revalidation_unresolved_partial_coverage_count"] == 1
     assert stats["coordinator_recheck_count"] == 1 and stats["added"] == 0
     [recheck] = client.support_requests
-    assert client.supplied_texts(recheck) == [claim]
+    assert client.supplied_texts(recheck) == [
+        f"Issue: PAY-12\nIssue ID: 10012\nDescription:\n{claim}",
+        "Issue: PAY-12\nIssue id: 10012",
+        "Issue ID: 10012\nIssue key: PAY-12",
+    ]
     # The Support that had an UNKNOWN part is replaced by the returned description.
-    assert await support_texts(db, memory.id) == {claim}
+    assert await support_texts(db, memory.id) == {f"Issue: PAY-12\nIssue ID: 10012\nDescription:\n{claim}"}
     assert await lifecycle_reviews(db, memory.id) == []
 
 

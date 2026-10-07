@@ -15,15 +15,21 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from hashlib import sha256
 from enum import Enum
 from typing import Any
 
 from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole, ResolvedEvidenceSelection
 from memforge.models import Memory
 from memforge.pipeline.evidence_fragments import EvidenceFragment
-from memforge.pipeline.projection_fragments import ProjectionFragmentCatalog
+from memforge.pipeline.projection_fragments import (
+    ProjectionFragmentCatalog,
+    SupportRevalidationLimitation,
+    SupportRevalidationLimitationCode,
+)
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext, reading_group_label
-from memforge.source_projection import ProjectionCoverage, SourceAnchor
+from memforge.source_artifacts import source_artifact_content_sha256
+from memforge.source_projection import AnchorKind, EvidenceCoordinateSpace, ProjectionCoverage, SourceAnchor
 
 
 # One Evidence part's exact identity: its Observation, raw digest and presentation digest.
@@ -38,28 +44,33 @@ def evidence_digests(selection: ResolvedEvidenceSelection) -> tuple[EvidenceDige
 
 
 def exact_evidence_selection(
-    catalog: ProjectionFragmentCatalog, parts: Sequence[tuple[EvidenceRole, EvidenceDigest]],
+    context: RevisionAssessmentContext, parts: Sequence[ActiveSupportEvidence],
 ) -> ResolvedEvidenceSelection | None:
-    """Rebind an Evidence selection whose every part is exactly and uniquely current, or None.
-
-    Like prior Evidence correspondence, a part matches only its own Observation's
-    Fragment with the same digests, and a Primary part only a Primary-eligible one.
-    """
+    """Use the same pinned, bilateral correspondence for a staged selection."""
+    catalog = context.catalog(context.full_fragments)
     refs: dict[EvidenceRole, list[str]] = {EvidenceRole.PRIMARY: [], EvidenceRole.REQUIRED: []}
-    for role, (observation_id, raw, presentation) in parts:
-        matches = [
-            fragment for fragment in catalog.fragments
-            if fragment.anchor.observation_id == observation_id
-            and _is_exact(role, raw, presentation, fragment)
-        ]
-        if len(matches) != 1:
+    displays = {}
+    for correspondence in correspond_evidence(context, parts):
+        if correspondence.status is not EvidenceCorrespondence.EXACT_UNCHANGED:
             return None
-        refs[role].append(matches[0].reference)
+        refs[correspondence.evidence.role].append(correspondence.current[0].reference)
+        if correspondence.evidence.presentation_sha256 == correspondence.current[0].presentation_sha256:
+            displays[correspondence.current[0].reference] = correspondence.evidence.display_text
     if len(refs[EvidenceRole.PRIMARY]) != 1:
         return None
     primary_ref = refs[EvidenceRole.PRIMARY][0]
     required = tuple(dict.fromkeys(ref for ref in refs[EvidenceRole.REQUIRED] if ref != primary_ref))
-    return catalog.resolve_selection(primary_ref=primary_ref, required_refs=required)
+    return catalog.resolve_selection(primary_ref=primary_ref, required_refs=required, display_text_by_ref=displays)
+
+
+def correspond_evidence(context, parts):
+    """Correspond pinned parts against the complete operation-local indexes."""
+    catalog = context.catalog(context.full_fragments)
+    by_observation: dict[str, dict[SourceAnchor, EvidenceFragment]] = {}
+    for fragment in catalog.fragments:
+        by_observation.setdefault(fragment.anchor.observation_id, {})[fragment.anchor] = fragment
+    returned = frozenset(observation.id for observation in context.projection.observations)
+    return tuple(_correspond(part, context, returned, by_observation) for part in parts)
 
 
 @dataclass(frozen=True)
@@ -230,17 +241,16 @@ def plan_support_revision(
 ) -> SupportRevisionPlan:
     """Correspond and route every fixed Support that shares one base/target pair."""
     catalog = context.catalog(context.full_fragments)
-    by_observation: dict[str, list[EvidenceFragment]] = {}
+    by_observation: dict[str, dict[SourceAnchor, EvidenceFragment]] = {}
     for fragment in catalog.fragments:
-        by_observation.setdefault(fragment.anchor.observation_id, []).append(fragment)
+        by_observation.setdefault(fragment.anchor.observation_id, {})[fragment.anchor] = fragment
     returned = frozenset(observation.id for observation in context.projection.observations)
-    # Evidence on a revision outside the current representation is dropped: the
-    # Support is judged by its other parts, and rebinding it leaves that part out.
+    # Unavailable retained interpretation remains UNKNOWN for the whole Support;
+    # it is never dropped to make the remaining parts exactly reusable.
     correspondences = [
         tuple(
             _correspond(part, context, returned, by_observation)
             for part in item.support
-            if part.anchor.observation_revision_id not in context.retired
         )
         for item in items
     ]
@@ -261,8 +271,37 @@ def _correspond(
     part: ActiveSupportEvidence,
     context: RevisionAssessmentContext,
     returned: frozenset[str],
-    by_observation: dict[str, list[EvidenceFragment]],
+    by_observation: dict[str, dict[SourceAnchor, EvidenceFragment]],
 ) -> PartCorrespondence:
+    old_revision = context.revisions.get(part.anchor.observation_revision_id)
+    if old_revision is not None:
+        _verify_pinned_integrity(part, old_revision)
+    if (part.anchor.observation_revision_id in context.retired
+            or old_revision is not None and old_revision.evidence_profile is None
+            or part.text_view is not None and part.text_view.version != 1):
+        return PartCorrespondence(part, EvidenceCorrespondence.UNKNOWN)
+    old_selection = ()
+    old_material = {}
+    if old_revision is not None:
+        old_anchors, old_material = context.selection_index(old_revision)
+        old_selection = old_anchors.get(part.anchor, ())
+        if part.text_view is not None and (len(old_selection) != 1 or part.text_view != old_selection[0].text_view):
+            raise SupportRevalidationLimitation(
+                SupportRevalidationLimitationCode.EVIDENCE_INTEGRITY,
+                "Stored text view does not reconstruct from its pinned source selection",
+            )
+        if len(old_selection) == 1 and part.raw_content_sha256 is not None:
+            old_fragment = old_selection[0]
+            if (
+                (part.text_view is not None and part.excerpt != old_fragment.presentation_text)
+                or old_fragment.raw_content_sha256 != part.raw_content_sha256
+                or part.presentation_sha256 is not None
+                and old_fragment.presentation_sha256 != part.presentation_sha256
+            ):
+                raise SupportRevalidationLimitation(
+                    SupportRevalidationLimitationCode.EVIDENCE_INTEGRITY,
+                    "Stored Evidence integrity differs from its pinned source selection",
+                )
     observation_id = part.anchor.observation_id
     coverage = context.projection.coverage
     # Another Source Unit's Observation is never a member here, so it is never rebound.
@@ -274,21 +313,69 @@ def _correspond(
     # A carried Observation the provider did not return proves neither presence nor absence.
     if coverage is ProjectionCoverage.PARTIAL_PROJECTION and observation_id not in returned:
         return PartCorrespondence(part, EvidenceCorrespondence.UNKNOWN)
-    candidates = tuple(
-        fragment for fragment in by_observation.get(observation_id, ())
-        if _is_exact(part.role, part.raw_content_sha256, part.presentation_sha256, fragment)
-    )
-    if len(candidates) == 1:
-        return PartCorrespondence(part, EvidenceCorrespondence.EXACT_UNCHANGED, candidates)
-    if candidates:
-        return PartCorrespondence(part, EvidenceCorrespondence.AMBIGUOUS, candidates)
+    if old_revision is None:
+        # Current complete source can still assess the fixed claim. Historical
+        # authority missing here forbids exact reuse, not a fresh assessment.
+        return PartCorrespondence(part, EvidenceCorrespondence.MODIFIED)
+    if len(old_selection) == 1 and part.raw_content_sha256 is not None:
+        old_fragment = old_selection[0]
+        target_revision = context.current.get(observation_id)
+        if target_revision is not None and old_revision.evidence_profile == target_revision.evidence_profile:
+            current_by_anchor = by_observation.get(observation_id, {})
+            if old_revision.id == target_revision.id:
+                # An exact pinned occurrence needs no cross-version disambiguation.
+                match = current_by_anchor.get(part.anchor)
+                candidates = (match,) if match is not None else ()
+                unique_old = True
+            else:
+                key = (old_fragment.kind, old_fragment.fragment_type, old_fragment.content_value)
+                unique_old = len(old_material.get(key, ())) == 1
+                _, target_material = context.selection_index(target_revision)
+                matches = target_material.get(key, ())
+                # Catalog refs are request-local; rebind indexed source anchors.
+                candidates = tuple(current_by_anchor[fragment.anchor] for fragment in matches
+                                   if fragment.anchor in current_by_anchor)
+            if candidates and (not unique_old or len(candidates) > 1):
+                return PartCorrespondence(part, EvidenceCorrespondence.AMBIGUOUS, candidates)
+            if len(candidates) == 1 and (
+                part.role is not EvidenceRole.PRIMARY or candidates[0].primary_eligible
+            ):
+                return PartCorrespondence(part, EvidenceCorrespondence.EXACT_UNCHANGED, candidates)
     # The Observation is still an authoritative member, but the exact text is gone. When
     # its revision is unchanged (a legacy part without digests, or a recompiled split),
     # the old anchor still locates the current text it is read with.
     overlapping = tuple(
-        fragment for fragment in by_observation.get(observation_id, ()) if _overlaps(part.anchor, fragment.anchor)
+        fragment for fragment in by_observation.get(observation_id, {}).values()
+        if _overlaps(part.anchor, fragment.anchor)
     )
     return PartCorrespondence(part, EvidenceCorrespondence.MODIFIED, overlapping)
+
+
+def _verify_pinned_integrity(part: ActiveSupportEvidence, revision) -> None:
+    """Check retained bytes independently of current coverage or renderer availability."""
+    try:
+        if revision.observation_id != part.anchor.observation_id:
+            raise ValueError("pinned Evidence Observation identity mismatch")
+        if part.text_view is not None:
+            part.text_view.verify_origins(part.anchor, revision.content)
+        start, end = part.anchor.range_start, part.anchor.range_end
+        profile = revision.evidence_profile
+        if profile is not None and profile.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT:
+            if (part.raw_content_sha256 is not None
+                    and source_artifact_content_sha256(revision.metadata) != part.raw_content_sha256):
+                raise ValueError("pinned Artifact byte integrity mismatch")
+        elif part.anchor.kind is AnchorKind.WHOLE_OBSERVATION:
+            start, end = 0, len(revision.content)
+        if start is not None and end is not None and part.raw_content_sha256 is not None:
+            if end > len(revision.content) or sha256(revision.content[start:end].encode()).hexdigest() != part.raw_content_sha256:
+                raise ValueError("pinned Evidence raw integrity mismatch")
+        if part.excerpt is not None and part.presentation_sha256 is not None:
+            if sha256(part.excerpt.encode()).hexdigest() != part.presentation_sha256:
+                raise ValueError("stored Evidence presentation integrity mismatch")
+    except ValueError as error:
+        raise SupportRevalidationLimitation(
+            SupportRevalidationLimitationCode.EVIDENCE_INTEGRITY, str(error),
+        ) from error
 
 
 def _overlaps(old: SourceAnchor, current: SourceAnchor) -> bool:
@@ -299,21 +386,6 @@ def _overlaps(old: SourceAnchor, current: SourceAnchor) -> bool:
         return True
     ranges = (old.range_start, old.range_end, current.range_start, current.range_end)
     return None not in ranges and current.range_start < old.range_end and old.range_start < current.range_end
-
-
-def _is_exact(role: EvidenceRole, raw: str | None, presentation: str | None, fragment: EvidenceFragment) -> bool:
-    """Compare every persisted digest without normalization; legacy parts without one never match."""
-    if role is EvidenceRole.PRIMARY and not fragment.primary_eligible:
-        return False
-    recorded = tuple(
-        (old, new)
-        for old, new in (
-            (raw, fragment.raw_content_sha256),
-            (presentation, fragment.presentation_sha256),
-        )
-        if old is not None
-    )
-    return bool(recorded) and all(old == new for old, new in recorded)
 
 
 def _all_exact(parts: tuple[PartCorrespondence, ...]) -> bool:

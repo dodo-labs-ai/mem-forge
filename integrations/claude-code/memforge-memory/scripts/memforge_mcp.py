@@ -87,7 +87,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.63"
+SERVER_VERSION = "0.1.64"
 CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
     "Local project context is optional. MemForge uses negotiated request-scoped host context when "
@@ -495,6 +495,8 @@ TOOLS: list[dict[str, Any]] = [
             "Fetch full memory detail by ID when a search result is insufficient. Returns "
             "canonical content together with grouped Evidence in evidence[], explicit "
             "Primary/Required/Context roles, document and Artifact resource locators, "
+            "and readable Evidence text. Read Primary and Required together; neither "
+            "role alone determines support. Use the pinned resource for the full source block. "
             "entity links, lifecycle metadata, and cross-document relations[] with relation_notice: "
             "contradicts means both statements cannot hold, so weigh both and their sources; updates "
             "means the knowledge changed over time and role older marks the outdated statement; "
@@ -514,6 +516,7 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "get_resource",
         "description": (
+            "Read pinned citation material from get_memory.evidence[].resource_url. "
             "Fetch a MemForge source artifact from get_memory.evidence[].items[].artifact.url, "
             "get_memory.evidence[].document.content_url, or "
             "get_memory.evidence[].document.pdf_url. "
@@ -534,7 +537,8 @@ TOOLS: list[dict[str, Any]] = [
                         "/api/v1/source-units/{source_unit_id}/pdf, "
                         "/api/v1/source-units/{source_unit_id}/artifacts/{kind}, the same "
                         "paths under /api/v1/documents/{doc_id}, or "
-                        "/api/v1/source-artifacts/{observation_revision_id}."
+                        "/api/v1/source-artifacts/{observation_revision_id}, or "
+                        "/api/v1/memories/{memory_id}/evidence/{evidence_unit_id}/resource."
                     ),
                 },
                 "mode": {
@@ -1860,10 +1864,14 @@ def _compact_memory_evidence_unit(unit: dict[str, Any]) -> dict[str, Any]:
         for key in (
             "kind",
             "evidence_unit_id",
+            "support_ids",
             "source_id",
             "source_type",
+            "source_unit_id",
+            "source_unit_revision_id",
             "doc_id",
             "current",
+            "resource_url",
         )
         if key in unit
     }
@@ -1888,12 +1896,29 @@ def _compact_memory_evidence_item(item: dict[str, Any]) -> dict[str, Any]:
             "role",
             "kind",
             "support_contribution",
+            "evidence_reference_id",
+            "observation_id",
+            "observation_revision_id",
+            "anchor_kind",
+            "fragment_id",
+            "range_start",
+            "range_end",
+            "raw_content_sha256",
+            "presentation_sha256",
+            "text_view",
+            "interpretation_available",
+            "resource_url",
             "excerpt",
+            "text",
             "current",
         )
         if key in item
     }
     artifact = item.get("artifact")
+    if item.get("text") is not None:
+        # Full source text remains available at the pinned resource, without
+        # repeating a broad source block beside its focused presentation.
+        compact.pop("excerpt", None)
     if isinstance(artifact, dict):
         compact["artifact"] = _compact_memory_evidence_artifact(artifact)
     return compact
@@ -1927,6 +1952,13 @@ def _compact_memory_evidence_artifact(
         "content_type",
         "size_bytes",
         "url",
+        "observation_id",
+        "observation_revision_id",
+        "artifact_id",
+        "parent_observation_id",
+        "evidence_reference_id",
+        "evidence_unit_id",
+        "sha256",
     ):
         if key in artifact:
             compact[key] = artifact[key]
@@ -2022,7 +2054,8 @@ def _handle_get_resource(
                 "Use a relative MemForge /api/v1/source-units/{source_unit_id} or "
                 "/api/v1/documents/{doc_id} URL ending in /content, /pdf or "
                 "/artifacts/{kind}, or /api/v1/source-artifacts/{observation_revision_id} "
-                "URL, or an absolute URL under MEMFORGE_API_URL."
+                "URL, /api/v1/memories/{memory_id}/evidence/{evidence_unit_id}/resource, "
+                "or an absolute URL under MEMFORGE_API_URL."
             ),
         }
 
@@ -2071,6 +2104,9 @@ def _fetch_resource_inline(
                 "hint": "Use mode=file for large or binary artifacts.",
                 "max_bytes": max_bytes,
             }
+        _verify_resource_integrity(
+            headers, observed_size=len(data), observed_sha256=hashlib.sha256(data).hexdigest(),
+        )
         if mode == "base64":
             return {**metadata, "data_base64": base64.b64encode(data).decode("ascii")}
         if not _is_text_content_type(content_type):
@@ -2080,6 +2116,11 @@ def _fetch_resource_inline(
                 "hint": "Use mode=file or mode=base64 for binary artifacts.",
             }
         text = data.decode("utf-8", errors="replace")
+        if target.kind == "evidence_unit" and len(text) > max_chars:
+            return {
+                **metadata, "error": "pinned Evidence exceeds max_chars", "truncated": True,
+                "hint": "Use mode=file or increase max_chars for the complete JSON resource.",
+            }
         return {**metadata, "text": text[:max_chars], "truncated": len(text) > max_chars}
 
 
@@ -2215,7 +2256,7 @@ def _parse_resource_url(
             return None
         path = parsed.path
     else:
-        path = url
+        path = parsed.path
 
     if not path.startswith("/"):
         path = f"/{path}"
@@ -2226,6 +2267,20 @@ def _parse_resource_url(
     relative_url = path
     if locator_workspace_id:
         relative_url += "?" + urlencode({"workspace_id": locator_workspace_id})
+    if (len(parts) == 9 and parts[:3] == ["api", "v1", "memories"]
+            and parts[4] == "evidence" and parts[6] == "references" and parts[8] == "resource"):
+        return ResourceTarget(
+            parts[7], "evidence_unit", relative_url,
+            _resource_url(path[len("/api/v1"):], target=target, workspace_id=effective_workspace_id),
+            identity_key="evidence_reference_id",
+        )
+    if (len(parts) == 7 and parts[:3] == ["api", "v1", "memories"]
+            and parts[4] == "evidence" and parts[6] == "resource"):
+        return ResourceTarget(
+            parts[5], "evidence_unit", relative_url,
+            _resource_url(path[len("/api/v1"):], target=target, workspace_id=effective_workspace_id),
+            identity_key="evidence_unit_id",
+        )
     stored_content_identity = _STORED_CONTENT_RESOURCE_IDENTITY.get(tuple(parts[:3]))
     if stored_content_identity is not None and (
         (len(parts) == 5 and parts[4] in {"content", "pdf"}) or (len(parts) == 6 and parts[4] == "artifacts")

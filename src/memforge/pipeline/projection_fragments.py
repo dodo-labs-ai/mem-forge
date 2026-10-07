@@ -70,6 +70,7 @@ class FragmentSelectionError(ValueError):
 class SupportRevalidationLimitationCode(str, Enum):
     UNSUPPORTED_REPRESENTATION = "unsupported_representation"
     COMPILER_FAILURE = "compiler_failure"
+    EVIDENCE_INTEGRITY = "evidence_integrity"
 
 
 class SupportRevalidationLimitation(RuntimeError):
@@ -164,6 +165,7 @@ class ProjectionFragmentCatalog:
         *,
         primary_ref: str,
         required_refs: tuple[str, ...] | list[str] = (),
+        display_text_by_ref: Mapping[str, str] | None = None,
     ) -> ResolvedEvidenceSelection:
         """Resolve one v9 model selection without guessing or widening."""
 
@@ -216,7 +218,8 @@ class ProjectionFragmentCatalog:
         primary = selected[0]
         required = tuple(sorted(selected[1:], key=lambda item: order[item[1].reference]))
         parts = tuple(
-            self._resolved_part(role=role, fragment=fragment)
+            replace(self._resolved_part(role=role, fragment=fragment),
+                    display_text=(display_text_by_ref or {}).get(fragment.reference))
             for role, fragment in (primary, *required)
         )
         return ResolvedEvidenceSelection(
@@ -259,6 +262,7 @@ class ProjectionFragmentCatalog:
                 else None
             ),
             artifact_metadata=dict(artifact_metadata),
+            text_view=fragment.text_view,
         )
 
 

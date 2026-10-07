@@ -209,7 +209,7 @@ class RevisionCompositionProof:
 
     @property
     def eligible(self) -> bool:
-        """Candidate admission already proved the candidate's current Evidence complete."""
+        """All three model judgments authorize a lossless revision; none is a formal proof."""
 
         return (
             self.same_memory_identity

@@ -14,7 +14,7 @@ import pytest
 from memforge.llm.structured import failure_retryable
 from memforge.memory.engine import SourceUnitLifecycleExecutionError
 from memforge.models import ContentItem, GeneMetadata, NormalizedContent, RawContent, ScopeListing, ScopeListingKind
-from memforge.pipeline.source_projection_adapters import jira_changelog_semantic_class
+from memforge.source_adapters.jira import changelog_semantic_class as jira_changelog_semantic_class
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
 from memforge.source_activity import SourceActivityConflict
 from memforge.source_derivation import DERIVATION_DETERMINISTIC_FAILURE
@@ -106,6 +106,7 @@ class JiraProvider:
                 "summary": "Payroll run", "description": "Body", "status": None, "priority": None,
                 "assignee": None, "labels": [], "resolution": None, "updated": SYNCED_AT.isoformat(),
             },
+            "renderedFields": {"description": "<p>Body</p>"},
             "_comments": [], "_comments_included": True, "_comments_total": 0,
             "changelog": {"startAt": 0, "histories": histories, "total": len(histories)},
         }).encode("utf-8")

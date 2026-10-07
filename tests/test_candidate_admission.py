@@ -1,4 +1,4 @@
-"""Candidate admission: complete Evidence support and same-round deduplication."""
+"""Candidate value/deduplication decisions cover the complete extraction."""
 
 from dataclasses import replace
 
@@ -99,7 +99,9 @@ async def test_a_single_candidate_is_judged_with_exactly_its_selected_evidence()
         "Two reviewers from distinct teams required.", "Country: US.",
     ]
     assert request["round_claims"] == [{"id": row["id"], "claim": MOST_SPECIFIC}]
-    assert COMPLETE_SUPPORT_DEFINITION in client.prompts[0]
+    assert COMPLETE_SUPPORT_DEFINITION not in client.prompts[0]
+    assert "Do not judge" in client.prompts[0]
+    assert "evidence_incomplete" not in client.prompts[0]
 
 
 @pytest.mark.asyncio
@@ -126,7 +128,7 @@ async def test_every_admission_request_judges_value_by_the_one_definition():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reject_reason", ["evidence_incomplete", "low_value"])
+@pytest.mark.parametrize("reject_reason", ["low_value"])
 async def test_rejected_candidate_is_not_admitted_and_keeps_its_reason(reject_reason):
     def judge(row, _round):
         if row["claim"] == SAME_KNOWLEDGE:
@@ -172,7 +174,7 @@ async def test_a_rejection_in_any_context_chunk_rejects_the_candidate():
 
     def judge(row, round_claims):
         if row["claim"] == SAME_KNOWLEDGE and INDEPENDENT in round_claims.values():
-            return {"candidate_id": row["id"], "verdict": "REJECTED", "reject_reason": "evidence_incomplete"}
+            return {"candidate_id": row["id"], "verdict": "REJECTED", "reject_reason": "low_value"}
         return admitted(row, round_claims)
 
     same, independent = candidate(SAME_KNOWLEDGE), candidate(INDEPENDENT)
@@ -218,7 +220,7 @@ async def test_identical_claims_are_each_judged_and_merge_once_admitted():
 async def test_an_identical_claim_with_complete_evidence_survives_a_rejected_copy():
     def judge(row, _round):
         if row["evidence_refs"] and len(row["evidence_refs"]) == 1:
-            return {"candidate_id": row["id"], "verdict": "REJECTED", "reject_reason": "evidence_incomplete"}
+            return {"candidate_id": row["id"], "verdict": "REJECTED", "reject_reason": "low_value"}
         return admitted(row, _round)
 
     incomplete, complete = candidate(MOST_SPECIFIC, required=False), repeated(MOST_SPECIFIC)
@@ -256,7 +258,7 @@ async def test_no_candidates_need_no_model_call():
                                           "duplicate_of": ["CND-0099"]}, id="duplicate-outside-round"),
     ],
 )
-async def test_a_candidate_whose_admission_stays_invalid_is_rejected_for_this_round(judge, request):
+async def test_a_candidate_whose_admission_stays_invalid_is_skipped_locally(judge, request):
     unknown_id = request.node.callspec.id == "unknown-id"
     unjudged = candidate(MOST_SPECIFIC)
     judged = candidate(INDEPENDENT)
@@ -266,18 +268,15 @@ async def test_a_candidate_whose_admission_stays_invalid_is_rejected_for_this_ro
 
     client = AdmissionClient(answer)
     result = await admit_candidates([unjudged, judged], client=client, model="fixture", unit_title=None)
-
     assert result.admitted == (judged,)
-    assert [(rejection.candidate, rejection.reject_reason) for rejection in result.rejected] == [
-        (unjudged, "invalid_response"),
-    ]
-    # A duplicate outside the round is a row rule: one re-ask of that Candidate. An ID the request did not
-    # supply voids the response: one correction, then halves, the bad Candidate alone with its correction.
+    assert [(r.candidate, r.reject_reason) for r in result.rejected] == [(unjudged, "invalid_response")]
+    assert result.merged_count == 0
     assert client.calls == (5 if unknown_id else 2)
 
 
+
 @pytest.mark.asyncio
-async def test_a_candidate_that_alone_exceeds_capacity_is_rejected_for_this_round():
+async def test_a_candidate_that_alone_exceeds_capacity_is_skipped_locally():
     oversized = candidate(MOST_SPECIFIC)
     judged = candidate(INDEPENDENT)
 
@@ -285,18 +284,17 @@ async def test_a_candidate_that_alone_exceeds_capacity_is_rejected_for_this_roun
         return all(row["claim"] != MOST_SPECIFIC for row in payload["candidates"])
 
     result = await admit_candidates([oversized, judged], client=AdmissionClient(fits=fits), model="fixture", unit_title=None)
-
     assert result.admitted == (judged,)
-    assert [(rejection.candidate, rejection.reject_reason) for rejection in result.rejected] == [
-        (oversized, "capacity_exceeded"),
-    ]
+    assert [(r.candidate, r.reject_reason) for r in result.rejected] == [(oversized, "capacity_exceeded")]
+    assert result.merged_count == 0
+
 
 
 @pytest.mark.asyncio
 async def test_a_transient_admission_failure_raises():
-    with pytest.raises(StructuredLlmError) as raised:
+    with pytest.raises(CandidateAdmissionError) as raised:
         await admit_candidates([candidate(MOST_SPECIFIC)], client=AdmissionClient(fail_at=1), model="fixture", unit_title=None)
-    assert raised.value.terminal_category == "deadline_exceeded"
+    assert raised.value.__cause__.terminal_category == "deadline_exceeded"
 
 
 @pytest.mark.asyncio
@@ -320,10 +318,12 @@ async def test_a_retried_sync_reuses_completed_admission_requests(tmp_path):
         return len(payload["candidates"]) == 1
 
     try:
-        with pytest.raises(StructuredLlmError, match="fixture deadline"):
+        with pytest.raises(CandidateAdmissionError) as failure:
             await admit_candidates(
                 candidates, client=AdmissionClient(fits=one_candidate_per_request, fail_at=3), store=db, **kwargs,
             )
+        assert isinstance(failure.value.__cause__, StructuredLlmError)
+        assert "fixture deadline" in str(failure.value.__cause__)
     finally:
         await db.close()
     db = Database(str(path))

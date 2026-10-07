@@ -1294,6 +1294,8 @@ class TeamsGene(Gene):
                     "attachments": m.get("attachments", []),
                     "hosted_content_ids": m.get("hosted_content_ids", []),
                     "is_root": m["id"] == root_msg_id,
+                    **({"parentMessageId": m["parentMessageId"]} if m.get("parentMessageId") else {}),
+                    **({"rootMessageId": m["rootMessageId"]} if m.get("rootMessageId") else {}),
                 }
                 for m in sorted(messages, key=lambda x: x["time"])
             ],

@@ -22,8 +22,14 @@ function EvidenceItemBlock({ item }: { item: EvidenceItem }) {
         <StatusBadge tone={item.role === "primary" ? "live" : "idle"}>{ITEM_ROLE_LABELS[item.role]}</StatusBadge>
         <span className="text-xs text-muted-foreground">{itemKindText(item)}</span>
       </div>
-      {item.excerpt ? (
-        <blockquote className="border-l-2 border-border-strong pl-3 text-sm text-subtle-foreground">{item.excerpt}</blockquote>
+      {(item.text ?? item.excerpt) ? (
+        <p className="whitespace-pre-wrap text-sm text-subtle-foreground">{item.text ?? item.excerpt}</p>
+      ) : null}
+      {item.excerpt && item.text != null && item.text !== item.excerpt ? (
+        <details className="text-sm text-subtle-foreground">
+          <summary className="cursor-pointer">Source evidence</summary>
+          <pre className="mt-2 whitespace-pre-wrap font-sans">{item.excerpt}</pre>
+        </details>
       ) : null}
       {item.artifact ? (
         <a

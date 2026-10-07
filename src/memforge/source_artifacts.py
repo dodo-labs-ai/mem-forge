@@ -334,6 +334,15 @@ class SourceArtifactRevision:
         }
 
 
+def source_artifact_content_sha256(metadata: Mapping[str, object]) -> str | None:
+    """Return the authoritative byte digest, independent of renderer eligibility."""
+    raw = metadata.get("source_artifact")
+    if not isinstance(raw, Mapping):
+        return None
+    digest = str(raw.get("sha256") or "").strip().lower()
+    return digest if len(digest) == 64 and all(c in "0123456789abcdef" for c in digest) else None
+
+
 def source_artifact_revision_from_metadata(
     *,
     observation_id: str,

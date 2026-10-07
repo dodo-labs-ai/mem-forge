@@ -280,10 +280,16 @@ function EvidenceGroupCard({ group }: { group: MemoryEvidenceGroup }) {
                 {!item.support_contribution ? " · context only" : ""}
               </span>
             </div>
-            {item.excerpt && (
-              <blockquote className="border-l-2 border-border pl-3 text-sm text-muted-foreground">
-                {item.excerpt}
-              </blockquote>
+            {(item.text ?? item.excerpt) && (
+              <p className="whitespace-pre-wrap text-sm text-muted-foreground">
+                {item.text ?? item.excerpt}
+              </p>
+            )}
+            {item.excerpt && item.text != null && item.text !== item.excerpt && (
+              <details className="text-sm text-muted-foreground">
+                <summary className="cursor-pointer">Source evidence</summary>
+                <pre className="mt-2 whitespace-pre-wrap font-sans">{item.excerpt}</pre>
+              </details>
             )}
             {item.artifact && (
               <a

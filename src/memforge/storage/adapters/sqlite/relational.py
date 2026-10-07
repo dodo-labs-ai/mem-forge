@@ -609,8 +609,10 @@ class SqliteRelationalStore:
     async def get_memory_evidence_units(
         self,
         memory_id: str,
+        *, include_historical: bool = False,
+        context_reference_id: str | None = None,
     ) -> tuple[MemoryEvidenceUnitProjection, ...]:
-        return await self._db.get_memory_evidence_units(memory_id)
+        return await self._db.get_memory_evidence_units(memory_id, include_historical=include_historical, context_reference_id=context_reference_id)
 
     async def find_source_unit_by_document_id(
         self,

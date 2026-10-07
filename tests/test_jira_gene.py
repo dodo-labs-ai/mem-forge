@@ -498,6 +498,7 @@ async def test_discover_hydrates_search_result_so_fetch_uses_no_per_issue_reques
                                     "author": {"displayName": "Grace"},
                                     "created": "2026-05-21T09:00:00.000+0000",
                                     "body": "Keep the low-request path.",
+                                    "renderedBody": "<p>Keep the low-request path.</p>",
                                 }
                             ],
                             changelog_total=3,
@@ -723,6 +724,7 @@ async def test_fetch_describes_jira_image_attachment_with_comment_parent():
                                     "author": {"displayName": "Grace"},
                                     "created": "2026-05-21T09:00:00Z",
                                     "body": "The result is shown in screenshot.png.",
+                                    "renderedBody": "<p>The result is shown in screenshot.png.</p>",
                                 }
                             ],
                         )
@@ -1794,3 +1796,23 @@ async def test_confirming_unlisted_issues_fails_when_jira_rejects_the_credential
             await gene.confirm_absent([_stored_issue("PAY-2", "100002")])
     finally:
         await gene._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_complete_hydrated_comments_without_rendering_fetch_attested_comment_snapshot():
+    issue = _jira_issue("PAY-123", comments=[{"id": "c1", "body": "*Require approval.*"}])
+    rendered = {**issue["fields"]["comment"]["comments"][0], "renderedBody": "<p><strong>Require approval.</strong></p>"}
+    class CommentClient(RecordingAsyncClient):
+        async def request(self, method, url, **kwargs):
+            self.calls.append((method, url, kwargs))
+            assert method == "GET" and url == "/rest/api/2/issue/PAY-123/comment"
+            assert kwargs["params"]["expand"] == "renderedBody"
+            return JsonResponse({"startAt": 0, "total": 1, "comments": [rendered]})
+    gene = JiraGene(config={"base_url": "https://jira.example.test", "include_comments": True}, source_id="src")
+    gene._client = CommentClient(base_url="https://jira.example.test")
+    gene._hydrated_issues = {"PAY-123": issue}
+    from memforge.models import ContentItem
+    item = ContentItem(item_id="jira-PAY-123", title="Rule", source_url=None, last_modified=datetime.now(timezone.utc), extra={"issue_key": "PAY-123"})
+    raw = await gene.fetch(item)
+    assert json.loads(raw.body)["_comments"] == [rendered]
+    assert len(gene._client.calls) == 1

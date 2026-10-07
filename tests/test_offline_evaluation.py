@@ -1071,7 +1071,7 @@ async def test_derivation_replay_uses_shared_planner_without_durable_staging() -
         source_type="confluence",
         run_id="projection-1",
         item=item,
-        raw=RawContent(item=item, body=body.encode(), content_type="text/plain"),
+        raw=RawContent(item=item, body=f"<p>{body}</p>".encode(), content_type="text/html"),
         normalized=NormalizedContent(item=item, markdown_body=body),
     )
     context = SourceUnitDerivationContext(

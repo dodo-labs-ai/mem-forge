@@ -12,6 +12,8 @@ fixture prompt and returning one of the fixture models below:
 unless a scenario overrides it, so an exact Support is read like any other.
 """
 
+from tests.evidence_display_fixture import evidence_displays
+
 import json
 from typing import Literal
 
@@ -395,7 +397,7 @@ def continued(work, support=(), opposing=()):
 
 def supported(work, primary, required=()):
     """A wire row that concludes supported with this selection."""
-    return {"work_id": work["work_id"], "status": "supported", "primary_ref": primary, "required_refs": list(required)}
+    return {"work_id": work["work_id"], "status": "supported", "primary_ref": primary, "required_refs": list(required), "evidence_displays": evidence_displays(primary, list(required))}
 
 
 def unsupported(work):
