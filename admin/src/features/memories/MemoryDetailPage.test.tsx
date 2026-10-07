@@ -58,6 +58,13 @@ test("shows focused evidence text and keeps the complete source available on exp
   expect(evidence).not.toHaveTextContent("LLM");
 });
 
+test("a memory that waits for review opens the review it waits for", async () => {
+  const { calls } = renderDetail(makeMemoryDetail({ status: "pending_review", open_review_id: "rev-pending" }));
+
+  expect(await screen.findByRole("link", { name: "Open review" })).toHaveAttribute("href", "/review/rev-pending");
+  expect(calls.some((request) => new URL(request.url).pathname === "/api/v1/memory-reviews")).toBe(false);
+});
+
 test("a source-backed memory offers Retire only with the reason it cannot", async () => {
   const user = userEvent.setup();
   renderDetail(makeMemoryDetail({ source_backed: true }));

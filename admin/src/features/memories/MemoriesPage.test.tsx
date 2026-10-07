@@ -96,6 +96,17 @@ test("a memory that needs review opens its review", async () => {
   );
 });
 
+test("the review count reads only the total of the open queue", async () => {
+  const { calls } = renderMemories("/memories");
+
+  const overview = await screen.findByRole("region", { name: "Overview" });
+  expect(await within(overview).findByText("5")).toBeInTheDocument();
+  const reviewRequests = requestsTo(calls, "GET", "/api/v1/memory-reviews");
+  expect(reviewRequests).toHaveLength(1);
+  expect(reviewRequests[0]!.searchParams.get("status")).toBe("open");
+  expect(reviewRequests[0]!.searchParams.get("limit")).toBe("1");
+});
+
 test("a project in the URL filters the listing", async () => {
   const { calls } = renderMemories("/memories?project=PAY");
 

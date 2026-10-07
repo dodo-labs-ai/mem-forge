@@ -2,18 +2,17 @@ import { keepPreviousData, useMutation, useQueries, useQuery, useQueryClient, ty
 import { useMemo } from "react";
 import { projectQueryKeys, unwrap, useApi, type components } from "@/api";
 import { reviewKeys } from "@/features/review";
-import { LIST_PAGE_SIZE, OPEN_REVIEW_LOOKUP_LIMIT } from "./constants";
+import { LIST_PAGE_SIZE } from "./constants";
 import { pageOffset, type MemoryListRequest } from "./model/listState";
 import { memoryRow, searchHitRow, type MemoryRow } from "./model/memoryRows";
 import { RELATION_LABELS, type RelationCounts } from "./model/relations";
-import { reviewIdByMemoryId } from "./model/reviews";
 import type { CorrectionKind, DismissedRelation, MemoryDetail, MemoryRelation, RelationLabel } from "./model/types";
 
 export const memoryKeys = {
   all: ["memories"] as const,
   list: (request: MemoryListRequest) => ["memories", "list", request] as const,
   stats: ["memories", "stats"] as const,
-  openReviews: ["memories", "open-reviews"] as const,
+  openReviewCount: ["memories", "open-review-count"] as const,
   relations: ["memories", "relations"] as const,
   relationPage: (label: RelationLabel | null, page: number) => ["memories", "relations", label, page] as const,
   relationCount: (label: RelationLabel) => ["memories", "relations", label, "count"] as const,
@@ -22,20 +21,18 @@ export const memoryKeys = {
 
 type Schemas = components["schemas"];
 
-/** One row is enough to read a relation label's total. */
+/** One row is enough to read a list's total. */
 const COUNT_ONLY_LIMIT = 1;
-const EMPTY_REVIEW_MAP: ReadonlyMap<string, string> = new Map();
 
-/** Open reviews: their total, and the review behind each Memory that waits for one. */
-export function useOpenReviews() {
+/** How many reviews wait for a decision. */
+export function useOpenReviewCount() {
   const api = useApi();
   const query = useQuery({
-    queryKey: memoryKeys.openReviews,
+    queryKey: memoryKeys.openReviewCount,
     queryFn: () =>
-      unwrap(api.GET("/api/v1/memory-reviews", { params: { query: { status: "open", limit: OPEN_REVIEW_LOOKUP_LIMIT } } })),
+      unwrap(api.GET("/api/v1/memory-reviews", { params: { query: { status: "open", limit: COUNT_ONLY_LIMIT } } })),
   });
-  const byMemory = useMemo(() => (query.data ? reviewIdByMemoryId(query.data.data) : EMPTY_REVIEW_MAP), [query.data]);
-  return { ...query, total: query.data?.total, reviewByMemory: byMemory };
+  return { ...query, total: query.data?.total };
 }
 
 export interface MemoryPage {
@@ -49,7 +46,7 @@ type MemoryListData =
   | { kind: "search"; page: Schemas["MemorySearchResponse"] }
   | { kind: "list"; page: Schemas["MemoryListResponse"] };
 
-export function useMemoryList(request: MemoryListRequest, reviewByMemory: ReadonlyMap<string, string>) {
+export function useMemoryList(request: MemoryListRequest) {
   const api = useApi();
   const query = useQuery({
     queryKey: memoryKeys.list(request),
@@ -64,13 +61,13 @@ export function useMemoryList(request: MemoryListRequest, reviewByMemory: Readon
     if (!data) return undefined;
     if (data.kind === "search") {
       return {
-        rows: data.page.results.map((hit) => searchHitRow(hit, reviewByMemory)),
+        rows: data.page.results.map(searchHitRow),
         total: data.page.total_candidates,
         ranked: true,
       };
     }
-    return { rows: data.page.data.map((memory) => memoryRow(memory, reviewByMemory)), total: data.page.total, ranked: false };
-  }, [query.data, reviewByMemory]);
+    return { rows: data.page.data.map(memoryRow), total: data.page.total, ranked: false };
+  }, [query.data]);
   return { ...query, page };
 }
 

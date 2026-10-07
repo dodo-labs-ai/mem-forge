@@ -1234,6 +1234,10 @@ export interface paths {
         /**
          * List Memory Reviews
          * @description List caller-visible Reviews with an exact post-stale-filter total.
+         *
+         *     Eligibility is evaluated across every matching candidate before exact
+         *     pagination. Lifecycle staged evidence is hydrated only for this page;
+         *     Memory version reads and queue enumeration still grow with the queue.
          */
         get: operations["list_memory_reviews_api_v1_memory_reviews_get"];
         put?: never;
@@ -3604,6 +3608,8 @@ export interface components {
             id: string;
             /** Memory Type */
             memory_type: string;
+            /** Open Review Id */
+            open_review_id?: string | null;
             /** Origin Client */
             origin_client?: string | null;
             /** Origin Source Type */
@@ -3899,6 +3905,8 @@ export interface components {
             id: string;
             /** Memory Type */
             memory_type: string;
+            /** Open Review Id */
+            open_review_id?: string | null;
             /** Origin Client */
             origin_client?: string | null;
             /** Origin Source Type */
