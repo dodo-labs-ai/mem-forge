@@ -73,8 +73,9 @@ def test_renderer_link_icons_are_decoration_but_image_and_link_identities_are_ma
     assert parse_rendered_html(inserted).fragments[0].content_value != parse_rendered_html('<p>Changed</p>').fragments[0].content_value
     assert parse_rendered_html(inserted).fragments[0].presentation == 'Changed'
     assert parse_rendered_html('<p><cite>Title</cite></p>').fragments[0].content_value != parse_rendered_html('<p>Title</p>').fragments[0].content_value
-    with pytest.raises(ValueError, match='must not conceal authored text'):
-        parse_rendered_html('<img class="rendericon" src="/attachment/1" alt="Material condition">')
+    labelled = parse_rendered_html('<img class="rendericon" src="/attachment/1" alt="Material condition">').fragments[0]
+    assert labelled.presentation == 'Material condition (image: /attachment/1)'
+    assert 'rendericon' in labelled.content_value
 
 
 def test_legacy_jira_schema_upgrade_plans_current_reading_and_next_revision_stays_incremental():
@@ -329,21 +330,63 @@ def test_table_headers_and_ordered_list_numbering_remain_readable_context():
 
 
 @pytest.mark.parametrize("source", [
-    '<p>Open', '<p><em>Wrong nesting</p></em>', '<script>ignore me</script>',
-    '<p a="x" a="y">Duplicated attribute</p>', '<!--hidden--><p>Visible</p>',
-    '<table><tr><td rowspan="2">Ambiguous grid</td></tr></table>',
-    '<div class="container"><table><tr><td rowspan="2">Ambiguous grid</td></tr></table></div>',
-    '<p><span style="color:red">Red means rejected.</span></p>',
-    '<p><span style="display:none">Hidden exception</span>Visible rule</p>',
-    '<p hidden="hidden">Hidden rule</p>',
-    '<p><span class="unknown-widget">Widget interpretation</span></p>',
-    '<a href="/rule" rel="alternate">Other rule</a>',
+    '<p>Open', '<p><em>Wrong nesting</p></em>', '<p a="x" a="y">Duplicated attribute</p>',
+    '<p>&undefined;</p>', '<?php echo 1 ?><p>Visible</p>',
 ])
-def test_unsupported_or_malformed_html_fails_as_a_whole(source):
+def test_malformed_html_fails_as_a_whole(source):
     with pytest.raises(ValueError):
         parse_rendered_html(source)
     with pytest.raises(ValueError):
         issue_record({"fields": {"description": "Native"}, "renderedFields": {"description": source}})
+
+
+@pytest.mark.parametrize("source, plain, expected", [
+    ('<p><span style="color:red">Red means rejected.</span></p>', '<p><span>Red means rejected.</span></p>',
+     'Red means rejected. [style: color:red]'),
+    ('<p><span style="display:none">Hidden exception</span>Visible rule</p>', '<p><span>Hidden exception</span>Visible rule</p>',
+     'Hidden exception [style: display:none]Visible rule'),
+    ('<p hidden="hidden">Hidden rule</p>', '<p>Hidden rule</p>', 'Hidden rule [hidden: hidden]'),
+    ('<p hidden>Hidden rule</p>', '<p>Hidden rule</p>', 'Hidden rule [hidden]'),
+    ('<p><span class="unknown-widget">Widget interpretation</span></p>', '<p><span>Widget interpretation</span></p>',
+     'Widget interpretation [class: unknown-widget]'),
+    ('<p><kbd>Ctrl</kbd> then confirm</p>', '<p>Ctrl then confirm</p>', 'Ctrl then confirm'),
+    ('<a href="/rule" rel="alternate" target="rules">Other rule</a>', '<a href="/rule">Other rule</a>',
+     'Other rule (/rule) [rel: alternate; target: rules]'),
+    ('<div class="panel" style="background-color: #ffc;border-width: 1px;"><div class="panelContent"><p>Only after approval.</p></div></div>',
+     '<div class="panel" style="border-width: 1px;"><div class="panelContent"><p>Only after approval.</p></div></div>',
+     'Only after approval. [style: background-color: #ffc;border-width: 1px;]'),
+    ('<font color="red" data-origin="paste">Rejected</font>', '<font color="red">Rejected</font>',
+     'Rejected [color: red] [data-origin: paste]'),
+])
+def test_undeclared_rendering_vocabulary_stays_visible_and_compared(source, plain, expected):
+    parsed = parse_rendered_html(source)
+    assert [fragment.presentation for fragment in parsed.fragments] == [expected]
+    assert parsed.fragments[0].content_value != parse_rendered_html(plain).fragments[0].content_value
+    assert issue_record({"fields": {"description": "Native"}, "renderedFields": {"description": source}})["description"] == source
+
+
+def test_content_html_never_displays_is_not_authored_text():
+    parsed = parse_rendered_html('<!--hidden--><p>Visible</p><script>ignore()</script><style>p { color: red }</style>')
+    assert [fragment.presentation for fragment in parsed.fragments] == ['Visible']
+    with pytest.raises(ValueError, match="no selectable view"):
+        issue_record({"fields": {"description": "Native"}, "renderedFields": {"description": '<script>ignore()</script>'}})
+
+
+@pytest.mark.parametrize("table, expected", [
+    ('<table><tr><th>Case</th><th>Period</th></tr><tr><td colspan="2">Applies to both.</td></tr></table>',
+     'Case | Period\nApplies to both.'),
+    ('<table><tbody><tr><td>14</td><td><div class="table-wrap"><table><tr><td>Current</td><td>No</td></tr></table></div></td></tr></tbody></table>',
+     '14 | Current | No'),
+    ('<table><tr><th>Case</th><th>Period</th></tr><tr><td>14</td></tr></table>', 'Case | Period\n14'),
+])
+def test_table_without_a_simple_grid_is_one_whole_selection(table, expected):
+    parsed = parse_rendered_html('<p>Rule.</p><div class="table-wrap">' + table + '</div>')
+    assert [(fragment.kind, fragment.presentation) for fragment in parsed.fragments] == [('p', 'Rule.'), ('table', expected)]
+
+
+def test_list_content_between_items_stays_in_reading_order():
+    parsed = parse_rendered_html('<ul><li>First</li><ul><li>Nested directly</li></ul><li>Second</li></ul>')
+    assert parsed.fragments[0].presentation == '• First\n• Nested directly\n• Second'
 
 
 def test_schema_cutover_keeps_historical_profile_truth():

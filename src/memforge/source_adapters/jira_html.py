@@ -3,6 +3,11 @@
 Offsets address the original provider-rendered string. Syntax highlighting is
 presentation decoration; literal code, links and meaningful formatting remain
 comparison values. This grammar does not interpret Jira's native wiki strings.
+
+The renderer's element, class, attribute and style vocabulary is open. Declared
+decoration is erased and declared semantics are presented; anything undeclared
+stays in comparison material and is shown beside the text it controls. Only
+malformed markup is rejected.
 """
 
 from __future__ import annotations
@@ -23,12 +28,8 @@ from memforge.source_adapters.contracts import (
 
 
 _VOID = {"br", "hr", "img", "col"}
-_TAGS = {
-    "p", "div", "span", "b", "strong", "i", "em", "u", "s", "del", "strike",
-    "sup", "sub", "a", "br", "hr", "img", "pre", "code", "tt", "blockquote",
-    "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6", "table", "thead",
-    "tbody", "tfoot", "tr", "th", "td", "colgroup", "col", "caption", "font", "ins", "cite",
-}
+# HTML never displays these elements' content.
+_NOT_DISPLAYED = {"script", "style"}
 _CODE_SPAN_CLASSES = {"code-tag", "code-quote", "code-keyword", "code-comment", "code-object", "code-quote-red"}
 _JIRA_FORMATTING = {"ins": "u", "del": "strikethrough", "s": "strikethrough", "strike": "strikethrough"}
 _ALIASES = {"b": "strong", "i": "em", "s": "del", "strike": "del", "tt": "code"}
@@ -81,6 +82,11 @@ _ATTRIBUTES = {
 }
 _NAVIGATION_REL = {"nofollow", "noopener", "noreferrer"}
 _EMPTY_BOOKMARK = _Decoration(omit=True)
+_CODE_LANGUAGE = re.compile(r"code-([\w+-]+)")
+
+
+class _IrregularTable(ValueError):
+    """Rendered rows, spans or nesting that resolve to no simple grid."""
 
 
 @dataclass(slots=True)
@@ -97,6 +103,8 @@ class _Node:
     start: int
     end: int
     children: list[_Node | _Text] = field(default_factory=list)
+    # Attributes, classes and styles the grammar assigns no meaning.
+    controls: tuple[tuple[str, str], ...] = ()
 
 
 class _Parser(HTMLParser):
@@ -118,12 +126,10 @@ class _Parser(HTMLParser):
         self._start(tag, attrs, True)
 
     def _start(self, tag, attrs, closed):
-        if tag not in _TAGS:
-            raise ValueError(f"unsupported Jira rendered HTML element: {tag}")
-        if len(dict(attrs)) != len(attrs) or any(value is None for _, value in attrs):
-            raise ValueError("Jira rendered HTML has duplicate or unvalued attributes")
+        if len(dict(attrs)) != len(attrs):
+            raise ValueError("Jira rendered HTML has duplicate attributes")
         start = self._position()
-        node = _Node(tag, dict(attrs), start, start + len(self.get_starttag_text()))
+        node = _Node(tag, {key: value or "" for key, value in attrs}, start, start + len(self.get_starttag_text()))
         self.stack[-1].children.append(node)
         if not closed and tag not in _VOID:
             self.stack.append(node)
@@ -156,9 +162,6 @@ class _Parser(HTMLParser):
         raw = f"&#{name};"
         self._text(html.unescape(raw), len(raw))
 
-    def handle_comment(self, data):
-        raise ValueError("unsupported Jira rendered HTML comment")
-
     def handle_decl(self, decl):
         raise ValueError("Jira rendered fields must not contain declarations")
 
@@ -181,65 +184,72 @@ def _classes(node):
 
 
 def _decoration(node):
+    # A control the grammar cannot read is never erased with its element.
+    if node.controls:
+        return None
     # Jira inserts empty named targets into rendered code/list wrappers.
     # A named link with authored content is not a presentation-only target.
     if node.tag == "a" and set(node.attrs) == {"name"} and not node.children:
         return _EMPTY_BOOKMARK
-    return _DECORATIONS.get((node.tag, _classes(node)))
+    decoration = _DECORATIONS.get((node.tag, _classes(node)))
+    # A renderer icon carrying authored text is an image, not decoration.
+    if decoration and decoration.omit and (node.attrs.get("alt") or node.attrs.get("title")):
+        return None
+    return decoration
 
 
-def _validate_attributes(node, *, literal=False):
-    """Only attested decoration or explicitly rendered semantic controls are supported."""
+def _classify(node, *, literal=False):
+    """Record every attribute, class and style outside the declared grammar.
+
+    Declared decoration and semantic controls keep their own treatment. The
+    rest are kept as written: compared across revisions and shown to readers.
+    """
     literal = literal or node.tag in {"pre", "code", "tt"}
     attrs = {key: value for key, value in node.attrs.items() if key not in {"class", "style"} or value.strip()}
-    allowed = _ATTRIBUTES.get(node.tag, set())
-    if set(attrs) - allowed:
-        raise ValueError(f"unsupported Jira rendered HTML attributes on {node.tag}")
+    undeclared = set(attrs) - _ATTRIBUTES.get(node.tag, set())
     classes = _classes(node)
-    if "class" in attrs:
-        supported_class = (
-            (node.tag, classes) in _DECORATIONS
-            or node.tag == "span" and literal and classes <= _CODE_SPAN_CLASSES
-            or node.tag == "pre" and re.fullmatch(r"code-[\w+-]+", attrs["class"])
-        )
-        if not supported_class:
-            raise ValueError(f"unsupported Jira rendered HTML class on {node.tag}")
+    decoration = _DECORATIONS.get((node.tag, classes))
+    if "class" in attrs and not (
+        decoration is not None
+        or node.tag == "span" and literal and classes <= _CODE_SPAN_CLASSES
+        or node.tag == "pre" and _CODE_LANGUAGE.fullmatch(attrs["class"])
+    ):
+        undeclared.add("class")
     if "style" in attrs:
         style = attrs["style"].replace(" ", "")
-        decoration = _decoration(node)
         declarations = [part.strip() for part in style.split(";") if part.strip()]
-        supported_style = bool(decoration and declarations and all(
+        declared_style = bool(decoration and declarations and all(
             ":" in part and part.split(":", 1)[0] in decoration.style_properties
             and part.split(":", 1)[1] for part in declarations
         )) or node.tag == "img" and style == "border:0pxsolidblack"
-        if not supported_style:
-            raise ValueError(f"unsupported Jira rendered HTML style on {node.tag}")
+        if not declared_style:
+            undeclared.add("style")
     if node.tag == "a":
         if "id" in attrs and attrs["id"] != attrs.get("file-preview-id", "") + "_thumb":
-            raise ValueError("unsupported Jira rendered HTML anchor identity")
+            undeclared.add("id")
         if attrs.get("target", "_self") not in {"_self", "_blank", "_parent", "_top"}:
-            raise ValueError("unsupported Jira rendered HTML link target")
+            undeclared.add("target")
         if classes != {"user-hover"} and set(attrs.get("rel", "").split()) - _NAVIGATION_REL:
-            raise ValueError("unsupported Jira rendered HTML link relationship")
+            undeclared.add("rel")
         if "data-username" in attrs and classes != {"user-hover"}:
-            raise ValueError("Jira author identity requires a rendered mention")
+            undeclared.add("data-username")
         if "data-issue-key" in attrs and classes != {"issue-link"}:
-            raise ValueError("Jira issue identity requires a rendered issue link")
+            undeclared.add("data-issue-key")
     if node.tag == "img" and attrs.get("role", "presentation") != "presentation":
-        raise ValueError("unsupported Jira rendered HTML image role")
-    decoration = _decoration(node)
-    if decoration and decoration.omit and (attrs.get("alt") or attrs.get("title")):
-        raise ValueError("Jira renderer icon must not conceal authored text")
+        undeclared.add("role")
     if node.tag == "ul" and "type" in attrs and attrs["type"] not in {"disc", "circle", "square"}:
-        raise ValueError("unsupported Jira rendered HTML list marker")
+        undeclared.add("type")
     if node.tag == "th" and attrs.get("scope", "col") != "col":
-        raise ValueError("unsupported Jira rendered HTML table header scope")
+        undeclared.add("scope")
+    node.controls = tuple(sorted((key, attrs[key]) for key in undeclared))
     for child in node.children:
         if isinstance(child, _Node):
-            _validate_attributes(child, literal=literal)
+            _classify(child, literal=literal)
 
 
 def _transparent(node, *, literal=False):
+    if node.controls:
+        return False
     attrs = {key: value for key, value in node.attrs.items() if key not in {"class", "style"} or value.strip()}
     if node.tag == "span":
         if not attrs:
@@ -269,14 +279,17 @@ def _attributes(node):
             attrs.pop("rel", None)
         if attrs.get("file-preview-id") and attrs.get("id") == attrs["file-preview-id"] + "_thumb":
             attrs.pop("id")
-    if node.tag == "pre" and re.fullmatch(r"code-[\w+-]+", attrs.get("class", "")):
-        attrs["language"] = attrs.pop("class")[5:]
+    language = _CODE_LANGUAGE.fullmatch(attrs.get("class", "")) if node.tag == "pre" else None
+    if language:
+        del attrs["class"]
+        attrs["language"] = language.group(1)
     if node.tag == "img":
         attrs.pop("role", None)
         for key in _IMAGE_LAYOUT:
             attrs.pop(key, None)
         if attrs.get("style", "").replace(" ", "") == "border:0pxsolidblack":
             attrs.pop("style")
+    attrs.update(node.controls)
     if "class" in attrs:
         attrs["class"] = " ".join(sorted(attrs["class"].split()))
     return sorted(attrs.items())
@@ -317,12 +330,22 @@ def _literal_text(node):
 def _render(node):
     if isinstance(node, _Text):
         return re.sub(r"\s+", " ", node.value)
+    text = _element(node)
+    if not node.controls:
+        return text
+    body = text.rstrip("\n")
+    controls = "; ".join(f"{key}: {value}" if value else key for key, value in node.controls)
+    return f"{body} [{controls}]" + text[len(body):]
+
+
+def _element(node):
     decoration = _decoration(node)
-    if decoration and decoration.omit:
+    if decoration and decoration.omit or node.tag in _NOT_DISPLAYED:
         return ""
     if node.tag in {"pre", "code", "tt"}:
-        if node.tag == "pre" and node.attrs.get("class"):
-            return f"Code (language: {node.attrs['class'][5:]}):\n" + _literal_text(node)
+        language = _CODE_LANGUAGE.fullmatch(node.attrs.get("class", "")) if node.tag == "pre" else None
+        if language:
+            return f"Code (language: {language.group(1)}):\n" + _literal_text(node)
         return _literal_text(node)
     text = "".join(_render(child) for child in node.children)
     if node.tag == "br":
@@ -364,7 +387,8 @@ def _render(node):
     if node.tag in {"sup", "sub"}:
         return f"[{node.tag}: {text}]"
     if node.tag == "font":
-        return text + " [" + "; ".join(f"{key}: {value}" for key, value in sorted(node.attrs.items())) + "]" if node.attrs else text
+        shown = sorted(set(node.attrs.items()) - set(node.controls))
+        return text + " [" + "; ".join(f"{key}: {value}" for key, value in shown) + "]" if shown else text
     if node.tag in {"ol", "ul"}:
         try:
             number = int(node.attrs.get("start", "1"))
@@ -375,7 +399,9 @@ def _render(node):
             if isinstance(child, _Text) and not child.value.strip():
                 continue
             if not isinstance(child, _Node) or child.tag != "li":
-                raise ValueError("Jira rendered list contains content outside list items")
+                # Content the renderer placed between items stays in reading order.
+                lines.append(_render(child).strip())
+                continue
             if "value" in child.attrs:
                 try:
                     number = int(child.attrs["value"])
@@ -397,7 +423,7 @@ def _table_rows(table):
         for child in node.children:
             if isinstance(child, _Text):
                 if child.value.strip():
-                    raise ValueError("Jira rendered table contains unstructured text")
+                    raise _IrregularTable("Jira rendered table contains unstructured text")
             elif child.tag in {"thead", "tbody", "tfoot"}:
                 collect(child)
             elif child.tag == "tr":
@@ -405,7 +431,7 @@ def _table_rows(table):
             elif child.tag == "caption":
                 captions.append(child)
             elif child.tag not in {"colgroup", "col"}:
-                raise ValueError("unsupported Jira rendered table structure")
+                raise _IrregularTable("Jira rendered table holds content outside its rows")
 
     collect(table)
     headers = []
@@ -417,23 +443,34 @@ def _table_rows(table):
             if isinstance(child, _Text) and not child.value.strip():
                 continue
             if not isinstance(child, _Node) or child.tag not in {"td", "th"}:
-                raise ValueError("Jira rendered table row contains non-cell content")
+                raise _IrregularTable("Jira rendered table row contains non-cell content")
             if any(child.attrs.get(name, "1") != "1" for name in ("rowspan", "colspan")):
-                raise ValueError("Jira rendered table spans require a supported grid representation")
+                raise _IrregularTable("Jira rendered table cells span rows or columns")
             if any(isinstance(n, _Node) and n.tag == "table" for n in _walk(child)):
-                raise ValueError("nested Jira rendered tables are unsupported")
+                raise _IrregularTable("Jira rendered table cell holds another table")
             cells.append(child)
         is_header = bool(cells) and all(cell.tag == "th" for cell in cells)
         if is_header and len(header_rows) == len(result):
             header_rows.append(row)
             if headers and len(headers) != len(cells):
-                raise ValueError("inconsistent Jira rendered table header width")
+                raise _IrregularTable("inconsistent Jira rendered table header width")
             headers = [" / ".join(filter(None, (headers[i] if headers else "", _render(cell).strip()))) for i, cell in enumerate(cells)]
         if headers and len(headers) != len(cells):
-            raise ValueError("inconsistent Jira rendered table row width")
+            raise _IrregularTable("inconsistent Jira rendered table row width")
         text = "\n".join(f"{headers[i] if headers else f'Column {i + 1}'}: {_render(cell).strip()}" for i, cell in enumerate(cells))
         result.append((row, text, is_header))
     return result, header_rows, captions
+
+
+def _authored_rows(node):
+    """A table without a simple grid, read row by row as rendered."""
+    if isinstance(node, _Text):
+        return _render(node)
+    if node.tag == "tr":
+        return " | ".join(filter(None, (_authored_rows(cell).strip() for cell in node.children))) + "\n"
+    if node.tag in {"table", "thead", "tbody", "tfoot", "td", "th"} or _transparent(node):
+        return "".join(_authored_rows(child) for child in node.children)
+    return _render(node)
 
 
 def _walk(node):
@@ -445,17 +482,13 @@ def _walk(node):
 
 def _parse_rendered_html(source: str, *, jira_formatting: bool) -> ParsedDeclaredText:
     root = _Parser(source).parse()
-    _validate_attributes(root)
+    _classify(root)
     if jira_formatting:
         # Jira wiki emphasis markers denote formatting, not insertion/deletion events.
         # Normalize only the current tree, preserving provider offsets and children.
         for node in _walk(root):
             if isinstance(node, _Node):
                 node.tag = _JIRA_FORMATTING.get(node.tag, node.tag)
-    # A parent selection must not conceal unsupported nested structures.
-    for node in _walk(root):
-        if isinstance(node, _Node) and node.tag == "table":
-            _table_rows(node)
     _render(root)
     fragments = []
     groups = []
@@ -474,7 +507,11 @@ def _parse_rendered_html(source: str, *, jira_formatting: bool) -> ParsedDeclare
         if isinstance(node, _Text):
             add(node)
         elif node.tag == "table":
-            rows, headers, captions = _table_rows(node)
+            try:
+                rows, headers, captions = _table_rows(node)
+            except _IrregularTable:
+                add(node, _authored_rows(node))
+                return
             for row, text, is_header in rows:
                 origins = tuple(DeclaredTextOrigin(h.start, h.end,
                     json.dumps(_canonical(h), ensure_ascii=False, separators=(",", ":")))
