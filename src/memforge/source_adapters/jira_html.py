@@ -30,6 +30,7 @@ _TAGS = {
     "tbody", "tfoot", "tr", "th", "td", "colgroup", "col", "caption", "font", "ins", "cite",
 }
 _CODE_SPAN_CLASSES = {"code-tag", "code-quote", "code-keyword", "code-comment", "code-object", "code-quote-red"}
+_JIRA_FORMATTING = {"ins": "u", "del": "strikethrough", "s": "strikethrough", "strike": "strikethrough"}
 _ALIASES = {"b": "strong", "i": "em", "s": "del", "strike": "del", "tt": "code"}
 _BLOCKS = {"root", "p", "div", "blockquote", "li", "td", "th", "caption", "h1", "h2", "h3", "h4", "h5", "h6"}
 
@@ -354,6 +355,8 @@ def _render(node):
                 details.append(f"{name}: {value}")
         suffix = "; " + "; ".join(details) if details else ""
         return f"{label} ({node.attrs.get('href', '')}{suffix})"
+    if node.tag == "strikethrough":
+        return f"[struck through: {text}]"
     if node.tag in {"s", "del", "strike"}:
         return f"[deleted: {text}]"
     if node.tag == "ins":
@@ -440,9 +443,15 @@ def _walk(node):
             yield from _walk(child)
 
 
-def parse_rendered_html(source: str) -> ParsedDeclaredText:
+def _parse_rendered_html(source: str, *, jira_formatting: bool) -> ParsedDeclaredText:
     root = _Parser(source).parse()
     _validate_attributes(root)
+    if jira_formatting:
+        # Jira wiki emphasis markers denote formatting, not insertion/deletion events.
+        # Normalize only the current tree, preserving provider offsets and children.
+        for node in _walk(root):
+            if isinstance(node, _Node):
+                node.tag = _JIRA_FORMATTING.get(node.tag, node.tag)
     # A parent selection must not conceal unsupported nested structures.
     for node in _walk(root):
         if isinstance(node, _Node) and node.tag == "table":
@@ -499,4 +508,13 @@ def parse_rendered_html(source: str) -> ParsedDeclaredText:
     return ParsedDeclaredText(tuple(fragments), tuple(groups))
 
 
-RENDERED_HTML_FORMAT = DeclaredTextFormat("jira-rendered-html", 1, parse_rendered_html)
+def _parse_rendered_html_v1(source: str) -> ParsedDeclaredText:
+    return _parse_rendered_html(source, jira_formatting=False)
+
+
+def parse_rendered_html(source: str) -> ParsedDeclaredText:
+    return _parse_rendered_html(source, jira_formatting=True)
+
+
+LEGACY_RENDERED_HTML_FORMAT = DeclaredTextFormat("jira-rendered-html", 1, _parse_rendered_html_v1)
+RENDERED_HTML_FORMAT = DeclaredTextFormat("jira-rendered-html", 2, parse_rendered_html)

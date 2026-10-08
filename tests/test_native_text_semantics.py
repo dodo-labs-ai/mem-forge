@@ -11,7 +11,7 @@ from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot, Ex
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.support_reading import EvidenceCorrespondence
 from memforge.source_adapters.confluence_storage import parse_storage
-from memforge.source_adapters.jira_html import parse_rendered_html
+from memforge.source_adapters.jira_html import LEGACY_RENDERED_HTML_FORMAT, parse_rendered_html
 from tests.test_confluence_native_evidence import planned, projection as confluence_projection
 from tests.test_jira_native_evidence import projection as jira_projection
 
@@ -22,7 +22,7 @@ FROZEN_EVIDENCE = json.loads((Path(__file__).parent / "fixtures/native_text_v1_e
 
 @pytest.mark.parametrize("case", FROZEN, ids=lambda case: case["source"])
 def test_registered_v1_native_contract_preserves_frozen_outputs(case):
-    parser = parse_storage if case["source"] == "confluence" else parse_rendered_html
+    parser = parse_storage if case["source"] == "confluence" else LEGACY_RENDERED_HTML_FORMAT.parse
     assert json.loads(json.dumps(asdict(parser(case["input"])))) == case["parsed"]
 
 
