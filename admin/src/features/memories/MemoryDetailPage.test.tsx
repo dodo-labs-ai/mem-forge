@@ -4,6 +4,9 @@ import { afterEach, expect, test, vi } from "vitest";
 import { errorResponse } from "@/test/fakeApi";
 import { makeMemoryDetail, makeRelation } from "@/test/memoryFixtures";
 import { memoriesRoutes, renderMemories } from "@/test/renderMemories";
+import { renderRoutes } from "@/test/renderRoutes";
+import { STANDALONE_TARGET } from "@/api";
+import { MemoryDetailPage } from "./MemoryDetailPage";
 import type { MemoryDetail } from "./model/types";
 
 afterEach(() => {
@@ -40,7 +43,34 @@ test("shows the memory's details, relations and evidence", async () => {
   const evidence = screen.getByRole("region", { name: "Evidence" });
   expect(within(evidence).getByText("Payroll Handbook")).toBeInTheDocument();
   expect(within(evidence).getByText("Primary")).toBeInTheDocument();
-  expect(within(evidence).getByRole("link", { name: "Open content" })).toBeInTheDocument();
+  expect(within(evidence).getByRole("link", { name: "Open content" })).toHaveAttribute(
+    "href", expect.stringContaining("workspace_id=local"),
+  );
+});
+
+test("content, PDF and artifact links retain the selected workspace while source links stay external", async () => {
+  const memory = makeMemoryDetail();
+  const group = memory.evidence![0]!;
+  group.document!.pdf_url = "/api/v1/source-units/su-1/pdf";
+  group.items[0]!.artifact = {
+    artifact_id: "artifact-1", content_type: "application/pdf", evidence_reference_id: "eref-1",
+    evidence_role: "primary", evidence_unit_id: "eu-1", filename: "evidence.pdf",
+    observation_id: "obs-1", observation_revision_id: "obsrev-1", parent_observation_id: "parent-1",
+    sha256: "a".repeat(64), size_bytes: 10, url: "/api/v1/evidence-units/eu-1/artifacts/eref-1",
+  };
+  renderRoutes([{ path: "/memories/:memoryId", element: <MemoryDetailPage /> }], {
+    path: `/memories/${memory.id}`,
+    api: memoriesRoutes({ [`GET /api/v1/memories/${memory.id}`]: () => memory }),
+    workspace: { ...STANDALONE_TARGET, workspaceId: "mount_tai" },
+  });
+  const evidence = await screen.findByRole("region", { name: "Evidence" });
+  for (const name of ["Open content", "Open PDF", "evidence.pdf"]) {
+    const href = within(evidence).getByRole("link", { name }).getAttribute("href")!;
+    expect(new URL(href).searchParams.getAll("workspace_id")).toEqual(["mount_tai"]);
+  }
+  expect(within(evidence).getByRole("link", { name: "Open Payroll Handbook in its source" })).toHaveAttribute(
+    "href", "https://wiki.example.test/payroll",
+  );
 });
 
 test("shows focused evidence text and keeps the complete source available on expansion", async () => {

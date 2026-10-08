@@ -1,4 +1,5 @@
 import { ExternalLink, Paperclip } from "lucide-react";
+import { useWorkspaceTarget, workspaceResourceUrl } from "@/api";
 import { SourceIcon } from "@/features/sources";
 import { formatDateTime, pluralize } from "@/lib/format";
 import { StatusBadge } from "@/patterns";
@@ -16,6 +17,7 @@ function itemKindText(item: EvidenceItem): string {
 }
 
 function EvidenceItemBlock({ item }: { item: EvidenceItem }) {
+  const workspace = useWorkspaceTarget();
   return (
     <div className="flex flex-col gap-2 rounded-md bg-surface-subtle p-3">
       <div className="flex items-center gap-2">
@@ -33,7 +35,7 @@ function EvidenceItemBlock({ item }: { item: EvidenceItem }) {
       ) : null}
       {item.artifact ? (
         <a
-          href={item.artifact.url}
+          href={workspaceResourceUrl(item.artifact.url, workspace)}
           target="_blank"
           rel="noopener noreferrer"
           className="inline-flex items-center gap-1 text-sm text-foreground underline-offset-2 hover:underline"
@@ -47,6 +49,7 @@ function EvidenceItemBlock({ item }: { item: EvidenceItem }) {
 }
 
 function EvidenceGroupCard({ group, typeLabel }: { group: EvidenceGroup; typeLabel: string }) {
+  const workspace = useWorkspaceTarget();
   const document = group.document;
   const title = document?.title ?? document?.doc_id ?? group.doc_id ?? group.source_id;
   return (
@@ -83,12 +86,12 @@ function EvidenceGroupCard({ group, typeLabel }: { group: EvidenceGroup; typeLab
       {document?.content_url || document?.pdf_url || document?.source_updated_at ? (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
           {document.content_url ? (
-            <a href={document.content_url} target="_blank" rel="noopener noreferrer" className="font-medium hover:underline">
+            <a href={workspaceResourceUrl(document.content_url, workspace)} target="_blank" rel="noopener noreferrer" className="font-medium hover:underline">
               Open content
             </a>
           ) : null}
           {document.pdf_url ? (
-            <a href={document.pdf_url} target="_blank" rel="noopener noreferrer" className="font-medium hover:underline">
+            <a href={workspaceResourceUrl(document.pdf_url, workspace)} target="_blank" rel="noopener noreferrer" className="font-medium hover:underline">
               Open PDF
             </a>
           ) : null}

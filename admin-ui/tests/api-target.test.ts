@@ -7,6 +7,7 @@ import {
   createWorkspaceApiController,
   currentLocalAgentBaseUrl,
   resourceClient,
+  workspaceResourceUrl,
 } from "../src/api/client.js";
 
 let clearCount = 0;
@@ -47,6 +48,9 @@ assert.deepEqual(workspaceApi.current(), {
   workspaceId: "mount_tai",
 });
 assert.equal(clearCount, 1);
+const resourceHref = workspaceResourceUrl("/api/v1/source-units/unit-1/content?view=raw&workspace_id=old#evidence", "https://admin.test");
+assert.equal(resourceHref, "https://admin.test/api/v1/source-units/unit-1/content?view=raw&workspace_id=mount_tai#evidence");
+assert.equal(workspaceResourceUrl("https://wiki.example.test/api/v1/page", "https://admin.test"), "https://wiki.example.test/api/v1/page");
 
 workspaceApi.setTarget({
   resourceBaseUrl: "/api/v1",
@@ -61,6 +65,7 @@ assert.deepEqual(resourceClient.defaults.params, {});
 assert.equal(workspaceApi.current(), null);
 assert.equal(currentLocalAgentBaseUrl(), LOCAL_AGENT_HOST_BASE_URL);
 assert.equal(clearCount, 2);
+assert.equal(workspaceResourceUrl("/api/v1/source-units/unit-1/pdf", "https://admin.test"), "https://admin.test/api/v1/source-units/unit-1/pdf?workspace_id=local");
 
 workspaceApi.setTarget(null);
 assert.equal(clearCount, 2, "resetting an already standalone target must preserve the query cache");

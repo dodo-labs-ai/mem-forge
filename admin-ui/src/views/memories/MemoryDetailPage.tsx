@@ -1,7 +1,7 @@
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, ArrowLeft, ExternalLink, Loader2 } from "lucide-react";
-import { resourceClient } from "@/api/client";
+import { resourceClient, workspaceResourceUrl } from "@/api/client";
 import type { Memory, MemoryEvidenceGroup } from "@/api/types";
 import { MemoryTypeBadge, StatusDot } from "@/components/admin/StatusBadge";
 import { MemoryTypeIcon } from "@/components/memories/MemoryTypeIcon";
@@ -293,7 +293,7 @@ function EvidenceGroupCard({ group }: { group: MemoryEvidenceGroup }) {
             )}
             {item.artifact && (
               <a
-                href={item.artifact.url}
+                href={workspaceResourceUrl(item.artifact.url)}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-1 text-sm text-primary hover:underline"
@@ -308,12 +308,12 @@ function EvidenceGroupCard({ group }: { group: MemoryEvidenceGroup }) {
       {(document?.content_url || document?.pdf_url) && (
         <div className="mt-3 flex flex-wrap gap-3 text-xs">
           {document.content_url && (
-            <a href={document.content_url} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
+            <a href={workspaceResourceUrl(document.content_url)} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
               Open content
             </a>
           )}
           {document.pdf_url && (
-            <a href={document.pdf_url} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
+            <a href={workspaceResourceUrl(document.pdf_url)} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
               Open PDF
             </a>
           )}

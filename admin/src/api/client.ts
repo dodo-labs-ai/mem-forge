@@ -1,13 +1,25 @@
 import createClient, { type Client, type Middleware } from "openapi-fetch";
 import { ApiError, NoWorkspaceError, describeErrorBody } from "./errors";
 import type { AdminPaths } from "./paths";
-import { LOCAL_AGENT_PREFIX, RESOURCE_PREFIX, type WorkspaceController } from "./workspace";
+import { LOCAL_AGENT_PREFIX, RESOURCE_PREFIX, type WorkspaceController, type WorkspaceTarget } from "./workspace";
 
 export type ApiClient = Client<AdminPaths>;
 
 const WORKSPACE_QUERY_PARAM = "workspace_id";
 
 const BODYLESS_METHODS = new Set(["GET", "HEAD"]);
+
+/** Routes a same-origin resource link exactly as the API client routes a request. */
+export function workspaceResourceUrl(href: string, target: WorkspaceTarget | null, origin = window.location.origin): string {
+  const url = new URL(href, origin);
+  if (url.origin !== new URL(origin).origin || !(url.pathname === RESOURCE_PREFIX || url.pathname.startsWith(`${RESOURCE_PREFIX}/`))) {
+    return href;
+  }
+  if (target === null) throw new NoWorkspaceError();
+  url.pathname = target.resourceBaseUrl + url.pathname.slice(RESOURCE_PREFIX.length);
+  if (target.workspaceId) url.searchParams.set(WORKSPACE_QUERY_PARAM, target.workspaceId);
+  return url.href;
+}
 
 /** Copies a request to a new URL field by field, which every fetch implementation honors. */
 async function withUrl(request: Request, url: URL): Promise<Request> {
@@ -31,8 +43,7 @@ function workspaceMiddleware(workspace: WorkspaceController): Middleware {
       const target = workspace.current();
       if (target === null) throw new NoWorkspaceError();
       if (isResource) {
-        url.pathname = target.resourceBaseUrl + url.pathname.slice(RESOURCE_PREFIX.length);
-        if (target.workspaceId) url.searchParams.set(WORKSPACE_QUERY_PARAM, target.workspaceId);
+        return withUrl(request, new URL(workspaceResourceUrl(request.url, target, url.origin)));
       } else {
         url.pathname = target.localAgentBaseUrl + url.pathname.slice(LOCAL_AGENT_PREFIX.length);
       }
