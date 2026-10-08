@@ -61,6 +61,10 @@ def test_renderer_link_icons_are_decoration_but_image_and_link_identities_are_ma
     simple = '<p><a href="https://example.test/doc">Reference</a></p>'
     decorated = '<p><span class="nobr"><a href="https://example.test/doc">Reference</a><img class="rendericon" src="/link.gif" height="7" width="7" align="absmiddle" alt="" border="0"></span></p>'
     assert parse_rendered_html(simple).fragments[0].content_value == parse_rendered_html(decorated).fragments[0].content_value
+    plain = '<p>Keep A.</p>'
+    bookmarked = '<p><a name="generated-1"></a>Keep A.</p>'
+    assert parse_rendered_html(plain).fragments[0].content_value == parse_rendered_html(bookmarked).fragments[0].content_value
+    assert parse_rendered_html(bookmarked).fragments[0].content_value == parse_rendered_html(bookmarked.replace('generated-1', 'generated-2')).fragments[0].content_value
     image = '<p><img src="/attachment/1" alt="Example" width="200" height="100" style="border: 0px solid black"></p>'
     resized = image.replace('width="200"', 'width="400"')
     assert parse_rendered_html(image).fragments[0].content_value == parse_rendered_html(resized).fragments[0].content_value

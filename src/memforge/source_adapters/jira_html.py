@@ -79,6 +79,7 @@ _ATTRIBUTES = {
     "th": {"rowspan", "colspan", "scope", "class"}, "td": {"rowspan", "colspan", "class"},
 }
 _NAVIGATION_REL = {"nofollow", "noopener", "noreferrer"}
+_EMPTY_BOOKMARK = _Decoration(omit=True)
 
 
 @dataclass(slots=True)
@@ -178,6 +179,14 @@ def _classes(node):
     return frozenset(node.attrs.get("class", "").split())
 
 
+def _decoration(node):
+    # Jira inserts empty named targets into rendered code/list wrappers.
+    # A named link with authored content is not a presentation-only target.
+    if node.tag == "a" and set(node.attrs) == {"name"} and not node.children:
+        return _EMPTY_BOOKMARK
+    return _DECORATIONS.get((node.tag, _classes(node)))
+
+
 def _validate_attributes(node, *, literal=False):
     """Only attested decoration or explicitly rendered semantic controls are supported."""
     literal = literal or node.tag in {"pre", "code", "tt"}
@@ -196,7 +205,7 @@ def _validate_attributes(node, *, literal=False):
             raise ValueError(f"unsupported Jira rendered HTML class on {node.tag}")
     if "style" in attrs:
         style = attrs["style"].replace(" ", "")
-        decoration = _DECORATIONS.get((node.tag, classes))
+        decoration = _decoration(node)
         declarations = [part.strip() for part in style.split(";") if part.strip()]
         supported_style = bool(decoration and declarations and all(
             ":" in part and part.split(":", 1)[0] in decoration.style_properties
@@ -217,7 +226,7 @@ def _validate_attributes(node, *, literal=False):
             raise ValueError("Jira issue identity requires a rendered issue link")
     if node.tag == "img" and attrs.get("role", "presentation") != "presentation":
         raise ValueError("unsupported Jira rendered HTML image role")
-    decoration = _DECORATIONS.get((node.tag, classes))
+    decoration = _decoration(node)
     if decoration and decoration.omit and (attrs.get("alt") or attrs.get("title")):
         raise ValueError("Jira renderer icon must not conceal authored text")
     if node.tag == "ul" and "type" in attrs and attrs["type"] not in {"disc", "circle", "square"}:
@@ -240,13 +249,13 @@ def _transparent(node, *, literal=False):
     if node.tag == "div":
         if not attrs:
             return True
-    decoration = _DECORATIONS.get((node.tag, _classes(node)))
+    decoration = _decoration(node)
     return bool(decoration and decoration.transparent and set(attrs) <= {"class", "style"})
 
 
 def _attributes(node):
     attrs = {key: value for key, value in node.attrs.items() if key not in {"class", "style"} or value.strip()}
-    decoration = _DECORATIONS.get((node.tag, _classes(node)))
+    decoration = _decoration(node)
     if decoration and (not decoration.retain_class or attrs.get("class") == decoration.erase_literal_class):
         attrs.pop("class", None)
     if decoration:
@@ -275,7 +284,7 @@ def _attributes(node):
 def _canonical(node, *, literal=False):
     if isinstance(node, _Text):
         return [("text", node.value if literal else re.sub(r"\s+", " ", node.value))]
-    decoration = _DECORATIONS.get((node.tag, _classes(node)))
+    decoration = _decoration(node)
     if decoration and decoration.omit:
         return []
     literal = literal or node.tag in {"pre", "code", "tt"}
@@ -307,7 +316,7 @@ def _literal_text(node):
 def _render(node):
     if isinstance(node, _Text):
         return re.sub(r"\s+", " ", node.value)
-    decoration = _DECORATIONS.get((node.tag, _classes(node)))
+    decoration = _decoration(node)
     if decoration and decoration.omit:
         return ""
     if node.tag in {"pre", "code", "tt"}:
@@ -324,8 +333,6 @@ def _render(node):
         title = f"; title: {node.attrs['title']}" if node.attrs.get("title") and node.attrs["title"] != name else ""
         return f"{name} (image: {node.attrs.get('src', '')}{title})"
     if node.tag == "a":
-        if "name" in node.attrs and not text.strip() and not node.attrs.get("href") and not node.attrs.get("title") and not node.attrs.get("file-preview-title"):
-            return ""
         authored_label = text.strip() if _literal_text(node).strip() else ""
         label = authored_label or node.attrs.get("file-preview-title") or text.strip() or node.attrs.get("title") or node.attrs.get("href", "")
         if not authored_label and node.attrs.get("file-preview-title"):
