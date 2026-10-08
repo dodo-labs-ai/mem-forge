@@ -71,7 +71,7 @@ def test_renderer_link_icons_are_decoration_but_image_and_link_identities_are_ma
     assert parse_rendered_html(image).fragments[0].content_value != parse_rendered_html(image.replace('/attachment/1', '/attachment/2')).fragments[0].content_value
     inserted = '<p><ins>Changed</ins></p>'
     assert parse_rendered_html(inserted).fragments[0].content_value != parse_rendered_html('<p>Changed</p>').fragments[0].content_value
-    assert '[inserted: Changed]' in parse_rendered_html(inserted).fragments[0].presentation
+    assert parse_rendered_html(inserted).fragments[0].presentation == 'Changed'
     assert parse_rendered_html('<p><cite>Title</cite></p>').fragments[0].content_value != parse_rendered_html('<p>Title</p>').fragments[0].content_value
     with pytest.raises(ValueError, match='must not conceal authored text'):
         parse_rendered_html('<img class="rendericon" src="/attachment/1" alt="Material condition">')
@@ -124,7 +124,7 @@ def test_current_html_is_attested_and_native_value_is_retained_without_duplicate
     record = json.loads(revision.content)
     assert record["native_description"] == native
     assert record["description"] == html
-    assert record["representation"] == "jira-issue-core:4"
+    assert record["representation"] == "jira-issue-core:5"
     index = build_revision_fragment_index(revision)
     assert not index.errors
     views = [f.presentation_text for f in index.fragments]
@@ -248,7 +248,7 @@ def test_comment_rendered_body_and_attachment_identity_survive_projection():
     assert record["attachments"] == [{"id": "33"}]
     index = build_revision_fragment_index(revision)
     assert not index.errors
-    assert any(f.presentation_text.endswith("[deleted: Resolved] Still pending.") for f in index.fragments)
+    assert any(f.presentation_text.endswith("[struck through: Resolved] Still pending.") for f in index.fragments)
 
 
 @pytest.mark.parametrize("rendered", [None, 42, "", "   "])
@@ -283,10 +283,10 @@ def test_inline_literal_code_whitespace_and_link_label_are_preserved():
     assert changed.content_value != fragment.content_value
 
 
-def test_link_destination_and_deletion_remain_meaningful_comparison_material():
+def test_link_destination_and_strikethrough_remain_meaningful_comparison_material():
     source = '<p><del>Use A.</del> Use <a href="https://example.test/B">B</a>.</p>'
     original = parse_rendered_html(source).fragments[0]
-    assert "[deleted: Use A.]" in original.presentation
+    assert "[struck through: Use A.]" in original.presentation
     assert "https://example.test/B" in original.presentation
     assert parse_rendered_html(source.replace("example.test/B", "example.test/C")).fragments[0].content_value != original.content_value
     assert parse_rendered_html(source.replace("<del>", "<span>").replace("</del>", "</span>")).fragments[0].content_value != original.content_value
@@ -348,7 +348,7 @@ def test_unsupported_or_malformed_html_fails_as_a_whole(source):
 
 def test_schema_cutover_keeps_historical_profile_truth():
     for key, profile in CURRENT_OBSERVATION_PROFILES.items():
-        assert profile.schema_version == 4
+        assert profile.schema_version == (4 if key[1] == "changelog" else 5)
         legacy = LEGACY_OBSERVATION_PROFILES[key]
         assert legacy.schema_version == 1
         schema = CANONICAL_RECORD_SCHEMAS[(legacy.schema_name, legacy.schema_version)]
@@ -390,3 +390,61 @@ def test_history_parent_population_change_keeps_all_current_value_views(old_coun
     assert isinstance(plan, ExtractionAuthority)
     assert not any(plan.authorizes(f) for f in context.full_fragments
                    if any(f.presentation_text.endswith(value) for value in ('Previous rule.', 'New rule.')))
+
+
+@pytest.mark.parametrize("html", [
+    '<p><ins>Keep the condition.</ins></p>',
+    '<ins>Keep the condition.</ins>',
+    '<table><tr><th><ins>Condition</ins></th></tr><tr><td>Keep it.</td></tr></table>',
+])
+def test_jira_underline_is_not_an_insertion_event_and_legacy_format_remains_pinned(html):
+    from memforge.source_adapters.jira_html import LEGACY_RENDERED_HTML_FORMAT, RENDERED_HTML_FORMAT
+
+    latest = RENDERED_HTML_FORMAT.parse(html)
+    underline = RENDERED_HTML_FORMAT.parse(html.replace('<ins>', '<u>').replace('</ins>', '</u>'))
+    assert [(f.kind, f.presentation, f.content_value) for f in latest.fragments] == [(f.kind, f.presentation, f.content_value) for f in underline.fragments]
+    assert all('[inserted:' not in fragment.presentation for fragment in latest.fragments)
+    legacy = LEGACY_RENDERED_HTML_FORMAT.parse(html)
+    assert any('[inserted:' in fragment.presentation for fragment in legacy.fragments)
+    assert [(f.start, f.end) for f in latest.fragments] == [(f.start, f.end) for f in legacy.fragments]
+
+
+def test_jira_format_upgrade_preserves_historical_text_views():
+    from memforge.source_adapters.jira import _profile
+
+    projected = projection('+Keep the condition.+', '<p><ins>Keep the condition.</ins></p>')
+    revision = projected.observation_revisions[0]
+    historical = replace(revision, id='historical-v4', evidence_profile=_profile('jira-issue-core', 4))
+    old_index = build_revision_fragment_index(historical)
+    assert not old_index.errors
+    old_fragment = next(f for f in old_index.fragments if '[inserted: Keep the condition.]' in f.presentation_text)
+    verify_text_evidence_view(historical, anchor=old_fragment.anchor,
+        raw_content_sha256=old_fragment.raw_content_sha256,
+        presentation_sha256=old_fragment.presentation_sha256,
+        excerpt=old_fragment.presentation_text, text_view=old_fragment.text_view)
+    current_index = build_revision_fragment_index(revision)
+    assert not current_index.errors
+    assert all('[inserted:' not in f.presentation_text for f in current_index.fragments)
+    old_unit = replace(projected.source_unit_revisions[0], id='historical-unit-v4', observation_revision_ids=(historical.id,))
+    old = replace(projected, observation_revisions=(historical,), source_unit_revisions=(old_unit,), deltas=())
+    current = projection('+Keep the condition.+', '<p><ins>Keep the condition.</ins></p>', prior=old)
+    _, support = planned(old, current, old_fragment)
+    assert support.parts[0].status is not EvidenceCorrespondence.EXACT_UNCHANGED
+
+    current_fragment = next(f for f in build_revision_fragment_index(current.observation_revisions[0]).fragments if f.presentation_text.endswith('Keep the condition.'))
+    next_revision = projection('+Keep the condition.+ Add B.', '<p><ins>Keep the condition.</ins></p><p>Add B.</p>', prior=current)
+    _, unchanged_support = planned(current, next_revision, current_fragment)
+    assert unchanged_support.parts[0].status is EvidenceCorrespondence.EXACT_UNCHANGED
+
+
+@pytest.mark.parametrize("tag", ['del', 's', 'strike'])
+def test_current_jira_strikethrough_preserves_authored_text_without_a_deletion_event(tag):
+    from memforge.source_adapters.jira_html import LEGACY_RENDERED_HTML_FORMAT, RENDERED_HTML_FORMAT
+
+    html = f'<p><{tag}>Old condition.</{tag}> Current condition.</p>'
+    latest = RENDERED_HTML_FORMAT.parse(html).fragments[0]
+    assert latest.presentation == '[struck through: Old condition.] Current condition.'
+    assert '[deleted:' not in latest.presentation
+    assert latest.content_value != RENDERED_HTML_FORMAT.parse('<p>Old condition. Current condition.</p>').fragments[0].content_value
+    assert LEGACY_RENDERED_HTML_FORMAT.parse(html).fragments[0].presentation == '[deleted: Old condition.] Current condition.'
+    assert (latest.start, latest.end) == (0, len(html))
