@@ -68,6 +68,22 @@ describe("createApiClient", () => {
     await expect(api.GET("/api/v1/sources")).rejects.toBeInstanceOf(NoWorkspaceError);
   });
 
+  test("reads an admitted local job at the host route after workspace selection changes", async () => {
+    const { calls } = fakeFetch({ "GET /api/cloud/local-agent/jobs/laj-auth": () => ({ status: "succeeded" }) });
+    const workspace = createWorkspaceController(() => {}, {
+      ...STANDALONE_TARGET,
+      localAgentBaseUrl: "/api/cloud/workspaces/ws-1/local-agent",
+      workspaceId: "ws-1",
+    });
+    const api = createApiClient(workspace, ORIGIN);
+    await unwrap(api.GET("/api/cloud/local-agent/jobs/{job_id}", { params: { path: { job_id: "laj-auth" } } }));
+    workspace.setTarget(null);
+    await unwrap(api.GET("/api/cloud/local-agent/jobs/{job_id}", { params: { path: { job_id: "laj-auth" } } }));
+    expect(calls.map((request) => new URL(request.url).pathname)).toEqual([
+      "/api/cloud/local-agent/jobs/laj-auth", "/api/cloud/local-agent/jobs/laj-auth",
+    ]);
+  });
+
   test("clears cached data only when the target really changes", () => {
     const onChange = vi.fn();
     const workspace = createWorkspaceController(onChange);
