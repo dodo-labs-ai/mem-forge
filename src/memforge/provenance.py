@@ -89,6 +89,8 @@ def list_stored_input_artifacts(
         ("pdf", unit_input.pdf_content_uri, PDF_MEDIA_TYPE),
     )
     for kind, uri, media_type in candidates:
+        if not store.belongs_to_document(uri, source_id=unit_input.source_id, doc_id=unit_input.document_id):
+            continue
         stored = store.get_artifact(uri, media_type)
         if stored is not None:
             artifacts[kind] = DocumentArtifact(
@@ -122,15 +124,13 @@ def source_unit_content_url(
 ) -> str | None:
     """Return the Unit's content URL when its stored input has readable content.
 
-    Without a store or configuration to read from, a recorded object stands
-    for readable content.
+    A store or configuration is required to establish the object ownership.
     """
     if unit_input is None:
         return None
     resource_path = source_unit_resource_path(unit_input.source_unit_id)
     if config is None and artifact_store is None:
-        recorded = unit_input.normalized_content_uri or unit_input.raw_content_uri
-        return f"{resource_path}/content" if recorded else None
+        return None
     if select_stored_input_artifact(unit_input, "content", config, artifact_store, resource_path=resource_path) is None:
         return None
     return f"{resource_path}/content"
@@ -146,7 +146,7 @@ def source_unit_pdf_url(
         return None
     resource_path = source_unit_resource_path(unit_input.source_unit_id)
     if config is None and artifact_store is None:
-        return f"{resource_path}/pdf" if unit_input.pdf_content_uri else None
+        return None
     if select_stored_input_artifact(unit_input, "pdf", config, artifact_store, resource_path=resource_path) is None:
         return None
     return f"{resource_path}/pdf"

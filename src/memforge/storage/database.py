@@ -39,6 +39,7 @@ from memforge.local_agent.source_contract import (
     source_sync_input_metadata_with_artifact_attestation,
 )
 from memforge.storage.admin_source import is_pause_only_source_update
+from memforge.storage.document_store import DocumentStore
 from memforge.source_activity import (
     SourceActivityConflict,
     SourceActivityKind,
@@ -4576,8 +4577,9 @@ async def _open_aiosqlite_connection(
 class Database:
     """Async SQLite database layer for MemForge."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *, document_store: DocumentStore | None = None) -> None:
         self.db_path = db_path
+        self._document_store = document_store
         self._db: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
 
@@ -6215,6 +6217,7 @@ class Database:
                     await self._release_input_objects_unlocked(
                         source_id,
                         (row["raw_content_uri"], row["normalized_content_uri"], row["pdf_content_uri"]),
+                        document_id=doc_id,
                     )
                 async with self.db.execute(
                     "SELECT source FROM documents WHERE doc_id = ?",
@@ -8001,7 +8004,7 @@ class Database:
             # A later revision of the Unit committed first; its input stays.
             return
         async with self.db.execute(
-            """SELECT raw_content_uri, normalized_content_uri, pdf_content_uri
+            """SELECT document_id, raw_content_uri, normalized_content_uri, pdf_content_uri
                  FROM source_unit_inputs WHERE source_unit_id = ?""",
             (unit_input.source_unit_id,),
         ) as cursor:
@@ -8053,14 +8056,17 @@ class Database:
                     )
                     if uri not in kept
                 ),
+                document_id=replaced["document_id"],
             )
 
     async def _release_input_objects_unlocked(
         self,
         source_id: str,
         uris: Sequence[str | None],
+        *,
+        document_id: str,
     ) -> None:
-        """Queue released stored input objects for cleanup.
+        """Queue only owned Document files for cleanup.
 
         Whether an object is still referenced is decided when cleanup runs
         (``source_artifact_uri_is_referenced``): the same key can be written
@@ -8068,6 +8074,10 @@ class Database:
         """
 
         for artifact_uri in dict.fromkeys(str(uri) for uri in uris if uri):
+            if self._document_store is None or not self._document_store.belongs_to_document(
+                artifact_uri, source_id=source_id, doc_id=document_id
+            ):
+                continue
             await self.db.execute(
                 "INSERT OR IGNORE INTO source_artifact_cleanup_tasks "
                 "(task_id, source_id, artifact_uri) VALUES (?, ?, ?)",

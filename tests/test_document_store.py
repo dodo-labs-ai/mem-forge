@@ -56,3 +56,30 @@ def test_same_title_documents_have_distinct_local_artifacts(tmp_path) -> None:
     assert store.read_artifact(second_normalized) == b"# Second"
     assert store.read_artifact(first_pdf) == b"%PDF-first"
     assert store.read_artifact(second_pdf) == b"%PDF-second"
+
+
+def test_an_object_belongs_only_to_the_document_whose_keys_it_is_stored_under(tmp_path) -> None:
+    store = LocalDocumentStore(str(tmp_path / "documents"))
+    source_id = "src-repository"
+    doc_id = "github:org/repo:docs/user-guide.md"
+    own = store.store_normalized(source_id=source_id, doc_id=doc_id, title="User Guide", markdown="# Own")
+    sibling = store.store_normalized(
+        source_id=source_id,
+        doc_id="github:org/repo:examples/user-guide.md",
+        title="User Guide",
+        markdown="# Sibling",
+    )
+    other_source = store.store_normalized(
+        source_id="src-other", doc_id=doc_id, title="User Guide", markdown="# Other Source"
+    )
+    title_keyed = tmp_path / "documents" / "src-repository" / "user-guide.md"
+    title_keyed.write_text("# Last same-titled Document", encoding="utf-8")
+
+    def belongs(uri: str | None) -> bool:
+        return store.belongs_to_document(uri, source_id=source_id, doc_id=doc_id)
+
+    assert belongs(own)
+    assert not belongs(sibling)
+    assert not belongs(other_source)
+    assert not belongs(str(title_keyed))
+    assert not belongs(None)

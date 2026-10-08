@@ -443,6 +443,9 @@ async def test_admin_memory_detail_exposes_service_artifact_urls_only(db: Databa
 
     docs_dir = tmp_path / "memforge" / "documents"
     docs_dir.mkdir(parents=True)
+    from memforge.storage.document_store import document_artifact_identity
+    docs_dir = docs_dir / "src-confluence" / document_artifact_identity("doc-pdf-uri")
+    docs_dir.mkdir(parents=True)
     source_pdf = docs_dir / "source.pdf"
     source_pdf.write_bytes(b"%PDF-1.4\n")
 
@@ -527,6 +530,9 @@ async def test_pinned_evidence_does_not_link_to_another_revisions_latest_input(
 
     docs_dir = tmp_path / "memforge" / "documents"
     docs_dir.mkdir(parents=True)
+    from memforge.storage.document_store import document_artifact_identity
+    docs_dir = docs_dir / "src-confluence" / document_artifact_identity("pinned-link")
+    docs_dir.mkdir(parents=True)
     markdown = docs_dir / "latest.md"
     markdown.write_text("Latest page content.")
     doc = await _insert_document(db, doc_id="pinned-link", normalized_content_uri=str(markdown))
@@ -565,6 +571,9 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
     from memforge.server.admin_api import create_admin_app
 
     docs_dir = tmp_path / "memforge" / "documents"
+    docs_dir.mkdir(parents=True)
+    from memforge.storage.document_store import document_artifact_identity
+    docs_dir = docs_dir / "src-confluence" / document_artifact_identity("doc-artifact-url")
     docs_dir.mkdir(parents=True)
     source_md = docs_dir / "source.md"
     source_pdf = docs_dir / "source.pdf"
@@ -969,6 +978,9 @@ async def test_admin_document_content_alias_falls_back_to_raw_source(db: Databas
 
     docs_dir = tmp_path / "memforge" / "documents"
     docs_dir.mkdir(parents=True)
+    from memforge.storage.document_store import document_artifact_identity
+    docs_dir = docs_dir / "src-confluence" / document_artifact_identity("doc-raw-artifact-url")
+    docs_dir.mkdir(parents=True)
     raw_source = docs_dir / "source.html"
     raw_source.write_text("<h1>Raw source</h1>", encoding="utf-8")
 
@@ -1001,6 +1013,9 @@ async def test_admin_document_artifacts_can_use_non_filesystem_store(db: Databas
     from memforge.storage.document_store import StoredDocumentArtifact
 
     class MemoryBackedDocumentStore:
+        def belongs_to_document(self, uri, *, source_id, doc_id):
+            return (source_id, doc_id, uri) == ("src-confluence", "doc-object-artifact-url", "mem://doc.md")
+
         def __init__(self):
             self.objects = {
                 "mem://doc.md": (
@@ -1306,6 +1321,9 @@ def test_sync_previous_content_read_does_not_bypass_document_store(tmp_path: Pat
     outside.write_text("previous content", encoding="utf-8")
 
     class RejectingDocumentStore:
+        def belongs_to_document(self, uri, *, source_id, doc_id):
+            return True
+
         def read_normalized(self, stored_path: str) -> str | None:
             assert stored_path == str(outside)
             return None
@@ -1324,6 +1342,38 @@ def test_sync_previous_content_read_does_not_bypass_document_store(tmp_path: Pat
     )
 
     assert orchestrator._read_previous_normalized_content(stored_input) is None
+
+
+
+def test_sync_previous_content_is_read_only_from_the_inputs_own_object(tmp_path: Path):
+    from memforge.models import slugify
+    from memforge.pipeline.sync import GeneSyncOrchestrator
+    from memforge.storage.document_store import LocalDocumentStore
+
+    doc_store = LocalDocumentStore(str(tmp_path))
+    own_uri = doc_store.store_normalized("src-confluence", "doc-own", "Source Page", "own previous content")
+    sibling_uri = doc_store.store_normalized("src-confluence", "doc-sibling", "Source Page", "sibling content")
+    other_source_uri = doc_store.store_normalized("src-other", "doc-own", "Source Page", "other Source content")
+    # Before objects were keyed by Document, same-titled Documents of one
+    # Source shared this key.
+    title_keyed = tmp_path / slugify("src-confluence") / f"{slugify('Source Page')}.md"
+    title_keyed.write_text("last same-titled Document's content", encoding="utf-8")
+    orchestrator = GeneSyncOrchestrator(
+        db=object(),
+        doc_store=doc_store,
+        memory_extractor=object(),
+        memory_engine=object(),
+        memory_store=object(),
+    )
+
+    def previous(uri: str) -> str | None:
+        stored_input = _confluence_stored_input("doc-own", normalized_content_uri=uri, pdf_content_uri=None)
+        return orchestrator._read_previous_normalized_content(stored_input)
+
+    assert previous(own_uri) == "own previous content"
+    assert previous(sibling_uri) is None
+    assert previous(other_source_uri) is None
+    assert previous(str(title_keyed)) is None
 
 
 def _confluence_stored_input(
@@ -1887,3 +1937,45 @@ async def test_admin_memory_update_with_empty_content_keeps_content(
     assert response.status_code == 200
     assert stored.content == content
     assert stored.content_hash == memory.content_hash
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("foreign_kind", ["sibling", "other_source", "title_keyed"])
+async def test_foreign_document_objects_are_not_served_or_linked(db, tmp_path, foreign_kind):
+    from memforge.server.admin_api import create_admin_app
+    from memforge.storage.document_store import LocalDocumentStore
+
+    config = _config(tmp_path)
+    store = LocalDocumentStore(config.storage.docs_path)
+    doc_id = "doc-requested"
+    foreign_source = "src-other" if foreign_kind == "other_source" else "src-confluence"
+    foreign_doc = "doc-sibling" if foreign_kind == "sibling" else doc_id
+    if foreign_kind == "title_keyed":
+        directory = Path(config.storage.docs_path) / "src-confluence"
+        directory.mkdir(parents=True)
+        uri = directory / "same-title.md"
+        uri.write_text("Wrong document body")
+        uri = str(uri)
+    else:
+        uri = store.store_normalized(foreign_source, foreign_doc, "Same title", "Wrong document body")
+    doc = await _insert_document(db, doc_id=doc_id, normalized_content_uri=uri, raw_content_uri=uri, pdf_content_uri=uri)
+    unit = await db.find_source_unit_by_document_id(doc.source, doc_id)
+    memory = await _insert_memory(db, mem_id="mem-safe-evidence", content="Correct retained claim.")
+    await db.add_memory_source(memory.id, doc_id, "confluence", excerpt="Correct retained Evidence.", source_updated_at=None)
+    with TestClient(create_admin_app(db=db, config=config, document_store=store)) as client:
+        detail = client.get(f"/api/v1/memories/{memory.id}")
+        for prefix in [f"/api/v1/documents/{doc_id}", f"/api/v1/source-units/{unit.id}"]:
+            manifest = client.get(prefix + "/artifacts")
+            if manifest.status_code == 200:
+                assert manifest.json()["artifacts"] == {}
+            else:
+                assert manifest.status_code == 404
+            for suffix in ["/content", "/pdf", "/artifacts/raw_source", "/artifacts/normalized_markdown", "/artifacts/pdf"]:
+                assert client.get(prefix + suffix).status_code == 404
+                assert client.head(prefix + suffix).status_code == 404
+    assert detail.status_code == 200
+    [evidence] = detail.json()["evidence"]
+    assert evidence["document"]["content_url"] is None
+    assert evidence["document"]["pdf_url"] is None
+    assert evidence["items"][0]["excerpt"] == "Correct retained Evidence."
+    assert store.read_artifact(uri) == b"Wrong document body"

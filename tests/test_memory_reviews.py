@@ -592,6 +592,9 @@ class TestReviewCrud:
         incumbent, challenger, review = await _seed_supersede_review(db, chroma, suffix="urls")
         docs_dir = Path(_config(tmp_path).storage.docs_path)
         docs_dir.mkdir(parents=True)
+        from memforge.storage.document_store import document_artifact_identity
+        docs_dir = docs_dir / "src-confluence" / document_artifact_identity("doc-review-incumbent")
+        docs_dir.mkdir(parents=True)
         incumbent_md = docs_dir / "incumbent.md"
         incumbent_md.write_text("# Incumbent evidence", encoding="utf-8")
         await _upsert_doc_with_artifacts(
@@ -646,6 +649,9 @@ class TestReviewCrud:
         from memforge.storage.document_store import StoredDocumentArtifact
 
         class MemoryBackedDocumentStore:
+            def belongs_to_document(self, uri, *, source_id, doc_id):
+                return (source_id, doc_id, uri) == ("src-confluence", "doc-review-object-incumbent", "mem://review-incumbent.md")
+
             def __init__(self) -> None:
                 self.objects = {"mem://review-incumbent.md": b"# Incumbent object evidence"}
 
