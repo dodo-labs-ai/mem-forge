@@ -8,6 +8,7 @@ import type { LocalAgentJob } from "./responses";
  */
 interface ResponsePatches {
   "/api/cloud/local-agent/jobs/current": { get: { data: LocalAgentJob[] } };
+  "/api/cloud/local-agent/jobs/{job_id}": { get: LocalAgentJob };
 }
 
 /** Success statuses whose generated body is replaced by the declared one. */

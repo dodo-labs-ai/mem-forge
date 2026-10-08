@@ -157,8 +157,8 @@ export function SourcesPage() {
                 title={source.name}
                 description={item.title}
                 action={
-                  <Button size="sm" variant="outline" onClick={() => actions.runAttention(item.action, source)}>
-                    {item.actionLabel}
+                  <Button size="sm" variant="outline" disabled={!actions.attentionControl(item.action, source, item.actionLabel).enabled} onClick={() => actions.runAttention(item.action, source)}>
+                    {actions.attentionControl(item.action, source, item.actionLabel).label}
                   </Button>
                 }
               />

@@ -29,12 +29,13 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete }: Sour
   const capabilities = source.capabilities;
   const sync = actions.syncControl(source, activity);
   const canSync = Boolean(capabilities?.can_sync) && source.status === "active";
+  const control = attention && actions.attentionControl(attention.action, source, attention.actionLabel);
 
   return (
     <div className="flex items-center justify-end gap-1" onClick={(event) => event.stopPropagation()}>
       {attention ? (
-        <Button size="sm" onClick={() => actions.runAttention(attention.action, source)}>
-          {attention.actionLabel}
+        <Button size="sm" disabled={!control?.enabled} onClick={() => actions.runAttention(attention.action, source)}>
+          {control?.label}
         </Button>
       ) : canSync ? (
         <Button size="sm" variant="outline" disabled={!sync.enabled} onClick={() => actions.syncNow(source, sync.retryTarget)}>
