@@ -26,7 +26,7 @@ from memforge.source_projection import (
 )
 
 
-PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 7
+PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +239,12 @@ def plan_projection_evidence_work(
             try:
                 if canonical_record_is_tombstoned(revision):
                     authority[anchor.observation_id] = ()
+                    continue
+                # A representation upgrade is current reading, not a text diff
+                # between incompatible coordinate/interpretation contracts.
+                # Support independently reassesses pinned historical Evidence.
+                if base_revision.evidence_profile != profile:
+                    authority[anchor.observation_id] = None
                     continue
                 changed_ranges = canonical_record_changed_raw_ranges(base_revision, revision)
             except ValueError:
