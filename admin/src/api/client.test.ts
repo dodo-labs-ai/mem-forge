@@ -1,10 +1,31 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { fakeFetch } from "@/test/fakeApi";
-import { createApiClient, unwrap } from "./client";
+import { createApiClient, unwrap, workspaceResourceUrl } from "./client";
 import { ApiError, NoWorkspaceError } from "./errors";
 import { STANDALONE_TARGET, createWorkspaceController } from "./workspace";
 
 const ORIGIN = "http://admin.test";
+
+describe("workspaceResourceUrl", () => {
+  test("routes links and preserves queries and fragments without a duplicate selector", () => {
+    const target = { ...STANDALONE_TARGET, resourceBaseUrl: "/api/cloud/workspaces/ws-1/v1", workspaceId: "ws-1" };
+    const url = new URL(workspaceResourceUrl("/api/v1/source-units/unit-1/content?view=raw&workspace_id=old#evidence", target, ORIGIN));
+    expect(url.pathname).toBe("/api/cloud/workspaces/ws-1/v1/source-units/unit-1/content");
+    expect(url.searchParams.getAll("workspace_id")).toEqual(["ws-1"]);
+    expect(url.searchParams.get("view")).toBe("raw");
+    expect(url.hash).toBe("#evidence");
+  });
+
+  test("does not send workspace selection to external sources or host routes", () => {
+    for (const href of ["https://wiki.example.test/api/v1/page", "/api/cloud/session", "/api/v10/content"]) {
+      expect(workspaceResourceUrl(href, STANDALONE_TARGET, ORIGIN)).toBe(href);
+    }
+  });
+
+  test("requires a selected workspace for resource links", () => {
+    expect(() => workspaceResourceUrl("/api/v1/source-units/unit-1/pdf", null, ORIGIN)).toThrow(NoWorkspaceError);
+  });
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
