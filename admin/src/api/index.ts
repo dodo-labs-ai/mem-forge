@@ -1,5 +1,5 @@
 export { ApiProvider, useApi, useWorkspaceTarget } from "./ApiProvider";
-export { createApiClient, unwrap, type ApiClient } from "./client";
+export { createApiClient, unwrap, workspaceResourceUrl, type ApiClient } from "./client";
 export { ApiError, HTTP_STATUS, NoWorkspaceError, isApiErrorStatus } from "./errors";
 export {
   RESERVED_PROJECT_KEYS,

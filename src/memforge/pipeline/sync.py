@@ -2630,6 +2630,12 @@ class GeneSyncOrchestrator:
         # Document before anything commits. A reprocess from stored input
         # reads its raw content from storage and keeps the provider exports it
         # cannot repeat; only a changed normalization is stored again.
+        # A stored object is reused only when it is this Document's own
+        # object in this Source; any other URI a stored input carries is
+        # written again under this Document's keys.
+        def own_object(uri: str | None) -> str | None:
+            return uri if self.doc_store.belongs_to_document(uri, source_id=source_id, doc_id=doc_id) else None
+
         reuse_content_artifacts = content_unchanged and (stored_document is not None or not force_reprocess)
         unit_revision_unchanged = (
             projection.deltas[0].previous_unit_revision_id == projection.source_unit_revisions[0].id
@@ -2643,10 +2649,12 @@ class GeneSyncOrchestrator:
         elif reuse_content_artifacts and unit_revision_unchanged and stored_input is not None:
             reused_raw = stored_input
             raw_sha256 = stored_input.raw_content_sha256
-        raw_uri = reused_raw.raw_content_uri if reused_raw is not None else None
+        raw_uri = own_object(reused_raw.raw_content_uri) if reused_raw is not None else None
         raw_content_type = reused_raw.raw_content_type if raw_uri and reused_raw is not None else raw.content_type
         norm_uri = (
-            stored_input.normalized_content_uri if reuse_content_artifacts and stored_input is not None else None
+            own_object(stored_input.normalized_content_uri)
+            if reuse_content_artifacts and stored_input is not None
+            else None
         )
         stored_content_artifact = False
         if not raw_uri:
@@ -2681,7 +2689,7 @@ class GeneSyncOrchestrator:
         # 3b. Export PDF (if gene supports it)
         # ------------------------------------------------------------------
         pdf_uri = (
-            stored_input.pdf_content_uri
+            own_object(stored_input.pdf_content_uri)
             if (reuse_content_artifacts or stored_document is not None) and stored_input is not None
             else None
         )
@@ -3261,20 +3269,24 @@ class GeneSyncOrchestrator:
         }
 
     def _read_previous_normalized_content(self, stored_input: SourceUnitInput | None) -> str | None:
-        """Read the normalized markdown of the Unit's stored input before this sync overwrites it."""
-        if stored_input is None or not stored_input.normalized_content_uri:
+        """Read the normalized markdown of the Unit's stored input before this sync overwrites it.
+
+        Only an object stored under the input's own Source and Document keys
+        holds this Unit's previous content; for any other URI the update has
+        no previous content to compare against.
+        """
+        if stored_input is None or not self.doc_store.belongs_to_document(
+            stored_input.normalized_content_uri,
+            source_id=stored_input.source_id,
+            doc_id=stored_input.document_id,
+        ):
             return None
 
-        uri = stored_input.normalized_content_uri
-        if self.doc_store and hasattr(self.doc_store, "read_normalized"):
-            try:
-                content = self.doc_store.read_normalized(uri)
-                if content is not None:
-                    return content
-            except Exception as e:
-                logger.warning("Failed to read previous normalized content via document store: %s", e)
-
-        return None
+        try:
+            return self.doc_store.read_normalized(str(stored_input.normalized_content_uri))
+        except Exception as e:
+            logger.warning("Failed to read previous normalized content via document store: %s", e)
+            return None
 
     async def _record_document_update_strategy(
         self,

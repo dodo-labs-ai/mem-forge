@@ -81,3 +81,15 @@ export function createWorkspaceApiController(
 export function currentLocalAgentBaseUrl(): string {
   return currentTarget?.localAgentBaseUrl ?? STANDALONE_TARGET.localAgentBaseUrl;
 }
+
+/** Applies the resource client's selected workspace to a same-origin resource link. */
+export function workspaceResourceUrl(href: string, origin = window.location.origin): string {
+  const url = new URL(href, origin);
+  if (url.origin !== new URL(origin).origin || !(url.pathname === "/api/v1" || url.pathname.startsWith("/api/v1/"))) {
+    return href;
+  }
+  const target = currentTarget ?? STANDALONE_TARGET;
+  url.pathname = target.resourceBaseUrl + url.pathname.slice("/api/v1".length);
+  if (target.workspaceId) url.searchParams.set("workspace_id", target.workspaceId);
+  return url.href;
+}
