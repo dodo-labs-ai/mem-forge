@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from memforge.memory.coordinator_review import (
     COORDINATOR_REVIEW_ORIGIN,
@@ -93,8 +93,9 @@ def build_lifecycle_plan(
     the incumbents. A conflict raised again reuses its Review: a pending one is
     refreshed, a stale one reopens, and a decided one is not raised again. A
     pending Review whose old Memory this revision decides without raising its
-    conflict is closed as stale; an old Memory kept unchanged without a decision
-    keeps its pending Reviews as they are.
+    conflict is closed as stale; an old Memory kept without a decision keeps its
+    pending Reviews as they are, and while it has one its Support stays as that
+    Review's proposal names it.
     """
 
     incumbent_ids = tuple(sorted(incumbents))
@@ -310,6 +311,10 @@ def build_lifecycle_plan(
 
     review_mutations: list[LifecycleMutation] = []
     raised_review_ids: set[str] = set()
+    pending_review_incumbents = {
+        review.incumbent_memory_id for review in coordinator_reviews
+        if review.status is LifecycleReviewStatus.PENDING
+    }
     for operation in add_operations:
         assert operation.memory is not None
         create_memory(operation.memory)
@@ -320,6 +325,9 @@ def build_lifecycle_plan(
         all_support = all_active_support_unit_ids.get(memory_id, ())
         external_support = set(all_support).difference(current_source_support)
 
+        if operation.relation_undecided and operation.memory is not None and memory_id in pending_review_incumbents:
+            # The undecided Memory's pending Review proposes against its current Support.
+            operation = replace(operation, memory=None, support_revalidation_skipped=True)
         if operation.support_revalidation_skipped and (
             operation.action is not ReconcileAction.NOOP or operation.memory is not None
         ):
@@ -598,7 +606,8 @@ def build_lifecycle_plan(
     # mutation of its Memory.
     undecided_ids = {
         operation.memory_id for operation in operations
-        if operation.support_revalidation_skipped and not operation.reviews and operation.memory_id is not None
+        if (operation.support_revalidation_skipped or operation.relation_undecided)
+        and not operation.reviews and operation.memory_id is not None
     }
     closures = tuple(
         LifecycleMutation(
