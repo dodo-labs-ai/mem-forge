@@ -9323,7 +9323,7 @@ async def test_reused_evidence_advances_only_support_validation_plan_across_revi
     (False, False, "support"), (True, False, "support"), (False, True, "support"),
     (True, False, "claim"), (False, True, "claim"),
 ])
-async def test_unresolved_support_preserves_its_baseline_and_resumes_after_source_advances(
+async def test_an_undecided_claim_keeps_what_was_verified_and_resumes_after_source_advances(
     db, equivalent_candidate, mixed_supports, skip_stage,
 ):
     from memforge.pipeline.revision_assessment import RevisionAssessmentContext
@@ -9472,12 +9472,18 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
 
     assert (await db.get_current_source_unit_revision(first.source_units[0].id)).id == third.source_unit_revisions[0].id
     remaining_support = await active_support_evidence(db, skipped.id, source_id="src-1")
-    remaining_by_reference = {part.reference_id: part for part in remaining_support}
-    assert all(remaining_by_reference.get(part.reference_id) == part for part in old_support)
     for unit_id, unit in old_units.items():
         assert await db.get_evidence_unit(unit_id) == unit
-    assert remaining_support == old_support
-    assert await db.get_memory(skipped.id) == old_memory
+    if skip_stage == "support":
+        # A claim that could not be judged keeps its Support and validation baseline.
+        assert remaining_support == old_support
+        assert await db.get_memory(skipped.id) == old_memory
+    else:
+        # An uncertain relationship withholds only the Candidate; the verified claim is on current Evidence.
+        assert remaining_support and {part.validation_unit_revision_id for part in remaining_support} == {
+            third.source_unit_revisions[0].id
+        }
+        assert replace(await db.get_memory(skipped.id), updated_at=old_memory.updated_at) == old_memory
     continued_support = await active_support_evidence(db, continued.id, source_id="src-1")
     assert continued_support and {part.validation_unit_revision_id for part in continued_support} == {third.source_unit_revisions[0].id}
     assert (await db.get_memory(skipped.id)).status == "active"
@@ -9489,8 +9495,7 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
     assert len(await db.db.execute_fetchall("SELECT id FROM memories")) == (3 if restated else 2)
     assert not await db.db.execute_fetchall("SELECT id FROM lifecycle_reviews")
     assert stats["pending_review"] == 0
-    assert stats["support_revalidation_skipped_memory_count"] == 1
-
+    assert stats["support_revalidation_skipped_memory_count"] == (1 if skip_stage == "support" else 0)
 
     client.skip_claim = False
     client.assessments.clear()
@@ -9506,8 +9511,9 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
     assert len(await db.db.execute_fetchall("SELECT id FROM memories")) == (3 if restated else 2)
     assert not await db.db.execute_fetchall("SELECT id FROM lifecycle_reviews")
 
-    # The skipped Support compares v2→v4, while the other Memory compares v3→v4.
-    for claim, old_edition in ((skipped_claim, "Edition 2."), (continued_claim, "Edition 3.")):
+    # A skipped Support compares v2→v4, while a Support verified at v3 compares v3→v4.
+    skipped_baseline = "Edition 2." if skip_stage == "support" else "Edition 3."
+    for claim, old_edition in ((skipped_claim, skipped_baseline), (continued_claim, "Edition 3.")):
         assert any(
             any(item["claim"] == claim for item in payload["works"])
             and any(text == old_edition for _, text, *_ in payload["removed_historical"])

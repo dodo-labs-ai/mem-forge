@@ -1311,7 +1311,8 @@ async def _coordinator_review_plan(
 
     ``raised`` raises the contradiction again; ``decided`` reads mem-1 as
     supported by its unchanged Evidence without the conflict; ``undecided``
-    keeps mem-1 unchanged without a decision.
+    keeps mem-1 unchanged without a decision; ``undecided_supported`` leaves its
+    claim relationships undecided while its own Support result keeps it.
     """
     from memforge.models import CoordinatorProposal, CoordinatorReview
 
@@ -1333,6 +1334,10 @@ async def _coordinator_review_plan(
         "undecided": ReconcileOperation(
             action=ReconcileAction.NOOP, memory_id=incumbent.id, reason="capacity",
             support_revalidation_skipped=True,
+        ),
+        "undecided_supported": ReconcileOperation(
+            action=ReconcileAction.NOOP, memory_id=incumbent.id, memory=_staged_claim(incumbent.content),
+            reason="unresolved claim relationship", relation_undecided=True,
         ),
     }[outcome]
     return build_lifecycle_plan(
@@ -1418,6 +1423,25 @@ async def test_a_conflict_the_revision_no_longer_raises_closes_stale_and_reopens
     [reopened] = await _coordinator_reviews(db)
     assert (reopened.id, reopened.status, reopened.resolved_at) == (pending.id, LifecycleReviewStatus.PENDING, None)
     assert reopened.lifecycle_plan_id == "plan-conflict-again"
+
+
+@pytest.mark.asyncio
+async def test_an_undecided_supported_claim_moves_to_current_evidence_unless_a_review_is_pending(db: Database) -> None:
+    await _persist_exact_support_and_provenance(db)
+    await db.enable_lifecycle_gate("src-1")
+
+    free = await _coordinator_review_plan(db, plan_id="plan-undecided-free", outcome="undecided_supported")
+    assert [mutation.mutation_type for mutation in free.mutations] == [LifecycleMutationType.ATTACH_SUPPORT]
+    assert free.coverage_proof.incumbent_decisions[0].skipped_support_ids == ()
+
+    await db.apply_lifecycle_plan(await _coordinator_review_plan(db, plan_id="plan-conflict-1"))
+    [pending] = await _coordinator_reviews(db)
+    # The pending Review proposes against mem-1's current Support, so that Support stays and the Review with it.
+    held = await _coordinator_review_plan(
+        db, plan_id="plan-undecided-held", outcome="undecided_supported", coordinator_reviews=(pending,),
+    )
+    assert held.mutations == ()
+    assert held.coverage_proof.incumbent_decisions[0].skipped_support_ids == ("eu-1",)
 
 
 @pytest.mark.asyncio
