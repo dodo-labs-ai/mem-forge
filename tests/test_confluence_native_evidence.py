@@ -192,13 +192,110 @@ def test_new_native_profile_does_not_rewrite_legacy_normalized_revision():
 
 @pytest.mark.parametrize("native", [
     '<p>unclosed',
-    '<ac:structured-macro ac:name="unknown"><ac:parameter ac:name="x">value</ac:parameter></ac:structured-macro>',
-    '<ac:structured-macro ac:name="status"><ac:parameter ac:name="title">Pass</ac:parameter><ac:parameter ac:name="title">Fail</ac:parameter></ac:structured-macro>',
+    '<p><em>crossed</p></em>',
+    '<p>&undefined;</p>',
+    '<p a="1" a="2">Twice</p>',
+    '<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[cut off</ac:plain-text-body></ac:structured-macro>',
+    '<ac:layout><p>Outside a section.</p></ac:layout>',
 ])
-def test_unsupported_or_ambiguous_native_structure_is_not_a_successful_partial_index(native):
+def test_malformed_native_structure_is_not_a_successful_partial_index(native):
     result = build_revision_fragment_index(projection('<p>Safe rule.</p>' + native).observation_revisions[0])
     assert any(error.fatal for error in result.errors)
     assert not result.fragments
+
+
+@pytest.mark.parametrize("macro, expected", [
+    ('<ac:structured-macro ac:name="children"/>', "[Macro children]"),
+    ('<ac:structured-macro ac:name="diagram" ac:macro-id="m"><ac:parameter ac:name="diagramName">Payment flow</ac:parameter>'
+     '<ac:parameter ac:name="revision">7</ac:parameter><ac:parameter ac:name="">default</ac:parameter>'
+     '<ac:parameter ac:name="empty"></ac:parameter></ac:structured-macro>',
+     "[Macro diagram: diagramName=Payment flow; revision=7; default]"),
+    ('<ac:structured-macro ac:name="tree"><ac:parameter ac:name="root"><ac:link><ri:page ri:content-title="Home"/></ac:link>'
+     '</ac:parameter></ac:structured-macro>', "[Macro tree: root=[page: content-title=Home]]"),
+    ('<ac:structured-macro ac:name="status"><ac:parameter ac:name="title">Pass</ac:parameter>'
+     '<ac:parameter ac:name="subtle">true</ac:parameter></ac:structured-macro>', "[Macro status: title=Pass; subtle=true]"),
+    ('<ac:structured-macro ac:name="status"><ac:parameter ac:name="title">Pass</ac:parameter>'
+     '<ac:parameter ac:name="title">Fail</ac:parameter></ac:structured-macro>', "[Macro status: title=Pass; title=Fail]"),
+    ('<ac:structured-macro ac:name="jira"><ac:parameter ac:name="jqlQuery">project = PAY</ac:parameter></ac:structured-macro>',
+     "[Macro jira: jqlQuery=project = PAY]"),
+])
+def test_macro_outside_a_declared_rule_states_its_own_envelope_and_nothing_else(macro, expected):
+    parsed = parse_storage('<p>Safe rule.</p>' + macro)
+    assert [fragment.presentation for fragment in parsed.fragments] == ["Safe rule.", expected]
+    changed = parse_storage('<p>Safe rule.</p>' + macro.replace('ac:name="', 'ac:name="x', 1))
+    assert changed.fragments[1].content_value != parsed.fragments[1].content_value
+
+
+def test_undeclared_plain_text_macro_body_is_literal():
+    parsed = parse_storage('<ac:structured-macro ac:name="uml"><ac:parameter ac:name="format">svg</ac:parameter>'
+                           '<ac:plain-text-body><![CDATA[A -> B : <pay>\n  note right]]></ac:plain-text-body></ac:structured-macro>')
+    assert [fragment.presentation for fragment in parsed.fragments] == ["Macro uml\nformat: svg\nA -> B : <pay>\n  note right\n"]
+
+
+def test_undeclared_container_macro_keeps_blocks_selectable_under_its_parameters():
+    native = ('<h1>Overview</h1><ac:structured-macro ac:name="properties" ac:macro-id="m">'
+              '<ac:parameter ac:name="id">release</ac:parameter><ac:rich-text-body>'
+              '<h2>Inside</h2><table><tr><th>Key</th><th>Value</th></tr><tr><td>Owner</td><td>Payroll</td></tr></table>'
+              '<p>Only after approval.</p></ac:rich-text-body></ac:structured-macro><p>After the container.</p>')
+    projected = projection(native)
+    context = RevisionAssessmentContext(projection=projected, base=None, access_context_hash="scope")
+    by_text = {fragment.presentation_text: fragment for fragment in context.full_fragments}
+    assert {"Macro properties id: release", "Inside", "Key: Owner\nValue: Payroll", "Only after approval.",
+            "After the container."} <= by_text.keys()
+    setting = by_text["Macro properties id: release"].anchor
+    assert setting in context.reading_context((by_text["Only after approval."],))
+    assert setting not in context.reading_context((by_text["After the container."],))
+    inside = by_text["Inside"].anchor
+    assert inside in context.reading_context((by_text["Only after approval."],))
+    assert inside not in context.reading_context((by_text["After the container."],))
+    assert by_text["Overview"].anchor in context.reading_context((by_text["After the container."],))
+
+
+def test_inline_only_container_body_stays_one_selection():
+    parsed = parse_storage('<ac:structured-macro ac:name="tooltip"><ac:parameter ac:name="tip">Net of tax</ac:parameter>'
+                           '<ac:rich-text-body>Gross <strong>pay</strong></ac:rich-text-body></ac:structured-macro>')
+    assert [fragment.presentation for fragment in parsed.fragments] == ["Macro tooltip\ntip: Net of tax\nGross pay"]
+
+
+def test_editor_instructions_and_opaque_identities_are_not_page_content():
+    parsed = parse_storage(
+        '<p><ac:placeholder>Type the decision here</ac:placeholder></p>'
+        '<p>Decided: <ac:placeholder ac:type="mention">@owner</ac:placeholder>ship it '
+        '<ac:emoticon ac:name="tick" ac:emoji-shortname=":check_mark:" ac:emoji-id="atlassian-check_mark"/></p>'
+        '<ac:task-list><ac:task><ac:task-id>4</ac:task-id><ac:task-uuid>0e1f</ac:task-uuid>'
+        '<ac:task-status>incomplete</ac:task-status><ac:task-body>Approve rollout.</ac:task-body></ac:task></ac:task-list>')
+    assert [fragment.presentation for fragment in parsed.fragments] == [
+        "Decided: ship it [Emoticon: tick]", "Task (incomplete): Approve rollout."]
+    renamed = parse_storage('<p>Decided: ship it <ac:emoticon ac:name="tick" ac:emoji-id="other"/></p>')
+    assert renamed.fragments[0].content_value != parsed.fragments[0].content_value
+
+
+def test_elements_and_placements_outside_the_documented_grammar_keep_their_text():
+    parsed = parse_storage(
+        '<ac:layout><ac:layout-section ac:type="four_equal"><ac:layout-cell>Loose &amp; unwrapped<p>Wrapped.</p></ac:layout-cell>'
+        '</ac:layout-section></ac:layout><small>Fine print.</small>'
+        '<ul><li>First</li><ul><li>Nested directly</li></ul><li>Second</li></ul>')
+    assert [(fragment.kind, fragment.presentation) for fragment in parsed.fragments] == [
+        ("text", "Loose & unwrapped"), ("p", "Wrapped."), ("small", "Fine print."),
+        ("ul", "- First\n  - Nested directly\n- Second"),
+    ]
+    source = '<ac:layout><ac:layout-section ac:type="four_equal"><ac:layout-cell>Loose &amp; unwrapped'
+    assert source[parsed.fragments[0].start:parsed.fragments[0].end] == "Loose &amp; unwrapped"
+
+
+def test_table_inside_a_cell_is_that_cells_content():
+    parsed = parse_storage('<table><tr><th>Case</th><th>Detail</th></tr><tr><td>14</td><td>'
+                           '<table><tr><th>Period</th><th>Allowed</th></tr><tr><td>Current</td><td>No</td></tr></table>'
+                           '</td></tr></table>')
+    assert [fragment.kind for fragment in parsed.fragments] == ["table-header", "table-row"]
+    assert parsed.fragments[1].presentation == "Case: 14\nDetail: Row 1:\nPeriod: Period\nAllowed: Allowed\nRow 2:\nPeriod: Current\nAllowed: No"
+
+
+def test_table_without_a_rectangular_grid_is_one_whole_selection():
+    parsed = parse_storage('<p>Rule.</p><table><tr><th>Case</th><th>Period</th></tr><tr><td>14</td></tr>'
+                           '<tr><td rowspan="9">15</td><td>Next</td></tr></table>')
+    assert [(fragment.kind, fragment.presentation) for fragment in parsed.fragments] == [
+        ("p", "Rule."), ("table", "Case | Period\n14\n15 | Next")]
 
 
 def test_row_and_column_spans_preserve_stored_values_in_readable_rows():
@@ -212,9 +309,10 @@ def test_deleted_text_and_ordered_nested_lists_keep_authored_meaning():
     assert parsed.fragments[1].presentation == "3. First\n  - Nested\n7. Second"
 
 
-def test_table_content_outside_cells_is_rejected_instead_of_silently_lost():
-    with pytest.raises(ValueError, match="unclassified content"):
-        parse_storage('<table><tbody><p>Only for emergencies.</p><tr><td>Allowed</td></tr></tbody></table>')
+def test_table_content_outside_cells_stays_in_one_whole_table_selection():
+    parsed = parse_storage('<table><tbody><p>Only for emergencies.</p><tr><td>Allowed</td></tr></tbody></table>')
+    assert [(fragment.kind, fragment.presentation) for fragment in parsed.fragments] == [
+        ("table", "Only for emergencies.\nAllowed")]
 
 
 def test_preformatted_whitespace_is_preserved():
@@ -290,12 +388,13 @@ def test_hidden_issue_origin_change_is_not_same_material_even_when_display_is_un
     assert current.content_value != old.content_value
 
 
-@pytest.mark.parametrize("body", [
-    '<ac:rich-text-body><p>Hidden rule.</p></ac:rich-text-body>',
-    '<ac:parameter ac:name="unsupported">Only after approval.</ac:parameter>',
+@pytest.mark.parametrize("body, expected", [
+    ('<ac:rich-text-body><p>Hidden rule.</p></ac:rich-text-body>', "Hidden rule."),
+    ('<ac:parameter ac:name="unsupported">Only after approval.</ac:parameter>', "[Macro toc: unsupported=Only after approval.]"),
 ])
-def test_undeclared_directory_content_does_not_silently_disappear(body):
+def test_undeclared_directory_content_does_not_silently_disappear(body, expected):
     index = build_revision_fragment_index(projection(
         '<p>Safe rule.</p><ac:structured-macro ac:name="toc">' + body + '</ac:structured-macro>'
     ).observation_revisions[0])
-    assert not index.fragments and any(error.fatal for error in index.errors)
+    assert not index.errors
+    assert expected in [fragment.presentation_text for fragment in index.fragments]
