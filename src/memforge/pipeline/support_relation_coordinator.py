@@ -35,8 +35,11 @@ that enters the table again. REFINES and uncertain edges keep the local
 unresolved relationship rules. A Candidate that receives different treatments
 across old Memories, or is staged in the Reviews of more than one, leaves its
 whole related component unresolved: consumed this round, with no ADD and no
-destructive action. A Candidate the Relation line could not judge even alone is
-consumed the same way; its missing row leaves the Relation line incomplete, so
+destructive action. An unresolved relationship withholds only what a Candidate
+would do. An old Memory of the component whose own Support result keeps it is
+still bound to its verified current Evidence; the others stay unchanged. A
+Candidate the Relation line could not judge even alone is consumed the same
+way; its missing row leaves the Relation line incomplete, so
 DestructiveValidation withholds every destructive decision of the Unit.
 """
 
@@ -410,11 +413,7 @@ def coordinate(
     for memory in ledger.incumbents:
         support = ledger.supports[memory.id]
         if memory.id in unresolved:
-            reason = (
-                support.reason if support.result.unjudged
-                else "Unresolved claim relationship; preserve existing Support and Evidence"
-            )
-            operations.append(replace(_kept_unchanged(reason), memory_id=memory.id))
+            operations.append(replace(_kept_undecided(support), memory_id=memory.id))
             continue
         decision = decided[memory.id]
         consumed.update(index for index, _ in decision.treatments)
@@ -544,6 +543,22 @@ def _kept(support: MemorySupport, reason: str | None = None) -> ReconcileOperati
             reason=reason or support.reason or "current Source Unit support retained",
         )
     return _kept_unchanged(support.reason)
+
+
+def _kept_undecided(support: MemorySupport) -> ReconcileOperation:
+    """Keep an old Memory of an unresolved component; its own Support result still applies."""
+    if support.result in _KEEPS_SUPPORT and support.evidence:
+        return replace(
+            _kept(support, "Unresolved claim relationship; keep on verified current Evidence"),
+            relation_undecided=True,
+        )
+    return replace(
+        _kept_unchanged(
+            support.reason if support.result.unjudged
+            else "Unresolved claim relationship; preserve existing Support and Evidence"
+        ),
+        relation_undecided=True,
+    )
 
 
 def _kept_unchanged(reason: str) -> ReconcileOperation:

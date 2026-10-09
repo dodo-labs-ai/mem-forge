@@ -336,8 +336,11 @@ def test_a_candidate_treated_differently_by_two_old_memories_leaves_the_componen
     by_memory = _by_memory(coordination.operations)
     for memory_id in ("mem-a", "mem-b"):
         assert by_memory[memory_id].action is ReconcileAction.NOOP
-        assert by_memory[memory_id].support_revalidation_skipped and not by_memory[memory_id].reviews
-    assert by_memory["mem-c"].action is ReconcileAction.DELETE
+        assert by_memory[memory_id].relation_undecided and not by_memory[memory_id].reviews
+    # The supported claim keeps its own Support result; the unsupported one stays unchanged.
+    assert by_memory["mem-a"].memory is REBOUND and not by_memory["mem-a"].support_revalidation_skipped
+    assert by_memory["mem-b"].memory is None and by_memory["mem-b"].support_revalidation_skipped
+    assert by_memory["mem-c"].action is ReconcileAction.DELETE and not by_memory["mem-c"].relation_undecided
     assert _additions(coordination.operations) == [unrelated]
     assert coordination.unresolved_candidate_count == 1
 
@@ -359,9 +362,43 @@ def test_a_candidate_staged_in_the_reviews_of_two_old_memories_leaves_the_compon
 
     for operation in coordination.operations:
         assert operation.action is ReconcileAction.NOOP
-        assert operation.support_revalidation_skipped and not operation.reviews
+        assert operation.relation_undecided and not operation.reviews
+    by_memory = _by_memory(coordination.operations)
+    assert by_memory["mem-a"].memory is REBOUND
+    assert (by_memory["mem-b"].memory is REBOUND) is (second_support.result is SUPPORTED)
+    assert by_memory["mem-b"].support_revalidation_skipped is (second_support.result is UNSUPPORTED)
     assert _additions(coordination.operations) == []
     assert coordination.unresolved_candidate_count == 1
+
+
+def test_a_candidate_merging_several_kept_claims_leaves_each_on_its_verified_evidence() -> None:
+    # One Candidate restates three old claims and losslessly refines a fourth.
+    merged = _candidate("Two reviewers from distinct teams approve payroll and retention is seven years.")
+    memory_ids = ("mem-a", "mem-b", "mem-c", "mem-d")
+    relations = [
+        *(_edge(0, EQUIVALENT, memory_id) for memory_id in memory_ids[:3]),
+        _edge(0, REFINES, "mem-d", direction=RelationDirection.CHALLENGER_TO_CANDIDATE),
+    ]
+    proof = RevisionCompositionProof(0, "mem-d", True, True, True)
+    coordination = _coordinate(
+        [merged], relations, {memory_id: _support(SUPPORTED) for memory_id in memory_ids},
+        incumbents=[_old(memory_id) for memory_id in memory_ids], proofs=[proof],
+    )
+
+    for operation in coordination.operations:
+        assert operation.action is ReconcileAction.NOOP and operation.memory is REBOUND
+        assert operation.relation_undecided and not operation.support_revalidation_skipped
+    assert _additions(coordination.operations) == []
+    assert coordination.unresolved_candidate_count == 1
+
+
+@pytest.mark.parametrize("result", [SUPPORTED, UNAFFECTED])
+def test_a_kept_claim_without_verified_evidence_stays_unchanged_in_an_unresolved_component(result) -> None:
+    support = MemorySupport(result, f"{result.value} reason")
+
+    [kept] = _coordinate([_candidate("Maybe related.")], [_edge(0, None)], {"mem-old": support}).operations
+
+    assert kept.memory is None and kept.support_revalidation_skipped and kept.relation_undecided
 
 
 def test_refinements_of_a_claim_in_an_unresolved_component_are_not_compared() -> None:
@@ -409,10 +446,16 @@ def test_a_refinement_preserving_an_unsupported_claim_stays_unresolved() -> None
     assert coordination.unresolved_candidate_count == 1
 
 
-def test_an_uncertain_relation_keeps_its_component_and_never_adds() -> None:
-    [kept] = _coordinate([_candidate("Maybe related.")], [_edge(0, None)], {"mem-old": _support(UNSUPPORTED)}).operations
+@pytest.mark.parametrize("result", [SUPPORTED, UNAFFECTED, UNSUPPORTED, PARTIAL])
+def test_an_uncertain_relation_keeps_its_component_and_never_adds(result) -> None:
+    coordination = _coordinate([_candidate("Maybe related.")], [_edge(0, None)], {"mem-old": _support(result)})
 
-    assert kept.action is ReconcileAction.NOOP and kept.support_revalidation_skipped
+    [kept] = coordination.operations
+    assert kept.action is ReconcileAction.NOOP and kept.relation_undecided and not kept.reviews
+    # Only a Support result that keeps the claim moves it to current Evidence.
+    assert (kept.memory is REBOUND) is (result in {SUPPORTED, UNAFFECTED})
+    assert kept.support_revalidation_skipped is (result in {UNSUPPORTED, PARTIAL})
+    assert coordination.unresolved_candidate_count == 1
 
 
 def test_a_carried_conflict_is_not_rechecked_again() -> None:

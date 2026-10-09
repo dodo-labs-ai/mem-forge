@@ -824,6 +824,8 @@ class ReconcileOperation:
     flag_for_review: bool = False
     # Program-owned outcome of L3; never parsed from an LLM reconciliation action.
     support_revalidation_skipped: bool = False
+    # The revision left this kept old Memory's claim relationships undecided.
+    relation_undecided: bool = False
     # Coordinator Reviews that hold this kept old Memory's decision.
     reviews: tuple[CoordinatorReview, ...] = ()
 
