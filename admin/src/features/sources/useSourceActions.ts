@@ -6,6 +6,7 @@ import { V1_SOURCES_PATH } from "./constants";
 import type { SourceAttentionAction } from "./model/sourceAttention";
 import { sourceSyncControl, type SourceSyncActivity, type SourceSyncRetryTarget } from "./model/sourceSyncActivity";
 import type { Source } from "./model/types";
+import { useJiraSignIn } from "./useJiraSignIn";
 
 /** Runs row and drawer actions, reporting the outcome in a toast. */
 export function useSourceActions({ onViewDetails }: { onViewDetails: (source: Source) => void }) {
@@ -13,6 +14,7 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
   const setPinned = useSetPinned();
   const setUsedInSearches = useSetUsedInSearches();
   const setPaused = useSetPaused();
+  const signIn = useJiraSignIn();
 
   function report(promise: Promise<unknown>, success: string, failure: string) {
     promise.then(
@@ -22,6 +24,13 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
   }
 
   return {
+    attentionControl(action: SourceAttentionAction, source: Source, label: string) {
+      const isSignIn = action === "sign_in";
+      return {
+        label: isSignIn && signIn.isPending && signIn.variables?.id === source.id ? "Waiting for sign-in…" : label,
+        enabled: !isSignIn || (Boolean(source.capabilities?.can_configure_connection) && !signIn.isPending),
+      };
+    },
     /** The sync button for a source, which reads Starting while this page's request for it is on its way. */
     syncControl(source: Source, activity: SourceSyncActivity | undefined) {
       return sourceSyncControl(activity, sync.isPending && sync.variables?.source.id === source.id);
@@ -74,6 +83,12 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
           onViewDetails(source);
           return;
         case "sign_in":
+          if (source.type === "jira" && (source.config.auth_mode ?? "browser_cookie") === "browser_cookie") {
+            report(signIn.mutateAsync(source), `Signed in to ${source.name}`, "Jira sign-in failed");
+            return;
+          }
+          this.openInV1();
+          return;
         case "configure":
         case "configure_scope":
         case "assign_project":

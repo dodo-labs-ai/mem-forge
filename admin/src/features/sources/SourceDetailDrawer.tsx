@@ -58,8 +58,8 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpe
           description={attention.detail}
           action={
             attention.action === "view_details" ? null : (
-              <Button size="sm" onClick={() => actions.runAttention(attention.action, source)}>
-                {attention.actionLabel}
+              <Button size="sm" disabled={!actions.attentionControl(attention.action, source, attention.actionLabel).enabled} onClick={() => actions.runAttention(attention.action, source)}>
+                {actions.attentionControl(attention.action, source, attention.actionLabel).label}
               </Button>
             )
           }

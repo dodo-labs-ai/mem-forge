@@ -34,7 +34,9 @@ async function withUrl(request: Request, url: URL): Promise<Request> {
 
 function workspaceMiddleware(workspace: WorkspaceController): Middleware {
   return {
-    async onRequest({ request }) {
+    async onRequest({ request, schemaPath }) {
+      // A job ID already identifies its workspace; the host authorizes access.
+      if (schemaPath === "/api/cloud/local-agent/jobs/{job_id}") return request;
       const url = new URL(request.url);
       const isResource = url.pathname.startsWith(`${RESOURCE_PREFIX}/`) || url.pathname === RESOURCE_PREFIX;
       const isLocalAgent = url.pathname.startsWith(LOCAL_AGENT_PREFIX);
