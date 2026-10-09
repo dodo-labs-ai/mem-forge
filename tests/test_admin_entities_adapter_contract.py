@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
 from memforge.models import Entity, EntityAlias, Memory, content_hash
+from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import ActiveMemorySupportState
 
 
@@ -38,6 +39,8 @@ class AdapterOnlyEntityDb:
         ]
         self.inserted_aliases: list[tuple[str, str, int, str]] = []
         self.removed_aliases: list[tuple[int, str]] = []
+        self.merge_source_id = 2
+        self.entity_scopes: list = []
         self.memory = Memory(
             id="mem-1",
             memory_type="fact",
@@ -51,18 +54,22 @@ class AdapterOnlyEntityDb:
     async def list_entities(
         self,
         *,
-        tag: str | None = None,
+        scope,
         search: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> tuple[list[Entity], int]:
+        self.entity_scopes.append(scope)
         return [self.entity], 1
 
     async def get_entity(self, entity_id: int) -> Entity | None:
+        if entity_id == self.merge_source_id:
+            return Entity(id=entity_id, canonical_name="Legacy Payroll Area", display_name="Legacy Payroll Area")
         return self.entity if entity_id == self.entity.id else None
 
-    async def count_memories_for_entity(self, entity_id: int) -> int:
-        return 2 if entity_id == self.entity.id else 0
+    async def count_memories_for_entity(self, entity_id: int, *, scope) -> int:
+        self.entity_scopes.append(scope)
+        return 2 if entity_id in {self.entity.id, self.merge_source_id} else 0
 
     async def get_aliases_for_entity(self, entity_id: int) -> list[EntityAlias]:
         return list(self.aliases) if entity_id == self.entity.id else []
@@ -176,3 +183,5 @@ def test_entity_admin_routes_use_adapter_methods_without_sqlite_db(tmp_path: Pat
     assert self_merge_response.json()["detail"] == "Source and target entities must differ"
     assert memory_detail_response.status_code == 200, memory_detail_response.text
     assert memory_detail_response.json()["entity_refs"] == ["Payroll Area"]
+    assert database.entity_scopes
+    assert {(scope.user_id, scope.include_private) for scope in database.entity_scopes} == {(LOCAL_DEV_USER_ID, True)}
