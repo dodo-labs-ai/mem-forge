@@ -66,6 +66,7 @@ def _opener(payloads: dict[str, bytes], *, transport_length_delta: int = 0):
 def _artifact_metadata(
     *,
     size_bytes: object = 4,
+    media_type: str = "image/png",
     **inference_fields: object,
 ) -> dict[str, object]:
     return {
@@ -74,7 +75,7 @@ def _artifact_metadata(
             "parent_observation_id": "obs-parent",
             "provider_revision": "1",
             "filename": "diagram.png",
-            "media_type": "image/png",
+            "media_type": media_type,
             "size_bytes": size_bytes,
             "sha256": "a" * 64,
             "uri": "artifact://diagram.png",
@@ -177,6 +178,49 @@ def test_artifact_inference_metadata_has_one_legacy_current_decision_table(
         if revision is not None
         else None
     ) == expected
+
+
+@pytest.mark.parametrize(
+    ("size_bytes", "inference_fields", "expected"),
+    (
+        (4, {}, (False, "unsupported_inference_media_type")),
+        (
+            source_artifacts.MAX_SOURCE_ARTIFACT_INFERENCE_BYTES + 1,
+            {},
+            (False, "inference_byte_limit"),
+        ),
+        (
+            4,
+            {
+                "inference_eligible": False,
+                "inference_ineligible_reason": "unsupported_inference_media_type",
+            },
+            (False, "unsupported_inference_media_type"),
+        ),
+    ),
+)
+def test_a_stored_document_artifact_never_enters_inference(
+    size_bytes: int,
+    inference_fields: dict[str, object],
+    expected: tuple[bool, str],
+) -> None:
+    metadata = _artifact_metadata(
+        size_bytes=size_bytes,
+        media_type="application/pdf",
+        **inference_fields,
+    )
+
+    revision = source_artifact_revision_from_metadata(
+        observation_id="obs-document",
+        observation_revision_id="obsrev-document",
+        source_id="src-1",
+        source_unit_id="unit-1",
+        metadata=metadata,
+    )
+
+    assert source_artifact_inference_eligibility(metadata) is False
+    assert revision is not None
+    assert (revision.inference_eligible, revision.inference_ineligible_reason) == expected
 
 
 def test_artifact_revision_summary_is_revision_pinned_and_legacy_optional() -> None:
