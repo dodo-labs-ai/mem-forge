@@ -97,6 +97,7 @@ def test_jira_comment_rendering_preserves_valid_issue_projection():
 @pytest.mark.parametrize("wrap", [
     '<ac:layout><ac:layout-section ac:type="single"><ac:layout-cell>{body}</ac:layout-cell></ac:layout-section></ac:layout>',
     '<ac:structured-macro ac:name="excerpt"><ac:rich-text-body>{body}</ac:rich-text-body></ac:structured-macro>',
+    '<ac:structured-macro ac:name="app-container"><ac:parameter ac:name="id">a</ac:parameter><ac:rich-text-body>{body}</ac:rich-text-body></ac:structured-macro>',
 ])
 def test_confluence_container_preserves_evidence_identity(wrap):
     body = '<p>Approval required.</p><p>Audit trail required.</p>'
@@ -129,8 +130,8 @@ def test_confluence_task_status_is_meaning_not_layout():
 
 @pytest.mark.parametrize('name', ['include', 'children', 'excerpt-include', 'unknown-query'])
 def test_external_or_unknown_confluence_macro_cannot_fake_complete_evidence(name):
-    with pytest.raises(ValueError):
-        parse_storage(f'<ac:structured-macro ac:name="{name}" />')
+    parsed = parse_storage(f'<p>Authored rule.</p><ac:structured-macro ac:name="{name}" />')
+    assert [fragment.presentation for fragment in parsed.fragments] == ['Authored rule.', f'[Macro {name}]']
 
 
 @pytest.mark.parametrize('source', ['jira', 'confluence'])
