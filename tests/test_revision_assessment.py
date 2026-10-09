@@ -277,6 +277,40 @@ async def test_changed_artifact_bytes_are_supplied_in_the_first_part():
     assert len(images) == 1 and isinstance(images[0], StructuredLlmImage) and images[0].body == b"new"
 
 
+def test_a_stored_document_artifact_without_recorded_eligibility_is_not_read():
+    from types import SimpleNamespace
+    from memforge.pipeline.evidence_fragments import EvidenceFragmentKind
+    from memforge.pipeline.projection_images import load_projection_images
+    from tests.test_projected_lifecycle_integration import _projection_with_artifact
+
+    projection = _projection_with_artifact(
+        run_id="linked-document", payload=b"%PDF-1.7", provider_revision="1", inference_eligible=True,
+        body="Two reviewers approve US releases.",
+    )
+    # A linked PDF whose revision predates recorded eligibility.
+    projection = replace(projection, observation_revisions=tuple(
+        replace(revision, metadata={**revision.metadata, "source_artifact": {
+            key: value for key, value in {
+                **revision.metadata["source_artifact"], "media_type": "application/pdf", "filename": "slides.pdf",
+            }.items() if not key.startswith("inference_")
+        }}) if "source_artifact" in revision.metadata else revision
+        for revision in projection.observation_revisions
+    ))
+    reads = []
+    ctx = RevisionAssessmentContext(
+        projection=projection, base=None, access_context_hash="scope",
+        image_loader=lambda ids: load_projection_images(
+            projection=projection, observation_ids=ids,
+            document_store=SimpleNamespace(read_artifact=lambda uri: reads.append(uri)),
+        ),
+    )
+
+    catalog = ctx.catalog(ctx.full_fragments)
+    assert "Two reviewers approve US releases." in [fragment.presentation_text for fragment in catalog.fragments]
+    assert not any(fragment.kind is EvidenceFragmentKind.ARTIFACT for fragment in catalog.fragments)
+    assert ctx.images_for(catalog) == () and reads == []
+
+
 def test_processing_limitation_cannot_retry_whole_document():
     from memforge.pipeline.projection_fragments import SupportRevalidationLimitationCode
 

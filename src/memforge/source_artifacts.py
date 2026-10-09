@@ -38,6 +38,13 @@ MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH = 15 * 1024 * 1024
 MAX_SOURCE_ARTIFACT_SUMMARY_CHARS = 240
 SOURCE_ARTIFACT_STREAM_CHUNK_BYTES = 256 * 1024
 SOURCE_ARTIFACT_SPOOL_MEMORY_BYTES = 1024 * 1024
+# The image media types a model request can carry, with the encoding each one's bytes must have.
+SOURCE_ARTIFACT_INFERENCE_IMAGE_FORMATS = {
+    "image/gif": "GIF",
+    "image/jpeg": "JPEG",
+    "image/png": "PNG",
+    "image/webp": "WEBP",
+}
 SOURCE_ARTIFACT_INELIGIBILITY_REASONS = frozenset(
     {
         "inference_byte_limit",
@@ -67,15 +74,17 @@ def _source_artifact_inference_fields(
     """Normalize supported inference metadata shapes at one compatibility seam."""
 
     if "inference_eligible" not in raw:
-        # The fieldless compatibility shape derives eligibility from size. A
-        # reason without its eligibility decision is ambiguous and rejected.
+        # The fieldless compatibility shape derives eligibility from the size
+        # and media type the revision records. A reason without its eligibility
+        # decision is ambiguous and rejected.
         if "inference_ineligible_reason" in raw:
             return None
-        eligible = size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
-        return (
-            eligible,
-            None if eligible else "inference_byte_limit",
-        )
+        if size_bytes > MAX_SOURCE_ARTIFACT_INFERENCE_BYTES:
+            return False, "inference_byte_limit"
+        media_type = normalize_source_artifact_media_type(raw.get("media_type"))
+        if media_type not in SOURCE_ARTIFACT_INFERENCE_IMAGE_FORMATS:
+            return False, "unsupported_inference_media_type"
+        return True, None
 
     inference_eligible = raw["inference_eligible"]
     raw_ineligible_reason = raw.get("inference_ineligible_reason")
@@ -691,15 +700,7 @@ def _artifact_inference_ineligible_reason(
 ) -> str | None:
     if artifact.size_bytes > MAX_SOURCE_ARTIFACT_INFERENCE_BYTES:
         return "inference_byte_limit"
-    if not artifact.media_type.startswith("image/"):
-        return "unsupported_inference_media_type"
-    expected_formats = {
-        "image/gif": "GIF",
-        "image/jpeg": "JPEG",
-        "image/png": "PNG",
-        "image/webp": "WEBP",
-    }
-    expected_format = expected_formats.get(artifact.media_type)
+    expected_format = SOURCE_ARTIFACT_INFERENCE_IMAGE_FORMATS.get(artifact.media_type)
     if expected_format is None:
         return "unsupported_inference_media_type"
     try:
