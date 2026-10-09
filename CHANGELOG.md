@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Entity admin routes follow Memory visibility. The entity list, detail, alias
+  list, linked Memory count and the `/api/v1/stats` entity total admit an
+  Entity only through a linked active Memory the caller can see, so a name
+  learned from another user's private Memory is not discoverable. Adding or
+  removing a manual alias and merging entities require workspace
+  administration (403 `entity_curation_forbidden`) and every Entity involved
+  must be discoverable (404). Entity detail returns `can_curate`, and
+  `/api/v1/stats` counts only Sources the caller can discover. Storage:
+  `list_entities`, `count_entities` and `count_memories_for_entity` take
+  `scope`. Cloud: HANA implements the same signatures together with the pin
+  to this version.
 - Review queues and Memory `open_review_id` links share caller-scoped
   participant and Source visibility and pinned-version checks. A hidden or
   dynamically stale newer Review cannot displace an older eligible Review.

@@ -19,6 +19,9 @@ Configured Source access is an additional support predicate. Direct
 user-lifecycle provenance (`user_memory` and `user_correction`) is virtual and
 does not correspond to a configured Source row, so it remains governed by the
 Memory owner/visibility branch rather than configured-source availability.
+
+Entities carry no access of their own. The Entity SQL fragment admits an Entity
+only through a linked Memory that passes the same predicate.
 """
 
 from __future__ import annotations
@@ -32,7 +35,13 @@ from memforge.models import (
 )
 from memforge.storage.adapters.context import AccessScope
 
-__all__ = ["is_visible", "readable_source_sql", "visible_chroma_where", "visible_sql"]
+__all__ = [
+    "is_visible",
+    "readable_source_sql",
+    "visible_chroma_where",
+    "visible_entity_sql",
+    "visible_sql",
+]
 
 
 def _project_mode_keys(scope: AccessScope) -> tuple[str, ...]:
@@ -119,6 +128,26 @@ def visible_sql(scope: AccessScope, alias: str) -> tuple[str, list[Any]]:
     params.extend(sorted(VIRTUAL_DOCUMENT_SOURCE_IDS))
     params.extend(readable_source_params)
     return "(" + " AND ".join(parts) + ")", params
+
+
+def visible_entity_sql(scope: AccessScope, alias: str) -> tuple[str, list[Any]]:
+    """Return (sql_fragment, params) admitting an Entity row the caller may discover.
+
+    Entity IDs are workspace-internal graph identities, not access authority,
+    so an Entity is discoverable only through a linked Memory visible under
+    ``scope``. An Entity without such a Memory is hidden, including from counts.
+    """
+    predicate_sql, predicate_params = visible_sql(scope, "entity_memory")
+    return (
+        f"""EXISTS (
+            SELECT 1
+            FROM memory_entities entity_link
+            JOIN memories entity_memory ON entity_memory.id = entity_link.memory_id
+            WHERE entity_link.entity_id = {alias}.id
+              AND {predicate_sql}
+        )""",
+        predicate_params,
+    )
 
 
 def readable_source_sql(scope: AccessScope, alias: str) -> tuple[str, list[Any]]:

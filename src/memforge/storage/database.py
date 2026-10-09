@@ -230,7 +230,7 @@ from memforge.evals.offline_evaluation import (
 )
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
 from memforge.memory.review_decision import ReviewVectorTask
-from memforge.retrieval.access_predicate import readable_source_sql, visible_sql
+from memforge.retrieval.access_predicate import readable_source_sql, visible_entity_sql, visible_sql
 from memforge.retrieval.metadata_text import metadata_alias_text, metadata_compact_text
 from memforge.source_access import infer_legacy_source_access
 from memforge.source_derivation import (
@@ -15641,24 +15641,25 @@ class Database:
     async def list_entities(
         self,
         *,
+        scope,
         search: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> tuple[list[Entity], int]:
-        """List entities for the admin API without exposing the DB connection."""
-        query = "SELECT * FROM entities WHERE 1=1"
-        params: list[Any] = []
+        """List the Entities linked to at least one Memory visible under ``scope``."""
+        entity_predicate_sql, params = visible_entity_sql(scope, "e")
+        query = f"SELECT e.* FROM entities e WHERE {entity_predicate_sql}"
         if search:
-            query += " AND (canonical_name LIKE ? OR display_name LIKE ?)"
+            query += " AND (e.canonical_name LIKE ? OR e.display_name LIKE ?)"
             like = f"%{search}%"
             params.extend([like, like])
 
-        count_q = query.replace("SELECT *", "SELECT COUNT(*)")
+        count_q = query.replace("SELECT e.*", "SELECT COUNT(*)", 1)
         async with self.db.execute(count_q, params) as cursor:
             total_row = await cursor.fetchone()
             total = total_row[0] if total_row else 0
 
-        query += " ORDER BY display_name LIMIT ? OFFSET ?"
+        query += " ORDER BY e.display_name LIMIT ? OFFSET ?"
         page_params = [*params, limit, offset]
         entities: list[Entity] = []
         async with self.db.execute(query, page_params) as cursor:
@@ -15666,13 +15667,31 @@ class Database:
                 entities.append(_entity_from_row(dict(row)))
         return entities, total
 
+    async def count_entities(self, *, scope) -> int:
+        """Count the Entities linked to at least one Memory visible under ``scope``."""
+        entity_predicate_sql, params = visible_entity_sql(scope, "e")
+        async with self.db.execute(
+            f"SELECT COUNT(*) FROM entities e WHERE {entity_predicate_sql}",
+            params,
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
     async def get_entity(self, entity_id: int) -> Entity | None:
         async with self.db.execute("SELECT * FROM entities WHERE id = ?", (entity_id,)) as cursor:
             row = await cursor.fetchone()
             return _entity_from_row(dict(row)) if row else None
 
-    async def count_memories_for_entity(self, entity_id: int) -> int:
-        async with self.db.execute("SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?", (entity_id,)) as cursor:
+    async def count_memories_for_entity(self, entity_id: int, *, scope) -> int:
+        """Count the Memories linked to ``entity_id`` that are visible under ``scope``."""
+        predicate_sql, predicate_params = visible_sql(scope, "m")
+        async with self.db.execute(
+            f"""SELECT COUNT(*)
+                  FROM memory_entities me
+                  JOIN memories m ON m.id = me.memory_id
+                 WHERE me.entity_id = ? AND {predicate_sql}""",
+            (entity_id, *predicate_params),
+        ) as cursor:
             count_row = await cursor.fetchone()
             return count_row[0] if count_row else 0
 
