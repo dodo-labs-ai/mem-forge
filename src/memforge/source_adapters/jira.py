@@ -6,7 +6,7 @@ from dataclasses import replace
 from typing import Mapping
 
 from memforge.source_adapters.contracts import CanonicalRecordField, CanonicalRecordSchema
-from memforge.source_adapters.jira_html import RENDERED_HTML_FORMAT
+from memforge.source_adapters.jira_html import LEGACY_RENDERED_HTML_FORMAT, RENDERED_HTML_FORMAT
 from memforge.source_projection import EvidenceCoordinateSpace, EvidenceRepresentationProfile
 from memforge.source_time import latest_source_time, reported_source_time
 
@@ -76,14 +76,14 @@ ISSUE_SCHEMA = replace(
     CANONICAL_RECORD_SCHEMAS[("jira-issue-core", 1)],
     version=2,
     fields=tuple(
-        CanonicalRecordField("/description", text_format=RENDERED_HTML_FORMAT)
+        CanonicalRecordField("/description", text_format=LEGACY_RENDERED_HTML_FORMAT)
         if field.json_pointer == "/description" else field
         for field in CANONICAL_RECORD_SCHEMAS[("jira-issue-core", 1)].fields
     ),
 )
 COMMENT_SCHEMA = CanonicalRecordSchema(
     name="jira-comment", version=2,
-    fields=(CanonicalRecordField("/body", text_format=RENDERED_HTML_FORMAT),),
+    fields=(CanonicalRecordField("/body", text_format=LEGACY_RENDERED_HTML_FORMAT),),
 )
 CHANGELOG_SCHEMA = replace(
     CANONICAL_RECORD_SCHEMAS[("jira-changelog", 1)],
@@ -147,6 +147,17 @@ CHANGELOG_SCHEMA = replace(CHANGELOG_SCHEMA, version=4,
                     ("/author/displayName", "Change author"), ("/author/key", "Author ID")))
 CANONICAL_RECORD_SCHEMAS = {**CANONICAL_RECORD_SCHEMAS,
     **{(schema.name, schema.version): schema for schema in (ISSUE_SCHEMA, COMMENT_SCHEMA, CHANGELOG_SCHEMA)}}
+
+
+# Current Jira formatting semantics; schemas 2–4 retain their pinned interpretation.
+ISSUE_SCHEMA, COMMENT_SCHEMA = (
+    replace(schema, version=5, fields=tuple(
+        replace(field, text_format=RENDERED_HTML_FORMAT) if field.text_format else field
+        for field in schema.fields))
+    for schema in (ISSUE_SCHEMA, COMMENT_SCHEMA)
+)
+CANONICAL_RECORD_SCHEMAS = {**CANONICAL_RECORD_SCHEMAS,
+    **{(schema.name, schema.version): schema for schema in (ISSUE_SCHEMA, COMMENT_SCHEMA)}}
 
 
 def _profile(schema_name: str, version: int) -> EvidenceRepresentationProfile:

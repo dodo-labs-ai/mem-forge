@@ -620,7 +620,7 @@ async def test_legacy_jira_profile_backfill_keeps_original_format_and_content(db
     assert revision.content == content and revision.semantic_hash == "historical-hash"
     assert revision.evidence_profile.schema_name == schema_name
     assert revision.evidence_profile.schema_version == 1
-    assert representation_profile_for_observation_contract(source_type="jira", observation_type=observation_type).schema_version == 4
+    assert representation_profile_for_observation_contract(source_type="jira", observation_type=observation_type).schema_version == (4 if observation_type == "changelog" else 5)
 
 
 @pytest.mark.asyncio
