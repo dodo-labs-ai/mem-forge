@@ -692,11 +692,12 @@ def _fragment_sort_key(fragment: EvidenceFragment, source_time: datetime | None)
     """Reading order: Observations by source time, then each one's Fragments by position.
 
     A conversation therefore reads in the order it was written. An Observation
-    whose source reports no time follows those that have one.
+    whose source reports no time is no event on that timeline, such as a Unit's
+    identity or an undated body, and is read before it.
     """
     anchor = fragment.anchor
     return (
-        source_time is None,
+        source_time is not None,
         source_time or datetime.min.replace(tzinfo=timezone.utc),
         anchor.observation_revision_id,
         -1 if anchor.range_start is None else anchor.range_start,
