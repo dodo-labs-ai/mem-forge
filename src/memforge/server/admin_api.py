@@ -133,6 +133,7 @@ from memforge.memory.store import MemoryStore
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
+    Entity,
     Memory,
     MemoryRelationContext,
     MemorySourceRef,
@@ -460,6 +461,36 @@ def _require_source_discoverability(request: Request, source: dict[str, Any]) ->
         viewer_id=resolve_request_principal(request),
     ):
         raise HTTPException(status_code=404, detail="Source not found")
+
+
+async def _require_visible_entity(
+    request: Request,
+    db: Database,
+    entity_id: int,
+    *,
+    missing_detail: str = "Entity not found",
+) -> tuple[Entity, int]:
+    """Return the Entity and its visible linked Memory count, or 404 when the caller cannot discover it."""
+    entity = await db.get_entity(entity_id)
+    linked_count = await db.count_memories_for_entity(
+        entity_id,
+        scope=_workspace_default_scope(request, include_private=True),
+    )
+    if entity is None or linked_count == 0:
+        raise HTTPException(status_code=404, detail=missing_detail)
+    return entity, linked_count
+
+
+def _require_entity_curation(request: Request) -> None:
+    """Manual aliases and merges are workspace-wide, so only workspace administrators curate them."""
+    if not can_manage_workspace(resolve_request_workspace_role(request)):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "entity_curation_forbidden",
+                "message": "Only a workspace admin can change entity aliases or merge entities.",
+            },
+        )
 
 
 def _require_local_agent_connection_management(
@@ -1499,6 +1530,7 @@ class EntityResponse(BaseModel):
 class EntityDetailResponse(EntityResponse):
     aliases: list[EntityAliasResponse] = []
     linked_memory_count: int = 0
+    can_curate: bool = False
 
 
 class EntityListResponse(BaseModel):
@@ -6035,13 +6067,15 @@ def create_admin_app(
 
     @entity_router.get("", response_model=EntityListResponse)
     async def list_entities(
+        request: Request,
         search: str | None = None,
         limit: int = 100,
         offset: int = 0,
         db: Database = Depends(get_db),
     ):
-        """List entities with optional name search."""
+        """List the Entities the caller can discover, with optional name search."""
         entity_rows, total = await db.list_entities(
+            scope=_workspace_default_scope(request, include_private=True),
             search=search,
             limit=limit,
             offset=offset,
@@ -6059,11 +6093,9 @@ def create_admin_app(
         return EntityListResponse(data=entities, total=total)
 
     @entity_router.get("/{entity_id}", response_model=EntityDetailResponse)
-    async def get_entity(entity_id: int, db: Database = Depends(get_db)):
-        """Get entity detail with aliases and linked memory count."""
-        ent = await db.get_entity(entity_id)
-        if ent is None:
-            raise HTTPException(status_code=404, detail="Entity not found")
+    async def get_entity(entity_id: int, request: Request, db: Database = Depends(get_db)):
+        """Get entity detail with aliases and the count of linked Memories the caller can query."""
+        ent, linked_count = await _require_visible_entity(request, db, entity_id)
 
         aliases = await db.get_aliases_for_entity(entity_id)
         alias_responses = [
@@ -6076,8 +6108,6 @@ def create_admin_app(
             for a in aliases
         ]
 
-        linked_count = await db.count_memories_for_entity(entity_id)
-
         return EntityDetailResponse(
             id=ent.id,
             canonical_name=ent.canonical_name,
@@ -6085,23 +6115,30 @@ def create_admin_app(
             created_at=_dt_iso(ent.created_at),
             aliases=alias_responses,
             linked_memory_count=linked_count,
+            can_curate=can_manage_workspace(resolve_request_workspace_role(request)),
         )
 
     @entity_router.post("/merge")
     async def merge_entities(
         req: MergeEntitiesRequest,
+        request: Request,
         db: Database = Depends(get_db),
     ):
         """Merge two entities: reassign all references from source to target.
 
         All memory_entities rows, aliases, and document references pointing to
         source_id are moved to target_id. The source entity is then deleted.
+        Both entities must be discoverable by the caller, and only a workspace
+        administrator may merge.
         """
         if req.source_id == req.target_id:
             raise HTTPException(
                 status_code=400,
                 detail="Source and target entities must differ",
             )
+        _require_entity_curation(request)
+        await _require_visible_entity(request, db, req.source_id, missing_detail="Source entity not found")
+        await _require_visible_entity(request, db, req.target_id, missing_detail="Target entity not found")
         try:
             merged = await db.merge_entities(
                 source_id=req.source_id,
@@ -6121,11 +6158,11 @@ def create_admin_app(
     @entity_router.get("/{entity_id}/aliases")
     async def list_entity_aliases(
         entity_id: int,
+        request: Request,
         db: Database = Depends(get_db),
     ):
         """List all aliases for an entity."""
-        if await db.get_entity(entity_id) is None:
-            raise HTTPException(status_code=404, detail="Entity not found")
+        await _require_visible_entity(request, db, entity_id)
 
         aliases = await db.get_aliases_for_entity(entity_id)
         return {
@@ -6144,11 +6181,12 @@ def create_admin_app(
     async def add_entity_alias(
         entity_id: int,
         req: AddAliasRequest,
+        request: Request,
         db: Database = Depends(get_db),
     ):
-        """Add a manual alias for an entity."""
-        if await db.get_entity(entity_id) is None:
-            raise HTTPException(status_code=404, detail="Entity not found")
+        """Add a workspace-wide manual alias for an entity."""
+        _require_entity_curation(request)
+        await _require_visible_entity(request, db, entity_id)
 
         normalized = canonicalize_entity_name(req.alias)
         await db.insert_alias(
@@ -6163,9 +6201,13 @@ def create_admin_app(
     async def remove_entity_alias(
         entity_id: int,
         alias: str,
+        request: Request,
         db: Database = Depends(get_db),
     ):
-        """Remove an alias from an entity."""
+        """Remove a workspace-wide alias from an entity."""
+        _require_entity_curation(request)
+        await _require_visible_entity(request, db, entity_id)
+
         normalized = canonicalize_entity_name(alias)
         removed = await db.remove_entity_alias(
             entity_id=entity_id,

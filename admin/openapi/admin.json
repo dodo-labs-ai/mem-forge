@@ -1809,6 +1809,11 @@
             "title": "Aliases",
             "type": "array"
           },
+          "can_curate": {
+            "default": false,
+            "title": "Can Curate",
+            "type": "boolean"
+          },
           "canonical_name": {
             "title": "Canonical Name",
             "type": "string"
@@ -9983,7 +9988,7 @@
     },
     "/api/v1/entities": {
       "get": {
-        "description": "List entities with optional name search.",
+        "description": "List the Entities the caller can discover, with optional name search.",
         "operationId": "list_entities_api_v1_entities_get",
         "parameters": [
           {
@@ -10053,7 +10058,7 @@
     },
     "/api/v1/entities/merge": {
       "post": {
-        "description": "Merge two entities: reassign all references from source to target.\n\nAll memory_entities rows, aliases, and document references pointing to\nsource_id are moved to target_id. The source entity is then deleted.",
+        "description": "Merge two entities: reassign all references from source to target.\n\nAll memory_entities rows, aliases, and document references pointing to\nsource_id are moved to target_id. The source entity is then deleted.\nBoth entities must be discoverable by the caller, and only a workspace\nadministrator may merge.",
         "operationId": "merge_entities_api_v1_entities_merge_post",
         "requestBody": {
           "content": {
@@ -10093,7 +10098,7 @@
     },
     "/api/v1/entities/{entity_id}": {
       "get": {
-        "description": "Get entity detail with aliases and linked memory count.",
+        "description": "Get entity detail with aliases and the count of linked Memories the caller can query.",
         "operationId": "get_entity_api_v1_entities__entity_id__get",
         "parameters": [
           {
@@ -10175,7 +10180,7 @@
         ]
       },
       "post": {
-        "description": "Add a manual alias for an entity.",
+        "description": "Add a workspace-wide manual alias for an entity.",
         "operationId": "add_entity_alias_api_v1_entities__entity_id__aliases_post",
         "parameters": [
           {
@@ -10226,7 +10231,7 @@
     },
     "/api/v1/entities/{entity_id}/aliases/{alias}": {
       "delete": {
-        "description": "Remove an alias from an entity.",
+        "description": "Remove a workspace-wide alias from an entity.",
         "operationId": "remove_entity_alias_api_v1_entities__entity_id__aliases__alias__delete",
         "parameters": [
           {
