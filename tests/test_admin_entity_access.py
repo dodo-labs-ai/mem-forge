@@ -149,37 +149,6 @@ def test_linked_memory_count_excludes_memories_the_caller_cannot_query(seeded) -
     assert other_view["linked_memory_count"] == 1
 
 
-def test_stats_entity_total_counts_only_visible_entities(seeded) -> None:
-    client, _database, _graph = seeded
-
-    assert client.get("/api/v1/stats", headers=_as(OWNER)).json()["total_entities"] == 3
-    assert client.get("/api/v1/stats", headers=_as(OTHER)).json()["total_entities"] == 2
-
-
-def test_stats_source_total_excludes_other_users_only_me_sources(seeded) -> None:
-    client, _database, _graph = seeded
-    created = client.post(
-        "/api/v1/sources",
-        json={
-            "type": "confluence",
-            "name": "Alice notes",
-            "access_policy": "private",
-            "config": {
-                "base_url": "https://wiki.example.test/wiki/spaces/ARCH/pages/12345/Home",
-                "pat": "test-token",
-                "sync_mode": "page_tree",
-                "page_tree_root": "12345",
-                "include_children": True,
-            },
-        },
-        headers=_as(OWNER),
-    )
-    assert created.status_code in {200, 201}, created.text
-
-    assert client.get("/api/v1/stats", headers=_as(OWNER)).json()["total_sources"] == 1
-    assert client.get("/api/v1/stats", headers=_as(OTHER)).json()["total_sources"] == 0
-
-
 @pytest.mark.parametrize("role", ["member", "viewer"])
 def test_entity_curation_requires_workspace_administration(seeded, role: str) -> None:
     client, database, graph = seeded
@@ -194,8 +163,10 @@ def test_entity_curation_requires_workspace_administration(seeded, role: str) ->
         headers=headers,
     )
 
+    hidden = client.post(f"/api/v1/entities/{graph.private}/aliases", json={"alias": "Launch"}, headers=headers)
+
     assert detail.json()["can_curate"] is False
-    for response in (added, removed, merged):
+    for response in (added, removed, merged, hidden):
         assert response.status_code == 403, response.text
         assert response.json()["detail"]["error"] == "entity_curation_forbidden"
     assert asyncio.run(database.get_aliases_for_entity(graph.shared)) == []

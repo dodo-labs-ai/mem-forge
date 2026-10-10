@@ -4903,11 +4903,8 @@ def create_admin_app(
         )
 
     @health_router.get("/api/v1/stats", response_model=StatsResponse)
-    async def stats(request: Request, db: Database = Depends(get_db)):
-        """Overall system statistics: memory counts, entity counts, source counts.
-
-        Entity and Source totals count only what the caller can discover.
-        """
+    async def stats(db: Database = Depends(get_db)):
+        """Overall system statistics: memory counts, entity counts, source counts."""
         # Memory counts by type
         type_counts: list[MemoryStatEntry] = []
         for mt in ["fact", "decision", "convention", "procedure"]:
@@ -4922,12 +4919,13 @@ def create_admin_app(
 
         total_memories = await db.count_memories()
 
-        total_entities = await db.count_entities(scope=_workspace_default_scope(request, include_private=True))
+        # Entity count
+        entities = await db.get_all_entities()
+        total_entities = len(entities)
 
-        principal = resolve_request_principal(request)
-        total_sources = sum(
-            1 for source in await db.list_sources() if source_is_discoverable(source, viewer_id=principal)
-        )
+        # Source count
+        sources = await db.list_sources()
+        total_sources = len(sources)
 
         return StatsResponse(
             total_memories=total_memories,
@@ -6138,9 +6136,9 @@ def create_admin_app(
                 status_code=400,
                 detail="Source and target entities must differ",
             )
+        _require_entity_curation(request)
         await _require_visible_entity(request, db, req.source_id, missing_detail="Source entity not found")
         await _require_visible_entity(request, db, req.target_id, missing_detail="Target entity not found")
-        _require_entity_curation(request)
         try:
             merged = await db.merge_entities(
                 source_id=req.source_id,
@@ -6187,8 +6185,8 @@ def create_admin_app(
         db: Database = Depends(get_db),
     ):
         """Add a workspace-wide manual alias for an entity."""
-        await _require_visible_entity(request, db, entity_id)
         _require_entity_curation(request)
+        await _require_visible_entity(request, db, entity_id)
 
         normalized = canonicalize_entity_name(req.alias)
         await db.insert_alias(
@@ -6207,8 +6205,8 @@ def create_admin_app(
         db: Database = Depends(get_db),
     ):
         """Remove a workspace-wide alias from an entity."""
-        await _require_visible_entity(request, db, entity_id)
         _require_entity_curation(request)
+        await _require_visible_entity(request, db, entity_id)
 
         normalized = canonicalize_entity_name(alias)
         removed = await db.remove_entity_alias(

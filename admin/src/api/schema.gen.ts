@@ -2189,8 +2189,6 @@ export interface paths {
         /**
          * Stats
          * @description Overall system statistics: memory counts, entity counts, source counts.
-         *
-         *     Entity and Source totals count only what the caller can discover.
          */
         get: operations["stats_api_v1_stats_get"];
         put?: never;
