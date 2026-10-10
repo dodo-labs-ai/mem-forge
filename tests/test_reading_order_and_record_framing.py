@@ -6,6 +6,8 @@ import json
 from dataclasses import replace
 from datetime import datetime, timezone
 
+import pytest
+
 from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.evidence_fragments import build_revision_fragment_index
@@ -89,11 +91,12 @@ def test_a_conversation_reads_in_the_order_it_was_written() -> None:
     ]
 
 
-def test_an_observation_without_a_source_time_follows_those_that_have_one() -> None:
+@pytest.mark.parametrize("unusable", [None, "2026-07-14 10:00:00"])
+def test_an_observation_without_a_usable_source_time_follows_those_that_have_one(unusable) -> None:
     projection = _window(_messages())
     first = next(o.id for o in projection.observations if o.provider_key == "msg-0")
     untimed = replace(projection, observation_revisions=tuple(
-        replace(revision, observed_at=None) if revision.observation_id == first else revision
+        replace(revision, observed_at=unusable) if revision.observation_id == first else revision
         for revision in projection.observation_revisions
     ))
 
