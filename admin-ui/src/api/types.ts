@@ -147,6 +147,8 @@ export interface Entity {
 export interface EntityDetail extends Entity {
   aliases: EntityAlias[];
   linked_memory_count: number;
+  /** Workspace administrators may add or remove manual aliases and merge entities. */
+  can_curate: boolean;
 }
 
 export interface EntityAlias {

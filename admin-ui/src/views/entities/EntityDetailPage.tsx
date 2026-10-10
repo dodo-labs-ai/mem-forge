@@ -152,28 +152,30 @@ export function EntityDetailPage() {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <form
-            onSubmit={(event) => {
-              event.preventDefault();
-              const next = newAlias.trim();
-              if (next) addAlias.mutate(next);
-            }}
-            className="mb-4 flex gap-2"
-          >
-            <Input
-              value={newAlias}
-              onChange={(event) => setNewAlias(event.target.value)}
-              placeholder="Add new alias..."
-              className="flex-1"
-            />
-            <Button
-              type="submit"
-              size="default"
-              disabled={!newAlias.trim() || addAlias.isPending}
+          {entity.can_curate && (
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                const next = newAlias.trim();
+                if (next) addAlias.mutate(next);
+              }}
+              className="mb-4 flex gap-2"
             >
-              <Plus className="mr-1 size-4" /> Add
-            </Button>
-          </form>
+              <Input
+                value={newAlias}
+                onChange={(event) => setNewAlias(event.target.value)}
+                placeholder="Add new alias..."
+                className="flex-1"
+              />
+              <Button
+                type="submit"
+                size="default"
+                disabled={!newAlias.trim() || addAlias.isPending}
+              >
+                <Plus className="mr-1 size-4" /> Add
+              </Button>
+            </form>
+          )}
 
           {entity.aliases.length === 0 ? (
             <p className="text-sm text-muted-foreground">No aliases yet.</p>
@@ -184,7 +186,7 @@ export function EntityDetailPage() {
                   <TableHead>Alias</TableHead>
                   <TableHead className="w-32">Source</TableHead>
                   <TableHead className="w-32">Added</TableHead>
-                  <TableHead className="w-10" />
+                  {entity.can_curate && <TableHead className="w-10" />}
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -201,16 +203,18 @@ export function EntityDetailPage() {
                         ? formatDateTime(alias.created_at)
                         : "-"}
                     </TableCell>
-                    <TableCell>
-                      <Button
-                        variant="ghost"
-                        size="icon-xs"
-                        onClick={() => deleteAlias.mutate(alias.alias)}
-                        title="Delete alias"
-                      >
-                        <Trash2 className="size-3.5 text-muted-foreground hover:text-destructive" />
-                      </Button>
-                    </TableCell>
+                    {entity.can_curate && (
+                      <TableCell>
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          onClick={() => deleteAlias.mutate(alias.alias)}
+                          title="Delete alias"
+                        >
+                          <Trash2 className="size-3.5 text-muted-foreground hover:text-destructive" />
+                        </Button>
+                      </TableCell>
+                    )}
                   </TableRow>
                 ))}
               </TableBody>
@@ -219,59 +223,61 @@ export function EntityDetailPage() {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm">Merge into another entity</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <p className="mb-3 text-xs text-muted-foreground">
-            This will make the current entity an alias of the target.
-          </p>
-          <form
-            onSubmit={(event) => {
-              event.preventDefault();
-            }}
-            className="flex gap-2"
-          >
-            <Input
-              value={mergeTargetId}
-              onChange={(event) => setMergeTargetId(event.target.value)}
-              className="w-40"
-              placeholder="Target entity ID"
-            />
-            <Dialog>
-              <DialogTrigger
-                render={
-                  <Button
-                    variant="destructive"
-                    disabled={!mergeTargetId.trim() || mergeEntity.isPending}
-                  />
-                }
-              >
-                Merge
-              </DialogTrigger>
-              <DialogContent>
-                <DialogHeader>
-                  <DialogTitle>Confirm merge</DialogTitle>
-                  <DialogDescription>
-                    This will merge "{entity.canonical_name}" into entity #
-                    {mergeTargetId}. This action cannot be undone.
-                  </DialogDescription>
-                </DialogHeader>
-                <DialogFooter>
-                  <Button
-                    variant="destructive"
-                    onClick={() => mergeEntity.mutate(mergeTargetId.trim())}
-                    disabled={mergeEntity.isPending}
-                  >
-                    {mergeEntity.isPending ? "Merging..." : "Confirm merge"}
-                  </Button>
-                </DialogFooter>
-              </DialogContent>
-            </Dialog>
-          </form>
-        </CardContent>
-      </Card>
+      {entity.can_curate && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Merge into another entity</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="mb-3 text-xs text-muted-foreground">
+              This will make the current entity an alias of the target.
+            </p>
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+              }}
+              className="flex gap-2"
+            >
+              <Input
+                value={mergeTargetId}
+                onChange={(event) => setMergeTargetId(event.target.value)}
+                className="w-40"
+                placeholder="Target entity ID"
+              />
+              <Dialog>
+                <DialogTrigger
+                  render={
+                    <Button
+                      variant="destructive"
+                      disabled={!mergeTargetId.trim() || mergeEntity.isPending}
+                    />
+                  }
+                >
+                  Merge
+                </DialogTrigger>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>Confirm merge</DialogTitle>
+                    <DialogDescription>
+                      This will merge "{entity.canonical_name}" into entity #
+                      {mergeTargetId}. This action cannot be undone.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <DialogFooter>
+                    <Button
+                      variant="destructive"
+                      onClick={() => mergeEntity.mutate(mergeTargetId.trim())}
+                      disabled={mergeEntity.isPending}
+                    >
+                      {mergeEntity.isPending ? "Merging..." : "Confirm merge"}
+                    </Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
+            </form>
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }

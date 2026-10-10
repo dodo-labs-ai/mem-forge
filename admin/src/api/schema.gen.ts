@@ -564,7 +564,7 @@ export interface paths {
         };
         /**
          * List Entities
-         * @description List entities with optional name search.
+         * @description List the Entities the caller can discover, with optional name search.
          */
         get: operations["list_entities_api_v1_entities_get"];
         put?: never;
@@ -590,6 +590,8 @@ export interface paths {
          *
          *     All memory_entities rows, aliases, and document references pointing to
          *     source_id are moved to target_id. The source entity is then deleted.
+         *     Both entities must be discoverable by the caller, and only a workspace
+         *     administrator may merge.
          */
         post: operations["merge_entities_api_v1_entities_merge_post"];
         delete?: never;
@@ -607,7 +609,7 @@ export interface paths {
         };
         /**
          * Get Entity
-         * @description Get entity detail with aliases and linked memory count.
+         * @description Get entity detail with aliases and the count of linked Memories the caller can query.
          */
         get: operations["get_entity_api_v1_entities__entity_id__get"];
         put?: never;
@@ -633,7 +635,7 @@ export interface paths {
         put?: never;
         /**
          * Add Entity Alias
-         * @description Add a manual alias for an entity.
+         * @description Add a workspace-wide manual alias for an entity.
          */
         post: operations["add_entity_alias_api_v1_entities__entity_id__aliases_post"];
         delete?: never;
@@ -654,7 +656,7 @@ export interface paths {
         post?: never;
         /**
          * Remove Entity Alias
-         * @description Remove an alias from an entity.
+         * @description Remove a workspace-wide alias from an entity.
          */
         delete: operations["remove_entity_alias_api_v1_entities__entity_id__aliases__alias__delete"];
         options?: never;
@@ -2927,6 +2929,11 @@ export interface components {
              * @default []
              */
             aliases: components["schemas"]["EntityAliasResponse"][];
+            /**
+             * Can Curate
+             * @default false
+             */
+            can_curate: boolean;
             /** Canonical Name */
             canonical_name: string;
             /** Created At */
