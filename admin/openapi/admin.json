@@ -14460,7 +14460,7 @@
     },
     "/api/v1/stats": {
       "get": {
-        "description": "Overall system statistics: memory counts, entity counts, source counts.\n\nEntity and Source totals count only what the caller can discover.",
+        "description": "Overall system statistics: memory counts, entity counts, source counts.",
         "operationId": "stats_api_v1_stats_get",
         "responses": {
           "200": {

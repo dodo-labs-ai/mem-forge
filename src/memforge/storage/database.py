@@ -15667,16 +15667,6 @@ class Database:
                 entities.append(_entity_from_row(dict(row)))
         return entities, total
 
-    async def count_entities(self, *, scope) -> int:
-        """Count the Entities linked to at least one Memory visible under ``scope``."""
-        entity_predicate_sql, params = visible_entity_sql(scope, "e")
-        async with self.db.execute(
-            f"SELECT COUNT(*) FROM entities e WHERE {entity_predicate_sql}",
-            params,
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-
     async def get_entity(self, entity_id: int) -> Entity | None:
         async with self.db.execute("SELECT * FROM entities WHERE id = ?", (entity_id,)) as cursor:
             row = await cursor.fetchone()

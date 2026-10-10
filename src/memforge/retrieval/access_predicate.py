@@ -135,7 +135,7 @@ def visible_entity_sql(scope: AccessScope, alias: str) -> tuple[str, list[Any]]:
 
     Entity IDs are workspace-internal graph identities, not access authority,
     so an Entity is discoverable only through a linked Memory visible under
-    ``scope``. An Entity without such a Memory is hidden, including from counts.
+    ``scope``. An Entity without such a Memory is hidden.
     """
     predicate_sql, predicate_params = visible_sql(scope, "entity_memory")
     return (
