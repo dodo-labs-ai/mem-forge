@@ -92,17 +92,17 @@ def test_a_conversation_reads_in_the_order_it_was_written() -> None:
 
 
 @pytest.mark.parametrize("unusable", [None, "2026-07-14 10:00:00"])
-def test_an_observation_without_a_usable_source_time_follows_those_that_have_one(unusable) -> None:
+def test_an_observation_without_a_usable_source_time_is_read_before_the_timeline(unusable) -> None:
     projection = _window(_messages())
-    first = next(o.id for o in projection.observations if o.provider_key == "msg-0")
+    last = next(o.id for o in projection.observations if o.provider_key == "msg-5")
     untimed = replace(projection, observation_revisions=tuple(
-        replace(revision, observed_at=unusable) if revision.observation_id == first else revision
+        replace(revision, observed_at=unusable) if revision.observation_id == last else revision
         for revision in projection.observation_revisions
     ))
 
     catalog = _reading(untimed).catalog
 
-    assert _message_ids(untimed, catalog.fragments) == ["msg-1", "msg-2", "msg-3", "msg-4", "msg-5", "msg-0"]
+    assert _message_ids(untimed, catalog.fragments) == ["msg-5", "msg-0", "msg-1", "msg-2", "msg-3", "msg-4"]
 
 
 def test_record_framing_is_shown_on_every_entry_and_never_listed_as_one() -> None:
