@@ -38,7 +38,7 @@ from memforge.pipeline.projection_context import ExtractionAuthority
 from memforge.pipeline.projection_images import (
     projection_inference_capability_hash,
 )
-from memforge.source_time import parse_source_time, reported_source_time
+from memforge.source_time import parse_source_time
 from memforge.source_projection import (
     AnchorKind,
     EvidenceCoordinateSpace,
@@ -402,10 +402,7 @@ def _compose_projection_fragment_catalog(
 ) -> ProjectionFragmentCatalog:
     """Compose revision-local compiler outputs behind one catalog interface."""
 
-    source_times = {
-        revision.id: parse_source_time(reported_source_time(revision.observed_at))
-        for revision in projection.observation_revisions
-    }
+    source_times = {revision.id: _source_time(revision) for revision in projection.observation_revisions}
     ordered = tuple(
         sorted(
             compiled_fragments,
@@ -681,6 +678,14 @@ def _merged_spans(spans: tuple[tuple[int, int], ...]) -> tuple[tuple[int, int], 
         else:
             merged.append((start, end))
     return tuple(merged)
+
+
+def _source_time(revision: SourceObservationRevision) -> datetime | None:
+    """The revision's source time on the timeline; ``None`` when its source gave no usable one."""
+    try:
+        return parse_source_time(revision.observed_at)
+    except ValueError:
+        return None
 
 
 def _fragment_sort_key(fragment: EvidenceFragment, source_time: datetime | None) -> tuple[object, ...]:
