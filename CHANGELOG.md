@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Model catalogs read in source-time order and list record framing only as
+  context (`revision-input-v11`). Observations are ordered by the time their
+  source reports, then each one's Fragments by position, so a Teams window or
+  an issue's comments read in the order they were written instead of in
+  revision-id order. A contextual record field is never Primary and never an
+  entry read alone; fields a schema declares as record framing (Teams sender,
+  times, reply referent and conversation; Jira issue key and id, author and
+  event times) stay displayed on every entry and are no longer listed as separate
+  entries. Evidence that selected such a field is assessed again the next time
+  its Unit is derived. Stored revisions and committed Evidence are unchanged.
+  Cloud: arrives with the pin; no HANA change.
 - Entity admin routes follow Memory visibility. The entity list, detail, alias
   list and linked Memory count admit an Entity only through a linked active
   Memory the caller can see, so a name learned from another user's private

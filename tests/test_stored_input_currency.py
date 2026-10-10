@@ -32,7 +32,10 @@ SOURCE_ID = "src-jira"
 ISSUES = {"PAY-1": "400001", "PAY-2": "400002"}
 SYNCED_AT = datetime(2026, 9, 20, tzinfo=timezone.utc)
 DOMAIN_HISTORY = {"id": "9001", "created": "2026-09-01T08:00:00.000+0000", "items": [{"field": "summary"}]}
-SPRINT_HISTORY = {"id": "9002", "created": "2026-09-02T08:00:00.000+0000", "items": [{"field": "Sprint"}]}
+SPRINT_HISTORY = {
+    "id": "9002", "created": "2026-09-02T08:00:00.000+0000",
+    "items": [{"field": "Sprint", "toString": "Sprint 5"}],
+}
 
 
 def doc_id(issue_key: str) -> str:
