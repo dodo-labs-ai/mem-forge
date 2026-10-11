@@ -87,7 +87,7 @@ def test_pinned_resource_rejects_untrusted_locator(resource_reader, monkeypatch,
     assert read({"url": url})["error"] == "unsupported resource URL"
 
 
-def test_compaction_preserves_every_ref_and_its_pinned_identity():
+def test_compaction_keeps_every_ref_readable_and_locatable_without_storage_identity():
     items = [{
         "authority": "revision_pinned", "role": "primary" if index == 0 else "required",
         "kind": "text", "support_contribution": True,
@@ -106,7 +106,27 @@ def test_compaction_preserves_every_ref_and_its_pinned_identity():
         "resource_url": items[0]["resource_url"], "items": items,
     }
     result = proxy._compact_memory_response({"id": "mem-1", "evidence": [unit]})
-    assert result["evidence"] == [unit]
+    assert result["evidence"] == [{
+        "source_id": "src-1", "source_type": "github_repo", "current": True,
+        "resource_url": "/api/v1/memories/mem-1/evidence/eu-1/resource",
+        "items": [{
+            "role": "primary" if index == 0 else "required", "kind": "text", "current": True,
+            "resource_url": "/api/v1/memories/mem-1/evidence/eu-1/resource", "text": "Exact readable evidence",
+        } for index in range(14)],
+    }]
+
+
+def test_a_focused_presentation_replaces_the_source_block_it_restates():
+    item = {"role": "primary", "kind": "text", "excerpt": "A whole table.", "text": "The one row.",
+            "text_view": {"kind": "table", "version": 1, "origins": []}}
+    [unit] = proxy._compact_memory_response({"id": "mem-1", "evidence": [{"items": [item]}]})["evidence"]
+    assert unit["items"] == [{"role": "primary", "kind": "text", "text": "The one row."}]
+
+
+def test_tool_results_keep_every_script_readable():
+    text = proxy._tool_result({"content": "缓存写入有额外费用"})["content"][0]["text"]
+    assert "缓存写入有额外费用" in text and "\\u" not in text
+    assert json.loads(text) == {"content": "缓存写入有额外费用"}
 
 
 def test_proxy_relative_pinned_resource_keeps_workspace_locator():

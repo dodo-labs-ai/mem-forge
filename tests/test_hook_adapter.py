@@ -930,7 +930,7 @@ def test_packaged_plugin_version_is_consistent():
     import tomllib
 
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.64"
+    version = "0.1.65"
     package = tomllib.loads((root / "pyproject.toml").read_text())
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
@@ -2818,7 +2818,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "durable memory content" in tools["create_memory"]["description"]
     assert "provenance" in tools["create_memory"]["description"]
     assert "one self-contained" in create_schema["properties"]["content"]["description"].lower()
-    assert "get_memory.evidence[].items[].excerpt" in create_schema["properties"]["provenance"]["description"]
+    assert "get_memory.evidence[].items[].text" in create_schema["properties"]["provenance"]["description"]
     assert "canonical content" in tools["get_memory"]["description"]
     assert "grouped Evidence" in tools["get_memory"]["description"]
     assert "sources[]" not in tools["get_memory"]["description"]
@@ -4027,31 +4027,17 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
         "entity_refs": ["periodcutoffblockerhint"],
         "evidence": [
             {
-                "kind": "document",
-                "evidence_unit_id": None,
-                "support_ids": [],
                 "source_id": "src-jira",
                 "source_type": "jira",
-                "doc_id": "jira-SFPAY-179397",
                 "current": True,
                 "document": {
-                    "doc_id": "jira-SFPAY-179397",
                     "title": "SFPAY-179397: Create Blocker Hint",
                     "source_url": "https://jira.example/browse/SFPAY-179397",
                     "content_url": "/api/v1/documents/jira-SFPAY-179397/content",
                     "pdf_url": None,
                     "source_updated_at": "2026-07-02T03:50:32+00:00",
                 },
-                "items": [
-                    {
-                        "authority": "application_document",
-                        "role": "primary",
-                        "kind": "text",
-                        "support_contribution": True,
-                        "excerpt": "large excerpt",
-                        "current": True,
-                    }
-                ],
+                "items": [{"role": "primary", "kind": "text", "current": True, "text": "large excerpt"}],
             }
         ],
     }
@@ -4287,7 +4273,7 @@ def test_mcp_proxy_fetches_resource_through_hosted_workspace(monkeypatch):
     assert captured["authorization"] == "Bearer token-123"
 
 
-def test_mcp_proxy_preserves_claim_local_evidence_on_get_memory(monkeypatch):
+def test_mcp_proxy_keeps_what_an_agent_reads_of_artifact_evidence_on_get_memory(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
     artifact = {
         "artifact_id": "artifact-1",
@@ -4343,7 +4329,19 @@ def test_mcp_proxy_preserves_claim_local_evidence_on_get_memory(monkeypatch):
 
     [group] = result["evidence"]
     assert group["document"]["content_url"] == "/api/v1/documents/doc-1/content"
-    assert group["items"][0]["artifact"] == artifact
+    assert group["items"][0] == {
+        "role": "primary",
+        "kind": "artifact",
+        "current": True,
+        "artifact": {
+            "summary": "Architecture diagram showing the request flow.",
+            "evidence_role": "primary",
+            "filename": "diagram.png",
+            "content_type": "image/png",
+            "size_bytes": 3,
+            "url": "/api/v1/source-artifacts/obsrev-1",
+        },
+    }
 
 
 def test_mcp_proxy_returns_source_artifact_as_native_image_content(monkeypatch):
