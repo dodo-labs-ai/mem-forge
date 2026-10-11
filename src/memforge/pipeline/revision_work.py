@@ -235,7 +235,7 @@ class RevisionWorkExecutor:
                     if support.route is SupportRoute.REBIND_SUPPORT or support.item.id in unaffected:
                         results[support.item.id] = self._rebound(plan.catalog, support)
                     elif support.route is SupportRoute.UNRESOLVED_PARTIAL_COVERAGE:
-                        results[support.item.id] = _unresolved_partial_coverage(support)
+                        results[support.item.id] = _kept_unjudged(support)
                     else:
                         # Support Assessment, and Change Impact that was AFFECTED or failed.
                         assessed.append(support)
@@ -793,14 +793,24 @@ def _log_change_impact_failure(context, item: SupportWorkItem, failure: ItemFail
     )
 
 
-def _unresolved_partial_coverage(support: SupportPlan) -> SupportAssessment:
-    return SupportAssessment(
-        None,
-        "Partial projection coverage cannot prove whether prior Evidence in "
-        + ", ".join(support.unknown_observation_ids) + " is still present.",
-        None,
-        unresolved="partial_coverage",
-    )
+def _kept_unjudged(support: SupportPlan) -> SupportAssessment:
+    """Keep a Support with an UNKNOWN part as it is, and say why the part is UNKNOWN.
+
+    Either cause leaves the claim neither judged nor retired, so both record
+    ``partial_coverage``; the reason tells an operator which one to act on.
+    """
+    reasons = []
+    if support.unreturned_observation_ids:
+        reasons.append(
+            "Partial projection coverage cannot prove whether prior Evidence in "
+            + ", ".join(support.unreturned_observation_ids) + " is still present."
+        )
+    if support.unreadable_observation_ids:
+        reasons.append(
+            "Prior Evidence in " + ", ".join(support.unreadable_observation_ids)
+            + " is stored in a representation this build does not read."
+        )
+    return SupportAssessment(None, " ".join(reasons), None, unresolved="partial_coverage")
 
 
 def _distinct_required(primary_ref: str, required_refs) -> tuple[str, ...]:

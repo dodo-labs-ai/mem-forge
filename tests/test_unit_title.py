@@ -39,8 +39,6 @@ from memforge.pipeline.unit_title import UNIT_TITLE_DEFINITION, render_unit_titl
 from memforge.source_projection import (
     AnchorKind,
     DeltaAxis,
-    EvidenceCoordinateSpace,
-    EvidenceRepresentationProfile,
     ProjectionCoverage,
     SourceAnchor,
     SourceObservation,
@@ -49,7 +47,12 @@ from memforge.source_projection import (
     source_projection_from_payload,
     source_projection_to_payload,
 )
-from memforge.source_representation import current_representation_of, in_current_representation
+from memforge.source_representation import (
+    UNIT_TITLE_OBSERVATION_PROFILE,
+    current_representation_of,
+    in_current_representation,
+    shown_as_reading_context,
+)
 from memforge.storage import database as database_module
 from memforge.storage.database import Database
 from tests.llm_fixture import NoopMemoryExtractor
@@ -63,9 +66,7 @@ COMMENT = "Decision: retain A7 for regular payroll."
 NOW = datetime(2026, 9, 26, tzinfo=timezone.utc)
 # How a Unit Title was stored when it was the Unit's first Observation.
 LEGACY_TITLE_TYPE = "unit_identity"
-LEGACY_TITLE_PROFILE = EvidenceRepresentationProfile(
-    name="unit-identity", version=1, coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
-)
+LEGACY_TITLE_PROFILE = UNIT_TITLE_OBSERVATION_PROFILE
 
 
 def jira(summary="Payroll run fails", *, issue_type=None, description="Payroll context.", comments_truncated=False,
@@ -176,7 +177,7 @@ def with_stored_title(projection):
 
 def title_part(stored):
     """Required Evidence a Support selected on the stored Unit Title."""
-    revision = next(item for item in stored.observation_revisions if item.evidence_profile == LEGACY_TITLE_PROFILE)
+    revision = next(item for item in stored.observation_revisions if not in_current_representation(item))
     return ActiveSupportEvidence(
         memory_id="memory", source_id=stored.source_id, reference_id="e-title", evidence_unit_id="eu1",
         role=EvidenceRole.REQUIRED,
@@ -301,10 +302,14 @@ def test_the_stored_unit_title_is_outside_the_current_representation():
     assert [in_current_representation(revision) for revision in stored.observation_revisions] == [
         False, *(True for _ in jira().observation_revisions),
     ]
+    # Of the revisions outside it, the title is one every reading still shows.
+    assert [shown_as_reading_context(revision) for revision in stored.observation_revisions] == [
+        True, *(False for _ in jira().observation_revisions),
+    ]
 
 
 @pytest.mark.asyncio
-async def test_a_retired_title_support_stays_unresolved_without_a_model_call():
+async def test_a_support_citing_the_stored_title_is_rebound_without_that_part_and_without_a_model_call():
     stored = with_stored_title(jira())
     current = jira(prior=stored, run_id="run-2")
     delta = current.deltas[0]
@@ -330,17 +335,19 @@ async def test_a_retired_title_support_stays_unresolved_without_a_model_call():
     named = (support_part(current, COMMENT), title_part(stored))
     revision_plan = plan_supports(context, named)
     [support] = revision_plan.supports
-    assert [part.status for part in support.parts] == [EvidenceCorrespondence.EXACT_UNCHANGED, EvidenceCorrespondence.UNKNOWN]
-    assert support.route is SupportRoute.UNRESOLVED_PARTIAL_COVERAGE
-    assert support.parts[1].evidence is named[1]
+    # Every reading still shows the title, so the part on it is left out: neither REMOVED nor UNKNOWN.
+    assert [part.status for part in support.parts] == [EvidenceCorrespondence.EXACT_UNCHANGED]
+    assert support.route is SupportRoute.REBIND_SUPPORT
     assert revision_plan.changes == ()
 
     client = NoModelClient()
     [result] = (await RevisionWorkExecutor(client=client, model="fixture").assess_many(
         [SupportWorkItem("w0", memory(), named, context)],
     )).values()
-    assert result.supported is None and not result.rebound
-    assert result.unresolved == "partial_coverage" and result.memory is None
+    assert result.supported and result.rebound
+    assert [part.anchor.observation_id for part in result.memory.resolved_evidence_selection.parts] == [
+        support.parts[0].evidence.anchor.observation_id,
+    ]
 
 
 def test_a_unit_whose_prior_revision_held_only_its_title_is_compared_with_that_revision():
@@ -483,7 +490,7 @@ def test_a_stored_payload_whose_delta_added_the_title_is_read_with_only_its_cont
     }
 
 
-def test_retired_title_evidence_stays_unresolved_even_without_a_baseline():
+def test_evidence_on_the_stored_title_is_left_out_by_its_own_revision_without_a_baseline():
     stored = with_stored_title(jira())
     current = jira(prior=stored, run_id="run-2")
     [title_revision] = [revision for revision in stored.observation_revisions if not in_current_representation(revision)]
@@ -494,12 +501,12 @@ def test_retired_title_evidence_stays_unresolved_even_without_a_baseline():
     )
     [support] = plan_supports(context, named).supports
 
-    assert [part.evidence.reference_id for part in support.parts] == ["e1", "e-title"]
-    assert support.parts[1].status is EvidenceCorrespondence.UNKNOWN
-    assert support.route is SupportRoute.UNRESOLVED_PARTIAL_COVERAGE
+    # An operator reprocess reads the whole Unit, and the stored title is no prior Evidence of it.
+    assert [part.evidence.reference_id for part in support.parts] == ["e1"]
+    assert support.route is SupportRoute.SUPPORT_ASSESSMENT
 
 
-def test_a_retired_primary_keeps_the_whole_support_unresolved():
+def test_a_support_whose_primary_is_the_stored_title_is_assessed_not_rebound():
     stored = with_stored_title(jira())
     current = jira(prior=stored, run_id="run-2")
     context = RevisionAssessmentContext(projection=current, base=stored, access_context_hash="scope")
@@ -508,11 +515,42 @@ def test_a_retired_primary_keeps_the_whole_support_unresolved():
 
     [only_title, with_required] = plan_supports(context, (primary_on_title,), (primary_on_title, required)).supports
 
-    assert [part.status for part in only_title.parts] == [EvidenceCorrespondence.UNKNOWN]
-    assert only_title.parts[0].evidence is primary_on_title
-    assert only_title.route is SupportRoute.UNRESOLVED_PARTIAL_COVERAGE
-    assert [part.status for part in with_required.parts] == [EvidenceCorrespondence.UNKNOWN, EvidenceCorrespondence.EXACT_UNCHANGED]
-    assert with_required.route is SupportRoute.UNRESOLVED_PARTIAL_COVERAGE
+    # Nothing is left to bind the claim to, so the whole revision is read for it.
+    assert only_title.parts == () and only_title.route is SupportRoute.SUPPORT_ASSESSMENT
+    assert [part.status for part in with_required.parts] == [EvidenceCorrespondence.EXACT_UNCHANGED]
+    assert with_required.route is SupportRoute.SUPPORT_ASSESSMENT
+
+
+@pytest.mark.asyncio
+async def test_evidence_in_a_retired_profile_not_named_as_reading_context_keeps_its_support_and_says_why():
+    """Only a named profile is left out; any other one this build does not read keeps the Support whole."""
+    unnamed = replace(LEGACY_TITLE_PROFILE, version=LEGACY_TITLE_PROFILE.version + 1)
+    stored = with_stored_title(jira())
+    stored = replace(stored, observation_revisions=tuple(
+        revision if in_current_representation(revision) else replace(revision, evidence_profile=unnamed)
+        for revision in stored.observation_revisions
+    ))
+    current = jira(prior=stored, run_id="run-2")
+    [unread_revision] = [revision for revision in stored.observation_revisions if not in_current_representation(revision)]
+    assert not shown_as_reading_context(unread_revision)
+
+    context = RevisionAssessmentContext(projection=current, base=stored, access_context_hash="scope")
+    named = (support_part(current, COMMENT), title_part(stored))
+    [support] = plan_supports(context, named).supports
+
+    assert [part.status for part in support.parts] == [EvidenceCorrespondence.EXACT_UNCHANGED, EvidenceCorrespondence.UNKNOWN]
+    assert support.route is SupportRoute.UNRESOLVED_PARTIAL_COVERAGE
+    assert support.unreadable_observation_ids == (unread_revision.observation_id,)
+    assert support.unreturned_observation_ids == ()
+
+    [result] = (await RevisionWorkExecutor(client=NoModelClient(), model="fixture").assess_many(
+        [SupportWorkItem("w0", memory(), named, context)],
+    )).values()
+    assert result.supported is None and not result.rebound and result.memory is None
+    assert result.unresolved == "partial_coverage"
+    assert result.reason == (
+        f"Prior Evidence in {unread_revision.observation_id} is stored in a representation this build does not read."
+    )
 
 
 @pytest.mark.asyncio
