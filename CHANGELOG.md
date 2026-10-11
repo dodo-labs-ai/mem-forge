@@ -13,7 +13,9 @@
   Evidence References and supporting Evidence are unchanged. Cloud: the HANA
   evidence read presents a whole Observation the same way and the HANA
   migration `context-for-declared-reply-v1` deactivates the same
-  associations, together with the pin to this version.
+  associations, together with the pin to this version. The unused storage
+  method `replace_evidence_context_associations` is removed from the protocol
+  and both stores.
 - Model catalogs read in source-time order and list record framing only as
   context (`revision-input-v11`). Observations are ordered by the time their
   source reports, then each one's Fragments by position, so a Teams window or

@@ -718,16 +718,6 @@ class SqliteRelationalStore:
     async def get_evidence_unit(self, evidence_unit_id: str) -> EvidenceUnit | None:
         return await self._db.get_evidence_unit(evidence_unit_id)
 
-    async def replace_evidence_context_associations(
-        self,
-        evidence_unit_id: str,
-        references: Sequence[EvidenceReference],
-    ) -> tuple[EvidenceReference, ...]:
-        return await self._db.replace_evidence_context_associations(
-            evidence_unit_id,
-            references,
-        )
-
     async def upsert_memory_unit_support_assertion(
         self,
         assertion: MemoryUnitSupportAssertion,
