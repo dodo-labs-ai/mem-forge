@@ -87,7 +87,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.64"
+SERVER_VERSION = "0.1.65"
 CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
     "Local project context is optional. MemForge uses negotiated request-scoped host context when "
@@ -582,7 +582,7 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": (
                         "Required claim-local evidence or source context. It is stored separately from "
-                        "canonical content and returned as grouped get_memory.evidence[].items[].excerpt. Use it for "
+                        "canonical content and returned as grouped get_memory.evidence[].items[].text. Use it for "
                         "details that explain where the memory came from or how it was verified, but "
                         "exclude secrets and raw oversized logs."
                     ),
@@ -1712,6 +1712,11 @@ def _root_path(item: Any) -> str | None:
     return uri
 
 
+def _result_text(payload: dict[str, Any]) -> str:
+    """The text an agent reads: every script as written, never as escape sequences."""
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
 def _tool_result(payload: dict[str, Any], *, structured: bool = False) -> dict[str, Any]:
     content_type = str(payload.get("content_type") or "").split(";", 1)[0].strip().lower()
     encoded = payload.get("data_base64")
@@ -1719,14 +1724,14 @@ def _tool_result(payload: dict[str, Any], *, structured: bool = False) -> dict[s
         metadata = {key: value for key, value in payload.items() if key != "data_base64"}
         return {
             "content": [
-                {"type": "text", "text": json.dumps(metadata, indent=2)},
+                {"type": "text", "text": _result_text(metadata)},
                 {"type": "image", "data": encoded, "mimeType": content_type},
             ],
             "isError": False,
         }
     is_error = "error" in payload
     result = {
-        "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
+        "content": [{"type": "text", "text": _result_text(payload)}],
         "isError": is_error,
     }
     if structured and not is_error:
@@ -1859,22 +1864,12 @@ def _compact_memory_response(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_memory_evidence_unit(unit: dict[str, Any]) -> dict[str, Any]:
-    compact = {
-        key: unit[key]
-        for key in (
-            "kind",
-            "evidence_unit_id",
-            "support_ids",
-            "source_id",
-            "source_type",
-            "source_unit_id",
-            "source_unit_revision_id",
-            "doc_id",
-            "current",
-            "resource_url",
-        )
-        if key in unit
-    }
+    """One Evidence group as an agent uses it: where it comes from, what it says, and how to open it.
+
+    Storage identities, anchors and hashes stay in the REST projection. No tool
+    accepts them, and ``resource_url`` already locates the pinned source.
+    """
+    compact = {key: unit[key] for key in ("source_id", "source_type", "current", "resource_url") if key in unit}
     document = unit.get("document")
     if isinstance(document, dict):
         compact["document"] = _compact_memory_evidence_document(document)
@@ -1889,36 +1884,13 @@ def _compact_memory_evidence_unit(unit: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_memory_evidence_item(item: dict[str, Any]) -> dict[str, Any]:
-    compact = {
-        key: item[key]
-        for key in (
-            "authority",
-            "role",
-            "kind",
-            "support_contribution",
-            "evidence_reference_id",
-            "observation_id",
-            "observation_revision_id",
-            "anchor_kind",
-            "fragment_id",
-            "range_start",
-            "range_end",
-            "raw_content_sha256",
-            "presentation_sha256",
-            "text_view",
-            "interpretation_available",
-            "resource_url",
-            "excerpt",
-            "text",
-            "current",
-        )
-        if key in item
-    }
+    compact = {key: item[key] for key in ("role", "kind", "current", "resource_url") if key in item}
+    # The focused presentation when the reference has one, else its source text.
+    # The full source block stays available at the pinned resource.
+    text = item.get("text") if item.get("text") is not None else item.get("excerpt")
+    if text is not None:
+        compact["text"] = text
     artifact = item.get("artifact")
-    if item.get("text") is not None:
-        # Full source text remains available at the pinned resource, without
-        # repeating a broad source block beside its focused presentation.
-        compact.pop("excerpt", None)
     if isinstance(artifact, dict):
         compact["artifact"] = _compact_memory_evidence_artifact(artifact)
     return compact
@@ -1930,7 +1902,6 @@ def _compact_memory_evidence_document(
     return {
         key: document[key]
         for key in (
-            "doc_id",
             "title",
             "source_url",
             "content_url",
@@ -1944,25 +1915,11 @@ def _compact_memory_evidence_document(
 def _compact_memory_evidence_artifact(
     artifact: dict[str, Any],
 ) -> dict[str, Any]:
-    compact: dict[str, Any] = {}
-    for key in (
-        "summary",
-        "evidence_role",
-        "filename",
-        "content_type",
-        "size_bytes",
-        "url",
-        "observation_id",
-        "observation_revision_id",
-        "artifact_id",
-        "parent_observation_id",
-        "evidence_reference_id",
-        "evidence_unit_id",
-        "sha256",
-    ):
-        if key in artifact:
-            compact[key] = artifact[key]
-    return compact
+    return {
+        key: artifact[key]
+        for key in ("summary", "evidence_role", "filename", "content_type", "size_bytes", "url")
+        if key in artifact
+    }
 
 
 def _resource_url(
