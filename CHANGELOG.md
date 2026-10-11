@@ -13,6 +13,13 @@
   entries. Evidence that selected such a field is assessed again the next time
   its Unit is derived. Stored revisions and committed Evidence are unchanged.
   Cloud: arrives with the pin; no HANA change.
+- MCP `get_memory` returns what an agent reads and can act on. Each Evidence
+  group keeps its Source, currency, document locators and pinned
+  `resource_url`; each item keeps its role, kind, currency, `resource_url`,
+  readable `text` and Artifact summary, filename, media type, size and URL.
+  Storage identities, anchors, hashes and `text_view` stay in the REST
+  projection: no tool accepts them. Tool results are written with every script
+  as text instead of `\uXXXX` escapes. Plugin 0.1.65; the server is unchanged.
 - Entity admin routes follow Memory visibility. The entity list, detail, alias
   list and linked Memory count admit an Entity only through a linked active
   Memory the caller can see, so a name learned from another user's private
