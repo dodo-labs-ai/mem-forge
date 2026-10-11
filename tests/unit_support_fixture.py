@@ -14,6 +14,7 @@ from memforge.memory.evidence import (
     EvidenceRole,
     EvidenceUnit,
     MemoryUnitSupportAssertion,
+    evidence_context_association_id,
     evidence_part_set_digest,
     evidence_reference_id_for,
     memory_unit_support_assertion_id,
@@ -118,6 +119,37 @@ async def record_unit_support(
         )
     )
     return recorded
+
+
+async def record_unit_context(
+    db: Database,
+    *,
+    evidence_unit_id: str,
+    references: Sequence[EvidenceReference],
+) -> None:
+    """Attach Context references to a persisted Evidence Unit the way a committed Lifecycle Plan leaves them."""
+
+    for reference in references:
+        anchor = reference.anchor
+        reference_id = evidence_reference_id_for(evidence_unit_id, reference)
+        await db.db.execute(
+            """INSERT INTO evidence_references (
+                   id, evidence_unit_id, role, part_kind, anchor_kind, observation_id,
+                   observation_revision_id, fragment_id, range_start, range_end, excerpt,
+                   artifact_metadata_json, created_at
+               ) VALUES (?, NULL, 'context', NULL, ?, ?, ?, ?, ?, ?, ?, '{}', '2026-08-27T08:00:00+00:00')""",
+            (
+                reference_id, anchor.kind.value, anchor.observation_id, anchor.observation_revision_id,
+                anchor.fragment_id, anchor.range_start, anchor.range_end, reference.excerpt,
+            ),
+        )
+        await db.db.execute(
+            """INSERT INTO evidence_context_associations (
+                   id, evidence_unit_id, evidence_reference_id, active, created_at, updated_at, removed_at
+               ) VALUES (?, ?, ?, 1, '2026-08-27T08:00:00+00:00', '2026-08-27T08:00:00+00:00', NULL)""",
+            (evidence_context_association_id(evidence_unit_id, reference_id), evidence_unit_id, reference_id),
+        )
+    await db.db.commit()
 
 
 def primary_reference(anchor: SourceAnchor) -> EvidenceReference:
