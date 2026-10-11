@@ -29,9 +29,11 @@ def test_native_insertion_authorizes_only_added_content_and_matches_all_unique_r
     context = RevisionAssessmentContext(projection=target, base=base, access_context_hash='scope')
     eligible = [f for f in context.full_fragments if authority(base, target).authorizes(f)]
     assert [f.presentation_text for f in eligible] == ['New independently authored assertion.']
-    old = build_revision_fragment_index(base.observation_revisions[0]).fragments
+    # The page title is context of the body, so it corresponds as Required.
+    old = RevisionAssessmentContext(projection=base, base=None, access_context_hash='scope').full_fragments
     parts = tuple(ActiveSupportEvidence(memory_id='m', source_id=base.source_id, reference_id=str(i),
-        evidence_unit_id='eu', role=EvidenceRole.PRIMARY, anchor=f.anchor, excerpt=f.presentation_text,
+        evidence_unit_id='eu', role=EvidenceRole.PRIMARY if f.primary_eligible else EvidenceRole.REQUIRED,
+        anchor=f.anchor, excerpt=f.presentation_text,
         raw_content_sha256=f.raw_content_sha256, presentation_sha256=f.presentation_sha256,
         text_view=f.text_view) for i, f in enumerate(old))
     assert all(c.status is EvidenceCorrespondence.EXACT_UNCHANGED for c in correspond_evidence(context, parts))

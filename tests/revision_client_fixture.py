@@ -327,7 +327,7 @@ class RevisionClientFixture:
             (item for item in primary_capable if item["text"] == primary_old["excerpt"]),
             next(
                 (item for item in primary_capable if item["kind"] != "artifact" and item["type"] != "markdown-heading"),
-                primary_capable[0],
+                next(iter(primary_capable), None),
             ),
         )
         if hasattr(self, "select_support_evidence"):
@@ -384,8 +384,9 @@ class RevisionClientFixture:
         ]
         return FixtureSupport(
             status="supported" if supported else "unsupported",
-            primary_ref=primary["ref"],
-            required_refs=required,
+            # A revision with no Primary-capable entry can only be unsupported.
+            primary_ref=primary["ref"] if primary else None,
+            required_refs=required if primary else [],
         )
 
 

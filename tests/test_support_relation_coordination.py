@@ -491,8 +491,6 @@ async def test_a_partial_coverage_equivalent_rebinds_the_claim_after_one_recheck
     [recheck] = client.support_requests
     assert client.supplied_texts(recheck) == [
         f"Issue: PAY-12\nIssue ID: 10012\nDescription:\n{claim}",
-        "Issue: PAY-12\nIssue id: 10012",
-        "Issue ID: 10012\nIssue key: PAY-12",
     ]
     # The Support that had an UNKNOWN part is replaced by the returned description.
     assert await support_texts(db, memory.id) == {f"Issue: PAY-12\nIssue ID: 10012\nDescription:\n{claim}"}
