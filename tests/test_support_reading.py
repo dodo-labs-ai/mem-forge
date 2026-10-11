@@ -167,7 +167,8 @@ def test_unknown_part_takes_priority_over_modified():
     # The carried context Observation was not returned, even though its revision is unchanged.
     assert statuses(support) == [Status.MODIFIED, Status.UNKNOWN]
     assert support.route is SupportRoute.UNRESOLVED_PARTIAL_COVERAGE
-    assert support.unknown_observation_ids == ("obs-context",)
+    assert support.unreturned_observation_ids == ("obs-context",)
+    assert support.unreadable_observation_ids == ()
 
 
 def test_without_historical_authority_support_is_assessed_not_exactly_rebound():

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- A Support that cites the stored Unit Title is judged again
+  (`revision-support-v12`). Evidence on a stored revision in a representation
+  no adapter projects kept its whole Support unresolved, so a Memory that
+  cited the Unit Title as Required Evidence was never revalidated after its
+  Unit moved to a title-free revision. Such a part now leaves its Support,
+  which is rebound by its other parts or assessed like any other; the Unit
+  Title is still shown by every model reading and Memory read. Only profiles
+  named in `source_representation.py` are left out, today `unit-identity`
+  alone. Evidence in any other representation this build does not read still
+  keeps its Support unresolved, and the recorded reason now says so instead
+  of reporting partial projection coverage. Cloud: arrives with the pin; no
+  HANA change.
 - Context Evidence is the Observation a claim's Primary answers, shown as a
   reader sees it. A claim carries Context only when its provider declares the
   reply; an Observation that merely precedes the Primary is read during

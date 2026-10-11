@@ -44,6 +44,16 @@ PLAIN_TEXT_PROFILE = EvidenceRepresentationProfile(
     version=1,
     coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
 )
+# A Unit Title stored as the Unit's first Observation. No adapter projects it:
+# the projection carries the Unit Title, and every reading shows it.
+UNIT_TITLE_OBSERVATION_PROFILE = EvidenceRepresentationProfile(
+    name="unit-identity",
+    version=1,
+    coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
+)
+# Profiles outside the current representation whose content every reading still
+# shows. ``shown_as_reading_context`` says why a profile has to be named here.
+_PROFILES_SHOWN_AS_READING_CONTEXT = frozenset({UNIT_TITLE_OBSERVATION_PROFILE})
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +158,33 @@ def in_current_representation(revision: SourceObservationRevision) -> bool:
 
     profile = revision.evidence_profile
     return profile is None or profile in _SUPPORTED_REPRESENTATION_CONTRACTS
+
+
+def shown_as_reading_context(revision: SourceObservationRevision) -> bool:
+    """Whether a stored revision outside the current representation holds content every reading still shows.
+
+    A profile is outside the current representation for one of three reasons,
+    and the profile alone does not say which:
+
+    - its content is shown to every reader another way, as the Unit Title is by
+      the projection that carries it;
+    - its content is no longer collected, so nothing shows it;
+    - this build does not know a profile that another build wrote, as after a
+      rollback, or lost a profile it should support.
+
+    Evidence on the first kind can leave its Support: the claim keeps what it
+    rests on and loses a citation of text its readers still see. Evidence on the
+    other two cannot. The claim would lose its ground, or sound Evidence would be
+    discarded, and nothing would report either. Such a Support is kept unresolved
+    instead, which a corrected build undoes; a citation left out stays out.
+
+    The program cannot tell the first kind from the others, so a profile counts
+    only when it is named in ``_PROFILES_SHOWN_AS_READING_CONTEXT``. Name one
+    there after establishing that every model reading and every Memory read
+    still shows its content.
+    """
+
+    return revision.evidence_profile in _PROFILES_SHOWN_AS_READING_CONTEXT
 
 
 def current_representation_of(projection: SourceProjection) -> SourceProjection:
