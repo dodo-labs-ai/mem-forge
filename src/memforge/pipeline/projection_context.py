@@ -369,6 +369,22 @@ def observation_is_inference_eligible(
     return source_artifact_inference_eligibility(metadata) is True
 
 
+def replied_to_observation_id(
+    projection: SourceProjection,
+    observation_id: str,
+) -> str | None:
+    """The Observation this one answers, when its provider declares the reply."""
+
+    return next(
+        (
+            relation.to_id
+            for relation in projection.relations
+            if relation.relation_type is SourceRelationType.REPLIES_TO and relation.from_id == observation_id
+        ),
+        None,
+    )
+
+
 def preceding_observation_id(
     projection: SourceProjection,
     observation_id: str,
@@ -380,11 +396,11 @@ def preceding_observation_id(
     never inferred from order or similarity.
     """
 
-    for relation_type, own_end in (
-        (SourceRelationType.REPLIES_TO, "from_id"),
-        (SourceRelationType.PRECEDES, "to_id"),
-    ):
-        for relation in projection.relations:
-            if relation.relation_type is relation_type and getattr(relation, own_end) == observation_id:
-                return relation.to_id if own_end == "from_id" else relation.from_id
-    return None
+    return replied_to_observation_id(projection, observation_id) or next(
+        (
+            relation.from_id
+            for relation in projection.relations
+            if relation.relation_type is SourceRelationType.PRECEDES and relation.to_id == observation_id
+        ),
+        None,
+    )
