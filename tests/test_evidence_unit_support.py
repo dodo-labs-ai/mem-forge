@@ -51,7 +51,7 @@ from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.source_access import source_is_discoverable
 from memforge.storage.database import Database
 from tests.llm_fixture import NoopMemoryExtractor, fixture_request_planner
-from tests.unit_support_fixture import active_support_evidence, record_unit_support
+from tests.unit_support_fixture import active_support_evidence, record_unit_context, record_unit_support
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
@@ -931,11 +931,11 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
 
 
 @pytest.mark.asyncio
-async def test_context_replacement_does_not_change_unit_support_identity_or_hash(db) -> None:
+async def test_context_does_not_change_unit_support_identity_or_hash(db) -> None:
     memory_id, unit_id, source_id, _access_hash = await _seed_complete_unit_support(db)
     before = (await db.get_active_memory_support_states((memory_id,)))[memory_id]
     now = datetime(2026, 8, 27, 10, 0, tzinfo=timezone.utc).isoformat()
-    for suffix in ("one", "two"):
+    for suffix in ("two",):
         observation_id = f"obs-context-{suffix}"
         revision_id = f"obsrev-context-{suffix}"
         text = f"Helpful context {suffix}."
@@ -963,9 +963,10 @@ async def test_context_replacement_does_not_change_unit_support_identity_or_hash
             ),
         )
         await db.db.commit()
-        await db.replace_evidence_context_associations(
-            unit_id,
-            (
+        await record_unit_context(
+            db,
+            evidence_unit_id=unit_id,
+            references=(
                 EvidenceReference(
                     role=EvidenceRole.CONTEXT,
                     anchor=SourceAnchor(
@@ -976,14 +977,6 @@ async def test_context_replacement_does_not_change_unit_support_identity_or_hash
                 ),
             ),
         )
-    associations = await db.db.execute_fetchall(
-        """SELECT active, removed_at FROM evidence_context_associations
-           WHERE evidence_unit_id = ? ORDER BY created_at, id""",
-        (unit_id,),
-    )
-    assert len(associations) == 2
-    assert sorted(int(row["active"]) for row in associations) == [0, 1]
-    assert next(row for row in associations if not row["active"])["removed_at"]
     after = (await db.get_active_memory_support_states((memory_id,)))[memory_id]
     assert after.unit_ids == before.unit_ids == (unit_id,)
     assert after.support_set_hash == before.support_set_hash

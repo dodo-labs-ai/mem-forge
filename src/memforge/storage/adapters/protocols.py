@@ -520,11 +520,6 @@ class RelationalStore(Protocol):
         *,
         source_activity: SourceActivityLease | None = None,
     ) -> tuple[EvidenceReference, ...]: ...
-    async def replace_evidence_context_associations(
-        self,
-        evidence_unit_id: str,
-        references: Sequence[EvidenceReference],
-    ) -> tuple[EvidenceReference, ...]: ...
     async def get_evidence_unit(self, evidence_unit_id: str) -> EvidenceUnit | None: ...
     async def upsert_memory_unit_support_assertion(
         self,

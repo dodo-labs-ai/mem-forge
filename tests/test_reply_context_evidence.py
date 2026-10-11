@@ -18,6 +18,7 @@ from memforge.storage.database import Database
 from tests.test_confluence_native_evidence import projection as confluence_projection
 from tests.test_evidence_unit_support import _seed_complete_unit_support
 from tests.test_reading_order_and_record_framing import CONVERSATION, _messages, _reading, _window
+from tests.unit_support_fixture import record_unit_context
 
 REPLY, REPLIED_TO, FOLLOWER, FOLLOWED = "msg-2", "msg-1", "msg-3", "msg-2"
 
@@ -133,7 +134,7 @@ async def test_stored_context_without_a_presentation_reads_as_its_record_present
             ),
         )
         await db.db.commit()
-        await db.replace_evidence_context_associations(evidence_unit_id, (
+        await record_unit_context(db, evidence_unit_id=evidence_unit_id, references=(
             EvidenceReference(role=EvidenceRole.CONTEXT, anchor=SourceAnchor(
                 kind=AnchorKind.WHOLE_OBSERVATION, observation_id="obs-message",
                 observation_revision_id="obsrev-message",
@@ -195,7 +196,7 @@ async def test_the_migration_keeps_stored_context_only_for_a_declared_reply(tmp_
                 (index, relation_type, from_id, to_id),
             )
         await db.db.commit()
-        await db.replace_evidence_context_associations(evidence_unit_id, tuple(
+        await record_unit_context(db, evidence_unit_id=evidence_unit_id, references=tuple(
             EvidenceReference(role=EvidenceRole.CONTEXT, anchor=SourceAnchor(
                 kind=AnchorKind.WHOLE_OBSERVATION, observation_id=observation_id,
                 observation_revision_id=f"rev-{observation_id}",
