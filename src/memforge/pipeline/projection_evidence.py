@@ -17,8 +17,9 @@ from memforge.memory.evidence import (
     evidence_unit_id_v2,
 )
 from memforge.models import RawMemory, content_hash
+from memforge.pipeline.evidence_fragments import observation_presentation
 from memforge.pipeline.projection_context import (
-    preceding_observation_id,
+    replied_to_observation_id,
 )
 from memforge.source_projection import (
     AnchorKind,
@@ -191,10 +192,12 @@ def _materialize_claim_evidence(
         for reference in supporting_tuple
         if reference.role is EvidenceRole.REQUIRED
     }
-    preceding_id = preceding_observation_id(projection, primary.anchor.observation_id)
+    # Context is the Observation the Primary answers. One that merely precedes it
+    # was read during selection and is Evidence only when selected as Required.
+    replied_to_id = replied_to_observation_id(projection, primary.anchor.observation_id)
     context_ids = (
-        (preceding_id,)
-        if preceding_id in revisions and preceding_id not in required_observation_ids
+        (replied_to_id,)
+        if replied_to_id in revisions and replied_to_id not in required_observation_ids
         else ()
     )
     contexts = tuple(
@@ -206,6 +209,7 @@ def _materialize_claim_evidence(
                 observation_revision_id=revisions[observation_id].id,
             ),
             evidence_unit_id=unit_id,
+            excerpt=observation_presentation(revisions[observation_id]),
         )
         for observation_id in context_ids
     )

@@ -4541,6 +4541,14 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
     (110, "Persist focused Evidence presentation separately from source excerpts", [
         "ALTER TABLE evidence_references ADD COLUMN display_text TEXT",
     ]),
+    (
+        111,
+        "Keep Context only for the Observation a Primary answers",
+        # Context is the Observation a claim's Primary answers by a declared
+        # reply. An association to an Observation that only preceded the Primary
+        # is deactivated (see _deactivate_context_without_declared_reply_unlocked).
+        [],
+    ),
 
 ]
 
@@ -4853,6 +4861,9 @@ class Database:
             if version == 103:
                 superseded = await self._supersede_stored_input_reprocess_derivations_unlocked()
                 logger.info("Superseded %d unapplied reprocess derivations staged from stored input", superseded)
+            if version == 111:
+                deactivated = await self._deactivate_context_without_declared_reply_unlocked()
+                logger.info("Deactivated %d Context associations without a declared reply", deactivated)
             if version == 104:
                 recorded = await self._move_stored_input_to_source_units_unlocked()
                 logger.info("Recorded the stored input of %d current Source Unit revisions", recorded)
@@ -4908,6 +4919,34 @@ class Database:
                 WHERE status IN ('pending', 'retryable_failure', 'completed')
                   AND json_extract(context_payload_json, '$.support_without_baseline') = 1""",
             (DERIVATION_INPUT_SUPERSEDED, _now_iso()),
+        )
+        return cursor.rowcount
+
+    async def _deactivate_context_without_declared_reply_unlocked(self) -> int:
+        """Deactivate Context whose Observation the Evidence Unit's Primary does not answer.
+
+        The association is the mutable current Context projection; its Evidence
+        Reference and the supporting Evidence Unit stay as they are.
+        """
+
+        now = _now_iso()
+        cursor = await self.db.execute(
+            """UPDATE evidence_context_associations
+                  SET active = 0, removed_at = ?, updated_at = ?
+                WHERE active = 1
+                  AND NOT EXISTS (
+                      SELECT 1
+                        FROM evidence_references context_reference
+                        JOIN evidence_references primary_reference
+                          ON primary_reference.evidence_unit_id = evidence_context_associations.evidence_unit_id
+                         AND primary_reference.role = 'primary'
+                        JOIN source_projection_relations reply
+                          ON reply.relation_type = 'replies_to'
+                         AND reply.from_id = primary_reference.observation_id
+                         AND reply.to_id = context_reference.observation_id
+                       WHERE context_reference.id = evidence_context_associations.evidence_reference_id
+                  )""",
+            (now, now),
         )
         return cursor.rowcount
 
@@ -7930,24 +7969,28 @@ class Database:
         raw_digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         if row["raw_content_sha256"] not in {None, raw_digest}:
             raise ValueError("text Evidence raw digest mismatch")
-        excerpt = (
-            str(row["excerpt"])
-            if row["excerpt"] is not None
-            else (
-                str(row["unit_excerpt"])
-                if role is EvidenceRole.PRIMARY
-                and row["unit_excerpt"] is not None
-                else raw
-            )
-        )
+        from memforge.source_representation import representation_contract_for_profile
+        pinned_profile = _evidence_profile_from_storage_row(row)
+        if row["excerpt"] is not None:
+            excerpt = str(row["excerpt"])
+        elif role is EvidenceRole.PRIMARY and row["unit_excerpt"] is not None:
+            excerpt = str(row["unit_excerpt"])
+        elif anchor.kind is AnchorKind.WHOLE_OBSERVATION:
+            # A whole Observation stored without a presentation reads as its profile presents it.
+            from memforge.pipeline.evidence_fragments import observation_presentation
+
+            excerpt = observation_presentation(SourceObservationRevision(
+                id=anchor.observation_revision_id, observation_id=anchor.observation_id,
+                semantic_hash="pinned-delivery", content=content,
+                evidence_profile=pinned_profile)) or raw
+        else:
+            excerpt = raw
         presentation_digest = hashlib.sha256(excerpt.encode("utf-8")).hexdigest()
         if row["presentation_sha256"] not in {None, presentation_digest}:
             raise ValueError("text Evidence presentation digest mismatch")
         text_view = TextEvidenceView.from_payload(json.loads(row["text_view_json"]) if row["text_view_json"] else None)
         if text_view is not None:
             text_view.verify_origins(anchor, content)
-        from memforge.source_representation import representation_contract_for_profile
-        pinned_profile = _evidence_profile_from_storage_row(row)
         interpretation_available = text_view is None or (
             text_view.version == 1 and representation_contract_for_profile(pinned_profile) is not None)
         if text_view is not None and interpretation_available:
@@ -8814,135 +8857,6 @@ class Database:
                 await self.db.rollback()
                 raise
         return persisted
-
-    async def replace_evidence_context_associations(
-        self,
-        evidence_unit_id: str,
-        references: Sequence[EvidenceReference],
-    ) -> tuple[EvidenceReference, ...]:
-        """Replace only the mutable current Context projection for one Unit."""
-
-        if any(reference.role is not EvidenceRole.CONTEXT for reference in references):
-            raise ValueError("Context replacement accepts only Context references")
-        persisted = tuple(
-            EvidenceReference(
-                id=reference.id
-                or evidence_reference_id_for(evidence_unit_id, reference),
-                evidence_unit_id=None,
-                role=EvidenceRole.CONTEXT,
-                anchor=reference.anchor,
-                kind=reference.kind,
-                raw_content_sha256=reference.raw_content_sha256,
-                presentation_sha256=reference.presentation_sha256,
-                excerpt=reference.excerpt,
-                artifact_metadata=dict(reference.artifact_metadata),
-                text_view=reference.text_view,
-                display_text=reference.display_text,
-            )
-            for reference in references
-        )
-        async with self._write_lock:
-            try:
-                async with self.db.execute(
-                    "SELECT source_id, source_lineage_id FROM evidence_units WHERE id = ?",
-                    (evidence_unit_id,),
-                ) as cursor:
-                    unit = await cursor.fetchone()
-                if unit is None:
-                    raise ValueError("Context association requires an Evidence Unit")
-                now = _now_iso()
-                for reference in persisted:
-                    anchor = reference.anchor
-                    async with self.db.execute(
-                        """SELECT so.source_id, so.source_unit_id,
-                                  so.current_revision_id
-                             FROM source_observations so
-                             JOIN source_observation_revisions sor
-                               ON sor.observation_id = so.id
-                            WHERE so.id = ? AND sor.id = ?""",
-                        (anchor.observation_id, anchor.observation_revision_id),
-                    ) as cursor:
-                        observation = await cursor.fetchone()
-                    if (
-                        observation is None
-                        or observation["source_id"] != unit["source_id"]
-                        or observation["source_unit_id"] != unit["source_lineage_id"]
-                        or observation["current_revision_id"]
-                        != anchor.observation_revision_id
-                    ):
-                        raise ValueError("Context reference is stale or outside the Evidence Unit")
-                    await self.db.execute(
-                        """INSERT OR IGNORE INTO evidence_references (
-                               id, evidence_unit_id, role, part_kind, anchor_kind,
-                               observation_id, observation_revision_id, fragment_id,
-                               range_start, range_end, raw_content_sha256,
-                               presentation_sha256, excerpt, artifact_metadata_json,
-                               created_at, text_view_json, display_text
-                           ) VALUES (?, NULL, 'context', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            reference.id,
-                            reference.kind.value if reference.kind is not None else None,
-                            anchor.kind.value,
-                            anchor.observation_id,
-                            anchor.observation_revision_id,
-                            anchor.fragment_id,
-                            anchor.range_start,
-                            anchor.range_end,
-                            reference.raw_content_sha256,
-                            reference.presentation_sha256,
-                            reference.excerpt,
-                            json.dumps(
-                                dict(reference.artifact_metadata),
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            ),
-                            now,
-                            json.dumps(reference.text_view.payload(), sort_keys=True, separators=(",", ":")) if reference.text_view else None,
-                            reference.display_text,
-                        ),
-                    )
-                    await self.db.execute(
-                        """INSERT INTO evidence_context_associations (
-                               id, evidence_unit_id, evidence_reference_id,
-                               active, created_at, updated_at, removed_at
-                           ) VALUES (?, ?, ?, 1, ?, ?, NULL)
-                           ON CONFLICT(evidence_unit_id, evidence_reference_id)
-                           DO UPDATE SET active = 1,
-                                         updated_at = excluded.updated_at,
-                                         removed_at = NULL""",
-                        (
-                            evidence_context_association_id(
-                                evidence_unit_id,
-                                str(reference.id),
-                            ),
-                            evidence_unit_id,
-                            reference.id,
-                            now,
-                            now,
-                        ),
-                    )
-                desired_ids = tuple(str(reference.id) for reference in persisted)
-                if desired_ids:
-                    placeholders = ",".join("?" for _ in desired_ids)
-                    await self.db.execute(
-                        f"""UPDATE evidence_context_associations
-                               SET active = 0, updated_at = ?, removed_at = ?
-                             WHERE evidence_unit_id = ? AND active = 1
-                               AND evidence_reference_id NOT IN ({placeholders})""",
-                        (now, now, evidence_unit_id, *desired_ids),
-                    )
-                else:
-                    await self.db.execute(
-                        """UPDATE evidence_context_associations
-                              SET active = 0, updated_at = ?, removed_at = ?
-                            WHERE evidence_unit_id = ? AND active = 1""",
-                        (now, now, evidence_unit_id),
-                    )
-                await self.db.commit()
-                return persisted
-            except Exception:
-                await self.db.rollback()
-                raise
 
     async def get_memory_support_set_hash(self, memory_id: str) -> str:
         return await self._memory_unit_support_set_hash_unlocked(memory_id)
