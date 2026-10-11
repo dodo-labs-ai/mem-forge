@@ -139,11 +139,21 @@ class SupportPlan:
         )
 
     @property
-    def unknown_observation_ids(self) -> tuple[str, ...]:
+    def unreturned_observation_ids(self) -> tuple[str, ...]:
+        """Observations of UNKNOWN parts that partial coverage did not return."""
+        return self._unknown_observation_ids(readable=True)
+
+    @property
+    def unreadable_observation_ids(self) -> tuple[str, ...]:
+        """Observations of UNKNOWN parts stored in a representation this build does not read."""
+        return self._unknown_observation_ids(readable=False)
+
+    def _unknown_observation_ids(self, *, readable: bool) -> tuple[str, ...]:
         return tuple(dict.fromkeys(
             correspondence.evidence.anchor.observation_id
             for correspondence in self.parts
             if correspondence.status is EvidenceCorrespondence.UNKNOWN
+            and _readable_as_stored(correspondence.evidence, self.item.context) is readable
         ))
 
 
@@ -245,12 +255,17 @@ def plan_support_revision(
     for fragment in catalog.fragments:
         by_observation.setdefault(fragment.anchor.observation_id, {})[fragment.anchor] = fragment
     returned = frozenset(observation.id for observation in context.projection.observations)
-    # Unavailable retained interpretation remains UNKNOWN for the whole Support;
-    # it is never dropped to make the remaining parts exactly reusable.
+    # Evidence on a retired revision whose content every reading still shows is
+    # left out: the Support is judged by its other parts, and binding it again
+    # leaves that part out. Evidence stored in any other representation this
+    # build does not read stays a part and is UNKNOWN, so its Support is kept as
+    # it is rather than made exactly reusable by losing the part
+    # (``shown_as_reading_context`` gives the reason for the difference).
     correspondences = [
         tuple(
             _correspond(part, context, returned, by_observation)
             for part in item.support
+            if part.anchor.observation_revision_id not in context.reading_context_revisions
         )
         for item in items
     ]
@@ -276,9 +291,7 @@ def _correspond(
     old_revision = context.revisions.get(part.anchor.observation_revision_id)
     if old_revision is not None:
         _verify_pinned_integrity(part, old_revision)
-    if (part.anchor.observation_revision_id in context.retired
-            or old_revision is not None and old_revision.evidence_profile is None
-            or part.text_view is not None and part.text_view.version != 1):
+    if not _readable_as_stored(part, context):
         return PartCorrespondence(part, EvidenceCorrespondence.UNKNOWN)
     old_selection = ()
     old_material = {}
@@ -349,6 +362,21 @@ def _correspond(
         if _overlaps(part.anchor, fragment.anchor)
     )
     return PartCorrespondence(part, EvidenceCorrespondence.MODIFIED, overlapping)
+
+
+def _readable_as_stored(part: ActiveSupportEvidence, context: RevisionAssessmentContext) -> bool:
+    """Whether this build reads an Evidence part in the representation it was stored in.
+
+    It does not when the part's revision is outside the current representation,
+    was stored without a profile, or holds a text view of another version. The
+    program then has no text to compare with the current revision.
+    """
+    revision = context.revisions.get(part.anchor.observation_revision_id)
+    return not (
+        part.anchor.observation_revision_id in context.retired
+        or revision is not None and revision.evidence_profile is None
+        or part.text_view is not None and part.text_view.version != 1
+    )
 
 
 def _verify_pinned_integrity(part: ActiveSupportEvidence, revision) -> None:

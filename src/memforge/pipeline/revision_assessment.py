@@ -38,11 +38,15 @@ from memforge.pipeline.projection_fragments import (
     _compose_projection_fragment_catalog,
 )
 from memforge.source_projection import SourceAnchor, SourceObservationRevision, SourceProjection
-from memforge.source_representation import in_current_representation, representation_contract_for_profile
+from memforge.source_representation import (
+    in_current_representation,
+    representation_contract_for_profile,
+    shown_as_reading_context,
+)
 
 # Versions how a fixed Support is revalidated against a revision: it enters the
 # reconciliation manifest and each revalidated Support's ``support_validation``.
-REVISION_SUPPORT_CONTRACT = "revision-support-v11"
+REVISION_SUPPORT_CONTRACT = "revision-support-v12"
 # Versions how revision Fragments are compiled into catalogs and ordered, what
 # every reading adds as context, and Claim Extraction's reading scope. Every catalog
 # this context composes, for extraction or for Support, carries it in its identity.
@@ -76,9 +80,11 @@ class SupportAssessment:
     supported: bool | None
     reason: str
     memory: RawMemory | None
-    # Why a kept claim could not be judged: an UNKNOWN Evidence part under partial
-    # coverage, one ReadingGroup that alone exceeds the model's capacity, or the
-    # model's output for the claim alone that stays invalid after its correction.
+    # Why a kept claim could not be judged: an UNKNOWN Evidence part (its Observation
+    # was not returned under partial coverage, or it is stored in a representation
+    # this build does not read), one ReadingGroup that alone exceeds the model's
+    # capacity, or the model's output for the claim alone that stays invalid after
+    # its correction.
     unresolved: Literal["partial_coverage", "capacity", "invalid_response"] | None = None
     # The Support was bound to its exactly unchanged current Evidence without a read:
     # the program rebind, or Change Impact judged it UNAFFECTED.
@@ -132,8 +138,11 @@ class RevisionAssessmentContext:
         The target is a revision in the current representation: a new projection, or
         a stored one read through ``current_representation_of``. The baseline is
         compared in the current representation only: a baseline revision outside it
-        is no previous content. Every revision known here outside it is ``retired``,
-        so Evidence on it remains unavailable for correspondence.
+        is no previous content. Every revision known here outside it is ``retired``:
+        Evidence on it has no current text to correspond to. Where every reading
+        still shows the retired revision's content (``reading_context_revisions``),
+        that Evidence leaves its Support; on any other retired revision it keeps
+        the Support unresolved.
         """
         self.projection = projection
         self.base = base
@@ -157,6 +166,9 @@ class RevisionAssessmentContext:
             for revision in (*evidence_revisions, *baseline, *projection.observation_revisions)
         }
         self.retired = frozenset(r.id for r in (*baseline, *evidence_revisions) if not in_current_representation(r))
+        self.reading_context_revisions = frozenset(
+            r.id for r in (*baseline, *evidence_revisions) if shown_as_reading_context(r)
+        )
         observations = {o.id: o for o in (*known_observations, *(base.observations if base else ()))}
         observations.update({o.id: o for o in projection.observations})
         if set(self.current) - set(observations):
