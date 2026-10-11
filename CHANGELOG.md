@@ -8,8 +8,7 @@
   readable `text` and Artifact summary, filename, media type, size and URL.
   Storage identities, anchors, hashes and `text_view` stay in the REST
   projection: no tool accepts them. Tool results are written with every script
-  as text instead of `\uXXXX` escapes. Takes effect with the next plugin
-  release; the server is unchanged.
+  as text instead of `\uXXXX` escapes. Plugin 0.1.65; the server is unchanged.
 - Entity admin routes follow Memory visibility. The entity list, detail, alias
   list and linked Memory count admit an Entity only through a linked active
   Memory the caller can see, so a name learned from another user's private
