@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Mapping
 
@@ -37,6 +38,7 @@ from memforge.pipeline.projection_context import ExtractionAuthority
 from memforge.pipeline.projection_images import (
     projection_inference_capability_hash,
 )
+from memforge.source_time import parse_source_time
 from memforge.source_projection import (
     AnchorKind,
     EvidenceCoordinateSpace,
@@ -400,7 +402,15 @@ def _compose_projection_fragment_catalog(
 ) -> ProjectionFragmentCatalog:
     """Compose revision-local compiler outputs behind one catalog interface."""
 
-    ordered = tuple(sorted(compiled_fragments, key=_fragment_sort_key))
+    source_times = {revision.id: _source_time(revision) for revision in projection.observation_revisions}
+    ordered = tuple(
+        sorted(
+            compiled_fragments,
+            key=lambda fragment: _fragment_sort_key(
+                fragment, source_times.get(fragment.anchor.observation_revision_id)
+            ),
+        )
+    )
     presentation_chars = sum(
         len(fragment.presentation_text) for fragment in ordered
     )
@@ -670,9 +680,25 @@ def _merged_spans(spans: tuple[tuple[int, int], ...]) -> tuple[tuple[int, int], 
     return tuple(merged)
 
 
-def _fragment_sort_key(fragment: EvidenceFragment) -> tuple[object, ...]:
+def _source_time(revision: SourceObservationRevision) -> datetime | None:
+    """The revision's source time on the timeline; ``None`` when its source gave no usable one."""
+    try:
+        return parse_source_time(revision.observed_at)
+    except ValueError:
+        return None
+
+
+def _fragment_sort_key(fragment: EvidenceFragment, source_time: datetime | None) -> tuple[object, ...]:
+    """Reading order: Observations by source time, then each one's Fragments by position.
+
+    A conversation therefore reads in the order it was written. An Observation
+    whose source reports no time is no event on that timeline, such as a Unit's
+    identity or an undated body, and is read before it.
+    """
     anchor = fragment.anchor
     return (
+        source_time is not None,
+        source_time or datetime.min.replace(tzinfo=timezone.utc),
         anchor.observation_revision_id,
         -1 if anchor.range_start is None else anchor.range_start,
         -1 if anchor.range_end is None else anchor.range_end,

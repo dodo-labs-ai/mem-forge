@@ -43,10 +43,10 @@ from memforge.source_representation import in_current_representation, representa
 # Versions how a fixed Support is revalidated against a revision: it enters the
 # reconciliation manifest and each revalidated Support's ``support_validation``.
 REVISION_SUPPORT_CONTRACT = "revision-support-v11"
-# Versions how revision Fragments are compiled into catalogs, what every
-# reading adds as context, and Claim Extraction's reading scope. Every catalog
+# Versions how revision Fragments are compiled into catalogs and ordered, what
+# every reading adds as context, and Claim Extraction's reading scope. Every catalog
 # this context composes, for extraction or for Support, carries it in its identity.
-REVISION_INPUT_POLICY = "revision-input-v10"
+REVISION_INPUT_POLICY = "revision-input-v11"
 
 
 def reading_group_label(fragments) -> str:
@@ -179,7 +179,6 @@ class RevisionAssessmentContext:
             and observation_is_inference_eligible(observations[key].observation_type, r.metadata)
         }
         self.previous = {r.observation_id: r for r in baseline if r.id not in self.retired}
-        self.full_fragments = tuple(f for revision in self.current.values() for f in self.index(revision).fragments)
         self._delta = None
         self.structural_context = {}
         self.canonical_fields = {
@@ -194,6 +193,8 @@ class RevisionAssessmentContext:
                 interpretation = contract.canonical_schema.model_interpretation
                 if interpretation:
                     self.format_interpretations[revision.id] = interpretation
+        self._entries = {revision.id: self._catalog_entries(revision) for revision in self.current.values()}
+        self.full_fragments = tuple(f for entries, _framing in self._entries.values() for f in entries)
         # Both sides, so removed old text keeps its heading path too.
         for revision in {r.id: r for r in (*self.previous.values(), *self.current.values())}.values():
             if revision.evidence_profile and revision.evidence_profile.name == "markdown-structural":
@@ -202,6 +203,38 @@ class RevisionAssessmentContext:
                 self.structural_context[revision.id] = tuple(
                     (unit.start, unit.end, identity[1]) for unit, identity in zip(units, identities, strict=True)
                 )
+
+    def _catalog_entries(self, revision) -> tuple[tuple[EvidenceFragment, ...], frozenset[SourceAnchor]]:
+        """The Fragments every catalog lists for one current revision, and the anchors of its record framing.
+
+        A contextual record field is context of its record's other fields: it is
+        never Primary and never read as an entry of its own. The record framing
+        already shows its framing fields on every entry, so those are not listed
+        again; a change to one of them is a change to every entry that shows it.
+        """
+        fragments = self.index(revision).fragments
+        contextual = tuple(
+            field for field in self.canonical_fields.get(revision.id, ()) if field.descriptor.contextual
+        )
+        if not contextual:
+            return fragments, frozenset()
+        schema = representation_contract_for_profile(revision.evidence_profile).canonical_schema
+        framing_pointers = {pointer for pointer, _label in schema.framing_fields}
+        entries, framing = [], set()
+        for fragment in fragments:
+            start, end = fragment.anchor.range_start, fragment.anchor.range_end
+            owner = next(
+                (field for field in contextual
+                 if start is not None and end is not None and field.start <= start and end <= field.end),
+                None,
+            )
+            if owner is None:
+                entries.append(fragment)
+            elif owner.descriptor.json_pointer in framing_pointers:
+                framing.add(fragment.anchor)
+            else:
+                entries.append(replace(fragment, primary_eligible=False))
+        return tuple(entries), frozenset(framing)
 
     def canonical_context(self, fragment):
         """Keep field and event identity on both sides of a canonical delta."""
@@ -385,7 +418,10 @@ class RevisionAssessmentContext:
         )
 
     def delta_fragments(self) -> tuple[tuple[EvidenceFragment, ...], tuple[EvidenceFragment, ...]]:
-        """The added or modified current Fragments, and the baseline Fragments this revision removed."""
+        """The added or modified current Fragments, and the baseline Fragments this revision removed.
+
+        Changed record framing changes every entry of that record.
+        """
         if self._delta is not None:
             return self._delta
         if self.base is None:
@@ -397,7 +433,9 @@ class RevisionAssessmentContext:
         for key, current in self.current.items():
             old = self.previous.get(key)
             ranges = _changed_ranges(old, current) if old else None
-            changed.extend(f for f in self.index(current).fragments if _in_ranges(f, ranges))
+            touched = {f.anchor for f in self.index(current).fragments if _in_ranges(f, ranges)}
+            entries, framing = self._entries[current.id]
+            changed.extend(entries if touched & framing else (f for f in entries if f.anchor in touched))
         for key, old in self.previous.items():
             current = self.current.get(key)
             if key in self.members and current is None and key not in self.tombstoned:
