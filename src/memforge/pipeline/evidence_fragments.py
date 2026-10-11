@@ -721,6 +721,45 @@ def _compile_canonical_record_profile(
     )
 
 
+def observation_presentation(revision: SourceObservationRevision) -> str | None:
+    """One whole Observation as a reader sees it, or ``None`` when its profile has no readable text.
+
+    A canonical record reads as its record framing once, then its entries in
+    source order; its contextual fields are framing, not entries. Markdown and
+    plain text read as written.
+    """
+
+    profile = revision.evidence_profile
+    if profile is None or profile.name not in {"canonical-record", "markdown-structural", "plain-text"}:
+        return None
+    if profile.name != "canonical-record":
+        return revision.content
+    contract = representation_contract_for_profile(profile)
+    if contract is None or contract.canonical_schema is None:
+        return None
+    index = build_revision_fragment_index(revision)
+    if any(error.fatal for error in index.errors):
+        return None
+    document = _JsonDocument.parse(revision.content)
+    framing = [
+        f"{label}: {_canonical_value_presentation(node.value)}"
+        for pointer, label in contract.canonical_schema.framing_fields
+        if (node := document.nodes.get(pointer)) is not None and node.value not in (None, "")
+    ]
+    prefix = "".join(f"{line}\n" for line in framing)
+    contextual = tuple(field for field in canonical_record_field_ranges(revision) if field.descriptor.contextual)
+    entries = [
+        fragment.presentation_text.removeprefix(prefix)
+        for fragment in index.fragments
+        if fragment.kind is EvidenceFragmentKind.TEXT
+        and not any(
+            field.start <= (fragment.anchor.range_start or 0) and (fragment.anchor.range_end or 0) <= field.end
+            for field in contextual
+        )
+    ]
+    return "\n".join((*framing, *entries)) or None
+
+
 def _canonical_selection_value(field: CanonicalRecordField, value: object) -> str:
     """Bind comparison material to its declared record field and format."""
     format_identity = (

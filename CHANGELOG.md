@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Context Evidence is the Observation a claim's Primary answers, shown as a
+  reader sees it. A claim carries Context only when its provider declares the
+  reply; an Observation that merely precedes the Primary is read during
+  selection and is Evidence only when selected as Required. A whole
+  Observation reads as its record framing once and then its entries instead
+  of its stored JSON record, for new Context and for Context already stored
+  without a presentation. Context attached under the earlier rule stays until
+  its Evidence Unit is derived again. Cloud: the HANA evidence read presents a
+  whole Observation the same way, together with the pin to this version.
 - Model catalogs read in source-time order and list record framing only as
   context (`revision-input-v11`). Observations are ordered by the time their
   source reports, then each one's Fragments by position, so a Teams window or

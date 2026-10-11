@@ -7930,24 +7930,28 @@ class Database:
         raw_digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         if row["raw_content_sha256"] not in {None, raw_digest}:
             raise ValueError("text Evidence raw digest mismatch")
-        excerpt = (
-            str(row["excerpt"])
-            if row["excerpt"] is not None
-            else (
-                str(row["unit_excerpt"])
-                if role is EvidenceRole.PRIMARY
-                and row["unit_excerpt"] is not None
-                else raw
-            )
-        )
+        from memforge.source_representation import representation_contract_for_profile
+        pinned_profile = _evidence_profile_from_storage_row(row)
+        if row["excerpt"] is not None:
+            excerpt = str(row["excerpt"])
+        elif role is EvidenceRole.PRIMARY and row["unit_excerpt"] is not None:
+            excerpt = str(row["unit_excerpt"])
+        elif anchor.kind is AnchorKind.WHOLE_OBSERVATION:
+            # A whole Observation stored without a presentation reads as its profile presents it.
+            from memforge.pipeline.evidence_fragments import observation_presentation
+
+            excerpt = observation_presentation(SourceObservationRevision(
+                id=anchor.observation_revision_id, observation_id=anchor.observation_id,
+                semantic_hash="pinned-delivery", content=content,
+                evidence_profile=pinned_profile)) or raw
+        else:
+            excerpt = raw
         presentation_digest = hashlib.sha256(excerpt.encode("utf-8")).hexdigest()
         if row["presentation_sha256"] not in {None, presentation_digest}:
             raise ValueError("text Evidence presentation digest mismatch")
         text_view = TextEvidenceView.from_payload(json.loads(row["text_view_json"]) if row["text_view_json"] else None)
         if text_view is not None:
             text_view.verify_origins(anchor, content)
-        from memforge.source_representation import representation_contract_for_profile
-        pinned_profile = _evidence_profile_from_storage_row(row)
         interpretation_available = text_view is None or (
             text_view.version == 1 and representation_contract_for_profile(pinned_profile) is not None)
         if text_view is not None and interpretation_available:
