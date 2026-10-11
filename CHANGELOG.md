@@ -8,9 +8,12 @@
   selection and is Evidence only when selected as Required. A whole
   Observation reads as its record framing once and then its entries instead
   of its stored JSON record, for new Context and for Context already stored
-  without a presentation. Context attached under the earlier rule stays until
-  its Evidence Unit is derived again. Cloud: the HANA evidence read presents a
-  whole Observation the same way, together with the pin to this version.
+  without a presentation. SQLite migration 111 deactivates stored Context
+  associations whose Observation the Evidence Unit's Primary does not answer;
+  Evidence References and supporting Evidence are unchanged. Cloud: the HANA
+  evidence read presents a whole Observation the same way and the HANA
+  migration `context-for-declared-reply-v1` deactivates the same
+  associations, together with the pin to this version.
 - Model catalogs read in source-time order and list record framing only as
   context (`revision-input-v11`). Observations are ordered by the time their
   source reports, then each one's Fragments by position, so a Teams window or

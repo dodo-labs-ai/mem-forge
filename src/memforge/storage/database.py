@@ -4541,6 +4541,14 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
     (110, "Persist focused Evidence presentation separately from source excerpts", [
         "ALTER TABLE evidence_references ADD COLUMN display_text TEXT",
     ]),
+    (
+        111,
+        "Keep Context only for the Observation a Primary answers",
+        # Context is the Observation a claim's Primary answers by a declared
+        # reply. An association to an Observation that only preceded the Primary
+        # is deactivated (see _deactivate_context_without_declared_reply_unlocked).
+        [],
+    ),
 
 ]
 
@@ -4853,6 +4861,9 @@ class Database:
             if version == 103:
                 superseded = await self._supersede_stored_input_reprocess_derivations_unlocked()
                 logger.info("Superseded %d unapplied reprocess derivations staged from stored input", superseded)
+            if version == 111:
+                deactivated = await self._deactivate_context_without_declared_reply_unlocked()
+                logger.info("Deactivated %d Context associations without a declared reply", deactivated)
             if version == 104:
                 recorded = await self._move_stored_input_to_source_units_unlocked()
                 logger.info("Recorded the stored input of %d current Source Unit revisions", recorded)
@@ -4908,6 +4919,34 @@ class Database:
                 WHERE status IN ('pending', 'retryable_failure', 'completed')
                   AND json_extract(context_payload_json, '$.support_without_baseline') = 1""",
             (DERIVATION_INPUT_SUPERSEDED, _now_iso()),
+        )
+        return cursor.rowcount
+
+    async def _deactivate_context_without_declared_reply_unlocked(self) -> int:
+        """Deactivate Context whose Observation the Evidence Unit's Primary does not answer.
+
+        The association is the mutable current Context projection; its Evidence
+        Reference and the supporting Evidence Unit stay as they are.
+        """
+
+        now = _now_iso()
+        cursor = await self.db.execute(
+            """UPDATE evidence_context_associations
+                  SET active = 0, removed_at = ?, updated_at = ?
+                WHERE active = 1
+                  AND NOT EXISTS (
+                      SELECT 1
+                        FROM evidence_references context_reference
+                        JOIN evidence_references primary_reference
+                          ON primary_reference.evidence_unit_id = evidence_context_associations.evidence_unit_id
+                         AND primary_reference.role = 'primary'
+                        JOIN source_projection_relations reply
+                          ON reply.relation_type = 'replies_to'
+                         AND reply.from_id = primary_reference.observation_id
+                         AND reply.to_id = context_reference.observation_id
+                       WHERE context_reference.id = evidence_context_associations.evidence_reference_id
+                  )""",
+            (now, now),
         )
         return cursor.rowcount
 

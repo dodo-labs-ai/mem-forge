@@ -152,3 +152,77 @@ async def test_stored_context_without_a_presentation_reads_as_its_record_present
         "Conversation ID: conv-1",
         CONVERSATION[0][1],
     ))
+
+
+@pytest.mark.asyncio
+async def test_the_migration_keeps_stored_context_only_for_a_declared_reply(tmp_path) -> None:
+    now = datetime(2026, 8, 27, 8, 0, tzinfo=timezone.utc).isoformat()
+    path = tmp_path / "stored-context.db"
+    db = Database(str(path))
+    await db.connect()
+    try:
+        memory_id, evidence_unit_id, source_id, _access_hash = await _seed_complete_unit_support(db)
+        for observation_id, text in (("obs-answered", "Should release wait?"), ("obs-preceding", "Lunch is at noon.")):
+            await db.db.execute(
+                """INSERT INTO source_observations (
+                       id, source_id, source_unit_id, observation_type, provider_key, locator_json,
+                       current_revision_id, updated_at
+                   ) VALUES (?, ?, 'unit-1', 'document_body', ?, '{}', ?, ?)""",
+                (observation_id, source_id, observation_id, f"rev-{observation_id}", now),
+            )
+            await db.db.execute(
+                """INSERT INTO source_observation_revisions (
+                       id, observation_id, semantic_hash, content, metadata_json, observed_at, profile_name,
+                       profile_version, coordinate_space, created_at
+                   ) VALUES (?, ?, ?, ?, '{}', ?, 'markdown-structural', 1, 'unicode-scalar', ?)""",
+                (f"rev-{observation_id}", observation_id, hashlib.sha256(text.encode()).hexdigest(), text, now, now),
+            )
+        await db.db.execute(
+            """INSERT INTO source_projection_runs (
+                   id, source_id, source_type, coverage, scope_json, checkpoint_json, payload_json,
+                   payload_hash, created_at
+               ) VALUES ('run-1', ?, 'github_repo', 'complete_snapshot', '{}', '{}', '{}', 'hash', ?)""",
+            (source_id, now),
+        )
+        for index, (relation_type, from_id, to_id) in enumerate((
+            ("replies_to", "obs-primary", "obs-answered"),
+            ("precedes", "obs-preceding", "obs-primary"),
+        )):
+            await db.db.execute(
+                """INSERT INTO source_projection_relations (
+                       projection_run_id, relation_index, relation_type, from_id, to_id
+                   ) VALUES ('run-1', ?, ?, ?, ?)""",
+                (index, relation_type, from_id, to_id),
+            )
+        await db.db.commit()
+        await db.replace_evidence_context_associations(evidence_unit_id, tuple(
+            EvidenceReference(role=EvidenceRole.CONTEXT, anchor=SourceAnchor(
+                kind=AnchorKind.WHOLE_OBSERVATION, observation_id=observation_id,
+                observation_revision_id=f"rev-{observation_id}",
+            ))
+            for observation_id in ("obs-answered", "obs-preceding")
+        ))
+        [stored] = await db.get_memory_evidence_units(memory_id)
+        assert {item.anchor.observation_id for item in stored.items if item.role is EvidenceRole.CONTEXT} == {
+            "obs-answered", "obs-preceding",
+        }
+        supporting = [item for item in stored.items if item.grants_support]
+        await db.db.execute("DELETE FROM schema_migrations WHERE version = ?", (111,))
+        await db.db.commit()
+    finally:
+        await db.close()
+
+    upgraded = Database(str(path))
+    await upgraded.connect()
+    try:
+        [group] = await upgraded.get_memory_evidence_units(memory_id)
+        references = await upgraded.db.execute_fetchall(
+            "SELECT COUNT(*) AS count FROM evidence_references WHERE role = 'context'"
+        )
+    finally:
+        await upgraded.close()
+
+    assert [item.anchor.observation_id for item in group.items if item.role is EvidenceRole.CONTEXT] == ["obs-answered"]
+    # Supporting Evidence and the immutable Context references are untouched.
+    assert [item for item in group.items if item.grants_support] == supporting
+    assert references[0]["count"] == 2
