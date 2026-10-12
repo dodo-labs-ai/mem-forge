@@ -1,13 +1,9 @@
-# MemForge
+<h1><img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/logo.svg" width="36" align="absmiddle" alt=""> MemForge</h1>
 
-**Help agents remember the decisions behind your work.**
+**Give every agent your team's brain on day one.**
 
-A memory layer for AI agents, with source citations and rechecking when
-connected documents change.
-
-MemForge builds it from Confluence, Jira, GitHub, Teams and your agents'
-sessions. Source sync rechecks affected memories against new revisions. The
-packaged agent integrations support Claude Code and Codex.
+The memory layer for AI agents. Everything your team knows. Cited, and always
+up to date. Built from your docs, tickets, chat and agent sessions.
 
 <p>
   <a href="https://github.com/shno-labs/mem-forge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/shno-labs/mem-forge/actions/workflows/ci.yml/badge.svg"></a>
@@ -15,7 +11,12 @@ packaged agent integrations support Claude Code and Codex.
   <img alt="Status alpha" src="https://img.shields.io/badge/status-alpha-f59e0b">
 </p>
 
-
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/demo-dark.gif">
+    <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/demo-light.gif" alt="A new hire asks a coding agent how to answer a support ticket. The agent searches MemForge and answers with two team rules, citing a GitHub Pages doc and a Jira ticket." width="100%">
+  </picture>
+</p>
 
 > **Status: alpha.** APIs, storage formats and plugin packaging may change.
 > The open-source build runs for one user on one machine.
@@ -45,48 +46,53 @@ codex plugin marketplace add shno-labs/mem-forge
 codex plugin add memory@memforge
 ```
 
-Start a new agent session. Hooks upload eligible session windows, and your
-agent can search memory. See [plugin routing](docs/quickstart.md#plugin-routing)
-when using a hosted endpoint or more than one workspace:
+Open **Sources** in the admin UI to connect Confluence, Jira or another source,
+then start a new agent session and ask:
 
 ```text
-Before changing the capture flow, check MemForge for decisions and conventions
-that apply, and show the evidence for any you rely on.
+Before you change this, check MemForge for decisions and conventions that
+apply, and show the source for each one you rely on.
 ```
 
-To add Confluence, Jira or other sources, open **Sources** in the admin UI. The
-[quickstart](docs/quickstart.md) covers model settings, local folders, the host
-CLI and network details.
+From here on, plugin hooks upload eligible session windows, so what you decide
+in a session becomes memory too.
+
+The [quickstart](docs/quickstart.md) covers model settings,
+[plugin routing](docs/quickstart.md#plugin-routing) for a hosted endpoint or
+more than one workspace, local folders, the host CLI and network details.
 
 ## Why MemForge
 
-**Your sessions and your team's docs, in one memory.** Agent plugins capture
-sessions through lifecycle hooks; today that is Claude Code and Codex. MemForge
-keeps the decisions, conventions and corrections that you stated, not
-everything the agent said. Every connected agent reads and writes the same
-store, so a decision made in Claude Code is available in Codex. Session
-memories are private to the person who had the session. Document sources sit in the same store and come back from
-the same `search` call.
+**One memory for your docs and your sessions.** Confluence, Jira, GitHub, Teams
+and your Claude Code and Codex sessions land in one store and come back from
+one `search` call. From sessions it keeps what you decided or corrected, not
+everything the agent said. A decision you made in Claude Code is there when you
+open Codex, and session memories stay private to you.
 
-**Recheck knowledge as sources change.** A successful source sync evaluates
-changed Evidence and the memories it supports. Supported memories can be kept;
-updates may replace or retire a memory, or await a Review. Unresolved support
-is preserved rather than treated as proof that a memory is false. Previous
-versions retain their lifecycle history. Across documents, `equivalent`,
-`updates` and `contradicts` relations help agents see competing knowledge.
+**It follows the source.** When a page or ticket changes, the next sync
+rechecks the memories built on it. Each one is kept, replaced or retired, or it
+waits for your review, and earlier versions keep their history. Across
+documents, MemForge marks memories that repeat, update or contradict each
+other.
 
-**Readable Evidence with traceable sources.** `get_memory` returns Evidence
-details, including citation text or excerpts and available source links. Readable text can be focused wording
-produced by the model; it is not always a verbatim quotation. Source-backed
-citations retain revision and range locators where available, and
-`get_resource` opens the pinned citation material or backing artifact. Managed
-session Evidence points to the generated concept document; raw conversation
-windows are not retained.
+<p align="center">
+  <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/memory-detail.png" alt="A memory in the admin UI: a decision from a Jira ticket that updates an older memory from the support playbook, shown with the ticket text it rests on." width="100%">
+</p>
 
-**Self-hosted and open source.** Apache-2.0. The service and local data run from
-`docker compose up` on your machine (SQLite, FTS5 and Chroma). You bring your
-own model endpoints and keys; configured providers receive inference inputs.
-Session text is redacted in the plugin and again in the service.
+**Every answer has a source.** `get_memory` returns the supporting text and a
+link back to the page, ticket or file. Where the source allows it, the citation
+is pinned to the revision and passage that was read, and `get_resource` opens
+the original. The supporting text can be the model's focused wording, not
+always a verbatim quote.
+
+**Runs on your machine.** Apache-2.0. `docker compose up` starts the service
+with local storage (SQLite, FTS5 and Chroma). You bring your own model
+endpoints and keys, and those providers receive what is sent for inference.
+Session text is redacted in the plugin and again in the service, and raw
+conversation windows are not kept.
+
+See [how MemForge compares](docs/comparison.md) with Mem0, Zep, claude-mem and
+Unblocked.
 
 ## How it works
 
@@ -110,60 +116,71 @@ flowchart LR
   API -- "read" --> Store
 ```
 
-1. **Capture.** Plugin hooks upload bounded, redacted windows of each session.
-   Connectors sync documents on demand or on a schedule.
-2. **Extract.** An LLM turns each source into short memories (facts, decisions,
-   procedures, conventions), with selected supporting Evidence.
-3. **Reconcile.** When a source changes, affected memories are re-checked
-   against the new revision, and new memories are compared with related ones
-   from other documents.
-4. **Recall.** Agents call MCP tools: `search` for memory cards, `get_memory`
-   for evidence and relations, `get_resource` for the backing document. You
-   can also ask the agent to create, correct or retire a memory; the plugin
-   tells the agent to confirm with you before it writes.
+1. **Capture.** Plugin hooks upload redacted session windows, and connectors
+   sync documents.
+2. **Extract.** An LLM turns each source into short memories with supporting
+   Evidence.
+3. **Reconcile.** When a source changes, affected memories are rechecked and
+   related ones are linked.
+4. **Recall.** Agents call `search`, `get_memory` and `get_resource` over MCP.
 
 More detail: [architecture](docs/architecture.md) and
 [agent client integration](docs/integrations/agent-clients.md).
 
-## How it compares
+## Integrations
 
-These projects address related needs with different data models. The following
-summary uses their public documentation checked on October 7, 2026; it is not a
-quality or latency benchmark. Corrections are welcome with a source link.
+MemForge sits between the systems where your team writes things down and the
+agents that do the work.
 
-| | MemForge | Mem0 | Zep / Graphiti | claude-mem | Unblocked |
-| --- | --- | --- | --- | --- | --- |
-| Main focus | Source-backed Memory and coding-session knowledge | Memory APIs for applications and agents | Temporal context graphs | Persistent coding-session observations | Context from connected engineering tools |
-| Source input | Confluence, Jira, GitHub, Teams, local files and plugin session windows | Application-provided content and integrations | Episodes supplied through APIs, loaders or MCP | Coding-agent hooks | Code, tickets, documents, conversations and other connected tools |
-| Changing knowledge | Recheck Source revisions; retain lifecycle history and gated Reviews | v3 extraction adds facts with temporal context; manual update/delete APIs are separate | Facts have temporal validity and old facts can be invalidated | Session observations and retrieval | Reconciles sources using context, recency and authority signals |
-| Evidence | Readable citation text and backing source links; pinned locators where available | Consult the selected library or Platform API contract | Source episodes and temporal facts | Observation identifiers | Citations to files, PRs, tickets and documents |
-| Open-source option | Apache-2.0 local service | Apache-2.0 library; hosted Platform is separate | Apache-2.0 Graphiti; hosted Zep is separate | Apache-2.0 local service | Hosted product |
+**Agent integrations**
 
-<details>
-<summary>Sources for this table</summary>
+<p>
+  <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/claude.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Claude&nbsp;Code&nbsp;&nbsp;&nbsp;
+  <picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/openai-dark.svg"><img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/openai-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;Codex
+</p>
 
-- Mem0: [README](https://github.com/mem0ai/mem0), [OSS v3 migration](https://docs.mem0.ai/migration/oss-v2-to-v3), [Platform v3 migration](https://docs.mem0.ai/migration/platform-v2-to-v3), [Claude Code plugin](https://docs.mem0.ai/integrations/claude-code), [pricing](https://mem0.ai/pricing)
-- Zep / Graphiti: [Graphiti README](https://github.com/getzep/graphiti), [edge model](https://github.com/getzep/graphiti/blob/main/graphiti_core/edges.py), [Community Edition notice](https://blog.getzep.com/announcing-a-new-direction-for-zeps-open-source-strategy/), [Zep Ingest](https://help.getzep.com/zep-ingest), [pricing](https://www.getzep.com/pricing)
-- claude-mem: [README](https://github.com/thedotmack/claude-mem), [search tools](https://docs.claude-mem.ai/usage/search-tools.md)
-- Unblocked: [product overview](https://getunblocked.com/ai-info/), [context engine](https://getunblocked.com/blog/inside-the-unblocked-context-engine/), [MCP](https://getunblocked.com/unblocked-mcp/), [pricing](https://getunblocked.com/pricing/)
+**Memory sources**
 
-</details>
+<table>
+  <tr>
+    <td>Docs and wikis</td>
+    <td nowrap>
+      <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/confluence.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Confluence&nbsp;&nbsp;&nbsp;
+      <picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/github-dark.svg"><img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/github-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;GitHub&nbsp;Pages&nbsp;&nbsp;&nbsp;
+      <picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/github-dark.svg"><img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/github-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;GitHub&nbsp;repo&nbsp;docs&nbsp;&nbsp;&nbsp;
+      <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/folder.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Local&nbsp;folders
+    </td>
+  </tr>
+  <tr>
+    <td>Tickets</td>
+    <td nowrap><img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/jira.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Jira</td>
+  </tr>
+  <tr>
+    <td>Chat</td>
+    <td nowrap><img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/teams.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Teams</td>
+  </tr>
+  <tr>
+    <td>Agent sessions</td>
+    <td nowrap>
+      <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/claude.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Claude&nbsp;Code&nbsp;&nbsp;&nbsp;
+      <picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/openai-dark.svg"><img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/openai-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;Codex
+    </td>
+  </tr>
+  <tr>
+    <td>Planned</td>
+    <td nowrap>
+      <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/slack.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Slack&nbsp;&nbsp;&nbsp;
+      <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/obsidian.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Obsidian
+    </td>
+  </tr>
+</table>
 
-## Sources
+[Add a source](docs/quickstart.md#4-add-a-source) lists what each one syncs and
+how to scope it. Need one that is missing?
+[Open an issue](https://github.com/shno-labs/mem-forge/issues).
 
-| Source | What is synced |
-| --- | --- |
-| Claude Code, Codex | Decisions, conventions and corrections from your sessions (private to you) |
-| Confluence | Pages, including exported PDFs; accepts a root, space or page URL |
-| Jira | Tickets, decisions and work items |
-| GitHub Repository | Repository files from GitHub or GitHub Enterprise, scoped by folders and file types |
-| GitHub Pages | Rendered documentation pages |
-| Microsoft Teams | Channel messages, group chats and direct messages |
-| Local Repository | Markdown, text, JSON and HTML files from a local folder or repo, uploaded by the local daemon ([guide](docs/local-repo-sync.md)) |
+## Limits
 
-## Status and limits
-
-- Alpha. Expect breaking changes to APIs, storage and plugin packaging.
 - The open-source build is single-user, has no authentication, and binds to
   `127.0.0.1` only. Do not expose it on a network.
 - Model extraction and semantic judgments can miss useful knowledge or make
