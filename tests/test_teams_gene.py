@@ -889,6 +889,7 @@ class TestMessageParsing:
         client._ensure_clients = AsyncMock()
         client._chat_client = object()
         monkeypatch.setattr("memforge.genes.teams_gene._MAX_PAGE_SIZE", 2)
+        monkeypatch.setattr("memforge.genes.teams_gene.asyncio.sleep", AsyncMock())
 
         def response(messages: list[dict], backward_link: str) -> MagicMock:
             value = MagicMock()
@@ -952,6 +953,7 @@ class TestMessageParsing:
         client._ensure_clients = AsyncMock()
         client._chat_client = object()
         monkeypatch.setattr("memforge.genes.teams_gene._MAX_PAGE_SIZE", 1)
+        monkeypatch.setattr("memforge.genes.teams_gene.asyncio.sleep", AsyncMock())
 
         response = MagicMock()
         response.json.return_value = {
@@ -1227,7 +1229,7 @@ class TestDiscover:
     async def test_discover_times_out_stuck_conversation_fetch(self, gene):
         conv_id = "19:abc@thread.tacv2"
         gene.config = {"group_chats": [conv_id]}
-        gene._conversation_fetch_timeout_seconds = 1
+        gene._conversation_fetch_timeout_seconds = 0.05
         gene._client.list_conversations = AsyncMock(
             return_value=[
                 {
@@ -1260,7 +1262,7 @@ class TestDiscover:
         stuck_id = "19:stuck@thread.v2"
         ok_id = "19:ok@thread.v2"
         gene.config = {"group_chats": [stuck_id, ok_id]}
-        gene._conversation_fetch_timeout_seconds = 1
+        gene._conversation_fetch_timeout_seconds = 0.05
         gene._client.list_conversations = AsyncMock(
             return_value=[
                 {

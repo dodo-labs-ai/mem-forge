@@ -1,12 +1,15 @@
 """Setup shared by the whole test suite."""
 
 import asyncio
+import os
 from pathlib import Path
 import shutil
 
 import pytest
 
-from memforge.storage.database import Database
+# litellm loads its model cost map when it is first imported. The copy packaged
+# with litellm keeps the suite, and every process it starts, off the network.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -18,6 +21,8 @@ def migrated_database_template(tmp_path_factory):
     of the result. A test that prepares its own file, such as an earlier schema
     to migrate, opens exactly the file it prepared.
     """
+    from memforge.storage.database import Database
+
     template = tmp_path_factory.mktemp("database-template") / "memforge.db"
 
     async def build() -> None:
@@ -28,7 +33,7 @@ def migrated_database_template(tmp_path_factory):
     asyncio.run(build())
     connect = Database.connect
 
-    async def connect_from_template(self: Database, *, run_migrations: bool = True) -> None:
+    async def connect_from_template(self, *, run_migrations: bool = True) -> None:
         path = Path(self.db_path).expanduser()
         if run_migrations and not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
