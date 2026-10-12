@@ -1,9 +1,31 @@
 name: CI
 
+# A change confined to these files leaves every job's inputs untouched. Only the
+# top level of docs/ is listed, so a file added in a docs/ subdirectory still
+# runs the documentation boundary test.
 on:
   pull_request:
+    paths-ignore: &unchecked_paths
+      - "docs/*.md"
+      - "README.md"
+      - "CHANGELOG.md"
+      - "AGENTS.md"
+      - "CLAUDE.md"
+      - "CONTRIBUTING.md"
+      - "CODE_OF_CONDUCT.md"
+      - "SECURITY.md"
+      - ".github/assets/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
   push:
     branches: [main]
+    paths-ignore: *unchecked_paths
+
+# A newer push to a pull request replaces the run for the older commit. Runs on
+# main are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   python:
