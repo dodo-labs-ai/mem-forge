@@ -1716,8 +1716,10 @@ class SourceSyncStatusResponse(BaseModel):
     ``recovery_count``, ``progress_revision``, ``progress_updated_at``). A
     sync running in this process carries its live counters (``phase``,
     ``docs_*``, ``memories_*``, ``current_title``). The last recorded sync
-    carries its totals, ``run_id`` and ``failed_docs``. Fields outside the
-    chosen shape are absent.
+    carries its totals, ``run_id``, ``failed_docs`` and
+    ``absence_check_skipped_reason``, which says why that run removed nothing
+    although its scope listing was due (ADR 0045). Fields outside the chosen
+    shape are absent.
     """
 
     status: SourceSyncStatus
@@ -1743,6 +1745,7 @@ class SourceSyncStatusResponse(BaseModel):
     memories_extracted: int | None = None
     memories_stored: int | None = None
     failed_docs: list[SourceSyncFailedDocResponse] | None = None
+    absence_check_skipped_reason: str | None = None
 
 
 class SourceAccessTransitionResponse(BaseModel):
