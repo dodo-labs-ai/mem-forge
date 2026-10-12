@@ -10,8 +10,8 @@
 ## Project
 
 - See `README.md` for setup and project orientation.
-- See `docs/architecture.md` for the full system design.
-- See `docs/design/agent-session-saas-plugin-flow.md` for the Codex and Claude Code adapter flow.
+- See `docs/architecture.md` for the system overview.
+- Design records (the full architecture, ADRs, subsystem designs, research and the domain glossary) live in the MemForge Cloud repository under `docs/oss/`. Do not add them to this repository.
 
 ## Plugin Release Validation
 
@@ -31,7 +31,7 @@
 - Before starting any PR merge, check the affected repo for existing open PRs and local/remote `codex/` branches that might be stale, superseded, or still awaiting action. Report the findings and explicitly call out whether any branch or PR should be handled before the merge.
 - Treat the approved design and implementation plan as the completion contract. Audit the current implementation against every design requirement before claiming the design is fully covered.
 - Record every user-approved deferred MemForge feature or optimization as one GitHub Issue in the coordinating repository. The issue must state the problem and evidence, affected repositories, execution trigger, acceptance criteria, explicit non-goals, type/area, `status:candidate` or `status:ready`, and `priority:P0` through `priority:P3`. Do not treat chat, handoff notes, ADR asides, or duplicate cross-repo issues as the execution backlog, and do not prescribe an unreviewed implementation as settled design.
-- When a validated change materially corrects or clarifies the design, update the repo-owned `docs/adr` record in the same goal/PR. Persist the durable decision and consequences, not the debugging chronology.
+- When a validated change materially corrects or clarifies the design, update its ADR under the Cloud repository's `docs/oss/adr` in the same goal. Persist the durable decision and consequences, not the debugging chronology.
 - Use online research when making design or technical judgment calls, especially for retrieval, ranking, database search, GraphRAG, deployment, security, or API-contract decisions. Prefer primary sources and current official docs; when useful, inspect relevant open-source project designs or code for implementation insight before settling the approach.
 - When explaining or refining retrieval behavior, lead with the runtime flow: user query, independent retrieval channels, fusion/ranking, and exact source/time/visibility predicates. Distinguish vector search, content BM25, metadata lexical channels, graph expansion, and deterministic source/time listing.
 - Run review incrementally while implementing. When the user asks for two reviewers, use exactly two independent reviewer lanes: one Claude Code reviewer and one Codex reviewer. Do not defer review until a large final diff.
@@ -61,8 +61,8 @@
 
 ## Architecture Decision Ownership
 
-- Record shared Memory lifecycle, retrieval, and storage-contract decisions in an OSS `docs/adr` record as the canonical design source. This includes transaction boundaries and work/outbox semantics that every storage adapter must implement.
-- Do not duplicate shared semantics in a Cloud ADR. Update a Cloud ADR only for a material HANA, Cloud Foundry, or other cloud-only consequence; link the canonical OSS ADR and describe only how Cloud implements or constrains that shared contract.
+- Record shared Memory lifecycle, retrieval, and storage-contract decisions in an OSS ADR under the Cloud repository's `docs/oss/adr` as the canonical design source. This includes transaction boundaries and work/outbox semantics that every storage adapter must implement.
+- Do not duplicate shared semantics in a Cloud ADR (`docs/adr` in the Cloud repository). Update a Cloud ADR only for a material HANA, Cloud Foundry, or other cloud-only consequence; link the canonical OSS ADR and describe only how Cloud implements or constrains that shared contract.
 
 ## OSS and Cloud Contract Consistency
 
