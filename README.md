@@ -135,8 +135,8 @@ agents that do the work.
 **Agent integrations**
 
 <p>
-  <img src=".github/assets/icons/claude.svg" height="18" align="absmiddle" alt=""> Claude Code &nbsp;&nbsp;&nbsp;
-  <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/openai-dark.svg"><img src=".github/assets/icons/openai-light.svg" height="18" align="absmiddle" alt=""></picture> Codex
+  <img src=".github/assets/icons/claude.svg" height="18" align="absmiddle" alt="">&nbsp;Claude&nbsp;Code&nbsp;&nbsp;&nbsp;
+  <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/openai-dark.svg"><img src=".github/assets/icons/openai-light.svg" height="18" align="absmiddle" alt=""></picture>&nbsp;Codex
 </p>
 
 **Memory sources**
@@ -145,30 +145,30 @@ agents that do the work.
   <tr>
     <td>Docs and wikis</td>
     <td>
-      <img src=".github/assets/icons/confluence.svg" height="18" align="absmiddle" alt=""> Confluence &nbsp;&nbsp;&nbsp;
-      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/github-dark.svg"><img src=".github/assets/icons/github-light.svg" height="18" align="absmiddle" alt=""></picture> GitHub Pages &nbsp;&nbsp;&nbsp;
-      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/github-dark.svg"><img src=".github/assets/icons/github-light.svg" height="18" align="absmiddle" alt=""></picture> GitHub repo docs &nbsp;&nbsp;&nbsp;
-      <img src=".github/assets/icons/folder.svg" height="18" align="absmiddle" alt=""> Local folders
+      <img src=".github/assets/icons/confluence.svg" height="18" align="absmiddle" alt="">&nbsp;Confluence&nbsp;&nbsp;&nbsp;
+      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/github-dark.svg"><img src=".github/assets/icons/github-light.svg" height="18" align="absmiddle" alt=""></picture>&nbsp;GitHub&nbsp;Pages&nbsp;&nbsp;&nbsp;
+      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/github-dark.svg"><img src=".github/assets/icons/github-light.svg" height="18" align="absmiddle" alt=""></picture>&nbsp;GitHub&nbsp;repo&nbsp;docs&nbsp;&nbsp;&nbsp;
+      <img src=".github/assets/icons/folder.svg" height="18" align="absmiddle" alt="">&nbsp;Local&nbsp;folders
     </td>
   </tr>
   <tr>
     <td>Tickets</td>
-    <td><img src=".github/assets/icons/jira.svg" height="18" align="absmiddle" alt=""> Jira</td>
+    <td><img src=".github/assets/icons/jira.svg" height="18" align="absmiddle" alt="">&nbsp;Jira</td>
   </tr>
   <tr>
     <td>Chat</td>
-    <td><img src=".github/assets/icons/teams.svg" height="18" align="absmiddle" alt=""> Teams</td>
+    <td><img src=".github/assets/icons/teams.svg" height="18" align="absmiddle" alt="">&nbsp;Teams</td>
   </tr>
   <tr>
     <td>Agent sessions</td>
     <td>
-      <img src=".github/assets/icons/claude.svg" height="18" align="absmiddle" alt=""> Claude Code &nbsp;&nbsp;&nbsp;
-      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/openai-dark.svg"><img src=".github/assets/icons/openai-light.svg" height="18" align="absmiddle" alt=""></picture> Codex
+      <img src=".github/assets/icons/claude.svg" height="18" align="absmiddle" alt="">&nbsp;Claude&nbsp;Code&nbsp;&nbsp;&nbsp;
+      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/openai-dark.svg"><img src=".github/assets/icons/openai-light.svg" height="18" align="absmiddle" alt=""></picture>&nbsp;Codex
     </td>
   </tr>
   <tr>
     <td>Planned</td>
-    <td><img src=".github/assets/icons/slack.svg" height="18" align="absmiddle" alt=""> Slack</td>
+    <td><img src=".github/assets/icons/slack.svg" height="18" align="absmiddle" alt="">&nbsp;Slack</td>
   </tr>
 </table>
 
