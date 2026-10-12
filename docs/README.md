@@ -15,6 +15,8 @@ Start here if you are new to the repository:
   Code adapter responsibilities, MCP request flow, and service boundaries.
 - [Python distribution release](releasing-python-distribution.md): package
   naming, Trusted Publisher configuration, release tags, and install smoke.
+- [How MemForge compares](comparison.md): MemForge beside Mem0, Zep / Graphiti,
+  claude-mem and Unblocked, with sources.
 
 ## Design ownership
 

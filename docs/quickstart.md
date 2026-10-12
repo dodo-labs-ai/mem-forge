@@ -193,6 +193,16 @@ Scheduled runs use the same backend queue and source permissions as a manual
 To sync a local folder or repository, choose **Add Source -> Local Repository**
 and run the printed CLI command. See [local-repo-sync.md](local-repo-sync.md).
 
+| Source | What is synced |
+| --- | --- |
+| Claude Code, Codex | Decisions, conventions and corrections from your sessions (private to you) |
+| Confluence | Pages, including exported PDFs; accepts a root, space or page URL |
+| Jira | Tickets, decisions and work items |
+| GitHub Repository | Repository files from GitHub or GitHub Enterprise, scoped by folders and file types |
+| GitHub Pages | Rendered documentation pages |
+| Microsoft Teams | Channel messages, group chats and direct messages |
+| Local Repository | Markdown, text, JSON and HTML files from a local folder or repo, uploaded by the local daemon |
+
 ### Confluence
 
 The Confluence source accepts a root, space, or page URL in the **Wiki URL**
@@ -253,6 +263,9 @@ and show the local_path. Use content_url or pdf_url when you want current conten
 These URLs are served by the API, so they work even when service storage lives
 inside a Docker volume. `local_path` is written by the local plugin under
 `~/.memforge-agent/artifacts`, not by the Docker container.
+
+You can also ask the agent to create, correct or retire a memory; the plugin
+tells the agent to confirm with you before it writes.
 
 ## 6. Install The Host CLI
 
