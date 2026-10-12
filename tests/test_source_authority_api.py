@@ -15,6 +15,7 @@ from memforge.models import (
     Memory,
     NormalizedContent,
     RawContent,
+    SyncState,
     content_hash,
 )
 from memforge.pipeline.source_projection_adapters import project_source_item
@@ -475,6 +476,48 @@ def test_agent_session_rejects_ordinary_sync_and_hides_historical_sync_failure(t
         assert asyncio.run(database.get_latest_source_sync_run(source_id=source_id)) is None
         history = asyncio.run(database.get_sync_history(source=source_id, limit=1))
         assert history[0]["status"] == "failed"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_source_list_returns_why_the_latest_sync_skipped_its_absence_check(tmp_path):
+    database = _connect_database(tmp_path)
+    source_id = "src-absence-check-skipped"
+    owner_headers = {"x-test-user": "owner-user", "x-test-workspace-role": "member"}
+    started_at = datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)
+    finished_at = datetime(2026, 9, 30, 8, 1, tzinfo=timezone.utc)
+    try:
+        asyncio.run(
+            database.upsert_source(
+                id=source_id,
+                type="jira",
+                name="Jira",
+                config_json="{}",
+                access_policy="workspace",
+                owner_user_id="owner-user",
+            )
+        )
+        asyncio.run(
+            database.record_source_sync_result(
+                SyncState(
+                    source=source_id,
+                    last_sync_at=finished_at,
+                    last_sync_status="success",
+                    absence_check_skipped_reason="Jira search total changed during pagination",
+                ),
+                started_at=started_at,
+                finished_at=finished_at,
+                run_id="run-absence-check-skipped",
+            )
+        )
+
+        with TestClient(_app(tmp_path, database)) as client:
+            listed = client.get("/api/v1/sources", headers=owner_headers)
+
+        assert listed.status_code == 200, listed.text
+        source = next(row for row in listed.json()["data"] if row["id"] == source_id)
+        assert source["sync"]["status"] == "success"
+        assert source["sync"]["absence_check_skipped_reason"] == "Jira search total changed during pagination"
     finally:
         asyncio.run(database.close())
 

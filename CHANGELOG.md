@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- A document Source run whose scope listing or absence confirmation does not
+  complete still succeeds and removes nothing (ADR 0045), and now records why
+  on the run: `SyncState.absence_check_skipped_reason`, stored in the new
+  nullable `sync_history.absence_check_skipped_reason` column (SQLite
+  migration 112) and returned as `sync.absence_check_skipped_reason` on each
+  Source in `GET /api/v1/sources`. The field is null when the check ran or when
+  the connector cannot list its scope. The admin UI V2 Source drawer shows it
+  as a notice, "Deletion check skipped: <reason>". Cloud: the HANA workspace
+  store adds the nullable `SYNC_HISTORY.ABSENCE_CHECK_SKIPPED_REASON` column at
+  startup with `_add_column_if_missing`, writes it with every sync history row
+  and returns it from `get_sync_history`. Existing rows read as null; no data
+  migration, `sap/` route or environment configuration change.
 - A Support that cites the stored Unit Title is judged again
   (`revision-support-v12`). Evidence on a stored revision in a representation
   no adapter projects kept its whole Support unresolved, so a Memory that

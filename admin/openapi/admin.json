@@ -8276,8 +8276,19 @@
         "type": "object"
       },
       "SourceSyncStatusResponse": {
-        "description": "A Source's latest sync, read from one of three places.\n\nAn active durable run carries the run fields (``run_id``, ``trigger``,\n``force_full_sync``, ``created_at``, ``next_attempt_at``,\n``recovery_count``, ``progress_revision``, ``progress_updated_at``). A\nsync running in this process carries its live counters (``phase``,\n``docs_*``, ``memories_*``, ``current_title``). The last recorded sync\ncarries its totals, ``run_id`` and ``failed_docs``. Fields outside the\nchosen shape are absent.",
+        "description": "A Source's latest sync, read from one of three places.\n\nAn active durable run carries the run fields (``run_id``, ``trigger``,\n``force_full_sync``, ``created_at``, ``next_attempt_at``,\n``recovery_count``, ``progress_revision``, ``progress_updated_at``). A\nsync running in this process carries its live counters (``phase``,\n``docs_*``, ``memories_*``, ``current_title``). The last recorded sync\ncarries its totals, ``run_id``, ``failed_docs`` and\n``absence_check_skipped_reason``, which says why that run removed nothing\nalthough its scope listing was due (ADR 0045). Fields outside the chosen\nshape are absent.",
         "properties": {
+          "absence_check_skipped_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Absence Check Skipped Reason"
+          },
           "created_at": {
             "anyOf": [
               {

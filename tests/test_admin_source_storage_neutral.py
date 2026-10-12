@@ -89,6 +89,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
                     "memories_extracted": 4,
                     "error_message": "one failed",
                     "failed_docs": [{"doc_id": "doc-1", "title": "Design", "error": "boom"}],
+                    "absence_check_skipped_reason": "scope listing timed out",
                 }
             ]
 
@@ -156,6 +157,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
         "memories_extracted": 4,
         "error_message": "one failed",
         "failed_docs": [{"doc_id": "doc-1", "title": "Design", "error": "boom"}],
+        "absence_check_skipped_reason": "scope listing timed out",
         "progress": {
             "schema_version": 1,
             "phase": "processing",

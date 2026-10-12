@@ -116,6 +116,10 @@ class Workspace:
     async def held(self) -> set[str]:
         return await self.db.list_indexed_doc_ids(SOURCE_ID)
 
+    async def recorded_skip_reason(self) -> str | None:
+        latest = (await self.db.get_sync_history(source=SOURCE_ID, limit=1))[0]
+        return latest["absence_check_skipped_reason"]
+
     def tombstoned(self) -> list[str]:
         return [doc_id for event, doc_id in self.engine.events if event == "tombstone"]
 
@@ -176,6 +180,8 @@ async def test_a_deleted_issue_is_tombstoned_in_an_incremental_run(workspace):
     assert project.confirmed == ["jira-1"]
     assert workspace.tombstoned() == ["jira-1"]
     assert await workspace.held() == {"jira-0"}
+    assert state.absence_check_skipped_reason is None
+    assert await workspace.recorded_skip_reason() is None
 
 
 @pytest.mark.asyncio
@@ -224,10 +230,14 @@ async def test_an_incomplete_listing_removes_nothing_and_the_run_still_succeeds(
     assert state.last_sync_status == "success"
     assert workspace.tombstoned() == []
     assert await workspace.held() == {"jira-0", "jira-1"}
+    assert state.absence_check_skipped_reason == "Jira search total changed during pagination"
+    assert await workspace.recorded_skip_reason() == "Jira search total changed during pagination"
 
     project.listing_error = None
-    await workspace.sync(project)
+    state = await workspace.sync(project)
     assert workspace.tombstoned() == ["jira-1"]
+    assert state.absence_check_skipped_reason is None
+    assert await workspace.recorded_skip_reason() is None
 
 
 @pytest.mark.asyncio
@@ -259,6 +269,22 @@ async def test_a_failed_confirmation_removes_nothing_and_the_run_still_succeeds(
     assert state.last_sync_status == "success"
     assert workspace.tombstoned() == []
     assert await workspace.held() == {"jira-0", "jira-1"}
+    assert await workspace.recorded_skip_reason() == "connection reset"
+
+
+@pytest.mark.asyncio
+async def test_a_source_that_cannot_list_its_scope_skips_no_absence_check(workspace):
+    project = JiraProject(existing={0, 1})
+    project.list_scope = None
+    await _synced(workspace, project)
+
+    project.move_on(existing={0})
+    state = await workspace.sync(project)
+
+    assert state.last_sync_status == "success"
+    assert workspace.tombstoned() == []
+    assert state.absence_check_skipped_reason is None
+    assert await workspace.recorded_skip_reason() is None
 
 
 @pytest.mark.asyncio

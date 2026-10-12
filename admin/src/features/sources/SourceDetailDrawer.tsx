@@ -1,5 +1,6 @@
+import { Info } from "lucide-react";
 import { formatCount, formatDateTime, formatInterval, formatRelative, formatUntil } from "@/lib/format";
-import { ActionCard, DetailDrawer, DrawerSection, PropertyList, StatusBadge } from "@/patterns";
+import { ActionCard, DetailDrawer, DrawerSection, Notice, PropertyList, StatusBadge } from "@/patterns";
 import { Button } from "@/ui/button";
 import { presentSourceSyncActivity } from "./model/sourceSyncActivity";
 import type { SourceRow } from "./model/sourceRows";
@@ -96,6 +97,7 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpe
             },
           ]}
         />
+        {presentation?.notice ? <Notice tone="idle" icon={Info}>{presentation.notice}</Notice> : null}
       </DrawerSection>
 
       <DrawerSection title="Content">
