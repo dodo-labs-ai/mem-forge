@@ -34,7 +34,7 @@ from memforge.llm.structured import (
     OUTPUT_TRUNCATED,
     PAYLOAD_TOO_LARGE,
     StructuredLlmError,
-    StructuredLlmImage,
+    StructuredImageInputs,
     structured_llm_max_concurrent,
 )
 from memforge.pipeline.bounded_work import collect_bounded
@@ -81,7 +81,7 @@ class LlmRequest:
     response_format: type[BaseModel]
     # The output the task asks for; the runner bounds it by the route's capacity.
     max_tokens: int
-    images: tuple[StructuredLlmImage, ...] = ()
+    images: StructuredImageInputs = ()
 
 
 # A client task method, called as ``call(prompt, max_tokens=..., model=...)``
@@ -94,7 +94,7 @@ class BudgetedClient(Protocol):
 
     def request_fits(
         self, prompt: str, *, response_format: type[BaseModel], max_tokens: int,
-        model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
+        model: str | None = None, images: StructuredImageInputs = (),
         reserve_correction: bool = True,
     ) -> bool: ...
 

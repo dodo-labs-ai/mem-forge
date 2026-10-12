@@ -28,6 +28,9 @@ from memforge.llm.structured_images import (
     StructuredLlmImageError,
     prepare_structured_llm_images as _prepare_structured_llm_images,
 )
+from memforge.llm.structured_image_delivery import ArtifactImageDelivery
+
+type StructuredImageInputs = tuple[StructuredLlmImage, ...] | ArtifactImageDelivery
 
 logger = logging.getLogger(__name__)
 
@@ -130,11 +133,28 @@ def structured_llm_max_concurrent(client: object) -> int:
 
 def _structured_user_content(
     prompt: str,
-    images: tuple[StructuredLlmImage, ...],
+    images: StructuredImageInputs,
 ) -> str | list[dict[str, object]]:
     if not images:
         return prompt
-    content: list[dict[str, object]] = [{"type": "text", "text": prompt}]
+    content: list[dict[str, object]] = []
+    if isinstance(images, ArtifactImageDelivery):
+        binding = dict(images.source_binding)
+        for ordinal, view in enumerate(images.views, 1):
+            encoded = base64.b64encode(view.body).decode("ascii")
+            content.extend(({
+                "type": "text", "text": (
+                    f"Delivery view {ordinal} ({view.kind}) of authorized Artifact {binding['artifact_ref']}; "
+                    f"Source Observation {binding['observation_id']}, revision {binding['observation_revision_id']}; "
+                    f"original top-left pixel rectangle {view.rectangle} in "
+                    f"{images.views[0].rectangle[2]}x{images.views[0].rectangle[3]}; "
+                    f"delivered dimensions {view.dimensions}; original SHA256 {binding['source_sha256']}. "
+                    "This is a reading view, not independent Evidence."
+                ),
+            }, {"type": "image_url", "image_url": {"url": f"data:{view.media_type};base64,{encoded}"}}))
+        content.append({"type": "text", "text": prompt})
+        return content
+    content.append({"type": "text", "text": prompt})
     for image in images:
         encoded = base64.b64encode(image.body).decode("ascii")
         content.extend(
@@ -1655,8 +1675,10 @@ class LiteLlmStructuredClient:
         *,
         telemetry_sink: Callable[[StructuredLlmCallTelemetry], None] | None = None,
         failure_trace_sink: FailureTraceSink | None = None,
+        completion_transport: Callable[..., Any] | None = None,
     ) -> None:
         self.config = config
+        self._completion_transport = completion_transport
         self._telemetry_sink = telemetry_sink
         self._failure_trace_sink = failure_trace_sink if failure_trace_sink is not None else local_failure_trace_sink_from_env()
         self._request_budgets = {}
@@ -1690,20 +1712,33 @@ class LiteLlmStructuredClient:
 
     def request_tokens(
         self, prompt: str, *, response_format: type[BaseModel],
-        model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
+        model: str | None = None, images: StructuredImageInputs = (),
     ) -> int:
         """Count the schema fallback transport, including its real instructions."""
         name = litellm_model_name(model or self.config.model)
         material = _json_text_prompt(prompt, response_format)
-        messages = [{"role": "user", "content": _structured_user_content(material, images)}]
+        content = _structured_user_content(material, images)
+        if isinstance(images, ArtifactImageDelivery):
+            images.validate(model=name, budget_identity=self.request_budget(model).identity)
+            encoded_bytes = len(json.dumps({"model": name, "messages": [{"role": "user", "content": content}],
+                                          "schema": response_format.model_json_schema()},
+                                         ensure_ascii=False).encode()) + 2048
+            if encoded_bytes > images.max_encoded_request_bytes:
+                raise StructuredLlmImageError(error_code="image_delivery_request_too_large")
+            # Actual label/schema text plus a conservative documented visual bound.
+            # Managed-route native overhead/resolution remain unverified.
+            content = [block for block in content if block["type"] == "text"]
+        messages = [{"role": "user", "content": content}]
         from memforge.llm.request_budget import metadata_model
 
-        return litellm.token_counter(model=metadata_model(name), messages=messages)
+        return litellm.token_counter(model=metadata_model(name), messages=messages) + (
+            images.visual_token_upper_bound if isinstance(images, ArtifactImageDelivery) else 0
+        )
 
     def request_fits(
         self, prompt: str, *, response_format: type[BaseModel],
         max_tokens: int, model: str | None = None,
-        images: tuple[StructuredLlmImage, ...] = (), reserve_correction: bool = True,
+        images: StructuredImageInputs = (), reserve_correction: bool = True,
     ) -> bool:
         budget = self.request_budget(model)
         if budget.available_input(max_tokens, reserve_correction=reserve_correction) < 0:
@@ -1730,7 +1765,7 @@ class LiteLlmStructuredClient:
 
     async def assess_claim_revisions(
         self, prompt: str, *, max_tokens: int = 32_768,
-        model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
+        model: str | None = None, images: StructuredImageInputs = (),
     ) -> ClaimRevisionWireResponse:
         return await self._call_schema(
             prompt=prompt, response_format=ClaimRevisionWireResponse,
@@ -1743,7 +1778,7 @@ class LiteLlmStructuredClient:
         *,
         max_tokens: int,
         model: str | None = None,
-        images: tuple[StructuredLlmImage, ...] = (),
+        images: StructuredImageInputs = (),
     ) -> ProjectionFragmentMemoryExtractionResponse:
         return await self._call_schema(
             prompt=prompt,
@@ -1755,7 +1790,7 @@ class LiteLlmStructuredClient:
 
     async def correct_projection_fragment_selectors(
         self, prompt: str, *, max_tokens: int, model: str | None = None,
-        images: tuple[StructuredLlmImage, ...] = (),
+        images: StructuredImageInputs = (),
     ) -> ProjectionFragmentSelectorCorrectionResponse:
         return await self._call_schema(
             prompt=prompt,
@@ -1767,7 +1802,7 @@ class LiteLlmStructuredClient:
 
     async def admit_candidates(
         self, prompt: str, *, max_tokens: int, model: str | None = None,
-        images: tuple[StructuredLlmImage, ...] = (),
+        images: StructuredImageInputs = (),
     ) -> CandidateAdmissionResponse:
         return await self._call_schema(
             prompt=prompt, response_format=CandidateAdmissionResponse,
@@ -1876,7 +1911,7 @@ class LiteLlmStructuredClient:
         max_tokens: int,
         model: str | None = None,
         retry_with_json_text: bool = True,
-        images: tuple[StructuredLlmImage, ...] = (),
+        images: StructuredImageInputs = (),
     ):
         admission = _process_structured_llm_admission(self.config.max_concurrent)
         async with capture_call(self._failure_trace_sink, prompt=prompt,
@@ -1898,7 +1933,7 @@ class LiteLlmStructuredClient:
         max_tokens: int,
         model: str | None,
         retry_with_json_text: bool,
-        images: tuple[StructuredLlmImage, ...],
+        images: StructuredImageInputs,
     ):
         model_name = litellm_model_name(model or self.config.model)
         started = perf_counter()
@@ -1912,6 +1947,10 @@ class LiteLlmStructuredClient:
         failure: _StructuredLlmFailure | None = None
         try:
             async with asyncio.timeout_at(deadline):
+                if isinstance(images, ArtifactImageDelivery) and not self.request_fits(
+                    prompt, response_format=response_format, max_tokens=max_tokens, model=model, images=images,
+                ):
+                    raise StructuredLlmImageError(error_code="image_delivery_input_capacity_exceeded")
                 prepared_images = await asyncio.to_thread(
                     _prepare_structured_llm_images,
                     images,
@@ -2011,7 +2050,7 @@ class LiteLlmStructuredClient:
         retry_with_json_text: bool,
         deadline: float,
         state: _StructuredCallState,
-        images: tuple[StructuredLlmImage, ...],
+        images: StructuredImageInputs,
     ):
         native_schema_transport = self._native_schema_transport(model_name)
         if (
@@ -2094,7 +2133,7 @@ class LiteLlmStructuredClient:
         native_schema_transport: NativeSchemaTransport,
         deadline: float,
         state: _StructuredCallState,
-        images: tuple[StructuredLlmImage, ...],
+        images: StructuredImageInputs,
         initial_validation_failure: _StructuredLlmFailure | None = None,
     ):
         """Attempt JSON text and repair one invalid response under the shared budget."""
@@ -2167,7 +2206,7 @@ class LiteLlmStructuredClient:
         native_schema_transport: NativeSchemaTransport,
         deadline: float,
         state: _StructuredCallState,
-        images: tuple[StructuredLlmImage, ...],
+        images: StructuredImageInputs,
         validation_failure: _StructuredLlmFailure | None = None,
         validation_source: Literal["native_schema", "json_text"] | None = None,
     ):
@@ -2181,6 +2220,11 @@ class LiteLlmStructuredClient:
                 validation_source=validation_source,
             )
         )
+        if isinstance(images, ArtifactImageDelivery) and not self.request_fits(
+            request_prompt, response_format=response_format, max_tokens=max_tokens,
+            model=model_name, images=images,
+        ):
+            raise StructuredLlmImageError(error_code="image_delivery_input_capacity_exceeded")
         messages = [{"role": "user", "content": _structured_user_content(request_prompt, images)}]
         provider_kwargs: dict[str, Any] = {}
         prompt_template_variable = self.config.prompt_template_variable
@@ -2264,7 +2308,8 @@ class LiteLlmStructuredClient:
                     max_tokens=max_tokens, timeout=remaining_s, num_retries=0,
                     **provider_kwargs, **schema_kwargs))
             try:
-                response = await litellm.acompletion(
+                transport = litellm.acompletion if self._completion_transport is None else self._completion_transport
+                response = await transport(
                     model=model_name,
                     messages=messages,
                     timeout=remaining_s,
