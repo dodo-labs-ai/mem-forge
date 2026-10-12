@@ -525,6 +525,8 @@ def test_binding_errors_wait_like_selection_errors(unbound, monkeypatch):
 def test_transient_failures_back_off_exponentially_up_to_the_cap(unbound, monkeypatch):
     db, _transcript, _request, _binding, clock = unbound
     monkeypatch.setattr(h, "_post_json", lambda *a, **kw: (_ for _ in ()).throw(OSError("503")))
+    # The session directory is not a Git checkout.
+    monkeypatch.setattr(h, "_git_value", lambda *a, **kw: None)
     delays = []
     for _attempt in range(8):
         attempted_at = clock[0]

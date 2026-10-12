@@ -11,6 +11,13 @@ from memforge.models import ContentItem
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
 
 
+@pytest.fixture(autouse=True)
+def unpaced_origin_requests(monkeypatch):
+    """Give each test its own origin limiters that leave no gap between requests."""
+    monkeypatch.setattr("memforge.genes.atlassian_auth._ATLASSIAN_REQUEST_LIMITERS", {})
+    monkeypatch.setattr("memforge.genes.confluence_gene.CONFLUENCE_REQUEST_INTERVAL_SECONDS", 0.0)
+
+
 def test_confluence_schema_hides_runtime_transport_fields_from_ui():
     fields = {field.key: field for field in ConfluenceGene.config_schema().fields}
 
