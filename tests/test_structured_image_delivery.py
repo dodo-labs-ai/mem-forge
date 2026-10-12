@@ -3,10 +3,9 @@
 from dataclasses import replace
 from hashlib import sha256
 from io import BytesIO
-from pathlib import Path
 from types import SimpleNamespace
 
-from PIL import Image
+from PIL import Image, ImageDraw
 from pydantic import BaseModel
 import pytest
 from litellm.exceptions import ServiceUnavailableError
@@ -47,11 +46,21 @@ def build(body, selected_client, **options):
     )
 
 
+def tall_png():
+    """A PNG larger than one native view, with distinct pixels in every tile."""
+    image = Image.new("RGB", (2040, 2410))
+    draw = ImageDraw.Draw(image)
+    for top in range(0, 2410, 10):
+        for left in range(0, 2040, 10):
+            draw.rectangle((left, top, left + 9, top + 9), fill=(left % 256, top % 256, (left + top) % 256))
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 @pytest.fixture(scope="module")
 def authentic():
-    body = (Path(__file__).parents[1] / "docs/design/images/revision-update-flow.png").read_bytes()
-    assert sha256(body).hexdigest() == "1bddb850aeb0d2b51cf78a3a4c7649b2c422718bb51a504ea6e0f35ef16234aa"
-    return build(body, client())
+    return build(tall_png(), client())
 
 
 def test_actual_png_complete_frozen_source_pixels(authentic):
