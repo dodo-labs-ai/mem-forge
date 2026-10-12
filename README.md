@@ -57,8 +57,8 @@ apply, and show the source for each one you rely on.
 From here on, plugin hooks upload eligible session windows, so what you decide
 in a session becomes memory too.
 
-The [quickstart](docs/quickstart.md) covers model settings,
-[plugin routing](docs/quickstart.md#plugin-routing) for a hosted endpoint or
+The [quickstart](https://github.com/shno-labs/mem-forge/blob/main/docs/quickstart.md) covers model settings,
+[plugin routing](https://github.com/shno-labs/mem-forge/blob/main/docs/quickstart.md#plugin-routing) for a hosted endpoint or
 more than one workspace, local folders, the host CLI and network details.
 
 ## Why MemForge
@@ -91,7 +91,7 @@ endpoints and keys, and those providers receive what is sent for inference.
 Session text is redacted in the plugin and again in the service, and raw
 conversation windows are not kept.
 
-See [how MemForge compares](docs/comparison.md) with Mem0, Zep, claude-mem and
+See [how MemForge compares](https://github.com/shno-labs/mem-forge/blob/main/docs/comparison.md) with Mem0, Zep, claude-mem and
 Unblocked.
 
 ## How it works
@@ -124,8 +124,8 @@ flowchart LR
    related ones are linked.
 4. **Recall.** Agents call `search`, `get_memory` and `get_resource` over MCP.
 
-More detail: [architecture](docs/architecture.md) and
-[agent client integration](docs/integrations/agent-clients.md).
+More detail: [architecture](https://github.com/shno-labs/mem-forge/blob/main/docs/architecture.md) and
+[agent client integration](https://github.com/shno-labs/mem-forge/blob/main/docs/integrations/agent-clients.md).
 
 ## Integrations
 
@@ -175,7 +175,7 @@ agents that do the work.
   </tr>
 </table>
 
-[Add a source](docs/quickstart.md#4-add-a-source) lists what each one syncs and
+[Add a source](https://github.com/shno-labs/mem-forge/blob/main/docs/quickstart.md#4-add-a-source) lists what each one syncs and
 how to scope it. Need one that is missing?
 [Open an issue](https://github.com/shno-labs/mem-forge/issues).
 
@@ -190,11 +190,11 @@ how to scope it. Need one that is missing?
 
 ## Documentation
 
-- [Quickstart](docs/quickstart.md): setup, models, plugins, sources, CLI,
+- [Quickstart](https://github.com/shno-labs/mem-forge/blob/main/docs/quickstart.md): setup, models, plugins, sources, CLI,
   development from source
-- [Docs index](docs/README.md): architecture, API, design notes and ADRs
-- [Contributing](CONTRIBUTING.md)
+- [Docs index](https://github.com/shno-labs/mem-forge/blob/main/docs/README.md): architecture, API, design notes and ADRs
+- [Contributing](https://github.com/shno-labs/mem-forge/blob/main/CONTRIBUTING.md)
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](https://github.com/shno-labs/mem-forge/blob/main/LICENSE).
