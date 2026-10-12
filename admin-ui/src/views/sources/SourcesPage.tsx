@@ -1605,9 +1605,9 @@ function AgentSessionSetupDialog({
               <code className="rounded bg-muted px-1 font-mono text-[11px]">MEMFORGE_API_TOKEN</code>{" "}
               when the plugin should reach a non-default MemForge instance. See{" "}
               <span className="font-medium text-foreground">
-                docs/design/agent-session-saas-plugin-flow.md
+                docs/quickstart.md
               </span>{" "}
-              in the MemForge repository for the full design.
+              in the MemForge repository for plugin routing.
             </p>
           </div>
         )}

@@ -7,5 +7,5 @@
 ## Project
 
 - See `README.md` for setup and project orientation.
-- See `docs/architecture.md` for the full system design.
-- See `docs/design/agent-session-saas-plugin-flow.md` for the Codex and Claude Code adapter flow.
+- See `docs/architecture.md` for the system overview.
+- Design records (the full architecture, ADRs, subsystem designs, research and the domain glossary) live in the MemForge Cloud repository under `docs/oss/`. Do not add them to this repository.

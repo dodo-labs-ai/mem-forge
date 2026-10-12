@@ -1,6 +1,6 @@
 """SQLite database for documents, memories, entities, sync state, and configuration.
 
-Mirrors the schema from architecture.md Section 9. Uses aiosqlite with WAL mode.
+Uses aiosqlite with WAL mode.
 FK enforcement is OFF — all cascades are implemented manually in delete methods.
 FTS5 rows must be manually synced on insert/update/delete of memories.
 """
