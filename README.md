@@ -1,4 +1,4 @@
-<h1><img src=".github/assets/logo.svg" width="36" align="absmiddle" alt=""> MemForge</h1>
+<h1><img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/logo.svg" width="36" align="absmiddle" alt=""> MemForge</h1>
 
 **Give every agent your team's brain on day one.**
 
@@ -13,8 +13,8 @@ up to date. Built from your docs, tickets, chat and agent sessions.
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/demo-dark.gif">
-    <img src=".github/assets/demo-light.gif" alt="A new hire asks a coding agent how to answer a support ticket. The agent searches MemForge and answers with two team rules, citing a GitHub Pages doc and a Jira ticket." width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/demo-dark.gif">
+    <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/demo-light.gif" alt="A new hire asks a coding agent how to answer a support ticket. The agent searches MemForge and answers with two team rules, citing a GitHub Pages doc and a Jira ticket." width="100%">
   </picture>
 </p>
 
@@ -76,7 +76,7 @@ documents, MemForge marks memories that repeat, update or contradict each
 other.
 
 <p align="center">
-  <img src=".github/assets/memory-detail.png" alt="A memory in the admin UI: a decision from a Jira ticket that updates an older memory from the support playbook, shown with the ticket text it rests on." width="100%">
+  <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/memory-detail.png" alt="A memory in the admin UI: a decision from a Jira ticket that updates an older memory from the support playbook, shown with the ticket text it rests on." width="100%">
 </p>
 
 **Every answer has a source.** `get_memory` returns the supporting text and a
@@ -135,8 +135,8 @@ agents that do the work.
 **Agent integrations**
 
 <p>
-  <img src=".github/assets/icons/claude.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Claude&nbsp;Code&nbsp;&nbsp;&nbsp;
-  <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/openai-dark.svg"><img src=".github/assets/icons/openai-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;Codex
+  <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/claude.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Claude&nbsp;Code&nbsp;&nbsp;&nbsp;
+  <picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/openai-dark.svg"><img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/openai-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;Codex
 </p>
 
 **Memory sources**
@@ -145,32 +145,32 @@ agents that do the work.
   <tr>
     <td>Docs and wikis</td>
     <td nowrap>
-      <img src=".github/assets/icons/confluence.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Confluence&nbsp;&nbsp;&nbsp;
-      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/github-dark.svg"><img src=".github/assets/icons/github-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;GitHub&nbsp;Pages&nbsp;&nbsp;&nbsp;
-      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/github-dark.svg"><img src=".github/assets/icons/github-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;GitHub&nbsp;repo&nbsp;docs&nbsp;&nbsp;&nbsp;
-      <img src=".github/assets/icons/folder.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Local&nbsp;folders
+      <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/confluence.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Confluence&nbsp;&nbsp;&nbsp;
+      <picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/github-dark.svg"><img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/github-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;GitHub&nbsp;Pages&nbsp;&nbsp;&nbsp;
+      <picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/github-dark.svg"><img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/github-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;GitHub&nbsp;repo&nbsp;docs&nbsp;&nbsp;&nbsp;
+      <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/folder.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Local&nbsp;folders
     </td>
   </tr>
   <tr>
     <td>Tickets</td>
-    <td nowrap><img src=".github/assets/icons/jira.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Jira</td>
+    <td nowrap><img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/jira.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Jira</td>
   </tr>
   <tr>
     <td>Chat</td>
-    <td nowrap><img src=".github/assets/icons/teams.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Teams</td>
+    <td nowrap><img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/teams.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Teams</td>
   </tr>
   <tr>
     <td>Agent sessions</td>
     <td nowrap>
-      <img src=".github/assets/icons/claude.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Claude&nbsp;Code&nbsp;&nbsp;&nbsp;
-      <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/openai-dark.svg"><img src=".github/assets/icons/openai-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;Codex
+      <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/claude.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Claude&nbsp;Code&nbsp;&nbsp;&nbsp;
+      <picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/openai-dark.svg"><img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/openai-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;Codex
     </td>
   </tr>
   <tr>
     <td>Planned</td>
     <td nowrap>
-      <img src=".github/assets/icons/slack.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Slack&nbsp;&nbsp;&nbsp;
-      <img src=".github/assets/icons/obsidian.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Obsidian
+      <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/slack.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Slack&nbsp;&nbsp;&nbsp;
+      <img src="https://raw.githubusercontent.com/shno-labs/mem-forge/main/.github/assets/icons/obsidian.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Obsidian
     </td>
   </tr>
 </table>
