@@ -144,7 +144,7 @@ agents that do the work.
 <table>
   <tr>
     <td>Docs and wikis</td>
-    <td>
+    <td nowrap>
       <img src=".github/assets/icons/confluence.svg" height="18" align="absmiddle" alt="">&nbsp;Confluence&nbsp;&nbsp;&nbsp;
       <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/github-dark.svg"><img src=".github/assets/icons/github-light.svg" height="18" align="absmiddle" alt=""></picture>&nbsp;GitHub&nbsp;Pages&nbsp;&nbsp;&nbsp;
       <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/github-dark.svg"><img src=".github/assets/icons/github-light.svg" height="18" align="absmiddle" alt=""></picture>&nbsp;GitHub&nbsp;repo&nbsp;docs&nbsp;&nbsp;&nbsp;
@@ -153,22 +153,22 @@ agents that do the work.
   </tr>
   <tr>
     <td>Tickets</td>
-    <td><img src=".github/assets/icons/jira.svg" height="18" align="absmiddle" alt="">&nbsp;Jira</td>
+    <td nowrap><img src=".github/assets/icons/jira.svg" height="18" align="absmiddle" alt="">&nbsp;Jira</td>
   </tr>
   <tr>
     <td>Chat</td>
-    <td><img src=".github/assets/icons/teams.svg" height="18" align="absmiddle" alt="">&nbsp;Teams</td>
+    <td nowrap><img src=".github/assets/icons/teams.svg" height="18" align="absmiddle" alt="">&nbsp;Teams</td>
   </tr>
   <tr>
     <td>Agent sessions</td>
-    <td>
+    <td nowrap>
       <img src=".github/assets/icons/claude.svg" height="18" align="absmiddle" alt="">&nbsp;Claude&nbsp;Code&nbsp;&nbsp;&nbsp;
       <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/openai-dark.svg"><img src=".github/assets/icons/openai-light.svg" height="18" align="absmiddle" alt=""></picture>&nbsp;Codex
     </td>
   </tr>
   <tr>
     <td>Planned</td>
-    <td><img src=".github/assets/icons/slack.svg" height="18" align="absmiddle" alt="">&nbsp;Slack</td>
+    <td nowrap><img src=".github/assets/icons/slack.svg" height="18" align="absmiddle" alt="">&nbsp;Slack</td>
   </tr>
 </table>
 
