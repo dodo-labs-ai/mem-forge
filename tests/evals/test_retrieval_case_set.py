@@ -490,24 +490,15 @@ fixtures:
         load_case_set("retrieval-core-v1")
 
 
-def test_hash_case_set_module_checks_packaged_manifest() -> None:
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "memforge.evals.retrieval.hash_case_set",
-            "--case-set",
-            "retrieval-core-v1",
-            "--check",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+def test_hash_case_set_module_checks_packaged_manifest(capsys) -> None:
+    from memforge.evals.retrieval import hash_case_set
 
-    assert completed.returncode == 0
-    assert "retrieval-core-v1" in completed.stdout
-    assert "OK" in completed.stdout
+    exit_code = hash_case_set.main(["--case-set", "retrieval-core-v1", "--check"])
+
+    stdout = capsys.readouterr().out
+    assert exit_code == 0
+    assert "retrieval-core-v1" in stdout
+    assert "OK" in stdout
 
 
 def test_hash_case_set_module_reports_stale_manifest_on_check(tmp_path) -> None:
@@ -555,9 +546,9 @@ def test_hash_case_set_module_reports_stale_manifest_on_check(tmp_path) -> None:
     assert "Traceback" not in completed.stderr
 
 
-def test_hash_case_set_module_writes_manifest_sha(tmp_path, monkeypatch) -> None:
+def test_hash_case_set_module_writes_manifest_sha(tmp_path, monkeypatch, capsys) -> None:
     from memforge.evals.retrieval import compute_case_set_sha, load_case_set
-    from memforge.evals.retrieval import schema
+    from memforge.evals.retrieval import hash_case_set, schema
 
     source_case_dir = resources.files("memforge.evals.retrieval.cases")
     case_dir = tmp_path / "cases"
@@ -589,24 +580,12 @@ def test_hash_case_set_module_writes_manifest_sha(tmp_path, monkeypatch) -> None
     stale = load_case_set("retrieval-core-v1", verify_sha=False)
     assert compute_case_set_sha(stale) != stale.manifest.case_set_sha
 
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "memforge.evals.retrieval.hash_case_set",
-            "--case-set",
-            "retrieval-core-v1",
-            "--write",
-            "--case-root",
-            str(case_dir),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
+    exit_code = hash_case_set.main(
+        ["--case-set", "retrieval-core-v1", "--write", "--case-root", str(case_dir)]
     )
 
-    assert completed.returncode == 0
-    assert "wrote" in completed.stdout
+    assert exit_code == 0
+    assert "wrote" in capsys.readouterr().out
     assert "case_files:\n  - metadata_lexical.yaml" in manifest_path.read_text(encoding="utf-8")
     fixed = load_case_set("retrieval-core-v1")
     assert compute_case_set_sha(fixed) == fixed.manifest.case_set_sha

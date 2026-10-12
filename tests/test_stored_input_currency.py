@@ -22,6 +22,7 @@ from memforge.storage.database import Database
 from tests.test_source_reprocess import RawKeepingDocumentStore
 from tests.test_sync_bookkeeping import (
     FailingMemoryExtractor,
+    _skip_retry_delay,
     _unit_input,
     NoopMemoryEngine,
     ProjectionFragmentRecordingExtractor,
@@ -132,7 +133,7 @@ class Harness:
     def orchestrator(self, extractor=None) -> GeneSyncOrchestrator:
         return GeneSyncOrchestrator(
             db=self.db, doc_store=self.store, memory_extractor=extractor or self.extractor,
-            memory_engine=self.engine, memory_store=None, max_concurrent=1,
+            memory_engine=self.engine, memory_store=None, max_concurrent=1, retry_sleep=_skip_retry_delay,
         )
 
     async def sync(self, extractor=None):
