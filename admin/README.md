@@ -1,7 +1,7 @@
 # MemForge admin UI
 
 The admin UI that replaces `admin-ui/` (the V1 admin UI). Both run side by side
-until V1 is removed; see [ADR 0044](../docs/adr/0044-build-the-admin-ui-v2-beside-v1-and-remove-v1-after-a-parallel-run.md).
+until V1 is removed.
 
 ## Run
 

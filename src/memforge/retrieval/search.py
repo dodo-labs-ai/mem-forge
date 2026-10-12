@@ -3,8 +3,6 @@
 Vector, content BM25/FTS, metadata lexical, and entity-graph channels run in
 parallel, then fuse through intent-specific weighted RRF before the final ranking
 and source/time page slicing.
-
-Architecture reference: docs/architecture.md Section 10.
 """
 
 from __future__ import annotations
