@@ -157,9 +157,6 @@ Each plugin does two things:
   machine under `~/.memforge-agent/artifacts`. The proxy does not need the
   `memforge` CLI.
 
-See [integrations/agent-clients.md](integrations/agent-clients.md) for the
-client-side versus service-side design.
-
 ### Plugin routing
 
 By default the plugins use `http://127.0.0.1:8765`. Set `MEMFORGE_API_URL` and
@@ -361,9 +358,7 @@ npm ci
 npm run dev
 ```
 
-V1 remains in `admin-ui/` during the parallel run described by
-[ADR 0044](adr/0044-build-the-admin-ui-v2-beside-v1-and-remove-v1-after-a-parallel-run.md).
-Source setup still opens V1 pages. For that flow, also start V1 in a third
+V1 remains in `admin-ui/` until V2 replaces it. Source setup still opens V1 pages. For that flow, also start V1 in a third
 terminal at `http://localhost:5174`:
 
 ```bash
@@ -398,8 +393,8 @@ Project layout:
 ```text
 src/memforge/        Python service, CLI, pipeline, genes, plugin MCP proxy
 admin/               V2 React admin console, served at /v2/
-admin-ui/            V1 console during the parallel run (ADR 0044)
+admin-ui/            V1 console, until V2 replaces it
 integrations/        Codex and Claude Code plugin packages
-docs/design/         Design notes for memory extraction and agent sessions
+docs/                Quickstart, architecture overview and API notes
 tests/               Python tests
 ```

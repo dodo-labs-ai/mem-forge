@@ -124,8 +124,7 @@ flowchart LR
    related ones are linked.
 4. **Recall.** Agents call `search`, `get_memory` and `get_resource` over MCP.
 
-More detail: [architecture](https://github.com/shno-labs/mem-forge/blob/main/docs/architecture.md) and
-[agent client integration](https://github.com/shno-labs/mem-forge/blob/main/docs/integrations/agent-clients.md).
+More detail: [architecture overview](https://github.com/shno-labs/mem-forge/blob/main/docs/architecture.md).
 
 ## Integrations
 
