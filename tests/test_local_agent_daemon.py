@@ -708,7 +708,7 @@ def test_local_agent_flushes_dirty_progress_before_lease_heartbeat():
         attempt_count=1,
         lease_seconds=60,
         interval_seconds=20,
-        progress_flush_seconds=1,
+        progress_flush_seconds=0.05,
     ) as lease:
         lease.report_progress(
             {

@@ -1194,7 +1194,7 @@ def _github_raw_process_transport(monkeypatch):
             body.write(raw)
             body.seek(0)
             return popen(
-                [sys.executable, "-c", "import shutil,sys; shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)"],
+                [sys.executable, "-S", "-c", "import shutil,sys; shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)"],
                 stdin=body, **kwargs,
             )
 

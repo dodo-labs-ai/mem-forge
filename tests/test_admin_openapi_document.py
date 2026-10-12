@@ -1,6 +1,8 @@
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +23,7 @@ def _export(tmp_path: Path, seed: str) -> str:
 
 
 def test_openapi_document_is_identical_across_hash_seeds(tmp_path):
-    documents = {_export(tmp_path, seed) for seed in HASH_SEEDS}
+    with ThreadPoolExecutor(max_workers=len(HASH_SEEDS)) as exports:
+        documents = set(exports.map(partial(_export, tmp_path), HASH_SEEDS))
 
     assert len(documents) == 1
