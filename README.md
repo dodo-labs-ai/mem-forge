@@ -168,7 +168,10 @@ agents that do the work.
   </tr>
   <tr>
     <td>Planned</td>
-    <td nowrap><img src=".github/assets/icons/slack.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Slack</td>
+    <td nowrap>
+      <img src=".github/assets/icons/slack.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Slack&nbsp;&nbsp;&nbsp;
+      <img src=".github/assets/icons/obsidian.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Obsidian
+    </td>
   </tr>
 </table>
 
