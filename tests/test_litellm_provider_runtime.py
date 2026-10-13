@@ -71,10 +71,15 @@ async def test_structured_client_omits_empty_base_url_and_api_key(monkeypatch):
     assert "api_key" not in captured
 
 
-def _embedding_runtime(model: str, *, base_url: str | None = None, api_key: str | None = None):
+def _embedding_runtime(route: str, *, base_url: str | None = None, api_key: str | None = None):
     from memforge.llm.embedding import EmbeddingRuntime, EmbeddingSettings
+    from memforge.llm.providers import ResolvedInvocation
 
-    return EmbeddingRuntime(EmbeddingSettings(model=model, base_url=base_url, api_key=api_key))
+    return EmbeddingRuntime(
+        EmbeddingSettings(
+            invocation=ResolvedInvocation(route=route, api_base=base_url, api_key=api_key),
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -103,7 +108,7 @@ async def test_provider_prefixed_embedding_uses_litellm_without_empty_credential
 
 
 @pytest.mark.asyncio
-async def test_bare_embedding_model_uses_the_openai_route_with_the_configured_endpoint(monkeypatch):
+async def test_openai_route_embedding_is_sent_to_the_configured_endpoint(monkeypatch):
     captured = {}
 
     async def fake_aembedding(**kwargs):
@@ -113,7 +118,7 @@ async def test_bare_embedding_model_uses_the_openai_route_with_the_configured_en
     monkeypatch.setattr("litellm.aembedding", fake_aembedding)
 
     vector = await _embedding_runtime(
-        "text-embedding-3-small",
+        "openai/text-embedding-3-small",
         base_url="https://embedding.example.test/v1",
         api_key="key",
     ).embed_query("alpha")
@@ -207,28 +212,24 @@ async def test_openai_compatible_embedding_rejects_invalid_response_indexes(monk
 
     with pytest.raises(ValueError, match=r"Embedding response indices"):
         await _embedding_runtime(
-            "text-embedding-3-small",
+            "openai/text-embedding-3-small",
             base_url="https://embedding.example.test/v1",
             api_key="key",
         ).embed_documents(["alpha", "beta"])
 
 
-def test_rerank_model_follows_effective_llm_config() -> None:
+def test_rerank_model_follows_the_generation_model() -> None:
     from memforge.config import AppConfig
-    from memforge.runtime import EffectiveLlmConfig, _retrieval_config_for_llm
+    from memforge.llm.providers import ResolvedInvocation
+    from memforge.runtime import ResolvedModels, _retrieval_config_for_models
 
     config = AppConfig()
-    llm = EffectiveLlmConfig(
-        enrichment_model="litellm_proxy/claude-sonnet",
-        enrichment_base_url="",
-        enrichment_api_key="",
-        request_timeout_s=30.0,
-        embedding_model="litellm_proxy/text-embedding-3-small",
-        embedding_base_url="",
-        embedding_api_key="",
+    models = ResolvedModels(
+        generation=ResolvedInvocation(route="litellm_proxy/claude-sonnet"),
+        embedding=ResolvedInvocation(route="litellm_proxy/text-embedding-3-small"),
     )
 
-    retrieval = _retrieval_config_for_llm(config, llm)
+    retrieval = _retrieval_config_for_models(config, models)
 
     assert retrieval.rerank_model == "litellm_proxy/claude-sonnet"
     assert config.retrieval.rerank_model != retrieval.rerank_model

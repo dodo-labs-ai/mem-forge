@@ -1,5 +1,6 @@
 import { Outlet } from "react-router-dom";
 import { DocumentTitle } from "./DocumentTitle";
+import { ModelSetupNotice } from "./ModelSetupNotice";
 import { Sidebar } from "./Sidebar";
 import { Topbar } from "./Topbar";
 
@@ -12,6 +13,7 @@ export function AppShell() {
         <Topbar />
         <main className="flex-1 overflow-y-auto">
           <div className="mx-auto w-full max-w-[1280px] px-6 py-6">
+            <ModelSetupNotice />
             <Outlet />
           </div>
         </main>

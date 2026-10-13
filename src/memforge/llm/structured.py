@@ -22,14 +22,18 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from memforge.llm.failure_trace import (
     FailureTraceSink, capture_call, current_capture, local_failure_trace_sink_from_env,
 )
-from memforge.llm.providers import litellm_optional_kwargs
+from memforge.llm.providers import ResolvedInvocation, litellm_optional_kwargs
 from memforge.llm.structured_images import (
     StructuredLlmImage,
     StructuredLlmImageError,
     prepare_structured_llm_images as _prepare_structured_llm_images,
 )
 from memforge.llm.structured_image_delivery import ArtifactImageDelivery
-from memforge.llm.transport import is_retryable_provider_error, provider_status_code
+from memforge.llm.transport import (
+    is_connection_failure,
+    is_retryable_provider_error,
+    provider_status_code,
+)
 
 type StructuredImageInputs = tuple[StructuredLlmImage, ...] | ArtifactImageDelivery
 
@@ -590,6 +594,9 @@ class OfflineSemanticJudgeResponse(StructuredResponseModel):
 
 @dataclass(frozen=True)
 class StructuredLlmConfig:
+    # The LiteLLM route of the main model, with the endpoint and credential
+    # its requests are made with. A runtime takes all three, and
+    # ``extra_params``, from one resolved invocation (``for_invocation``).
     model: str
     base_url: str | None
     api_key: str | None
@@ -621,6 +628,19 @@ class StructuredLlmConfig:
     # credentials and capacity caps, and has its own schema wire contract.
     decision_model: str | None = None
     decision_native_schema_transport: NativeSchemaTransport = "auto"
+    # The extra request parameters of the resolved invocation.
+    extra_params: Mapping[str, Any] = dataclass_field(default_factory=dict)
+
+    @classmethod
+    def for_invocation(cls, invocation: ResolvedInvocation, **settings: Any) -> StructuredLlmConfig:
+        """Build the configuration of a client that calls one resolved invocation."""
+        return cls(
+            model=invocation.route,
+            base_url=invocation.api_base,
+            api_key=invocation.api_key,
+            extra_params=invocation.extra_params,
+            **settings,
+        )
 
 
 @dataclass(frozen=True)
@@ -665,6 +685,8 @@ class StructuredLlmCallTelemetry:
     diagnostic_attempts: tuple[StructuredLlmAttemptTelemetry, ...] = ()
     # The model that answered the call.
     model: str | None = None
+    # The model id the provider reported in its latest answer, if it reported one.
+    provider_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -722,6 +744,11 @@ class StructuredLlmMetricsCollector:
             self._calls.append(telemetry)
         if self._parent is not None:
             self._parent.record(telemetry)
+
+    def calls(self) -> tuple[StructuredLlmCallTelemetry, ...]:
+        """Every call recorded so far, in the order the calls ended."""
+        with self._lock:
+            return tuple(self._calls)
 
     def checkpoint(self) -> int:
         """Mark the start of a stage without replacing its Unit collector."""
@@ -812,11 +839,13 @@ class _StructuredCallState:
     total_tokens: int = 0
     usage_complete: bool = True
     usage_seen: bool = False
+    provider_model: str | None = None
     diagnostic_attempts: list[StructuredLlmAttemptTelemetry] = dataclass_field(
         default_factory=list
     )
 
     def record_response(self, response: object) -> None:
+        self.provider_model = _safe_response_label(_object_value(response, "model"))
         usage = _response_usage(response)
         if usage is None:
             self.usage_complete = False
@@ -922,6 +951,7 @@ class _StructuredCallState:
             total_tokens=self.total_tokens if usage_known else None,
             diagnostic_attempts=tuple(self.diagnostic_attempts),
             model=self.model,
+            provider_model=self.provider_model,
         )
 
 
@@ -993,12 +1023,18 @@ class StructuredLlmError(RuntimeError):
         error_code: str = "structured_llm_error",
         validation_fields: tuple[tuple[str, str], ...] = (),
         diagnostic: Any = None,
+        status_code: int | None = None,
+        unreachable: bool = False,
     ) -> None:
         super().__init__(message)
         self.terminal_category = terminal_category
         self.error_code = error_code
         self.validation_fields = validation_fields
         self.diagnostic = diagnostic
+        # The HTTP status the provider answered with, when it answered.
+        self.status_code = status_code
+        # The request never reached the provider.
+        self.unreachable = unreachable
 
 
 class _InvalidModelOutput(Exception):
@@ -1015,6 +1051,10 @@ class _StructuredLlmFailure:
     # Whole-object rules have no field path to point at, so the schema repair
     # prompt names them by the validator's own message.
     model_level_messages: tuple[str, ...] = ()
+    # The HTTP status the provider answered with, when it answered.
+    status_code: int | None = None
+    # The request never reached the provider.
+    unreachable: bool = False
 
     def to_error(self, *, timeout_s: float | None = None) -> StructuredLlmError:
         if self.terminal_category == "deadline_exceeded":
@@ -1035,6 +1075,8 @@ class _StructuredLlmFailure:
             terminal_category=self.terminal_category,
             error_code=self.error_code,
             validation_fields=self.validation_fields,
+            status_code=self.status_code,
+            unreachable=self.unreachable,
         )
 
 
@@ -1142,6 +1184,8 @@ def _structured_failure(
             terminal_category=terminal_category or exc.terminal_category,
             error_code=exc.error_code,
             validation_fields=exc.validation_fields,
+            status_code=exc.status_code,
+            unreachable=exc.unreachable,
         )
     if isinstance(exc, _InvalidModelOutput) and exc.__cause__ is not None:
         exc, terminal_category = exc.__cause__, "invalid_response"
@@ -1153,6 +1197,8 @@ def _structured_failure(
         error_code=_safe_provider_error_code(exc),
         validation_fields=_safe_validation_fields(exc),
         model_level_messages=_model_level_validation_messages(exc),
+        status_code=provider_status_code(exc),
+        unreachable=is_connection_failure(exc),
     )
 
 
@@ -1744,6 +1790,19 @@ class LiteLlmStructuredClient:
             yield selected
 
 
+    async def answer_schema(
+        self,
+        prompt: str,
+        *,
+        response_format: type[BaseModel],
+        max_tokens: int,
+        model: str | None = None,
+    ):
+        """Answer ``prompt`` as one validated ``response_format`` object."""
+        return await self._call_schema(
+            prompt=prompt, response_format=response_format, max_tokens=max_tokens, model=model,
+        )
+
     async def evaluate_revision_work(self, prompt, *, response_format, max_tokens, model=None, images=()):
         return await self._call_schema(prompt=prompt, response_format=response_format,
                                        max_tokens=max_tokens, model=model, images=images)
@@ -2307,6 +2366,7 @@ class LiteLlmStructuredClient:
                         api_base=self.config.base_url,
                         api_key=self.config.api_key,
                     ),
+                    **self.config.extra_params,
                     **provider_kwargs,
                     **schema_kwargs,
                 )

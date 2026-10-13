@@ -18,6 +18,7 @@ from PIL import Image
 from pydantic import ConfigDict, ValidationError
 
 from memforge.evals.agent_evaluation import QualitySignalCollector, quality_signal_scope
+from memforge.llm.capability import CapabilityCheckResponse
 from memforge.llm.structured import (
     AgentSessionAuthorityResponse,
     CandidateAdmissionDecision,
@@ -765,6 +766,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
             '{"verdict":"criterion_satisfied",'
             '"confidence":"high"}'
         ),
+        "CapabilityCheckResponse": '{"probe":{"label":"memforge","confirmed":true,"items":[]}}',
     }
 
     async def fake_acompletion(**kwargs):
@@ -806,6 +808,9 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "judge_offline_semantics": lambda: client.judge_offline_semantics(
             "prompt",
             model="gateway/judge-model",
+        ),
+        "answer_schema": lambda: client.answer_schema(
+            "prompt", response_format=CapabilityCheckResponse, max_tokens=512,
         ),
     }
     public_async_operations = {

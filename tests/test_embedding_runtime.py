@@ -1,4 +1,4 @@
-"""The Embedding Runtime: route, attempts, deadline, slicing, validation, cache."""
+"""The Embedding Runtime: invocation, attempts, deadline, slicing, validation, cache."""
 
 from __future__ import annotations
 
@@ -15,9 +15,11 @@ from memforge.llm.embedding import (
     EmbeddingRuntime,
     EmbeddingSettings,
     InvalidEmbeddingResponse,
-    litellm_embedding_route,
 )
+from memforge.llm.providers import ResolvedInvocation
 from tests.embedding_fixture import embedding_response
+
+_OLLAMA = ResolvedInvocation(route="ollama/embedding-model")
 
 
 class ProviderFailure(Exception):
@@ -69,57 +71,37 @@ def recorded_pauses(monkeypatch) -> list[float]:
 
 def _runtime(provider: ScriptedProvider, **settings: Any) -> EmbeddingRuntime:
     return EmbeddingRuntime(
-        EmbeddingSettings(model="ollama/embedding-model", **settings),
+        EmbeddingSettings(invocation=_OLLAMA, **settings),
         transport=provider,
     )
 
 
-@pytest.mark.parametrize(
-    ("model", "route"),
-    [
-        ("text-embedding-3-small", "openai/text-embedding-3-small"),
-        (" ollama/embedding-model ", "ollama/embedding-model"),
-        ("openrouter/openai/text-embedding-3-small", "openrouter/openai/text-embedding-3-small"),
-        ("litellm_proxy/text-embedding-3-small", "litellm_proxy/text-embedding-3-small"),
-        ("BAAI/bge-m3", "openai/BAAI/bge-m3"),
-    ],
-)
-def test_a_known_provider_prefix_is_a_route_and_any_other_name_is_an_openai_model_id(model, route) -> None:
-    assert litellm_embedding_route(model) == route
+def test_a_runtime_is_configured_when_it_has_an_invocation() -> None:
+    assert EmbeddingRuntime(EmbeddingSettings(invocation=_OLLAMA)).configured is True
+    assert EmbeddingRuntime(EmbeddingSettings(invocation=None)).configured is False
 
 
-def test_a_provider_registered_with_litellm_is_a_route(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "litellm.custom_provider_map",
-        [{"provider": "house-models", "custom_handler": object()}],
+def test_a_keyless_invocation_is_configured() -> None:
+    keyless = ResolvedInvocation(
+        route="openai/local-embedding",
+        api_base="http://localhost:11434/v1",
+        api_key="no-api-key",
     )
 
-    assert litellm_embedding_route("house-models/embed-1") == "house-models/embed-1"
-
-
-@pytest.mark.parametrize(
-    ("settings", "configured"),
-    [
-        (EmbeddingSettings(model=""), False),
-        (EmbeddingSettings(model="ollama/embedding-model"), True),
-        (EmbeddingSettings(model="bare-model"), False),
-        (EmbeddingSettings(model="bare-model", base_url="https://embed.test/v1"), False),
-        (EmbeddingSettings(model="bare-model", base_url="https://embed.test/v1", api_key="key"), True),
-        (EmbeddingSettings(model="BAAI/bge-m3"), False),
-        (EmbeddingSettings(model="BAAI/bge-m3", base_url="https://embed.test/v1", api_key="key"), True),
-    ],
-)
-def test_configured_needs_a_model_and_a_way_to_reach_it(settings, configured) -> None:
-    assert EmbeddingRuntime(settings).configured is configured
+    assert EmbeddingRuntime(EmbeddingSettings(invocation=keyless)).configured is True
 
 
 def test_settings_repr_does_not_show_the_api_key() -> None:
-    assert "secret-key" not in repr(EmbeddingSettings(model="bare-model", api_key="secret-key"))
+    settings = EmbeddingSettings(
+        invocation=ResolvedInvocation(route="openai/bare-model", api_key="secret-key"),
+    )
+
+    assert "secret-key" not in repr(settings)
 
 
 async def test_a_runtime_without_a_model_fails_before_any_request() -> None:
     provider = ScriptedProvider()
-    runtime = EmbeddingRuntime(EmbeddingSettings(model=" "), transport=provider)
+    runtime = EmbeddingRuntime(EmbeddingSettings(invocation=None), transport=provider)
 
     with pytest.raises(EmbeddingNotConfigured):
         await runtime.embed_query("alpha")
@@ -127,48 +109,86 @@ async def test_a_runtime_without_a_model_fails_before_any_request() -> None:
     assert provider.requests == []
 
 
-@pytest.mark.parametrize("model", ["bare-model", "BAAI/bge-m3"])
-async def test_an_openai_model_id_without_a_base_url_fails_before_any_request(model) -> None:
-    provider = ScriptedProvider()
-    runtime = EmbeddingRuntime(EmbeddingSettings(model=model, api_key="key"), transport=provider)
-
-    with pytest.raises(EmbeddingNotConfigured, match="base URL is not configured"):
-        await runtime.embed_documents(["alpha"])
-
-    assert provider.requests == []
-
-
-async def test_a_model_id_with_a_slash_is_sent_to_the_configured_endpoint() -> None:
+async def test_a_request_carries_the_route_endpoint_key_and_extra_parameters_of_the_invocation() -> None:
     provider = ScriptedProvider()
     runtime = EmbeddingRuntime(
-        EmbeddingSettings(model="BAAI/bge-m3", base_url="https://embed.test/v1", api_key="key"),
+        EmbeddingSettings(
+            invocation=ResolvedInvocation(
+                route="openai/BAAI/bge-m3",
+                api_base="https://embed.test/v1",
+                api_key="key",
+                extra_params={"dimensions": 256},
+            ),
+        ),
         transport=provider,
     )
 
     await runtime.embed_query("alpha")
 
     request = provider.requests[0]
-    assert request["model"] == "openai/BAAI/bge-m3"
-    assert request["api_base"] == "https://embed.test/v1"
-    assert request["api_key"] == "key"
+    assert request == {
+        "model": "openai/BAAI/bge-m3",
+        "input": ["alpha"],
+        "timeout": request["timeout"],
+        "max_retries": 0,
+        "api_base": "https://embed.test/v1",
+        "api_key": "key",
+        "dimensions": 256,
+        "allowed_openai_params": ["dimensions"],
+    }
 
 
-async def test_a_bare_model_without_a_key_sends_an_explicit_keyless_value() -> None:
+@pytest.mark.parametrize(
+    ("route", "extra_params"),
+    [
+        ("openai/BAAI/bge-m3", {}),
+        ("openai/BAAI/bge-m3", {"organization": "org-1"}),
+        ("voyage/voyage-3", {"dimensions": 256}),
+        ("ollama/nomic-embed-text", {"dimensions": 256}),
+    ],
+    ids=["no_dimension", "another_parameter", "voyage_route", "ollama_route"],
+)
+async def test_only_a_set_dimension_on_the_openai_route_is_named_for_the_sdk_to_send(route, extra_params) -> None:
     provider = ScriptedProvider()
     runtime = EmbeddingRuntime(
-        EmbeddingSettings(model="local-embedding", base_url="http://localhost:11434/v1"),
+        EmbeddingSettings(
+            invocation=ResolvedInvocation(
+                route=route,
+                api_base="https://embed.test/v1",
+                api_key="key",
+                extra_params=extra_params,
+            ),
+        ),
         transport=provider,
     )
 
     await runtime.embed_query("alpha")
 
-    request = provider.requests[0]
-    assert request["model"] == "openai/local-embedding"
-    assert request["api_base"] == "http://localhost:11434/v1"
-    assert request["api_key"] == "no-api-key"
+    assert "allowed_openai_params" not in provider.requests[0]
 
 
-async def test_a_provider_route_without_settings_leaves_credentials_to_the_provider() -> None:
+async def test_a_parameter_the_route_does_not_take_fails_without_a_request_and_says_so() -> None:
+    """LiteLLM itself refuses the parameter before it sends anything."""
+    runtime = EmbeddingRuntime(
+        EmbeddingSettings(
+            invocation=ResolvedInvocation(
+                route="mistral/mistral-embed",
+                api_base="https://embed.test/v1",
+                api_key="key",
+                extra_params={"dimensions": 256},
+            ),
+        ),
+    )
+
+    with pytest.raises(EmbeddingProviderError) as raised:
+        await runtime.embed_query("alpha")
+
+    assert raised.value.parameter_refused is True
+    assert raised.value.status_code is None
+    assert raised.value.unreachable is False
+
+
+async def test_an_invocation_without_endpoint_or_key_leaves_both_to_the_provider() -> None:
     provider = ScriptedProvider()
 
     await _runtime(provider).embed_query("alpha")
@@ -177,6 +197,16 @@ async def test_a_provider_route_without_settings_leaves_credentials_to_the_provi
     assert request["model"] == "ollama/embedding-model"
     assert "api_base" not in request
     assert "api_key" not in request
+
+
+async def test_the_runtime_reports_the_model_id_the_provider_answered_with() -> None:
+    provider = ScriptedProvider({**embedding_response([[1.0, 0.0]]), "model": "embedding-model-2026"})
+    runtime = _runtime(provider)
+
+    assert runtime.provider_model is None
+    await runtime.embed_query("alpha")
+
+    assert runtime.provider_model == "embedding-model-2026"
 
 
 async def test_out_of_order_response_items_return_in_input_order() -> None:
@@ -433,7 +463,7 @@ async def test_a_deadline_that_passes_during_an_attempt_ends_the_call() -> None:
 
     runtime = EmbeddingRuntime(
         EmbeddingSettings(
-            model="ollama/embedding-model",
+            invocation=_OLLAMA,
             timeout_s=0.1,
             num_retries=50,
             retry_pauses_s=(0.0,),
@@ -450,7 +480,7 @@ async def test_a_request_that_never_answers_ends_at_the_deadline() -> None:
         await asyncio.sleep(60)
 
     runtime = EmbeddingRuntime(
-        EmbeddingSettings(model="ollama/embedding-model", timeout_s=0.05),
+        EmbeddingSettings(invocation=_OLLAMA, timeout_s=0.05),
         transport=never_answers,
     )
     started = asyncio.get_running_loop().time()
@@ -555,8 +585,14 @@ async def test_the_cache_keeps_the_most_recently_used_vectors() -> None:
 async def test_a_runtime_never_serves_another_runtimes_vectors() -> None:
     small = ScriptedProvider(embedding_response([[1.0, 0.0]]))
     large = ScriptedProvider(embedding_response([[0.0, 1.0, 0.0]]))
-    small_runtime = EmbeddingRuntime(EmbeddingSettings(model="ollama/small"), transport=small)
-    large_runtime = EmbeddingRuntime(EmbeddingSettings(model="ollama/large"), transport=large)
+    small_runtime = EmbeddingRuntime(
+        EmbeddingSettings(invocation=ResolvedInvocation(route="ollama/small")),
+        transport=small,
+    )
+    large_runtime = EmbeddingRuntime(
+        EmbeddingSettings(invocation=ResolvedInvocation(route="ollama/large")),
+        transport=large,
+    )
 
     assert await small_runtime.embed_query("alpha") == [1.0, 0.0]
     assert await large_runtime.embed_query("alpha") == [0.0, 1.0, 0.0]
