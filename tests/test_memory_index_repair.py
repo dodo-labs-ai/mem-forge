@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import struct
 from datetime import datetime, timezone
 from typing import Any
 
 import pytest
+from click.testing import CliRunner
 
 from memforge.memory.health import MemoryIndexHealthChecker
 from memforge.memory.repair import MemoryIndexRepairer
 from memforge.models import Memory, content_hash
 from memforge.storage.database import Database
+from tests.embedding_fixture import embedding_from_texts, embedding_response, fixed_vector_embedding
 
 
 class RepairableCollection:
@@ -116,7 +119,7 @@ async def test_repair_restores_memory_fts_and_vector_consistency(db: Database):
     repairer = MemoryIndexRepairer(
         db=db,
         memory_collection=collection,
-        embed_cfg={"base_url": "http://embed.test", "api_key": "key", "model": "model"},
+        embedding=fixed_vector_embedding([0.0, 0.0, 0.0]),
     )
     repairer._embed_memory = lambda memory: _async_value([0.9, 0.8, 0.7])  # type: ignore[method-assign]
 
@@ -142,7 +145,7 @@ async def test_repair_stamps_hash_from_persisted_float32_memory_vector(db: Datab
     repairer = MemoryIndexRepairer(
         db=db,
         memory_collection=collection,
-        embed_cfg={"base_url": "http://embed.test", "api_key": "key", "model": "model"},
+        embedding=fixed_vector_embedding([0.0, 0.0, 0.0]),
     )
     repairer._embed_memory = lambda memory: _async_value([0.123456789, 0.987654321, 0.555555555])  # type: ignore[method-assign]
 
@@ -150,3 +153,68 @@ async def test_repair_stamps_hash_from_persisted_float32_memory_vector(db: Datab
 
     report = await MemoryIndexHealthChecker(db=db, memory_collection=collection).check()
     assert [issue for issue in report.issues if issue.kind == "chroma_embedding_vector_hash_mismatch"] == []
+
+
+@pytest.mark.asyncio
+async def test_repair_embeds_a_missing_memory_vector_through_the_embedding_runtime(db: Database):
+    active = _memory("mem-missing-vector", "Missing vector fact")
+    await db.insert_memory(active)
+    embedded: list[str] = []
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        embedded.extend(texts)
+        return [[0.25, 0.5, 0.75] for _ in texts]
+
+    collection = RepairableCollection({})
+
+    result = await MemoryIndexRepairer(
+        db=db,
+        memory_collection=collection,
+        embedding=embedding_from_texts(embed),
+    ).repair()
+
+    assert result.memory_vectors_repaired == 1
+    assert result.unrepaired_memories == []
+    assert embedded == ["Fact: Missing vector fact\nEntities: "]
+    assert collection.embeddings[active.id] == [0.25, 0.5, 0.75]
+    assert (await MemoryIndexHealthChecker(db=db, memory_collection=collection).check()).ok
+
+
+def test_repair_indexes_command_embeds_at_the_configured_endpoint(tmp_path, monkeypatch):
+    from memforge.config import load_config
+    from memforge.main import cli
+
+    monkeypatch.setenv("MEMFORGE_BASE_DIR", str(tmp_path / "mem"))
+    monkeypatch.setenv("MEMFORGE_EMBEDDING_MODEL", "repair-embedding-model")
+    monkeypatch.setenv("MEMFORGE_EMBEDDING_BASE_URL", "https://embed.repair.example.test/v1")
+    monkeypatch.setenv("MEMFORGE_EMBEDDING_API_KEY", "repair-embedding-key")
+    requests: list[dict[str, Any]] = []
+
+    async def provider(**request: Any) -> dict[str, Any]:
+        requests.append(request)
+        return embedding_response([[0.25, 0.5, 0.75] for _ in request["input"]])
+
+    monkeypatch.setattr("litellm.aembedding", provider)
+    collection = RepairableCollection({})
+    monkeypatch.setattr(
+        "memforge.retrieval.embeddings.get_chroma_collection",
+        lambda *_args, **_kwargs: collection,
+    )
+
+    async def seed() -> None:
+        database = Database(load_config().storage.db_path)
+        await database.connect()
+        await database.insert_memory(_memory("mem-cli-repair", "Command line repair fact"))
+        await database.close()
+
+    asyncio.run(seed())
+
+    result = CliRunner().invoke(cli, ["maintenance", "repair-indexes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Index health is clean." in result.output
+    assert [request["input"] for request in requests] == [["Fact: Command line repair fact\nEntities: "]]
+    assert requests[0]["model"] == "openai/repair-embedding-model"
+    assert requests[0]["api_base"] == "https://embed.repair.example.test/v1"
+    assert requests[0]["api_key"] == "repair-embedding-key"
+    assert collection.embeddings["mem-cli-repair"] == [0.25, 0.5, 0.75]

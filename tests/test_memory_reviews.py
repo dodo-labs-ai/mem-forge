@@ -38,6 +38,7 @@ from memforge.models import (
 from memforge.storage.database import Database
 from tests.test_sync_bookkeeping import _hold_document
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
+from tests.embedding_fixture import unconfigured_embedding
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +108,7 @@ def memory_store(db, chroma) -> MemoryStore:
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         audit_logger=audit_logger,
     )
 

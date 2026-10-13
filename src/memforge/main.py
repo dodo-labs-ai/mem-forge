@@ -6320,22 +6320,17 @@ def maintenance_repair_indexes(ctx):
         from memforge.memory.health import MemoryIndexHealthChecker
         from memforge.memory.repair import MemoryIndexRepairer
         from memforge.retrieval.embeddings import get_chroma_collection
-        from memforge.runtime import get_effective_llm_config
+        from memforge.runtime import build_embedding_runtime, get_effective_llm_config
 
         config: AppConfig = ctx.obj["config"]
         db = await _get_db(config)
         memory_collection = get_chroma_collection(config.storage.chroma_path, name="memories")
         llm = await get_effective_llm_config(db, config)
-        embed_cfg = {
-            "base_url": llm.embedding_base_url,
-            "api_key": llm.embedding_api_key,
-            "model": llm.embedding_model,
-        }
         try:
             result = await MemoryIndexRepairer(
                 db=db,
                 memory_collection=memory_collection,
-                embed_cfg=embed_cfg,
+                embedding=build_embedding_runtime(llm, config),
             ).repair()
             report = await MemoryIndexHealthChecker(
                 db=db,

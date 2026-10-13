@@ -18,6 +18,7 @@ from memforge.models import ContentItem, DocumentRecord, Memory, RawMemory, Sour
 from memforge.storage.database import Database
 from tests.test_sync_bookkeeping import _hold_document
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
+from tests.embedding_fixture import unconfigured_embedding
 
 
 METADATA_CONTENT = (
@@ -425,7 +426,7 @@ async def test_store_source_cascade_cleans_indexes_for_retired_memories(db: Data
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
     )
 
     retired_ids = await store.delete_source_cascade(doc.source)

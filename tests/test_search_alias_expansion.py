@@ -38,6 +38,7 @@ from memforge.storage.adapters.context import (
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
 from memforge.memory.lifecycle import allowed_search_statuses
+from tests.embedding_fixture import unconfigured_embedding
 
 
 class FakeCollection:
@@ -109,7 +110,7 @@ async def test_bm25_with_alias_expansion_still_matches(db):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
 
@@ -140,7 +141,7 @@ async def test_build_alias_clause_emits_fts5_or_group(db):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
 
@@ -164,7 +165,7 @@ async def test_build_alias_clause_returns_empty_when_no_new_terms(db):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
 
