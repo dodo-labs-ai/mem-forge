@@ -5,8 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from memforge.config import load_config
-from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
-from memforge.runtime import get_effective_llm_config
+from memforge.runtime import DefaultRuntimeProvider, resolve_models
 from memforge.storage.database import Database
 
 
@@ -39,21 +38,13 @@ async def main() -> None:
     db = Database(config.storage.db_path)
     await db.connect()
     try:
-        llm = await get_effective_llm_config(db, config)
+        models = await resolve_models(db, config)
     finally:
         await db.close()
 
-    if not llm.enrichment_api_key:
-        raise RuntimeError("MEMFORGE_ENRICHMENT_API_KEY or DB enrichment_api_key is required")
-
-    client = LiteLlmStructuredClient(
-        StructuredLlmConfig(
-            model=llm.enrichment_model,
-            base_url=llm.enrichment_base_url or None,
-            api_key=llm.enrichment_api_key,
-            timeout_s=llm.request_timeout_s,
-        )
-    )
+    client = DefaultRuntimeProvider().build_structured_llm_client(models, max_concurrent=1)
+    if client is None:
+        raise RuntimeError("No generation model is configured; set one in Settings or MEMFORGE_ENRICHMENT_*")
     response = await client.verify_source_support(PROMPT)
     print(response.model_dump_json(indent=2))
 

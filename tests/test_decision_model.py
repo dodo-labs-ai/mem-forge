@@ -37,7 +37,7 @@ from memforge.memory.relation_classifier import (
     StructuredMemoryPairClassifier,
 )
 from memforge.pipeline.revision_work import CHANGE_IMPACT_CONTRACT, CHANGE_IMPACT_TASK, RevisionWorkExecutor
-from memforge.runtime import DefaultRuntimeProvider, get_effective_llm_config
+from memforge.runtime import DefaultRuntimeProvider, resolve_models
 from tests.test_agent_session_api import _AuthorizesAllCandidateUserEvidence, _authorized_events
 from tests.test_change_impact import ImpactClient, cohort, impact_works
 from tests.test_cross_document_relation_classifier import _Client as RelationClient
@@ -114,39 +114,83 @@ def test_decision_model_setting_is_empty_by_default_and_read_from_the_environmen
     assert AppConfig().llm.decision_model == DECISION_MODEL
 
 
+class _NoStoredBindings:
+    async def get_model_binding(self, kind, slot):
+        return None
+
+
+def _generation_environment(monkeypatch, model: str) -> None:
+    monkeypatch.setenv("MEMFORGE_ENRICHMENT_MODEL", model)
+    monkeypatch.setenv("MEMFORGE_ENRICHMENT_BASE_URL", "")
+    monkeypatch.setenv("MEMFORGE_ENRICHMENT_API_KEY", "fixture-key")
+
+
 @pytest.mark.asyncio
-async def test_effective_config_takes_the_decision_model_from_the_environment_only(monkeypatch) -> None:
+async def test_the_decision_model_comes_from_the_environment_and_shares_the_generation_route(monkeypatch) -> None:
     monkeypatch.setenv("MEMFORGE_DECISION_MODEL", DECISION_MODEL)
+    _generation_environment(monkeypatch, MAIN_MODEL)
 
-    class StoredConfig:
-        async def get_llm_config(self):
-            return {
-                "enrichment_model": MAIN_MODEL,
-                "enrichment_api_key": "fixture-key",
-                "decision_model": "gateway/stored-model",
-            }
+    models = await resolve_models(_NoStoredBindings(), AppConfig())
+    client = DefaultRuntimeProvider().build_structured_llm_client(models, max_concurrent=1)
 
-    llm = await get_effective_llm_config(StoredConfig(), AppConfig())
-    client = DefaultRuntimeProvider().build_structured_llm_client(llm, max_concurrent=1)
-
-    assert llm.enrichment_model == MAIN_MODEL
-    assert llm.decision_model == DECISION_MODEL
+    assert models.generation_route == MAIN_MODEL
+    assert models.decision_route == DECISION_MODEL
     assert client.config.model == MAIN_MODEL
     assert client.decision_model == DECISION_MODEL
 
 
 @pytest.mark.asyncio
+async def test_the_decision_model_is_a_model_id_of_the_generation_provider(monkeypatch) -> None:
+    monkeypatch.setenv("MEMFORGE_DECISION_MODEL", "claude-haiku")
+    _generation_environment(monkeypatch, "claude-sonnet")
+
+    models = await resolve_models(_NoStoredBindings(), AppConfig())
+
+    assert models.generation_route == "anthropic/claude-sonnet"
+    assert models.decision_route == "anthropic/claude-haiku"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("generation_model", "decision_setting", "decision_route"),
+    [
+        ("claude-sonnet", "anthropic/claude-haiku", "anthropic/claude-haiku"),
+        ("claude-sonnet", "anthropic/anthropic/claude-haiku", "anthropic/anthropic/claude-haiku"),
+        ("claude-sonnet", "vendor/claude-haiku", "anthropic/vendor/claude-haiku"),
+    ],
+    ids=["own_route", "model_id_that_starts_with_the_prefix", "slashed_model_id"],
+)
+async def test_a_decision_model_written_as_a_route_of_the_generation_provider_is_that_route(
+    monkeypatch, generation_model, decision_setting, decision_route
+) -> None:
+    monkeypatch.setenv("MEMFORGE_DECISION_MODEL", decision_setting)
+    _generation_environment(monkeypatch, generation_model)
+
+    models = await resolve_models(_NoStoredBindings(), AppConfig())
+    client = DefaultRuntimeProvider().build_structured_llm_client(models, max_concurrent=1)
+
+    assert models.generation_route == f"anthropic/{generation_model}"
+    assert models.decision_route == decision_route
+    assert client.decision_model == decision_route
+
+
+@pytest.mark.asyncio
+async def test_a_decision_model_the_generation_provider_cannot_route_is_left_out(monkeypatch) -> None:
+    monkeypatch.setenv("MEMFORGE_DECISION_MODEL", "not-a-route")
+    _generation_environment(monkeypatch, MAIN_MODEL)
+
+    models = await resolve_models(_NoStoredBindings(), AppConfig())
+
+    assert models.decision_route is None
+
+
+@pytest.mark.asyncio
 async def test_unset_decision_model_builds_a_client_that_runs_every_task_on_the_main_model(monkeypatch) -> None:
     monkeypatch.delenv("MEMFORGE_DECISION_MODEL", raising=False)
-    monkeypatch.setenv("MEMFORGE_ENRICHMENT_MODEL", MAIN_MODEL)
-    monkeypatch.setenv("MEMFORGE_ENRICHMENT_API_KEY", "fixture-key")
+    _generation_environment(monkeypatch, MAIN_MODEL)
 
-    class NoStoredConfig:
-        async def get_llm_config(self):
-            return None
-
-    llm = await get_effective_llm_config(NoStoredConfig(), AppConfig())
-    client = DefaultRuntimeProvider().build_structured_llm_client(llm, max_concurrent=1)
+    models = await resolve_models(_NoStoredBindings(), AppConfig())
+    client = DefaultRuntimeProvider().build_structured_llm_client(models, max_concurrent=1)
 
     assert client.decision_model is None
 

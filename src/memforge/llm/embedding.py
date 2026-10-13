@@ -1,9 +1,10 @@
 """Embedding Runtime: text to vectors through the LiteLLM SDK.
 
-One runtime stands for one embedding configuration. It owns everything between
-"embed these texts" and a list of usable vectors: the provider route, the
-attempt loop, the logical deadline, the per-request item limit, validation of
-what the provider returned, and the cache of vectors it has produced.
+One runtime stands for one embedding model, named by the invocation it is
+built from. It owns everything between "embed these texts" and a list of
+usable vectors: the attempt loop, the logical deadline, the per-request item
+limit, validation of what the provider returned, and the cache of vectors it
+has produced.
 """
 
 from __future__ import annotations
@@ -13,14 +14,14 @@ import logging
 import math
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-import httpx
 import litellm
 
-from memforge.llm.providers import litellm_optional_kwargs
+from memforge.llm.providers import ResolvedInvocation
 from memforge.llm.transport import (
+    is_connection_failure,
     is_retryable_provider_error,
     provider_retry_after_seconds,
     provider_status_code,
@@ -36,17 +37,9 @@ __all__ = [
     "EmbeddingRuntime",
     "EmbeddingSettings",
     "InvalidEmbeddingResponse",
-    "litellm_embedding_route",
 ]
 
 EmbeddingTransport = Callable[..., Awaitable[Any]]
-
-# An OpenAI-compatible endpoint that needs no key ignores the Authorization
-# header, but the SDK builds no request without a key. A model served by such
-# an endpoint sends this value when no key is configured, so a key from the
-# process environment is never sent to an endpoint the operator did not pair
-# it with.
-_KEYLESS_API_KEY = "no-api-key"
 
 
 class EmbeddingError(RuntimeError):
@@ -54,7 +47,7 @@ class EmbeddingError(RuntimeError):
 
 
 class EmbeddingNotConfigured(EmbeddingError):
-    """The settings name no model, or no endpoint for a model that needs one."""
+    """No embedding model is configured."""
 
 
 class EmbeddingProviderError(EmbeddingError):
@@ -65,9 +58,21 @@ class EmbeddingProviderError(EmbeddingError):
     fault, so it is attempted again like one.
     """
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        unreachable: bool = False,
+        parameter_refused: bool = False,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        # The request never reached the provider.
+        self.unreachable = unreachable
+        # The SDK sent nothing, because the route does not take a parameter the
+        # request sets.
+        self.parameter_refused = parameter_refused
 
 
 class EmbeddingDeadlineExceeded(EmbeddingError):
@@ -85,11 +90,9 @@ class InvalidEmbeddingResponse(EmbeddingError, ValueError):
 class EmbeddingSettings:
     """What defines one Embedding Runtime."""
 
-    # A LiteLLM ``provider/model`` route, or the model id of an
-    # OpenAI-compatible endpoint at ``base_url``.
-    model: str
-    base_url: str | None = None
-    api_key: str | None = field(default=None, repr=False)
+    # The route, endpoint and credential every request is made with. ``None``
+    # is an installation with no embedding model.
+    invocation: ResolvedInvocation | None
     # One budget of time for a whole embed call: every request, every retry and
     # every pause between them.
     timeout_s: float = 60.0
@@ -106,32 +109,8 @@ class EmbeddingSettings:
     cache_size: int = 256
 
 
-def litellm_embedding_route(model: str) -> str:
-    """Compile a configured embedding model into a LiteLLM route.
-
-    A name whose first segment is a provider LiteLLM knows, as in
-    ``ollama/nomic-embed-text``, names its own route. Any other name is the
-    model id of an OpenAI-compatible embeddings endpoint and takes the
-    ``openai/`` route; such an id may contain a slash itself, as
-    ``BAAI/bge-m3`` does.
-    """
-    name = model.strip()
-    if _names_provider_route(name):
-        return name
-    return f"openai/{name}"
-
-
-def _names_provider_route(model: str) -> bool:
-    provider, separator, provider_model = model.partition("/")
-    if not separator or not provider_model:
-        return False
-    return provider in litellm.provider_list or any(
-        registered.get("provider") == provider for registered in litellm.custom_provider_map
-    )
-
-
 class EmbeddingRuntime:
-    """Embeds queries and documents for one embedding configuration.
+    """Embeds queries and documents with one embedding model.
 
     Queries and documents share one vector space and one cache. The cache
     belongs to this instance, so a runtime built from other settings can never
@@ -148,26 +127,22 @@ class EmbeddingRuntime:
         self._transport = transport
         self._cache = _VectorCache(settings.cache_size)
         self._dimension: int | None = None
+        self._provider_model: str | None = None
 
     @property
     def configured(self) -> bool:
-        """Whether the settings name a model and a way to reach it.
-
-        A ``provider/model`` route may resolve its endpoint and credentials
-        from the provider's own environment. The model id of an
-        OpenAI-compatible endpoint needs both a base URL and an API key.
-        """
-        model = self.settings.model.strip()
-        if not model:
-            return False
-        if _names_provider_route(model):
-            return True
-        return bool(self.settings.base_url and self.settings.api_key)
+        """Whether an embedding model is configured."""
+        return self.settings.invocation is not None
 
     @property
     def dimension(self) -> int | None:
         """The vector length this runtime has observed, once it has embedded."""
         return self._dimension
+
+    @property
+    def provider_model(self) -> str | None:
+        """The model id the provider reported in its latest answer, if it reported one."""
+        return self._provider_model
 
     async def embed_query(self, text: str) -> list[float]:
         """Return the vector for one search query."""
@@ -200,7 +175,9 @@ class EmbeddingRuntime:
         return [list(vectors[text]) for text in texts]
 
     async def _request_vectors(self, texts: list[str]) -> list[tuple[float, ...]]:
-        route = self._route()
+        invocation = self.settings.invocation
+        if invocation is None:
+            raise EmbeddingNotConfigured("Embedding model is not configured")
         limit = max(1, self.settings.max_inputs_per_request)
         timeout_s = max(0.0, self.settings.timeout_s)
         loop = asyncio.get_running_loop()
@@ -212,7 +189,7 @@ class EmbeddingRuntime:
                 for start in range(0, len(texts), limit):
                     produced.extend(
                         await self._request_slice(
-                            route,
+                            invocation,
                             texts[start : start + limit],
                             deadline=deadline,
                             attempts=attempts,
@@ -228,7 +205,7 @@ class EmbeddingRuntime:
 
     async def _request_slice(
         self,
-        route: str,
+        invocation: ResolvedInvocation,
         texts: list[str],
         *,
         deadline: float,
@@ -242,13 +219,13 @@ class EmbeddingRuntime:
                 raise TimeoutError
             try:
                 response = await transport(
-                    model=route,
+                    model=invocation.route,
                     input=texts,
                     timeout=remaining_s,
                     # This loop owns the retry budget, so that every attempt
                     # counts against the one deadline.
                     max_retries=0,
-                    **self._endpoint_kwargs(),
+                    **invocation.request_kwargs(),
                 )
             except Exception as exc:
                 if not is_retryable_provider_error(exc) or attempts.retries_left <= 0:
@@ -268,34 +245,15 @@ class EmbeddingRuntime:
                 )
                 await asyncio.sleep(pause_s)
                 continue
-            return _response_vectors(response, expected_count=len(texts))
+            vectors = _response_vectors(response, expected_count=len(texts))
+            self._provider_model = _response_model(response)
+            return vectors
 
     def _retry_pause_s(self, exc: Exception, *, retries_used: int) -> float:
         """Return the pause before the next retry: the scheduled one, or longer if the provider asks."""
         pauses = self.settings.retry_pauses_s
         scheduled_s = pauses[min(retries_used, len(pauses) - 1)] if pauses else 0.0
         return max(scheduled_s, provider_retry_after_seconds(exc) or 0.0)
-
-    def _endpoint_kwargs(self) -> dict[str, str]:
-        kwargs = litellm_optional_kwargs(
-            api_base=self.settings.base_url,
-            api_key=self.settings.api_key,
-        )
-        if not _names_provider_route(self.settings.model.strip()):
-            kwargs.setdefault("api_key", _KEYLESS_API_KEY)
-        return kwargs
-
-    def _route(self) -> str:
-        model = self.settings.model.strip()
-        if not model:
-            raise EmbeddingNotConfigured("Embedding model is not configured")
-        # Without a base URL the SDK would pick an endpoint from the process
-        # environment and send it the configured key and the texts.
-        if not _names_provider_route(model) and not self.settings.base_url:
-            raise EmbeddingNotConfigured(
-                f"Embedding base URL is not configured for model {model!r}"
-            )
-        return litellm_embedding_route(model)
 
 
 @dataclass
@@ -330,27 +288,18 @@ class _VectorCache:
 
 
 def _provider_error(exc: Exception) -> EmbeddingProviderError:
-    prefix = (
-        "Embedding provider unreachable"
-        if _is_connection_failure(exc)
-        else "Embedding provider request failed"
-    )
+    if isinstance(exc, litellm.UnsupportedParamsError):
+        return EmbeddingProviderError(
+            f"Embedding route does not take a parameter the request sets: {exc}",
+            parameter_refused=True,
+        )
+    unreachable = is_connection_failure(exc)
+    prefix = "Embedding provider unreachable" if unreachable else "Embedding provider request failed"
     return EmbeddingProviderError(
         f"{prefix}: {type(exc).__name__}: {exc}",
         status_code=provider_status_code(exc),
+        unreachable=unreachable,
     )
-
-
-def _is_connection_failure(exc: BaseException) -> bool:
-    """Whether the request never reached the provider, anywhere in the error's chain."""
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        if isinstance(current, (ConnectionError, httpx.ConnectError, httpx.ConnectTimeout)):
-            return True
-        seen.add(id(current))
-        current = current.__cause__ or current.__context__
-    return False
 
 
 def _response_vectors(response: object, *, expected_count: int) -> list[tuple[float, ...]]:
@@ -374,6 +323,11 @@ def _response_vectors(response: object, *, expected_count: int) -> list[tuple[fl
             f"expected 0..{expected_count - 1}"
         )
     return [by_index[index] for index in range(expected_count)]
+
+
+def _response_model(response: object) -> str | None:
+    model = _item_field(response, "model")
+    return model.strip() or None if isinstance(model, str) else None
 
 
 def _item_field(item: object, name: str) -> Any:

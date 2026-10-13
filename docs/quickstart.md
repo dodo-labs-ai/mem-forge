@@ -8,8 +8,8 @@ a first source, and shows how agents read memory and its evidence.
 Requirements:
 
 - Docker with a current Compose v2
-- An API key for the extraction model (Anthropic by default) and, for vector
-  search, an embedding endpoint (OpenAI by default)
+- An API key for the generation model that writes memories (Anthropic by
+  default) and, for vector search, an embedding endpoint (OpenAI by default)
 
 ```bash
 git clone https://github.com/shno-labs/mem-forge.git
@@ -79,26 +79,93 @@ HTML layout for source evidence PDFs.
 
 ## 2. Configure Models
 
-MemForge needs an extraction model to create or re-check memories. Without it,
-syncs store source content but produce no memories. Embeddings are optional:
-when the embedding endpoint is unavailable, search falls back to full-text
-ranking.
+MemForge uses two models:
 
-Open `http://localhost:5174/settings` and configure the enrichment and
-embedding endpoints. Use **Test connection** to verify that the MemForge API
-container can reach the URL and to load model ids when the endpoint exposes a
-model list. Values saved in the UI are stored in the local database and are
-used by the next sync.
+- A **generation model** reads your sources and writes memories. Without one,
+  a sync stores source content but produces no memories.
+- An **embedding model** turns memories into vectors for semantic search. It
+  is optional: without one, search falls back to full-text ranking.
 
-Model calls go through LiteLLM. A bare model name is treated as an Anthropic
-model; a `provider/model` name selects another LiteLLM provider.
+Open `http://localhost:5174/v2/settings`. For each model, choose a provider
+and fill in what it asks for:
 
-If MemForge runs in Docker and your model proxy runs on your Mac, use
+| Provider | Use it for | You enter |
+| --- | --- | --- |
+| OpenAI | OpenAI models | API key, model |
+| Anthropic | Claude models (generation only) | API key, model |
+| OpenRouter | Any model OpenRouter offers | API key, model |
+| Ollama | Models running on your machine | Model; the address if it is not `http://localhost:11434` |
+| OpenAI-compatible endpoint | A proxy or local server that speaks the OpenAI API, such as LM Studio or vLLM | Base URL, model, and an API key if the server wants one |
+| LiteLLM route (advanced) | Any other provider LiteLLM supports | The model as `provider/model`, and an API key or the provider's own environment variables |
+
+Where the provider can list its models, **Load models** fills the model field
+for you.
+
+### Save and validate
+
+**Save and validate** stores your edit without changing the model MemForge is
+using, then sends one small real request to the model:
+
+- The generation model must return a short structured answer.
+- The embedding model must return two vectors of the same size, twice.
+
+When the request succeeds, your edit becomes the model in use, and the next
+sync and search use it. When it fails, MemForge keeps using the previous model
+and shows why (for example a rejected API key or an unknown model), so a
+typing mistake cannot break a working setup. The failed edit stays in the form
+until you correct it or choose **Discard changes**.
+
+Each card shows the model in use above the form. **Validate again** repeats
+the request for that model at any time; the model stays in use whatever the
+result. Until a generation model is ready, every other page of the new admin
+(the pages under `http://localhost:5174/v2/`) shows a notice that links to
+Settings.
+
+Each model shows one of three states:
+
+| State | Meaning |
+| --- | --- |
+| Ready | The model passed its latest check. |
+| Not validated | The model has not passed a check yet. Settings that came from `.env` or from an earlier MemForge version start here and are checked in the background when the server starts. |
+| Needs revalidation | The model passed a check before, but something changed since, or its latest check failed. It stays in use; open Settings and choose **Validate again**. |
+
+### API keys
+
+A key you enter in Settings is stored encrypted in the local database and is
+never shown again; Settings displays only its last four characters. A saved
+key belongs to the address it was saved for. If you point a model at a
+different host, port or scheme, enter the key again: MemForge does not send a
+saved key to a new address.
+
+Choose **No authentication** for a local server that needs no key.
+
+A model that takes its credentials from the provider's own environment
+variables is reached at the provider's own address. To send its requests to
+another base URL, enter an API key for that address. A model from `.env` can
+name a `provider/model` route with a base URL and no key; Settings shows such
+a model and, before it saves a change to it, asks you to either remove the
+base URL or choose **API key** (or, for a server that needs no key, the Ollama
+or OpenAI-compatible provider). A base URL is stored and
+shown as you type it, so it must not contain a user name or a password.
+
+### Models on your own machine
+
+If MemForge runs in Docker and your model server runs on your Mac, use
 `http://host.docker.internal:<port>` instead of `http://localhost:<port>`.
 Inside the container, `localhost` points back to the container itself.
 
-For file-based configuration, edit only the values you want to manage outside
-the UI:
+MemForge sizes its requests to the model's token limits. For a model LiteLLM
+has no limits for, which is common for local models, set them in `.env`:
+
+```bash
+MEMFORGE_LLM_MAX_INPUT_TOKENS=32768
+MEMFORGE_LLM_CONTEXT_WINDOW_TOKENS=32768
+MEMFORGE_LLM_MAX_OUTPUT_TOKENS=4096
+```
+
+### Configuring models in `.env`
+
+You can name the models in `.env` instead of Settings:
 
 ```bash
 MEMFORGE_ENRICHMENT_MODEL=...
@@ -109,11 +176,21 @@ MEMFORGE_EMBEDDING_BASE_URL=...
 MEMFORGE_EMBEDDING_API_KEY=...
 ```
 
-Then restart the stack:
+These values apply to a model until you save and validate one in Settings;
+from then on the saved model is used. A plain generation model name is an
+Anthropic model, and `provider/model` is a LiteLLM route. A plain embedding
+model name is sent to the OpenAI-compatible endpoint at the base URL, and a
+name that starts with a provider LiteLLM knows (`ollama/nomic-embed-text`) is a
+LiteLLM route.
+
+Restart the stack after editing `.env`:
 
 ```bash
 docker compose up --build
 ```
+
+`memforge config show` prints the model each kind is using, where its settings
+come from and its state. It never prints a key.
 
 ## 3. Install Agent Plugins
 

@@ -16,6 +16,7 @@ from memforge.evals.retrieval.schema import (
     RetrievalCaseSet,
 )
 from memforge.llm.embedding import EmbeddingRuntime, EmbeddingSettings
+from memforge.llm.providers import ResolvedInvocation
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -313,7 +314,7 @@ def _fixture_embedding_runtime() -> EmbeddingRuntime:
         }
 
     return EmbeddingRuntime(
-        EmbeddingSettings(model="retrieval-fixture", base_url="http://retrieval-fixture.invalid"),
+        EmbeddingSettings(invocation=ResolvedInvocation(route="openai/retrieval-fixture")),
         transport=fixed_vectors,
     )
 
