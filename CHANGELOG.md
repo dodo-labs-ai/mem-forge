@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+- Embedding goes through the LiteLLM SDK only, behind an Embedding Runtime
+  (`memforge.llm.embedding.EmbeddingRuntime`, with `embed_query` and
+  `embed_documents`). An embedding model name whose first segment is a
+  provider LiteLLM knows (`ollama/nomic-embed-text`, `sap/...`) is used as
+  that route. Any other name, including one with a slash such as
+  `BAAI/bge-m3`, is a model id sent on the `openai/<model>` route to the
+  configured base URL, and without a base URL the call fails before any
+  request instead of reaching an endpoint named by the environment. The
+  direct HTTP embedding call, `embed_texts` and `EmbeddingCache` are removed.
+  The runtime retries timeouts, connection failures, 408, 409, 429 and 5xx
+  (three retries by default, pausing 2, 4 and 8 seconds, or longer when the
+  provider sends `Retry-After`) inside one 60 second deadline for the whole
+  call; a pause that would outlast the deadline ends the call at once. It
+  sends at most 32 inputs per request, so that decoding one response holds
+  the event loop only briefly, and returns every vector or none:
+  a failed or invalid request fails the call and leaves nothing cached. A
+  response must hold one vector per input, complete indices, finite numbers
+  and one dimension; an answer the SDK cannot read as an embedding payload at
+  all counts as a provider failure and is retried. Each runtime owns its
+  vector cache; the Memory store and the search engine no longer hold one.
+  `MemoryStore`, `SearchEngine`, `MemoryEngine`, `EntityResolver` and
+  `MemoryIndexRepairer` take `embedding=` (an `EmbeddingRuntime`) where they
+  took `embed_cfg=`, and `memforge.runtime.build_embedding_runtime` builds
+  one from the effective settings. Importing a model client applies one
+  transport policy to generation and embedding: no HTTP client LiteLLM uses
+  follows a redirect (`litellm.aclient_session` is an `httpx.AsyncClient`
+  that refuses them, with one connection pool per event loop, and the clients
+  LiteLLM builds for the other routes, the `anthropic/` route of a bare
+  generation model among them, refuse them too), so an endpoint that answers
+  with a redirect fails and neither the API key nor the request body is sent
+  on; LiteLLM's default SDK retry count is zero, so one attempt is one
+  request; and LiteLLM's help notice is no longer printed to standard output
+  on a failed request. A provider answer that LiteLLM reports as a connection
+  error is retried or not by the status the provider gave, so a 400, 401 or
+  404 on the `ollama/` or `voyage/` routes is one request. A model id with no
+  API key sends the placeholder key `no-api-key` instead of a key from the
+  environment. `POST /api/v1/llm-config/probe` does not follow redirects
+  either: a redirect to another origin fails the probe, and a request
+  without `api_key` uses the saved key only when its base URL has the origin
+  (scheme, host, port) of the saved one; otherwise it asks for the key
+  again. The response shape is unchanged. `litellm` is declared as
+  `>=1.86,<1.88`. Cloud: pass `embedding=EmbeddingRuntime(...)` in place of
+  `embed_cfg=` to those five constructors (`SearchEngine` needs it even with
+  `embedding_provider=`, and no longer reads
+  `RetrievalConfig.embedding_cache_size`: pass `cache_size` in
+  `EmbeddingSettings`) and replace `embed_texts` calls with
+  `await runtime.embed_documents(...)` or `embed_query(...)`: embedding is
+  asynchronous and needs no thread hand-off. The attributes `embed_cfg` and
+  `SearchEngine._embed_cfg` are `embedding` and `SearchEngine._embedding`,
+  and a test that replaced `embed_texts`, `litellm.embedding` or `httpx`
+  replaces `litellm.aembedding`. SDK retries are disabled for `sap/` routes
+  as well (`max_retries=0` on every request), so confirm that AI Core accepts
+  requests without them and that embedding on a `sap/` route does not hold
+  the event loop. No HANA change.
 - A document Source run whose scope listing or absence confirmation does not
   complete still succeeds and removes nothing (ADR 0045), and now records why
   on the run: `SyncState.absence_check_skipped_reason`, stored in the new

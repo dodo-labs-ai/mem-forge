@@ -21,6 +21,7 @@ from memforge.models import (
     content_hash,
 )
 from memforge.storage.database import Database
+from tests.embedding_fixture import unconfigured_embedding
 
 
 WORKSPACE = Visibility.WORKSPACE.value
@@ -96,7 +97,7 @@ async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatc
                 relational=adapters.relational,
                 keyword=adapters.keyword,
                 vector=adapters.vector,
-                embed_cfg={},
+                embedding=unconfigured_embedding(),
                 config=RetrievalConfig(),
                 embedding_provider=lambda _query: [0.1, 0.1, 0.1],
             )

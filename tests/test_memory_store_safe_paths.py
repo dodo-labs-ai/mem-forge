@@ -31,6 +31,7 @@ from memforge.memory.review_service import ReviewKind, ReviewStatus
 from memforge.memory.store import MemoryStore
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
+from tests.embedding_fixture import unconfigured_embedding
 
 
 class RecordingCollection:
@@ -401,7 +402,7 @@ def _store(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         audit_logger=logger,
     )
 

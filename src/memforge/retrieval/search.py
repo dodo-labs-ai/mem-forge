@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 from memforge.config import DEFAULT_RANK_WINDOW_SIZE, DEFAULT_RRF_K, DEFAULT_SEARCH_TOP_K, RetrievalConfig
 from memforge.llm.batch_runner import ItemFailure, LlmBatchRunner, LlmRequest
+from memforge.llm.embedding import EmbeddingRuntime
 from memforge.llm.structured import RerankResponse
 from memforge.memory.cross_document_relation_reader import (
     RelationGraph,
@@ -32,7 +33,6 @@ from memforge.memory.cross_document_relation_reader import (
 )
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
-from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.intents import (
     RankedRetrievalIntent,
@@ -392,9 +392,8 @@ class SearchEngine:
         The BM25/FTS5 channel.
     vector : VectorStore
         The embedding channel; owns the distance-to-score conversion.
-    embed_cfg : dict
-        Keys ``base_url``, ``api_key``, ``model`` forwarded to
-        :func:`embed_texts` for query embeddings.
+    embedding : EmbeddingRuntime
+        Embeds the query for the vector channel.
     config : RetrievalConfig
         Tuning knobs (``rrf_k``, ``recency_half_life_days``, etc.).
     structured_llm_client : Any | None
@@ -406,7 +405,7 @@ class SearchEngine:
         relational: RelationalStore,
         keyword: KeywordSearch,
         vector: VectorStore,
-        embed_cfg: dict,
+        embedding: EmbeddingRuntime,
         config: RetrievalConfig,
         structured_llm_client: Any | None = None,
         embedding_provider: Callable[[str], list[float] | None] | None = None,
@@ -414,9 +413,8 @@ class SearchEngine:
         self._relational = relational
         self._keyword = keyword
         self._vector = vector
-        self._embed_cfg = embed_cfg
+        self._embedding = embedding
         self._config = config
-        self._embed_cache = EmbeddingCache(max_size=config.embedding_cache_size)
         self._structured_llm_client = structured_llm_client
         self._embedding_provider = embedding_provider
 
@@ -808,13 +806,13 @@ class SearchEngine:
         scope: AccessScope,
         limit: int,
     ) -> list[tuple[str, float]]:
-        """Embed the query via cache, then query the vector channel.
+        """Embed the query, then query the vector channel.
 
         Source filtering is authoritative on the fused candidate set because a
         memory can have many source rows and vector stores cannot express that
         provenance predicate.
         """
-        embedding = self._get_or_compute_embedding(query)
+        embedding = await self._embed_query(query)
         if embedding is None:
             return []
         return await self._vector.query(embedding, scope, memory_types, limit)
@@ -1325,11 +1323,11 @@ class SearchEngine:
         or_clause = " OR ".join(f'"{t}"' for t in unique)
         return f"({or_clause})"
 
-    def _get_or_compute_embedding(self, text: str) -> list[float] | None:
-        """Return cached embedding or compute via the embedding API.
+    async def _embed_query(self, text: str) -> list[float] | None:
+        """Return the query's vector, or ``None`` when it cannot be embedded.
 
-        Returns ``None`` if the embedding call fails (caller should degrade
-        gracefully).
+        The vector channel is optional: without a vector the search degrades to
+        its other channels.
         """
         if self._embedding_provider is not None:
             try:
@@ -1338,20 +1336,8 @@ class SearchEngine:
                 logger.exception("Injected embedding provider failed for query")
                 return None
 
-        cached = self._embed_cache.get(text)
-        if cached is not None:
-            return cached
-
         try:
-            vectors = embed_texts(
-                [text],
-                base_url=self._embed_cfg.get("base_url", ""),
-                api_key=self._embed_cfg.get("api_key", ""),
-                model=self._embed_cfg.get("model", ""),
-            )
-            if vectors:
-                self._embed_cache.put(text, vectors[0])
-                return vectors[0]
+            return await self._embedding.embed_query(text)
         except Exception:
             logger.exception("Embedding computation failed for query")
         return None

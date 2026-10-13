@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, Request
@@ -129,6 +129,7 @@ from memforge.memory.review_decision import (
     lifecycle_review_decision_fingerprint,
     memory_review_decision_fingerprint,
 )
+from memforge.llm.providers import endpoint_origin
 from memforge.memory.store import MemoryStore
 from memforge.models import (
     ConfigField,
@@ -2812,11 +2813,48 @@ def _probe_error_response(
     )
 
 
+def _origin_label(origin: tuple[str, str, int] | None) -> str:
+    if origin is None:
+        return "an address that is not HTTP(S)"
+    scheme, host, port = origin
+    if ":" in host:
+        host = f"[{host}]"
+    default_port = 443 if scheme == "https" else 80
+    return f"{scheme}://{host}" if port == default_port else f"{scheme}://{host}:{port}"
+
+
+def _saved_probe_api_key(
+    *,
+    requested_base_url: str,
+    saved_base_url: str | None,
+    saved_api_key: str | None,
+) -> tuple[str | None, bool]:
+    """Decide whether a probe that carries no key may use the saved one.
+
+    A saved key belongs to the origin it was saved for. Returns the key to
+    send and whether the operator must enter a key for the requested origin.
+    """
+    if not saved_api_key:
+        return None, False
+    requested_origin = endpoint_origin(requested_base_url)
+    if requested_origin is None:
+        return None, False
+    if requested_origin != endpoint_origin(saved_base_url):
+        return None, True
+    return saved_api_key, False
+
+
 async def _probe_llm_models(
     *,
     base_url: str,
     api_key: str | None,
 ) -> LlmConfigProbeResponse:
+    """List the models an endpoint offers, without ever leaving its origin.
+
+    The probe sends the API key, so it does not follow redirects: an answer
+    that points to another origin fails the probe, and one that points
+    elsewhere on the same origin only rules out the address that gave it.
+    """
     value = base_url.strip()
     parsed = urlsplit(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -2828,9 +2866,10 @@ async def _probe_llm_models(
 
     headers = _model_probe_headers(api_key)
     unsupported: tuple[int, int] | None = None
+    redirected: tuple[int, int] | None = None
     non_json_latency_ms: int | None = None
 
-    async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
         for url in _model_list_urls(value):
             started = time.perf_counter()
             try:
@@ -2857,6 +2896,22 @@ async def _probe_llm_models(
                 )
 
             latency_ms = int((time.perf_counter() - started) * 1000)
+            if resp.has_redirect_location:
+                target_origin = endpoint_origin(urljoin(url, resp.headers["location"]))
+                if target_origin != endpoint_origin(url):
+                    return _probe_error_response(
+                        base_url=value,
+                        stage="http",
+                        status=resp.status_code,
+                        latency_ms=latency_ms,
+                        message=(
+                            f"Endpoint redirected to {_origin_label(target_origin)}, "
+                            "another origin, and the redirect is not followed. "
+                            "Enter the base URL of the endpoint that answers directly."
+                        ),
+                    )
+                redirected = (resp.status_code, latency_ms)
+                continue
             if resp.status_code in {404, 405, 501}:
                 unsupported = (resp.status_code, latency_ms)
                 continue
@@ -2906,6 +2961,19 @@ async def _probe_llm_models(
             models_supported=False,
             message="Connected, but this endpoint did not return a model list.",
             latency_ms=non_json_latency_ms,
+        )
+
+    if redirected is not None:
+        status, latency_ms = redirected
+        return _probe_error_response(
+            base_url=value,
+            stage="http",
+            status=status,
+            latency_ms=latency_ms,
+            message=(
+                "Endpoint answered with a redirect, which is not followed. "
+                "Enter the base URL of the endpoint that answers directly."
+            ),
         )
 
     status, latency_ms = unsupported or (404, None)
@@ -4201,14 +4269,9 @@ async def _build_memory_store(
     """Build a request-scoped memory store with effective embedding settings."""
 
     from memforge.memory.audit import MemoryAuditLogger
-    from memforge.runtime import get_effective_llm_config
+    from memforge.runtime import build_embedding_runtime, get_effective_llm_config
 
     llm = await get_effective_llm_config(db, config)
-    embed_cfg = {
-        "base_url": llm.embedding_base_url,
-        "api_key": llm.embedding_api_key,
-        "model": llm.embedding_model,
-    }
     provider = runtime_provider or DefaultRuntimeProvider()
     default_audit_context = audit_context or AuditContext(actor_type="admin")
     audit_logger = MemoryAuditLogger(db, default_context=default_audit_context)
@@ -4217,7 +4280,7 @@ async def _build_memory_store(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg=embed_cfg,
+        embedding=build_embedding_runtime(llm, config),
         audit_logger=audit_logger,
     )
 
@@ -9025,12 +9088,29 @@ def create_admin_app(
     async def probe_llm_config(
         req: LlmConfigProbeRequest,
         db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
     ):
         """Test an LLM endpoint and fetch model ids when the endpoint supports it."""
-        current = await db.get_llm_config()
         api_key = req.api_key
         if api_key is None:
-            api_key = current.get(f"{req.kind}_api_key")
+            current = await db.get_llm_config()
+            api_key, key_required = _saved_probe_api_key(
+                requested_base_url=req.base_url,
+                saved_base_url=(
+                    current.get(f"{req.kind}_base_url")
+                    or getattr(config.llm, f"{req.kind}_base_url")
+                ),
+                saved_api_key=current.get(f"{req.kind}_api_key"),
+            )
+            if key_required:
+                return _probe_error_response(
+                    base_url=req.base_url.strip(),
+                    stage="auth",
+                    message=(
+                        "The saved API key belongs to another endpoint. "
+                        "Enter the API key for this endpoint, then test again."
+                    ),
+                )
         return await _probe_llm_models(base_url=req.base_url, api_key=api_key or None)
 
     @llm_router.put("", response_model=LlmConfigResponse)

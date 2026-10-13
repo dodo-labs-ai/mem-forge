@@ -1,0 +1,206 @@
+"""Transport policy shared by every model call made through the LiteLLM SDK.
+
+Generation and embedding both reach their providers through the in-process
+LiteLLM SDK. This module holds what the two paths share: HTTP clients that
+refuse redirects, the SDK's own retries and help notice switched off, and the
+rule for which provider failures are worth another attempt. Each caller owns
+its attempt loop, its pauses and its logical deadline.
+
+LiteLLM sends a request through one of two kinds of HTTP client. Its
+OpenAI-compatible routes, which carry every embedding model sent to a
+configured base URL, share one process-wide client. Every other route, the
+``anthropic/`` route of a bare generation model among them, uses a client
+LiteLLM builds for that provider. Both kinds refuse redirects here.
+
+Importing this module applies the process-wide policy. Every module that issues
+a LiteLLM request imports it, so the policy is in force before LiteLLM builds a
+provider client in any process, server or command line. MemForge issues every
+model request asynchronously, so the policy covers the asynchronous clients.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import functools
+import math
+import threading
+from typing import Any
+
+import httpx
+import litellm
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+__all__ = [
+    "NoRedirectAsyncClient",
+    "disable_sdk_default_retries",
+    "install_no_redirect_http_client",
+    "is_retryable_provider_error",
+    "provider_retry_after_seconds",
+    "provider_status_code",
+    "refuse_redirects_in_provider_clients",
+    "silence_sdk_help_notice",
+]
+
+_RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
+_REFUSES_REDIRECTS_MARK = "_memforge_refuses_redirects"
+
+
+class NoRedirectAsyncClient(httpx.AsyncClient):
+    """An HTTP client that never follows a redirect, safe to share in a process.
+
+    A followed redirect resends the request, with its credentials and its
+    payload, to a location the operator never configured. A model endpoint that
+    answers with a redirect is therefore a failed request, not a new address.
+
+    LiteLLM hands this one object to every OpenAI-compatible provider client
+    it builds, on whichever event loop is running, while a pooled connection
+    only works on the loop that opened it. Each event loop therefore sends
+    through its own connection pool.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(follow_redirects=False)
+        self._pools: dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
+        self._pools_lock = threading.Lock()
+
+    async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        kwargs["follow_redirects"] = False
+        return await self._pool().send(request, **kwargs)
+
+    async def aclose(self) -> None:
+        with self._pools_lock:
+            pool = self._pools.pop(asyncio.get_running_loop(), None)
+        if pool is not None:
+            await pool.aclose()
+        await super().aclose()
+
+    def _pool(self) -> httpx.AsyncClient:
+        loop = asyncio.get_running_loop()
+        with self._pools_lock:
+            pool = self._pools.get(loop)
+            if pool is None:
+                for known in [known for known in self._pools if known.is_closed()]:
+                    del self._pools[known]
+                pool = self._pools[loop] = self._new_pool()
+            return pool
+
+    def _new_pool(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(follow_redirects=False)
+
+
+def install_no_redirect_http_client() -> httpx.AsyncClient:
+    """Make LiteLLM's shared HTTP client one that refuses redirects.
+
+    A client that already refuses redirects is kept, so a host process may
+    install its own before importing MemForge.
+    """
+    session = litellm.aclient_session
+    if isinstance(session, httpx.AsyncClient) and not session.follow_redirects:
+        return session
+    session = NoRedirectAsyncClient()
+    litellm.aclient_session = session
+    return session
+
+
+def refuse_redirects_in_provider_clients() -> None:
+    """Make every HTTP client LiteLLM builds for a provider refuse redirects.
+
+    LiteLLM builds these clients in ``AsyncHTTPHandler.create_client`` and sets
+    them to follow redirects. Wrapping that one method turns the setting off on
+    each client as it is built, whichever provider it is for.
+    """
+    build_client = AsyncHTTPHandler.create_client
+    if getattr(build_client, _REFUSES_REDIRECTS_MARK, False):
+        return
+
+    @functools.wraps(build_client)
+    def create_client(self: AsyncHTTPHandler, *args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        client = build_client(self, *args, **kwargs)
+        client.follow_redirects = False
+        return client
+
+    setattr(create_client, _REFUSES_REDIRECTS_MARK, True)
+    AsyncHTTPHandler.create_client = create_client
+
+
+def disable_sdk_default_retries() -> None:
+    """Make a request that asks the SDK for no retries get none.
+
+    Callers pass a retry count of zero with every request. LiteLLM's OpenAI
+    embedding path reads zero as "not set" and falls back to the SDK-wide
+    default, so that default is zero as well.
+    """
+    litellm.DEFAULT_MAX_RETRIES = 0
+
+
+def silence_sdk_help_notice() -> None:
+    """Stop LiteLLM printing its help notice to standard output on a failed request.
+
+    A failed request is reported through the caller's own error and log line.
+    """
+    litellm.suppress_debug_info = True
+
+
+def provider_status_code(exc: BaseException) -> int | None:
+    """Return the HTTP status the provider answered with, when it answered.
+
+    On some routes LiteLLM reports any provider answer as a connection error
+    with a status of its own. The answer's status is then the one on the HTTP
+    error underneath, so a rejected request is not mistaken for a server fault.
+    """
+    if isinstance(exc, litellm.APIConnectionError):
+        answered = _answered_status_code(exc)
+        if answered is not None:
+            return answered
+    raw = getattr(exc, "status_code", None)
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def provider_retry_after_seconds(exc: BaseException) -> float | None:
+    """Return how long the provider asked to wait before another attempt.
+
+    Reads a ``Retry-After`` header given in seconds from the failed response.
+    """
+    headers = getattr(exc, "litellm_response_headers", None)
+    if headers is None:
+        return None
+    try:
+        seconds = float(headers.get("retry-after"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
+def is_retryable_provider_error(exc: BaseException) -> bool:
+    """Whether a failed provider request may succeed when sent again unchanged.
+
+    Timeouts, connection failures, request timeout (408), conflict (409), rate
+    limiting (429) and server errors (5xx) are transient. Every other failure
+    repeats for the same request.
+    """
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    status_code = provider_status_code(exc)
+    return status_code in _RETRYABLE_STATUS_CODES or bool(
+        status_code is not None and status_code >= 500
+    )
+
+
+def _answered_status_code(exc: BaseException) -> int | None:
+    seen: set[int] = set()
+    current: BaseException | None = exc.__cause__ or exc.__context__
+    while current is not None and id(current) not in seen:
+        if isinstance(current, httpx.HTTPStatusError):
+            return current.response.status_code
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+install_no_redirect_http_client()
+refuse_redirects_in_provider_clients()
+disable_sdk_default_retries()
+silence_sdk_help_notice()

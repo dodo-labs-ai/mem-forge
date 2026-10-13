@@ -10,6 +10,7 @@ from memforge.memory.store import MemoryStore
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
+from tests.embedding_fixture import unconfigured_embedding
 
 
 class RecordingCollection:
@@ -96,7 +97,7 @@ async def test_collection_property_points_at_the_vector_handle(db):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
     )
     assert store.collection is collection
 
@@ -109,7 +110,7 @@ async def test_insert_then_purge_routes_through_adapters(db, monkeypatch):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
     )
 
     async def fake_embed(text: str):

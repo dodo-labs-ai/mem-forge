@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from collections.abc import Mapping, Sequence
@@ -14,6 +13,7 @@ from typing import Any
 
 from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
 from memforge.llm.decision_model import DecisionTask, decision_task_model
+from memforge.llm.embedding import EmbeddingRuntime
 from memforge.llm.structured import EntityBatchValidationResponse, StructuredLlmError
 from memforge.models import Entity, EntityAlias, canonicalize_entity_name
 from memforge.storage.adapters.protocols import (
@@ -124,7 +124,7 @@ class EntityResolver:
     def __init__(
         self,
         store: RelationalStore,
-        embed_cfg: dict | None = None,
+        embedding: EmbeddingRuntime | None = None,
         structured_llm_client: Any = None,
         llm_model: str = "claude-sonnet-4-20250514",
         embedding_threshold: float = 0.6,
@@ -133,7 +133,7 @@ class EntityResolver:
         policy: EntityResolutionPolicy | None = None,
     ) -> None:
         self.store = store
-        self.embed_cfg = embed_cfg
+        self.embedding = embedding
         self.structured_llm_client = structured_llm_client
         self.llm_model = llm_model
         self.embedding_threshold = embedding_threshold
@@ -210,7 +210,7 @@ class EntityResolver:
         embedded_mentions = 0
         embedding_batches = 0
         ambiguous: dict[str, tuple[Entity, ...]] = {}
-        if unresolved and self.embed_cfg:
+        if unresolved and self.embedding is not None:
             unique_candidate_names = tuple(
                 dict.fromkeys(
                     candidate.canonical_name
@@ -220,17 +220,11 @@ class EntityResolver:
             )
             texts = [*unresolved, *unique_candidate_names]
             if texts:
-                from memforge.retrieval.embeddings import embed_texts
-
                 vectors = []
                 for start in range(0, len(texts), self.policy.embedding_batch_size):
                     vectors.extend(
-                        await asyncio.to_thread(
-                            embed_texts,
-                            texts[start : start + self.policy.embedding_batch_size],
-                            self.embed_cfg["base_url"],
-                            self.embed_cfg["api_key"],
-                            self.embed_cfg["model"],
+                        await self.embedding.embed_documents(
+                            texts[start : start + self.policy.embedding_batch_size]
                         )
                     )
                     embedding_batches += 1
