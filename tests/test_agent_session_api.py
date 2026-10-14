@@ -61,8 +61,8 @@ async def test_agent_session_window_client_uses_runtime_provider(tmp_path):
     captured = {}
 
     class CapturingRuntimeProvider:
-        def build_structured_llm_client(self, llm, *, max_concurrent):
-            captured["llm"] = llm
+        def build_structured_llm_client(self, models, *, max_concurrent):
+            captured["models"] = models
             captured["max_concurrent"] = max_concurrent
             return expected_client
 
@@ -76,7 +76,7 @@ async def test_agent_session_window_client_uses_runtime_provider(tmp_path):
         await database.close()
 
     assert client is expected_client
-    assert captured["llm"].enrichment_model == "gateway/structured-model"
+    assert captured["models"].generation_route == "gateway/structured-model"
     assert captured["max_concurrent"] == 7
 
 

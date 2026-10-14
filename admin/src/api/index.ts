@@ -2,6 +2,15 @@ export { ApiProvider, useApi, useWorkspaceTarget } from "./ApiProvider";
 export { createApiClient, unwrap, workspaceResourceUrl, type ApiClient } from "./client";
 export { ApiError, HTTP_STATUS, NoWorkspaceError, isApiErrorStatus } from "./errors";
 export {
+  MODEL_KINDS,
+  modelSettingsQueryKeys,
+  useModelSettings,
+  type ModelBinding,
+  type ModelKind,
+  type ModelKindSettings,
+  type ModelSettings,
+} from "./modelSettings";
+export {
   RESERVED_PROJECT_KEYS,
   SHARED_PROJECT_KEY,
   UNSORTED_PROJECT_KEY,

@@ -2126,6 +2126,10 @@
               }
             ]
           },
+          "models": {
+            "$ref": "#/components/schemas/ModelHealthResponse",
+            "description": "Whether a generation model and an embedding model are configured, and the state of each. No generation model is ready unless generation.state is 'ready'."
+          },
           "status": {
             "title": "Status",
             "type": "string"
@@ -2137,7 +2141,8 @@
         "required": [
           "status",
           "database",
-          "vector_store"
+          "vector_store",
+          "models"
         ],
         "title": "HealthResponse",
         "type": "object"
@@ -2305,329 +2310,6 @@
           "cookie_header"
         ],
         "title": "JiraSessionUploadRequest",
-        "type": "object"
-      },
-      "LlmConfigProbeRequest": {
-        "properties": {
-          "api_key": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Api Key"
-          },
-          "base_url": {
-            "title": "Base Url",
-            "type": "string"
-          },
-          "kind": {
-            "enum": [
-              "enrichment",
-              "embedding"
-            ],
-            "title": "Kind",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "base_url"
-        ],
-        "title": "LlmConfigProbeRequest",
-        "type": "object"
-      },
-      "LlmConfigProbeResponse": {
-        "properties": {
-          "latency_ms": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Latency Ms"
-          },
-          "message": {
-            "title": "Message",
-            "type": "string"
-          },
-          "models": {
-            "items": {
-              "$ref": "#/components/schemas/LlmModelOption"
-            },
-            "title": "Models",
-            "type": "array"
-          },
-          "models_supported": {
-            "default": false,
-            "title": "Models Supported",
-            "type": "boolean"
-          },
-          "ok": {
-            "title": "Ok",
-            "type": "boolean"
-          },
-          "stage": {
-            "anyOf": [
-              {
-                "enum": [
-                  "validation",
-                  "connect",
-                  "tls",
-                  "timeout",
-                  "auth",
-                  "http"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Stage"
-          },
-          "status": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Status"
-          },
-          "suggested_base_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Suggested Base Url"
-          }
-        },
-        "required": [
-          "ok",
-          "message"
-        ],
-        "title": "LlmConfigProbeResponse",
-        "type": "object"
-      },
-      "LlmConfigRequest": {
-        "properties": {
-          "embedding_api_key": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Embedding Api Key"
-          },
-          "embedding_base_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Embedding Base Url"
-          },
-          "embedding_model": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Embedding Model"
-          },
-          "enrichment_api_key": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Enrichment Api Key"
-          },
-          "enrichment_base_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Enrichment Base Url"
-          },
-          "enrichment_model": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Enrichment Model"
-          }
-        },
-        "title": "LlmConfigRequest",
-        "type": "object"
-      },
-      "LlmConfigResponse": {
-        "properties": {
-          "embedding_api_key": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Embedding Api Key"
-          },
-          "embedding_api_key_last4": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Embedding Api Key Last4"
-          },
-          "embedding_api_key_set": {
-            "default": false,
-            "title": "Embedding Api Key Set",
-            "type": "boolean"
-          },
-          "embedding_base_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Embedding Base Url"
-          },
-          "embedding_model": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Embedding Model"
-          },
-          "enrichment_api_key": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Enrichment Api Key"
-          },
-          "enrichment_api_key_last4": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Enrichment Api Key Last4"
-          },
-          "enrichment_api_key_set": {
-            "default": false,
-            "title": "Enrichment Api Key Set",
-            "type": "boolean"
-          },
-          "enrichment_base_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Enrichment Base Url"
-          },
-          "enrichment_model": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Enrichment Model"
-          },
-          "writable": {
-            "description": "False when the deployment environment manages LLM settings (MEMFORGE_LLM_CONFIG_WRITABLE), so updates are refused.",
-            "title": "Writable",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "writable"
-        ],
-        "title": "LlmConfigResponse",
-        "type": "object"
-      },
-      "LlmModelOption": {
-        "properties": {
-          "id": {
-            "title": "Id",
-            "type": "string"
-          },
-          "label": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Label"
-          }
-        },
-        "required": [
-          "id"
-        ],
-        "title": "LlmModelOption",
         "type": "object"
       },
       "LocalAgentDaemonStatusResponse": {
@@ -6229,6 +5911,708 @@
           "target_id"
         ],
         "title": "MergeEntitiesRequest",
+        "type": "object"
+      },
+      "ModelApiKeyStatus": {
+        "properties": {
+          "is_set": {
+            "description": "Whether a key is available to the binding.",
+            "title": "Is Set",
+            "type": "boolean"
+          },
+          "last4": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The last four characters of the key; null for a key too short to show them.",
+            "title": "Last4"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "enum": [
+                  "saved",
+                  "environment"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "'saved' for a key entered in Settings and stored encrypted, 'environment' for a key read from a MEMFORGE_* variable, null when the binding uses no key.",
+            "title": "Source"
+          }
+        },
+        "required": [
+          "is_set"
+        ],
+        "title": "ModelApiKeyStatus",
+        "type": "object"
+      },
+      "ModelBindingResponse": {
+        "properties": {
+          "api_key": {
+            "$ref": "#/components/schemas/ModelApiKeyStatus"
+          },
+          "auth_strategy": {
+            "enum": [
+              "api_key",
+              "none",
+              "environment"
+            ],
+            "title": "Auth Strategy",
+            "type": "string"
+          },
+          "config_source": {
+            "enum": [
+              "settings",
+              "environment",
+              "deployment"
+            ],
+            "title": "Config Source",
+            "type": "string"
+          },
+          "endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint"
+          },
+          "kind": {
+            "enum": [
+              "generation",
+              "embedding"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "options": {
+            "additionalProperties": true,
+            "title": "Options",
+            "type": "object"
+          },
+          "origin": {
+            "description": "The normalized origin a saved API key is bound to.",
+            "title": "Origin",
+            "type": "string"
+          },
+          "parameters": {
+            "additionalProperties": true,
+            "title": "Parameters",
+            "type": "object"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "route": {
+            "description": "The LiteLLM route the model id compiles to.",
+            "title": "Route",
+            "type": "string"
+          },
+          "saved_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When the stored binding was last saved; null for one read from the environment.",
+            "title": "Saved At"
+          },
+          "state": {
+            "enum": [
+              "not_validated",
+              "ready",
+              "needs_revalidation"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "validation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelValidationResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "provider",
+          "endpoint",
+          "origin",
+          "auth_strategy",
+          "model_id",
+          "route",
+          "options",
+          "parameters",
+          "config_source",
+          "state",
+          "validation",
+          "api_key",
+          "saved_at"
+        ],
+        "title": "ModelBindingResponse",
+        "type": "object"
+      },
+      "ModelCandidateRequest": {
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A new API key. Leave it out to keep the key saved for this endpoint.",
+            "title": "Api Key"
+          },
+          "auth_strategy": {
+            "anyOf": [
+              {
+                "enum": [
+                  "api_key",
+                  "none",
+                  "environment"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Strategy"
+          },
+          "endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint"
+          },
+          "model_id": {
+            "default": "",
+            "description": "The model, as the provider descriptor reads it.",
+            "title": "Model Id",
+            "type": "string"
+          },
+          "options": {
+            "additionalProperties": true,
+            "title": "Options",
+            "type": "object"
+          },
+          "parameters": {
+            "additionalProperties": true,
+            "title": "Parameters",
+            "type": "object"
+          },
+          "provider": {
+            "default": "",
+            "description": "The id of a provider descriptor.",
+            "title": "Provider",
+            "type": "string"
+          }
+        },
+        "title": "ModelCandidateRequest",
+        "type": "object"
+      },
+      "ModelDiscoveryRequest": {
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Leave it out to use the key saved for this endpoint's origin.",
+            "title": "Api Key"
+          },
+          "auth_strategy": {
+            "anyOf": [
+              {
+                "enum": [
+                  "api_key",
+                  "none",
+                  "environment"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Strategy"
+          },
+          "endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint"
+          },
+          "provider": {
+            "default": "",
+            "description": "The id of a provider descriptor.",
+            "title": "Provider",
+            "type": "string"
+          }
+        },
+        "title": "ModelDiscoveryRequest",
+        "type": "object"
+      },
+      "ModelDiscoveryResponse": {
+        "properties": {
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "latency_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latency Ms"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/ModelOption"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "models_supported": {
+            "default": false,
+            "title": "Models Supported",
+            "type": "boolean"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "stage": {
+            "anyOf": [
+              {
+                "enum": [
+                  "validation",
+                  "connect",
+                  "tls",
+                  "timeout",
+                  "auth",
+                  "http"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "suggested_endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suggested Endpoint"
+          }
+        },
+        "required": [
+          "ok",
+          "message"
+        ],
+        "title": "ModelDiscoveryResponse",
+        "type": "object"
+      },
+      "ModelHealthResponse": {
+        "properties": {
+          "embedding": {
+            "$ref": "#/components/schemas/ModelKindHealthResponse"
+          },
+          "generation": {
+            "$ref": "#/components/schemas/ModelKindHealthResponse"
+          }
+        },
+        "required": [
+          "generation",
+          "embedding"
+        ],
+        "title": "ModelHealthResponse",
+        "type": "object"
+      },
+      "ModelKindHealthResponse": {
+        "properties": {
+          "configured": {
+            "description": "Whether a binding of this kind is in use.",
+            "title": "Configured",
+            "type": "boolean"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "not_validated",
+                  "ready",
+                  "needs_revalidation"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The state of that binding; null when none is configured.",
+            "title": "State"
+          }
+        },
+        "required": [
+          "configured"
+        ],
+        "title": "ModelKindHealthResponse",
+        "type": "object"
+      },
+      "ModelKindSettingsResponse": {
+        "properties": {
+          "active": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelBindingResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The binding the runtime uses."
+          },
+          "candidate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelBindingResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The binding Settings is editing, not yet in use."
+          }
+        },
+        "required": [
+          "active",
+          "candidate"
+        ],
+        "title": "ModelKindSettingsResponse",
+        "type": "object"
+      },
+      "ModelOption": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "ModelOption",
+        "type": "object"
+      },
+      "ModelProviderListResponse": {
+        "properties": {
+          "providers": {
+            "items": {
+              "$ref": "#/components/schemas/ModelProviderResponse"
+            },
+            "title": "Providers",
+            "type": "array"
+          }
+        },
+        "required": [
+          "providers"
+        ],
+        "title": "ModelProviderListResponse",
+        "type": "object"
+      },
+      "ModelProviderResponse": {
+        "properties": {
+          "auth_strategies": {
+            "description": "The accepted auth strategies; the first is the one to propose.",
+            "items": {
+              "enum": [
+                "api_key",
+                "none",
+                "environment"
+              ],
+              "type": "string"
+            },
+            "title": "Auth Strategies",
+            "type": "array"
+          },
+          "default_endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The base URL used when none is entered; null when the provider has none.",
+            "title": "Default Endpoint"
+          },
+          "endpoint_required": {
+            "description": "Whether a base URL has to be entered.",
+            "title": "Endpoint Required",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kinds": {
+            "description": "The kinds of model the provider serves.",
+            "items": {
+              "enum": [
+                "generation",
+                "embedding"
+              ],
+              "type": "string"
+            },
+            "title": "Kinds",
+            "type": "array"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "lists_models": {
+            "description": "Whether the endpoint can list its models.",
+            "title": "Lists Models",
+            "type": "boolean"
+          },
+          "model_is_route": {
+            "description": "Whether the model is entered as a full LiteLLM provider/model route.",
+            "title": "Model Is Route",
+            "type": "boolean"
+          },
+          "options": {
+            "description": "The names of the non-secret options the provider accepts.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Options",
+            "type": "array"
+          },
+          "parameters": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "description": "The request parameters a binding of each served kind may set.",
+            "propertyNames": {
+              "enum": [
+                "generation",
+                "embedding"
+              ]
+            },
+            "title": "Parameters",
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "kinds",
+          "auth_strategies",
+          "default_endpoint",
+          "endpoint_required",
+          "model_is_route",
+          "lists_models",
+          "options",
+          "parameters"
+        ],
+        "title": "ModelProviderResponse",
+        "type": "object"
+      },
+      "ModelSettingsResponse": {
+        "properties": {
+          "embedding": {
+            "$ref": "#/components/schemas/ModelKindSettingsResponse"
+          },
+          "generation": {
+            "$ref": "#/components/schemas/ModelKindSettingsResponse"
+          },
+          "litellm_version": {
+            "title": "Litellm Version",
+            "type": "string"
+          },
+          "writable": {
+            "description": "False when the deployment environment manages model settings (MEMFORGE_LLM_CONFIG_WRITABLE), so every write is refused.",
+            "title": "Writable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "writable",
+          "litellm_version",
+          "generation",
+          "embedding"
+        ],
+        "title": "ModelSettingsResponse",
+        "type": "object"
+      },
+      "ModelValidationResponse": {
+        "properties": {
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "passed": {
+            "title": "Passed",
+            "type": "boolean"
+          },
+          "promoted": {
+            "description": "Whether the checked candidate became the active binding.",
+            "title": "Promoted",
+            "type": "boolean"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/ModelKindSettingsResponse"
+          },
+          "validation": {
+            "$ref": "#/components/schemas/ModelValidationResult"
+          }
+        },
+        "required": [
+          "passed",
+          "promoted",
+          "validation",
+          "settings"
+        ],
+        "title": "ModelValidationResponse",
+        "type": "object"
+      },
+      "ModelValidationResult": {
+        "properties": {
+          "checked_at": {
+            "title": "Checked At",
+            "type": "string"
+          },
+          "current": {
+            "description": "Whether the check ran against the binding as it is now.",
+            "title": "Current",
+            "type": "boolean"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "facts": {
+            "additionalProperties": true,
+            "description": "What the check observed: latency_ms; for generation structured_output_mode ('native_schema' or 'json_text'), schema_fallback, token_limits_known and provider_model; for embedding dimension and provider_model. provider_model is present only when the provider reported one.",
+            "title": "Facts",
+            "type": "object"
+          },
+          "passed": {
+            "title": "Passed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "checked_at",
+          "passed",
+          "current"
+        ],
+        "title": "ModelValidationResult",
         "type": "object"
       },
       "ProjectCreateRequest": {
@@ -10556,110 +10940,6 @@
         ]
       }
     },
-    "/api/v1/llm-config": {
-      "get": {
-        "description": "Get LLM configuration. API keys are masked in the response.",
-        "operationId": "get_llm_config_api_v1_llm_config_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LlmConfigResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Get Llm Config",
-        "tags": [
-          "llm-config"
-        ]
-      },
-      "put": {
-        "description": "Update LLM configuration and return the stored result.",
-        "operationId": "update_llm_config_api_v1_llm_config_put",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/LlmConfigRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LlmConfigResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Update Llm Config",
-        "tags": [
-          "llm-config"
-        ]
-      }
-    },
-    "/api/v1/llm-config/probe": {
-      "post": {
-        "description": "Test an LLM endpoint and fetch model ids when the endpoint supports it.",
-        "operationId": "probe_llm_config_api_v1_llm_config_probe_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/LlmConfigProbeRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LlmConfigProbeResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Probe Llm Config",
-        "tags": [
-          "llm-config"
-        ]
-      }
-    },
     "/api/v1/memories": {
       "get": {
         "description": "List memories with pagination and filters.\n\nFilters: type (fact/decision/convention/procedure), status, source,\nproject, free-text search. Supports limit/offset pagination.\n\nWithout ``status`` the list holds active Memories, so its total for a\nproject equals that project's ``memory_count``; ``status`` lists the\nMemories in exactly that lifecycle status instead.\n\nThe access predicate gates every row: workspace rows are visible\nacross every project (the ranker handles project relevance, not\nthe predicate), and the caller's own private rows surface only\nwhen ``include_private=True``.",
@@ -12103,6 +12383,303 @@
         "summary": "Reject Memory Review",
         "tags": [
           "memory-reviews"
+        ]
+      }
+    },
+    "/api/v1/model-settings": {
+      "get": {
+        "description": "Read the active and candidate bindings of both kinds. No key is returned.",
+        "operationId": "read_model_settings_api_v1_model_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelSettingsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Model Settings",
+        "tags": [
+          "model-settings"
+        ]
+      }
+    },
+    "/api/v1/model-settings/providers": {
+      "get": {
+        "description": "List the provider descriptors a binding can name.",
+        "operationId": "list_model_providers_api_v1_model_settings_providers_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelProviderListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Model Providers",
+        "tags": [
+          "model-settings"
+        ]
+      }
+    },
+    "/api/v1/model-settings/{kind}/active/validate": {
+      "post": {
+        "description": "Check the active binding again. It stays in use whatever the outcome.",
+        "operationId": "validate_active_model_api_v1_model_settings__kind__active_validate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "generation",
+                "embedding"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelValidationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Validate Active Model",
+        "tags": [
+          "model-settings"
+        ]
+      }
+    },
+    "/api/v1/model-settings/{kind}/candidate": {
+      "delete": {
+        "description": "Discard the candidate binding of a kind.",
+        "operationId": "discard_model_candidate_api_v1_model_settings__kind__candidate_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "generation",
+                "embedding"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelKindSettingsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Discard Model Candidate",
+        "tags": [
+          "model-settings"
+        ]
+      },
+      "put": {
+        "description": "Save the candidate binding of a kind. The active binding is not changed.",
+        "operationId": "save_model_candidate_api_v1_model_settings__kind__candidate_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "generation",
+                "embedding"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelCandidateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelKindSettingsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Model Candidate",
+        "tags": [
+          "model-settings"
+        ]
+      }
+    },
+    "/api/v1/model-settings/{kind}/candidate/validate": {
+      "post": {
+        "description": "Check the candidate with one real request and make it active when it passes.",
+        "operationId": "validate_model_candidate_api_v1_model_settings__kind__candidate_validate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "generation",
+                "embedding"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelValidationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Validate Model Candidate",
+        "tags": [
+          "model-settings"
+        ]
+      }
+    },
+    "/api/v1/model-settings/{kind}/discover-models": {
+      "post": {
+        "description": "List the models an endpoint offers, for choosing a candidate's model.",
+        "operationId": "discover_models_api_v1_model_settings__kind__discover_models_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "generation",
+                "embedding"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelDiscoveryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelDiscoveryResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Discover Models",
+        "tags": [
+          "model-settings"
         ]
       }
     },

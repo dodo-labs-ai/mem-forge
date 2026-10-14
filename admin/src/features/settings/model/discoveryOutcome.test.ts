@@ -1,20 +1,20 @@
 import { expect, test } from "vitest";
-import { probeOutcome } from "./probeOutcome";
+import { discoveryOutcome } from "./discoveryOutcome";
 
-test("a test that listed models succeeds and reports the latency", () => {
+test("an endpoint that listed models succeeds and reports the latency", () => {
   expect(
-    probeOutcome({
+    discoveryOutcome({
       ok: true,
       models_supported: true,
-      models: [{ id: "openai/gpt-5.4" }],
+      models: [{ id: "gpt-5.4" }],
       message: "Connected. Found 1 model.",
       latency_ms: 182,
     }),
-  ).toEqual({ tone: "ok", message: "Connected. Found 1 model. (182 ms)", models: ["openai/gpt-5.4"], suggestedBaseUrl: null });
+  ).toEqual({ tone: "ok", message: "Connected. Found 1 model. (182 ms)", models: ["gpt-5.4"], suggestedEndpoint: null });
 });
 
 test("a connection without a model list is a warning", () => {
-  const outcome = probeOutcome({
+  const outcome = discoveryOutcome({
     ok: true,
     models_supported: false,
     message: "Connected, but this endpoint did not return a model list.",
@@ -24,19 +24,20 @@ test("a connection without a model list is a warning", () => {
   expect(outcome.models).toEqual([]);
 });
 
-test("a failed test keeps the server's message and its suggested base URL", () => {
+test("a failure keeps the server's message and its suggested base URL", () => {
   expect(
-    probeOutcome({
+    discoveryOutcome({
       ok: false,
       models_supported: false,
       stage: "connect",
+      error_code: "provider_unreachable",
       message: "Could not reach localhost.",
-      suggested_base_url: "http://host.docker.internal:11434/v1",
+      suggested_endpoint: "http://host.docker.internal:11434",
     }),
   ).toEqual({
     tone: "danger",
     message: "Could not reach localhost.",
     models: [],
-    suggestedBaseUrl: "http://host.docker.internal:11434/v1",
+    suggestedEndpoint: "http://host.docker.internal:11434",
   });
 });

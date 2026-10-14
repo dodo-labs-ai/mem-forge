@@ -1,4 +1,4 @@
-"""Every consumer embeds through the Embedding Runtime built from the effective settings."""
+"""Every consumer embeds through the Embedding Runtime built from the active embedding binding."""
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ from memforge import runtime
 from memforge.config import AppConfig
 from memforge.llm.embedding import EmbeddingRuntime
 from memforge.models import DocumentRecord, Memory, content_hash
-from memforge.runtime import EffectiveLlmConfig, build_embedding_runtime
+from memforge.llm.providers import ResolvedInvocation
+from memforge.runtime import build_embedding_runtime, resolve_models
 from memforge.storage.database import Database
 from tests.embedding_fixture import embedding_response
 
@@ -104,18 +105,6 @@ def _config(tmp_path: Path) -> AppConfig:
     return config
 
 
-def _llm(**embedding: str) -> EffectiveLlmConfig:
-    return EffectiveLlmConfig(
-        enrichment_model="wiring-generation-model",
-        enrichment_base_url="https://generate.wiring.example.test",
-        enrichment_api_key="wiring-generation-key",
-        request_timeout_s=30.0,
-        embedding_model=embedding.get("model", EMBEDDING_MODEL),
-        embedding_base_url=embedding.get("base_url", EMBEDDING_BASE_URL),
-        embedding_api_key=embedding.get("api_key", EMBEDDING_API_KEY),
-    )
-
-
 def _memory(mem_id: str, content: str) -> Memory:
     now = datetime.now(timezone.utc)
     return Memory(
@@ -155,26 +144,47 @@ def _assert_sent_to_the_configured_endpoint(request: dict[str, Any]) -> None:
     assert request["api_key"] == EMBEDDING_API_KEY
 
 
-def test_the_runtime_is_built_from_the_effective_embedding_settings(tmp_path) -> None:
+def test_the_runtime_is_built_from_the_resolved_invocation(tmp_path) -> None:
     config = _config(tmp_path)
     config.retrieval.embedding_cache_size = 7
+    invocation = ResolvedInvocation(
+        route=f"openai/{EMBEDDING_MODEL}",
+        api_base=EMBEDDING_BASE_URL,
+        api_key=EMBEDDING_API_KEY,
+    )
 
-    settings = build_embedding_runtime(_llm(), config).settings
+    settings = build_embedding_runtime(invocation, config).settings
 
-    assert settings.model == EMBEDDING_MODEL
-    assert settings.base_url == EMBEDDING_BASE_URL
-    assert settings.api_key == EMBEDDING_API_KEY
+    assert settings.invocation is invocation
     assert settings.cache_size == 7
 
 
-def test_blank_endpoint_settings_are_left_for_the_provider_route_to_resolve(tmp_path) -> None:
-    llm = _llm(model="ollama/nomic-embed-text", base_url="", api_key="")
+def test_a_runtime_built_without_an_invocation_is_not_configured(tmp_path) -> None:
+    assert build_embedding_runtime(None, _config(tmp_path)).configured is False
 
-    built = build_embedding_runtime(llm, _config(tmp_path))
 
-    assert built.settings.base_url is None
-    assert built.settings.api_key is None
-    assert built.configured is True
+async def test_the_environment_settings_resolve_to_the_configured_endpoint(db, tmp_path) -> None:
+    models = await resolve_models(db, _config(tmp_path))
+
+    assert models.embedding == ResolvedInvocation(
+        route=f"openai/{EMBEDDING_MODEL}",
+        api_base=EMBEDDING_BASE_URL,
+        api_key=EMBEDDING_API_KEY,
+    )
+
+
+async def test_a_provider_route_without_endpoint_or_key_is_left_for_the_provider_to_resolve(
+    db, tmp_path
+) -> None:
+    config = _config(tmp_path)
+    config.llm.embedding_model = "ollama/nomic-embed-text"
+    config.llm.embedding_base_url = ""
+    config.llm.embedding_api_key = ""
+
+    models = await resolve_models(db, config)
+
+    assert models.embedding == ResolvedInvocation(route="ollama/nomic-embed-text")
+    assert build_embedding_runtime(models.embedding, config).configured is True
 
 
 async def test_the_sync_runtime_writes_memories_through_the_configured_runtime(

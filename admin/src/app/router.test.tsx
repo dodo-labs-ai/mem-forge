@@ -4,6 +4,7 @@ import { RouterProvider, createMemoryRouter } from "react-router-dom";
 import { afterEach, expect, test, vi } from "vitest";
 import { ApiProvider, createApiClient, createWorkspaceController } from "@/api";
 import { fakeFetch } from "@/test/fakeApi";
+import { PROVIDERS, makeModelSettings } from "@/test/modelSettingsFixtures";
 import { APP_BASE_PATH } from "./basePath";
 import type { AdminExtension } from "./extension/contract";
 import { ExtensionProvider } from "./extension/ExtensionProvider";
@@ -26,7 +27,8 @@ function openApp(path: string, extension?: AdminExtension) {
   fakeFetch({
     "GET /api/cloud/local-agent/status": () => ({ status: "online", last_seen_at: null, checked_at: "", stale_after_seconds: 60 }),
     "GET /api/cloud/local-agent/jobs/current": () => ({ data: [] }),
-    "GET /api/v1/llm-config": () => ({ writable: true, enrichment_api_key_set: false, embedding_api_key_set: false }),
+    "GET /api/v1/model-settings": () => makeModelSettings(),
+    "GET /api/v1/model-settings/providers": () => ({ providers: PROVIDERS }),
   });
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const workspace = createWorkspaceController(() => queryClient.clear());

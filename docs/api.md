@@ -27,6 +27,9 @@ Default base URL: `http://127.0.0.1:8765`.
 | Documents | `GET /api/documents/{doc_id}/artifacts`, `.../artifacts/{kind}`, `.../content`, `.../pdf` | The same reads for the newest copy of the Document stored by a Source the caller can read |
 | Review | `GET /api/review` | List review queue items |
 | Agent sessions | `POST /api/agent-sessions/windows` | Submit a redacted evidence window |
+| Model settings | `GET /api/v1/model-settings` | The generation and embedding models in use and being edited; never a key |
+| Model settings | `PUT /api/v1/model-settings/{kind}/candidate` | Save an edit to a model without putting it to use |
+| Model settings | `POST /api/v1/model-settings/{kind}/candidate/validate` | Check the edit with one real request and put it to use when it passes |
 
 The API schema is also available from FastAPI's generated OpenAPI endpoint while
 the service is running.

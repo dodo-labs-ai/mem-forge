@@ -748,33 +748,27 @@ export interface LocalAgentDaemonStatusResponse {
   stale_after_seconds: number;
 }
 
-export interface LlmConfig {
-  enrichment_model: string | null;
-  enrichment_base_url: string | null;
-  enrichment_api_key: string | null;
-  enrichment_api_key_set?: boolean;
-  enrichment_api_key_last4?: string | null;
-  embedding_model: string | null;
-  embedding_base_url: string | null;
-  embedding_api_key: string | null;
-  embedding_api_key_set?: boolean;
-  embedding_api_key_last4?: string | null;
+export type ModelKind = "generation" | "embedding";
+
+/** One configured model, as `GET /model-settings` returns it. */
+export interface ModelBinding {
+  kind: ModelKind;
+  provider: string;
+  endpoint: string | null;
+  model_id: string;
+  state: "not_validated" | "ready" | "needs_revalidation";
 }
 
-export interface LlmModelOption {
-  id: string;
-  label?: string | null;
+export interface ModelKindSettings {
+  /** The model the server uses. */
+  active: ModelBinding | null;
 }
 
-export interface LlmConfigProbeResponse {
-  ok: boolean;
-  models_supported: boolean;
-  models: LlmModelOption[];
-  stage: "validation" | "connect" | "tls" | "timeout" | "auth" | "http" | null;
-  status: number | null;
-  message: string;
-  latency_ms: number | null;
-  suggested_base_url: string | null;
+export interface ModelSettings {
+  /** False when the deployment environment manages the models. */
+  writable: boolean;
+  generation: ModelKindSettings;
+  embedding: ModelKindSettings;
 }
 
 export interface StatBucket {

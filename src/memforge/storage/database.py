@@ -20,7 +20,7 @@ from contextlib import nullcontext
 from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Collection, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Collection, Mapping, Sequence
 
 import aiosqlite
 
@@ -300,7 +300,13 @@ from memforge.storage.admin_source import (
     validate_source_list_sort_mode,
 )
 
+if TYPE_CHECKING:
+    from memforge.config import LlmConfig
+
 logger = logging.getLogger(__name__)
+
+# How long a statement waits for a lock another connection holds.
+_BUSY_TIMEOUT_MS = 5000
 
 
 def _evidence_profile_from_storage_row(row: Mapping[str, object]) -> EvidenceRepresentationProfile | None:
@@ -614,6 +620,44 @@ def _assert_relation_run_retry_matches(row: Mapping[str, Any], run: RelationRunR
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _model_validation_columns(validation: Mapping[str, Any]) -> tuple[Any, Any, Any, Any]:
+    return (
+        validation["checked_at"],
+        validation["digest"],
+        json.dumps(validation.get("facts") or {}, sort_keys=True),
+        validation.get("error_code"),
+    )
+
+
+def _model_binding_from_row(row: Any) -> dict[str, Any]:
+    stored = dict(row)
+    validation = None
+    if stored["validated_at"] is not None:
+        validation = {
+            "checked_at": stored["validated_at"],
+            "digest": stored["validation_digest"],
+            "facts": json.loads(stored["validation_facts_json"] or "{}"),
+            "error_code": stored["validation_error_code"],
+        }
+    return {
+        "kind": stored["kind"],
+        "slot": stored["slot"],
+        "provider": stored["provider"],
+        "endpoint": stored["endpoint"],
+        "origin": stored["origin"],
+        "auth_strategy": stored["auth_strategy"],
+        "options": json.loads(stored["options_json"] or "{}"),
+        "secret_ref": stored["secret_ref"],
+        "model_id": stored["model_id"],
+        "route": stored["route"],
+        "parameters": json.loads(stored["parameters_json"] or "{}"),
+        "config_source": stored["config_source"],
+        "state": stored["state"],
+        "validation": validation,
+        "updated_at": stored["updated_at"],
+    }
 
 
 def _document_item_extra_json(doc: DocumentRecord) -> str | None:
@@ -1887,16 +1931,37 @@ CREATE TABLE IF NOT EXISTS local_agent_heartbeats (
 );
 
 -- ---------------------------------------------------------------
--- Config singletons
+-- Model bindings: the active and the candidate configuration of the
+-- generation model and of the embedding model. A binding refers to its API
+-- key; the key itself is stored encrypted in model_secrets.
 -- ---------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS llm_config (
-    id                  INTEGER PRIMARY KEY CHECK (id = 1),
-    enrichment_model    TEXT,
-    enrichment_base_url TEXT,
-    enrichment_api_key  TEXT,
-    embedding_model     TEXT,
-    embedding_base_url  TEXT,
-    embedding_api_key   TEXT
+CREATE TABLE IF NOT EXISTS model_bindings (
+    kind             TEXT NOT NULL CHECK (kind IN ('generation', 'embedding')),
+    slot             TEXT NOT NULL CHECK (slot IN ('active', 'candidate')),
+    provider         TEXT NOT NULL,
+    endpoint         TEXT,
+    origin           TEXT NOT NULL,
+    auth_strategy    TEXT NOT NULL CHECK (auth_strategy IN ('api_key', 'none', 'environment')),
+    options_json     TEXT NOT NULL DEFAULT '{}',
+    secret_ref       TEXT,
+    model_id         TEXT NOT NULL,
+    route            TEXT NOT NULL,
+    parameters_json  TEXT NOT NULL DEFAULT '{}',
+    config_source    TEXT NOT NULL,
+    state            TEXT NOT NULL CHECK (state IN ('not_validated', 'ready', 'needs_revalidation')),
+    validated_at             TEXT,
+    validation_digest        TEXT,
+    validation_facts_json    TEXT,
+    validation_error_code    TEXT,
+    updated_at       TEXT NOT NULL,
+    PRIMARY KEY (kind, slot)
+);
+CREATE TABLE IF NOT EXISTS model_secrets (
+    id          TEXT PRIMARY KEY,
+    ciphertext  TEXT NOT NULL,
+    origin      TEXT NOT NULL,
+    last4       TEXT NOT NULL,
+    created_at  TEXT NOT NULL
 );
 
 -- ---------------------------------------------------------------
@@ -4557,6 +4622,44 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # why in its sync history (ADR 0045).
         ["ALTER TABLE sync_history ADD COLUMN absence_check_skipped_reason TEXT"],
     ),
+    (
+        113,
+        "Configure the generation and embedding models as bindings",
+        # Each kind of model has an active and a candidate binding, and API
+        # keys are stored encrypted. Settings held by the single-row
+        # llm_config table become active bindings once the process hands over
+        # the configuration that completes them (see translate_llm_config).
+        [
+            """CREATE TABLE IF NOT EXISTS model_bindings (
+                kind             TEXT NOT NULL CHECK (kind IN ('generation', 'embedding')),
+                slot             TEXT NOT NULL CHECK (slot IN ('active', 'candidate')),
+                provider         TEXT NOT NULL,
+                endpoint         TEXT,
+                origin           TEXT NOT NULL,
+                auth_strategy    TEXT NOT NULL CHECK (auth_strategy IN ('api_key', 'none', 'environment')),
+                options_json     TEXT NOT NULL DEFAULT '{}',
+                secret_ref       TEXT,
+                model_id         TEXT NOT NULL,
+                route            TEXT NOT NULL,
+                parameters_json  TEXT NOT NULL DEFAULT '{}',
+                config_source    TEXT NOT NULL,
+                state            TEXT NOT NULL CHECK (state IN ('not_validated', 'ready', 'needs_revalidation')),
+                validated_at             TEXT,
+                validation_digest        TEXT,
+                validation_facts_json    TEXT,
+                validation_error_code    TEXT,
+                updated_at       TEXT NOT NULL,
+                PRIMARY KEY (kind, slot)
+            )""",
+            """CREATE TABLE IF NOT EXISTS model_secrets (
+                id          TEXT PRIMARY KEY,
+                ciphertext  TEXT NOT NULL,
+                origin      TEXT NOT NULL,
+                last4       TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            )""",
+        ],
+    ),
 ]
 
 
@@ -4589,6 +4692,25 @@ async def _open_aiosqlite_connection(
         raise
 
 
+def _truncate_write_ahead_log(path: str, *, wait_s: float) -> bool:
+    """Checkpoint the database at ``path`` and truncate its write-ahead log.
+
+    Returns False when a connection that is reading or writing kept the log in
+    use for longer than ``wait_s``.
+    """
+    try:
+        connection = sqlite3.connect(path, timeout=wait_s)
+    except sqlite3.OperationalError:
+        return False
+    try:
+        row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        connection.close()
+    return row is not None and int(row[0]) == 0
+
+
 class Database:
     """Async SQLite database layer for MemForge."""
 
@@ -4597,6 +4719,11 @@ class Database:
         self._document_store = document_store
         self._db: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
+        # Whether the database still holds its model settings in the llm_config
+        # table, and whether its write-ahead log may still hold the plain-text
+        # keys of that table (see translate_llm_config).
+        self._holds_llm_config = False
+        self._wal_holds_plaintext_keys = False
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -4613,11 +4740,12 @@ class Database:
             read_only_uri = f"{path.resolve().as_uri()}?mode=ro"
             self._db = await _open_aiosqlite_connection(read_only_uri, uri=True)
         self._db.row_factory = aiosqlite.Row
-        await self._db.execute("PRAGMA busy_timeout=5000")
+        await self._db.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         await self._db.execute("PRAGMA foreign_keys = ON")
         if not run_migrations:
             await self._db.execute("PRAGMA query_only = ON")
             await self._assert_evidence_unit_support_marker()
+            self._holds_llm_config = await self._table_exists_unlocked("llm_config")
             return
         await self._refuse_reference_scoped_support_unlocked()
         await self._db.execute("PRAGMA journal_mode=WAL")
@@ -4626,6 +4754,7 @@ class Database:
         await self._assert_memory_source_ids_resolved()
         await self._assert_evidence_unit_support_marker()
         await self._db.commit()
+        self._holds_llm_config = await self._table_exists_unlocked("llm_config")
 
     async def _table_exists_unlocked(self, table: str) -> bool:
         async with self.db.execute(
@@ -4891,6 +5020,111 @@ class Database:
                     raise RuntimeError("failed to restore SQLite foreign key enforcement")
             logger.info("Applied migration %d: %s", version, description)
         await self._assert_memory_source_ids_resolved()
+
+    async def translate_llm_config(self, defaults: "LlmConfig") -> int:
+        """Turn the settings of the llm_config table into active model bindings and drop the table.
+
+        The table is the single row in which a database made before model
+        bindings holds its model settings, API keys in plain text. Whoever
+        opens such a database calls this before any model binding is read,
+        with the model settings of the configuration the process runs with: a
+        column the row leaves empty takes its value from ``defaults``. A
+        database without the table is left as it is.
+
+        Each kind the row configures becomes an active binding that has not
+        been validated. A key the row holds is stored encrypted and the binding
+        refers to it. Returns the number of bindings written. When a key cannot
+        be encrypted the error is raised and the table is left as it is.
+        """
+        if not self._holds_llm_config:
+            return 0
+        async with self._write_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                if not await self._table_exists_unlocked("llm_config"):
+                    await self.db.rollback()
+                    self._holds_llm_config = False
+                    return 0
+                translated = await self._write_llm_config_bindings_unlocked(defaults)
+                # Dropping the table with secure delete on overwrites the pages
+                # that held the keys instead of leaving them readable in the file.
+                async with self.db.execute("PRAGMA secure_delete") as cursor:
+                    secure_delete = ("OFF", "ON", "FAST")[int((await cursor.fetchone())[0])]
+                await self.db.execute("PRAGMA secure_delete = ON")
+                await self.db.execute("DROP TABLE llm_config")
+                await self.db.execute(f"PRAGMA secure_delete = {secure_delete}")
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+            self._holds_llm_config = False
+            # The write-ahead log still holds the pages the keys were written
+            # to; emptying it removes the last copy.
+            self._wal_holds_plaintext_keys = True
+            erased = await self._truncate_wal_unlocked(wait_for_readers=True)
+        logger.info("Translated stored model settings into %d active bindings", translated)
+        if not erased:
+            logger.warning(
+                "Another connection is reading %s, so its write-ahead log still holds the "
+                "model API keys that were stored in plain text. They are erased once it is done.",
+                self.db_path,
+            )
+        return translated
+
+    async def _write_llm_config_bindings_unlocked(self, defaults: "LlmConfig") -> int:
+        from memforge.llm.bindings import binding_record, translate_stored_settings
+
+        async with self.db.execute("SELECT * FROM llm_config WHERE id = 1") as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return 0
+        translated = 0
+        for kind, column in (("generation", "enrichment"), ("embedding", "embedding")):
+            translation = translate_stored_settings(
+                kind,
+                model=row[f"{column}_model"],
+                base_url=row[f"{column}_base_url"],
+                api_key=row[f"{column}_api_key"],
+                defaults=defaults,
+            )
+            if translation is None:
+                continue
+            binding, secret = translation
+            if secret is not None:
+                await self._write_model_secret_unlocked(secret)
+            await self._write_model_binding_unlocked(kind, "active", binding_record(binding))
+            translated += 1
+        return translated
+
+    async def erase_plaintext_keys(self) -> bool:
+        """Empty a write-ahead log that still holds plain-text model API keys.
+
+        Returns whether none are left. A connection that is reading the
+        database keeps the log from being emptied; the caller tries again
+        later, and closing the database tries once more.
+        """
+        if not self._wal_holds_plaintext_keys:
+            return True
+        async with self._write_lock:
+            return await self._truncate_wal_unlocked(wait_for_readers=False)
+
+    async def _truncate_wal_unlocked(self, *, wait_for_readers: bool) -> bool:
+        """Move the write-ahead log into the database file and empty it.
+
+        Returns whether the log was emptied; a reader on another connection
+        prevents it. Waiting for readers takes as long as the busy timeout at
+        most. The checkpoint runs on a connection of its own, so waiting never
+        holds up a statement of this one.
+        """
+        wait_s = _BUSY_TIMEOUT_MS / 1000 if wait_for_readers else 0.0
+        emptied = await asyncio.to_thread(
+            _truncate_write_ahead_log,
+            str(Path(self.db_path).expanduser()),
+            wait_s=wait_s,
+        )
+        if emptied:
+            self._wal_holds_plaintext_keys = False
+        return emptied
 
     async def _classify_jira_changelog_revisions_unlocked(self) -> int:
         """Give every stored Jira changelog revision the semantic class its content has."""
@@ -5461,6 +5695,8 @@ class Database:
     async def close(self) -> None:
         """Close the database connection."""
         if self._db:
+            if self._wal_holds_plaintext_keys:
+                await self.erase_plaintext_keys()
             await self._db.close()
             self._db = None
 
@@ -21772,55 +22008,183 @@ class Database:
         )
 
     # ==================================================================
-    # Config - LLM
+    # Model bindings
     # ==================================================================
 
-    async def get_llm_config(self) -> dict:
-        async with self.db.execute("SELECT * FROM llm_config WHERE id = 1") as cursor:
+    async def get_model_binding(self, kind: str, slot: str) -> dict[str, Any] | None:
+        """Return the stored binding of ``kind`` in ``slot`` ('active' or 'candidate')."""
+        if self._holds_llm_config:
+            raise RuntimeError(
+                "The model settings of this database are still in its llm_config table. "
+                "Call translate_llm_config with the model settings of the running "
+                "configuration before reading a model binding."
+            )
+        async with self.db.execute(
+            "SELECT * FROM model_bindings WHERE kind = ? AND slot = ?",
+            (kind, slot),
+        ) as cursor:
             row = await cursor.fetchone()
-            if not row:
-                return {
-                    "enrichment_model": None,
-                    "enrichment_base_url": None,
-                    "enrichment_api_key": None,
-                    "embedding_model": None,
-                    "embedding_base_url": None,
-                    "embedding_api_key": None,
-                }
-            d = dict(row)
-            return {
-                "enrichment_model": d["enrichment_model"],
-                "enrichment_base_url": d["enrichment_base_url"],
-                "enrichment_api_key": d["enrichment_api_key"],
-                "embedding_model": d["embedding_model"],
-                "embedding_base_url": d["embedding_base_url"],
-                "embedding_api_key": d["embedding_api_key"],
-            }
+        return None if row is None else _model_binding_from_row(row)
 
-    async def set_llm_config(self, config: dict) -> None:
+    async def put_model_binding(
+        self,
+        kind: str,
+        slot: str,
+        record: Mapping[str, Any],
+        *,
+        secret: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Store ``record`` as the binding of ``kind`` in ``slot`` and return what is stored.
+
+        ``secret`` is an encrypted API key the record refers to, stored with it.
+        A stored key no binding refers to any more is deleted.
+        """
+        async with self._write_lock:
+            if secret is not None:
+                await self._write_model_secret_unlocked(secret)
+            await self._write_model_binding_unlocked(kind, slot, record)
+            await self._delete_unreferenced_model_secrets_unlocked()
+            await self.db.commit()
+        stored = await self.get_model_binding(kind, slot)
+        assert stored is not None
+        return stored
+
+    async def delete_model_binding(self, kind: str, slot: str) -> None:
         async with self._write_lock:
             await self.db.execute(
-                """INSERT INTO llm_config (
-                    id, enrichment_model, enrichment_base_url, enrichment_api_key,
-                    embedding_model, embedding_base_url, embedding_api_key
-                ) VALUES (1, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    enrichment_model=excluded.enrichment_model,
-                    enrichment_base_url=excluded.enrichment_base_url,
-                    enrichment_api_key=excluded.enrichment_api_key,
-                    embedding_model=excluded.embedding_model,
-                    embedding_base_url=excluded.embedding_base_url,
-                    embedding_api_key=excluded.embedding_api_key""",
-                (
-                    config.get("enrichment_model"),
-                    config.get("enrichment_base_url"),
-                    config.get("enrichment_api_key"),
-                    config.get("embedding_model"),
-                    config.get("embedding_base_url"),
-                    config.get("embedding_api_key"),
-                ),
+                "DELETE FROM model_bindings WHERE kind = ? AND slot = ?",
+                (kind, slot),
+            )
+            await self._delete_unreferenced_model_secrets_unlocked()
+            await self.db.commit()
+
+    async def record_model_binding_validation(
+        self,
+        kind: str,
+        slot: str,
+        *,
+        updated_at: str,
+        state: str,
+        validation: Mapping[str, Any],
+    ) -> bool:
+        """Record the outcome of a capability check on the binding it ran against.
+
+        ``updated_at`` names the stored binding the check ran against. Returns
+        False, recording nothing, when that binding has been saved again since.
+        """
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE model_bindings
+                      SET state = ?, validated_at = ?, validation_digest = ?,
+                          validation_facts_json = ?, validation_error_code = ?
+                    WHERE kind = ? AND slot = ? AND updated_at = ?""",
+                (state, *_model_validation_columns(validation), kind, slot, updated_at),
             )
             await self.db.commit()
+            return cursor.rowcount == 1
+
+    async def promote_model_candidate(
+        self,
+        kind: str,
+        *,
+        updated_at: str,
+        state: str,
+        validation: Mapping[str, Any],
+    ) -> bool:
+        """Make the candidate of ``kind`` its active binding, with its validation.
+
+        ``updated_at`` names the candidate that passed its check. Returns False,
+        changing nothing, when the candidate has been saved again since.
+        """
+        async with self._write_lock:
+            async with self.db.execute(
+                "SELECT 1 FROM model_bindings WHERE kind = ? AND slot = 'candidate' AND updated_at = ?",
+                (kind, updated_at),
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return False
+            await self.db.execute(
+                "DELETE FROM model_bindings WHERE kind = ? AND slot = 'active'",
+                (kind,),
+            )
+            await self.db.execute(
+                """UPDATE model_bindings
+                      SET slot = 'active', state = ?, validated_at = ?, validation_digest = ?,
+                          validation_facts_json = ?, validation_error_code = ?, updated_at = ?
+                    WHERE kind = ? AND slot = 'candidate'""",
+                (state, *_model_validation_columns(validation), _now_iso(), kind),
+            )
+            await self._delete_unreferenced_model_secrets_unlocked()
+            await self.db.commit()
+            return True
+
+    async def get_model_secret(self, secret_id: str) -> dict[str, Any] | None:
+        async with self.db.execute(
+            "SELECT id, ciphertext, origin, last4 FROM model_secrets WHERE id = ?",
+            (secret_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return None if row is None else dict(row)
+
+    async def _write_model_binding_unlocked(self, kind: str, slot: str, record: Mapping[str, Any]) -> None:
+        validation = record.get("validation")
+        await self.db.execute(
+            """INSERT INTO model_bindings (
+                   kind, slot, provider, endpoint, origin, auth_strategy, options_json,
+                   secret_ref, model_id, route, parameters_json, config_source, state,
+                   validated_at, validation_digest, validation_facts_json,
+                   validation_error_code, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(kind, slot) DO UPDATE SET
+                   provider = excluded.provider,
+                   endpoint = excluded.endpoint,
+                   origin = excluded.origin,
+                   auth_strategy = excluded.auth_strategy,
+                   options_json = excluded.options_json,
+                   secret_ref = excluded.secret_ref,
+                   model_id = excluded.model_id,
+                   route = excluded.route,
+                   parameters_json = excluded.parameters_json,
+                   config_source = excluded.config_source,
+                   state = excluded.state,
+                   validated_at = excluded.validated_at,
+                   validation_digest = excluded.validation_digest,
+                   validation_facts_json = excluded.validation_facts_json,
+                   validation_error_code = excluded.validation_error_code,
+                   updated_at = excluded.updated_at""",
+            (
+                kind,
+                slot,
+                record["provider"],
+                record.get("endpoint"),
+                record["origin"],
+                record["auth_strategy"],
+                json.dumps(record.get("options") or {}, sort_keys=True),
+                record.get("secret_ref"),
+                record["model_id"],
+                record["route"],
+                json.dumps(record.get("parameters") or {}, sort_keys=True),
+                record["config_source"],
+                record["state"],
+                *(_model_validation_columns(validation) if validation else (None, None, None, None)),
+                _now_iso(),
+            ),
+        )
+
+    async def _write_model_secret_unlocked(self, secret: Mapping[str, str]) -> None:
+        await self.db.execute(
+            """INSERT INTO model_secrets (id, ciphertext, origin, last4, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (secret["id"], secret["ciphertext"], secret["origin"], secret["last4"], _now_iso()),
+        )
+
+    async def _delete_unreferenced_model_secrets_unlocked(self) -> None:
+        await self.db.execute(
+            """DELETE FROM model_secrets
+                WHERE 'secret:' || id NOT IN (
+                    SELECT secret_ref FROM model_bindings WHERE secret_ref IS NOT NULL
+                )"""
+        )
 
     # ==================================================================
     # Users

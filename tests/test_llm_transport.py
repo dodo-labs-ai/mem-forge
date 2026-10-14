@@ -11,12 +11,15 @@ import pytest
 from litellm.caching.llm_caching_handler import LLMClientCache
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 
+from memforge.llm.bindings import build_binding, compile_binding
 from memforge.llm.embedding import EmbeddingProviderError, EmbeddingRuntime, EmbeddingSettings
+from memforge.llm.providers import ResolvedInvocation
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError
 from memforge.llm.transport import (
     NoRedirectAsyncClient,
     install_no_redirect_http_client,
     is_retryable_provider_error,
+    keep_ollama_model_lookups_off_request_endpoints,
     provider_retry_after_seconds,
     provider_status_code,
     refuse_redirects_in_provider_clients,
@@ -218,13 +221,18 @@ def test_the_sdk_help_notice_is_silenced() -> None:
 
 
 def _endpoint_runtime(base_url: str, *, api_key: str | None = "endpoint-key") -> EmbeddingRuntime:
+    """A runtime for an OpenAI-compatible endpoint, with a key or with the none auth strategy."""
+    binding = build_binding(
+        kind="embedding",
+        provider="openai_compatible",
+        model_id="text-embedding-test",
+        endpoint=base_url,
+        auth_strategy="api_key" if api_key else "none",
+        secret_ref="secret:test" if api_key else None,
+        config_source="settings",
+    )
     return EmbeddingRuntime(
-        EmbeddingSettings(
-            model="text-embedding-test",
-            base_url=base_url,
-            api_key=api_key,
-            num_retries=0,
-        )
+        EmbeddingSettings(invocation=compile_binding(binding, api_key), num_retries=0)
     )
 
 
@@ -257,7 +265,7 @@ async def endpoint(monkeypatch):
     await client.aclose()
 
 
-async def test_a_bare_embedding_model_reaches_the_configured_endpoint_through_litellm(endpoint) -> None:
+async def test_an_openai_compatible_model_reaches_the_configured_endpoint_through_litellm(endpoint) -> None:
     vectors = await _endpoint_runtime("https://embed-ok.example.test/v1").embed_documents(["alpha", "be"])
 
     assert vectors == [[5.0, 0.5], [2.0, 0.5]]
@@ -272,7 +280,30 @@ async def test_a_keyless_endpoint_is_never_sent_a_key_from_the_environment(monke
 
     await _endpoint_runtime("https://embed-keyless.example.test/v1", api_key=None).embed_query("alpha")
 
-    assert "environment-key" not in endpoint.requests[0].headers["authorization"]
+    assert endpoint.requests[0].headers["authorization"] == "Bearer no-api-key"
+
+
+async def test_a_set_dimension_reaches_an_openai_compatible_endpoint_whatever_the_model_is_called(
+    endpoint,
+) -> None:
+    binding = build_binding(
+        kind="embedding",
+        provider="openai_compatible",
+        model_id="BAAI/bge-m3",
+        endpoint="https://embed-sized.example.test/v1",
+        parameters={"dimensions": 2},
+        secret_ref="secret:test",
+        config_source="settings",
+    )
+    runtime = EmbeddingRuntime(
+        EmbeddingSettings(invocation=compile_binding(binding, "endpoint-key"), num_retries=0)
+    )
+
+    await runtime.embed_query("alpha")
+
+    sent = json.loads(endpoint.requests[0].content)
+    assert (sent["model"], sent["dimensions"]) == ("BAAI/bge-m3", 2)
+    assert "allowed_openai_params" not in sent
 
 
 async def test_one_attempt_is_one_request_because_the_sdk_does_not_retry(endpoint) -> None:
@@ -365,7 +396,10 @@ async def test_a_provider_route_embedding_is_not_sent_on_to_a_redirect_target(
     provider_endpoint, model, base_url
 ) -> None:
     runtime = EmbeddingRuntime(
-        EmbeddingSettings(model=model, base_url=base_url, api_key="endpoint-key", num_retries=3)
+        EmbeddingSettings(
+            invocation=ResolvedInvocation(route=model, api_base=base_url, api_key="endpoint-key"),
+            num_retries=3,
+        )
     )
 
     with pytest.raises(EmbeddingProviderError) as raised:
@@ -373,3 +407,114 @@ async def test_a_provider_route_embedding_is_not_sent_on_to_a_redirect_target(
 
     assert raised.value.status_code == 307
     assert [request.url.host for request in provider_endpoint] == ["embed-moved.example.test"]
+
+
+class _OllamaLookups:
+    """Stand in for the client LiteLLM asks an Ollama server about a model with.
+
+    It records each question and answers none, as when no server is listening.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, dict[str, str]]] = []
+
+    def post(self, url: str, json=None, headers=None, **_options) -> httpx.Response:
+        self.requests.append((url, dict(headers or {})))
+        raise httpx.ConnectError("connection refused")
+
+
+@pytest.fixture
+async def ollama_endpoint(monkeypatch):
+    """An in-memory Ollama server behind LiteLLM, and the model lookups LiteLLM makes."""
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    requests: list[httpx.Request] = []
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "model": "private-chat-model",
+                "message": {"role": "assistant", "content": json.dumps({"ranked_ids": []})},
+                "done": True,
+                "done_reason": "stop",
+                "prompt_eval_count": 1,
+                "eval_count": 1,
+            },
+        )
+
+    lookups = _OllamaLookups()
+    monkeypatch.setattr(
+        AsyncHTTPHandler,
+        "_create_async_transport",
+        staticmethod(lambda **_options: httpx.MockTransport(chat)),
+    )
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
+    monkeypatch.setattr(litellm, "module_level_client", lookups)
+    yield requests, lookups
+    await GLOBAL_LOGGING_WORKER.flush()
+
+
+async def test_a_keyless_ollama_endpoint_is_never_sent_the_ollama_key_of_the_environment(
+    monkeypatch, ollama_endpoint
+) -> None:
+    """LiteLLM looks the model up once more after the request, at the address the request went to."""
+    requests, lookups = ollama_endpoint
+    monkeypatch.setenv("OLLAMA_API_KEY", "environment-ollama-key")
+    monkeypatch.setenv("OLLAMA_API_BASE", "https://ollama-environment.example.test")
+    getattr(litellm.get_model_info, "cache_clear", lambda: None)()
+    loop = asyncio.get_running_loop()
+    looked_up_after_the_request = asyncio.Event()
+    look_up = litellm.OllamaConfig.get_model_info
+
+    def watched_look_up(self, model, api_base=None):
+        if api_base is not None:
+            loop.call_soon_threadsafe(looked_up_after_the_request.set)
+        return look_up(self, model, api_base)
+
+    monkeypatch.setattr(litellm.OllamaConfig, "get_model_info", watched_look_up)
+    binding = build_binding(
+        kind="generation",
+        provider="ollama",
+        model_id="private-chat-model",
+        endpoint="https://ollama-keyless.example.test",
+        auth_strategy="none",
+        config_source="settings",
+    )
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig.for_invocation(compile_binding(binding, None), timeout_s=5.0)
+    )
+
+    await client.rerank_memories("Rank the matching memories")
+    await asyncio.wait_for(looked_up_after_the_request.wait(), timeout=10)
+
+    assert {request.url.host for request in requests} == {"ollama-keyless.example.test"}
+    assert {request.headers.get("authorization") for request in requests} == {"Bearer no-api-key"}
+    assert lookups.requests
+    assert {httpx.URL(url).host for url, _headers in lookups.requests} == {"ollama-environment.example.test"}
+
+
+def test_an_ollama_lookup_at_a_request_endpoint_reports_a_model_with_no_known_limits(monkeypatch) -> None:
+    lookups = _OllamaLookups()
+    monkeypatch.setattr(litellm, "module_level_client", lookups)
+    monkeypatch.setenv("OLLAMA_API_KEY", "environment-ollama-key")
+
+    info = litellm.OllamaConfig().get_model_info(
+        "ollama_chat/private-chat-model", api_base="https://ollama-keyless.example.test/api/chat"
+    )
+
+    assert lookups.requests == []
+    assert (info["key"], info["max_input_tokens"], info["input_cost_per_token"]) == (
+        "ollama_chat/private-chat-model",
+        None,
+        0.0,
+    )
+
+
+def test_keeping_ollama_lookups_off_request_endpoints_wraps_the_lookup_once() -> None:
+    lookup = litellm.OllamaConfig.get_model_info
+
+    keep_ollama_model_lookups_off_request_endpoints()
+
+    assert litellm.OllamaConfig.get_model_info is lookup

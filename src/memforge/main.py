@@ -159,12 +159,18 @@ def setup_logging(verbose: bool = False) -> None:
 
 
 async def _get_db(config: AppConfig):
+    """Open the local database for a command that runs with ``config``."""
     from memforge.storage.database import Database
 
     from memforge.storage.document_store import LocalDocumentStore
 
     db = Database(config.storage.db_path, document_store=LocalDocumentStore(config.storage.docs_path))
     await db.connect()
+    try:
+        await db.translate_llm_config(config.llm)
+    except BaseException:
+        await db.close()
+        raise
     return db
 
 
@@ -1909,13 +1915,9 @@ def sync(ctx, source: str | None):
 
     async def _run():
         config: AppConfig = ctx.obj["config"]
-        from memforge.storage.database import Database
         from memforge.runtime import build_sync_runtime, run_source_sync
 
-        from memforge.storage.document_store import LocalDocumentStore
-
-        db = Database(config.storage.db_path, document_store=LocalDocumentStore(config.storage.docs_path))
-        await db.connect()
+        db = await _get_db(config)
         try:
             runtime = await build_sync_runtime(db, config)
         except Exception as e:
@@ -6319,18 +6321,19 @@ def maintenance_repair_indexes(ctx):
     async def _run():
         from memforge.memory.health import MemoryIndexHealthChecker
         from memforge.memory.repair import MemoryIndexRepairer
+        from memforge.llm.bindings import resolve_active_invocation
         from memforge.retrieval.embeddings import get_chroma_collection
-        from memforge.runtime import build_embedding_runtime, get_effective_llm_config
+        from memforge.runtime import build_embedding_runtime
 
         config: AppConfig = ctx.obj["config"]
         db = await _get_db(config)
         memory_collection = get_chroma_collection(config.storage.chroma_path, name="memories")
-        llm = await get_effective_llm_config(db, config)
         try:
+            embedding = await resolve_active_invocation(db, config, "embedding")
             result = await MemoryIndexRepairer(
                 db=db,
                 memory_collection=memory_collection,
-                embedding=build_embedding_runtime(llm, config),
+                embedding=build_embedding_runtime(embedding, config),
             ).repair()
             report = await MemoryIndexHealthChecker(
                 db=db,
@@ -6352,12 +6355,8 @@ def maintenance_repair_indexes(ctx):
             console.print("[green]Index health is clean.[/]")
         else:
             console.print(f"[yellow]{len(report.issues)} consistency issue(s) remain.[/]")
-            if result.unrepaired_memories:
-                for memory_id in result.unrepaired_memories[:10]:
-                    console.print(f"  [dim]Unrepaired memory: {memory_id}[/]")
-            if result.unrepaired_documents:
-                for doc_id in result.unrepaired_documents[:10]:
-                    console.print(f"  [dim]Unrepaired document: {doc_id}[/]")
+            for memory_id in result.unrepaired_memories[:10]:
+                console.print(f"  [dim]Unrepaired memory: {memory_id}[/]")
 
     asyncio.run(_run())
 
@@ -6373,6 +6372,48 @@ def config_group():
     pass
 
 
+async def _active_model_rows(config: AppConfig) -> dict[str, str]:
+    """Describe the model each kind uses with the local database, without any key.
+
+    The database holds the models saved in Settings. Before it exists, the
+    models are the ones the MEMFORGE_* variables describe.
+    """
+    from memforge.llm.bindings import environment_binding, key_source, resolve_active_binding
+    from memforge.llm.providers import MODEL_KINDS, provider_descriptor
+
+    bindings = {}
+    if Path(config.storage.db_path).exists():
+        db = await _get_db(config)
+        try:
+            for kind in MODEL_KINDS:
+                bindings[kind] = await resolve_active_binding(db, config, kind)
+        finally:
+            await db.close()
+    else:
+        source = "environment" if config.server.llm_config_writable else "deployment"
+        for kind in MODEL_KINDS:
+            bindings[kind] = environment_binding(config, kind, config_source=source)
+
+    rows: dict[str, str] = {}
+    for kind, binding in bindings.items():
+        title = kind.capitalize()
+        if binding is None:
+            rows[f"{title} model"] = "[red]NOT CONFIGURED[/]"
+            continue
+        credential = {
+            "api_key": "API key from the environment"
+            if key_source(binding) == "environment"
+            else "API key saved in Settings",
+            "environment": "provider credentials from the environment",
+            "none": "no credential",
+        }[binding.auth_strategy]
+        rows[f"{title} model"] = f"{binding.model_id} ({provider_descriptor(binding.provider).label})"
+        rows[f"{title} endpoint"] = binding.endpoint or "[dim]set by the route[/]"
+        rows[f"{title} credential"] = credential
+        rows[f"{title} status"] = f"{binding.state.replace('_', ' ')}, from {binding.config_source}"
+    return rows
+
+
 @config_group.command("show")
 @click.pass_context
 def config_show(ctx):
@@ -6386,13 +6427,8 @@ def config_show(ctx):
         "Database": config.storage.db_path,
         "ChromaDB": config.storage.chroma_path,
         "Documents": config.storage.docs_path,
-        "Enrichment model": config.llm.enrichment_model,
-        "Decision model": config.llm.decision_model or "[dim]main model[/]",
-        "Enrichment API": config.llm.enrichment_base_url,
-        "Enrichment key": "***" if config.llm.enrichment_api_key else "[red]NOT SET[/]",
-        "Embedding model": config.llm.embedding_model,
-        "Embedding API": config.llm.embedding_base_url,
-        "Embedding key": "***" if config.llm.embedding_api_key else "[red]NOT SET[/]",
+        **asyncio.run(_active_model_rows(config)),
+        "Decision model": config.llm.decision_model or "[dim]generation model[/]",
         "Dedup threshold": str(config.memory.dedup_cosine_threshold),
         "Default top_k": str(config.retrieval.default_top_k),
         "RRF k": str(config.retrieval.rrf_k),

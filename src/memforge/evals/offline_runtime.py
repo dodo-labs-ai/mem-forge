@@ -16,7 +16,7 @@ from memforge.evals.offline_evaluation import (
     SourceUnitReconciliationReplayExecutor,
     StructuredOfflineSemanticJudge,
 )
-from memforge.runtime import RuntimeProvider, get_effective_llm_config
+from memforge.runtime import RuntimeProvider, resolve_models
 
 
 async def build_offline_evaluation_for_run(
@@ -27,15 +27,20 @@ async def build_offline_evaluation_for_run(
 ) -> OfflineAgentEvaluation:
     """Build candidate and judge adapters from one pinned Run manifest."""
 
-    llm = await get_effective_llm_config(store, config)
-    # The Run pins one model for every step it replays.
-    candidate_llm = replace(
-        llm,
-        enrichment_model=str(run.candidate_manifest["model"]),
-        decision_model="",
+    models = await resolve_models(store, config)
+    # The Run pins one model for every step it replays, reached through the
+    # generation model's endpoint and credential.
+    candidate_models = replace(
+        models,
+        generation=(
+            None
+            if models.generation is None
+            else replace(models.generation, route=str(run.candidate_manifest["model"]))
+        ),
+        decision_route=None,
     )
     structured_client = runtime_provider.build_structured_llm_client(
-        candidate_llm,
+        candidate_models,
         max_concurrent=config.llm.enrichment_max_concurrent,
     )
     if structured_client is None:

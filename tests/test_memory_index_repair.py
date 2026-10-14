@@ -218,3 +218,65 @@ def test_repair_indexes_command_embeds_at_the_configured_endpoint(tmp_path, monk
     assert requests[0]["api_base"] == "https://embed.repair.example.test/v1"
     assert requests[0]["api_key"] == "repair-embedding-key"
     assert collection.embeddings["mem-cli-repair"] == [0.25, 0.5, 0.75]
+
+
+def _seed_memory_without_vector(monkeypatch, tmp_path, memory_id: str) -> RepairableCollection:
+    """Give the command line a database with one Memory that has no vector."""
+    from memforge.config import load_config
+
+    monkeypatch.setenv("MEMFORGE_BASE_DIR", str(tmp_path / "mem"))
+    collection = RepairableCollection({})
+    monkeypatch.setattr(
+        "memforge.retrieval.embeddings.get_chroma_collection",
+        lambda *_args, **_kwargs: collection,
+    )
+
+    async def seed() -> None:
+        database = Database(load_config().storage.db_path)
+        await database.connect()
+        await database.insert_memory(_memory(memory_id, "Command line repair fact"))
+        await database.close()
+
+    asyncio.run(seed())
+    return collection
+
+
+def test_repair_indexes_command_lists_the_memories_it_could_not_repair(tmp_path, monkeypatch):
+    from memforge.main import cli
+
+    monkeypatch.setenv("MEMFORGE_EMBEDDING_MODEL", "")
+    _seed_memory_without_vector(monkeypatch, tmp_path, "mem-cli-unrepaired")
+
+    result = CliRunner().invoke(cli, ["maintenance", "repair-indexes"])
+
+    assert result.exit_code == 0, result.output
+    assert result.exception is None
+    assert "consistency issue(s) remain." in result.output
+    assert "Unrepaired memory: mem-cli-unrepaired" in result.output
+    assert "Index health is clean." not in result.output
+
+
+def test_repair_indexes_command_repairs_through_a_keyless_endpoint(tmp_path, monkeypatch):
+    from memforge.main import cli
+
+    monkeypatch.setenv("MEMFORGE_EMBEDDING_MODEL", "local-embedding")
+    monkeypatch.setenv("MEMFORGE_EMBEDDING_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.setenv("MEMFORGE_EMBEDDING_API_KEY", "")
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-key")
+    requests: list[dict[str, Any]] = []
+
+    async def provider(**request: Any) -> dict[str, Any]:
+        requests.append(request)
+        return embedding_response([[0.25, 0.5, 0.75] for _ in request["input"]])
+
+    monkeypatch.setattr("litellm.aembedding", provider)
+    collection = _seed_memory_without_vector(monkeypatch, tmp_path, "mem-cli-keyless")
+
+    result = CliRunner().invoke(cli, ["maintenance", "repair-indexes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Index health is clean." in result.output
+    assert requests[0]["model"] == "openai/local-embedding"
+    assert requests[0]["api_base"] == "http://localhost:11434/v1"
+    assert requests[0]["api_key"] == "no-api-key"
+    assert collection.embeddings["mem-cli-keyless"] == [0.25, 0.5, 0.75]
