@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- The Admin API answers browser requests only from the Admin UI dev server on
+  loopback (`http://localhost:5174,http://127.0.0.1:5174`) by default, instead
+  of from every origin. The loopback bind keeps other machines out but not a
+  web page open in the operator's own browser, which could otherwise read and
+  change a local install that has no login. Both admin UIs reach the API
+  through their own dev-server proxy and are unaffected, as are the CLI, the
+  local-agent daemon and MCP clients. Set `MEMFORGE_CORS_ORIGINS` to answer
+  other origins; `*` answers every origin and never carries credentials.
+  Cloud: arrives with the pin; the Cloud UI calls the mounted Admin API from
+  the same origin, so no environment change.
 - The Memory vector index belongs to one embedding model, and changing that
   model rebuilds it. An Embedding Profile is the identity of a vector space:
   the provider, the LiteLLM route, the endpoint, the model id, the requested
