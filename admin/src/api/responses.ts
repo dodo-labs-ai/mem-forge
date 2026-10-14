@@ -29,3 +29,21 @@ export interface LocalAgentJobResult {
 }
 
 export type LocalAgentJob = Omit<Schemas["LocalAgentJobResponse"], "result"> & { result: LocalAgentJobResult };
+
+/**
+ * What a model validation observed. The server sends these as a free-form
+ * object, and a failed validation is only certain to carry `latency_ms`.
+ */
+export interface ModelValidationFacts {
+  latency_ms?: number;
+  /** Generation: whether the model answered a JSON schema request or was asked for JSON as text. */
+  structured_output_mode?: "native_schema" | "json_text";
+  /** Generation: whether the request fell back from a JSON schema to JSON as text. */
+  schema_fallback?: boolean;
+  /** Generation: false when the server has no token limits for the model. */
+  token_limits_known?: boolean;
+  /** Embedding: the length of the vectors the model returned. */
+  dimension?: number;
+  /** The model name the provider reported, when it reported one. */
+  provider_model?: string;
+}

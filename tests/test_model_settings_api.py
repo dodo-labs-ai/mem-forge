@@ -1,0 +1,1745 @@
+"""The model settings API: descriptors, bindings, validation, discovery and health."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sqlite3
+import threading
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import httpx
+import litellm
+import pytest
+from fastapi.testclient import TestClient
+
+from memforge.config import AppConfig
+from memforge.llm import bindings
+from memforge.llm.bindings import resolve_active_binding
+from memforge.llm.providers import ModelConfigError, ResolvedInvocation
+from memforge.model_settings import CandidateDraft, ModelSettings
+from memforge.runtime import DefaultRuntimeProvider, SourceSyncWorker, resolve_models
+from memforge.server import model_settings_api
+from memforge.server.admin_api import create_admin_app
+from memforge.storage.database import Database
+from tests.test_model_bindings import _database_with_llm_config
+
+SECRET_KEY = "VV4JjZLLr2BcgRnhV90gCnxzchn43M900VQy3dXJI30="
+GENERATION_KEY = "generation-secret-key-1111"
+EMBEDDING_KEY = "embedding-secret-key-2222"
+ENVIRONMENT_KEY = "environment-secret-key-3333"
+OTHER_KEY = "replacement-secret-key-4444"
+ALL_KEYS = (GENERATION_KEY, EMBEDDING_KEY, ENVIRONMENT_KEY, OTHER_KEY)
+API = "/api/v1/model-settings"
+EXPECTED_REPLY = {"probe": {"label": "memforge", "confirmed": True, "items": ["alpha", "beta", "gamma"]}}
+
+OPENAI_GENERATION = {"provider": "openai", "model_id": "gpt-5-mini"}
+COMPATIBLE_EMBEDDING = {
+    "provider": "openai_compatible",
+    "endpoint": "https://embed.example.test/v1",
+    "model_id": "embed-model",
+}
+
+
+@pytest.fixture(autouse=True)
+def secret_key(monkeypatch) -> None:
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", SECRET_KEY)
+
+
+@pytest.fixture
+async def db(tmp_path):
+    database = Database(str(tmp_path / "settings.db"))
+    await database.connect()
+    yield database
+    await database.close()
+
+
+def _config(tmp_path: Path) -> AppConfig:
+    config = AppConfig(base_dir=tmp_path / "mem")
+    config.llm.enrichment_model = "claude-sonnet-4"
+    config.llm.enrichment_base_url = "https://api.anthropic.com"
+    config.llm.enrichment_api_key = ""
+    config.llm.embedding_model = "text-embedding-3-small"
+    config.llm.embedding_base_url = "https://api.openai.com/v1"
+    config.llm.embedding_api_key = ""
+    config.llm.decision_model = ""
+    config.server.jwt_secret = "test-secret"
+    config.sync.scheduler_enabled = False
+    config.sync.worker_enabled = False
+    return config
+
+
+class Providers:
+    """Stand in for the model providers behind LiteLLM.
+
+    Every generation and embedding request is recorded. A failure set on a kind
+    is raised for each of its requests until it is cleared.
+    """
+
+    def __init__(self, monkeypatch) -> None:
+        self.generation_requests: list[dict[str, Any]] = []
+        self.embedding_requests: list[dict[str, Any]] = []
+        self.generation_failure: Exception | None = None
+        self.embedding_failure: Exception | None = None
+        self.generation_gate: threading.Event | None = None
+        self.dimension = 3
+        monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", self.complete)
+        monkeypatch.setattr("memforge.llm.structured.litellm.supports_response_schema", lambda **_kwargs: True)
+        monkeypatch.setattr("litellm.aembedding", self.embed)
+
+    async def complete(self, **request: Any) -> Any:
+        import asyncio
+
+        self.generation_requests.append(request)
+        while self.generation_gate is not None and not self.generation_gate.is_set():
+            await asyncio.sleep(0.005)
+        if self.generation_failure is not None:
+            raise self.generation_failure
+        return SimpleNamespace(
+            model="reported-generation-model",
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=json.dumps(EXPECTED_REPLY)),
+                    finish_reason="stop",
+                )
+            ],
+        )
+
+    async def embed(self, **request: Any) -> Any:
+        self.embedding_requests.append(request)
+        if self.embedding_failure is not None:
+            raise self.embedding_failure
+        return {
+            "model": "reported-embedding-model",
+            "data": [
+                {"index": index, "embedding": [float(len(text))] + [0.5] * (self.dimension - 1)}
+                for index, text in enumerate(request["input"])
+            ],
+        }
+
+
+class Rejection(Exception):
+    status_code = 401
+
+
+@pytest.fixture
+def providers(monkeypatch) -> Providers:
+    return Providers(monkeypatch)
+
+
+def _rejected_key() -> Exception:
+    return litellm.AuthenticationError("invalid api key", "openai", "gpt-5-mini")
+
+
+def _stored_rows(db: Database) -> list[tuple[str, str]]:
+    with sqlite3.connect(db.db_path) as raw:
+        return raw.execute("SELECT kind, slot FROM model_bindings ORDER BY kind, slot").fetchall()
+
+
+def _settings(config: AppConfig) -> ModelSettings:
+    return ModelSettings(config, DefaultRuntimeProvider())
+
+
+# -- Descriptors and reading --------------------------------------------------------
+
+
+def test_the_api_lists_the_provider_descriptors(db, tmp_path) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    providers = client.get(f"{API}/providers").json()["providers"]
+
+    assert [provider["id"] for provider in providers] == [
+        "openai",
+        "anthropic",
+        "openrouter",
+        "ollama",
+        "openai_compatible",
+        "litellm",
+    ]
+    by_id = {provider["id"]: provider for provider in providers}
+    assert by_id["openai"] == {
+        "id": "openai",
+        "label": "OpenAI",
+        "kinds": ["generation", "embedding"],
+        "auth_strategies": ["api_key", "environment"],
+        "default_endpoint": "https://api.openai.com/v1",
+        "endpoint_required": False,
+        "model_is_route": False,
+        "lists_models": True,
+        "options": ["organization"],
+        "parameters": {"generation": [], "embedding": ["dimensions"]},
+    }
+    assert by_id["anthropic"]["kinds"] == ["generation"]
+    assert by_id["anthropic"]["parameters"] == {"generation": []}
+    assert by_id["ollama"]["auth_strategies"] == ["none", "api_key"]
+    assert by_id["openai_compatible"]["endpoint_required"] is True
+    assert by_id["openai_compatible"]["default_endpoint"] is None
+    assert by_id["litellm"]["model_is_route"] is True
+    assert by_id["litellm"]["lists_models"] is False
+
+
+def test_a_fresh_installation_reads_as_writable_with_no_bindings(db, tmp_path) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = client.get(API).json()
+
+    assert payload["writable"] is True
+    assert payload["litellm_version"] == bindings.installed_litellm_version()
+    assert payload["generation"] == {"active": None, "candidate": None}
+    assert payload["embedding"] == {"active": None, "candidate": None}
+
+
+def test_environment_values_read_as_the_active_binding_without_the_key(db, tmp_path) -> None:
+    config = _config(tmp_path)
+    config.llm.enrichment_api_key = ENVIRONMENT_KEY
+    client = TestClient(create_admin_app(db=db, config=config))
+
+    response = client.get(API)
+
+    active = response.json()["generation"]["active"]
+    assert active == {
+        "kind": "generation",
+        "provider": "anthropic",
+        "endpoint": "https://api.anthropic.com",
+        "origin": "https://api.anthropic.com",
+        "auth_strategy": "api_key",
+        "model_id": "claude-sonnet-4",
+        "route": "anthropic/claude-sonnet-4",
+        "options": {},
+        "parameters": {},
+        "config_source": "environment",
+        "state": "not_validated",
+        "validation": None,
+        "api_key": {"is_set": True, "source": "environment", "last4": "3333"},
+        "saved_at": None,
+    }
+    assert ENVIRONMENT_KEY not in response.text
+    assert _stored_rows(db) == []
+
+
+# -- Saving a candidate -------------------------------------------------------------
+
+
+def test_saving_writes_the_candidate_and_leaves_the_active_binding_in_use(db, tmp_path) -> None:
+    config = _config(tmp_path)
+    config.llm.enrichment_api_key = ENVIRONMENT_KEY
+    client = TestClient(create_admin_app(db=db, config=config))
+
+    response = client.put(f"{API}/generation/candidate", json={**OPENAI_GENERATION, "api_key": GENERATION_KEY})
+
+    payload = response.json()
+    assert response.status_code == 200, response.text
+    assert payload["active"]["route"] == "anthropic/claude-sonnet-4"
+    candidate = payload["candidate"]
+    assert candidate["route"] == "openai/gpt-5-mini"
+    assert candidate["endpoint"] == "https://api.openai.com/v1"
+    assert candidate["auth_strategy"] == "api_key"
+    assert candidate["config_source"] == "settings"
+    assert candidate["state"] == "not_validated"
+    assert candidate["validation"] is None
+    assert candidate["api_key"] == {"is_set": True, "source": "saved", "last4": "1111"}
+    assert candidate["saved_at"]
+    assert GENERATION_KEY not in response.text
+    assert _stored_rows(db) == [("generation", "candidate")]
+    assert client.get(API).json()["generation"] == payload
+
+
+async def test_the_runtime_keeps_the_active_binding_while_a_candidate_waits(db, tmp_path) -> None:
+    config = _config(tmp_path)
+    config.llm.enrichment_api_key = ENVIRONMENT_KEY
+    await _settings(config).save_candidate(
+        db, "generation", CandidateDraft(**OPENAI_GENERATION, api_key=GENERATION_KEY)
+    )
+
+    models = await resolve_models(db, config)
+
+    assert models.generation_route == "anthropic/claude-sonnet-4"
+    assert models.generation.api_key == ENVIRONMENT_KEY
+
+
+def test_a_candidate_that_needs_a_key_cannot_be_saved_without_one(db, tmp_path) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    response = client.put(f"{API}/generation/candidate", json=OPENAI_GENERATION)
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == "api_key_required"
+    assert _stored_rows(db) == []
+
+
+@pytest.mark.parametrize(
+    ("body", "code"),
+    [
+        ({"provider": "bedrock", "model_id": "model-a"}, "unknown_provider"),
+        ({"provider": "anthropic", "model_id": ""}, "model_required"),
+        ({"provider": "openai_compatible", "model_id": "model-a"}, "endpoint_required"),
+        ({"provider": "openai", "model_id": "model-a", "endpoint": "ftp://host"}, "endpoint_invalid"),
+        (
+            {"provider": "openai", "model_id": "model-a", "endpoint": "https://user:pw-secret@proxy.example.test/v1"},
+            "endpoint_invalid",
+        ),
+        ({"provider": "openai", "model_id": "model-a", "endpoint": "https://token@proxy.example.test/v1"}, "endpoint_invalid"),
+        ({"model_id": "model-a"}, "unknown_provider"),
+        ({"provider": "openai"}, "model_required"),
+        ({"provider": "litellm", "model_id": "bare-model"}, "model_route_invalid"),
+        ({"provider": "anthropic", "model_id": "model-a", "auth_strategy": "none"}, "auth_strategy_not_supported"),
+        ({"provider": "openai", "model_id": "model-a", "options": {"project": "p"}}, "option_not_supported"),
+        ({"provider": "openai", "model_id": "model-a", "parameters": {"dimensions": 8}}, "parameter_not_supported"),
+    ],
+)
+def test_unusable_settings_are_refused_with_a_stable_code(db, tmp_path, body, code) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    response = client.put(f"{API}/generation/candidate", json={**body, "api_key": GENERATION_KEY})
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == code
+    assert response.json()["detail"]["message"]
+    assert GENERATION_KEY not in response.text
+    assert _stored_rows(db) == []
+
+
+def test_a_credential_written_into_an_endpoint_is_neither_stored_nor_repeated(db, tmp_path) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    response = client.put(
+        f"{API}/embedding/candidate",
+        json={
+            "provider": "openai_compatible",
+            "model_id": "embed-model",
+            "endpoint": "https://user:pw-secret@embed.example.test/v1",
+            "auth_strategy": "none",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == "endpoint_invalid"
+    assert "pw-secret" not in response.text
+    assert "pw-secret" not in client.get(API).text
+    assert _stored_rows(db) == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "body"),
+    [
+        ("generation", {"provider": "openai", "model_id": "gpt-5-mini", "endpoint": "https://collector.example.test/v1"}),
+        ("embedding", {"provider": "openai", "model_id": "embed-a", "endpoint": "http://api.openai.com/v1"}),
+        ("generation", {"provider": "anthropic", "model_id": "claude-x", "endpoint": "https://collector.example.test"}),
+        ("generation", {"provider": "openrouter", "model_id": "vendor/model", "endpoint": "https://collector.example.test/api/v1"}),
+        ("generation", {"provider": "litellm", "model_id": "openai/gpt-x", "endpoint": "https://collector.example.test/v1"}),
+        ("embedding", {"provider": "litellm", "model_id": "voyage/voyage-3", "endpoint": "https://collector.example.test"}),
+    ],
+    ids=["openai", "openai_other_scheme", "anthropic", "openrouter", "litellm_generation", "litellm_embedding"],
+)
+def test_credentials_from_the_environment_cannot_be_saved_for_an_endpoint_a_request_names(
+    db, tmp_path, providers, kind, body
+) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    response = client.put(f"{API}/{kind}/candidate", json={**body, "auth_strategy": "environment"})
+    validated = client.post(f"{API}/{kind}/candidate/validate")
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == "environment_endpoint_not_allowed"
+    assert response.json()["detail"]["message"]
+    assert validated.status_code == 409
+    assert _stored_rows(db) == []
+    assert providers.generation_requests == [] and providers.embedding_requests == []
+
+
+@pytest.mark.parametrize(
+    ("body", "endpoint"),
+    [
+        ({"provider": "openai", "model_id": "gpt-5-mini"}, "https://api.openai.com/v1"),
+        ({"provider": "openai", "model_id": "gpt-5-mini", "endpoint": "https://api.openai.com/v1/"}, "https://api.openai.com/v1"),
+        ({"provider": "anthropic", "model_id": "claude-x", "endpoint": ""}, "https://api.anthropic.com"),
+        ({"provider": "litellm", "model_id": "sap/anthropic--claude"}, None),
+    ],
+    ids=["openai_default", "openai_default_written_out", "anthropic_default", "litellm_route"],
+)
+def test_credentials_from_the_environment_are_accepted_for_the_providers_own_endpoint(
+    db, tmp_path, body, endpoint
+) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    response = client.put(f"{API}/generation/candidate", json={**body, "auth_strategy": "environment"})
+
+    assert response.status_code == 200, response.text
+    candidate = response.json()["candidate"]
+    assert (candidate["auth_strategy"], candidate["endpoint"]) == ("environment", endpoint)
+    assert candidate["api_key"] == {"is_set": False, "source": None, "last4": None}
+
+
+async def test_an_api_key_lets_a_route_name_its_own_endpoint(db, tmp_path) -> None:
+    view = await _settings(_config(tmp_path)).save_candidate(
+        db,
+        "generation",
+        CandidateDraft(
+            provider="litellm",
+            model_id="openai/gpt-x",
+            endpoint="https://proxy.example.test/v1",
+            api_key=GENERATION_KEY,
+        ),
+    )
+
+    assert (view.candidate.binding.auth_strategy, view.candidate.binding.endpoint) == (
+        "api_key",
+        "https://proxy.example.test/v1",
+    )
+
+
+async def test_the_environment_variables_may_pair_environment_credentials_with_a_base_url(db, tmp_path) -> None:
+    """The operator sets both, so the binding the variables describe keeps its base URL."""
+    config = _config(tmp_path)
+    config.llm.enrichment_model = "openai/gpt-x"
+    config.llm.enrichment_base_url = "https://proxy.example.test/v1"
+
+    models = await resolve_models(db, config)
+
+    assert (models.generation.route, models.generation.api_base, models.generation.api_key) == (
+        "openai/gpt-x",
+        "https://proxy.example.test/v1",
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("put", "generation/candidate", {"provider": "openai", "model_id": 7, "api_key": GENERATION_KEY}),
+        ("put", "generation/candidate", {"provider": "openai", "model_id": "m", "api_key": [GENERATION_KEY]}),
+        ("put", "generation/candidate", {"provider": "openai", "options": GENERATION_KEY, "api_key": GENERATION_KEY}),
+        ("put", "reranking/candidate", {"provider": "openai", "model_id": "m", "api_key": GENERATION_KEY}),
+        ("post", "generation/discover-models", {"provider": ["openai"], "api_key": GENERATION_KEY}),
+        ("post", "generation/discover-models", {"provider": "openai", "api_key": {"value": GENERATION_KEY}}),
+    ],
+    ids=[
+        "model_not_text",
+        "key_not_text",
+        "options_not_an_object",
+        "unknown_kind",
+        "discovery_provider_not_text",
+        "discovery_key_not_text",
+    ],
+)
+def test_a_malformed_request_is_refused_without_repeating_what_it_carried(db, tmp_path, method, path, body) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    response = client.request(method, f"{API}/{path}", json=body)
+
+    assert response.status_code == 422
+    assert GENERATION_KEY not in response.text
+    errors = response.json()["detail"]
+    assert errors and all(set(error) == {"type", "loc", "msg"} for error in errors)
+    assert _stored_rows(db) == []
+
+
+def test_a_request_without_a_provider_or_a_model_is_refused_by_code_and_not_echoed(db, tmp_path) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    without_model = client.put(
+        f"{API}/generation/candidate", json={"provider": "openai", "api_key": GENERATION_KEY}
+    )
+    without_provider = client.post(f"{API}/generation/discover-models", json={"api_key": GENERATION_KEY})
+
+    assert (without_model.status_code, without_model.json()["detail"]["error"]) == (422, "model_required")
+    assert (without_provider.status_code, without_provider.json()["detail"]["error"]) == (422, "unknown_provider")
+    assert GENERATION_KEY not in without_model.text + without_provider.text
+
+
+def test_a_provider_that_does_not_serve_the_kind_is_refused(db, tmp_path) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    response = client.put(
+        f"{API}/embedding/candidate",
+        json={"provider": "anthropic", "model_id": "claude-sonnet-4", "api_key": EMBEDDING_KEY},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == "kind_not_supported"
+
+
+def test_an_unknown_kind_is_not_a_route(db, tmp_path) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    assert client.put(f"{API}/reranking/candidate", json=OPENAI_GENERATION).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["https://embed.example.test/v1", "https://EMBED.example.test:443/other/path/"],
+    ids=["same_url", "same_origin_other_spelling"],
+)
+def test_a_candidate_saved_again_for_the_same_origin_keeps_its_key(db, tmp_path, endpoint) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+    client.put(f"{API}/embedding/candidate", json={**COMPATIBLE_EMBEDDING, "api_key": EMBEDDING_KEY})
+
+    response = client.put(
+        f"{API}/embedding/candidate",
+        json={**COMPATIBLE_EMBEDDING, "endpoint": endpoint, "model_id": "another-model"},
+    )
+
+    candidate = response.json()["candidate"]
+    assert response.status_code == 200, response.text
+    assert candidate["model_id"] == "another-model"
+    assert candidate["api_key"] == {"is_set": True, "source": "saved", "last4": "2222"}
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://other.example.test/v1",
+        "http://embed.example.test/v1",
+        "https://embed.example.test:8443/v1",
+    ],
+    ids=["other_host", "other_scheme", "other_port"],
+)
+def test_a_candidate_for_another_origin_has_to_bring_the_key_again(db, tmp_path, endpoint) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+    client.put(f"{API}/embedding/candidate", json={**COMPATIBLE_EMBEDDING, "api_key": EMBEDDING_KEY})
+
+    refused = client.put(f"{API}/embedding/candidate", json={**COMPATIBLE_EMBEDDING, "endpoint": endpoint})
+    kept = client.get(API).json()["embedding"]["candidate"]
+    accepted = client.put(
+        f"{API}/embedding/candidate",
+        json={**COMPATIBLE_EMBEDDING, "endpoint": endpoint, "api_key": OTHER_KEY},
+    )
+
+    assert refused.status_code == 422
+    assert refused.json()["detail"]["error"] == "api_key_origin_changed"
+    assert "https://embed.example.test" in refused.json()["detail"]["message"]
+    assert EMBEDDING_KEY not in refused.text
+    assert kept["endpoint"] == "https://embed.example.test/v1"
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["candidate"]["api_key"]["last4"] == "4444"
+
+
+async def test_a_candidate_keeps_the_active_bindings_key_only_on_its_origin(db, tmp_path, providers) -> None:
+    config = _config(tmp_path)
+    settings = _settings(config)
+    await settings.save_candidate(db, "embedding", CandidateDraft(**COMPATIBLE_EMBEDDING, api_key=EMBEDDING_KEY))
+    await settings.validate_candidate(db, "embedding")
+
+    same_origin = await settings.save_candidate(
+        db, "embedding", CandidateDraft(**{**COMPATIBLE_EMBEDDING, "model_id": "larger-model"})
+    )
+    await settings.discard_candidate(db, "embedding")
+    with pytest.raises(ModelConfigError) as refused:
+        await settings.save_candidate(
+            db,
+            "embedding",
+            CandidateDraft(**{**COMPATIBLE_EMBEDDING, "endpoint": "https://collector.example.test/v1"}),
+        )
+
+    assert same_origin.candidate.key.last4 == "2222"
+    assert same_origin.candidate.binding.secret_ref == same_origin.active.binding.secret_ref
+    assert refused.value.code == "api_key_origin_changed"
+
+
+async def test_a_candidate_may_keep_the_environment_key_of_the_active_binding_on_its_origin(
+    db, tmp_path
+) -> None:
+    config = _config(tmp_path)
+    config.llm.enrichment_api_key = ENVIRONMENT_KEY
+    settings = _settings(config)
+
+    view = await settings.save_candidate(
+        db, "generation", CandidateDraft(provider="anthropic", model_id="claude-opus-4")
+    )
+    with pytest.raises(ModelConfigError) as refused:
+        await settings.save_candidate(db, "generation", CandidateDraft(**OPENAI_GENERATION))
+
+    assert view.candidate.binding.secret_ref == "env:MEMFORGE_ENRICHMENT_API_KEY"
+    assert view.candidate.key.source == "environment"
+    assert refused.value.code == "api_key_origin_changed"
+
+
+def test_a_candidate_can_be_discarded(db, tmp_path) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+    client.put(f"{API}/generation/candidate", json={**OPENAI_GENERATION, "api_key": GENERATION_KEY})
+
+    response = client.delete(f"{API}/generation/candidate")
+
+    assert response.status_code == 200
+    assert response.json() == {"active": None, "candidate": None}
+    assert _stored_rows(db) == []
+    with sqlite3.connect(db.db_path) as raw:
+        assert raw.execute("SELECT COUNT(*) FROM model_secrets").fetchone() == (0,)
+
+
+# -- Validation and promotion -------------------------------------------------------
+
+
+def test_a_candidate_becomes_active_only_after_its_check_passes(db, tmp_path, providers) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+    client.put(f"{API}/generation/candidate", json={**OPENAI_GENERATION, "api_key": GENERATION_KEY})
+    providers.generation_failure = _rejected_key()
+
+    failed = client.post(f"{API}/generation/candidate/validate")
+    after_failure = client.get(API).json()["generation"]
+    providers.generation_failure = None
+    passed = client.post(f"{API}/generation/candidate/validate")
+
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["passed"] is False
+    assert failed.json()["promoted"] is False
+    assert failed.json()["error_code"] == "authentication_failed"
+    assert after_failure["active"] is None
+    assert after_failure["candidate"]["state"] == "not_validated"
+    assert after_failure["candidate"]["validation"]["passed"] is False
+    assert after_failure["candidate"]["validation"]["error_code"] == "authentication_failed"
+    assert after_failure["candidate"]["validation"]["current"] is True
+
+    payload = passed.json()
+    assert passed.status_code == 200, passed.text
+    assert payload["passed"] is True
+    assert payload["promoted"] is True
+    assert payload["error_code"] is None
+    assert payload["settings"]["candidate"] is None
+    active = payload["settings"]["active"]
+    assert active["route"] == "openai/gpt-5-mini"
+    assert active["state"] == "ready"
+    assert active["api_key"] == {"is_set": True, "source": "saved", "last4": "1111"}
+    assert active["validation"]["passed"] is True
+    assert active["validation"]["current"] is True
+    assert active["validation"]["facts"] == {
+        "latency_ms": active["validation"]["facts"]["latency_ms"],
+        "token_limits_known": active["validation"]["facts"]["token_limits_known"],
+        "structured_output_mode": "native_schema",
+        "schema_fallback": False,
+        "provider_model": "reported-generation-model",
+    }
+    assert _stored_rows(db) == [("generation", "active")]
+    for response in (failed, passed):
+        assert GENERATION_KEY not in response.text
+
+
+def test_the_check_is_made_with_the_candidates_route_endpoint_and_key(db, tmp_path, providers) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+    client.put(f"{API}/generation/candidate", json={**OPENAI_GENERATION, "api_key": GENERATION_KEY})
+
+    client.post(f"{API}/generation/candidate/validate")
+
+    request = providers.generation_requests[0]
+    assert request["model"] == "openai/gpt-5-mini"
+    assert request["api_base"] == "https://api.openai.com/v1"
+    assert request["api_key"] == GENERATION_KEY
+    assert request["num_retries"] == 0
+
+
+async def test_the_runtime_uses_a_promoted_binding(db, tmp_path, providers) -> None:
+    config = _config(tmp_path)
+    settings = _settings(config)
+    await settings.save_candidate(db, "generation", CandidateDraft(**OPENAI_GENERATION, api_key=GENERATION_KEY))
+    before = await resolve_models(db, config)
+
+    outcome = await settings.validate_candidate(db, "generation")
+    after = await resolve_models(db, config)
+
+    assert before.generation is None
+    assert outcome.promoted is True
+    assert after.generation == ResolvedInvocation(
+        route="openai/gpt-5-mini",
+        api_base="https://api.openai.com/v1",
+        api_key=GENERATION_KEY,
+    )
+
+
+def test_a_validated_embedding_candidate_becomes_active_at_once(db, tmp_path, providers) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+    client.put(
+        f"{API}/embedding/candidate",
+        json={**COMPATIBLE_EMBEDDING, "api_key": EMBEDDING_KEY, "parameters": {"dimensions": 3}},
+    )
+
+    response = client.post(f"{API}/embedding/candidate/validate")
+
+    payload = response.json()
+    assert payload["promoted"] is True
+    active = payload["settings"]["active"]
+    assert active["state"] == "ready"
+    assert active["parameters"] == {"dimensions": 3}
+    assert active["validation"]["facts"] == {
+        "dimension": 3,
+        "provider_model": "reported-embedding-model",
+        "latency_ms": active["validation"]["facts"]["latency_ms"],
+    }
+    assert len(providers.embedding_requests) == 2
+    assert providers.embedding_requests[0]["dimensions"] == 3
+    assert providers.embedding_requests[0]["api_key"] == EMBEDDING_KEY
+    assert EMBEDDING_KEY not in response.text
+
+
+def test_an_embedding_candidate_whose_vectors_are_not_the_requested_size_stays_a_candidate(
+    db, tmp_path, providers
+) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+    client.put(
+        f"{API}/embedding/candidate",
+        json={**COMPATIBLE_EMBEDDING, "api_key": EMBEDDING_KEY, "parameters": {"dimensions": 8}},
+    )
+
+    response = client.post(f"{API}/embedding/candidate/validate")
+
+    assert response.json()["error_code"] == "embedding_dimension_mismatch"
+    assert response.json()["settings"]["active"] is None
+    assert response.json()["settings"]["candidate"]["validation"]["facts"]["dimension"] == 3
+
+
+def test_a_keyless_candidate_is_checked_without_a_credential_from_the_environment(
+    db, tmp_path, providers, monkeypatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", ENVIRONMENT_KEY)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+    saved = client.put(
+        f"{API}/embedding/candidate",
+        json={**COMPATIBLE_EMBEDDING, "endpoint": "http://localhost:11434/v1", "auth_strategy": "none"},
+    )
+
+    response = client.post(f"{API}/embedding/candidate/validate")
+
+    assert saved.json()["candidate"]["api_key"] == {"is_set": False, "source": None, "last4": None}
+    assert response.json()["promoted"] is True
+    assert {request["api_key"] for request in providers.embedding_requests} == {"no-api-key"}
+
+
+def test_validating_without_a_candidate_is_refused(db, tmp_path, providers) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    response = client.post(f"{API}/generation/candidate/validate")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"] == "candidate_not_found"
+    assert providers.generation_requests == []
+
+
+def test_promotion_makes_the_server_build_its_search_engine_again(db, tmp_path, providers) -> None:
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    client = TestClient(app)
+    app.state.memory_search_engine = object()
+    client.put(f"{API}/embedding/candidate", json={**COMPATIBLE_EMBEDDING, "api_key": EMBEDDING_KEY})
+
+    client.post(f"{API}/embedding/candidate/validate")
+
+    assert app.state.memory_search_engine is None
+
+
+async def test_promotion_makes_the_sync_worker_embed_with_the_binding_now_active(db, tmp_path, providers) -> None:
+    config = _config(tmp_path)
+    app = create_admin_app(db=db, config=config)
+    settings: ModelSettings = app.state.model_settings
+    await settings.save_candidate(db, "embedding", CandidateDraft(**COMPATIBLE_EMBEDDING, api_key=EMBEDDING_KEY))
+    await settings.validate_candidate(db, "embedding")
+    worker = SourceSyncWorker(db, config)
+    app.state.sync_worker = worker
+    worker._vector_runtime = await worker._build_runtime()
+    worker._relation_runtime = worker._vector_runtime
+    before = worker._vector_runtime.memory_store.embedding.settings.invocation
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        await client.put(
+            f"{API}/embedding/candidate",
+            json={
+                "provider": "openai_compatible",
+                "endpoint": "https://new-embed.example.test/v1",
+                "model_id": "new-embed-model",
+                "api_key": OTHER_KEY,
+            },
+        )
+        promoted = await client.post(f"{API}/embedding/candidate/validate")
+
+    assert promoted.json()["promoted"] is True
+    assert (worker._vector_runtime, worker._relation_runtime) == (None, None)
+    after = (await worker._build_runtime()).memory_store.embedding.settings.invocation
+    assert (before.route, before.api_base, before.api_key) == (
+        "openai/embed-model",
+        "https://embed.example.test/v1",
+        EMBEDDING_KEY,
+    )
+    assert (after.route, after.api_base, after.api_key) == (
+        "openai/new-embed-model",
+        "https://new-embed.example.test/v1",
+        OTHER_KEY,
+    )
+
+
+async def test_a_failed_validation_leaves_the_sync_workers_runtimes_in_place(db, tmp_path, providers) -> None:
+    config = _config(tmp_path)
+    app = create_admin_app(db=db, config=config)
+    worker = SourceSyncWorker(db, config)
+    app.state.sync_worker = worker
+    worker._vector_runtime = kept = await worker._build_runtime()
+    providers.embedding_failure = Rejection("invalid api key")
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        await client.put(f"{API}/embedding/candidate", json={**COMPATIBLE_EMBEDDING, "api_key": EMBEDDING_KEY})
+        refused = await client.post(f"{API}/embedding/candidate/validate")
+
+    assert refused.json()["promoted"] is False
+    assert worker._vector_runtime is kept
+
+
+async def test_a_runtime_built_while_the_models_change_is_built_again(db, tmp_path) -> None:
+    config = _config(tmp_path)
+    built: list[object] = []
+
+    class ChangingProvider(DefaultRuntimeProvider):
+        async def build_sync_runtime(self, *args: Any, **kwargs: Any) -> Any:
+            runtime = await super().build_sync_runtime(*args, **kwargs)
+            built.append(runtime)
+            if len(built) == 1:
+                worker.models_changed()
+            return runtime
+
+    worker = SourceSyncWorker(db, config, runtime_provider=ChangingProvider())
+
+    runtime = await worker._build_runtime()
+
+    assert len(built) == 2
+    assert runtime is built[1]
+
+
+async def test_simultaneous_checks_of_the_active_binding_make_one_model_request(db, tmp_path, providers) -> None:
+    config = _config(tmp_path)
+    config.llm.enrichment_api_key = ENVIRONMENT_KEY
+    settings = _settings(config)
+    providers.generation_gate = threading.Event()
+
+    checks = [asyncio.create_task(settings.validate_active(db, "generation")) for _ in range(4)]
+    while not providers.generation_requests:
+        await asyncio.sleep(0.005)
+    await asyncio.sleep(0.05)
+    providers.generation_gate.set()
+    outcomes = await asyncio.gather(*checks)
+
+    assert len(providers.generation_requests) == 1
+    assert {outcome.state for outcome in outcomes} == {"ready"}
+    assert len({outcome.validation.checked_at for outcome in outcomes}) == 1
+    assert (await settings.health(db))["generation"].state == "ready"
+
+
+async def test_a_check_requested_after_one_finished_is_made_again(db, tmp_path, providers) -> None:
+    config = _config(tmp_path)
+    config.llm.enrichment_api_key = ENVIRONMENT_KEY
+    settings = _settings(config)
+
+    await settings.validate_active(db, "generation")
+    await settings.validate_active(db, "generation")
+
+    assert len(providers.generation_requests) == 2
+
+
+async def test_a_check_that_started_first_is_the_one_whose_outcome_is_stored(db, tmp_path, providers) -> None:
+    """A later request does not start a second check whose result an earlier one could overwrite."""
+    config = _config(tmp_path)
+    settings = _settings(config)
+    await _ready_generation(db, settings)
+    providers.generation_requests.clear()
+    providers.generation_gate = threading.Event()
+    providers.generation_failure = _rejected_key()
+
+    first = asyncio.create_task(settings.validate_active(db, "generation"))
+    while not providers.generation_requests:
+        await asyncio.sleep(0.005)
+    second = asyncio.create_task(settings.validate_active(db, "generation"))
+    await asyncio.sleep(0.05)
+    providers.generation_gate.set()
+    outcomes = await asyncio.gather(first, second)
+
+    view = await settings.view(db, "generation")
+    assert len(providers.generation_requests) == 1
+    assert [outcome.state for outcome in outcomes] == ["needs_revalidation", "needs_revalidation"]
+    assert view.active.binding.state == "needs_revalidation"
+    assert view.active.binding.validation.error_code == "authentication_failed"
+
+
+async def test_simultaneous_validations_of_a_candidate_promote_it_once(db, tmp_path, providers) -> None:
+    settings = _settings(_config(tmp_path))
+    await settings.save_candidate(db, "generation", CandidateDraft(**OPENAI_GENERATION, api_key=GENERATION_KEY))
+    providers.generation_gate = threading.Event()
+
+    checks = [asyncio.create_task(settings.validate_candidate(db, "generation")) for _ in range(3)]
+    while not providers.generation_requests:
+        await asyncio.sleep(0.005)
+    await asyncio.sleep(0.05)
+    providers.generation_gate.set()
+    outcomes = await asyncio.gather(*checks)
+
+    view = await settings.view(db, "generation")
+    assert len(providers.generation_requests) == 1
+    assert [outcome.promoted for outcome in outcomes] == [True, True, True]
+    assert (view.active.binding.state, view.candidate) == ("ready", None)
+
+
+async def test_a_binding_that_replaced_the_checked_one_gets_a_check_of_its_own(db, tmp_path, providers) -> None:
+    config = _config(tmp_path)
+    settings = _settings(config)
+    await _ready_generation(db, settings)
+    providers.generation_requests.clear()
+    providers.generation_gate = threading.Event()
+
+    first = asyncio.create_task(settings.validate_active(db, "generation"))
+    while not providers.generation_requests:
+        await asyncio.sleep(0.005)
+    await settings.save_candidate(db, "generation", CandidateDraft(provider="openai", model_id="gpt-5"))
+    promotion = asyncio.create_task(settings.validate_candidate(db, "generation"))
+    while len(providers.generation_requests) < 2:
+        await asyncio.sleep(0.005)
+    providers.generation_gate.set()
+    await asyncio.gather(first, promotion)
+    providers.generation_requests.clear()
+    await settings.validate_active(db, "generation")
+
+    view = await settings.view(db, "generation")
+    assert [request["model"] for request in providers.generation_requests] == ["openai/gpt-5"]
+    assert (view.active.binding.model_id, view.active.binding.state) == ("gpt-5", "ready")
+
+
+async def test_a_candidate_saved_again_while_it_is_checked_is_not_promoted(
+    db, tmp_path, providers, monkeypatch
+) -> None:
+    config = _config(tmp_path)
+    settings = _settings(config)
+    await settings.save_candidate(db, "generation", CandidateDraft(**OPENAI_GENERATION, api_key=GENERATION_KEY))
+    answer = providers.complete
+
+    async def save_again_then_answer(**request: Any) -> Any:
+        await settings.save_candidate(db, "generation", CandidateDraft(provider="openai", model_id="gpt-5"))
+        return await answer(**request)
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", save_again_then_answer)
+    with pytest.raises(ModelConfigError) as refused:
+        await settings.validate_candidate(db, "generation")
+
+    view = await settings.view(db, "generation")
+    assert refused.value.code == "candidate_changed"
+    assert view.active is None
+    assert view.candidate.binding.model_id == "gpt-5"
+    assert view.candidate.binding.validation is None
+
+
+# -- States of the active binding ---------------------------------------------------
+
+
+async def _ready_generation(db: Database, settings: ModelSettings) -> None:
+    await settings.save_candidate(db, "generation", CandidateDraft(**OPENAI_GENERATION, api_key=GENERATION_KEY))
+    assert (await settings.validate_candidate(db, "generation")).promoted is True
+
+
+async def test_a_failed_check_moves_a_ready_binding_to_needs_revalidation_and_it_stays_in_use(
+    db, tmp_path, providers
+) -> None:
+    config = _config(tmp_path)
+    settings = _settings(config)
+    await _ready_generation(db, settings)
+    providers.generation_failure = _rejected_key()
+
+    outcome = await settings.validate_active(db, "generation")
+    view = await settings.view(db, "generation")
+    models = await resolve_models(db, config)
+
+    assert outcome.promoted is False
+    assert outcome.state == "needs_revalidation"
+    assert view.active.binding.state == "needs_revalidation"
+    assert view.active.binding.validation.error_code == "authentication_failed"
+    assert models.generation_route == "openai/gpt-5-mini"
+
+    providers.generation_failure = None
+    assert (await settings.validate_active(db, "generation")).state == "ready"
+
+
+def test_the_active_binding_can_be_checked_again_through_the_api(db, tmp_path, providers) -> None:
+    config = _config(tmp_path)
+    config.llm.enrichment_api_key = ENVIRONMENT_KEY
+    client = TestClient(create_admin_app(db=db, config=config))
+
+    response = client.post(f"{API}/generation/active/validate")
+    unconfigured = client.post(f"{API}/embedding/active/validate")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["passed"] is True
+    assert response.json()["promoted"] is False
+    assert response.json()["settings"]["active"]["state"] == "ready"
+    assert providers.generation_requests[0]["api_key"] == ENVIRONMENT_KEY
+    assert ENVIRONMENT_KEY not in response.text
+    assert unconfigured.status_code == 409
+    assert unconfigured.json()["detail"]["error"] == "model_not_configured"
+    assert _stored_rows(db) == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"endpoint": "https://embed.example.test/v2"},
+        {"model_id": "larger-model"},
+        {"parameters": {"dimensions": 3}},
+        {"auth_strategy": "none"},
+    ],
+    ids=["endpoint", "model", "dimensions", "auth_strategy"],
+)
+async def test_changing_what_a_check_vouched_for_leaves_a_ready_candidate_to_be_validated_again(
+    db, tmp_path, change
+) -> None:
+    config = _config(tmp_path)
+    settings = _settings(config)
+    view = await settings.save_candidate(
+        db, "embedding", CandidateDraft(**COMPATIBLE_EMBEDDING, api_key=EMBEDDING_KEY)
+    )
+    binding = view.candidate.binding
+    passed = bindings.validation_record(
+        bindings.ValidationResult(checked_at="2026-10-14T00:00:00+00:00", digest=binding.digest, facts={"dimension": 3})
+    )
+    await db.record_model_binding_validation(
+        "embedding", "candidate", updated_at=binding.saved_at, state="ready", validation=passed
+    )
+
+    unchanged = await settings.save_candidate(db, "embedding", CandidateDraft(**COMPATIBLE_EMBEDDING))
+    changed = await settings.save_candidate(
+        db, "embedding", CandidateDraft(**{**COMPATIBLE_EMBEDDING, **change})
+    )
+
+    assert unchanged.candidate.binding.state == "ready"
+    assert changed.candidate.binding.state == "needs_revalidation"
+    assert changed.candidate.binding.validation.digest != changed.candidate.binding.digest
+
+
+async def test_a_failed_check_is_forgotten_once_the_settings_it_failed_with_change(
+    db, tmp_path, providers
+) -> None:
+    config = _config(tmp_path)
+    settings = _settings(config)
+    providers.generation_failure = _rejected_key()
+    await settings.save_candidate(db, "generation", CandidateDraft(**OPENAI_GENERATION, api_key=GENERATION_KEY))
+    await settings.validate_candidate(db, "generation")
+
+    same = await settings.save_candidate(db, "generation", CandidateDraft(**OPENAI_GENERATION))
+    new_key = await settings.save_candidate(
+        db, "generation", CandidateDraft(**OPENAI_GENERATION, api_key=OTHER_KEY)
+    )
+
+    assert same.candidate.binding.validation.error_code == "authentication_failed"
+    assert new_key.candidate.binding.validation is None
+    assert new_key.candidate.binding.state == "not_validated"
+
+
+# -- At server start ----------------------------------------------------------------
+
+
+async def _translated_generation(db: Database) -> None:
+    """Store an active binding as the settings of an earlier version are carried over."""
+    binding = bindings.build_binding(
+        kind="generation",
+        provider="anthropic",
+        model_id="claude-sonnet-4",
+        secret_ref="env:MEMFORGE_ENRICHMENT_API_KEY",
+        config_source="settings",
+    )
+    await db.put_model_binding("generation", "active", bindings.binding_record(binding))
+
+
+def _wait_for_state(client: TestClient, kind: str, state: str) -> dict[str, Any]:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        health = client.get("/api/v1/health").json()["models"]
+        if health[kind]["state"] == state:
+            return health
+        time.sleep(0.01)
+    raise AssertionError(f"the {kind} model did not become {state}: {health}")
+
+
+async def test_a_starting_server_checks_carried_over_bindings_without_waiting_for_the_check(
+    db, tmp_path, providers, model_checks_at_server_start
+) -> None:
+    config = _config(tmp_path)
+    config.llm.enrichment_api_key = ENVIRONMENT_KEY
+    await _translated_generation(db)
+    providers.generation_gate = threading.Event()
+
+    with TestClient(create_admin_app(db=db, config=config)) as client:
+        while_checking = client.get("/api/v1/health").json()["models"]
+        providers.generation_gate.set()
+        checked = _wait_for_state(client, "generation", "ready")
+
+    assert while_checking["generation"] == {"configured": True, "state": "not_validated"}
+    assert checked["generation"] == {"configured": True, "state": "ready"}
+    assert len(providers.generation_requests) == 1
+    stored = bindings.binding_from_record(await db.get_model_binding("generation", "active"))
+    assert stored.state == "ready"
+    assert stored.validation.facts["structured_output_mode"] == "native_schema"
+
+
+async def test_a_carried_over_binding_that_fails_its_check_stays_in_use(db, tmp_path, providers) -> None:
+    config = _config(tmp_path)
+    config.llm.enrichment_api_key = ENVIRONMENT_KEY
+    await _translated_generation(db)
+    providers.generation_failure = _rejected_key()
+
+    settings = _settings(config)
+    await settings.validate_unready_active_bindings(db)
+
+    view = await settings.view(db, "generation")
+    assert view.active.binding.state == "not_validated"
+    assert view.active.binding.validation.error_code == "authentication_failed"
+    assert (await resolve_models(db, config)).generation_route == "anthropic/claude-sonnet-4"
+
+
+async def test_a_starting_server_checks_again_a_binding_validated_under_another_litellm(
+    db, tmp_path, providers, monkeypatch
+) -> None:
+    config = _config(tmp_path)
+    settings = _settings(config)
+    await _ready_generation(db, settings)
+    providers.generation_requests.clear()
+
+    await settings.validate_unready_active_bindings(db)
+    assert providers.generation_requests == []
+
+    monkeypatch.setattr(bindings, "installed_litellm_version", lambda: "9.9.9")
+    assert (await settings.health(db))["generation"].state == "needs_revalidation"
+    await settings.validate_unready_active_bindings(db)
+
+    assert len(providers.generation_requests) == 1
+    assert (await settings.health(db))["generation"].state == "ready"
+
+
+async def test_a_failing_check_of_one_kind_does_not_stop_the_check_of_the_other(
+    db, tmp_path, providers
+) -> None:
+    config = _config(tmp_path)
+    config.llm.enrichment_api_key = ENVIRONMENT_KEY
+    config.llm.embedding_api_key = ENVIRONMENT_KEY
+    settings = _settings(config)
+    validate_active = settings.validate_active
+
+    async def validate(database, kind):
+        if kind == "generation":
+            raise RuntimeError("the check could not be made")
+        return await validate_active(database, kind)
+
+    settings.validate_active = validate
+    await settings.validate_unready_active_bindings(db)
+
+    health = await settings.health(db)
+    assert health["generation"].state == "not_validated"
+    assert health["embedding"].state == "ready"
+
+
+async def test_a_starting_server_translates_earlier_settings_with_the_configuration_it_was_given(
+    tmp_path, providers
+) -> None:
+    """A host hands its own configuration to the app; that one completes the stored settings."""
+    config = _config(tmp_path)
+    config.llm.enrichment_model = "claude-from-the-configuration"
+    config.llm.enrichment_api_key = ENVIRONMENT_KEY
+    config.llm.embedding_api_key = ENVIRONMENT_KEY
+    await _database_with_llm_config(
+        Path(config.storage.db_path),
+        {
+            "enrichment_model": "claude-opus-ui",
+            "enrichment_base_url": "http://proxy.internal:6655/anthropic",
+            "embedding_model": "text-embedding-3-large",
+            "embedding_api_key": EMBEDDING_KEY,
+        },
+    )
+
+    with TestClient(create_admin_app(config=config)) as client:
+        payload = client.get(API).json()
+
+    generation, embedding = payload["generation"]["active"], payload["embedding"]["active"]
+    assert (generation["route"], generation["endpoint"], generation["config_source"], generation["state"]) == (
+        "anthropic/claude-opus-ui",
+        "http://proxy.internal:6655/anthropic",
+        "settings",
+        "not_validated",
+    )
+    assert generation["api_key"] == {"is_set": True, "source": "environment", "last4": "3333"}
+    assert (embedding["route"], embedding["endpoint"]) == (
+        "openai/text-embedding-3-large",
+        "https://api.openai.com/v1",
+    )
+    assert embedding["api_key"] == {"is_set": True, "source": "saved", "last4": "2222"}
+    database_bytes = b"".join(
+        file.read_bytes() for file in Path(config.storage.db_path).parent.glob("memforge.db*")
+    )
+    assert EMBEDDING_KEY.encode() not in database_bytes
+
+
+def test_a_server_with_nothing_configured_makes_no_model_request_at_start(
+    db, tmp_path, providers, model_checks_at_server_start
+) -> None:
+    with TestClient(create_admin_app(db=db, config=_config(tmp_path))) as client:
+        health = client.get("/api/v1/health").json()["models"]
+
+    assert health == {
+        "generation": {"configured": False, "state": None},
+        "embedding": {"configured": False, "state": None},
+    }
+    assert providers.generation_requests == []
+    assert providers.embedding_requests == []
+
+
+# -- A deployment that manages its model settings -----------------------------------
+
+
+def _deployment_config(tmp_path: Path) -> AppConfig:
+    config = _config(tmp_path)
+    config.server.llm_config_writable = False
+    config.llm.enrichment_model = "sap/anthropic--claude-4.6-sonnet"
+    config.llm.enrichment_base_url = ""
+    config.llm.embedding_model = "sap/text-embedding-3-small"
+    config.llm.embedding_base_url = ""
+    return config
+
+
+def test_a_deployment_managed_installation_reads_its_bindings_and_refuses_every_write(
+    db, tmp_path, providers
+) -> None:
+    client = TestClient(create_admin_app(db=db, config=_deployment_config(tmp_path)))
+
+    read = client.get(API)
+    writes = [
+        client.put(f"{API}/generation/candidate", json={**OPENAI_GENERATION, "api_key": GENERATION_KEY}),
+        client.delete(f"{API}/generation/candidate"),
+        client.post(f"{API}/generation/candidate/validate"),
+    ]
+
+    payload = read.json()
+    assert payload["writable"] is False
+    assert payload["generation"]["candidate"] is None
+    active = payload["generation"]["active"]
+    assert (active["provider"], active["route"], active["auth_strategy"], active["config_source"]) == (
+        "litellm",
+        "sap/anthropic--claude-4.6-sonnet",
+        "environment",
+        "deployment",
+    )
+    assert active["api_key"] == {"is_set": False, "source": None, "last4": None}
+    assert payload["embedding"]["active"]["route"] == "sap/text-embedding-3-small"
+    for response in writes:
+        assert response.status_code == 405
+        assert response.json()["detail"]["error"] == "model_settings_read_only"
+    assert providers.generation_requests == []
+    assert _stored_rows(db) == []
+
+
+async def test_a_deployment_managed_installation_keeps_its_checks_in_memory(
+    db, tmp_path, providers, model_checks_at_server_start
+) -> None:
+    config = _deployment_config(tmp_path)
+
+    with TestClient(create_admin_app(db=db, config=config)) as client:
+        health = _wait_for_state(client, "embedding", "ready")
+        _wait_for_state(client, "generation", "ready")
+        active = client.get(API).json()["generation"]["active"]
+
+    assert health["embedding"] == {"configured": True, "state": "ready"}
+    assert active["state"] == "ready"
+    assert active["validation"]["passed"] is True
+    assert active["saved_at"] is None
+    assert "api_key" not in providers.generation_requests[0]
+    assert "api_base" not in providers.generation_requests[0]
+    assert _stored_rows(db) == []
+    with sqlite3.connect(db.db_path) as raw:
+        assert raw.execute("SELECT COUNT(*) FROM model_secrets").fetchone() == (0,)
+
+
+async def test_a_checked_deployment_binding_needs_revalidation_once_its_environment_changes(
+    db, tmp_path, providers
+) -> None:
+    config = _deployment_config(tmp_path)
+    settings = _settings(config)
+    await settings.validate_unready_active_bindings(db)
+    assert (await settings.health(db))["generation"].state == "ready"
+
+    config.llm.enrichment_model = "sap/another-model"
+    changed = await settings.view(db, "generation")
+
+    assert changed.active.binding.route == "sap/another-model"
+    assert changed.active.binding.state == "needs_revalidation"
+    assert changed.active.binding.validation.digest != changed.active.binding.digest
+
+
+def test_a_key_that_cannot_be_encrypted_is_refused_and_not_stored(db, tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", "not-a-usable-secret-key")
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    response = client.put(f"{API}/generation/candidate", json={**OPENAI_GENERATION, "api_key": GENERATION_KEY})
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == "secret_storage_unavailable"
+    assert GENERATION_KEY not in response.text
+    assert _stored_rows(db) == []
+
+
+# -- Health -------------------------------------------------------------------------
+
+
+def test_health_tells_when_no_generation_model_is_ready(db, tmp_path, providers) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    first_run = client.get("/api/v1/health").json()
+    client.put(f"{API}/generation/candidate", json={**OPENAI_GENERATION, "api_key": GENERATION_KEY})
+    with_candidate = client.get("/api/v1/health").json()
+    client.post(f"{API}/generation/candidate/validate")
+    validated = client.get("/api/v1/health").json()
+
+    assert first_run["models"]["generation"] == {"configured": False, "state": None}
+    assert with_candidate["models"]["generation"] == {"configured": False, "state": None}
+    assert validated["models"]["generation"] == {"configured": True, "state": "ready"}
+    assert validated["models"]["embedding"] == {"configured": False, "state": None}
+    assert first_run["status"] == validated["status"]
+
+
+# -- Model discovery ----------------------------------------------------------------
+
+
+class Endpoint:
+    """Stand in for the HTTP client of a model listing request and record what it was asked."""
+
+    def __init__(self, monkeypatch, respond=None) -> None:
+        self.client_options: list[dict] = []
+        self.requests: list[tuple[str, dict]] = []
+        self._respond = respond or _model_list
+        monkeypatch.setattr(model_settings_api.httpx, "AsyncClient", self)
+
+    def __call__(self, **options):
+        self.client_options.append(options)
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def get(self, url, headers):
+        self.requests.append((url, dict(headers)))
+        return self._respond(url, httpx.Request("GET", url))
+
+
+def _model_list(url, request):
+    return httpx.Response(
+        200,
+        json={"data": [{"id": "model-a"}, {"id": "model-b", "display_name": "Model B"}]},
+        request=request,
+    )
+
+
+def _discover(client: TestClient, kind: str = "embedding", **body: Any) -> dict[str, Any]:
+    response = client.post(f"{API}/{kind}/discover-models", json=body)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_discovery_lists_the_models_of_an_endpoint(db, tmp_path, monkeypatch) -> None:
+    endpoint = Endpoint(monkeypatch)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(
+        client, provider="openai_compatible", endpoint="https://proxy.example.test/v1", api_key=OTHER_KEY
+    )
+
+    assert payload["ok"] is True
+    assert payload["models_supported"] is True
+    assert payload["models"] == [{"id": "model-a", "label": None}, {"id": "model-b", "label": "Model B"}]
+    assert payload["error_code"] is None
+    assert endpoint.requests == [
+        (
+            "https://proxy.example.test/v1/models",
+            {"Accept": "application/json", "Authorization": f"Bearer {OTHER_KEY}"},
+        )
+    ]
+    assert [options["follow_redirects"] for options in endpoint.client_options] == [False]
+
+
+def test_discovery_uses_the_default_endpoint_and_key_header_of_the_provider(db, tmp_path, monkeypatch) -> None:
+    endpoint = Endpoint(
+        monkeypatch,
+        lambda url, request: (
+            _model_list(url, request)
+            if url.endswith("/v1/models")
+            else httpx.Response(404, json={}, request=request)
+        ),
+    )
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(client, "generation", provider="anthropic", api_key=OTHER_KEY)
+
+    assert payload["ok"] is True
+    assert [url for url, _headers in endpoint.requests] == [
+        "https://api.anthropic.com/models",
+        "https://api.anthropic.com/v1/models",
+    ]
+    assert endpoint.requests[0][1] == {
+        "Accept": "application/json",
+        "x-api-key": OTHER_KEY,
+        "anthropic-version": "2023-06-01",
+    }
+
+
+def test_a_provider_without_a_model_list_is_not_asked(db, tmp_path, monkeypatch) -> None:
+    endpoint = Endpoint(monkeypatch)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(client, provider="litellm", api_key=OTHER_KEY)
+
+    assert payload["ok"] is True
+    assert payload["models_supported"] is False
+    assert endpoint.requests == []
+
+
+@pytest.mark.parametrize(
+    "requested",
+    ["https://embed.example.test/v1", "https://EMBED.Example.Test:443/other/path"],
+    ids=["same_url", "same_origin_other_spelling"],
+)
+def test_discovery_uses_the_saved_key_for_its_own_origin(db, tmp_path, monkeypatch, requested) -> None:
+    endpoint = Endpoint(monkeypatch)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+    client.put(f"{API}/embedding/candidate", json={**COMPATIBLE_EMBEDDING, "api_key": EMBEDDING_KEY})
+
+    payload = _discover(client, provider="openai_compatible", endpoint=requested)
+
+    assert payload["ok"] is True
+    assert endpoint.requests[0][1]["Authorization"] == f"Bearer {EMBEDDING_KEY}"
+    assert EMBEDDING_KEY not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    "requested",
+    [
+        "https://other.example.test/v1",
+        "http://embed.example.test/v1",
+        "https://embed.example.test:8443/v1",
+    ],
+    ids=["other_host", "other_scheme", "other_port"],
+)
+def test_discovery_asks_for_the_key_again_on_another_origin(db, tmp_path, monkeypatch, requested) -> None:
+    endpoint = Endpoint(monkeypatch)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+    client.put(f"{API}/embedding/candidate", json={**COMPATIBLE_EMBEDDING, "api_key": EMBEDDING_KEY})
+
+    payload = _discover(client, provider="openai_compatible", endpoint=requested)
+
+    assert payload["ok"] is False
+    assert payload["stage"] == "auth"
+    assert payload["error_code"] == "api_key_origin_changed"
+    assert "Enter the API key for this endpoint" in payload["message"]
+    assert endpoint.requests == []
+
+
+def test_discovery_sends_a_key_entered_for_another_origin(db, tmp_path, monkeypatch) -> None:
+    endpoint = Endpoint(monkeypatch)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+    client.put(f"{API}/embedding/candidate", json={**COMPATIBLE_EMBEDDING, "api_key": EMBEDDING_KEY})
+
+    payload = _discover(
+        client, provider="openai_compatible", endpoint="https://other.example.test/v1", api_key=OTHER_KEY
+    )
+
+    assert payload["ok"] is True
+    assert endpoint.requests[0][1]["Authorization"] == f"Bearer {OTHER_KEY}"
+
+
+def test_discovery_uses_the_environment_key_only_for_the_environment_endpoint(db, tmp_path, monkeypatch) -> None:
+    endpoint = Endpoint(monkeypatch)
+    config = _config(tmp_path)
+    config.llm.embedding_model = "embed-model"
+    config.llm.embedding_base_url = "https://configured.example.test/v1"
+    config.llm.embedding_api_key = ENVIRONMENT_KEY
+    client = TestClient(create_admin_app(db=db, config=config))
+
+    same_origin = _discover(client, provider="openai_compatible", endpoint="https://configured.example.test/v1")
+    other_origin = _discover(client, provider="openai_compatible", endpoint="https://other.example.test/v1")
+
+    assert same_origin["ok"] is True
+    assert other_origin["ok"] is False
+    assert other_origin["error_code"] == "api_key_origin_changed"
+    assert [headers["Authorization"] for _url, headers in endpoint.requests] == [f"Bearer {ENVIRONMENT_KEY}"]
+
+
+def test_discovery_with_the_none_strategy_sends_no_saved_key(db, tmp_path, monkeypatch) -> None:
+    endpoint = Endpoint(monkeypatch)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+    client.put(f"{API}/embedding/candidate", json={**COMPATIBLE_EMBEDDING, "api_key": EMBEDDING_KEY})
+
+    payload = _discover(
+        client, provider="openai_compatible", endpoint="https://embed.example.test/v1", auth_strategy="none"
+    )
+
+    assert payload["ok"] is True
+    assert endpoint.requests[0][1] == {"Accept": "application/json"}
+
+
+def test_discovery_reports_a_redirect_to_another_origin_as_failed(db, tmp_path, monkeypatch) -> None:
+    endpoint = Endpoint(
+        monkeypatch,
+        lambda url, request: httpx.Response(
+            302,
+            headers={"location": "https://collector.example.test/v1/models?from=probe"},
+            request=request,
+        ),
+    )
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(
+        client, provider="openai_compatible", endpoint="https://proxy.example.test/v1", api_key=OTHER_KEY
+    )
+
+    assert payload["ok"] is False
+    assert payload["stage"] == "http"
+    assert payload["error_code"] == "redirect_to_another_origin"
+    assert payload["status"] == 302
+    assert "redirected to https://collector.example.test, another origin" in payload["message"]
+    assert "from=probe" not in payload["message"]
+    assert [url for url, _headers in endpoint.requests] == ["https://proxy.example.test/v1/models"]
+
+
+@pytest.mark.parametrize(
+    "location",
+    ["http://proxy.example.test/v1/models", "https://proxy.example.test:8443/v1/models"],
+    ids=["other_scheme", "other_port"],
+)
+def test_discovery_treats_a_changed_port_or_scheme_as_another_origin(db, tmp_path, monkeypatch, location) -> None:
+    Endpoint(monkeypatch, lambda url, request: httpx.Response(307, headers={"location": location}, request=request))
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(
+        client, provider="openai_compatible", endpoint="https://proxy.example.test/v1", api_key=OTHER_KEY
+    )
+
+    assert payload["ok"] is False
+    assert payload["error_code"] == "redirect_to_another_origin"
+
+
+def test_discovery_does_not_follow_a_redirect_within_the_origin(db, tmp_path, monkeypatch) -> None:
+    def respond(url, request):
+        if url.endswith("/v1/models"):
+            return _model_list(url, request)
+        return httpx.Response(301, headers={"location": "/elsewhere/models"}, request=request)
+
+    endpoint = Endpoint(monkeypatch, respond)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(
+        client, provider="openai_compatible", endpoint="https://proxy.example.test", api_key=OTHER_KEY
+    )
+
+    assert payload["ok"] is True
+    assert [url for url, _headers in endpoint.requests] == [
+        "https://proxy.example.test/models",
+        "https://proxy.example.test/v1/models",
+    ]
+
+
+def test_discovery_fails_when_the_endpoint_only_redirects(db, tmp_path, monkeypatch) -> None:
+    Endpoint(
+        monkeypatch,
+        lambda url, request: httpx.Response(308, headers={"location": "/moved"}, request=request),
+    )
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(
+        client, provider="openai_compatible", endpoint="https://proxy.example.test", api_key=OTHER_KEY
+    )
+
+    assert payload["ok"] is False
+    assert payload["stage"] == "http"
+    assert payload["error_code"] == "redirect_not_followed"
+    assert payload["status"] == 308
+
+
+def test_discovery_treats_a_missing_model_list_as_a_model_to_enter_by_hand(db, tmp_path, monkeypatch) -> None:
+    Endpoint(monkeypatch, lambda url, request: httpx.Response(404, json={"error": "not found"}, request=request))
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(
+        client, provider="openai_compatible", endpoint="https://proxy.example.test", api_key=OTHER_KEY
+    )
+
+    assert payload["ok"] is True
+    assert payload["models_supported"] is False
+    assert payload["models"] == []
+    assert "does not expose a model list" in payload["message"]
+
+
+def test_discovery_falls_through_from_an_html_answer_to_the_v1_path(db, tmp_path, monkeypatch) -> None:
+    def respond(url, request):
+        if url.endswith("/v1/models"):
+            return httpx.Response(200, json={"data": [{"id": "model-from-v1"}]}, request=request)
+        return httpx.Response(200, content=b"<html>not json</html>", request=request)
+
+    Endpoint(monkeypatch, respond)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(
+        client, provider="openai_compatible", endpoint="https://proxy.example.test", api_key=OTHER_KEY
+    )
+
+    assert [model["id"] for model in payload["models"]] == ["model-from-v1"]
+
+
+def test_discovery_suggests_the_docker_host_for_an_unreachable_localhost(db, tmp_path, monkeypatch) -> None:
+    def refuse(url, request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    Endpoint(monkeypatch, refuse)
+    monkeypatch.setattr(model_settings_api, "_is_running_in_container", lambda: True)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(client, provider="ollama", endpoint="http://localhost:11434")
+
+    assert payload["ok"] is False
+    assert payload["stage"] == "connect"
+    assert payload["error_code"] == "provider_unreachable"
+    assert payload["suggested_endpoint"] == "http://host.docker.internal:11434"
+
+
+def test_discovery_without_a_key_says_to_add_one_when_the_endpoint_wants_one(db, tmp_path, monkeypatch) -> None:
+    Endpoint(monkeypatch, lambda url, request: httpx.Response(401, json={"error": "unauthorized"}, request=request))
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    without_key = _discover(client, provider="openai_compatible", endpoint="https://proxy.example.test/v1")
+    with_key = _discover(
+        client, provider="openai_compatible", endpoint="https://proxy.example.test/v1", api_key=OTHER_KEY
+    )
+
+    assert (without_key["stage"], without_key["error_code"]) == ("auth", "api_key_required")
+    assert without_key["message"] == "Add an API key, then try again."
+    assert (with_key["stage"], with_key["error_code"]) == ("auth", "authentication_failed")
+    assert OTHER_KEY not in json.dumps(with_key)
+
+
+def test_discovery_with_environment_credentials_says_the_model_has_to_be_entered(
+    db, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", ENVIRONMENT_KEY)
+    endpoint = Endpoint(
+        monkeypatch, lambda url, request: httpx.Response(401, json={"error": "unauthorized"}, request=request)
+    )
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(client, kind="generation", provider="openai", auth_strategy="environment")
+
+    assert (payload["ok"], payload["stage"], payload["status"]) == (False, "auth", 401)
+    assert payload["error_code"] == "listing_needs_api_key"
+    assert payload["message"] == (
+        "This endpoint lists its models only for an API key, and credentials from the "
+        "server environment are not sent with this request. Enter the model yourself."
+    )
+    assert endpoint.requests == [("https://api.openai.com/v1/models", {"Accept": "application/json"})]
+
+
+def test_discovery_with_environment_credentials_lists_an_endpoint_that_asks_for_no_key(
+    db, tmp_path, monkeypatch
+) -> None:
+    endpoint = Endpoint(monkeypatch)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(client, kind="generation", provider="openrouter", auth_strategy="environment")
+
+    assert payload["ok"] is True
+    assert [model["id"] for model in payload["models"]] == ["model-a", "model-b"]
+    assert endpoint.requests == [("https://openrouter.ai/api/v1/models", {"Accept": "application/json"})]
+
+
+def test_discovery_refuses_an_endpoint_that_is_not_a_url(db, tmp_path, monkeypatch) -> None:
+    endpoint = Endpoint(monkeypatch)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(client, provider="openai_compatible", endpoint="proxy.example.test/v1")
+
+    assert (payload["ok"], payload["stage"], payload["error_code"]) == (False, "validation", "endpoint_invalid")
+    assert endpoint.requests == []
+
+
+def test_discovery_refuses_an_endpoint_that_carries_a_credential(db, tmp_path, monkeypatch) -> None:
+    endpoint = Endpoint(monkeypatch)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    response = client.post(
+        f"{API}/embedding/discover-models",
+        json={"provider": "openai_compatible", "endpoint": "https://user:pw-secret@embed.example.test/v1"},
+    )
+
+    payload = response.json()
+    assert (payload["ok"], payload["stage"], payload["error_code"]) == (False, "validation", "endpoint_invalid")
+    assert "pw-secret" not in response.text
+    assert endpoint.requests == []
+
+
+# -- Keys never leave ---------------------------------------------------------------
+
+
+def test_no_response_and_no_log_line_contains_a_key(db, tmp_path, providers, monkeypatch, caplog) -> None:
+    Endpoint(monkeypatch)
+    config = _config(tmp_path)
+    config.llm.embedding_model = "embed-model"
+    config.llm.embedding_base_url = "https://configured.example.test/v1"
+    config.llm.embedding_api_key = ENVIRONMENT_KEY
+    client = TestClient(create_admin_app(db=db, config=config))
+    responses = []
+
+    with caplog.at_level("DEBUG"):
+        responses.append(client.get(API))
+        responses.append(
+            client.put(f"{API}/generation/candidate", json={**OPENAI_GENERATION, "api_key": GENERATION_KEY})
+        )
+        providers.generation_failure = _rejected_key()
+        responses.append(client.post(f"{API}/generation/candidate/validate"))
+        providers.generation_failure = None
+        responses.append(client.post(f"{API}/generation/candidate/validate"))
+        responses.append(
+            client.put(f"{API}/generation/candidate", json={**OPENAI_GENERATION, "api_key": OTHER_KEY})
+        )
+        responses.append(
+            client.put(
+                f"{API}/generation/candidate",
+                json={"provider": "openai_compatible", "endpoint": "https://moved.example.test", "model_id": "m"},
+            )
+        )
+        responses.append(
+            client.put(f"{API}/embedding/candidate", json={**COMPATIBLE_EMBEDDING, "api_key": EMBEDDING_KEY})
+        )
+        providers.embedding_failure = Rejection("invalid api key")
+        responses.append(client.post(f"{API}/embedding/candidate/validate"))
+        providers.embedding_failure = None
+        responses.append(client.post(f"{API}/embedding/candidate/validate"))
+        responses.append(client.post(f"{API}/embedding/active/validate"))
+        responses.append(
+            client.post(
+                f"{API}/embedding/discover-models",
+                json={"provider": "openai_compatible", "endpoint": "https://embed.example.test/v1"},
+            )
+        )
+        responses.append(client.get(API))
+        responses.append(client.get("/api/v1/health"))
+        responses.append(client.delete(f"{API}/generation/candidate"))
+
+    assert [response.status_code for response in responses] == [
+        200, 200, 200, 200, 200, 422, 200, 200, 200, 200, 200, 200, 200, 200,
+    ]
+    sent_keys = {request["api_key"] for request in providers.generation_requests + providers.embedding_requests}
+    assert sent_keys == {GENERATION_KEY, EMBEDDING_KEY}
+    for key in ALL_KEYS:
+        assert all(key not in response.text for response in responses)
+        assert key not in caplog.text
+    final = responses[-3].json()
+    assert final["generation"]["active"]["api_key"]["last4"] == "1111"
+    assert final["generation"]["candidate"]["api_key"]["last4"] == "4444"
+    assert final["embedding"]["active"]["api_key"]["last4"] == "2222"
+
+
+async def test_the_resolved_binding_of_the_api_is_the_one_the_runtime_resolves(db, tmp_path, providers) -> None:
+    config = _config(tmp_path)
+    client = TestClient(create_admin_app(db=db, config=config))
+    client.put(f"{API}/embedding/candidate", json={**COMPATIBLE_EMBEDDING, "api_key": EMBEDDING_KEY})
+    client.post(f"{API}/embedding/candidate/validate")
+
+    shown = client.get(API).json()["embedding"]["active"]
+    resolved = await resolve_active_binding(db, config, "embedding")
+
+    assert (shown["route"], shown["endpoint"], shown["state"]) == (resolved.route, resolved.endpoint, resolved.state)

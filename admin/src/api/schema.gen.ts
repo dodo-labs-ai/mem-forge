@@ -804,50 +804,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/llm-config": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get Llm Config
-         * @description Get LLM configuration. API keys are masked in the response.
-         */
-        get: operations["get_llm_config_api_v1_llm_config_get"];
-        /**
-         * Update Llm Config
-         * @description Update LLM configuration and return the stored result.
-         */
-        put: operations["update_llm_config_api_v1_llm_config_put"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/llm-config/probe": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Probe Llm Config
-         * @description Test an LLM endpoint and fetch model ids when the endpoint supports it.
-         */
-        post: operations["probe_llm_config_api_v1_llm_config_probe_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/memories": {
         parameters: {
             query?: never;
@@ -1355,6 +1311,130 @@ export interface paths {
         put?: never;
         /** Reject Memory Review */
         post: operations["reject_memory_review_api_v1_memory_reviews__review_id__reject_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/model-settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Model Settings
+         * @description Read the active and candidate bindings of both kinds. No key is returned.
+         */
+        get: operations["read_model_settings_api_v1_model_settings_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/model-settings/providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Model Providers
+         * @description List the provider descriptors a binding can name.
+         */
+        get: operations["list_model_providers_api_v1_model_settings_providers_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/model-settings/{kind}/active/validate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Validate Active Model
+         * @description Check the active binding again. It stays in use whatever the outcome.
+         */
+        post: operations["validate_active_model_api_v1_model_settings__kind__active_validate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/model-settings/{kind}/candidate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Save Model Candidate
+         * @description Save the candidate binding of a kind. The active binding is not changed.
+         */
+        put: operations["save_model_candidate_api_v1_model_settings__kind__candidate_put"];
+        post?: never;
+        /**
+         * Discard Model Candidate
+         * @description Discard the candidate binding of a kind.
+         */
+        delete: operations["discard_model_candidate_api_v1_model_settings__kind__candidate_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/model-settings/{kind}/candidate/validate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Validate Model Candidate
+         * @description Check the candidate with one real request and make it active when it passes.
+         */
+        post: operations["validate_model_candidate_api_v1_model_settings__kind__candidate_validate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/model-settings/{kind}/discover-models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Discover Models
+         * @description List the models an endpoint offers, for choosing a candidate's model.
+         */
+        post: operations["discover_models_api_v1_model_settings__kind__discover_models_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3056,6 +3136,8 @@ export interface components {
                 [key: string]: components["schemas"]["ComponentHealth"];
             };
             index_consistency?: components["schemas"]["ComponentHealth"] | null;
+            /** @description Whether a generation model and an embedding model are configured, and the state of each. No generation model is ready unless generation.state is 'ready'. */
+            models: components["schemas"]["ModelHealthResponse"];
             /** Status */
             status: string;
             vector_store: components["schemas"]["ComponentHealth"];
@@ -3119,96 +3201,6 @@ export interface components {
             confirm_principal_change: boolean;
             /** Cookie Header */
             cookie_header: string;
-        };
-        /** LlmConfigProbeRequest */
-        LlmConfigProbeRequest: {
-            /** Api Key */
-            api_key?: string | null;
-            /** Base Url */
-            base_url: string;
-            /**
-             * Kind
-             * @enum {string}
-             */
-            kind: "enrichment" | "embedding";
-        };
-        /** LlmConfigProbeResponse */
-        LlmConfigProbeResponse: {
-            /** Latency Ms */
-            latency_ms?: number | null;
-            /** Message */
-            message: string;
-            /** Models */
-            models?: components["schemas"]["LlmModelOption"][];
-            /**
-             * Models Supported
-             * @default false
-             */
-            models_supported: boolean;
-            /** Ok */
-            ok: boolean;
-            /** Stage */
-            stage?: ("validation" | "connect" | "tls" | "timeout" | "auth" | "http") | null;
-            /** Status */
-            status?: number | null;
-            /** Suggested Base Url */
-            suggested_base_url?: string | null;
-        };
-        /** LlmConfigRequest */
-        LlmConfigRequest: {
-            /** Embedding Api Key */
-            embedding_api_key?: string | null;
-            /** Embedding Base Url */
-            embedding_base_url?: string | null;
-            /** Embedding Model */
-            embedding_model?: string | null;
-            /** Enrichment Api Key */
-            enrichment_api_key?: string | null;
-            /** Enrichment Base Url */
-            enrichment_base_url?: string | null;
-            /** Enrichment Model */
-            enrichment_model?: string | null;
-        };
-        /** LlmConfigResponse */
-        LlmConfigResponse: {
-            /** Embedding Api Key */
-            embedding_api_key?: string | null;
-            /** Embedding Api Key Last4 */
-            embedding_api_key_last4?: string | null;
-            /**
-             * Embedding Api Key Set
-             * @default false
-             */
-            embedding_api_key_set: boolean;
-            /** Embedding Base Url */
-            embedding_base_url?: string | null;
-            /** Embedding Model */
-            embedding_model?: string | null;
-            /** Enrichment Api Key */
-            enrichment_api_key?: string | null;
-            /** Enrichment Api Key Last4 */
-            enrichment_api_key_last4?: string | null;
-            /**
-             * Enrichment Api Key Set
-             * @default false
-             */
-            enrichment_api_key_set: boolean;
-            /** Enrichment Base Url */
-            enrichment_base_url?: string | null;
-            /** Enrichment Model */
-            enrichment_model?: string | null;
-            /**
-             * Writable
-             * @description False when the deployment environment manages LLM settings (MEMFORGE_LLM_CONFIG_WRITABLE), so updates are refused.
-             */
-            writable: boolean;
-        };
-        /** LlmModelOption */
-        LlmModelOption: {
-            /** Id */
-            id: string;
-            /** Label */
-            label?: string | null;
         };
         /** LocalAgentDaemonStatusResponse */
         LocalAgentDaemonStatusResponse: {
@@ -4415,6 +4407,285 @@ export interface components {
             source_id: number;
             /** Target Id */
             target_id: number;
+        };
+        /** ModelApiKeyStatus */
+        ModelApiKeyStatus: {
+            /**
+             * Is Set
+             * @description Whether a key is available to the binding.
+             */
+            is_set: boolean;
+            /**
+             * Last4
+             * @description The last four characters of the key; null for a key too short to show them.
+             */
+            last4?: string | null;
+            /**
+             * Source
+             * @description 'saved' for a key entered in Settings and stored encrypted, 'environment' for a key read from a MEMFORGE_* variable, null when the binding uses no key.
+             */
+            source?: ("saved" | "environment") | null;
+        };
+        /** ModelBindingResponse */
+        ModelBindingResponse: {
+            api_key: components["schemas"]["ModelApiKeyStatus"];
+            /**
+             * Auth Strategy
+             * @enum {string}
+             */
+            auth_strategy: "api_key" | "none" | "environment";
+            /**
+             * Config Source
+             * @enum {string}
+             */
+            config_source: "settings" | "environment" | "deployment";
+            /** Endpoint */
+            endpoint: string | null;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "generation" | "embedding";
+            /** Model Id */
+            model_id: string;
+            /** Options */
+            options: {
+                [key: string]: unknown;
+            };
+            /**
+             * Origin
+             * @description The normalized origin a saved API key is bound to.
+             */
+            origin: string;
+            /** Parameters */
+            parameters: {
+                [key: string]: unknown;
+            };
+            /** Provider */
+            provider: string;
+            /**
+             * Route
+             * @description The LiteLLM route the model id compiles to.
+             */
+            route: string;
+            /**
+             * Saved At
+             * @description When the stored binding was last saved; null for one read from the environment.
+             */
+            saved_at: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "not_validated" | "ready" | "needs_revalidation";
+            validation: components["schemas"]["ModelValidationResult"] | null;
+        };
+        /** ModelCandidateRequest */
+        ModelCandidateRequest: {
+            /**
+             * Api Key
+             * @description A new API key. Leave it out to keep the key saved for this endpoint.
+             */
+            api_key?: string | null;
+            /** Auth Strategy */
+            auth_strategy?: ("api_key" | "none" | "environment") | null;
+            /** Endpoint */
+            endpoint?: string | null;
+            /**
+             * Model Id
+             * @description The model, as the provider descriptor reads it.
+             * @default
+             */
+            model_id: string;
+            /** Options */
+            options?: {
+                [key: string]: unknown;
+            };
+            /** Parameters */
+            parameters?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Provider
+             * @description The id of a provider descriptor.
+             * @default
+             */
+            provider: string;
+        };
+        /** ModelDiscoveryRequest */
+        ModelDiscoveryRequest: {
+            /**
+             * Api Key
+             * @description Leave it out to use the key saved for this endpoint's origin.
+             */
+            api_key?: string | null;
+            /** Auth Strategy */
+            auth_strategy?: ("api_key" | "none" | "environment") | null;
+            /** Endpoint */
+            endpoint?: string | null;
+            /**
+             * Provider
+             * @description The id of a provider descriptor.
+             * @default
+             */
+            provider: string;
+        };
+        /** ModelDiscoveryResponse */
+        ModelDiscoveryResponse: {
+            /** Error Code */
+            error_code?: string | null;
+            /** Latency Ms */
+            latency_ms?: number | null;
+            /** Message */
+            message: string;
+            /** Models */
+            models?: components["schemas"]["ModelOption"][];
+            /**
+             * Models Supported
+             * @default false
+             */
+            models_supported: boolean;
+            /** Ok */
+            ok: boolean;
+            /** Stage */
+            stage?: ("validation" | "connect" | "tls" | "timeout" | "auth" | "http") | null;
+            /** Status */
+            status?: number | null;
+            /** Suggested Endpoint */
+            suggested_endpoint?: string | null;
+        };
+        /** ModelHealthResponse */
+        ModelHealthResponse: {
+            embedding: components["schemas"]["ModelKindHealthResponse"];
+            generation: components["schemas"]["ModelKindHealthResponse"];
+        };
+        /** ModelKindHealthResponse */
+        ModelKindHealthResponse: {
+            /**
+             * Configured
+             * @description Whether a binding of this kind is in use.
+             */
+            configured: boolean;
+            /**
+             * State
+             * @description The state of that binding; null when none is configured.
+             */
+            state?: ("not_validated" | "ready" | "needs_revalidation") | null;
+        };
+        /** ModelKindSettingsResponse */
+        ModelKindSettingsResponse: {
+            /** @description The binding the runtime uses. */
+            active: components["schemas"]["ModelBindingResponse"] | null;
+            /** @description The binding Settings is editing, not yet in use. */
+            candidate: components["schemas"]["ModelBindingResponse"] | null;
+        };
+        /** ModelOption */
+        ModelOption: {
+            /** Id */
+            id: string;
+            /** Label */
+            label?: string | null;
+        };
+        /** ModelProviderListResponse */
+        ModelProviderListResponse: {
+            /** Providers */
+            providers: components["schemas"]["ModelProviderResponse"][];
+        };
+        /** ModelProviderResponse */
+        ModelProviderResponse: {
+            /**
+             * Auth Strategies
+             * @description The accepted auth strategies; the first is the one to propose.
+             */
+            auth_strategies: ("api_key" | "none" | "environment")[];
+            /**
+             * Default Endpoint
+             * @description The base URL used when none is entered; null when the provider has none.
+             */
+            default_endpoint: string | null;
+            /**
+             * Endpoint Required
+             * @description Whether a base URL has to be entered.
+             */
+            endpoint_required: boolean;
+            /** Id */
+            id: string;
+            /**
+             * Kinds
+             * @description The kinds of model the provider serves.
+             */
+            kinds: ("generation" | "embedding")[];
+            /** Label */
+            label: string;
+            /**
+             * Lists Models
+             * @description Whether the endpoint can list its models.
+             */
+            lists_models: boolean;
+            /**
+             * Model Is Route
+             * @description Whether the model is entered as a full LiteLLM provider/model route.
+             */
+            model_is_route: boolean;
+            /**
+             * Options
+             * @description The names of the non-secret options the provider accepts.
+             */
+            options: string[];
+            /**
+             * Parameters
+             * @description The request parameters a binding of each served kind may set.
+             */
+            parameters: {
+                [key: string]: string[];
+            };
+        };
+        /** ModelSettingsResponse */
+        ModelSettingsResponse: {
+            embedding: components["schemas"]["ModelKindSettingsResponse"];
+            generation: components["schemas"]["ModelKindSettingsResponse"];
+            /** Litellm Version */
+            litellm_version: string;
+            /**
+             * Writable
+             * @description False when the deployment environment manages model settings (MEMFORGE_LLM_CONFIG_WRITABLE), so every write is refused.
+             */
+            writable: boolean;
+        };
+        /** ModelValidationResponse */
+        ModelValidationResponse: {
+            /** Error Code */
+            error_code?: string | null;
+            /** Passed */
+            passed: boolean;
+            /**
+             * Promoted
+             * @description Whether the checked candidate became the active binding.
+             */
+            promoted: boolean;
+            settings: components["schemas"]["ModelKindSettingsResponse"];
+            validation: components["schemas"]["ModelValidationResult"];
+        };
+        /** ModelValidationResult */
+        ModelValidationResult: {
+            /** Checked At */
+            checked_at: string;
+            /**
+             * Current
+             * @description Whether the check ran against the binding as it is now.
+             */
+            current: boolean;
+            /** Error Code */
+            error_code?: string | null;
+            /**
+             * Facts
+             * @description What the check observed: latency_ms; for generation structured_output_mode ('native_schema' or 'json_text'), schema_fallback, token_limits_known and provider_model; for embedding dimension and provider_model. provider_model is present only when the provider reported one.
+             */
+            facts?: {
+                [key: string]: unknown;
+            };
+            /** Passed */
+            passed: boolean;
         };
         /** ProjectCreateRequest */
         ProjectCreateRequest: {
@@ -6636,92 +6907,6 @@ export interface operations {
             };
         };
     };
-    get_llm_config_api_v1_llm_config_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LlmConfigResponse"];
-                };
-            };
-        };
-    };
-    update_llm_config_api_v1_llm_config_put: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LlmConfigRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LlmConfigResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    probe_llm_config_api_v1_llm_config_probe_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LlmConfigProbeRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LlmConfigProbeResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     list_memories_api_v1_memories_get: {
         parameters: {
             query?: {
@@ -7603,6 +7788,209 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MemoryReviewDetailResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_model_settings_api_v1_model_settings_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelSettingsResponse"];
+                };
+            };
+        };
+    };
+    list_model_providers_api_v1_model_settings_providers_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelProviderListResponse"];
+                };
+            };
+        };
+    };
+    validate_active_model_api_v1_model_settings__kind__active_validate_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: "generation" | "embedding";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelValidationResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    save_model_candidate_api_v1_model_settings__kind__candidate_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: "generation" | "embedding";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelCandidateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelKindSettingsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    discard_model_candidate_api_v1_model_settings__kind__candidate_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: "generation" | "embedding";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelKindSettingsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    validate_model_candidate_api_v1_model_settings__kind__candidate_validate_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: "generation" | "embedding";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelValidationResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    discover_models_api_v1_model_settings__kind__discover_models_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: "generation" | "embedding";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelDiscoveryRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelDiscoveryResponse"];
                 };
             };
             /** @description Validation Error */

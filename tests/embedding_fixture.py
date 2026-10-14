@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from memforge.llm.embedding import EmbeddingRuntime, EmbeddingSettings
+from memforge.llm.providers import ResolvedInvocation
 
 EmbeddingTransport = Callable[..., Awaitable[dict[str, Any]]]
 
@@ -34,9 +35,20 @@ def fixed_vector_transport(vector: Sequence[float]) -> EmbeddingTransport:
     return texts_transport(lambda texts: [vector for _ in texts])
 
 
+def embedding_invocation(
+    route: str = "openai/test-embedding",
+    *,
+    api_base: str | None = "http://embed.test",
+    api_key: str | None = "key",
+    **extra_params: Any,
+) -> ResolvedInvocation:
+    """The invocation of an embedding model at a test endpoint."""
+    return ResolvedInvocation(route=route, api_base=api_base, api_key=api_key, extra_params=extra_params)
+
+
 def unconfigured_embedding() -> EmbeddingRuntime:
     """A runtime with no model: every embed call fails, as on a fresh install."""
-    return EmbeddingRuntime(EmbeddingSettings(model=""))
+    return EmbeddingRuntime(EmbeddingSettings(invocation=None))
 
 
 def embedding_from_texts(
@@ -44,7 +56,7 @@ def embedding_from_texts(
 ) -> EmbeddingRuntime:
     """A configured runtime whose provider answers with ``embed(texts)``."""
     return EmbeddingRuntime(
-        EmbeddingSettings(model="test-embedding", base_url="http://embed.test", api_key="key"),
+        EmbeddingSettings(invocation=embedding_invocation()),
         transport=texts_transport(embed),
     )
 

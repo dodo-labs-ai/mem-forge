@@ -2,14 +2,158 @@
 
 ## Unreleased
 
+- Model settings are two bindings, one for the generation model and one for
+  the embedding model, and replace the single LLM configuration. A binding
+  names a provider descriptor (`openai`, `anthropic`, `openrouter`, `ollama`,
+  `openai_compatible`, or `litellm` for a full `provider/model` route), an
+  endpoint, an auth strategy (`api_key`, `none`, or `environment` for
+  credentials LiteLLM reads from the process environment), a model id and the
+  LiteLLM route it compiles to. Each kind has an active binding, which the
+  runtime uses, and a candidate, which Settings edits. Saving writes the
+  candidate; validating it makes one real request through the runtime's own
+  client (generation must return a small strict nested object under the
+  runtime's structured-output policy; embedding must return one valid vector
+  per input for two inputs, twice, with one stable dimension) and, when that
+  passes, makes the candidate the active binding. A binding is
+  `not_validated`, `ready` or `needs_revalidation`; only the latest check is
+  kept, on the binding, with its time, observed facts (latency, dimension,
+  the model id the provider reported, whether the schema fell back to JSON
+  text, whether the model's token limits are known) and an error code, never
+  a prompt or a response. A ready binding needs revalidation when its
+  endpoint, provider, route, auth strategy, model, requested dimensions or
+  the installed LiteLLM version changes, or when a later check of it fails;
+  the active binding stays in use whatever its state. A starting server
+  checks every active binding that is not ready in the background, without
+  delaying its start. One check of a binding runs at a time: a request for a
+  check made while one of the same binding is running waits for it and takes
+  its outcome, so simultaneous requests make one model call. When a candidate
+  becomes active, the search engine and the embedded sync worker
+  (`SourceSyncWorker.models_changed()`) build their model clients again, so
+  the replaced model, endpoint and key are no longer used; a Source sync that
+  is running finishes with the runtime it started with. The
+  `/api/v1/llm-config` routes are removed;
+  `/api/v1/model-settings` replaces them: `GET /providers`, `GET` (both
+  kinds, never a key), `PUT` and `DELETE /{kind}/candidate`,
+  `POST /{kind}/candidate/validate`, `POST /{kind}/active/validate` and
+  `POST /{kind}/discover-models`, with machine-readable error codes in
+  `detail.error`. A request that does not fit a route's schema is answered
+  422 with the field and the problem of each error and without the value that
+  was sent, so a submitted key is never repeated; `provider` and `model_id`
+  may be left out of the body and are then refused as `unknown_provider` and
+  `model_required`. An endpoint that carries a user name or a password is
+  refused as `endpoint_invalid`, on saving and on model discovery. A
+  candidate with the `environment` strategy is accepted only for the default
+  endpoint of its provider, and for no endpoint with `litellm`
+  (`environment_endpoint_not_allowed` otherwise), so saving a base URL cannot
+  send a credential of the process environment to another server; the
+  `MEMFORGE_*` variables may still pair a route with a base URL. Model
+  discovery does not follow redirects, and a redirect to another origin fails
+  the listing. A listing request carries an API key or nothing, never a
+  credential of the process environment: an endpoint that refuses it under
+  the `environment` strategy is reported as `listing_needs_api_key`, with a
+  message that says to enter the model, and as `api_key_required` otherwise. An embedding binding's `dimensions` is sent to every model of
+  an `openai/` route, whatever the model is called; on a route LiteLLM does
+  not send it for, the check fails with `parameter_not_supported_by_route`
+  before any request. `GET /api/v1/health` gains `models.generation` and
+  `models.embedding`, each `{configured, state}`, so a client can tell that no
+  generation model is ready. An API key entered in Settings is stored
+  encrypted with the source-secret key in the new `model_secrets` table and
+  the binding holds a reference to it; reads return where the key is kept and
+  its last four characters. A saved key is bound to the origin (scheme, host,
+  port) it was saved for: saving a candidate for another origin, or listing
+  the models of another origin, needs the key again. The `none` strategy
+  sends the placeholder key `no-api-key` with every model request and never a
+  key from the environment, and a keyless binding counts as configured, so
+  `memforge maintenance repair-indexes` embeds through a keyless endpoint.
+  That command no longer fails with `AttributeError` after printing its
+  table when issues remain. LiteLLM's own lookup of an Ollama model's limits
+  still goes to the server `OLLAMA_API_BASE` names (`http://localhost:11434`
+  when unset) with `OLLAMA_API_KEY`; it is no longer sent to the endpoint of
+  an Ollama request. SQLite migration 113 adds `model_bindings` and
+  `model_secrets`. An existing `llm_config` row becomes active bindings in
+  state `not_validated` when a process opens the database, with the
+  configuration that process runs with: a plain-text key is encrypted, an
+  empty column takes the value of that configuration (a file given with
+  `--config` and an `AppConfig` a host built included), and a stored model
+  with no key anywhere refers to its `MEMFORGE_*_API_KEY` variable and is
+  used once that is set. The table is then dropped, overwriting the pages
+  that held the keys, and the write-ahead log is emptied as soon as no other
+  connection is reading the database. Stored settings that no binding accepts
+  are dropped with a warning in the log; a stored key that cannot be
+  encrypted stops the process with the table left as it is. `memforge api`
+  and every `memforge` command do this; a host that opens a `Database`
+  itself calls `await db.translate_llm_config(config.llm)` after `connect()`,
+  and reading a model binding before that raises. `MEMFORGE_DECISION_MODEL` is a model id
+  of the generation model's provider or the full route of one
+  (`anthropic/claude-haiku-4` beside a bare Anthropic generation model). In a
+  writable installation a stored binding wins and the
+  `MEMFORGE_ENRICHMENT_*` and `MEMFORGE_EMBEDDING_*` variables describe a kind
+  with nothing stored, read as before: a bare generation model is an
+  Anthropic model, `provider/model` is a route, and a bare embedding model
+  is a model id of the OpenAI-compatible endpoint at its base URL (the
+  `openai` descriptor when that is `api.openai.com`). A bare Anthropic model
+  with no key and an OpenAI embedding model with no key are not configured.
+  The runtime names the generation model by its route, so a bare
+  `MEMFORGE_ENRICHMENT_MODEL=claude-x` is now `anthropic/claude-x` in work
+  identities and recorded model names, as it would be after a change of
+  model. `memforge config show` prints the model each kind uses, its source
+  and its state. In Python,
+  `memforge.runtime.resolve_models(db, config)` returns `ResolvedModels`
+  (`generation` and `embedding` as `ResolvedInvocation`, or `None`) and
+  replaces `get_effective_llm_config` and `EffectiveLlmConfig`;
+  `RuntimeProvider.build_structured_llm_client` takes that `ResolvedModels`;
+  `build_embedding_runtime` takes a `ResolvedInvocation | None`;
+  `EmbeddingSettings` takes `invocation=` in place of `model`, `base_url` and
+  `api_key`; `StructuredLlmConfig.for_invocation(...)` builds a client
+  configuration from an invocation; `Database.get_llm_config` and
+  `set_llm_config`, `is_litellm_provider_model` and `litellm_embedding_route`
+  are removed. Cloud: with `MEMFORGE_LLM_CONFIG_WRITABLE=false` every
+  resolution compiles the bindings in memory from the environment with
+  `config_source: "deployment"` and neither reads nor writes the workspace
+  store, so the HANA store needs no new table or method and its
+  `get_llm_config` and `set_llm_config` are no longer called; a `sap/...`
+  model resolves to the `litellm` descriptor with the `environment` strategy
+  (or `api_key` when `MEMFORGE_*_API_KEY` is set). Change
+  the runtime provider's `build_structured_llm_client(llm, ...)` to take
+  `ResolvedModels` (`models.generation.route`, `.api_base`, `.api_key`,
+  `models.decision_route`; return `None` when `models.generation` is `None`),
+  build embedding runtimes with `build_embedding_runtime(models.embedding,
+  config)` or `EmbeddingSettings(invocation=...)`, replace
+  `get_effective_llm_config` with `resolve_models`, and point any client of
+  `/api/v1/llm-config` at `/api/v1/model-settings`. Each API process checks
+  its environment bindings once at start with one generation request and four
+  embedding inputs, keeps the outcome in memory, and reports it in
+  `GET /api/v1/health`; confirm that this start-up request is acceptable on
+  AI Core. No HANA schema change.
+- The admin UI V2 Settings page has one card for the generation model and one
+  for the embedding model. Each shows the model in use with its state (Ready,
+  Not validated, Needs revalidation), what its latest validation found and a
+  **Validate again** action, and below it a form: a provider choice, then the
+  fields that provider needs (base URL, the way of authenticating, API key,
+  model with **Load models** where the provider lists them, organization for
+  OpenAI, output dimensions for an embedding model). **Save and validate**
+  saves the edit and validates it in one step; an edit that fails stays in the
+  form with the reason, and the page names the model that is still in use.
+  Moving the base URL to another origin asks for the API key again before
+  anything is sent. The form sends the base URL it shows: for a model that
+  pairs a base URL with credentials from the server environment, as the
+  `MEMFORGE_*` variables can, it says so and saves nothing until the user
+  removes the base URL or chooses another way of authenticating. For a model
+  whose key the server does not have, the key field names the unset
+  `MEMFORGE_*_API_KEY` variable and asks for a key. With `MEMFORGE_LLM_CONFIG_WRITABLE=false` the page shows
+  the models without a form. Until a generation model is ready, every other
+  product page shows a notice with a link to Settings; an extension that
+  redirects Settings (`reservedRouteRedirects`) gets the link to its own page,
+  or no link for a user its `visibleWhen` hides the page from. The V1 admin
+  UI's Settings page shows the two models in use (provider, endpoint, model,
+  state) and links to the V2 page for changes.
 - Embedding goes through the LiteLLM SDK only, behind an Embedding Runtime
   (`memforge.llm.embedding.EmbeddingRuntime`, with `embed_query` and
   `embed_documents`). An embedding model name whose first segment is a
   provider LiteLLM knows (`ollama/nomic-embed-text`, `sap/...`) is used as
   that route. Any other name, including one with a slash such as
   `BAAI/bge-m3`, is a model id sent on the `openai/<model>` route to the
-  configured base URL, and without a base URL the call fails before any
-  request instead of reaching an endpoint named by the environment. The
+  configured base URL, and never to an endpoint named by the environment. The
   direct HTTP embedding call, `embed_texts` and `EmbeddingCache` are removed.
   The runtime retries timeouts, connection failures, 408, 409, 429 and 5xx
   (three retries by default, pausing 2, 4 and 8 seconds, or longer when the
@@ -25,7 +169,7 @@
   `MemoryStore`, `SearchEngine`, `MemoryEngine`, `EntityResolver` and
   `MemoryIndexRepairer` take `embedding=` (an `EmbeddingRuntime`) where they
   took `embed_cfg=`, and `memforge.runtime.build_embedding_runtime` builds
-  one from the effective settings. Importing a model client applies one
+  one. Importing a model client applies one
   transport policy to generation and embedding: no HTTP client LiteLLM uses
   follows a redirect (`litellm.aclient_session` is an `httpx.AsyncClient`
   that refuses them, with one connection pool per event loop, and the clients
@@ -36,14 +180,8 @@
   request; and LiteLLM's help notice is no longer printed to standard output
   on a failed request. A provider answer that LiteLLM reports as a connection
   error is retried or not by the status the provider gave, so a 400, 401 or
-  404 on the `ollama/` or `voyage/` routes is one request. A model id with no
-  API key sends the placeholder key `no-api-key` instead of a key from the
-  environment. `POST /api/v1/llm-config/probe` does not follow redirects
-  either: a redirect to another origin fails the probe, and a request
-  without `api_key` uses the saved key only when its base URL has the origin
-  (scheme, host, port) of the saved one; otherwise it asks for the key
-  again. The response shape is unchanged. `litellm` is declared as
-  `>=1.86,<1.88`. Cloud: pass `embedding=EmbeddingRuntime(...)` in place of
+  404 on the `ollama/` or `voyage/` routes is one request. `litellm` is
+  declared as `>=1.86,<1.88`. Cloud: pass `embedding=EmbeddingRuntime(...)` in place of
   `embed_cfg=` to those five constructors (`SearchEngine` needs it even with
   `embedding_provider=`, and no longer reads
   `RetrievalConfig.embedding_cache_size`: pass `cache_size` in

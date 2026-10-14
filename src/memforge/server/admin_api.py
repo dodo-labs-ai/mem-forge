@@ -1,7 +1,7 @@
 """Admin REST API for MemForge.
 
 FastAPI application providing management endpoints for memories, entities,
-sources/genes, schedule, LLM configuration, and system health/stats.
+sources/genes, schedule, model settings, and system health/stats.
 """
 
 from __future__ import annotations
@@ -23,9 +23,8 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
-from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+from urllib.parse import quote
 
-import httpx
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.routing import APIRoute
 from fastapi.middleware.cors import CORSMiddleware
@@ -129,7 +128,7 @@ from memforge.memory.review_decision import (
     lifecycle_review_decision_fingerprint,
     memory_review_decision_fingerprint,
 )
-from memforge.llm.providers import endpoint_origin
+from memforge.model_settings import ModelSettings
 from memforge.memory.store import MemoryStore
 from memforge.models import (
     ConfigField,
@@ -188,6 +187,11 @@ from memforge.runtime import (
 from memforge.pipeline.source_projection_adapters import DEFAULT_SOURCE_PROJECTION_ADAPTER
 from memforge.pipeline.stored_document import reprocess_preview
 from memforge.scheduler import SyncScheduler
+from memforge.server.model_settings_api import (
+    ModelHealthResponse,
+    build_model_settings_router,
+    model_health_response,
+)
 from memforge.source_secrets import (
     decrypt_source_config_for_runtime,
     decrypt_secret,
@@ -255,6 +259,9 @@ from memforge.storage.admin_source import (
 from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
+
+# How long to wait before trying again to empty a write-ahead log a reader holds.
+_KEY_ERASURE_RETRY_S = 30.0
 
 
 async def _run_source_access_background(
@@ -799,6 +806,12 @@ class HealthResponse(BaseModel):
     index_consistency: ComponentHealth | None = None
     audit_failures: ComponentHealth | None = None
     genes: dict[str, ComponentHealth] = {}
+    models: ModelHealthResponse = Field(
+        description=(
+            "Whether a generation model and an embedding model are configured, and the "
+            "state of each. No generation model is ready unless generation.state is 'ready'."
+        ),
+    )
 
 
 def _runtime_component_to_response(component: RuntimeHealthComponent) -> ComponentHealth:
@@ -2284,59 +2297,6 @@ class AgentHookContextRequest(BaseModel):
     include_recent_changes: bool = True
 
 
-# -- LLM Config --
-
-
-class LlmConfigResponse(BaseModel):
-    writable: bool = Field(
-        description=(
-            "False when the deployment environment manages LLM settings "
-            "(MEMFORGE_LLM_CONFIG_WRITABLE), so updates are refused."
-        ),
-    )
-    enrichment_model: str | None = None
-    enrichment_base_url: str | None = None
-    enrichment_api_key: str | None = None
-    enrichment_api_key_set: bool = False
-    enrichment_api_key_last4: str | None = None
-    embedding_model: str | None = None
-    embedding_base_url: str | None = None
-    embedding_api_key: str | None = None
-    embedding_api_key_set: bool = False
-    embedding_api_key_last4: str | None = None
-
-
-class LlmConfigRequest(BaseModel):
-    enrichment_model: str | None = None
-    enrichment_base_url: str | None = None
-    enrichment_api_key: str | None = None
-    embedding_model: str | None = None
-    embedding_base_url: str | None = None
-    embedding_api_key: str | None = None
-
-
-class LlmModelOption(BaseModel):
-    id: str
-    label: str | None = None
-
-
-class LlmConfigProbeRequest(BaseModel):
-    kind: Literal["enrichment", "embedding"]
-    base_url: str
-    api_key: str | None = None
-
-
-class LlmConfigProbeResponse(BaseModel):
-    ok: bool
-    models_supported: bool = False
-    models: list[LlmModelOption] = Field(default_factory=list)
-    stage: Literal["validation", "connect", "tls", "timeout", "auth", "http"] | None = None
-    status: int | None = None
-    message: str
-    latency_ms: int | None = None
-    suggested_base_url: str | None = None
-
-
 # -- Memory reviews --
 
 
@@ -2694,296 +2654,6 @@ class MemoryReviewDecisionManifestResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _mask_api_key(key: str | None) -> str | None:
-    """Mask an API key, showing only the last 4 characters."""
-    if not key:
-        return None
-    if len(key) <= 4:
-        return "****"
-    return "*" * (len(key) - 4) + key[-4:]
-
-
-def _api_key_last4(key: str | None) -> str | None:
-    if not key:
-        return None
-    return key[-4:]
-
-
-def _llm_config_response(cfg: dict[str, Any], *, writable: bool) -> LlmConfigResponse:
-    enrichment_key = cfg.get("enrichment_api_key")
-    embedding_key = cfg.get("embedding_api_key")
-    return LlmConfigResponse(
-        writable=writable,
-        enrichment_model=cfg.get("enrichment_model"),
-        enrichment_base_url=cfg.get("enrichment_base_url"),
-        enrichment_api_key=_mask_api_key(enrichment_key),
-        enrichment_api_key_set=bool(enrichment_key),
-        enrichment_api_key_last4=_api_key_last4(enrichment_key),
-        embedding_model=cfg.get("embedding_model"),
-        embedding_base_url=cfg.get("embedding_base_url"),
-        embedding_api_key=_mask_api_key(embedding_key),
-        embedding_api_key_set=bool(embedding_key),
-        embedding_api_key_last4=_api_key_last4(embedding_key),
-    )
-
-
-def _is_running_in_container() -> bool:
-    return Path("/.dockerenv").exists()
-
-
-def _suggest_host_base_url(base_url: str) -> str | None:
-    parsed = urlsplit(base_url)
-    if parsed.hostname not in {"localhost", "127.0.0.1"}:
-        return None
-    if not _is_running_in_container():
-        return None
-    netloc = "host.docker.internal"
-    if parsed.port:
-        netloc = f"{netloc}:{parsed.port}"
-    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
-
-
-def _model_list_urls(base_url: str) -> list[str]:
-    root = base_url.strip().rstrip("/")
-    urls = [f"{root}/models"]
-    parsed = urlsplit(root)
-    if not parsed.path.rstrip("/").endswith("/v1"):
-        urls.append(f"{root}/v1/models")
-    return list(dict.fromkeys(urls))
-
-
-def _model_probe_headers(api_key: str | None) -> dict[str, str]:
-    headers = {"Accept": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-        headers["x-api-key"] = api_key
-        headers["anthropic-version"] = "2023-06-01"
-    return headers
-
-
-def _extract_model_options(payload: Any) -> list[LlmModelOption]:
-    if isinstance(payload, dict):
-        raw_items = payload.get("data")
-        if raw_items is None:
-            raw_items = payload.get("models")
-    else:
-        raw_items = payload
-
-    if not isinstance(raw_items, list):
-        return []
-
-    seen: set[str] = set()
-    models: list[LlmModelOption] = []
-    for item in raw_items:
-        model_id: str | None = None
-        label: str | None = None
-        if isinstance(item, str):
-            model_id = item
-        elif isinstance(item, dict):
-            raw_id = item.get("id") or item.get("name") or item.get("model")
-            if raw_id is not None:
-                model_id = str(raw_id)
-            raw_label = item.get("display_name") or item.get("label") or item.get("name")
-            if raw_label is not None and str(raw_label) != model_id:
-                label = str(raw_label)
-        if not model_id or model_id in seen:
-            continue
-        seen.add(model_id)
-        models.append(LlmModelOption(id=model_id, label=label))
-    return models
-
-
-def _probe_error_response(
-    *,
-    base_url: str,
-    stage: Literal["validation", "connect", "tls", "timeout", "auth", "http"],
-    message: str,
-    status: int | None = None,
-    latency_ms: int | None = None,
-) -> LlmConfigProbeResponse:
-    return LlmConfigProbeResponse(
-        ok=False,
-        stage=stage,
-        status=status,
-        message=message,
-        latency_ms=latency_ms,
-        suggested_base_url=_suggest_host_base_url(base_url),
-    )
-
-
-def _origin_label(origin: tuple[str, str, int] | None) -> str:
-    if origin is None:
-        return "an address that is not HTTP(S)"
-    scheme, host, port = origin
-    if ":" in host:
-        host = f"[{host}]"
-    default_port = 443 if scheme == "https" else 80
-    return f"{scheme}://{host}" if port == default_port else f"{scheme}://{host}:{port}"
-
-
-def _saved_probe_api_key(
-    *,
-    requested_base_url: str,
-    saved_base_url: str | None,
-    saved_api_key: str | None,
-) -> tuple[str | None, bool]:
-    """Decide whether a probe that carries no key may use the saved one.
-
-    A saved key belongs to the origin it was saved for. Returns the key to
-    send and whether the operator must enter a key for the requested origin.
-    """
-    if not saved_api_key:
-        return None, False
-    requested_origin = endpoint_origin(requested_base_url)
-    if requested_origin is None:
-        return None, False
-    if requested_origin != endpoint_origin(saved_base_url):
-        return None, True
-    return saved_api_key, False
-
-
-async def _probe_llm_models(
-    *,
-    base_url: str,
-    api_key: str | None,
-) -> LlmConfigProbeResponse:
-    """List the models an endpoint offers, without ever leaving its origin.
-
-    The probe sends the API key, so it does not follow redirects: an answer
-    that points to another origin fails the probe, and one that points
-    elsewhere on the same origin only rules out the address that gave it.
-    """
-    value = base_url.strip()
-    parsed = urlsplit(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return _probe_error_response(
-            base_url=value,
-            stage="validation",
-            message="Enter a URL starting with http:// or https://.",
-        )
-
-    headers = _model_probe_headers(api_key)
-    unsupported: tuple[int, int] | None = None
-    redirected: tuple[int, int] | None = None
-    non_json_latency_ms: int | None = None
-
-    async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
-        for url in _model_list_urls(value):
-            started = time.perf_counter()
-            try:
-                resp = await client.get(url, headers=headers)
-            except httpx.TimeoutException:
-                return _probe_error_response(
-                    base_url=value,
-                    stage="timeout",
-                    message="No response before the timeout.",
-                )
-            except httpx.ConnectError as exc:
-                text = str(exc).lower()
-                stage: Literal["connect", "tls"] = "tls" if "ssl" in text or "tls" in text else "connect"
-                return _probe_error_response(
-                    base_url=value,
-                    stage=stage,
-                    message=f"Could not reach {parsed.hostname or 'the endpoint'}.",
-                )
-            except httpx.HTTPError:
-                return _probe_error_response(
-                    base_url=value,
-                    stage="connect",
-                    message=f"Could not reach {parsed.hostname or 'the endpoint'}.",
-                )
-
-            latency_ms = int((time.perf_counter() - started) * 1000)
-            if resp.has_redirect_location:
-                target_origin = endpoint_origin(urljoin(url, resp.headers["location"]))
-                if target_origin != endpoint_origin(url):
-                    return _probe_error_response(
-                        base_url=value,
-                        stage="http",
-                        status=resp.status_code,
-                        latency_ms=latency_ms,
-                        message=(
-                            f"Endpoint redirected to {_origin_label(target_origin)}, "
-                            "another origin, and the redirect is not followed. "
-                            "Enter the base URL of the endpoint that answers directly."
-                        ),
-                    )
-                redirected = (resp.status_code, latency_ms)
-                continue
-            if resp.status_code in {404, 405, 501}:
-                unsupported = (resp.status_code, latency_ms)
-                continue
-            if resp.status_code in {401, 403}:
-                return _probe_error_response(
-                    base_url=value,
-                    stage="auth",
-                    status=resp.status_code,
-                    latency_ms=latency_ms,
-                    message=(
-                        "Add an API key, then test again."
-                        if not api_key
-                        else f"Endpoint rejected the API key (HTTP {resp.status_code})."
-                    ),
-                )
-            if resp.status_code >= 400:
-                return _probe_error_response(
-                    base_url=value,
-                    stage="http",
-                    status=resp.status_code,
-                    latency_ms=latency_ms,
-                    message=f"Endpoint returned HTTP {resp.status_code}.",
-                )
-
-            try:
-                data = resp.json()
-            except ValueError:
-                non_json_latency_ms = latency_ms
-                continue
-
-            models = _extract_model_options(data)
-            return LlmConfigProbeResponse(
-                ok=True,
-                models_supported=True,
-                models=models,
-                message=(
-                    f"Connected. Found {len(models)} model{'s' if len(models) != 1 else ''}."
-                    if models
-                    else "Connected, but this endpoint returned no models."
-                ),
-                latency_ms=latency_ms,
-            )
-
-    if non_json_latency_ms is not None:
-        return LlmConfigProbeResponse(
-            ok=True,
-            models_supported=False,
-            message="Connected, but this endpoint did not return a model list.",
-            latency_ms=non_json_latency_ms,
-        )
-
-    if redirected is not None:
-        status, latency_ms = redirected
-        return _probe_error_response(
-            base_url=value,
-            stage="http",
-            status=status,
-            latency_ms=latency_ms,
-            message=(
-                "Endpoint answered with a redirect, which is not followed. "
-                "Enter the base URL of the endpoint that answers directly."
-            ),
-        )
-
-    status, latency_ms = unsupported or (404, None)
-    return LlmConfigProbeResponse(
-        ok=True,
-        models_supported=False,
-        status=status,
-        message="Connected, but this endpoint does not expose a model list.",
-        latency_ms=latency_ms,
-    )
 
 
 def _source_secret_fields(source_type: str) -> tuple[str, ...]:
@@ -4266,12 +3936,13 @@ async def _build_memory_store(
     runtime_provider: RuntimeProvider | None = None,
     audit_context: AuditContext | None = None,
 ) -> MemoryStore:
-    """Build a request-scoped memory store with effective embedding settings."""
+    """Build a request-scoped memory store that embeds with the active embedding model."""
 
+    from memforge.llm.bindings import resolve_active_invocation
     from memforge.memory.audit import MemoryAuditLogger
-    from memforge.runtime import build_embedding_runtime, get_effective_llm_config
+    from memforge.runtime import build_embedding_runtime
 
-    llm = await get_effective_llm_config(db, config)
+    embedding = await resolve_active_invocation(db, config, "embedding")
     provider = runtime_provider or DefaultRuntimeProvider()
     default_audit_context = audit_context or AuditContext(actor_type="admin")
     audit_logger = MemoryAuditLogger(db, default_context=default_audit_context)
@@ -4280,7 +3951,7 @@ async def _build_memory_store(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embedding=build_embedding_runtime(llm, config),
+        embedding=build_embedding_runtime(embedding, config),
         audit_logger=audit_logger,
     )
 
@@ -4380,9 +4051,8 @@ async def _build_review_service(
 ) -> ReviewService:
     """Build a request-scoped review service.
 
-    Embedding configuration comes from the same effective resolution that the
-    sync runtime uses, so admin overrides flow through to approve-time
-    re-embedding instead of going to a stale process default.
+    Its memory store embeds with the active embedding model, as the sync
+    runtime does, so approve-time re-embedding follows the model settings.
     """
     memory_store = await _build_memory_store(db, config, runtime_provider)
     return ReviewService(db=db, memory_store=memory_store)
@@ -4405,11 +4075,10 @@ async def _build_agent_session_window_client(
 ):
     """Build the request-scoped client through the active runtime adapter."""
 
-    from memforge.runtime import get_effective_llm_config
+    from memforge.runtime import resolve_models
 
-    llm = await get_effective_llm_config(db, config)
     return runtime_provider.build_structured_llm_client(
-        llm,
+        await resolve_models(db, config),
         max_concurrent=config.llm.enrichment_max_concurrent,
     )
 
@@ -4447,6 +4116,22 @@ def get_workspace_id(request: Request) -> str:
 def get_runtime_provider(request: Request) -> RuntimeProvider:
     """FastAPI dependency: retrieve the app-scoped runtime provider."""
     return request.app.state.runtime_provider
+
+
+def get_model_settings(request: Request) -> ModelSettings:
+    """FastAPI dependency: retrieve the app-scoped model settings."""
+    return request.app.state.model_settings
+
+
+async def _validate_models_after_startup(app: FastAPI) -> None:
+    """Check the active model bindings that have not passed a check as they stand."""
+    await app.state.model_settings.validate_unready_active_bindings(app.state.db)
+
+
+async def _erase_plaintext_model_keys(db: Database) -> None:
+    """Empty the write-ahead log of plain-text model keys once no reader holds it."""
+    while not await db.erase_plaintext_keys():
+        await asyncio.sleep(_KEY_ERASURE_RETRY_S)
 
 
 # ---------------------------------------------------------------------------
@@ -4580,9 +4265,18 @@ def create_admin_app(
                 document_store=document_store or LocalDocumentStore(config.storage.docs_path),
             )
             await owned_db.connect()
+            try:
+                # A database made before model bindings holds its model
+                # settings in one row; this configuration completes them.
+                await owned_db.translate_llm_config(config.llm)
+            except BaseException:
+                await owned_db.close()
+                raise
             app.state.db = owned_db
+            app.state.key_erasure_task = asyncio.create_task(_erase_plaintext_model_keys(owned_db))
         else:
             app.state.db = db
+            app.state.key_erasure_task = None
 
         app.state.config = config
         app.state.workspace_id = workspace_id
@@ -4600,6 +4294,9 @@ def create_admin_app(
             runtime_provider=runtime_provider,
             workspace_id=workspace_id,
         )
+        # The checks make model requests, so they run beside the server and
+        # never hold up its start.
+        app.state.model_validation_task = asyncio.create_task(_validate_models_after_startup(app))
         app.state.sync_scheduler = None
         if config.sync.scheduler_enabled:
             app.state.sync_scheduler = SyncScheduler(
@@ -4653,13 +4350,17 @@ def create_admin_app(
         try:
             yield
         finally:
-            worker_task = getattr(app.state, "sync_worker_task", None)
-            if worker_task is not None:
-                worker_task.cancel()
-                try:
-                    await worker_task
-                except asyncio.CancelledError:
-                    pass
+            for background_task in (
+                app.state.model_validation_task,
+                app.state.key_erasure_task,
+                getattr(app.state, "sync_worker_task", None),
+            ):
+                if background_task is not None:
+                    background_task.cancel()
+                    try:
+                        await background_task
+                    except asyncio.CancelledError:
+                        pass
             if app.state.sync_scheduler is not None:
                 await app.state.sync_scheduler.shutdown()
             await app.state.sync_service.shutdown()
@@ -4695,6 +4396,7 @@ def create_admin_app(
     app.state.workspace_id = workspace_id
     app.state.document_store = document_store or LocalDocumentStore(config.storage.docs_path)
     app.state.runtime_provider = runtime_provider
+    app.state.model_settings = ModelSettings(config, runtime_provider)
     app.state.principal_resolver = principal_resolver
     app.state.workspace_role_resolver = workspace_role_resolver
     app.state.maintenance_operator_resolver = maintenance_operator_resolver
@@ -4900,7 +4602,10 @@ def create_admin_app(
     agent_session_router = APIRouter(prefix="/api/v1/agent-sessions", tags=["agent-sessions"])
     hook_router = APIRouter(prefix="/api/v1/hooks", tags=["hooks"])
     recent_change_router = APIRouter(prefix="/api/v1/recent-changes", tags=["recent-changes"])
-    llm_router = APIRouter(prefix="/api/v1/llm-config", tags=["llm-config"])
+    model_settings_router = build_model_settings_router(
+        get_db=get_db,
+        get_model_settings=get_model_settings,
+    )
     projects_router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
     local_agent_router = APIRouter(
         prefix="/api/cloud/local-agent",
@@ -4966,6 +4671,7 @@ def create_admin_app(
             ),
             audit_failures=(_runtime_component_to_response(report.audit_failures) if report.audit_failures else None),
             genes={name: _runtime_component_to_response(component) for name, component in report.genes.items()},
+            models=await model_health_response(request.app.state.model_settings, db),
         )
 
     @health_router.get("/api/v1/stats", response_model=StatsResponse)
@@ -9070,100 +8776,6 @@ def create_admin_app(
         )
 
     # ===================================================================
-    # 5. LLM Config Endpoints
-    # ===================================================================
-
-    @llm_router.get("", response_model=LlmConfigResponse)
-    async def get_llm_config(
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-    ):
-        """Get LLM configuration. API keys are masked in the response."""
-        return _llm_config_response(
-            await db.get_llm_config(),
-            writable=config.server.llm_config_writable,
-        )
-
-    @llm_router.post("/probe", response_model=LlmConfigProbeResponse)
-    async def probe_llm_config(
-        req: LlmConfigProbeRequest,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-    ):
-        """Test an LLM endpoint and fetch model ids when the endpoint supports it."""
-        api_key = req.api_key
-        if api_key is None:
-            current = await db.get_llm_config()
-            api_key, key_required = _saved_probe_api_key(
-                requested_base_url=req.base_url,
-                saved_base_url=(
-                    current.get(f"{req.kind}_base_url")
-                    or getattr(config.llm, f"{req.kind}_base_url")
-                ),
-                saved_api_key=current.get(f"{req.kind}_api_key"),
-            )
-            if key_required:
-                return _probe_error_response(
-                    base_url=req.base_url.strip(),
-                    stage="auth",
-                    message=(
-                        "The saved API key belongs to another endpoint. "
-                        "Enter the API key for this endpoint, then test again."
-                    ),
-                )
-        return await _probe_llm_models(base_url=req.base_url, api_key=api_key or None)
-
-    @llm_router.put("", response_model=LlmConfigResponse)
-    async def update_llm_config(
-        req: LlmConfigRequest,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-    ):
-        """Update LLM configuration and return the stored result."""
-        if not config.server.llm_config_writable:
-            raise HTTPException(
-                status_code=405,
-                detail="LLM settings are managed by the deployment environment",
-            )
-
-        # Fetch current config to preserve masked keys
-        current = await db.get_llm_config()
-        fields_set = req.model_fields_set
-
-        def _resolve_value(field: str) -> str | None:
-            if field not in fields_set:
-                return current.get(field)
-            new_val = getattr(req, field)
-            if new_val is None:
-                return current.get(field)
-            return new_val.strip() or None
-
-        def _resolve_key(field: str) -> str | None:
-            if field not in fields_set:
-                return current.get(field)
-            new_val = getattr(req, field)
-            if new_val is None:
-                return current.get(field)
-            if new_val == "":
-                return None
-            if new_val.startswith("*"):
-                # Masked values represent an existing secret, not a replacement.
-                return current.get(field)
-            return new_val.strip() or None
-
-        await db.set_llm_config(
-            {
-                "enrichment_model": _resolve_value("enrichment_model"),
-                "enrichment_base_url": _resolve_value("enrichment_base_url"),
-                "enrichment_api_key": _resolve_key("enrichment_api_key"),
-                "embedding_model": _resolve_value("embedding_model"),
-                "embedding_base_url": _resolve_value("embedding_base_url"),
-                "embedding_api_key": _resolve_key("embedding_api_key"),
-            }
-        )
-        return _llm_config_response(await db.get_llm_config(), writable=True)
-
-    # ===================================================================
     # Projects
     # ===================================================================
 
@@ -10219,7 +9831,7 @@ def create_admin_app(
     app.include_router(agent_session_router)
     app.include_router(hook_router)
     app.include_router(recent_change_router)
-    app.include_router(llm_router)
+    app.include_router(model_settings_router)
     app.include_router(projects_router)
     app.include_router(local_agent_router)
 

@@ -20,8 +20,9 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.auth import browser_session
 from memforge.genes import GENE_REGISTRY, create_gene, source_type_supports_sync
+from memforge.llm.bindings import resolve_active_binding, resolve_active_invocation, usable_invocation
 from memforge.llm.embedding import EmbeddingRuntime, EmbeddingSettings
-from memforge.llm.providers import is_litellm_provider_model
+from memforge.llm.providers import ModelConfigError, ResolvedInvocation, provider_descriptor
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
 from memforge.local_agent.source_contract import (
     local_agent_collection_is_authoritative,
@@ -110,22 +111,30 @@ class RuntimeHealthReport:
     genes: dict[str, RuntimeHealthComponent] = field(default_factory=dict)
 
 
-@dataclass
-class EffectiveLlmConfig:
-    enrichment_model: str
-    enrichment_base_url: str
-    enrichment_api_key: str
-    request_timeout_s: float
-    embedding_model: str
-    embedding_base_url: str
-    embedding_api_key: str
+@dataclass(frozen=True)
+class ResolvedModels:
+    """The models one runtime calls, resolved for one database.
 
+    Each invocation is the active binding of its kind compiled with its
+    credential; ``None`` means no model of that kind can be called.
+    """
+
+    generation: ResolvedInvocation | None
+    embedding: ResolvedInvocation | None
+    request_timeout_s: float = 300.0
     max_input_tokens: int | None = None
     context_window_tokens: int | None = None
     max_output_tokens: int | None = None
     input_budget_fraction: float = 0.8
-    # Environment-only: no stored LLM configuration row names a decision model.
-    decision_model: str = ""
+    # The route of the model that answers registered Decision tasks. It is
+    # reached through the generation model's endpoint and credential; ``None``
+    # runs every task on the generation model.
+    decision_route: str | None = None
+
+    @property
+    def generation_route(self) -> str:
+        """The route of the generation model, or an empty string without one."""
+        return self.generation.route if self.generation is not None else ""
 
 
 @dataclass
@@ -198,7 +207,7 @@ class RuntimeProvider(Protocol):
 
     def build_structured_llm_client(
         self,
-        llm: EffectiveLlmConfig,
+        models: ResolvedModels,
         *,
         max_concurrent: int,
     ) -> LiteLlmStructuredClient | None: ...
@@ -261,24 +270,22 @@ class DefaultRuntimeProvider:
 
     def build_structured_llm_client(
         self,
-        llm: EffectiveLlmConfig,
+        models: ResolvedModels,
         *,
         max_concurrent: int,
     ) -> LiteLlmStructuredClient | None:
-        if not _has_structured_llm_credentials(llm):
+        if models.generation is None:
             return None
         return LiteLlmStructuredClient(
-            StructuredLlmConfig(
-                model=llm.enrichment_model,
-                decision_model=llm.decision_model or None,
-                base_url=llm.enrichment_base_url or None,
-                api_key=llm.enrichment_api_key or None,
-                timeout_s=llm.request_timeout_s,
+            StructuredLlmConfig.for_invocation(
+                models.generation,
+                decision_model=models.decision_route,
+                timeout_s=models.request_timeout_s,
                 max_concurrent=max_concurrent,
-                max_input_tokens=llm.max_input_tokens,
-                context_window_tokens=llm.context_window_tokens,
-                max_output_tokens=llm.max_output_tokens,
-                input_budget_fraction=llm.input_budget_fraction,
+                max_input_tokens=models.max_input_tokens,
+                context_window_tokens=models.context_window_tokens,
+                max_output_tokens=models.max_output_tokens,
+                input_budget_fraction=models.input_budget_fraction,
             )
         )
 
@@ -298,15 +305,15 @@ class DefaultRuntimeProvider:
         *,
         audit_logger: MemoryAuditLogger | None = None,
     ) -> Any:
-        llm = await get_effective_llm_config(db, config)
+        models = await resolve_models(db, config)
         structured_llm_client = self.build_structured_llm_client(
-            llm,
+            models,
             max_concurrent=config.llm.enrichment_max_concurrent,
         )
         return _build_default_search_engine(
             db=db,
             config=config,
-            llm=llm,
+            models=models,
             structured_llm_client=structured_llm_client,
             audit_logger=audit_logger,
         )
@@ -319,15 +326,15 @@ class DefaultRuntimeProvider:
         extraction_pool: ExtractionWorkPool | None = None,
         document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
     ) -> SyncRuntime:
-        llm = await get_effective_llm_config(db, config)
+        models = await resolve_models(db, config)
         structured_llm_client = self.build_structured_llm_client(
-            llm,
+            models,
             max_concurrent=config.llm.enrichment_max_concurrent,
         )
         return _build_default_sync_runtime(
             db=db,
             config=config,
-            llm=llm,
+            models=models,
             structured_llm_client=structured_llm_client,
             extraction_pool=extraction_pool,
             document_lifecycle_admission=document_lifecycle_admission,
@@ -373,28 +380,52 @@ class DefaultRuntimeProvider:
         )
 
 
-async def get_effective_llm_config(db: "Database", config: AppConfig) -> EffectiveLlmConfig:
-    db_llm = await db.get_llm_config()
+async def resolve_models(db: "Database", config: AppConfig) -> ResolvedModels:
+    """Resolve the generation and embedding models a runtime calls with ``db``.
 
-    def value(key: str, fallback: str) -> str:
-        if not db_llm:
-            return fallback
-        return db_llm.get(key) or fallback
-
-    return EffectiveLlmConfig(
-        enrichment_model=value("enrichment_model", config.llm.enrichment_model),
-        enrichment_base_url=value("enrichment_base_url", config.llm.enrichment_base_url),
-        enrichment_api_key=value("enrichment_api_key", config.llm.enrichment_api_key),
+    Each is the active binding of its kind for this database, compiled with its
+    credential. The request limits and the decision model come from ``config``.
+    """
+    generation_binding = await resolve_active_binding(db, config, "generation")
+    generation = await usable_invocation(db, config, generation_binding)
+    decision_route: str | None = None
+    if generation_binding is not None and generation is not None:
+        decision_route = _decision_route(generation_binding.provider, config.llm.decision_model)
+    return ResolvedModels(
+        generation=generation,
+        embedding=await resolve_active_invocation(db, config, "embedding"),
         request_timeout_s=config.llm.request_timeout_s,
         max_input_tokens=config.llm.max_input_tokens,
         context_window_tokens=config.llm.context_window_tokens,
         max_output_tokens=config.llm.max_output_tokens,
         input_budget_fraction=config.llm.input_budget_fraction,
-        decision_model=config.llm.decision_model,
-        embedding_model=value("embedding_model", config.llm.embedding_model),
-        embedding_base_url=value("embedding_base_url", config.llm.embedding_base_url),
-        embedding_api_key=value("embedding_api_key", config.llm.embedding_api_key),
+        decision_route=decision_route,
     )
+
+
+def _decision_route(provider: str, decision_model: str) -> str | None:
+    """Compile the decision model as a model of the generation model's provider.
+
+    The setting is a model id of that provider, or the full route of one: a
+    name that starts with the provider's own route prefix is taken as the route
+    it spells.
+    """
+    name = decision_model.strip()
+    if not name:
+        return None
+    try:
+        descriptor = provider_descriptor(provider)
+        prefix = descriptor.route_prefixes.get("generation")
+        if prefix and len(name) > len(prefix) + 1 and name.startswith(f"{prefix}/"):
+            return name
+        return descriptor.compile_route("generation", name)
+    except ModelConfigError as exc:
+        logger.warning(
+            "MEMFORGE_DECISION_MODEL is not a model of the generation provider (%s); "
+            "Decision tasks run on the generation model",
+            exc.code,
+        )
+        return None
 
 
 AUDIT_HEALTH_FAILURE_EVENTS = (
@@ -553,25 +584,26 @@ def _dt_iso(value: Any) -> str | None:
     return str(value)
 
 
-def _has_structured_llm_credentials(llm: EffectiveLlmConfig) -> bool:
-    return bool(llm.enrichment_api_key) or is_litellm_provider_model(llm.enrichment_model)
+def build_embedding_runtime(
+    invocation: ResolvedInvocation | None,
+    config: AppConfig,
+) -> EmbeddingRuntime:
+    """Build the Embedding Runtime that calls ``invocation``.
 
-
-def build_embedding_runtime(llm: EffectiveLlmConfig, config: AppConfig) -> EmbeddingRuntime:
-    """Build the Embedding Runtime for the effective embedding settings."""
+    Without an invocation the runtime reports that no embedding model is
+    configured and every embed call fails.
+    """
     return EmbeddingRuntime(
         EmbeddingSettings(
-            model=llm.embedding_model,
-            base_url=llm.embedding_base_url or None,
-            api_key=llm.embedding_api_key or None,
+            invocation=invocation,
             cache_size=config.retrieval.embedding_cache_size,
         )
     )
 
 
-def _retrieval_config_for_llm(config: AppConfig, llm: EffectiveLlmConfig):
-    """Use the effective main model for the optional retrieval rerank."""
-    return replace(config.retrieval, rerank_model=llm.enrichment_model)
+def _retrieval_config_for_models(config: AppConfig, models: ResolvedModels):
+    """Use the generation model for the optional retrieval rerank."""
+    return replace(config.retrieval, rerank_model=models.generation_route)
 
 
 def _build_default_adapters(
@@ -611,7 +643,7 @@ def _build_default_search_engine(
     *,
     db: "Database",
     config: AppConfig,
-    llm: EffectiveLlmConfig,
+    models: ResolvedModels,
     structured_llm_client: LiteLlmStructuredClient | None,
     audit_logger: MemoryAuditLogger | None,
 ) -> Any:
@@ -622,8 +654,8 @@ def _build_default_search_engine(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embedding=build_embedding_runtime(llm, config),
-        config=_retrieval_config_for_llm(config, llm),
+        embedding=build_embedding_runtime(models.embedding, config),
+        config=_retrieval_config_for_models(config, models),
         structured_llm_client=structured_llm_client,
     )
 
@@ -647,7 +679,7 @@ def _build_default_sync_runtime(
     *,
     db: "Database",
     config: AppConfig,
-    llm: EffectiveLlmConfig,
+    models: ResolvedModels,
     structured_llm_client: LiteLlmStructuredClient | None,
     extraction_pool: ExtractionWorkPool | None,
     document_lifecycle_admission: DocumentLifecycleAdmission | None,
@@ -657,15 +689,13 @@ def _build_default_sync_runtime(
     runtime_event_trace_sink = runtime_event_trace_sink_from_env()
 
     memory_extractor = MemoryExtractor(
-        model=llm.enrichment_model,
-        base_url=llm.enrichment_base_url or None,
-        api_key=llm.enrichment_api_key or None,
+        model=models.generation_route,
         max_tokens=config.llm.memory_extraction_max_tokens,
-        request_timeout_s=llm.request_timeout_s,
+        request_timeout_s=models.request_timeout_s,
         structured_llm_client=structured_llm_client,
     )
 
-    embedding = build_embedding_runtime(llm, config)
+    embedding = build_embedding_runtime(models.embedding, config)
     adapters = _build_default_adapters(
         db,
         config,
@@ -689,7 +719,7 @@ def _build_default_sync_runtime(
         memory_store=memory_store,
         embedding=embedding,
         structured_llm_client=structured_llm_client,
-        llm_model=llm.enrichment_model,
+        llm_model=models.generation_route,
         runtime_event_trace_sink=runtime_event_trace_sink,
     )
     relation_discovery = None
@@ -710,7 +740,7 @@ def _build_default_sync_runtime(
         memory_store=memory_store,
         memory_engine=memory_engine,
         structured_llm_client=structured_llm_client,
-        llm_model=llm.enrichment_model,
+        llm_model=models.generation_route,
         relation_discovery=relation_discovery,
         extraction_pool=extraction_pool,
         document_lifecycle_admission=document_lifecycle_admission,
@@ -852,8 +882,36 @@ class SourceSyncWorker:
         self._extraction_pool = get_process_extraction_work_pool(max_extraction_workers)
         max_document_lifecycles = max(0, int(config.sync.max_document_lifecycles))
         self._document_lifecycle_admission = get_process_document_lifecycle_admission(max_document_lifecycles)
+        # The runtimes idle work reuses between slices. Each is built for the
+        # models in use when it was built (see models_changed).
         self._relation_runtime: SyncRuntime | None = None
         self._vector_runtime: SyncRuntime | None = None
+        self._models_version = 0
+
+    def models_changed(self) -> None:
+        """Discard the runtimes built for the models in use until now.
+
+        The server calls this when a model binding is replaced, so that the next
+        slice of idle work builds its runtime for the model, endpoint and key
+        now in use. A Source sync that is running finishes with the runtime it
+        started with.
+        """
+        self._models_version += 1
+        self._relation_runtime = None
+        self._vector_runtime = None
+
+    async def _build_runtime(self) -> SyncRuntime:
+        """Build a sync runtime for the models in use once it is built."""
+        while True:
+            models_version = self._models_version
+            runtime = await self.runtime_provider.build_sync_runtime(
+                self.db,
+                self.config,
+                extraction_pool=self._extraction_pool,
+                document_lifecycle_admission=self._document_lifecycle_admission,
+            )
+            if models_version == self._models_version:
+                return runtime
 
     async def process_lifecycle_vector_delivery_once(self) -> bool:
         """Process one bounded durable vector-outbox slice while the worker is idle."""
@@ -868,12 +926,7 @@ class SourceSyncWorker:
             if not pending:
                 return False
             if self._vector_runtime is None:
-                self._vector_runtime = await self.runtime_provider.build_sync_runtime(
-                    self.db,
-                    self.config,
-                    extraction_pool=self._extraction_pool,
-                    document_lifecycle_admission=self._document_lifecycle_admission,
-                )
+                self._vector_runtime = await self._build_runtime()
             result = await self._vector_runtime.memory_store.attempt_lifecycle_vector_delivery()
             if result.attempted_tasks:
                 logger.info(
@@ -901,12 +954,7 @@ class SourceSyncWorker:
             if not pending:
                 return False
             if self._vector_runtime is None:
-                self._vector_runtime = await self.runtime_provider.build_sync_runtime(
-                    self.db,
-                    self.config,
-                    extraction_pool=self._extraction_pool,
-                    document_lifecycle_admission=self._document_lifecycle_admission,
-                )
+                self._vector_runtime = await self._build_runtime()
             result = await self._vector_runtime.memory_store.attempt_review_vector_delivery()
             if result.attempted_tasks:
                 logger.info(
@@ -930,12 +978,7 @@ class SourceSyncWorker:
                     max_attempts=DEFAULT_RELATION_DISCOVERY_BUDGET.max_attempts,
                 ):
                     return False
-                self._relation_runtime = await self.runtime_provider.build_sync_runtime(
-                    self.db,
-                    self.config,
-                    extraction_pool=self._extraction_pool,
-                    document_lifecycle_admission=self._document_lifecycle_admission,
-                )
+                self._relation_runtime = await self._build_runtime()
             processor = self._relation_runtime.relation_discovery
             if processor is None:
                 return False
@@ -1232,12 +1275,7 @@ class SourceSyncWorker:
                     authoritative_snapshot=authoritative_collection,
                 )
 
-            runtime = await self.runtime_provider.build_sync_runtime(
-                self.db,
-                self.config,
-                extraction_pool=self._extraction_pool,
-                document_lifecycle_admission=self._document_lifecycle_admission,
-            )
+            runtime = await self._build_runtime()
             self._relation_runtime = runtime
             if run.source_activity is None:
                 raise SourceSyncLeaseLost(

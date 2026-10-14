@@ -7,10 +7,15 @@ rule for which provider failures are worth another attempt. Each caller owns
 its attempt loop, its pauses and its logical deadline.
 
 LiteLLM sends a request through one of two kinds of HTTP client. Its
-OpenAI-compatible routes, which carry every embedding model sent to a
-configured base URL, share one process-wide client. Every other route, the
-``anthropic/`` route of a bare generation model among them, uses a client
-LiteLLM builds for that provider. Both kinds refuse redirects here.
+OpenAI-compatible routes, which carry every model of an OpenAI-compatible
+endpoint, share one process-wide client. Every other route, ``anthropic/``
+among them, uses a client LiteLLM builds for that provider. Both kinds refuse
+redirects here.
+
+LiteLLM also looks a model up by itself, to learn its limits and prices. For an
+Ollama model that lookup is a request, with the key the process environment
+holds for Ollama. It is allowed to go to the server the environment names and
+nowhere else.
 
 Importing this module applies the process-wide policy. Every module that issues
 a LiteLLM request imports it, so the policy is in force before LiteLLM builds a
@@ -29,12 +34,15 @@ from typing import Any
 import httpx
 import litellm
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+from litellm.types.utils import ModelInfoBase
 
 __all__ = [
     "NoRedirectAsyncClient",
     "disable_sdk_default_retries",
     "install_no_redirect_http_client",
+    "is_connection_failure",
     "is_retryable_provider_error",
+    "keep_ollama_model_lookups_off_request_endpoints",
     "provider_retry_after_seconds",
     "provider_status_code",
     "refuse_redirects_in_provider_clients",
@@ -43,6 +51,7 @@ __all__ = [
 
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
 _REFUSES_REDIRECTS_MARK = "_memforge_refuses_redirects"
+_LOOKS_UP_AT_ENVIRONMENT_SERVER_ONLY_MARK = "_memforge_looks_up_at_environment_server_only"
 
 
 class NoRedirectAsyncClient(httpx.AsyncClient):
@@ -123,6 +132,40 @@ def refuse_redirects_in_provider_clients() -> None:
     AsyncHTTPHandler.create_client = create_client
 
 
+def keep_ollama_model_lookups_off_request_endpoints() -> None:
+    """Stop LiteLLM asking the endpoint of an Ollama request about its model.
+
+    LiteLLM asks an Ollama server for a model's limits, and sends the key
+    ``OLLAMA_API_KEY`` holds with the question. Asked with no address, it asks
+    the server ``OLLAMA_API_BASE`` names: the environment paired that server
+    with that key. After a request it asks the address the request went to
+    instead, an address the operator configured with a key of its own or with
+    none. That question is not sent, and the lookup reports what it reports
+    when a server does not answer: a model with no known limits.
+    """
+    look_up = litellm.OllamaConfig.get_model_info
+    if getattr(look_up, _LOOKS_UP_AT_ENVIRONMENT_SERVER_ONLY_MARK, False):
+        return
+
+    @functools.wraps(look_up)
+    def get_model_info(self: Any, model: str, api_base: str | None = None) -> ModelInfoBase:
+        if api_base is None:
+            return look_up(self, model)
+        return ModelInfoBase(
+            key=model,
+            litellm_provider="ollama",
+            mode="chat",
+            input_cost_per_token=0.0,
+            output_cost_per_token=0.0,
+            max_tokens=None,
+            max_input_tokens=None,
+            max_output_tokens=None,
+        )
+
+    setattr(get_model_info, _LOOKS_UP_AT_ENVIRONMENT_SERVER_ONLY_MARK, True)
+    litellm.OllamaConfig.get_model_info = get_model_info
+
+
 def disable_sdk_default_retries() -> None:
     """Make a request that asks the SDK for no retries get none.
 
@@ -189,6 +232,18 @@ def is_retryable_provider_error(exc: BaseException) -> bool:
     )
 
 
+def is_connection_failure(exc: BaseException) -> bool:
+    """Whether the request never reached the provider, anywhere in the error's chain."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, (ConnectionError, httpx.ConnectError, httpx.ConnectTimeout)):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _answered_status_code(exc: BaseException) -> int | None:
     seen: set[int] = set()
     current: BaseException | None = exc.__cause__ or exc.__context__
@@ -202,5 +257,6 @@ def _answered_status_code(exc: BaseException) -> int | None:
 
 install_no_redirect_http_client()
 refuse_redirects_in_provider_clients()
+keep_ollama_model_lookups_off_request_endpoints()
 disable_sdk_default_retries()
 silence_sdk_help_notice()
