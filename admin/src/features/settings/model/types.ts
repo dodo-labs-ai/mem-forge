@@ -1,6 +1,7 @@
 import type { components } from "@/api";
+import type { Tone } from "@/patterns";
 
-export type { ModelBinding, ModelKind, ModelKindSettings, ModelSettings } from "@/api";
+export type { ModelBinding, ModelKind, ModelKindSettings, ModelSettings, VectorIndex } from "@/api";
 
 type Schemas = components["schemas"];
 
@@ -16,3 +17,16 @@ export type ModelValidationOutcome = Schemas["ModelValidationResponse"];
 export type ModelCandidateRequest = Schemas["ModelCandidateRequest"];
 export type ModelDiscoveryRequest = Schemas["ModelDiscoveryRequest"];
 export type ModelDiscoveryResult = Schemas["ModelDiscoveryResponse"];
+/** The vector space of an embedding model: its settings and the size of its vectors. */
+export type EmbeddingProfile = Schemas["EmbeddingProfileResponse"];
+/** The latest rebuild of the search index, running or ended. */
+export type Reindex = Schemas["VectorReindexResponse"];
+
+/** One state in plain words. */
+export interface StatusSummary {
+  tone: Tone;
+  /** What was found, and when. */
+  headline: string;
+  /** What the user should know or do about it. */
+  detail: string | null;
+}

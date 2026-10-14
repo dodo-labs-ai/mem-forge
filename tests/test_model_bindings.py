@@ -470,13 +470,56 @@ def test_the_digest_changes_with_each_setting_a_check_vouches_for(change) -> Non
     assert build_binding(**settings).digest != build_binding(**{**settings, **change}).digest
 
 
-def test_the_digest_does_not_change_with_the_key_or_where_the_settings_came_from() -> None:
-    settings = {"kind": "generation", "provider": "openai", "model_id": "gpt-5-mini"}
+def test_the_digest_does_not_change_with_where_the_settings_came_from() -> None:
+    settings = {"kind": "generation", "provider": "openai", "model_id": "gpt-5-mini", "secret_ref": "secret:one"}
 
-    first = build_binding(**settings, secret_ref="secret:one", config_source="settings")
-    second = build_binding(**settings, secret_ref="secret:two", config_source="environment")
+    first = build_binding(**settings, config_source="settings")
+    second = build_binding(**settings, config_source="environment")
 
     assert first.digest == second.digest
+
+
+def test_the_digest_changes_with_the_key_the_binding_refers_to() -> None:
+    settings = {"kind": "generation", "provider": "openai", "model_id": "gpt-5-mini", "config_source": "settings"}
+
+    saved = build_binding(**settings, secret_ref="secret:one")
+    replaced = build_binding(**settings, secret_ref="secret:two")
+    from_environment = build_binding(**settings, secret_ref="env:MEMFORGE_ENRICHMENT_API_KEY")
+
+    assert len({saved.digest, replaced.digest, from_environment.digest}) == 3
+
+
+def test_the_digest_changes_with_the_token_limits_of_a_generation_binding() -> None:
+    settings = {"kind": "generation", "provider": "ollama", "model_id": "qwen3", "config_source": "settings"}
+
+    plain = build_binding(**settings)
+    limited = build_binding(**settings, token_limits={"context_window_tokens": 32_768, "max_output_tokens": 4_096})
+
+    assert plain.token_limits == {}
+    assert limited.token_limits == {"context_window_tokens": 32_768, "max_output_tokens": 4_096}
+    assert plain.digest != limited.digest
+
+
+@pytest.mark.parametrize(
+    ("kind", "token_limits", "error_code"),
+    [
+        ("generation", {"context_window_tokens": 0}, "token_limit_invalid"),
+        ("generation", {"max_output_tokens": "4096"}, "token_limit_invalid"),
+        ("generation", {"max_input_tokens": 8_000}, "token_limit_not_supported"),
+        ("embedding", {"context_window_tokens": 8_000}, "token_limit_not_supported"),
+    ],
+)
+def test_a_token_limit_a_binding_cannot_state_is_refused(kind, token_limits, error_code) -> None:
+    with pytest.raises(ModelConfigError) as refusal:
+        build_binding(
+            kind=kind,
+            provider="ollama",
+            model_id="local-model",
+            token_limits=token_limits,
+            config_source="settings",
+        )
+
+    assert refusal.value.code == error_code
 
 
 async def test_a_ready_binding_needs_revalidation_once_the_installed_litellm_changes(db, monkeypatch) -> None:

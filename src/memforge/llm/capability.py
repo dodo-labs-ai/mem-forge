@@ -6,6 +6,10 @@ object under the runtime's structured-output policy and validates the reply.
 The embedding check embeds two different texts, twice, and validates the
 vectors.
 
+A generation model passes only when the runtime can also size requests to it:
+its context window and its largest output have to be known, from LiteLLM's
+model registry, from the binding or from the ``MEMFORGE_LLM_*`` limits.
+
 A check reports what it observed (latency, the vector dimension, the model id
 the provider reported, how the structured reply was obtained, whether the
 model's token limits are known) or one stable error code. It keeps no prompt
@@ -48,6 +52,7 @@ __all__ = [
     "CapabilityCheck",
     "check_embedding",
     "check_generation",
+    "embedding_error_code",
 ]
 
 # The longest a generation check may take, queueing behind other model calls included.
@@ -138,6 +143,8 @@ async def check_generation(client: LiteLlmStructuredClient) -> CapabilityCheck:
         "latency_ms": _elapsed_ms(started),
         "token_limits_known": _token_limits_known(client),
     }
+    if error_code is None and not facts["token_limits_known"]:
+        error_code = "token_limits_required"
     calls = collector.calls()
     if calls:
         call = calls[-1]
@@ -175,7 +182,7 @@ async def check_embedding(
         elif (await _embed_probe(invocation, transport)).dimension != first.dimension:
             error_code = "embedding_dimension_unstable"
     except EmbeddingError as exc:
-        error_code = _embedding_error_code(exc)
+        error_code = embedding_error_code(exc)
     except Exception as exc:
         logger.warning("Embedding capability check failed (%s)", type(exc).__name__)
         error_code = "provider_error"
@@ -215,7 +222,8 @@ def _token_limits_known(client: LiteLlmStructuredClient) -> bool:
     """Whether the runtime can size requests to the model.
 
     Work that fills a request to the model's capacity needs its token limits,
-    from LiteLLM's model registry or from the MEMFORGE_LLM_* limits.
+    from LiteLLM's model registry, from the binding or from the MEMFORGE_LLM_*
+    limits.
     """
     try:
         client.request_budget()
@@ -241,7 +249,8 @@ def _generation_error_code(exc: StructuredLlmError) -> str:
     return _provider_error_code(status_code=exc.status_code, unreachable=unreachable)
 
 
-def _embedding_error_code(exc: EmbeddingError) -> str:
+def embedding_error_code(exc: EmbeddingError) -> str:
+    """Name a failed embedding operation by a stable code."""
     if isinstance(exc, EmbeddingDeadlineExceeded):
         return "timeout"
     if isinstance(exc, InvalidEmbeddingResponse):

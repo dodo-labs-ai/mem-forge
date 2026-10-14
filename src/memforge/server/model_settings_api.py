@@ -1,9 +1,13 @@
-"""HTTP API for model settings: provider descriptors, bindings, validation and model discovery."""
+"""HTTP API for model settings.
+
+Provider descriptors, the bindings of both kinds, their validation, model
+discovery, and the Memory vector index that belongs to the embedding model.
+"""
 
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -21,7 +25,9 @@ from memforge.llm.bindings import (
     ModelBinding,
     installed_litellm_version,
     parameters_for_kind,
+    token_limits_for_kind,
 )
+from memforge.llm.embedding_profile import EmbeddingProfile
 from memforge.llm.providers import (
     PROVIDER_DESCRIPTORS,
     AuthStrategy,
@@ -39,6 +45,8 @@ from memforge.model_settings import (
     KindView,
     ModelSettings,
     ValidationOutcome,
+    VectorIndexStatus,
+    VectorIndexView,
 )
 
 __all__ = [
@@ -56,6 +64,11 @@ _ERROR_STATUS = {
     "candidate_not_found": 409,
     "candidate_changed": 409,
     "model_not_configured": 409,
+    "reindex_in_progress": 409,
+    "sync_in_progress": 409,
+    "reindex_not_required": 409,
+    "embedding_not_validated": 409,
+    "reindex_not_available": 405,
 }
 
 
@@ -113,6 +126,12 @@ class ModelProviderResponse(BaseModel):
     parameters: dict[ModelKind, list[str]] = Field(
         description="The request parameters a binding of each served kind may set.",
     )
+    token_limits: dict[ModelKind, list[str]] = Field(
+        description=(
+            "The token limits a binding of each served kind may state for its model: "
+            "context_window_tokens and max_output_tokens for a generation model."
+        ),
+    )
 
 
 class ModelProviderListResponse(BaseModel):
@@ -152,6 +171,28 @@ class ModelValidationResult(BaseModel):
     )
 
 
+class EmbeddingProfileResponse(BaseModel):
+    """The identity of one vector space: an embedding model's settings and its vector length."""
+
+    provider: str
+    route: str
+    endpoint: str | None
+    model_id: str
+    requested_dimensions: int | None = Field(
+        description="The output size requests ask for; null takes the model's own.",
+    )
+    dimension: int = Field(description="The vector length the model answered with.")
+    fingerprint: str = Field(
+        description="A hash of the fields above. Vectors are shared only between equal fingerprints.",
+    )
+    thresholds_calibrated: bool = Field(
+        description=(
+            "Whether the similarity thresholds were tuned on this model's vectors. When false "
+            "they still apply, as approximate values nobody has measured for this model."
+        ),
+    )
+
+
 class ModelBindingResponse(BaseModel):
     kind: ModelKind
     provider: str
@@ -162,6 +203,12 @@ class ModelBindingResponse(BaseModel):
     route: str = Field(description="The LiteLLM route the model id compiles to.")
     options: dict[str, Any]
     parameters: dict[str, Any]
+    token_limits: dict[str, int] = Field(
+        description=(
+            "The token limits the binding states for its model: context_window_tokens and "
+            "max_output_tokens. Empty when it states none."
+        ),
+    )
     config_source: ConfigSource
     state: BindingState
     validation: ModelValidationResult | None
@@ -169,12 +216,109 @@ class ModelBindingResponse(BaseModel):
     saved_at: str | None = Field(
         description="When the stored binding was last saved; null for one read from the environment.",
     )
+    profile: EmbeddingProfileResponse | None = Field(
+        default=None,
+        description=(
+            "For an embedding binding whose latest check passed for the binding as it is: "
+            "the Embedding Profile it embeds in. Null otherwise."
+        ),
+    )
+    waits_for_reindex: bool = Field(
+        default=False,
+        description=(
+            "True for an embedding candidate that passed its check and becomes active once "
+            "the vector index is rebuilt for it."
+        ),
+    )
 
 
 class ModelKindSettingsResponse(BaseModel):
     active: ModelBindingResponse | None = Field(description="The binding the runtime uses.")
     candidate: ModelBindingResponse | None = Field(
         description="The binding Settings is editing, not yet in use.",
+    )
+
+
+class VectorIndexRecordResponse(BaseModel):
+    """One physical Memory vector index."""
+
+    fingerprint: str = Field(description="The fingerprint of the Embedding Profile it was built with.")
+    collection: str = Field(description="The name of the collection that holds its vectors.")
+    dimension: int
+    adopted: bool = Field(
+        description=(
+            "True when the vectors were in place before the index was recorded: the model "
+            "they came from is assumed to be the profile's, not known."
+        ),
+    )
+    vector_count: int = Field(description="The vectors the index holds now.")
+    activated_at: str | None = Field(description="When the index came into use.")
+    profile: EmbeddingProfileResponse | None = Field(
+        description="The Embedding Profile the index was built with.",
+    )
+
+
+class VectorReindexResponse(BaseModel):
+    """The latest rebuild of the vector index."""
+
+    state: Literal["running", "succeeded", "failed"]
+    target: Literal["active", "candidate"] | None = Field(
+        description="The embedding binding the rebuild is for.",
+    )
+    fingerprint: str
+    profile: EmbeddingProfileResponse | None
+    memories_total: int | None = Field(
+        description="The searchable Memories the rebuild covers; null until it has counted them.",
+    )
+    memories_indexed: int = Field(description="The Memories embedded into the new index so far.")
+    started_at: str | None
+    finished_at: str | None
+    error_code: str | None = Field(
+        default=None,
+        description=(
+            "Why a failed rebuild failed: a provider code of the embedding check "
+            "(provider_unreachable, authentication_failed, rate_limited, timeout, "
+            "embedding_response_invalid, provider_error, ...), embedding_dimension_mismatch, "
+            "vector_count_mismatch, vector_invalid, memories_changed, candidate_changed, "
+            "reindex_lease_lost, interrupted or index_error."
+        ),
+    )
+
+
+class VectorIndexResponse(BaseModel):
+    status: VectorIndexStatus = Field(
+        description=(
+            "'ready': the embedding model in use is the one the index was built with. "
+            "'reindex_required': it is another one, or the stored vectors cannot be adopted; "
+            "until the index is rebuilt vector search is off, a write that needs a new vector "
+            "is refused and vector work already queued waits. "
+            "'reindexing': a rebuild is running. 'awaiting_validation': no index is in use "
+            "because the embedding model has not passed a check yet. 'not_configured': no "
+            "embedding model. 'not_managed': the deployment keeps its index by its own means."
+        ),
+    )
+    reindex_required: bool = Field(description="True exactly when status is 'reindex_required'.")
+    serves_search: bool = Field(
+        description=(
+            "Whether search reads the index in use: there is one, and the embedding model in "
+            "use is the one it was built with. A rebuild does not change this before it "
+            "switches, so during a rebuild that started while a reindex was required it "
+            "stays false."
+        ),
+    )
+    reindex_target: Literal["active", "candidate"] | None = Field(
+        description=(
+            "The embedding binding a rebuild started now would be for: 'candidate' for a "
+            "candidate that waits for the index, 'active' when the index in use is missing, "
+            "was built with another model or was adopted. An active binding that has not "
+            "passed a check as it stands is checked when the rebuild is started, which is "
+            "refused with embedding_not_validated when the check fails. Null when there is "
+            "nothing to rebuild for, and while a rebuild runs."
+        ),
+    )
+    index: VectorIndexRecordResponse | None = Field(description="The index in use.")
+    reindex: VectorReindexResponse | None = Field(
+        description="The latest rebuild, running or ended; null when none has been started.",
     )
 
 
@@ -188,6 +332,7 @@ class ModelSettingsResponse(BaseModel):
     litellm_version: str
     generation: ModelKindSettingsResponse
     embedding: ModelKindSettingsResponse
+    vector_index: VectorIndexResponse
 
 
 class ModelCandidateRequest(BaseModel):
@@ -197,6 +342,13 @@ class ModelCandidateRequest(BaseModel):
     auth_strategy: AuthStrategy | None = None
     options: dict[str, Any] = Field(default_factory=dict)
     parameters: dict[str, Any] = Field(default_factory=dict)
+    token_limits: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "For a generation model LiteLLM has no limits for: context_window_tokens and "
+            "max_output_tokens, whole numbers of tokens."
+        ),
+    )
     api_key: str | None = Field(
         default=None,
         description="A new API key. Leave it out to keep the key saved for this endpoint.",
@@ -206,6 +358,13 @@ class ModelCandidateRequest(BaseModel):
 class ModelValidationResponse(BaseModel):
     passed: bool
     promoted: bool = Field(description="Whether the checked candidate became the active binding.")
+    reindex_required: bool = Field(
+        default=False,
+        description=(
+            "True when an embedding candidate passed and stays the candidate until the "
+            "vector index is rebuilt for it."
+        ),
+    )
     error_code: str | None = None
     validation: ModelValidationResult
     settings: ModelKindSettingsResponse
@@ -246,21 +405,36 @@ class ModelKindHealthResponse(BaseModel):
     )
 
 
+class EmbeddingModelHealthResponse(ModelKindHealthResponse):
+    vector_index: VectorIndexStatus = Field(
+        description="The state of the Memory vector index, as the model settings report it.",
+    )
+    reindex_required: bool = Field(
+        description=(
+            "True when the vector index has to be rebuilt for the embedding model in use. "
+            "Until then search answers without its vector channel."
+        ),
+    )
+
+
 class ModelHealthResponse(BaseModel):
     generation: ModelKindHealthResponse
-    embedding: ModelKindHealthResponse
+    embedding: EmbeddingModelHealthResponse
 
 
 async def model_health_response(settings: ModelSettings, db: Any) -> ModelHealthResponse:
     report = await settings.health(db)
+    vector_index = report["embedding"].vector_index or "not_managed"
     return ModelHealthResponse(
         generation=ModelKindHealthResponse(
             configured=report["generation"].configured,
             state=report["generation"].state,
         ),
-        embedding=ModelKindHealthResponse(
+        embedding=EmbeddingModelHealthResponse(
             configured=report["embedding"].configured,
             state=report["embedding"].state,
+            vector_index=vector_index,
+            reindex_required=vector_index == "reindex_required",
         ),
     )
 
@@ -294,7 +468,33 @@ def build_model_settings_router(
             litellm_version=installed_litellm_version(),
             generation=_kind_response(await settings.view(db, "generation")),
             embedding=_kind_response(await settings.view(db, "embedding")),
+            vector_index=_vector_index_response(await settings.vector_index(db, count_vectors=True)),
         )
+
+    @router.get("/vector-index", response_model=VectorIndexResponse)
+    async def read_vector_index(
+        db: Any = Depends(get_db),
+        settings: ModelSettings = Depends(get_model_settings),
+    ):
+        """Read the Memory vector index in use and the latest rebuild of it."""
+        return _vector_index_response(await settings.vector_index(db, count_vectors=True))
+
+    @router.post("/vector-index/reindex", response_model=VectorIndexResponse, status_code=202)
+    async def start_vector_reindex(
+        request: Request,
+        db: Any = Depends(get_db),
+        settings: ModelSettings = Depends(get_model_settings),
+    ):
+        """Start a rebuild of the vector index. It runs beside the server; read its state with GET."""
+        app = request.app
+        try:
+            view = await settings.start_reindex(
+                db,
+                on_switch=lambda: _discard_runtimes_of_the_replaced_binding(app),
+            )
+        except ModelConfigError as exc:
+            raise _http_error(exc) from exc
+        return _vector_index_response(view)
 
     @router.put("/{kind}/candidate", response_model=ModelKindSettingsResponse)
     async def save_model_candidate(
@@ -315,6 +515,7 @@ def build_model_settings_router(
                     auth_strategy=req.auth_strategy,
                     options=req.options,
                     parameters=req.parameters,
+                    token_limits=req.token_limits,
                     api_key=req.api_key,
                 ),
             )
@@ -443,6 +644,7 @@ def _descriptor_response(descriptor: ProviderDescriptor) -> ModelProviderRespons
         lists_models=descriptor.lists_models,
         options=list(descriptor.options),
         parameters={kind: list(parameters_for_kind(kind)) for kind in descriptor.kinds},
+        token_limits={kind: list(token_limits_for_kind(kind)) for kind in descriptor.kinds},
     )
 
 
@@ -459,6 +661,7 @@ def _binding_response(view: BindingView) -> ModelBindingResponse:
         route=binding.route,
         options=dict(binding.options),
         parameters=dict(binding.parameters),
+        token_limits=dict(binding.token_limits),
         config_source=binding.config_source,
         state=binding.state,
         validation=(
@@ -478,7 +681,80 @@ def _binding_response(view: BindingView) -> ModelBindingResponse:
             last4=view.key.last4,
         ),
         saved_at=binding.saved_at,
+        profile=_profile_response(view.profile),
+        waits_for_reindex=view.waits_for_reindex,
     )
+
+
+def _profile_response(profile: EmbeddingProfile | None) -> EmbeddingProfileResponse | None:
+    if profile is None:
+        return None
+    return EmbeddingProfileResponse(
+        **profile.fields(),
+        fingerprint=profile.fingerprint,
+        thresholds_calibrated=profile.thresholds_calibrated,
+    )
+
+
+def _recorded_profile(record: Mapping[str, Any]) -> EmbeddingProfileResponse | None:
+    fields = record.get("profile") or {}
+    return _profile_response(EmbeddingProfile.from_fields(fields)) if fields else None
+
+
+def _vector_index_response(view: VectorIndexView) -> VectorIndexResponse:
+    in_use = view.in_use
+    reindex = view.reindex
+    return VectorIndexResponse(
+        status=view.status,
+        reindex_required=view.reindex_required,
+        serves_search=view.serves_search,
+        reindex_target=view.reindex_target,
+        index=(
+            None
+            if in_use is None
+            else VectorIndexRecordResponse(
+                fingerprint=in_use["fingerprint"],
+                collection=in_use["collection_name"],
+                dimension=in_use["dimension"],
+                adopted=in_use["adopted"],
+                vector_count=in_use["vector_count"] if view.vector_count is None else view.vector_count,
+                activated_at=in_use["activated_at"],
+                profile=_recorded_profile(in_use),
+            )
+        ),
+        reindex=(
+            None
+            if reindex is None
+            else VectorReindexResponse(
+                state=_reindex_state(reindex, running=view.reindex_running),
+                target=reindex["binding_slot"],
+                fingerprint=reindex["fingerprint"],
+                profile=_recorded_profile(reindex),
+                memories_total=reindex["memory_count"],
+                memories_indexed=reindex["vector_count"],
+                started_at=reindex["started_at"],
+                finished_at=reindex["finished_at"],
+                error_code=_reindex_error_code(reindex, running=view.reindex_running),
+            )
+        ),
+    )
+
+
+def _reindex_state(
+    reindex: Mapping[str, Any],
+    *,
+    running: bool,
+) -> Literal["running", "succeeded", "failed"]:
+    """Read the state of a rebuild; one that stopped reporting has failed."""
+    if reindex["state"] == "building":
+        return "running" if running else "failed"
+    return "failed" if reindex["state"] == "failed" else "succeeded"
+
+
+def _reindex_error_code(reindex: Mapping[str, Any], *, running: bool) -> str | None:
+    if reindex["state"] == "building" and not running:
+        return "interrupted"
+    return reindex["error_code"]
 
 
 def _kind_response(view: KindView) -> ModelKindSettingsResponse:
@@ -497,6 +773,7 @@ async def _validation_response(
     return ModelValidationResponse(
         passed=validation.passed,
         promoted=outcome.promoted,
+        reindex_required=outcome.reindex_required,
         error_code=validation.error_code,
         validation=ModelValidationResult(
             checked_at=validation.checked_at,

@@ -28,7 +28,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol
+from urllib.parse import urlsplit, urlunsplit
 
+from memforge.llm.embedding_profile import EmbeddingIdentity, EmbeddingProfile
 from memforge.llm.providers import (
     KEYLESS_API_KEY,
     AuthStrategy,
@@ -62,6 +64,8 @@ __all__ = [
     "binding_record",
     "build_binding",
     "compile_binding",
+    "embedding_identity",
+    "embedding_profile",
     "environment_binding",
     "environment_secret_ref",
     "installed_litellm_version",
@@ -77,6 +81,7 @@ __all__ = [
     "state_after_check",
     "stored_secret_id",
     "stored_secret_ref",
+    "token_limits_for_kind",
     "translate_stored_settings",
     "usable_invocation",
     "validation_record",
@@ -105,6 +110,13 @@ _PARAMETERS_BY_KIND: Mapping[ModelKind, tuple[str, ...]] = MappingProxyType(
     {
         "generation": (),
         "embedding": ("dimensions",),
+    }
+)
+# The token limits a binding of each kind may state for its model.
+_TOKEN_LIMITS_BY_KIND: Mapping[ModelKind, tuple[str, ...]] = MappingProxyType(
+    {
+        "generation": ("context_window_tokens", "max_output_tokens"),
+        "embedding": (),
     }
 )
 _OPENAI_HOST = "api.openai.com"
@@ -153,6 +165,9 @@ class ModelBinding:
     # When the stored binding was last saved. It identifies that version of the
     # binding; a binding that is not stored has none.
     saved_at: str | None = None
+    # The context window and the largest output of the model, in tokens, for a
+    # model whose limits LiteLLM does not know.
+    token_limits: Mapping[str, int] = field(default_factory=dict)
 
     @property
     def digest(self) -> str:
@@ -160,7 +175,8 @@ class ModelBinding:
 
         A check that passed for one digest says nothing about a binding with
         another: the endpoint, provider, route, auth strategy, model, requested
-        dimensions or the installed LiteLLM version has changed.
+        dimensions, token limits, the key the binding refers to or the
+        installed LiteLLM version has changed.
         """
         material = {
             "provider": self.provider,
@@ -170,6 +186,8 @@ class ModelBinding:
             "auth_strategy": self.auth_strategy,
             "model_id": self.model_id,
             "dimensions": self.parameters.get("dimensions"),
+            "token_limits": dict(self.token_limits),
+            "secret_ref": self.secret_ref,
             "litellm": installed_litellm_version(),
         }
         encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
@@ -183,6 +201,40 @@ def installed_litellm_version() -> str:
 def parameters_for_kind(kind: ModelKind) -> tuple[str, ...]:
     """The request parameters a binding of ``kind`` may set."""
     return _PARAMETERS_BY_KIND[kind]
+
+
+def token_limits_for_kind(kind: ModelKind) -> tuple[str, ...]:
+    """The token limits a binding of ``kind`` may state for its model."""
+    return _TOKEN_LIMITS_BY_KIND[kind]
+
+
+def embedding_identity(binding: ModelBinding) -> EmbeddingIdentity:
+    """The settings of an embedding binding that decide its vector space."""
+    return EmbeddingIdentity(
+        provider=binding.provider,
+        route=binding.route,
+        endpoint=_identity_endpoint(binding.endpoint),
+        model_id=binding.model_id,
+        requested_dimensions=binding.parameters.get("dimensions"),
+    )
+
+
+def embedding_profile(binding: ModelBinding | None) -> EmbeddingProfile | None:
+    """The Embedding Profile of an embedding binding its latest check vouches for.
+
+    The profile needs the vector length the model answered with, so a binding
+    has one only while a check that passed is on record for the binding as it
+    stands.
+    """
+    if binding is None or binding.kind != "embedding":
+        return None
+    validation = binding.validation
+    if validation is None or not validation.passed or validation.digest != binding.digest:
+        return None
+    dimension = validation.facts.get("dimension")
+    if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension < 1:
+        return None
+    return embedding_identity(binding).profile(dimension)
 
 
 def state_after_change(state: BindingState, *, previous_digest: str, digest: str) -> BindingState:
@@ -213,6 +265,7 @@ def build_binding(
     auth_strategy: AuthStrategy | None = None,
     options: Mapping[str, Any] | None = None,
     parameters: Mapping[str, Any] | None = None,
+    token_limits: Mapping[str, Any] | None = None,
     secret_ref: str | None = None,
 ) -> ModelBinding:
     """Build a binding of ``kind`` from settings, or say which setting is unusable."""
@@ -237,6 +290,7 @@ def build_binding(
         parameters=_validated_parameters(kind, parameters),
         secret_ref=secret_ref if strategy == "api_key" else None,
         config_source=config_source,
+        token_limits=_validated_token_limits(kind, token_limits),
     )
 
 
@@ -453,6 +507,7 @@ def binding_record(binding: ModelBinding) -> dict[str, Any]:
         "model_id": binding.model_id,
         "route": binding.route,
         "parameters": dict(binding.parameters),
+        "token_limits": dict(binding.token_limits),
         "config_source": binding.config_source,
         "state": binding.state,
         "validation": None if validation is None else validation_record(validation),
@@ -497,6 +552,7 @@ def binding_from_record(record: Mapping[str, Any]) -> ModelBinding:
         state=record["state"],
         validation=validation,
         saved_at=record.get("updated_at"),
+        token_limits=MappingProxyType(dict(record.get("token_limits") or {})),
     )
     if validation is None:
         return binding
@@ -672,6 +728,20 @@ def _normalized_endpoint(descriptor: ProviderDescriptor, endpoint: str | None) -
     return value
 
 
+def _identity_endpoint(endpoint: str | None) -> str | None:
+    """Write an endpoint the one way an Embedding Profile records it.
+
+    Scheme and host are written in lower case, a port that is the scheme's
+    default is left out and a trailing slash is dropped, so every spelling of
+    one address gives one vector space. The path keeps its case.
+    """
+    origin = endpoint_origin(endpoint)
+    if endpoint is None or origin is None:
+        return endpoint
+    address = urlsplit(endpoint.strip())
+    return origin_label(origin) + urlunsplit(("", "", address.path.rstrip("/"), address.query, address.fragment))
+
+
 def _binding_origin(endpoint: str | None, route: str) -> str:
     """What a key saved with a binding is bound to.
 
@@ -720,6 +790,28 @@ def _validated_parameters(
             raise ModelConfigError(
                 "parameter_invalid",
                 f"The {name!r} parameter must be a whole number greater than zero.",
+            )
+        validated[name] = value
+    return MappingProxyType(validated)
+
+
+def _validated_token_limits(
+    kind: ModelKind,
+    token_limits: Mapping[str, Any] | None,
+) -> Mapping[str, int]:
+    validated: dict[str, int] = {}
+    for name, value in (token_limits or {}).items():
+        if name not in _TOKEN_LIMITS_BY_KIND[kind]:
+            raise ModelConfigError(
+                "token_limit_not_supported",
+                f"A {kind} model has no {name!r} limit.",
+            )
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ModelConfigError(
+                "token_limit_invalid",
+                f"The {name!r} limit must be a whole number of tokens greater than zero.",
             )
         validated[name] = value
     return MappingProxyType(validated)

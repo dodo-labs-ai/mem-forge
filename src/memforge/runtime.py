@@ -6,11 +6,11 @@ import asyncio
 import contextlib
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from memforge.config import AppConfig
 from memforge.evals.agent_evaluation import (
@@ -20,8 +20,14 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.auth import browser_session
 from memforge.genes import GENE_REGISTRY, create_gene, source_type_supports_sync
-from memforge.llm.bindings import resolve_active_binding, resolve_active_invocation, usable_invocation
-from memforge.llm.embedding import EmbeddingRuntime, EmbeddingSettings
+from memforge.llm.bindings import embedding_identity, resolve_active_binding, usable_invocation
+from memforge.llm.embedding import (
+    EmbeddingIndexMismatch,
+    EmbeddingRuntime,
+    EmbeddingSettings,
+    ProfileObserver,
+)
+from memforge.llm.embedding_profile import EmbeddingIdentity, EmbeddingProfile
 from memforge.llm.providers import ModelConfigError, ResolvedInvocation, provider_descriptor
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
 from memforge.local_agent.source_contract import (
@@ -48,7 +54,7 @@ from memforge.pipeline.sync import (
     get_process_document_lifecycle_admission,
     get_process_extraction_work_pool,
 )
-from memforge.retrieval.embeddings import get_chroma_collection
+from memforge.retrieval import vector_index
 from memforge.source_secrets import decrypt_source_config_for_runtime, source_secret_fields
 from memforge.source_activity import (
     SourceActivityConflict,
@@ -56,11 +62,12 @@ from memforge.source_activity import (
     SourceActivityLease,
 )
 from memforge.storage.document_store import LocalDocumentStore
-from memforge.storage.adapters.sqlite import SqliteAdapters, build_sqlite_adapters
+from memforge.storage.adapters.sqlite import SqliteAdapters, SqliteVectorStore, build_sqlite_adapters
 from memforge.sync_progress import SourceSyncProgressAccumulator, source_sync_progress_from_pipeline
 
 if TYPE_CHECKING:
     from memforge.evals.agent_evaluation import RuntimeEventTraceSink
+    from memforge.memory.reindex import MemoryVectorIndexes
     from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -121,6 +128,8 @@ class ResolvedModels:
 
     generation: ResolvedInvocation | None
     embedding: ResolvedInvocation | None
+    # The settings of the embedding model that decide its vector space.
+    embedding_identity: EmbeddingIdentity | None = None
     request_timeout_s: float = 300.0
     max_input_tokens: int | None = None
     context_window_tokens: int | None = None
@@ -265,8 +274,53 @@ class RuntimeProvider(Protocol):
     ) -> SyncState: ...
 
 
+@runtime_checkable
+class VectorIndexProvider(Protocol):
+    """A runtime provider whose Memory vector index is settled and rebuilt by this service.
+
+    ``memory_vector_indexes`` returns the indexes of one database, or ``None``
+    for a database whose index the provider keeps by its own means. A provider
+    without the method keeps every index that way: no index is recorded, no
+    rebuild is offered and nothing is guarded for one.
+    """
+
+    def memory_vector_indexes(self, db: "Database", config: AppConfig) -> "MemoryVectorIndexes | None": ...
+
+
+def memory_vector_indexes(
+    provider: object,
+    db: "Database",
+    config: AppConfig,
+) -> "MemoryVectorIndexes | None":
+    """Return the vector indexes ``provider`` lets this service manage for ``db``, if it does."""
+    if isinstance(provider, VectorIndexProvider):
+        return provider.memory_vector_indexes(db, config)
+    return None
+
+
+def first_index_settler(provider: object, db: "Database", config: AppConfig) -> ProfileObserver | None:
+    """Return what an Embedding Runtime tells its profile to, so that ``db`` gets its first index.
+
+    An installation with no vector index in use gets one the first time its
+    embedding model answers: the answer shows the vector length, and with it
+    the Embedding Profile the index is recorded for.
+    """
+    indexes = memory_vector_indexes(provider, db, config)
+    if indexes is None:
+        return None
+
+    async def settle(profile: EmbeddingProfile) -> None:
+        if await indexes.in_use() is None:
+            await indexes.settle(profile)
+
+    return settle
+
+
 class DefaultRuntimeProvider:
     """Default SQLite-backed runtime provider."""
+
+    def memory_vector_indexes(self, db: "Database", config: AppConfig) -> "MemoryVectorIndexes | None":
+        return _default_vector_indexes(db, config)
 
     def build_structured_llm_client(
         self,
@@ -316,6 +370,7 @@ class DefaultRuntimeProvider:
             models=models,
             structured_llm_client=structured_llm_client,
             audit_logger=audit_logger,
+            first_index=first_index_settler(self, db, config),
         )
 
     async def build_sync_runtime(
@@ -338,6 +393,7 @@ class DefaultRuntimeProvider:
             structured_llm_client=structured_llm_client,
             extraction_pool=extraction_pool,
             document_lifecycle_admission=document_lifecycle_admission,
+            first_index=first_index_settler(self, db, config),
         )
 
     async def check_health(self, db: "Database", config: AppConfig) -> RuntimeHealthReport:
@@ -384,23 +440,47 @@ async def resolve_models(db: "Database", config: AppConfig) -> ResolvedModels:
     """Resolve the generation and embedding models a runtime calls with ``db``.
 
     Each is the active binding of its kind for this database, compiled with its
-    credential. The request limits and the decision model come from ``config``.
+    credential. The decision model comes from ``config``, and so do the request
+    limits the generation binding does not state itself.
     """
     generation_binding = await resolve_active_binding(db, config, "generation")
     generation = await usable_invocation(db, config, generation_binding)
     decision_route: str | None = None
     if generation_binding is not None and generation is not None:
         decision_route = _decision_route(generation_binding.provider, config.llm.decision_model)
+    embedding_binding = await resolve_active_binding(db, config, "embedding")
+    embedding = await usable_invocation(db, config, embedding_binding)
     return ResolvedModels(
         generation=generation,
-        embedding=await resolve_active_invocation(db, config, "embedding"),
+        embedding=embedding,
+        embedding_identity=(
+            embedding_identity(embedding_binding)
+            if embedding_binding is not None and embedding is not None
+            else None
+        ),
         request_timeout_s=config.llm.request_timeout_s,
-        max_input_tokens=config.llm.max_input_tokens,
-        context_window_tokens=config.llm.context_window_tokens,
-        max_output_tokens=config.llm.max_output_tokens,
+        **generation_token_limits(
+            config.llm,
+            {} if generation_binding is None else generation_binding.token_limits,
+        ),
         input_budget_fraction=config.llm.input_budget_fraction,
         decision_route=decision_route,
     )
+
+
+def generation_token_limits(llm: Any, binding_limits: Mapping[str, int]) -> dict[str, int | None]:
+    """The token limits requests to a generation model are sized with.
+
+    A limit the binding states is the one used. The ``MEMFORGE_LLM_*`` limits
+    apply to whatever the binding leaves open, and a model with a stated
+    context window takes that as the most input it reads.
+    """
+    context_window = binding_limits.get("context_window_tokens", llm.context_window_tokens)
+    return {
+        "max_input_tokens": llm.max_input_tokens or binding_limits.get("context_window_tokens"),
+        "context_window_tokens": context_window,
+        "max_output_tokens": binding_limits.get("max_output_tokens", llm.max_output_tokens),
+    }
 
 
 def _decision_route(provider: str, decision_model: str) -> str | None:
@@ -475,14 +555,15 @@ async def check_runtime_health(db: "Database", config: AppConfig) -> RuntimeHeal
 
     index_consistency: RuntimeHealthComponent | None = None
     try:
-        if Path(config.storage.chroma_path).exists():
-            memory_collection = get_chroma_collection(
-                config.storage.chroma_path,
-                name="memories",
-            )
+        index = (
+            await vector_index.open_memory_vector_index(db, config.storage.chroma_path)
+            if Path(config.storage.chroma_path).exists()
+            else None
+        )
+        if index is not None:
             report = await MemoryIndexHealthChecker(
                 db=db,
-                memory_collection=memory_collection,
+                memory_collection=index.collection,
             ).check()
             if report.ok:
                 index_consistency = RuntimeHealthComponent(
@@ -498,7 +579,7 @@ async def check_runtime_health(db: "Database", config: AppConfig) -> RuntimeHeal
         else:
             index_consistency = RuntimeHealthComponent(
                 status="not_configured",
-                detail="ChromaDB path does not exist",
+                detail="No Memory vector index is in use",
             )
     except Exception as exc:
         overall = "degraded"
@@ -587,17 +668,39 @@ def _dt_iso(value: Any) -> str | None:
 def build_embedding_runtime(
     invocation: ResolvedInvocation | None,
     config: AppConfig,
+    *,
+    identity: EmbeddingIdentity | None = None,
+    profile_observer: ProfileObserver | None = None,
 ) -> EmbeddingRuntime:
     """Build the Embedding Runtime that calls ``invocation``.
 
     Without an invocation the runtime reports that no embedding model is
-    configured and every embed call fails.
+    configured and every embed call fails. ``identity`` names the vector space
+    of the model, so that its vectors reach only an index built with it.
     """
     return EmbeddingRuntime(
         EmbeddingSettings(
             invocation=invocation,
+            identity=identity,
             cache_size=config.retrieval.embedding_cache_size,
-        )
+        ),
+        profile_observer=profile_observer,
+    )
+
+
+async def build_active_embedding_runtime(
+    db: "Database",
+    config: AppConfig,
+    provider: object,
+) -> EmbeddingRuntime:
+    """Build the Embedding Runtime of the active embedding binding of ``db``."""
+    binding = await resolve_active_binding(db, config, "embedding")
+    invocation = await usable_invocation(db, config, binding)
+    return build_embedding_runtime(
+        invocation,
+        config,
+        identity=None if binding is None or invocation is None else embedding_identity(binding),
+        profile_observer=first_index_settler(provider, db, config),
     )
 
 
@@ -612,12 +715,27 @@ def _build_default_adapters(
     *,
     audit_logger: MemoryAuditLogger | None,
 ) -> SqliteAdapters:
-    """Bind the SQLite stores to the Memory Chroma collection at ``config.storage.chroma_path``."""
-    memory_collection = get_chroma_collection(
-        chroma_path=config.storage.chroma_path,
-        name="memories",
+    """Bind the SQLite stores to the Memory vector index in use at ``config.storage.chroma_path``."""
+    chroma_path = config.storage.chroma_path
+
+    async def open_index() -> vector_index.MemoryVectorIndex | None:
+        return await vector_index.open_memory_vector_index(db, chroma_path)
+
+    return build_sqlite_adapters(
+        db,
+        SqliteVectorStore.of_index_in_use(open_index),
+        audit_logger=audit_logger,
     )
-    return build_sqlite_adapters(db, memory_collection, audit_logger=audit_logger)
+
+
+def _default_vector_indexes(db: "Database", config: AppConfig) -> "MemoryVectorIndexes | None":
+    """The Chroma indexes recorded in a SQLite database; any other store has none here."""
+    from memforge.memory.reindex import MemoryVectorIndexes
+    from memforge.storage.database import Database
+
+    if not isinstance(db, Database):
+        return None
+    return MemoryVectorIndexes(db, config.storage.chroma_path)
 
 
 async def build_search_engine(
@@ -646,6 +764,7 @@ def _build_default_search_engine(
     models: ResolvedModels,
     structured_llm_client: LiteLlmStructuredClient | None,
     audit_logger: MemoryAuditLogger | None,
+    first_index: ProfileObserver | None = None,
 ) -> Any:
     from memforge.retrieval.search import SearchEngine
 
@@ -654,7 +773,12 @@ def _build_default_search_engine(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embedding=build_embedding_runtime(models.embedding, config),
+        embedding=build_embedding_runtime(
+            models.embedding,
+            config,
+            identity=models.embedding_identity,
+            profile_observer=first_index,
+        ),
         config=_retrieval_config_for_models(config, models),
         structured_llm_client=structured_llm_client,
     )
@@ -683,6 +807,7 @@ def _build_default_sync_runtime(
     structured_llm_client: LiteLlmStructuredClient | None,
     extraction_pool: ExtractionWorkPool | None,
     document_lifecycle_admission: DocumentLifecycleAdmission | None,
+    first_index: ProfileObserver | None = None,
 ) -> SyncRuntime:
     from memforge.evals.agent_evaluation import runtime_event_trace_sink_from_env
     doc_store = LocalDocumentStore(config.storage.docs_path)
@@ -695,7 +820,12 @@ def _build_default_sync_runtime(
         structured_llm_client=structured_llm_client,
     )
 
-    embedding = build_embedding_runtime(models.embedding, config)
+    embedding = build_embedding_runtime(
+        models.embedding,
+        config,
+        identity=models.embedding_identity,
+        profile_observer=first_index,
+    )
     adapters = _build_default_adapters(
         db,
         config,
@@ -928,6 +1058,7 @@ class SourceSyncWorker:
             if self._vector_runtime is None:
                 self._vector_runtime = await self._build_runtime()
             result = await self._vector_runtime.memory_store.attempt_lifecycle_vector_delivery()
+            self._discard_runtime_of_another_index(result)
             if result.attempted_tasks:
                 logger.info(
                     "Lifecycle vector slice attempted=%d delivered=%d failed=%d pending=%s",
@@ -956,6 +1087,7 @@ class SourceSyncWorker:
             if self._vector_runtime is None:
                 self._vector_runtime = await self._build_runtime()
             result = await self._vector_runtime.memory_store.attempt_review_vector_delivery()
+            self._discard_runtime_of_another_index(result)
             if result.attempted_tasks:
                 logger.info(
                     "Review vector slice attempted=%d delivered=%d failed=%d pending=%s",
@@ -968,6 +1100,17 @@ class SourceSyncWorker:
         except Exception:
             logger.exception("Review vector worker slice failed")
             return False
+
+    def _discard_runtime_of_another_index(self, result: Any) -> None:
+        """Build the vector runtime again once its model is not the index's.
+
+        The index may have been rebuilt for a model that became the one in use
+        after this runtime was built. The next slice then works with a runtime
+        of that model; while the index still waits for its rebuild, the work
+        stays pending.
+        """
+        if EmbeddingIndexMismatch.__name__ in result.error_types:
+            self._vector_runtime = None
 
     async def _process_relation_discovery_once(self) -> bool:
         try:
@@ -1004,11 +1147,26 @@ class SourceSyncWorker:
             return False
 
     async def process_bounded_maintenance_once(self) -> None:
-        """Interleave one bounded slice of each non-source lifecycle queue."""
+        """Interleave one bounded slice of each non-source lifecycle queue.
 
+        The queues wait while the Memory vector index is rebuilt: their work
+        writes vectors and Memories, which a rebuild needs to stand still.
+        """
+
+        if await self._vector_reindex_running():
+            return
         await self.process_lifecycle_vector_delivery_once()
         await self.process_review_vector_delivery_once()
         await self._process_relation_discovery_once()
+
+    async def _vector_reindex_running(self) -> bool:
+        if memory_vector_indexes(self.runtime_provider, self.db, self.config) is None:
+            return False
+        try:
+            return await self.db.vector_reindex_running()
+        except Exception:
+            logger.exception("Could not tell whether the Memory vector index is being rebuilt")
+            return True
 
     async def _heartbeat_until_stopped(
         self,
@@ -1557,7 +1715,7 @@ class SyncService:
         runtime = await self.runtime_provider.build_sync_runtime(self.db, self.config)
         checker = MemoryIndexHealthChecker(
             db=self.db,
-            memory_collection=runtime.memory_store.collection,
+            memory_collection=await runtime.memory_store.index_collection(),
         )
         return await checker.check()
 

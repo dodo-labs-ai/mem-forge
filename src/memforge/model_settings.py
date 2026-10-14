@@ -11,6 +11,13 @@ its check is kept by this object for as long as the server runs.
 One check of a binding runs at a time. A caller that asks for a check while one
 of the same binding is running waits for it and takes its outcome, so no number
 of simultaneous requests makes more than one model call.
+
+The embedding binding and the Memory vector index belong together: an index
+holds the vectors of one Embedding Profile. An embedding candidate that passes
+its check becomes active at once only when its profile is the one the index in
+use was built with. Otherwise it waits, validated, for a rebuild of the index,
+which is started on request, runs beside the server and makes the candidate
+active in the same transaction that puts the rebuilt index into use.
 """
 
 from __future__ import annotations
@@ -20,7 +27,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from memforge.config import AppConfig
 from memforge.llm.bindings import (
@@ -32,6 +39,8 @@ from memforge.llm.bindings import (
     binding_from_record,
     binding_record,
     build_binding,
+    embedding_identity,
+    embedding_profile,
     key_last4,
     key_source,
     new_stored_secret,
@@ -56,9 +65,22 @@ from memforge.llm.providers import (
     ModelKind,
     provider_descriptor,
 )
-from memforge.runtime import ResolvedModels, RuntimeProvider
+from memforge.llm.embedding_profile import EmbeddingProfile
+from memforge.runtime import (
+    ResolvedModels,
+    RuntimeProvider,
+    generation_token_limits,
+    memory_vector_indexes,
+)
+from memforge.vector_index_errors import (
+    REINDEX_IN_PROGRESS,
+    REINDEX_NOT_REQUIRED,
+    REINDEX_NOT_REQUIRED_MESSAGE,
+    VectorReindexRefused,
+)
 
 if TYPE_CHECKING:
+    from memforge.memory.reindex import MemoryVectorIndexes, ReindexProgress, ReindexTarget
     from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -71,6 +93,23 @@ __all__ = [
     "ModelHealth",
     "ModelSettings",
     "ValidationOutcome",
+    "VectorIndexStatus",
+    "VectorIndexView",
+]
+
+# ``ready``: the embedding model in use is the one the index was built with.
+# ``reindex_required``: it is another one, or the stored vectors cannot be
+# adopted; vector search is off until the index is rebuilt. ``reindexing``: a
+# rebuild is running. ``awaiting_validation``: no index is in use yet, because
+# the embedding model has not passed a check. ``not_configured``: no embedding
+# model. ``not_managed``: the deployment keeps the index by its own means.
+VectorIndexStatus = Literal[
+    "ready",
+    "reindex_required",
+    "reindexing",
+    "awaiting_validation",
+    "not_configured",
+    "not_managed",
 ]
 
 @dataclass(frozen=True)
@@ -83,6 +122,7 @@ class CandidateDraft:
     auth_strategy: AuthStrategy | None = None
     options: Mapping[str, Any] = field(default_factory=dict)
     parameters: Mapping[str, Any] = field(default_factory=dict)
+    token_limits: Mapping[str, Any] = field(default_factory=dict)
     # A new API key. ``None`` keeps the key already saved for the endpoint.
     api_key: str | None = field(default=None, repr=False)
 
@@ -100,6 +140,36 @@ class KeyView:
 class BindingView:
     binding: ModelBinding
     key: KeyView
+    # The Embedding Profile of an embedding binding whose latest check vouches for it.
+    profile: EmbeddingProfile | None = None
+    # Whether this embedding candidate has passed its check and becomes active
+    # once the vector index is rebuilt for it.
+    waits_for_reindex: bool = False
+
+
+@dataclass(frozen=True)
+class VectorIndexView:
+    """The Memory vector index as Settings shows it."""
+
+    status: VectorIndexStatus
+    # Whether search reads the index in use: there is one, and the embedding
+    # model in use is the one it was built with. A rebuild does not change
+    # this before its switch.
+    serves_search: bool = False
+    # The binding a rebuild started now would build for; ``None`` when there
+    # is nothing to rebuild for.
+    reindex_target: BindingSlot | None = None
+    # The record of the index in use.
+    in_use: Mapping[str, Any] | None = None
+    # The vectors the index in use holds now, when they were counted.
+    vector_count: int | None = None
+    # The record of the latest rebuild, whatever became of it.
+    reindex: Mapping[str, Any] | None = None
+    reindex_running: bool = False
+
+    @property
+    def reindex_required(self) -> bool:
+        return self.status == "reindex_required"
 
 
 @dataclass(frozen=True)
@@ -118,6 +188,8 @@ class ValidationOutcome:
     # Whether the checked candidate became the active binding.
     promoted: bool
     state: BindingState
+    # Whether the candidate passed and now waits for a rebuild of the vector index.
+    reindex_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -126,6 +198,8 @@ class ModelHealth:
 
     configured: bool
     state: BindingState | None = None
+    # For the embedding model: the state of the Memory vector index.
+    vector_index: VectorIndexStatus | None = None
 
 
 # What one check is a check of: the database a stored binding is in, the slot,
@@ -155,6 +229,8 @@ class ModelSettings:
         self._check_queues: dict[tuple[ModelKind, BindingSlot], _CheckQueue] = {
             (kind, slot): _CheckQueue() for kind in MODEL_KINDS for slot in ("active", "candidate")
         }
+        # The rebuilds of the vector index this server is running.
+        self._reindex_tasks: set[asyncio.Task[Any]] = set()
 
     @property
     def writable(self) -> bool:
@@ -165,10 +241,17 @@ class ModelSettings:
         """Return the active and the candidate binding of ``kind`` as Settings shows them."""
         active = await self._active(db, kind)
         candidate = await self._candidate(db, kind)
+        waits = False
+        if kind == "embedding" and candidate is not None and self._indexes(db) is not None:
+            waits = _waits_for_reindex(candidate, await db.get_active_vector_index())
         return KindView(
             kind=kind,
             active=None if active is None else await self._binding_view(db, active),
-            candidate=None if candidate is None else await self._binding_view(db, candidate),
+            candidate=(
+                None
+                if candidate is None
+                else await self._binding_view(db, candidate, waits_for_reindex=waits)
+            ),
         )
 
     async def health(self, db: "Database") -> dict[ModelKind, ModelHealth]:
@@ -176,12 +259,68 @@ class ModelSettings:
         report: dict[ModelKind, ModelHealth] = {}
         for kind in MODEL_KINDS:
             active = await self._active(db, kind)
+            vector_index = (await self.vector_index(db)).status if kind == "embedding" else None
             report[kind] = (
-                ModelHealth(configured=False)
+                ModelHealth(configured=False, vector_index=vector_index)
                 if active is None
-                else ModelHealth(configured=True, state=active.state)
+                else ModelHealth(configured=True, state=active.state, vector_index=vector_index)
             )
         return report
+
+    async def vector_index(self, db: "Database", *, count_vectors: bool = False) -> VectorIndexView:
+        """Report the Memory vector index in use and whether it fits the embedding model.
+
+        An installation with no index in use gets its first one here, when the
+        Embedding Profile of the active binding is known and the stored vectors,
+        if there are any, have its length. ``count_vectors`` also counts the
+        vectors the index holds.
+        """
+        indexes = self._indexes(db)
+        if indexes is None:
+            return VectorIndexView(status="not_managed", serves_search=True)
+        active = await self._active(db, "embedding")
+        candidate = await self._candidate(db, "embedding")
+        profile = embedding_profile(active)
+        in_use = await db.get_active_vector_index()
+        if in_use is None and profile is not None:
+            in_use = await indexes.settle(profile)
+        running = await db.vector_reindex_running()
+        serves_search = (
+            active is not None
+            and in_use is not None
+            and _fingerprint_in_use(active, in_use) == in_use["fingerprint"]
+        )
+        if running:
+            status: VectorIndexStatus = "reindexing"
+        elif active is None:
+            status = "not_configured"
+        elif in_use is None:
+            status = "awaiting_validation" if profile is None else "reindex_required"
+        else:
+            status = "ready" if serves_search else "reindex_required"
+        reindex_target: BindingSlot | None = None
+        if not running:
+            # Whether stored vectors fit a model that has not answered yet is
+            # not known, so there is a rebuild to start for it whenever some
+            # are stored.
+            stored_vectors = (
+                active is not None and in_use is None and profile is None and await indexes.holds_stored_vectors()
+            )
+            reindex_target = _reindex_slot(active, candidate, in_use, stored_vectors=stored_vectors)
+        vector_count: int | None = None
+        if count_vectors and in_use is not None:
+            opened = await indexes.in_use()
+            if opened is not None:
+                vector_count = int(await asyncio.to_thread(opened.collection.count))
+        return VectorIndexView(
+            status=status,
+            serves_search=serves_search,
+            reindex_target=reindex_target,
+            in_use=in_use,
+            vector_count=vector_count,
+            reindex=await db.get_latest_vector_reindex(),
+            reindex_running=running,
+        )
 
     async def save_candidate(self, db: "Database", kind: ModelKind, draft: CandidateDraft) -> KindView:
         """Store ``draft`` as the candidate of ``kind``.
@@ -193,6 +332,7 @@ class ModelSettings:
         environment is accepted only for its provider's own endpoint.
         """
         self._require_writable()
+        await self._refuse_embedding_change_during_reindex(db, kind)
         binding = build_binding(
             kind=kind,
             provider=draft.provider,
@@ -201,6 +341,7 @@ class ModelSettings:
             auth_strategy=draft.auth_strategy,
             options=draft.options,
             parameters=draft.parameters,
+            token_limits=draft.token_limits,
             config_source="settings",
         )
         _require_provider_endpoint_for_environment_credentials(binding)
@@ -214,13 +355,14 @@ class ModelSettings:
                 secret_ref = await self._kept_secret_ref(db, binding)
             binding = replace(binding, secret_ref=secret_ref)
         if previous is not None:
-            binding = _carry_over_check(binding, previous, key_replaced=bool(new_key))
+            binding = _carry_over_check(binding, previous)
         await db.put_model_binding(kind, "candidate", binding_record(binding), secret=secret)
         return await self.view(db, kind)
 
     async def discard_candidate(self, db: "Database", kind: ModelKind) -> KindView:
         """Delete the candidate of ``kind``; the active binding is untouched."""
         self._require_writable()
+        await self._refuse_embedding_change_during_reindex(db, kind)
         await db.delete_model_binding(kind, "candidate")
         return await self.view(db, kind)
 
@@ -230,8 +372,14 @@ class ModelSettings:
         A candidate that fails stays the candidate, with the outcome recorded
         on it. The outcome applies only to the candidate that was checked: one
         saved again while its check ran is neither promoted nor marked.
+
+        An embedding candidate that passes becomes active at once only when
+        its vectors belong in the index in use, or when the installation has
+        no index yet and can start one for it. Otherwise it stays the
+        candidate, validated, until the index is rebuilt for it.
         """
         self._require_writable()
+        await self._refuse_embedding_change_during_reindex(db, kind)
 
         async def read() -> ModelBinding:
             binding = await self._candidate(db, kind)
@@ -243,12 +391,20 @@ class ModelSettings:
             validation = await self._validation(db, binding)
             state = state_after_check(binding.state, passed=validation.passed)
             assert binding.saved_at is not None
-            if validation.passed:
+            promote = validation.passed
+            first_index: Mapping[str, Any] | None = None
+            if promote and kind == "embedding":
+                promote, first_index = await self._index_for_promotion(
+                    db,
+                    replace(binding, state=state, validation=validation),
+                )
+            if promote:
                 applied = await db.promote_model_candidate(
                     kind,
                     updated_at=binding.saved_at,
                     state=state,
                     validation=validation_record(validation),
+                    vector_index=first_index,
                 )
             else:
                 applied = await db.record_model_binding_validation(
@@ -266,8 +422,9 @@ class ModelSettings:
             return ValidationOutcome(
                 kind=kind,
                 validation=validation,
-                promoted=validation.passed,
+                promoted=promote,
                 state=state,
+                reindex_required=validation.passed and not promote,
             )
 
         return await self._check_once(db, kind, "candidate", read=read, check=check)
@@ -295,6 +452,8 @@ class ModelSettings:
                     state=state,
                     validation=validation_record(validation),
                 )
+            if kind == "embedding" and validation.passed:
+                await self._settle_first_index(db, replace(binding, state=state, validation=validation))
             return ValidationOutcome(kind=kind, validation=validation, promoted=False, state=state)
 
         return await self._check_once(db, kind, "active", read=read, check=check)
@@ -361,6 +520,179 @@ class ModelSettings:
                     outcome.state,
                     outcome.validation.error_code,
                 )
+
+    async def reindex_running(self, db: "Database") -> bool:
+        """Whether the vector index of ``db`` is being rebuilt, here or by another process."""
+        return self._indexes(db) is not None and await db.vector_reindex_running()
+
+    async def prepare_vector_index(self, db: "Database") -> None:
+        """Bring the vector index of a starting server into order.
+
+        A rebuild that a stopped process left unfinished is recorded as
+        interrupted, what it or a replaced index left behind is deleted, and
+        an installation with no index in use gets its first one when the
+        active embedding binding has passed its check.
+        """
+        indexes = self._indexes(db)
+        if indexes is None:
+            return
+        try:
+            await indexes.clean_up()
+            await self._settle_first_index(db, await self._active(db, "embedding"))
+        except Exception:
+            logger.exception("Could not prepare the Memory vector index")
+
+    async def start_reindex(
+        self,
+        db: "Database",
+        *,
+        on_switch: Callable[[], None] | None = None,
+    ) -> VectorIndexView:
+        """Start a rebuild of the vector index beside the server and report it.
+
+        The rebuild is for the embedding candidate that waits for it, or else
+        for the active embedding binding when the index in use was built with
+        another model, was adopted, or is missing. An active binding that has
+        not passed a check as it stands is checked first, and the rebuild is
+        refused when it fails. ``on_switch`` is called once the rebuilt index
+        is in use.
+        """
+        indexes, target = await self._reindex_target(db)
+        record = await self._admit_reindex(indexes, target)
+        task = asyncio.create_task(self._run_reindex(indexes, record, target, on_switch=on_switch))
+        self._reindex_tasks.add(task)
+        task.add_done_callback(self._reindex_tasks.discard)
+        return await self.vector_index(db, count_vectors=True)
+
+    async def run_reindex(
+        self,
+        db: "Database",
+        *,
+        progress: "ReindexProgress | None" = None,
+    ) -> Mapping[str, Any]:
+        """Rebuild the vector index and return the record of the rebuild once it has ended."""
+        indexes, target = await self._reindex_target(db)
+        record = await self._admit_reindex(indexes, target)
+        return await indexes.rebuild(record, target, progress=progress)
+
+    async def shutdown(self) -> None:
+        """Stop the rebuilds this server is running; each is recorded as interrupted."""
+        tasks = list(self._reindex_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _admit_reindex(
+        self,
+        indexes: "MemoryVectorIndexes",
+        target: "ReindexTarget",
+    ) -> Mapping[str, Any]:
+        try:
+            return await indexes.start_rebuild(target)
+        except VectorReindexRefused as exc:
+            raise ModelConfigError(exc.code, exc.message) from exc
+
+    async def _run_reindex(
+        self,
+        indexes: "MemoryVectorIndexes",
+        record: Mapping[str, Any],
+        target: "ReindexTarget",
+        *,
+        on_switch: Callable[[], None] | None,
+    ) -> None:
+        finished = await indexes.rebuild(record, target)
+        if finished["state"] == "active" and on_switch is not None:
+            on_switch()
+
+    async def _reindex_target(self, db: "Database") -> tuple["MemoryVectorIndexes", "ReindexTarget"]:
+        """Decide which embedding binding a rebuild started now is for."""
+        from memforge.memory.reindex import ReindexTarget
+
+        indexes = self._indexes(db)
+        if indexes is None:
+            raise ModelConfigError(
+                "reindex_not_available",
+                "The vector index of this deployment is not rebuilt from here.",
+            )
+        active = await self._active(db, "embedding")
+        if active is not None and embedding_profile(active) is None:
+            # A rebuild needs the vector length of the model, which a check observes.
+            await self.validate_active(db, "embedding")
+            active = await self._active(db, "embedding")
+        candidate = await self._candidate(db, "embedding")
+        in_use = await db.get_active_vector_index()
+        slot = _reindex_slot(active, candidate, in_use)
+        if slot != "candidate" and embedding_profile(active) is None:
+            raise ModelConfigError(
+                "embedding_not_validated",
+                "The embedding model has to pass its check before the vector index is rebuilt.",
+            )
+        if slot is None:
+            raise ModelConfigError(REINDEX_NOT_REQUIRED, REINDEX_NOT_REQUIRED_MESSAGE)
+        binding = candidate if slot == "candidate" else active
+        assert binding is not None
+        profile = embedding_profile(binding)
+        assert profile is not None and binding.validation is not None
+        promotion: Mapping[str, Any] | None = None
+        if slot == "candidate":
+            promotion = {
+                "updated_at": binding.saved_at,
+                "state": binding.state,
+                "validation": validation_record(binding.validation),
+            }
+        return indexes, ReindexTarget(
+            profile=profile,
+            invocation=await resolve_invocation(db, self._config, binding),
+            binding_slot=slot,
+            promotion=promotion,
+        )
+
+    async def _index_for_promotion(
+        self,
+        db: "Database",
+        candidate: ModelBinding,
+    ) -> tuple[bool, Mapping[str, Any] | None]:
+        """Decide whether a validated embedding candidate may become active now.
+
+        Returns whether it may, and the first index to record with it for an
+        installation that has no index in use. Stored vectors are adopted for
+        the candidate only when it names the model the active binding names:
+        they were made by the model in use.
+        """
+        indexes = self._indexes(db)
+        profile = embedding_profile(candidate)
+        if indexes is None or profile is None:
+            return True, None
+        in_use = await db.get_active_vector_index()
+        if in_use is not None:
+            return profile.fingerprint == in_use["fingerprint"], None
+        first_index = await indexes.first_index_record(profile)
+        if first_index is None:
+            return False, None
+        active = await self._active(db, "embedding")
+        if first_index["adopted"] and active is not None and embedding_identity(active) != profile.identity:
+            return False, None
+        return True, first_index
+
+    async def _settle_first_index(self, db: "Database", active: ModelBinding | None) -> None:
+        indexes = self._indexes(db)
+        profile = embedding_profile(active)
+        if indexes is not None and profile is not None:
+            await indexes.settle(profile)
+
+    async def _refuse_embedding_change_during_reindex(self, db: "Database", kind: ModelKind) -> None:
+        """Keep the embedding candidate as it is while the index is rebuilt for it."""
+        if kind != "embedding" or self._indexes(db) is None:
+            return
+        if await db.vector_reindex_running():
+            raise ModelConfigError(
+                REINDEX_IN_PROGRESS,
+                "The vector index is being rebuilt. Change the embedding model once the rebuild has finished.",
+            )
+
+    def _indexes(self, db: "Database") -> "MemoryVectorIndexes | None":
+        """The vector indexes this service manages for ``db``, if the runtime provider has it do so."""
+        return memory_vector_indexes(self._runtime_provider, db, self._config)
 
     async def discovery_key(
         self,
@@ -450,9 +782,7 @@ class ModelSettings:
                 generation=invocation,
                 embedding=None,
                 request_timeout_s=min(llm.request_timeout_s, GENERATION_CHECK_TIMEOUT_S),
-                max_input_tokens=llm.max_input_tokens,
-                context_window_tokens=llm.context_window_tokens,
-                max_output_tokens=llm.max_output_tokens,
+                **generation_token_limits(llm, binding.token_limits),
                 input_budget_fraction=llm.input_budget_fraction,
             ),
             max_concurrent=llm.enrichment_max_concurrent,
@@ -461,8 +791,19 @@ class ModelSettings:
             return CapabilityCheck(error_code="not_configured")
         return await check_generation(client)
 
-    async def _binding_view(self, db: "Database", binding: ModelBinding) -> BindingView:
-        return BindingView(binding=binding, key=await self._key_view(db, binding))
+    async def _binding_view(
+        self,
+        db: "Database",
+        binding: ModelBinding,
+        *,
+        waits_for_reindex: bool = False,
+    ) -> BindingView:
+        return BindingView(
+            binding=binding,
+            key=await self._key_view(db, binding),
+            profile=embedding_profile(binding),
+            waits_for_reindex=waits_for_reindex,
+        )
 
     async def _key_view(self, db: "Database", binding: ModelBinding) -> KeyView:
         source = key_source(binding)
@@ -516,21 +857,64 @@ def _require_provider_endpoint_for_environment_credentials(binding: ModelBinding
     raise ModelConfigError("environment_endpoint_not_allowed", message)
 
 
-def _carry_over_check(
-    binding: ModelBinding,
-    previous: ModelBinding,
-    *,
-    key_replaced: bool,
-) -> ModelBinding:
+def _carry_over_check(binding: ModelBinding, previous: ModelBinding) -> ModelBinding:
     """Give a saved candidate the state and latest check of the one it replaces.
 
-    A passed check stays on record, and a change to what it vouched for leaves
-    the candidate to be validated again. A failed check is kept only while the
-    settings and the key it failed with are unchanged.
+    A passed check stays on record, and a change to what it vouched for, the
+    key included, leaves the candidate to be validated again. A failed check
+    is kept only while the settings and the key it failed with are unchanged.
     """
     state = state_after_change(previous.state, previous_digest=previous.digest, digest=binding.digest)
     validation = previous.validation
-    if validation is not None and not validation.passed:
-        if key_replaced or previous.digest != binding.digest:
-            validation = None
+    if validation is not None and not validation.passed and previous.digest != binding.digest:
+        validation = None
     return replace(binding, state=state, validation=validation)
+
+
+def _fingerprint_in_use(active: ModelBinding, in_use: Mapping[str, Any]) -> str:
+    """The fingerprint the active embedding binding embeds with, as far as it is known.
+
+    A binding that has not passed a check as it stands is taken to answer with
+    the vector length of the index in use, so that only its settings decide
+    whether it is the model the index was built with.
+    """
+    profile = embedding_profile(active) or embedding_identity(active).profile(int(in_use["dimension"]))
+    return profile.fingerprint
+
+
+def _waits_for_reindex(candidate: ModelBinding, in_use: Mapping[str, Any] | None) -> bool:
+    """Whether a candidate has passed its check and only the vector index keeps it from use."""
+    profile = embedding_profile(candidate)
+    if profile is None or candidate.state != "ready":
+        return False
+    return in_use is None or profile.fingerprint != in_use["fingerprint"]
+
+
+def _reindex_slot(
+    active: ModelBinding | None,
+    candidate: ModelBinding | None,
+    in_use: Mapping[str, Any] | None,
+    *,
+    stored_vectors: bool = False,
+) -> BindingSlot | None:
+    """Which embedding binding a rebuild of the vector index would be for, if any.
+
+    A candidate that waits for the index comes first. Otherwise the active
+    binding, when the index in use is missing, was built with another model,
+    or was adopted with its model assumed.
+
+    An active binding that has not passed a check as it stands is judged by
+    its settings, as ``_fingerprint_in_use`` reads them. With no index in use
+    there is a rebuild for it only when ``stored_vectors`` says the
+    installation holds vectors: without any, its first answer gives the
+    installation an empty index that needs no rebuild.
+    """
+    if candidate is not None and _waits_for_reindex(candidate, in_use):
+        return "candidate"
+    if active is None:
+        return None
+    if in_use is None:
+        return "active" if stored_vectors or embedding_profile(active) is not None else None
+    if in_use["adopted"] or _fingerprint_in_use(active, in_use) != in_use["fingerprint"]:
+        return "active"
+    return None

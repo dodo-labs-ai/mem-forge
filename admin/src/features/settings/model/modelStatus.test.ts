@@ -1,6 +1,14 @@
 import { describe, expect, test } from "vitest";
 import { PROVIDERS, makeBinding, makeEmbeddingBinding, makeValidation } from "@/test/modelSettingsFixtures";
-import { failureReason, providerLabel, stateBadge, validationFacts, validationNotes, validationSummary } from "./modelStatus";
+import {
+  failureReason,
+  needsTokenLimits,
+  providerLabel,
+  stateBadge,
+  validationFacts,
+  validationNotes,
+  validationSummary,
+} from "./modelStatus";
 
 const NOW = new Date("2026-03-02T09:05:00Z");
 
@@ -66,6 +74,19 @@ describe("validationSummary", () => {
     );
   });
 
+  test("a model the server has no token limits for is told where to give them", () => {
+    const refused = makeValidation({ passed: false, error_code: "token_limits_required", facts: { token_limits_known: false } });
+    const saved = makeBinding({ state: "not_validated", validation: refused });
+    const deployed = makeBinding({ state: "not_validated", validation: refused, config_source: "deployment" });
+
+    expect(validationSummary(saved, "candidate", NOW).detail).toBe(
+      "The model answered, but MemForge has no token limits for it. Enter its context window and maximum output, then validate again.",
+    );
+    expect(validationSummary(deployed, "active", NOW).detail).toBe(
+      "The model answered, but MemForge has no token limits for it. Set MEMFORGE_LLM_MAX_INPUT_TOKENS, MEMFORGE_LLM_CONTEXT_WINDOW_TOKENS and MEMFORGE_LLM_MAX_OUTPUT_TOKENS on the server. MemForge keeps using this model.",
+    );
+  });
+
   test("a pass from before a change asks for another validation", () => {
     const stale = makeBinding({ state: "needs_revalidation", validation: makeValidation({ current: false }) });
 
@@ -91,18 +112,26 @@ test("validation facts are read by type, and anything else is left out", () => {
   expect(validationFacts(validation)).toEqual({ dimension: 768, token_limits_known: false });
 });
 
-describe("validationNotes", () => {
-  test("a generation model without known token limits needs them set on the server", () => {
-    const notes = validationNotes("generation", makeValidation({ facts: { token_limits_known: false, schema_fallback: true } }));
+test("a model needs its token limits stated once a validation found that the server has none", () => {
+  const refused = makeValidation({ passed: false, error_code: "token_limits_required", facts: { token_limits_known: false } });
 
-    expect(notes).toHaveLength(2);
-    expect(notes[0]).toContain("MEMFORGE_LLM_MAX_INPUT_TOKENS");
-    expect(notes[1]).toContain("JSON as text");
+  expect(needsTokenLimits(makeBinding({ validation: refused }))).toBe(true);
+  expect(needsTokenLimits(makeBinding({ validation: makeValidation({ passed: false, error_code: "timeout", facts: {} }) }))).toBe(false);
+  expect(needsTokenLimits(makeBinding())).toBe(false);
+  expect(needsTokenLimits(makeBinding({ validation: null }))).toBe(false);
+});
+
+describe("validationNotes", () => {
+  test("a generation model that takes no JSON schema is asked for JSON as text", () => {
+    const notes = validationNotes("generation", makeValidation({ facts: { schema_fallback: true } }));
+
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain("JSON as text");
   });
 
   test("there is nothing to note for a plain pass, a failure or an embedding model", () => {
     expect(validationNotes("generation", makeValidation())).toEqual([]);
-    expect(validationNotes("generation", makeValidation({ passed: false, facts: { token_limits_known: false } }))).toEqual([]);
+    expect(validationNotes("generation", makeValidation({ passed: false, facts: { schema_fallback: true } }))).toEqual([]);
     expect(validationNotes("embedding", makeEmbeddingBinding().validation)).toEqual([]);
     expect(validationNotes("generation", null)).toEqual([]);
   });

@@ -9,17 +9,23 @@ type Schemas = components["schemas"];
 export type ModelBinding = Schemas["ModelBindingResponse"];
 /** The model of one kind that is in use (`active`) and the edit that waits to be validated (`candidate`). */
 export type ModelKindSettings = Schemas["ModelKindSettingsResponse"];
-/** The models of both kinds, with whether this installation lets Settings change them. */
+/** The models of both kinds, the search index, and whether this installation lets Settings change the models. */
 export type ModelSettings = Schemas["ModelSettingsResponse"];
+/**
+ * The search index: the vectors of all memories, which belong to one
+ * embedding model. It says whether it fits the model in use and how the
+ * latest rebuild of it went.
+ */
+export type VectorIndex = Schemas["VectorIndexResponse"];
 /** The two models MemForge calls: one writes memories, one embeds them for search. */
 export type ModelKind = ModelBinding["kind"];
 
 export const MODEL_KINDS: readonly ModelKind[] = ["generation", "embedding"];
 
 /**
- * Query keys of the model settings. Settings and the notice in the app shell
- * read the one answer, so a model that passes validation clears the notice
- * without another request.
+ * Query keys of the model settings. Settings and the notices in the app shell
+ * read the one answer, so a model that passes validation or a search index
+ * that is rebuilt clears its notice without another request.
  */
 export const modelSettingsQueryKeys = {
   all: ["model-settings"] as const,
@@ -41,19 +47,26 @@ function awaitsBackgroundValidation(settings: ModelSettings | undefined): boolea
   });
 }
 
+/** How often the settings are read again while the search index is rebuilt, to follow its progress. */
+const REINDEX_REFETCH_MS = 2_000;
+
 /**
- * The model settings of the workspace. A server validates the models it
- * starts with in the background, so the answer is read again for a few
- * minutes until each of them has a result.
+ * The model settings of the workspace. A rebuild of the search index runs
+ * beside the server and ends by putting a model to use, so the answer is read
+ * again every two seconds for as long as one runs. A server also validates
+ * the models it starts with in the background, so the answer is read again
+ * for a few minutes until each of them has a result.
  */
 export function useModelSettings() {
   const api = useApi();
   return useQuery({
     queryKey: modelSettingsQueryKeys.settings,
     queryFn: () => unwrap(api.GET("/api/v1/model-settings")),
-    refetchInterval: ({ state }) =>
-      awaitsBackgroundValidation(state.data) && state.dataUpdateCount < BACKGROUND_VALIDATION_MAX_READS
+    refetchInterval: ({ state }) => {
+      if (state.data?.vector_index.status === "reindexing") return REINDEX_REFETCH_MS;
+      return awaitsBackgroundValidation(state.data) && state.dataUpdateCount < BACKGROUND_VALIDATION_MAX_READS
         ? BACKGROUND_VALIDATION_REFETCH_MS
-        : false,
+        : false;
+    },
   });
 }

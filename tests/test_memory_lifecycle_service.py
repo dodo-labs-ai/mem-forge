@@ -45,6 +45,7 @@ from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from tests.unit_support_fixture import primary_reference, record_unit_support
 from tests.embedding_fixture import unconfigured_embedding
+from tests.vector_index_fixture import use_collection_as_index
 
 
 class RecordingCollection:
@@ -1855,10 +1856,7 @@ async def test_purge_memory_route_requires_workspace_administrator_for_workspace
 
 @pytest.mark.asyncio
 async def test_purge_memory_route_lets_owner_purge_own_private_memory(db: Database, tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "memforge.runtime.get_chroma_collection",
-        lambda **_kwargs: RecordingCollection(),
-    )
+    use_collection_as_index(monkeypatch, RecordingCollection())
     memory = _private_memory("mem-purge-own", "Bob's private fact", owner_user_id="bob@example.test")
     await db.insert_memory(memory)
     app = _member_app(db, tmp_path, user_id="bob@example.test")
@@ -1934,10 +1932,7 @@ async def test_purge_memory_route_removes_retired_workspace_memory_and_audits_ac
     monkeypatch,
 ):
     collection = RecordingCollection()
-    monkeypatch.setattr(
-        "memforge.runtime.get_chroma_collection",
-        lambda **_kwargs: collection,
-    )
+    use_collection_as_index(monkeypatch, collection)
     memory = replace(_memory("mem-purge-retired", "Retired workspace fact"), status="retired")
     await db.insert_memory(memory)
     app = _member_app(db, tmp_path, user_id="admin@example.test", workspace_role="workspace_admin")
@@ -2020,6 +2015,7 @@ async def test_propose_memory_correction_route_creates_review_for_workspace_memb
         return [0.1, 0.2, 0.3]
 
     monkeypatch.setattr("memforge.memory.store.MemoryStore._embed", fake_embed)
+    use_collection_as_index(monkeypatch, RecordingCollection())
     old = await _source_backed_memory(db, suffix="route-review", source_owner="source-owner")
     app = create_admin_app(
         db=db,

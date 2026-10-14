@@ -92,6 +92,27 @@ test("a failed decision keeps the comparison and the typed note, and offers a re
   expect(screen.getByLabelText("Decision note")).toHaveValue("Checked with payroll");
 });
 
+test("a decision made while the search index is rebuilt says so, and asks for no reload", async () => {
+  const review = makeReviewDetail();
+  renderReview(review, {
+    "POST /api/v1/memory-reviews/review-1/approve": () =>
+      errorResponse(409, {
+        error: "reindex_in_progress",
+        message: "The Memory vector index is being rebuilt. Memories cannot be changed until the rebuild has finished.",
+      }),
+  });
+  const user = userEvent.setup();
+
+  await user.click(await screen.findByRole("button", { name: "Use latest state" }));
+
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent(
+    "The search index is being rebuilt, so this change has to wait. Try again when the rebuild has finished. Settings shows its progress.",
+  );
+  expect(within(alert).queryByRole("button", { name: "Reload review" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Use latest state" })).toBeEnabled();
+});
+
 test("a caller who cannot decide sees the review as view only", async () => {
   renderReview(makeReviewDetail({ can_decide: false }));
 

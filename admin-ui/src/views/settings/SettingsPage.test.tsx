@@ -23,6 +23,17 @@ const SETTINGS: ModelSettings = {
     },
   },
   embedding: { active: null },
+  vector_index: { status: "not_configured", index: null },
+};
+
+const EMBEDDING: ModelSettings["embedding"] = {
+  active: {
+    kind: "embedding",
+    provider: "ollama",
+    endpoint: "http://localhost:11434",
+    model_id: "nomic-embed-text",
+    state: "ready",
+  },
 };
 
 function renderPage(settings: ModelSettings) {
@@ -54,6 +65,33 @@ it("shows the models in use and where they are changed, with nothing to edit", a
   expect(screen.getByRole("link", { name: "Settings in the new admin" }).getAttribute("href")).toBe("/v2/settings");
   expect(screen.queryByRole("textbox")).toBeNull();
   expect(screen.queryByRole("button")).toBeNull();
+});
+
+it("says how many memories the search index holds, under the embedding model that built it", async () => {
+  renderPage({ ...SETTINGS, embedding: EMBEDDING, vector_index: { status: "ready", index: { vector_count: 1204 } } });
+
+  const embedding = await screen.findByRole("region", { name: "Embedding model" });
+  expect(within(embedding).getByText("Search index: ready, with 1,204 memories.")).toBeTruthy();
+  expect(within(screen.getByRole("region", { name: "Generation model" })).queryByText(/Search index/)).toBeNull();
+});
+
+it("says that vector search is off until the search index is rebuilt in the new admin", async () => {
+  renderPage({ ...SETTINGS, embedding: EMBEDDING, vector_index: { status: "reindex_required", index: null } });
+
+  const embedding = await screen.findByRole("region", { name: "Embedding model" });
+  expect(
+    within(embedding).getByText(
+      "Search index: has to be rebuilt for this model. Vector search is off until it is; start the rebuild in Settings in the new admin.",
+    ),
+  ).toBeTruthy();
+  expect(screen.queryByRole("button")).toBeNull();
+});
+
+it("says nothing about a search index the deployment keeps by its own means", async () => {
+  renderPage({ ...SETTINGS, embedding: EMBEDDING, vector_index: { status: "not_managed", index: null } });
+
+  await screen.findByRole("region", { name: "Embedding model" });
+  expect(screen.queryByText(/Search index/)).toBeNull();
 });
 
 it("says so when the deployment environment manages the models", async () => {

@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import tempfile
 import time
 import unicodedata
@@ -129,6 +130,14 @@ from memforge.memory.review_decision import (
     memory_review_decision_fingerprint,
 )
 from memforge.model_settings import ModelSettings
+from memforge.llm.embedding import EmbeddingIndexMismatch
+from memforge.vector_index_errors import (
+    REINDEX_IN_PROGRESS,
+    REINDEX_IN_PROGRESS_MESSAGE,
+    NoVectorIndex,
+    ReindexInProgress,
+    is_reindex_refusal,
+)
 from memforge.memory.store import MemoryStore
 from memforge.models import (
     ConfigField,
@@ -262,6 +271,9 @@ logger = logging.getLogger(__name__)
 
 # How long to wait before trying again to empty a write-ahead log a reader holds.
 _KEY_ERASURE_RETRY_S = 30.0
+# How long a search engine whose embedding model is not the vector index's is
+# kept before it is built again for the model then in use.
+_SEARCH_ENGINE_REBUILD_S = 30.0
 
 
 async def _run_source_access_background(
@@ -3938,11 +3950,9 @@ async def _build_memory_store(
 ) -> MemoryStore:
     """Build a request-scoped memory store that embeds with the active embedding model."""
 
-    from memforge.llm.bindings import resolve_active_invocation
     from memforge.memory.audit import MemoryAuditLogger
-    from memforge.runtime import build_embedding_runtime
+    from memforge.runtime import build_active_embedding_runtime
 
-    embedding = await resolve_active_invocation(db, config, "embedding")
     provider = runtime_provider or DefaultRuntimeProvider()
     default_audit_context = audit_context or AuditContext(actor_type="admin")
     audit_logger = MemoryAuditLogger(db, default_context=default_audit_context)
@@ -3951,7 +3961,7 @@ async def _build_memory_store(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embedding=build_embedding_runtime(embedding, config),
+        embedding=await build_active_embedding_runtime(db, config, provider),
         audit_logger=audit_logger,
     )
 
@@ -4124,8 +4134,31 @@ def get_model_settings(request: Request) -> ModelSettings:
 
 
 async def _validate_models_after_startup(app: FastAPI) -> None:
-    """Check the active model bindings that have not passed a check as they stand."""
+    """Check the active model bindings that have not passed a check as they stand.
+
+    The vector index is brought into order first, which asks no model: a
+    rebuild that a stopped server left unfinished is ended before anything
+    waits for a provider. An embedding model that passes its check here gives
+    an installation without an index its first one.
+    """
+    await app.state.model_settings.prepare_vector_index(app.state.db)
     await app.state.model_settings.validate_unready_active_bindings(app.state.db)
+
+
+async def refuse_memory_writes_during_reindex(
+    request: Request,
+    db: Database = Depends(get_db),
+) -> None:
+    """FastAPI dependency: refuse a request that changes Memories while the vector index is rebuilt.
+
+    A rebuild embeds every searchable Memory as it stands, so Memories are
+    not created, corrected, retired or decided on until it has finished.
+    """
+    if await request.app.state.model_settings.reindex_running(db):
+        raise HTTPException(
+            status_code=409,
+            detail={"error": REINDEX_IN_PROGRESS, "message": REINDEX_IN_PROGRESS_MESSAGE},
+        )
 
 
 async def _erase_plaintext_model_keys(db: Database) -> None:
@@ -4361,6 +4394,7 @@ def create_admin_app(
                         await background_task
                     except asyncio.CancelledError:
                         pass
+            await app.state.model_settings.shutdown()
             if app.state.sync_scheduler is not None:
                 await app.state.sync_scheduler.shutdown()
             await app.state.sync_service.shutdown()
@@ -4583,6 +4617,34 @@ def create_admin_app(
         logger.exception("Unhandled server error")
         return _json_error(500, "Internal server error")
 
+    @app.exception_handler(ReindexInProgress)
+    @app.exception_handler(sqlite3.IntegrityError)
+    async def refused_during_reindex_handler(request: Request, exc: Exception):
+        """Answer a write the database refused during a rebuild of the vector index with its code."""
+        if not is_reindex_refusal(exc):
+            raise exc
+        return JSONResponse(
+            status_code=409,
+            content={"detail": {"error": REINDEX_IN_PROGRESS, "message": REINDEX_IN_PROGRESS_MESSAGE}},
+        )
+
+    @app.exception_handler(EmbeddingIndexMismatch)
+    @app.exception_handler(NoVectorIndex)
+    async def waits_for_vector_index_handler(request: Request, exc: Exception):
+        """Answer a write whose vector has no index to go to; it can be repeated once there is one."""
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": {
+                    "error": exc.code,
+                    "message": (
+                        "The vector index has to be rebuilt for the embedding model in use "
+                        "before this change can be made."
+                    ),
+                }
+            },
+        )
+
     # -- Register routers --
     health_router = APIRouter(tags=["health"])
     document_router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
@@ -4615,15 +4677,25 @@ def create_admin_app(
     async def get_search_engine(request: Request, db: Database, config: AppConfig):
         from memforge.memory.audit import AuditContext, MemoryAuditLogger
 
-        engine = getattr(request.app.state, "memory_search_engine", None)
+        state = request.app.state
+        engine = getattr(state, "memory_search_engine", None)
+        if (
+            engine is not None
+            and getattr(engine, "serves_another_index", False)
+            and time.monotonic() - getattr(state, "memory_search_engine_built_at", 0.0) > _SEARCH_ENGINE_REBUILD_S
+        ):
+            # The vector index was built with another embedding model than
+            # this engine's. That model may be the one in use by now.
+            engine = None
         if engine is None:
-            runtime_provider = request.app.state.runtime_provider
+            runtime_provider = state.runtime_provider
             engine = await runtime_provider.build_search_engine(
                 db,
                 config,
                 audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="admin")),
             )
-            request.app.state.memory_search_engine = engine
+            state.memory_search_engine = engine
+            state.memory_search_engine_built_at = time.monotonic()
         return engine
 
     # ===================================================================
@@ -5348,7 +5420,11 @@ def create_admin_app(
     # route with a fixed reason and no content hash, visibility check or actor.
     # The admin UI uses POST /memories/{id}/retire; this route is removed with
     # the V1 admin UI (ADR 0044).
-    @memory_router.put("/{memory_id}", deprecated=True)
+    @memory_router.put(
+        "/{memory_id}",
+        deprecated=True,
+        dependencies=[Depends(refuse_memory_writes_during_reindex)],
+    )
     async def update_memory(
         memory_id: str,
         req: MemoryUpdateRequest = Body(...),
@@ -5414,7 +5490,11 @@ def create_admin_app(
 
         return {"status": "updated", "memory_id": memory_id}
 
-    @memory_router.post("/create", response_model=MemoryCreateResponse)
+    @memory_router.post(
+        "/create",
+        response_model=MemoryCreateResponse,
+        dependencies=[Depends(refuse_memory_writes_during_reindex)],
+    )
     async def create_memory_route(
         req: MemoryCreateRequest,
         request: Request,
@@ -5485,6 +5565,7 @@ def create_admin_app(
     @memory_router.post(
         "/maintenance-closures/apply",
         response_model=MemoryMaintenanceClosureApplyResponse,
+        dependencies=[Depends(refuse_memory_writes_during_reindex)],
     )
     async def apply_memory_maintenance_closures(
         req: MemoryMaintenanceClosureApplyRequest,
@@ -5562,6 +5643,7 @@ def create_admin_app(
     @memory_router.post(
         "/cross-source-review-conversion/apply",
         response_model=CrossSourceReviewConversionReceiptResponse,
+        dependencies=[Depends(refuse_memory_writes_during_reindex)],
     )
     async def apply_cross_source_review_conversion(
         body: CrossSourceReviewConversionApplyRequest,
@@ -5652,7 +5734,11 @@ def create_admin_app(
             rerun_count=await db.rerun_relation_discovery_work(selection, actor=actor)
         )
 
-    @memory_router.post("/{memory_id}/retire", response_model=MemoryLifecycleResponse)
+    @memory_router.post(
+        "/{memory_id}/retire",
+        response_model=MemoryLifecycleResponse,
+        dependencies=[Depends(refuse_memory_writes_during_reindex)],
+    )
     async def retire_memory_route(
         memory_id: str,
         req: MemoryRetireRequest,
@@ -5686,6 +5772,7 @@ def create_admin_app(
     @memory_router.post(
         "/{memory_id}/corrections/propose",
         response_model=MemoryCorrectionProposalResponse,
+        dependencies=[Depends(refuse_memory_writes_during_reindex)],
     )
     async def propose_memory_correction_route(
         memory_id: str,
@@ -5731,7 +5818,10 @@ def create_admin_app(
             review_id=result.review_id,
         )
 
-    @memory_router.delete("/{memory_id}/purge")
+    @memory_router.delete(
+        "/{memory_id}/purge",
+        dependencies=[Depends(refuse_memory_writes_during_reindex)],
+    )
     async def purge_memory(
         memory_id: str,
         request: Request,
@@ -7039,7 +7129,10 @@ def create_admin_app(
             "lifecycle_plan_id": plan.id,
         }
 
-    @source_router.post("/{source_id}/memory-lifecycle/reviews/{review_id}/approve")
+    @source_router.post(
+        "/{source_id}/memory-lifecycle/reviews/{review_id}/approve",
+        dependencies=[Depends(refuse_memory_writes_during_reindex)],
+    )
     async def approve_source_lifecycle_review(
         source_id: str,
         review_id: str,
@@ -7063,7 +7156,10 @@ def create_admin_app(
             runtime_provider=runtime_provider,
         )
 
-    @source_router.post("/{source_id}/memory-lifecycle/reviews/{review_id}/reject")
+    @source_router.post(
+        "/{source_id}/memory-lifecycle/reviews/{review_id}/reject",
+        dependencies=[Depends(refuse_memory_writes_during_reindex)],
+    )
     async def reject_source_lifecycle_review(
         source_id: str,
         review_id: str,
@@ -8873,7 +8969,11 @@ def create_admin_app(
         released_source_ids = await adapters.relational.list_sources_released_by_project_deletion(project_id)
         return ProjectDeletionImpactResponse(memory_count=len(memory_ids), source_count=len(released_source_ids))
 
-    @projects_router.delete("/{project_id}", response_model=ProjectDeleteResponse)
+    @projects_router.delete(
+        "/{project_id}",
+        response_model=ProjectDeleteResponse,
+        dependencies=[Depends(refuse_memory_writes_during_reindex)],
+    )
     async def delete_project_route(
         request: Request,
         project_id: str,
@@ -9060,7 +9160,11 @@ def create_admin_app(
             artifact_store=artifact_store,
         )
 
-    @review_router.post("/{review_id}/approve", response_model=MemoryReviewDetailResponse)
+    @review_router.post(
+        "/{review_id}/approve",
+        response_model=MemoryReviewDetailResponse,
+        dependencies=[Depends(refuse_memory_writes_during_reindex)],
+    )
     async def approve_memory_review(
         review_id: str,
         request: Request,
@@ -9151,7 +9255,11 @@ def create_admin_app(
             artifact_store=artifact_store,
         )
 
-    @review_router.post("/{review_id}/reject", response_model=MemoryReviewDetailResponse)
+    @review_router.post(
+        "/{review_id}/reject",
+        response_model=MemoryReviewDetailResponse,
+        dependencies=[Depends(refuse_memory_writes_during_reindex)],
+    )
     async def reject_memory_review(
         review_id: str,
         request: Request,
@@ -9496,6 +9604,7 @@ def create_admin_app(
     @review_router.post(
         "/decisions/apply",
         response_model=MemoryReviewDecisionManifestResponse,
+        dependencies=[Depends(refuse_memory_writes_during_reindex)],
     )
     async def apply_memory_review_decisions(
         req: MemoryReviewDecisionManifestRequest,

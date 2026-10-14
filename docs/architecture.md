@@ -40,9 +40,16 @@ MemForge or contribute to it.
 data volume. The open-source build serves a single user in one workspace named
 `local`, has no authentication and binds to `127.0.0.1`.
 
-Model calls go to the endpoints you configure: one model for extraction and
-semantic judgments, one for embeddings. Without an extraction model a sync
-stores content and creates no memories.
+Model calls go to the endpoints you configure: a generation model, which
+extracts memories and makes semantic judgments, and an embedding model.
+Without a generation model a sync stores content and creates no memories.
+
+The vectors of all memories form one index, built with one embedding model and
+recorded with a fingerprint of that model's settings and vector length.
+Vectors are read and written only by the model the index was built with.
+Changing the embedding model rebuilds the index from the memories in SQLite
+and switches to it in one step; the [quickstart](quickstart.md#changing-the-embedding-model)
+describes the procedure.
 
 ## Adding a source
 

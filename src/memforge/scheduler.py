@@ -15,6 +15,7 @@ from memforge.genes import source_type_supports_sync
 from memforge.runtime import SyncService
 from memforge.storage.document_store import DocumentStore, LocalDocumentStore
 from memforge.storage.source_cleanup import SourceArtifactCleanupService
+from memforge.vector_index_errors import is_reindex_refusal
 
 if TYPE_CHECKING:
     from memforge.storage.database import Database
@@ -129,7 +130,14 @@ class SyncScheduler:
             self._running_jobs.discard(task)
 
     async def _retire_expired_memories(self) -> None:
-        retired_count = await self.sync_service.retire_expired_memories()
+        try:
+            retired_count = await self.sync_service.retire_expired_memories()
+        except Exception as exc:
+            if not is_reindex_refusal(exc):
+                raise
+            # No Memory changes while the vector index is rebuilt.
+            logger.info("Expired memories are retired by the next run: the vector index is being rebuilt")
+            return
         if retired_count:
             logger.info("Retired %d expired memories", retired_count)
 

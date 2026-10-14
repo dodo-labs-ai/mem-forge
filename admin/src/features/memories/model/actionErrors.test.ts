@@ -11,6 +11,12 @@ test("translates the reason codes memory actions return", () => {
   );
 });
 
+test("keeps the explanation of a change that waits for the search index", () => {
+  const waiting = new ApiError(409, "The search index is being rebuilt, so this change has to wait.", "reindex_in_progress");
+
+  expect(actionErrorMessage(waiting)).toBe("The search index is being rebuilt, so this change has to wait.");
+});
+
 test("keeps any other message the server gives", () => {
   expect(actionErrorMessage(new ApiError(500, "The request failed with status 500."))).toBe("The request failed with status 500.");
 });

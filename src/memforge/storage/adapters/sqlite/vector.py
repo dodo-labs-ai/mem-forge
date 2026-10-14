@@ -1,8 +1,14 @@
-"""SqliteVectorStore: wraps the Chroma memories collection.
+"""SqliteVectorStore: wraps the Chroma collection of the Memory vector index.
 
 Owns every distance/score conversion in one place so no caller assumes a
 distance metric: similarity() for ranking, within_dedup_threshold() for the
 duplicate decision.
+
+A store reaches its collection in one of two ways. Built over an open
+collection, it works on that collection. Built with ``of_index_in_use``, it
+opens the index in use for every operation, so it follows a rebuilt index the
+moment that index is put into use and never keeps a collection that has been
+deleted.
 """
 
 from __future__ import annotations
@@ -10,13 +16,18 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from typing import Any, Sequence
 
 from memforge.retrieval.access_predicate import visible_chroma_where
+from memforge.retrieval.vector_index import MemoryVectorIndex
 from memforge.retrieval.vector_metadata import upsert_with_stored_vector_hash
 from memforge.storage.adapters.context import AccessScope
+from memforge.vector_index_errors import NoVectorIndex
 
 __all__ = ["SqliteVectorStore", "SIMILARITY_FLOOR"]
+
+IndexOpener = Callable[[], Awaitable[MemoryVectorIndex | None]]
 
 # Cosine distance can exceed 1.0 for opposed vectors, which would yield a
 # negative similarity. Scores feed rank fusion, where negatives are
@@ -25,12 +36,44 @@ SIMILARITY_FLOOR = 0.0
 
 
 class SqliteVectorStore:
-    """The embedding channel backed by a single Chroma collection."""
+    """The embedding channel backed by the Chroma collection of one vector index."""
 
     distance_metric = "cosine"
 
-    def __init__(self, collection: Any) -> None:
+    def __init__(self, collection: Any, *, index_fingerprint: str | None = None) -> None:
+        """Work on ``collection``, an index built with ``index_fingerprint``.
+
+        A collection given without a fingerprint is bound to no embedding
+        model.
+        """
         self.collection = collection
+        self._index = MemoryVectorIndex(collection=collection, fingerprint=index_fingerprint)
+        self._open_index: IndexOpener | None = None
+
+    @classmethod
+    def of_index_in_use(cls, open_index: IndexOpener) -> SqliteVectorStore:
+        """Work on whichever index ``open_index`` returns at each operation.
+
+        While it returns ``None`` there is nothing to read, and a vector that
+        is to be written is refused with ``NoVectorIndex``.
+        """
+        store = cls(None)
+        store._open_index = open_index
+        return store
+
+    async def _index_in_use(self) -> MemoryVectorIndex | None:
+        if self._open_index is None:
+            return self._index
+        return await self._open_index()
+
+    async def open_collection(self) -> Any | None:
+        """The collection of the index in use, for whoever inspects the index itself."""
+        index = await self._index_in_use()
+        return None if index is None else index.collection
+
+    async def index_fingerprint(self) -> str | None:
+        index = await self._index_in_use()
+        return None if index is None else index.fingerprint
 
     def similarity(self, distance: float) -> float:
         return max(1.0 - distance, SIMILARITY_FLOOR)
@@ -71,6 +114,10 @@ class SqliteVectorStore:
             raise ValueError("vector query batch inputs must have equal length")
         if not embeddings:
             return []
+        index = await self._index_in_use()
+        if index is None:
+            return [[] for _ in embeddings]
+        collection = index.collection
 
         groups: dict[str, list[int]] = defaultdict(list)
         where_by_key: dict[str, dict[str, Any] | None] = {}
@@ -89,7 +136,7 @@ class SqliteVectorStore:
             where = where_by_key[key]
             if where:
                 params["where"] = where
-            results = await asyncio.to_thread(lambda: self.collection.query(**params))
+            results = await asyncio.to_thread(lambda: collection.query(**params))
             result_ids = (results or {}).get("ids") or []
             result_distances = (results or {}).get("distances") or []
             for local_index, output_index in enumerate(indices):
@@ -104,20 +151,29 @@ class SqliteVectorStore:
         embeddings: Sequence[Sequence[float]],
         metadatas: Sequence[dict[str, Any]],
     ) -> None:
+        index = await self._index_in_use()
+        if index is None:
+            raise NoVectorIndex("No Memory vector index is in use, so the vector cannot be written")
         await asyncio.to_thread(
             upsert_with_stored_vector_hash,
-            self.collection,
+            index.collection,
             ids=list(ids),
             embeddings=[list(e) for e in embeddings],
             metadatas=[dict(m) for m in metadatas],
         )
 
     async def delete(self, ids: Sequence[str]) -> None:
-        await asyncio.to_thread(lambda: self.collection.delete(ids=list(ids)))
+        index = await self._index_in_use()
+        if index is None:
+            return
+        await asyncio.to_thread(lambda: index.collection.delete(ids=list(ids)))
 
     async def get_record(self, memory_id: str) -> dict[str, Any] | None:
+        index = await self._index_in_use()
+        if index is None:
+            return None
         raw = await asyncio.to_thread(
-            lambda: self.collection.get(
+            lambda: index.collection.get(
                 ids=[memory_id],
                 include=["embeddings", "metadatas"],
             )
