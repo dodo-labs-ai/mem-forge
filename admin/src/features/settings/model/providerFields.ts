@@ -28,6 +28,15 @@ const PARAMETER_FIELDS: Record<string, ExtraField> = {
   dimensions: { label: "Output dimensions", hint: "Optional. Leave blank for the model's own vector size." },
 };
 
+/** The token limits a model may state, by the name the server gives them. Each is a number of tokens. */
+const TOKEN_LIMIT_FIELDS: Record<string, ExtraField> = {
+  context_window_tokens: {
+    label: "Context window",
+    hint: "In tokens: the most the model takes in one request, its answer included.",
+  },
+  max_output_tokens: { label: "Maximum output", hint: "In tokens: the most the model writes in one answer." },
+};
+
 function fallbackField(name: string): ExtraField {
   const words = name.replaceAll("_", " ");
   return { label: words.charAt(0).toUpperCase() + words.slice(1), hint: "Optional." };
@@ -39,6 +48,10 @@ export function optionField(name: string): ExtraField {
 
 export function parameterField(name: string): ExtraField {
   return PARAMETER_FIELDS[name] ?? fallbackField(name);
+}
+
+export function tokenLimitField(name: string): ExtraField {
+  return TOKEN_LIMIT_FIELDS[name] ?? fallbackField(name);
 }
 
 /** The providers that serve models of `kind`, in the order the server lists them. */
@@ -54,6 +67,11 @@ export function keylessProviders(kind: ModelKind, providers: readonly ModelProvi
 /** The request settings a model of `kind` may set with this provider. */
 export function parameterNames(provider: ModelProvider, kind: ModelKind): string[] {
   return provider.parameters[kind] ?? [];
+}
+
+/** The token limits a model of `kind` may state with this provider. */
+export function tokenLimitNames(provider: ModelProvider, kind: ModelKind): string[] {
+  return provider.token_limits[kind] ?? [];
 }
 
 export interface TextFieldCopy {

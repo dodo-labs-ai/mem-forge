@@ -1,13 +1,14 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { Check, CircleCheck, ListRestart, Loader2, Undo2 } from "lucide-react";
+import { Check, CircleCheck, ListRestart, Loader2, RefreshCw, Undo2 } from "lucide-react";
 import { useEffect, useId, useMemo } from "react";
 import { FormProvider, useForm, useWatch } from "react-hook-form";
+import { isReindexInProgress } from "@/api";
 import { errorMessage } from "@/lib/errors";
 import { ErrorNotice, Notice } from "@/patterns";
 import { Button } from "@/ui/button";
 import { Input } from "@/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/ui/select";
-import { useDiscardCandidate, useDiscoverModels, useSaveCandidate, useValidateCandidate } from "./api";
+import { useDiscardCandidate, useDiscoverModels, useSaveCandidate, useStartReindex, useValidateCandidate } from "./api";
 import { ApiKeyField } from "./ApiKeyField";
 import { describedBy } from "./describedBy";
 import { DiscoveryNotice } from "./DiscoveryNotice";
@@ -22,10 +23,12 @@ import {
   formOrigin,
   isChanged,
   modelFormSchema,
+  offersTokenLimits,
   savedValues,
   valuesForProvider,
   type ModelFormValues,
 } from "./model/modelForm";
+import { needsTokenLimits } from "./model/modelStatus";
 import { preferredModel } from "./model/modelSuggestions";
 import {
   AUTH_HINTS,
@@ -37,11 +40,14 @@ import {
   parameterField,
   parameterNames,
   providersFor,
+  tokenLimitNames,
 } from "./model/providerFields";
 import { savedKeyFor } from "./model/savedKey";
-import type { AuthStrategy, ModelKind, ModelKindSettings, ModelProvider } from "./model/types";
+import { rebuildLabel, startRefusalReason } from "./model/searchIndex";
+import type { AuthStrategy, ModelKind, ModelKindSettings, ModelProvider, VectorIndex } from "./model/types";
 import { ModelSuggestions } from "./ModelSuggestions";
 import { PendingEditNotice } from "./PendingEditNotice";
+import { TokenLimitFields } from "./TokenLimitFields";
 
 const INPUT_CLASS = "font-mono read-only:bg-surface-subtle";
 
@@ -50,6 +56,8 @@ interface ModelFormProps {
   title: string;
   settings: ModelKindSettings;
   providers: readonly ModelProvider[];
+  /** The search index, for the embedding model, whose edits can wait for a rebuild of it. */
+  vectorIndex?: VectorIndex;
   /** Tells the page whether the form holds changes that are not saved. */
   onUnsavedChange: (kind: ModelKind, unsaved: boolean) => void;
 }
@@ -58,8 +66,13 @@ interface ModelFormProps {
  * The form that changes one model. It edits the saved edit when there is one
  * and the model in use otherwise. Its one action saves the form and validates
  * what was saved with a real request; only an edit that passes is put to use.
+ *
+ * An embedding model whose vectors cannot be compared with the stored ones
+ * passes validation and then waits: the action becomes the rebuild of the
+ * search index, which puts the model to use when it ends. While a rebuild
+ * runs the embedding model cannot be changed.
  */
-export function ModelForm({ kind, title, settings, providers, onUnsavedChange }: ModelFormProps) {
+export function ModelForm({ kind, title, settings, providers, vectorIndex, onUnsavedChange }: ModelFormProps) {
   const { active, candidate } = settings;
   const stored = candidate ?? active;
   const saved = useMemo(() => savedValues(stored, kind, providers), [stored, kind, providers]);
@@ -78,11 +91,11 @@ export function ModelForm({ kind, title, settings, providers, onUnsavedChange }:
     ),
   });
   const { register, setValue, getValues, trigger, reset, control, formState } = form;
-  const [providerId, endpoint, authStrategy, apiKey, model, options, parameters] = useWatch({
+  const [providerId, endpoint, authStrategy, apiKey, model, options, parameters, tokenLimits] = useWatch({
     control,
-    name: ["provider", "endpoint", "authStrategy", "apiKey", "model", "options", "parameters"],
+    name: ["provider", "endpoint", "authStrategy", "apiKey", "model", "options", "parameters", "tokenLimits"],
   });
-  const values: ModelFormValues = { provider: providerId, endpoint, authStrategy, apiKey, model, options, parameters };
+  const values: ModelFormValues = { provider: providerId, endpoint, authStrategy, apiKey, model, options, parameters, tokenLimits };
   const provider = findProvider(providerId);
   const changed = isChanged(saved, values, provider, kind);
 
@@ -90,7 +103,10 @@ export function ModelForm({ kind, title, settings, providers, onUnsavedChange }:
   const validate = useValidateCandidate(kind);
   const discard = useDiscardCandidate(kind);
   const discovery = useDiscoverModels(kind);
-  const busy = save.isPending || validate.isPending || discard.isPending;
+  const rebuild = useStartReindex();
+  const rebuilding = vectorIndex?.status === "reindexing";
+  const busy = save.isPending || validate.isPending || discard.isPending || rebuild.isPending;
+  const locked = busy || rebuilding;
   const canSubmit = changed || candidate !== null || active === null;
 
   useEffect(() => {
@@ -127,10 +143,12 @@ export function ModelForm({ kind, title, settings, providers, onUnsavedChange }:
     if (!provider) return;
     discovery.reset();
     if (!changed && candidate !== null) {
-      validateSaved();
+      if (candidate.waits_for_reindex) rebuild.mutate();
+      else validateSaved();
       return;
     }
     validate.reset();
+    rebuild.reset();
     save.mutate(candidateRequest(submitted, provider, kind), {
       onSuccess: (next) => {
         showStored(next);
@@ -142,6 +160,7 @@ export function ModelForm({ kind, title, settings, providers, onUnsavedChange }:
   function discardEdit() {
     save.reset();
     validate.reset();
+    rebuild.reset();
     discovery.reset();
     if (candidate === null) {
       reset(saved);
@@ -190,13 +209,27 @@ export function ModelForm({ kind, title, settings, providers, onUnsavedChange }:
   const savedKey = savedKeyOf(values, provider);
   const endpointConflict = provider ? environmentEndpointConflict(values, provider) : null;
   const endpointHint = endpointConflict === null ? endpointCopy?.hint : null;
+  const limitNames = provider && offersTokenLimits(stored) ? tokenLimitNames(provider, kind) : [];
+  const rebuilt = rebuild.isSuccess && vectorIndex?.reindex?.state === "succeeded" && candidate === null;
+  const rebuildAction = vectorIndex && candidate?.waits_for_reindex && !changed ? rebuildLabel(vectorIndex) : null;
+  const rebuildingForEdit = rebuilding && candidate?.waits_for_reindex === true;
+  const working = save.isPending || validate.isPending || rebuild.isPending || rebuildingForEdit;
+  const actionLabel = save.isPending
+    ? "Saving…"
+    : validate.isPending
+      ? "Validating…"
+      : rebuild.isPending
+        ? "Starting the rebuild…"
+        : rebuildingForEdit
+          ? "Rebuilding…"
+          : (rebuildAction ?? "Save and validate");
 
   return (
     <FormProvider {...form}>
       <form onSubmit={submit} noValidate aria-label={`${title} settings`} className="space-y-4">
-        <fieldset disabled={busy} className="min-w-0 space-y-4">
+        <fieldset disabled={locked} className="min-w-0 space-y-4">
           <FormField label="Provider" htmlFor={ids.provider} labelId={ids.providerLabel}>
-            <Select disabled={busy} value={providerId} onValueChange={(next) => (typeof next === "string" ? chooseProvider(next) : undefined)}>
+            <Select disabled={locked} value={providerId} onValueChange={(next) => (typeof next === "string" ? chooseProvider(next) : undefined)}>
               <SelectTrigger id={ids.provider} aria-labelledby={ids.providerLabel} className="w-full">
                 <SelectValue>
                   {(selected: string) => findProvider(selected)?.label ?? (selected || "Choose a provider")}
@@ -255,7 +288,7 @@ export function ModelForm({ kind, title, settings, providers, onUnsavedChange }:
                   hintId={`${ids.auth}-hint`}
                 >
                   <Select
-                    disabled={busy}
+                    disabled={locked}
                     value={authStrategy}
                     onValueChange={(next) => {
                       const chosen = provider.auth_strategies.find((strategy) => strategy === next);
@@ -361,6 +394,14 @@ export function ModelForm({ kind, title, settings, providers, onUnsavedChange }:
                   </FormField>
                 );
               })}
+
+              {limitNames.length > 0 ? (
+                <TokenLimitFields
+                  id={`${baseId}-token-limits`}
+                  names={limitNames}
+                  missing={stored !== null && needsTokenLimits(stored)}
+                />
+              ) : null}
             </>
           ) : (
             <p className="text-sm text-tone-danger-foreground">
@@ -369,35 +410,54 @@ export function ModelForm({ kind, title, settings, providers, onUnsavedChange }:
           )}
         </fieldset>
 
-        {candidate !== null && !busy ? (
-          <PendingEditNotice kind={kind} edit={candidate} inUse={active} providers={providers} />
+        {candidate !== null && !locked ? (
+          <PendingEditNotice
+            kind={kind}
+            edit={candidate}
+            inUse={active}
+            providers={providers}
+            vectorSearchOn={vectorIndex?.serves_search}
+          />
         ) : null}
-        {validate.data?.promoted && active?.state === "ready" && !changed && !busy ? (
+        {validate.data?.promoted && active?.state === "ready" && !changed && !locked ? (
           <Notice tone="ok" icon={CircleCheck} title="Validation passed">
+            MemForge now uses this model.
+          </Notice>
+        ) : null}
+        {rebuilt && !changed && !locked ? (
+          <Notice tone="ok" icon={CircleCheck} title="Search index rebuilt">
             MemForge now uses this model.
           </Notice>
         ) : null}
         {save.isError ? <ErrorNotice title="Couldn't save" message={errorMessage(save.error)} /> : null}
         {validate.isError ? <ErrorNotice title="Couldn't validate" message={errorMessage(validate.error)} /> : null}
         {discard.isError ? <ErrorNotice title="Couldn't discard the changes" message={errorMessage(discard.error)} /> : null}
+        {rebuild.isError && !isReindexInProgress(rebuild.error) ? (
+          <ErrorNotice title="Couldn't start the rebuild" message={startRefusalReason(rebuild.error)} />
+        ) : null}
 
         <div className="flex flex-wrap items-center gap-3">
-          <Button type="submit" size="lg" disabled={!canSubmit || busy}>
-            {save.isPending || validate.isPending ? <Loader2 className="animate-spin" /> : <Check />}
-            {save.isPending ? "Saving…" : validate.isPending ? "Validating…" : "Save and validate"}
+          <Button type="submit" size="lg" disabled={!canSubmit || locked}>
+            {working ? <Loader2 className="animate-spin" /> : rebuildAction !== null ? <RefreshCw /> : <Check />}
+            {actionLabel}
           </Button>
           {changed || candidate !== null ? (
-            <Button type="button" variant="outline" size="lg" onClick={discardEdit} disabled={busy}>
+            <Button type="button" variant="outline" size="lg" onClick={discardEdit} disabled={locked}>
               <Undo2 />
               Discard changes
             </Button>
           ) : null}
-          <p role="status" className={validate.isPending ? "text-sm text-muted-foreground" : "text-sm text-tone-warn-foreground"}>
+          <p
+            role="status"
+            className={validate.isPending || rebuilding ? "text-sm text-muted-foreground" : "text-sm text-tone-warn-foreground"}
+          >
             {validate.isPending
               ? "Sending one real request to the model. This can take up to a minute."
-              : changed
-                ? "Unsaved changes"
-                : ""}
+              : rebuilding
+                ? "The embedding model can be changed once the search index is rebuilt."
+                : changed
+                  ? "Unsaved changes"
+                  : ""}
           </p>
         </div>
       </form>

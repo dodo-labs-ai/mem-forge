@@ -570,11 +570,10 @@ def test_project_routes_take_vector_adapter_from_runtime_provider(tmp_path, monk
     """A runtime provider owns its vector backend; the admin routes never open Chroma."""
     from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
-    def refuse_chroma(**_kwargs):
+    async def refuse_chroma(*_args, **_kwargs):
         raise AssertionError("admin routes must not open Chroma for a runtime provider")
 
-    monkeypatch.setattr("memforge.retrieval.embeddings.get_chroma_collection", refuse_chroma)
-    monkeypatch.setattr("memforge.runtime.get_chroma_collection", refuse_chroma)
+    monkeypatch.setattr("memforge.retrieval.vector_index.open_memory_vector_index", refuse_chroma)
     collection = _EmptyCollection()
 
     class ProviderOwnedVector:

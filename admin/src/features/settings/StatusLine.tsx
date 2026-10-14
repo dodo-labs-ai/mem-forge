@@ -1,15 +1,15 @@
-import { AlertCircle, AlertTriangle, CircleCheck } from "lucide-react";
+import { AlertCircle, AlertTriangle, CircleCheck, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { toneText } from "@/patterns";
-import type { ValidationSummary } from "./model/modelStatus";
+import type { StatusSummary } from "./model/types";
 
-const ICONS = { ok: CircleCheck, warn: AlertTriangle, danger: AlertCircle, live: CircleCheck, idle: AlertTriangle } satisfies Record<
-  ValidationSummary["tone"],
+const ICONS = { ok: CircleCheck, warn: AlertTriangle, danger: AlertCircle, live: RefreshCw, idle: AlertTriangle } satisfies Record<
+  StatusSummary["tone"],
   unknown
 >;
 
-/** The latest validation of a model: what it found, and what follows from it. */
-export function ValidationLine({ summary }: { summary: ValidationSummary }) {
+/** One state in a line: what was found, and what follows from it. */
+export function StatusLine({ summary }: { summary: StatusSummary }) {
   const Icon = ICONS[summary.tone];
   return (
     <div className="flex items-start gap-2 text-sm">

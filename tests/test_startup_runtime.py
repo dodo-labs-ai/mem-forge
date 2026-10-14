@@ -17,6 +17,7 @@ from memforge.models import Memory, SyncState, Visibility, content_hash
 from memforge.source_projection import ProjectionScopeAttestation
 from memforge.storage.database import Database
 from tests.test_sync_bookkeeping import _hold_document
+from tests.vector_index_fixture import use_collection_as_index
 
 TEST_SOURCE_KEY = "VV4JjZLLr2BcgRnhV90gCnxzchn43M900VQy3dXJI30="
 
@@ -101,7 +102,7 @@ async def test_sync_runtime_wires_structured_llm_client_into_memory_engine(db, t
             captured["client"] = self
 
     monkeypatch.setattr(runtime, "LiteLlmStructuredClient", RecordingStructuredClient)
-    monkeypatch.setattr(runtime, "get_chroma_collection", lambda **kwargs: FakeCollection())
+    use_collection_as_index(monkeypatch, FakeCollection())
 
     sync_runtime = await runtime.build_sync_runtime(db, _config(tmp_path))
 
@@ -113,7 +114,7 @@ async def test_sync_runtime_wires_structured_llm_client_into_memory_engine(db, t
 
 
 @pytest.mark.asyncio
-async def test_default_runtime_provider_binds_adapters_to_configured_chroma_collection(
+async def test_default_runtime_provider_binds_adapters_to_the_vector_index_in_use(
     db,
     tmp_path,
     monkeypatch,
@@ -121,19 +122,15 @@ async def test_default_runtime_provider_binds_adapters_to_configured_chroma_coll
     from memforge import runtime
 
     collection = FakeCollection()
-    opened = []
-
-    def open_collection(**kwargs):
-        opened.append(kwargs)
-        return collection
-
-    monkeypatch.setattr(runtime, "get_chroma_collection", open_collection)
+    opened = use_collection_as_index(monkeypatch, collection, fingerprint="index-fingerprint")
     config = _config(tmp_path)
 
     adapters = runtime.DefaultRuntimeProvider().build_adapters(db, config)
 
-    assert opened == [{"chroma_path": config.storage.chroma_path, "name": "memories"}]
-    assert adapters.vector.collection is collection
+    assert opened == []
+    assert await adapters.vector.open_collection() is collection
+    assert await adapters.vector.index_fingerprint() == "index-fingerprint"
+    assert opened == [config.storage.chroma_path, config.storage.chroma_path]
 
 
 @pytest.mark.asyncio
@@ -156,7 +153,7 @@ async def test_default_runtime_provider_uses_one_structured_client_seam_for_sear
         return structured_client
 
     monkeypatch.setattr(provider, "build_structured_llm_client", build_client)
-    monkeypatch.setattr(runtime, "get_chroma_collection", lambda **kwargs: FakeCollection())
+    use_collection_as_index(monkeypatch, FakeCollection())
     config = _config(tmp_path)
 
     search_engine = await provider.build_search_engine(db, config)
@@ -182,7 +179,7 @@ async def test_direct_sync_runtime_uses_configured_process_document_admission(
     """Maintenance callers must inherit the same process memory admission as workers."""
     from memforge import runtime
 
-    monkeypatch.setattr(runtime, "get_chroma_collection", lambda **kwargs: FakeCollection())
+    use_collection_as_index(monkeypatch, FakeCollection())
     config = _config(tmp_path)
     config.sync.max_document_lifecycles = 1
 
@@ -215,7 +212,7 @@ async def test_direct_sync_runtime_uses_process_extraction_pool(
     """Maintenance callers must share heavy-work admission with workers."""
     from memforge import runtime
 
-    monkeypatch.setattr(runtime, "get_chroma_collection", lambda **kwargs: FakeCollection())
+    use_collection_as_index(monkeypatch, FakeCollection())
     config = _config(tmp_path)
 
     sync_runtime = await runtime.build_sync_runtime(db, config)
@@ -247,7 +244,7 @@ async def test_sync_runtime_bounds_structured_request_timeout(db, tmp_path, monk
             configs.append(config)
 
     monkeypatch.setattr(runtime, "LiteLlmStructuredClient", RecordingStructuredClient)
-    monkeypatch.setattr(runtime, "get_chroma_collection", lambda **kwargs: FakeCollection())
+    use_collection_as_index(monkeypatch, FakeCollection())
 
     sync_runtime = await runtime.build_sync_runtime(db, _config(tmp_path))
 
@@ -269,7 +266,7 @@ async def test_build_sync_runtime_wires_configured_litellm_structured_client(db,
             captured["client"] = self
 
     monkeypatch.setattr("memforge.runtime.LiteLlmStructuredClient", RecordingStructuredClient)
-    monkeypatch.setattr("memforge.runtime.get_chroma_collection", lambda **kwargs: FakeCollection())
+    use_collection_as_index(monkeypatch, FakeCollection())
 
     config = AppConfig()
     config.base_dir = tmp_path
@@ -308,7 +305,7 @@ async def test_build_sync_runtime_wires_env_backed_provider_model_without_api_ke
             captured["client"] = self
 
     monkeypatch.setattr("memforge.runtime.LiteLlmStructuredClient", RecordingStructuredClient)
-    monkeypatch.setattr("memforge.runtime.get_chroma_collection", lambda **kwargs: FakeCollection())
+    use_collection_as_index(monkeypatch, FakeCollection())
 
     config = AppConfig()
     config.base_dir = tmp_path

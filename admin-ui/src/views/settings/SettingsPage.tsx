@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { SlidersHorizontal } from "lucide-react";
 import { resourceClient } from "@/api/client";
-import type { ModelBinding, ModelKind, ModelSettings } from "@/api/types";
+import type { ModelBinding, ModelKind, ModelSettings, VectorIndex } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
 import { DataSurface } from "@/components/admin/DataSurface";
 import { EmptyState } from "@/components/admin/EmptyState";
@@ -22,9 +22,25 @@ const STATE_LABELS: Record<ModelBinding["state"], string> = {
   needs_revalidation: "Needs revalidation",
 };
 
+/** The state of the search index in one line, or `null` when there is no index to speak of. */
+function searchIndexLine({ status, index }: VectorIndex): string | null {
+  if (status === "ready") {
+    return index ? `Search index: ready, with ${index.vector_count.toLocaleString("en-US")} memories.` : "Search index: ready.";
+  }
+  if (status === "reindex_required") {
+    return "Search index: has to be rebuilt for this model. Vector search is off until it is; start the rebuild in Settings in the new admin.";
+  }
+  if (status === "reindexing") {
+    return "Search index: being rebuilt. Source syncs and changes to memories wait until the rebuild has finished.";
+  }
+  if (status === "awaiting_validation") return "Search index: none yet. It is built once the model has passed validation.";
+  return null;
+}
+
 /**
- * @deprecated admin-ui-v1: shows the two models in use. They are changed and
- * validated on the Settings page of the new admin UI.
+ * @deprecated admin-ui-v1: shows the two models in use and the state of the
+ * search index. Models are changed and validated, and the index is rebuilt,
+ * on the Settings page of the new admin UI.
  */
 export function SettingsPage() {
   const settingsQuery = useQuery<ModelSettings>({
@@ -67,7 +83,13 @@ export function SettingsPage() {
               )}
             </p>
             {KINDS.map(({ kind, title, description }) => (
-              <ModelSection key={kind} title={title} description={description} model={settings[kind].active} />
+              <ModelSection
+                key={kind}
+                title={title}
+                description={description}
+                model={settings[kind].active}
+                note={kind === "embedding" ? searchIndexLine(settings.vector_index) : null}
+              />
             ))}
           </>
         )}
@@ -76,7 +98,15 @@ export function SettingsPage() {
   );
 }
 
-function ModelSection({ title, description, model }: { title: string; description: string; model: ModelBinding | null }) {
+interface ModelSectionProps {
+  title: string;
+  description: string;
+  model: ModelBinding | null;
+  /** One more line about the model, such as the state of the index it builds. */
+  note: string | null;
+}
+
+function ModelSection({ title, description, model, note }: ModelSectionProps) {
   return (
     <DataSurface>
       <section aria-label={title} className="space-y-4 p-4">
@@ -99,6 +129,7 @@ function ModelSection({ title, description, model }: { title: string; descriptio
             <dd className="break-all font-mono">{model.model_id}</dd>
           </dl>
         )}
+        {note && <p className="text-sm text-muted-foreground">{note}</p>}
       </section>
     </DataSurface>
   );

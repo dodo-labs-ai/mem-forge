@@ -1,4 +1,4 @@
-import { HTTP_STATUS, isApiErrorStatus } from "@/api";
+import { HTTP_STATUS, isApiErrorStatus, isSearchIndexRefusal } from "@/api";
 import { errorMessage } from "@/lib/errors";
 import type { Tone } from "@/patterns";
 import type { ReviewAction, ReviewDecision, ReviewListItem, ReviewPresentation } from "./types";
@@ -117,6 +117,8 @@ export interface DecisionFailure {
 
 export function decisionFailure(error: unknown): DecisionFailure {
   const message = errorMessage(error);
+  // The search index keeps the decision from being applied; the review itself is as it was.
+  if (isSearchIndexRefusal(error)) return { message, hint: null, reloadable: false };
   if (isApiErrorStatus(error, HTTP_STATUS.forbidden)) {
     return { message, hint: "You can read this review, but a source manager has to decide.", reloadable: false };
   }

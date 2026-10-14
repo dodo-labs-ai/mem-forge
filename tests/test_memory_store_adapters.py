@@ -90,7 +90,7 @@ async def db(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_collection_property_points_at_the_vector_handle(db):
+async def test_the_index_collection_is_the_one_the_vector_handle_works_on(db):
     collection = RecordingCollection()
     adapters = build_sqlite_adapters(db, collection)
     store = MemoryStore(
@@ -99,7 +99,7 @@ async def test_collection_property_points_at_the_vector_handle(db):
         vector=adapters.vector,
         embedding=unconfigured_embedding(),
     )
-    assert store.collection is collection
+    assert await store.index_collection() is collection
 
 
 @pytest.mark.asyncio

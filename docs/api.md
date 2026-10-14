@@ -29,7 +29,9 @@ Default base URL: `http://127.0.0.1:8765`.
 | Agent sessions | `POST /api/agent-sessions/windows` | Submit a redacted evidence window |
 | Model settings | `GET /api/v1/model-settings` | The generation and embedding models in use and being edited; never a key |
 | Model settings | `PUT /api/v1/model-settings/{kind}/candidate` | Save an edit to a model without putting it to use |
-| Model settings | `POST /api/v1/model-settings/{kind}/candidate/validate` | Check the edit with one real request and put it to use when it passes |
+| Model settings | `POST /api/v1/model-settings/{kind}/candidate/validate` | Check the edit with one real request and put it to use when it passes; an embedding model of another vector space waits for a reindex |
+| Model settings | `GET /api/v1/model-settings/vector-index` | The Memory vector index in use, whether it fits the embedding model, and the latest reindex |
+| Model settings | `POST /api/v1/model-settings/vector-index/reindex` | Start a rebuild of the vector index for the embedding model |
 
 The API schema is also available from FastAPI's generated OpenAPI endpoint while
 the service is running.

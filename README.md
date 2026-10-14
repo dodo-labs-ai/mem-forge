@@ -23,8 +23,8 @@ up to date. Built from your docs, tickets, chat and agent sessions.
 
 ## Quick start
 
-You need Docker with Compose v2 and a model API key (Anthropic for extraction by
-default, OpenAI for embeddings).
+You need Docker with Compose v2 and a model API key (Anthropic for the
+generation model by default, OpenAI for the embedding model).
 
 ```bash
 git clone https://github.com/shno-labs/mem-forge.git && cd mem-forge
@@ -184,7 +184,7 @@ how to scope it. Need one that is missing?
   `127.0.0.1` only. Do not expose it on a network.
 - Model extraction and semantic judgments can miss useful knowledge or make
   mistakes. Check the cited Evidence before relying on a consequential claim.
-- An extraction model is required; without one, syncs store content but create
+- A generation model is required; without one, syncs store content but create
   no memories.
 
 ## Documentation

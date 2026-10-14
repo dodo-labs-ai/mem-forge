@@ -1,7 +1,14 @@
 import { describe, expect, test } from "vitest";
-import { NO_MODELS, kindSettings, makeBinding, makeModelSettings, makeValidation } from "@/test/modelSettingsFixtures";
+import {
+  NO_MODELS,
+  kindSettings,
+  makeBinding,
+  makeModelSettings,
+  makeValidation,
+  makeVectorIndex,
+} from "@/test/modelSettingsFixtures";
 import type { AdminExtension } from "../extension/contract";
-import { modelSetupMessage, settingsLinkTarget, showsModelSetup } from "./modelSetup";
+import { modelSetupMessage, modelSetupMessages, searchIndexMessage, settingsLinkTarget, showsModelSetup } from "./modelSetup";
 
 describe("modelSetupMessage", () => {
   test("says nothing while the generation model is ready, whatever the embedding model is", () => {
@@ -42,6 +49,45 @@ describe("modelSetupMessage", () => {
       "The generation model needs revalidation",
     );
   });
+});
+
+describe("searchIndexMessage", () => {
+  test("says that vector search is off while the search index has to be rebuilt", () => {
+    const settings = makeModelSettings({ vector_index: makeVectorIndex({ status: "reindex_required", reindex_target: "active" }) });
+
+    expect(searchIndexMessage(settings)).toEqual({
+      title: "Vector search is off",
+      body: "The search index does not fit the embedding model in use. Search ranks by matching words until the index is rebuilt in Settings.",
+    });
+  });
+
+  test("says so through a rebuild that started while vector search was off", () => {
+    const settings = makeModelSettings({ vector_index: makeVectorIndex({ status: "reindexing", serves_search: false }) });
+
+    expect(searchIndexMessage(settings)).toEqual({
+      title: "Vector search is off",
+      body: "The search index is being rebuilt for the embedding model in use. Search ranks by matching words until the rebuild has finished.",
+    });
+  });
+
+  test("says nothing while the index fits, is being replaced while search reads it, or is not there to rebuild", () => {
+    for (const status of ["ready", "reindexing", "awaiting_validation", "not_configured", "not_managed"] as const) {
+      expect(searchIndexMessage(makeModelSettings({ vector_index: makeVectorIndex({ status }) }))).toBeNull();
+    }
+  });
+});
+
+test("an installation with neither a generation model nor a usable search index hears both, the generation model first", () => {
+  const settings = makeModelSettings({
+    generation: kindSettings(null),
+    vector_index: makeVectorIndex({ status: "reindex_required", reindex_target: "active" }),
+  });
+
+  expect(modelSetupMessages(settings).map((message) => message.title)).toEqual([
+    "No generation model is set up",
+    "Vector search is off",
+  ]);
+  expect(modelSetupMessages(makeModelSettings())).toEqual([]);
 });
 
 test("the notice belongs on every product page but Settings", () => {

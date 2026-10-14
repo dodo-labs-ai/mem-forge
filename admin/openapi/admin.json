@@ -1765,6 +1765,124 @@
         "title": "DismissedRelationDetail",
         "type": "object"
       },
+      "EmbeddingModelHealthResponse": {
+        "properties": {
+          "configured": {
+            "description": "Whether a binding of this kind is in use.",
+            "title": "Configured",
+            "type": "boolean"
+          },
+          "reindex_required": {
+            "description": "True when the vector index has to be rebuilt for the embedding model in use. Until then search answers without its vector channel.",
+            "title": "Reindex Required",
+            "type": "boolean"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "not_validated",
+                  "ready",
+                  "needs_revalidation"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The state of that binding; null when none is configured.",
+            "title": "State"
+          },
+          "vector_index": {
+            "description": "The state of the Memory vector index, as the model settings report it.",
+            "enum": [
+              "ready",
+              "reindex_required",
+              "reindexing",
+              "awaiting_validation",
+              "not_configured",
+              "not_managed"
+            ],
+            "title": "Vector Index",
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "vector_index",
+          "reindex_required"
+        ],
+        "title": "EmbeddingModelHealthResponse",
+        "type": "object"
+      },
+      "EmbeddingProfileResponse": {
+        "description": "The identity of one vector space: an embedding model's settings and its vector length.",
+        "properties": {
+          "dimension": {
+            "description": "The vector length the model answered with.",
+            "title": "Dimension",
+            "type": "integer"
+          },
+          "endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint"
+          },
+          "fingerprint": {
+            "description": "A hash of the fields above. Vectors are shared only between equal fingerprints.",
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "requested_dimensions": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The output size requests ask for; null takes the model's own.",
+            "title": "Requested Dimensions"
+          },
+          "route": {
+            "title": "Route",
+            "type": "string"
+          },
+          "thresholds_calibrated": {
+            "description": "Whether the similarity thresholds were tuned on this model's vectors. When false they still apply, as approximate values nobody has measured for this model.",
+            "title": "Thresholds Calibrated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "provider",
+          "route",
+          "endpoint",
+          "model_id",
+          "requested_dimensions",
+          "dimension",
+          "fingerprint",
+          "thresholds_calibrated"
+        ],
+        "title": "EmbeddingProfileResponse",
+        "type": "object"
+      },
       "EntityAliasResponse": {
         "properties": {
           "alias": {
@@ -6016,6 +6134,17 @@
             "title": "Parameters",
             "type": "object"
           },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmbeddingProfileResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For an embedding binding whose latest check passed for the binding as it is: the Embedding Profile it embeds in. Null otherwise."
+          },
           "provider": {
             "title": "Provider",
             "type": "string"
@@ -6046,6 +6175,14 @@
             "title": "State",
             "type": "string"
           },
+          "token_limits": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "description": "The token limits the binding states for its model: context_window_tokens and max_output_tokens. Empty when it states none.",
+            "title": "Token Limits",
+            "type": "object"
+          },
           "validation": {
             "anyOf": [
               {
@@ -6055,6 +6192,12 @@
                 "type": "null"
               }
             ]
+          },
+          "waits_for_reindex": {
+            "default": false,
+            "description": "True for an embedding candidate that passed its check and becomes active once the vector index is rebuilt for it.",
+            "title": "Waits For Reindex",
+            "type": "boolean"
           }
         },
         "required": [
@@ -6067,6 +6210,7 @@
           "route",
           "options",
           "parameters",
+          "token_limits",
           "config_source",
           "state",
           "validation",
@@ -6138,6 +6282,12 @@
             "description": "The id of a provider descriptor.",
             "title": "Provider",
             "type": "string"
+          },
+          "token_limits": {
+            "additionalProperties": true,
+            "description": "For a generation model LiteLLM has no limits for: context_window_tokens and max_output_tokens, whole numbers of tokens.",
+            "title": "Token Limits",
+            "type": "object"
           }
         },
         "title": "ModelCandidateRequest",
@@ -6290,7 +6440,7 @@
       "ModelHealthResponse": {
         "properties": {
           "embedding": {
-            "$ref": "#/components/schemas/ModelKindHealthResponse"
+            "$ref": "#/components/schemas/EmbeddingModelHealthResponse"
           },
           "generation": {
             "$ref": "#/components/schemas/ModelKindHealthResponse"
@@ -6492,6 +6642,23 @@
             },
             "title": "Parameters",
             "type": "object"
+          },
+          "token_limits": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "description": "The token limits a binding of each served kind may state for its model: context_window_tokens and max_output_tokens for a generation model.",
+            "propertyNames": {
+              "enum": [
+                "generation",
+                "embedding"
+              ]
+            },
+            "title": "Token Limits",
+            "type": "object"
           }
         },
         "required": [
@@ -6504,7 +6671,8 @@
           "model_is_route",
           "lists_models",
           "options",
-          "parameters"
+          "parameters",
+          "token_limits"
         ],
         "title": "ModelProviderResponse",
         "type": "object"
@@ -6521,6 +6689,9 @@
             "title": "Litellm Version",
             "type": "string"
           },
+          "vector_index": {
+            "$ref": "#/components/schemas/VectorIndexResponse"
+          },
           "writable": {
             "description": "False when the deployment environment manages model settings (MEMFORGE_LLM_CONFIG_WRITABLE), so every write is refused.",
             "title": "Writable",
@@ -6531,7 +6702,8 @@
           "writable",
           "litellm_version",
           "generation",
-          "embedding"
+          "embedding",
+          "vector_index"
         ],
         "title": "ModelSettingsResponse",
         "type": "object"
@@ -6556,6 +6728,12 @@
           "promoted": {
             "description": "Whether the checked candidate became the active binding.",
             "title": "Promoted",
+            "type": "boolean"
+          },
+          "reindex_required": {
+            "default": false,
+            "description": "True when an embedding candidate passed and stays the candidate until the vector index is rebuilt for it.",
+            "title": "Reindex Required",
             "type": "boolean"
           },
           "settings": {
@@ -9079,6 +9257,251 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "VectorIndexRecordResponse": {
+        "description": "One physical Memory vector index.",
+        "properties": {
+          "activated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When the index came into use.",
+            "title": "Activated At"
+          },
+          "adopted": {
+            "description": "True when the vectors were in place before the index was recorded: the model they came from is assumed to be the profile's, not known.",
+            "title": "Adopted",
+            "type": "boolean"
+          },
+          "collection": {
+            "description": "The name of the collection that holds its vectors.",
+            "title": "Collection",
+            "type": "string"
+          },
+          "dimension": {
+            "title": "Dimension",
+            "type": "integer"
+          },
+          "fingerprint": {
+            "description": "The fingerprint of the Embedding Profile it was built with.",
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmbeddingProfileResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The Embedding Profile the index was built with."
+          },
+          "vector_count": {
+            "description": "The vectors the index holds now.",
+            "title": "Vector Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fingerprint",
+          "collection",
+          "dimension",
+          "adopted",
+          "vector_count",
+          "activated_at",
+          "profile"
+        ],
+        "title": "VectorIndexRecordResponse",
+        "type": "object"
+      },
+      "VectorIndexResponse": {
+        "properties": {
+          "index": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VectorIndexRecordResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The index in use."
+          },
+          "reindex": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VectorReindexResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The latest rebuild, running or ended; null when none has been started."
+          },
+          "reindex_required": {
+            "description": "True exactly when status is 'reindex_required'.",
+            "title": "Reindex Required",
+            "type": "boolean"
+          },
+          "reindex_target": {
+            "anyOf": [
+              {
+                "enum": [
+                  "active",
+                  "candidate"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The embedding binding a rebuild started now would be for: 'candidate' for a candidate that waits for the index, 'active' when the index in use is missing, was built with another model or was adopted. An active binding that has not passed a check as it stands is checked when the rebuild is started, which is refused with embedding_not_validated when the check fails. Null when there is nothing to rebuild for, and while a rebuild runs.",
+            "title": "Reindex Target"
+          },
+          "serves_search": {
+            "description": "Whether search reads the index in use: there is one, and the embedding model in use is the one it was built with. A rebuild does not change this before it switches, so during a rebuild that started while a reindex was required it stays false.",
+            "title": "Serves Search",
+            "type": "boolean"
+          },
+          "status": {
+            "description": "'ready': the embedding model in use is the one the index was built with. 'reindex_required': it is another one, or the stored vectors cannot be adopted; until the index is rebuilt vector search is off, a write that needs a new vector is refused and vector work already queued waits. 'reindexing': a rebuild is running. 'awaiting_validation': no index is in use because the embedding model has not passed a check yet. 'not_configured': no embedding model. 'not_managed': the deployment keeps its index by its own means.",
+            "enum": [
+              "ready",
+              "reindex_required",
+              "reindexing",
+              "awaiting_validation",
+              "not_configured",
+              "not_managed"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "reindex_required",
+          "serves_search",
+          "reindex_target",
+          "index",
+          "reindex"
+        ],
+        "title": "VectorIndexResponse",
+        "type": "object"
+      },
+      "VectorReindexResponse": {
+        "description": "The latest rebuild of the vector index.",
+        "properties": {
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why a failed rebuild failed: a provider code of the embedding check (provider_unreachable, authentication_failed, rate_limited, timeout, embedding_response_invalid, provider_error, ...), embedding_dimension_mismatch, vector_count_mismatch, vector_invalid, memories_changed, candidate_changed, reindex_lease_lost, interrupted or index_error.",
+            "title": "Error Code"
+          },
+          "fingerprint": {
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "memories_indexed": {
+            "description": "The Memories embedded into the new index so far.",
+            "title": "Memories Indexed",
+            "type": "integer"
+          },
+          "memories_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The searchable Memories the rebuild covers; null until it has counted them.",
+            "title": "Memories Total"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmbeddingProfileResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "state": {
+            "enum": [
+              "running",
+              "succeeded",
+              "failed"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "enum": [
+                  "active",
+                  "candidate"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The embedding binding the rebuild is for.",
+            "title": "Target"
+          }
+        },
+        "required": [
+          "state",
+          "target",
+          "fingerprint",
+          "profile",
+          "memories_total",
+          "memories_indexed",
+          "started_at",
+          "finished_at"
+        ],
+        "title": "VectorReindexResponse",
         "type": "object"
       },
       "WorkspaceAgentEvaluationResponse": {
@@ -12425,6 +12848,50 @@
           }
         },
         "summary": "List Model Providers",
+        "tags": [
+          "model-settings"
+        ]
+      }
+    },
+    "/api/v1/model-settings/vector-index": {
+      "get": {
+        "description": "Read the Memory vector index in use and the latest rebuild of it.",
+        "operationId": "read_vector_index_api_v1_model_settings_vector_index_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VectorIndexResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Vector Index",
+        "tags": [
+          "model-settings"
+        ]
+      }
+    },
+    "/api/v1/model-settings/vector-index/reindex": {
+      "post": {
+        "description": "Start a rebuild of the vector index. It runs beside the server; read its state with GET.",
+        "operationId": "start_vector_reindex_api_v1_model_settings_vector_index_reindex_post",
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VectorIndexResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Start Vector Reindex",
         "tags": [
           "model-settings"
         ]

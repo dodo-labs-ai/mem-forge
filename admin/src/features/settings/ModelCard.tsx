@@ -2,21 +2,27 @@ import { useId } from "react";
 import { StatusBadge } from "@/patterns";
 import { KIND_DESCRIPTIONS, KIND_TITLES } from "./model/kinds";
 import { stateBadge } from "./model/modelStatus";
-import type { ModelKind, ModelKindSettings, ModelProvider } from "./model/types";
+import type { ModelKind, ModelKindSettings, ModelProvider, VectorIndex } from "./model/types";
 import { ModelForm } from "./ModelForm";
 import { ModelInUse } from "./ModelInUse";
+import { SearchIndex } from "./SearchIndex";
 
 interface ModelCardProps {
   kind: ModelKind;
   settings: ModelKindSettings;
   providers: readonly ModelProvider[];
+  /** The search index, on the card of the embedding model, which builds it. */
+  vectorIndex?: VectorIndex;
   /** False when the deployment manages the models, so the card only shows them. */
   writable: boolean;
   onUnsavedChange: (kind: ModelKind, unsaved: boolean) => void;
 }
 
-/** One kind of model: the one in use with its state, and the form that changes it. */
-export function ModelCard({ kind, settings, providers, writable, onUnsavedChange }: ModelCardProps) {
+/**
+ * One kind of model: the one in use with its state, and the form that changes
+ * it. The embedding model also shows the search index it builds.
+ */
+export function ModelCard({ kind, settings, providers, vectorIndex, writable, onUnsavedChange }: ModelCardProps) {
   const titleId = useId();
   const badge = stateBadge(settings.active);
   const title = KIND_TITLES[kind];
@@ -33,8 +39,16 @@ export function ModelCard({ kind, settings, providers, writable, onUnsavedChange
         <StatusBadge tone={badge.tone}>{badge.label}</StatusBadge>
       </div>
       <ModelInUse kind={kind} model={settings.active} providers={providers} />
+      {vectorIndex ? <SearchIndex vectorIndex={vectorIndex} embedding={settings} providers={providers} /> : null}
       {writable ? (
-        <ModelForm kind={kind} title={title} settings={settings} providers={providers} onUnsavedChange={onUnsavedChange} />
+        <ModelForm
+          kind={kind}
+          title={title}
+          settings={settings}
+          providers={providers}
+          vectorIndex={vectorIndex}
+          onUnsavedChange={onUnsavedChange}
+        />
       ) : null}
     </section>
   );
