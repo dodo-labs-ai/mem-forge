@@ -1,6 +1,6 @@
 case_schema_version: 3
 case_set_id: retrieval-core-v1
-case_set_sha: sha256:67695d465764066971c60c12d4f112b0bb629a3df2d65f6885d5190c27b000ce
+case_set_sha: sha256:b6dae2a2dd0e0bdb3969207d8e8da4cc73efdc9c14fac22a64b71aa96b4e60cd
 case_files:
   - metadata_lexical.yaml
   - hybrid_fusion.yaml
@@ -24,6 +24,12 @@ fixtures:
         status: active
         access_policy: workspace
         owner_user_id: eval-user
+      - id: src-platform
+        type: confluence
+        name: Platform Wiki
+        status: active
+        access_policy: workspace
+        owner_user_id: eval-user
     source_subscriptions:
       - user_id: eval-user
         source_id: src-payroll
@@ -31,6 +37,9 @@ fixtures:
       - user_id: eval-user
         source_id: src-muted
         enabled: false
+      - user_id: eval-user
+        source_id: src-platform
+        enabled: true
     documents:
       - doc_id: SFPAY-179397
         source_id: src-payroll
@@ -52,6 +61,21 @@ fixtures:
         title: Command failure No process tree found before a new vector process map is ready
         source_url: https://eval.example/SFPAY-181363
         space_or_project: PAY
+      - doc_id: doc-memforge-release-notes
+        source_id: src-platform
+        title: MemForge Release Notes
+        source_url: https://eval.example/doc-memforge-release-notes
+        space_or_project: PLAT
+      - doc_id: doc-blocker-hints-command
+        source_id: src-platform
+        title: PersistCutOffBlockerHintsCommand source reference
+        source_url: https://eval.example/doc-blocker-hints-command
+        space_or_project: PLAT
+      - doc_id: doc-compose-file
+        source_id: src-platform
+        title: deploy/docker-compose.yml
+        source_url: https://eval.example/doc-compose-file
+        space_or_project: PLAT
     memories:
       - id: mem-blocker-hint
         content: Lifecycle assignment skips person assignment creation in one onboarding branch.
@@ -143,6 +167,21 @@ fixtures:
       - id: mem-process-tree-06
         content: Retrying is disabled after the validation classification is persisted.
         project_key: PAY
+      - id: mem-workspace-setup
+        content: An administrator creates each workspace, and every source belongs to exactly one workspace.
+        project_key: PAY
+      - id: mem-memforge-release-notes
+        content: Release notes list the features shipped in each version.
+        project_key: PAY
+      - id: mem-blocker-hints-command
+        content: The cutoff job writes one record per employee when the period closes.
+        project_key: PAY
+      - id: mem-cutoff-notification
+        content: Closing a payroll period notifies managers about pending approvals.
+        project_key: PAY
+      - id: mem-compose-services
+        content: The API, the worker and the database each run as their own service with a shared data volume.
+        project_key: PAY
     entities:
       - canonical_name: rule locking
         display_name: Rule Locking
@@ -219,3 +258,12 @@ fixtures:
       - memory_id: mem-process-tree-06
         doc_id: SFPAY-181363
         source_type: jira
+      - memory_id: mem-memforge-release-notes
+        doc_id: doc-memforge-release-notes
+        source_type: confluence
+      - memory_id: mem-blocker-hints-command
+        doc_id: doc-blocker-hints-command
+        source_type: confluence
+      - memory_id: mem-compose-services
+        doc_id: doc-compose-file
+        source_type: confluence

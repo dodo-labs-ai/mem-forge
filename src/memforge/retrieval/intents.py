@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Literal, cast
 
+from memforge.retrieval.query_plan import IdentifierKind, QueryIdentity
+
 RankedRetrievalIntent = Literal["general_hybrid", "known_item", "relationship"]
 IntentSource = Literal["requested", "deterministic", "default", "fallback"]
 FallbackReason = Literal["no_traversable_entity"]
@@ -37,6 +39,15 @@ _FUSION_WEIGHTS: dict[RankedRetrievalIntent, dict[str, float]] = {
 }
 
 
+# Identifier kinds that name one item wherever they appear in a query.  A
+# camel-case word, a quoted phrase, or a slash or dotted term may equally be a
+# product name, prose or a phrase inside a question ("MemForge", "and/or",
+# "Node.js"), so those name an item only when the query is nothing else.
+_SELF_IDENTIFYING_KINDS: frozenset[IdentifierKind] = frozenset(
+    {"url", "uuid", "path", "external_id", "dotted_name", "snake_case"}
+)
+
+
 @dataclass(frozen=True)
 class RetrievalIntentResolution:
     """One validated request hint and the ranked intent used by the service."""
@@ -60,15 +71,31 @@ def validate_requested_intent(value: str | None) -> RankedRetrievalIntent | None
     return cast(RankedRetrievalIntent, value)
 
 
+def names_one_item(identity: QueryIdentity) -> bool:
+    """Whether the query's identifier syntax alone names one item.
+
+    True for a self-identifying identifier anywhere in the query, or for a
+    query made only of identifiers.
+    """
+
+    if identity.kinds & _SELF_IDENTIFYING_KINDS:
+        return True
+    return bool(identity.identifiers) and not identity.has_free_text
+
+
 def resolve_retrieval_intent(
     requested_intent: str | None,
     *,
-    has_external_id: bool,
-    has_code_symbol: bool,
+    identity: QueryIdentity,
     has_strong_metadata_identity: bool,
     has_traversable_entity: bool,
 ) -> RetrievalIntentResolution:
-    """Resolve intent without language detection, translation, or an LLM call."""
+    """Resolve intent without language detection, translation, or an LLM call.
+
+    An omitted intent is ``known_item`` when the query's identifiers name one
+    item or a metadata field equals the whole query, and ``general_hybrid``
+    otherwise.
+    """
 
     requested = validate_requested_intent(requested_intent)
     if requested == "relationship" and not has_traversable_entity:
@@ -84,7 +111,7 @@ def resolve_retrieval_intent(
             resolved_intent=requested,
             intent_source="requested",
         )
-    if has_external_id or has_code_symbol or has_strong_metadata_identity:
+    if names_one_item(identity) or has_strong_metadata_identity:
         return RetrievalIntentResolution(
             requested_intent=None,
             resolved_intent="known_item",
@@ -109,6 +136,7 @@ __all__ = [
     "RankedRetrievalIntent",
     "RetrievalIntentResolution",
     "fusion_weights",
+    "names_one_item",
     "resolve_retrieval_intent",
     "validate_requested_intent",
 ]

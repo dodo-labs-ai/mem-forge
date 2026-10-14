@@ -15,6 +15,7 @@ from memforge.config import DEFAULT_RANK_WINDOW_SIZE, DEFAULT_RRF_K, RetrievalCo
 from memforge.llm.structured import RerankResponse, StructuredLlmError
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
+from memforge.retrieval.query_plan import build_lexical_query_plan
 from memforge.retrieval.search import SearchEngine, _quoted_identity_query
 from memforge.storage.database import Database
 from memforge.storage.adapters.protocols import EntityLinkCandidate, KeywordCandidate
@@ -226,7 +227,7 @@ async def test_search_exposes_rank_fusion_contributions_for_each_result(db):
     )
     engine._embed_query = AsyncMock(return_value=[0.1])
 
-    result = await engine.search("PostgreSQL", top_k=10)
+    result = await engine.search("PostgreSQL", intent="known_item", top_k=10)
 
     evidence_by_id = {
         item.memory_id: item.retrieval_evidence or {}
@@ -276,6 +277,11 @@ async def test_search_exposes_rank_fusion_contributions_for_each_result(db):
         ("edit a locked rule", None, "general_hybrid", "default"),
         ("编辑一个被别人锁住的规则", None, "general_hybrid", "default"),
         ("persist_cutoff_blocker_hints", None, "known_item", "deterministic"),
+        ("PersistCutOffBlockerHintsCommand", None, "known_item", "deterministic"),
+        ("How do I configure workspaces in MemForge?", None, "general_hybrid", "default"),
+        ("在 MemForge 里怎么配置工作区？", None, "general_hybrid", "default"),
+        ("How does GitHub sync pull requests?", None, "general_hybrid", "default"),
+        ("GitHub 的同步是怎么工作的？", None, "general_hybrid", "default"),
         ("SFPAY-179397", "general_hybrid", "general_hybrid", "requested"),
         ("how does this relate", "known_item", "known_item", "requested"),
     ],
@@ -524,7 +530,7 @@ async def test_metadata_query_paths_only_report_retained_channel_hits(
     )
 
     hits, paths = await engine._metadata_searches(
-        'Find the memory titled "Create Access Review in Quarterly Payroll"',
+        build_lexical_query_plan('Find the memory titled "Create Access Review in Quarterly Payroll"'),
         "known_item",
         None,
         object(),
@@ -955,21 +961,29 @@ async def test_code_symbol_metadata_hit_resolves_known_item(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_code_symbol_without_metadata_support_resolves_known_item(db, monkeypatch):
-    metadata_target = _memory("m-metadata", "Blocker hint Jira task summary")
-    semantic_competitor = _memory("m-semantic", "Command implementation retry analysis")
-    await db.insert_memory(metadata_target)
+async def test_code_symbol_with_ordinary_words_ranks_exact_symbol_first_under_general_hybrid(db):
+    symbol_target = _memory("m-symbol", "Cutoff job writes one record per employee")
+    semantic_competitor = _memory("m-semantic", "Payroll cutoff closes the period and notifies managers")
+    await db.insert_memory(symbol_target)
     await db.insert_memory(semantic_competitor)
-    await db.upsert_source("src-jira", "jira", "Mount Tai Jira", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source(
+        "src-code", "github", "Payroll Repository", "{}", access_policy="workspace", owner_user_id="dev"
+    )
     await _document(
         db,
-        "SFPAY-100",
-        "src-jira",
-        title="Create blocker hint lifecycle task",
+        "payroll/PersistCutOffBlockerHintsCommand.java",
+        "src-code",
+        title="PersistCutOffBlockerHintsCommand source reference",
     )
-    await db.add_memory_source("m-metadata", "SFPAY-100", "jira", None, source_updated_at=None)
+    await db.add_memory_source(
+        symbol_target.id,
+        "payroll/PersistCutOffBlockerHintsCommand.java",
+        "github",
+        None,
+        source_updated_at=None,
+    )
 
-    adapters = build_sqlite_adapters(db, FakeCollection(["m-semantic", "m-metadata"]))
+    adapters = build_sqlite_adapters(db, FakeCollection([semantic_competitor.id, symbol_target.id]))
     engine = SearchEngine(
         relational=adapters.relational,
         keyword=adapters.keyword,
@@ -979,29 +993,13 @@ async def test_code_symbol_without_metadata_support_resolves_known_item(db, monk
     )
     engine._embed_query = AsyncMock(return_value=[0.1])
 
-    async def metadata_results(
-        _query,
-        _memory_types,
-        _scope,
-        limit,
-        *,
-        source_filter,
-        time_range,
-    ):
-        return [
-            KeywordCandidate(
-                memory_id="m-metadata",
-                score=10.0,
-                channel="bm25_metadata_tokens",
-                matched_text=("Create blocker hint lifecycle task",),
-            )
-        ]
-
-    monkeypatch.setattr(engine, "_bm25_metadata_search", metadata_results)
-
     result = await engine.search("PersistCutOffBlockerHintsCommand blocker hint", top_k=2)
 
-    assert result["retrieval_intent"]["resolved_intent"] == "known_item"
+    assert result["retrieval_intent"]["resolved_intent"] == "general_hybrid"
+    assert result["retrieval_intent"]["intent_source"] == "default"
+    assert [item.memory_id for item in result["results"]] == [symbol_target.id, semantic_competitor.id]
+    evidence = result["results"][0].retrieval_evidence or {}
+    assert evidence["metadata_lexical"]["matched_fields"] == ["metadata_exact_anchor"]
 
 
 @pytest.mark.asyncio
