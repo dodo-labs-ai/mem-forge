@@ -4479,11 +4479,14 @@ def create_admin_app(
         return await call_next(request)
 
     # -- CORS --
-    cors_origins = config.server.cors_origins.split(",") if config.server.cors_origins != "*" else ["*"]
+    # The loopback bind does not hold against the operator's own browser, so
+    # only the configured origins may read responses. A wildcard answers every
+    # origin and therefore never carries credentials.
+    cors_origins = [origin.strip() for origin in config.server.cors_origins.split(",") if origin.strip()]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
-        allow_credentials=True,
+        allow_credentials="*" not in cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )
