@@ -132,3 +132,220 @@
       mem-cross-language-lock:
         - graph
     required_intent: relationship
+
+- id: product_name_question_prefers_semantic_answer
+  family: named_product_question
+  description: a question naming a camel-case product keeps the semantic answer above a title that only shares the product name
+  query: How do I configure workspaces in MemForge?
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  parity_gate: hard
+  ranked_channel_results:
+    vector:
+      - memory_id: mem-workspace-setup
+        score: 0.99
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-workspace-setup: 3
+      mem-memforge-release-notes: 1
+    max_rank:
+      mem-workspace-setup: 1
+    required_channels:
+      mem-workspace-setup:
+        - vector
+      mem-memforge-release-notes:
+        - bm25_metadata_tokens
+    required_intent: general_hybrid
+
+- id: unicode_product_name_question_prefers_semantic_answer
+  family: named_product_question
+  description: a Unicode question naming the same product keeps the same semantic answer first
+  query: 在 MemForge 里怎么配置工作区？
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  control_case_id: product_name_question_prefers_semantic_answer
+  parity_gate: hard
+  ranked_channel_results:
+    vector:
+      - memory_id: mem-workspace-setup
+        score: 0.99
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-workspace-setup: 3
+      mem-memforge-release-notes: 1
+    max_rank:
+      mem-workspace-setup: 1
+    required_channels:
+      mem-workspace-setup:
+        - vector
+      mem-memforge-release-notes:
+        - bm25_metadata_tokens
+    required_intent: general_hybrid
+
+- id: bare_code_symbol_lookup
+  family: code_symbol_lookup
+  description: a query that is only a code symbol identifies the memory whose source names it
+  query: PersistCutOffBlockerHintsCommand
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  parity_gate: hard
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-blocker-hints-command: 3
+    max_rank:
+      mem-blocker-hints-command: 1
+    required_channels:
+      mem-blocker-hints-command:
+        - bm25_metadata_tokens
+    required_intent: known_item
+
+- id: code_symbol_with_words_keeps_exact_symbol_first
+  family: code_symbol_lookup
+  description: a code symbol with ordinary words ranks its exact-symbol memory above a stronger vector match
+  query: PersistCutOffBlockerHintsCommand blocker hint
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  parity_gate: hard
+  ranked_channel_results:
+    vector:
+      - memory_id: mem-cutoff-notification
+        score: 0.99
+      - memory_id: mem-blocker-hints-command
+        score: 0.95
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-blocker-hints-command: 3
+      mem-cutoff-notification: 1
+    max_rank:
+      mem-blocker-hints-command: 1
+    required_channels:
+      mem-blocker-hints-command:
+        - bm25_metadata_tokens
+        - vector
+      mem-cutoff-notification:
+        - vector
+    required_intent: general_hybrid
+
+- id: slash_prose_question_stays_general
+  family: hybrid_vector_recall
+  description: prose joined by a slash such as and/or is not an identifier, so vector evidence still leads
+  query: explain why editing a rule locked by another user and/or an admin returns a generic error
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  parity_gate: hard
+  ranked_channel_results:
+    vector:
+      - memory_id: mem-cross-language-lock
+        score: 0.99
+    bm25_content:
+      - memory_id: mem-lexical-lock-distractor
+        score: 10.0
+      - memory_id: mem-lexical-lock-distractor-2
+        score: 9.0
+      - memory_id: mem-lexical-lock-distractor-3
+        score: 8.0
+      - memory_id: mem-lexical-lock-distractor-4
+        score: 7.0
+      - memory_id: mem-lexical-lock-distractor-5
+        score: 6.0
+      - memory_id: mem-lexical-lock-distractor-6
+        score: 5.0
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-cross-language-lock: 3
+      mem-lexical-lock-distractor: 1
+    max_rank:
+      mem-cross-language-lock: 1
+    required_channels:
+      mem-cross-language-lock:
+        - vector
+      mem-lexical-lock-distractor:
+        - bm25_content
+    required_intent: general_hybrid
+
+- id: file_name_question_is_known_item
+  family: file_name_lookup
+  description: a question naming a hyphenated file name identifies the memory whose source is that file above a stronger vector match
+  query: what is in docker-compose.yml
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  parity_gate: hard
+  ranked_channel_results:
+    vector:
+      - memory_id: mem-workspace-setup
+        score: 0.99
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-compose-services: 3
+    max_rank:
+      mem-compose-services: 1
+    required_channels:
+      mem-compose-services:
+        - bm25_metadata_tokens
+    required_intent: known_item

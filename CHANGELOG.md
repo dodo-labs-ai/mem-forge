@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- A search question that names a product written in camel case, such as
+  "How do I configure workspaces in MemForge?" or "GitHub 的同步是怎么工作的？",
+  is ranked as an open question (`general_hybrid`) instead of a lookup of one
+  item (`known_item`), so the Memory that answers it is no longer pushed below
+  documents that only share the product name. Without a requested intent, a
+  search is a `known_item` lookup when it contains an issue key, `#123`, a
+  UUID, a URL, a snake_case name, a path or a dotted name. A path is relative
+  to the home or current directory, has two segments under the root, has
+  three or more segments, or ends in a file name (`src/App.tsx`, but not a
+  pair of capitalised names such as `React/Node.js`). A dotted
+  name is a module, attribute or file name such as `litellm.aembedding` or
+  `docker-compose.yml`. A search is also a `known_item` lookup when it is
+  made only of camel-case names, quoted phrases, and slash or dotted terms
+  that read as prose or a product as readily as a name (`and/or`, `TCP/IP`,
+  `pkg/errors`, `e.g.`, `Node.js`, `Cargo.toml`), or when a source title or
+  alias equals the whole query. Inside a question these terms do not make it
+  a lookup. A code symbol with other words, such as
+  "PersistCutOffBlockerHintsCommand blocker hint", is ranked as an open
+  question and its Memory still comes first through the exact metadata match.
+  The words searched as exact metadata anchors are unchanged, and a requested
+  intent is honoured as before. Cloud: arrives with the pin; Cloud search
+  runs the OSS `SearchEngine`, which resolves the intent and hands the HANA
+  keyword adapter the same metadata query plan as before.
 - The Admin API answers browser requests only from the Admin UI dev server on
   loopback (`http://localhost:5174,http://127.0.0.1:5174`) by default, instead
   of from every origin. The loopback bind keeps other machines out but not a
