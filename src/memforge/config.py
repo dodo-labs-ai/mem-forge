@@ -91,11 +91,16 @@ class RetrievalConfig:
     rerank_candidates: int = 30
 
 
+DEFAULT_CORS_ORIGINS = "http://localhost:5174,http://127.0.0.1:5174"
+
+
 @dataclass
 class ServerConfig:
     admin_api_port: int = 8765
     jwt_secret: str = ""
-    cors_origins: str = "*"  # comma-separated origins, or "*" for dev
+    # Comma-separated browser origins the Admin API answers. The default is the
+    # Admin UI dev server on loopback; "*" must be set explicitly.
+    cors_origins: str = DEFAULT_CORS_ORIGINS
     llm_config_writable: bool = True
 
 
