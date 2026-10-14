@@ -6,12 +6,12 @@ corroboration, and full-text search index maintenance.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from typing import Any, Awaitable, Callable, Sequence
 
+from memforge.llm.embedding import EmbeddingRuntime
 from memforge.memory.audit import AuditContext, MemoryAuditEvent, MemoryAuditLogger
 from memforge.memory.evidence import (
     AuthorityCase,
@@ -48,7 +48,6 @@ from memforge.models import (
     UNSORTED_PROJECT_KEY,
     Visibility,
 )
-from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, VectorStore
 from memforge.source_activity import SourceActivityConflict, SourceActivityLease
@@ -202,16 +201,15 @@ class MemoryStore:
         relational: RelationalStore,
         keyword: KeywordSearch,
         vector: VectorStore,
-        embed_cfg: dict,
+        embedding: EmbeddingRuntime,
         dedup_threshold: float = 0.08,
         audit_logger: MemoryAuditLogger | None = None,
     ) -> None:
         self.relational = relational
         self.keyword = keyword
         self.vector = vector
-        self.embed_cfg = embed_cfg
+        self.embedding = embedding
         self.dedup_threshold = dedup_threshold
-        self._embedding_cache = EmbeddingCache()
         self.audit_logger = audit_logger
 
     @property
@@ -2453,18 +2451,5 @@ class MemoryStore:
     # -------------------------------------------------------------------
 
     async def _embed(self, text: str) -> list[float]:
-        """Embed text, with LRU cache for repeated queries."""
-        cached = self._embedding_cache.get(text)
-        if cached is not None:
-            return cached
-
-        vectors = await asyncio.to_thread(
-            embed_texts,
-            [text],
-            self.embed_cfg["base_url"],
-            self.embed_cfg["api_key"],
-            self.embed_cfg["model"],
-        )
-        embedding = vectors[0]
-        self._embedding_cache.put(text, embedding)
-        return embedding
+        """Return the vector for one Memory embedding text."""
+        return (await self.embedding.embed_documents([text]))[0]

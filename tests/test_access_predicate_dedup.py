@@ -22,6 +22,7 @@ from memforge.models import (
 from memforge.storage.adapters.context import AccessScope
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
+from tests.embedding_fixture import unconfigured_embedding
 
 
 WORKSPACE = Visibility.WORKSPACE.value
@@ -93,7 +94,7 @@ async def store_fixture(tmp_path, monkeypatch):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         audit_logger=MemoryAuditLogger(db),
     )
 

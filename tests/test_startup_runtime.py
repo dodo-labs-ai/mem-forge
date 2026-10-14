@@ -3473,6 +3473,287 @@ async def test_llm_config_probe_auth_error_without_key_is_actionable(db, tmp_pat
     assert payload["message"] == "Add an API key, then test again."
 
 
+class _ProbeEndpoint:
+    """Stand in for the probe's HTTP client and record what it was asked."""
+
+    def __init__(self, respond):
+        self.client_options: list[dict] = []
+        self.requests: list[tuple[str, dict]] = []
+        self._respond = respond
+
+    def __call__(self, **options):
+        self.client_options.append(options)
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def get(self, url, headers):
+        import httpx
+
+        self.requests.append((url, dict(headers)))
+        return self._respond(url, httpx.Request("GET", url))
+
+
+def _model_list(url, request):
+    import httpx
+
+    return httpx.Response(200, json={"data": [{"id": "model-a"}]}, request=request)
+
+
+@pytest.mark.asyncio
+async def test_llm_config_probe_reports_a_redirect_to_another_origin_as_failed(db, tmp_path, monkeypatch):
+    import httpx
+
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    endpoint = _ProbeEndpoint(
+        lambda url, request: httpx.Response(
+            302,
+            headers={"location": "https://collector.example.test/v1/models?from=probe"},
+            request=request,
+        )
+    )
+    monkeypatch.setattr(admin_api.httpx, "AsyncClient", endpoint)
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/llm-config/probe",
+            json={"kind": "enrichment", "base_url": "https://proxy.example.test/v1", "api_key": "proxy-key"},
+        )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["ok"] is False
+    assert payload["stage"] == "http"
+    assert payload["status"] == 302
+    assert "redirected to https://collector.example.test, another origin" in payload["message"]
+    assert "from=probe" not in payload["message"]
+    assert [options["follow_redirects"] for options in endpoint.client_options] == [False]
+    assert [url for url, _headers in endpoint.requests] == ["https://proxy.example.test/v1/models"]
+
+
+@pytest.mark.asyncio
+async def test_llm_config_probe_treats_a_changed_port_or_scheme_as_another_origin(db, tmp_path, monkeypatch):
+    import httpx
+
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    locations = iter(["http://proxy.example.test/v1/models", "https://proxy.example.test:8443/v1/models"])
+    endpoint = _ProbeEndpoint(
+        lambda url, request: httpx.Response(307, headers={"location": next(locations)}, request=request)
+    )
+    monkeypatch.setattr(admin_api.httpx, "AsyncClient", endpoint)
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        messages = [
+            client.post(
+                "/api/v1/llm-config/probe",
+                json={"kind": "enrichment", "base_url": "https://proxy.example.test/v1", "api_key": "proxy-key"},
+            ).json()["message"]
+            for _ in range(2)
+        ]
+
+    assert "redirected to http://proxy.example.test, another origin" in messages[0]
+    assert "redirected to https://proxy.example.test:8443, another origin" in messages[1]
+    assert len(endpoint.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_llm_config_probe_does_not_follow_a_redirect_within_the_origin(db, tmp_path, monkeypatch):
+    import httpx
+
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    def respond(url, request):
+        if url.endswith("/v1/models"):
+            return _model_list(url, request)
+        return httpx.Response(301, headers={"location": "/login"}, request=request)
+
+    endpoint = _ProbeEndpoint(respond)
+    monkeypatch.setattr(admin_api.httpx, "AsyncClient", endpoint)
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/llm-config/probe",
+            json={"kind": "enrichment", "base_url": "https://proxy.example.test", "api_key": "proxy-key"},
+        )
+
+    payload = response.json()
+    assert payload["ok"] is True
+    assert [model["id"] for model in payload["models"]] == ["model-a"]
+    assert [url for url, _headers in endpoint.requests] == [
+        "https://proxy.example.test/models",
+        "https://proxy.example.test/v1/models",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_llm_config_probe_fails_when_the_endpoint_only_redirects(db, tmp_path, monkeypatch):
+    import httpx
+
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    endpoint = _ProbeEndpoint(
+        lambda url, request: httpx.Response(308, headers={"location": url + "/"}, request=request)
+    )
+    monkeypatch.setattr(admin_api.httpx, "AsyncClient", endpoint)
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/llm-config/probe",
+            json={"kind": "enrichment", "base_url": "https://proxy.example.test", "api_key": "proxy-key"},
+        )
+
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["stage"] == "http"
+    assert payload["status"] == 308
+    assert "redirect, which is not followed" in payload["message"]
+    assert len(endpoint.requests) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested_base_url",
+    [
+        "https://api.saved.example.test/v1",
+        "https://API.Saved.Example.Test:443/other/path",
+    ],
+    ids=["same_url", "same_origin_other_spelling"],
+)
+async def test_llm_config_probe_uses_the_saved_key_for_its_own_origin(
+    db, tmp_path, monkeypatch, requested_base_url
+):
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    await db.set_llm_config(
+        {
+            "embedding_base_url": "https://api.saved.example.test/v1",
+            "embedding_api_key": "saved-embedding-key",
+        }
+    )
+    endpoint = _ProbeEndpoint(_model_list)
+    monkeypatch.setattr(admin_api.httpx, "AsyncClient", endpoint)
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/llm-config/probe",
+            json={"kind": "embedding", "base_url": requested_base_url},
+        )
+
+    assert response.json()["ok"] is True
+    assert endpoint.requests[0][1]["Authorization"] == "Bearer saved-embedding-key"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested_base_url",
+    [
+        "https://other.example.test/v1",
+        "http://api.saved.example.test/v1",
+        "https://api.saved.example.test:8443/v1",
+    ],
+    ids=["other_host", "other_scheme", "other_port"],
+)
+async def test_llm_config_probe_asks_for_the_key_again_on_another_origin(
+    db, tmp_path, monkeypatch, requested_base_url
+):
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    await db.set_llm_config(
+        {
+            "embedding_base_url": "https://api.saved.example.test/v1",
+            "embedding_api_key": "saved-embedding-key",
+        }
+    )
+    endpoint = _ProbeEndpoint(_model_list)
+    monkeypatch.setattr(admin_api.httpx, "AsyncClient", endpoint)
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/llm-config/probe",
+            json={"kind": "embedding", "base_url": requested_base_url},
+        )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["ok"] is False
+    assert payload["stage"] == "auth"
+    assert "Enter the API key for this endpoint" in payload["message"]
+    assert endpoint.requests == []
+
+
+@pytest.mark.asyncio
+async def test_llm_config_probe_sends_a_key_entered_for_another_origin(db, tmp_path, monkeypatch):
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    await db.set_llm_config(
+        {
+            "embedding_base_url": "https://api.saved.example.test/v1",
+            "embedding_api_key": "saved-embedding-key",
+        }
+    )
+    endpoint = _ProbeEndpoint(_model_list)
+    monkeypatch.setattr(admin_api.httpx, "AsyncClient", endpoint)
+    app = create_admin_app(db=db, config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/llm-config/probe",
+            json={"kind": "embedding", "base_url": "https://other.example.test/v1", "api_key": "entered-key"},
+        )
+
+    assert response.json()["ok"] is True
+    assert endpoint.requests[0][1]["Authorization"] == "Bearer entered-key"
+
+
+@pytest.mark.asyncio
+async def test_llm_config_probe_binds_a_saved_key_to_the_configured_endpoint_when_none_is_saved(
+    db, tmp_path, monkeypatch
+):
+    from memforge.server import admin_api
+    from memforge.server.admin_api import create_admin_app
+
+    await db.set_llm_config({"embedding_api_key": "saved-embedding-key"})
+    endpoint = _ProbeEndpoint(_model_list)
+    monkeypatch.setattr(admin_api.httpx, "AsyncClient", endpoint)
+    config = _config(tmp_path)
+    config.llm.embedding_base_url = "https://configured.example.test/v1"
+    app = create_admin_app(db=db, config=config)
+
+    with TestClient(app) as client:
+        same_origin = client.post(
+            "/api/v1/llm-config/probe",
+            json={"kind": "embedding", "base_url": "https://configured.example.test/v1"},
+        ).json()
+        other_origin = client.post(
+            "/api/v1/llm-config/probe",
+            json={"kind": "embedding", "base_url": "https://other.example.test/v1"},
+        ).json()
+
+    assert same_origin["ok"] is True
+    assert other_origin["ok"] is False
+    assert other_origin["stage"] == "auth"
+    assert [headers["Authorization"] for _url, headers in endpoint.requests] == ["Bearer saved-embedding-key"]
+
+
 @pytest.mark.asyncio
 async def test_llm_config_put_can_preserve_and_clear_keys(db, tmp_path):
     from memforge.server.admin_api import create_admin_app

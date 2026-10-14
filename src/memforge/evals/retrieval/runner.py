@@ -15,6 +15,7 @@ from memforge.evals.retrieval.schema import (
     RetrievalCase,
     RetrievalCaseSet,
 )
+from memforge.llm.embedding import EmbeddingRuntime, EmbeddingSettings
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -130,9 +131,8 @@ async def run_sqlite_case_set(
                     if "vector" in case.ranked_channel_results
                     else adapters.vector
                 ),
-                embed_cfg={},
+                embedding=_fixture_embedding_runtime(),
                 config=RetrievalConfig(enable_reranking=False),
-                embedding_provider=lambda _query: [0.0],
             )
             result = await engine.search(
                 case.query,
@@ -299,6 +299,23 @@ def _remove_sqlite_files(db_path: Path) -> None:
     ):
         with suppress(FileNotFoundError):
             path.unlink()
+
+
+def _fixture_embedding_runtime() -> EmbeddingRuntime:
+    """Embed every query as one fixed vector; the fixture ranks the vector channel itself."""
+
+    async def fixed_vectors(*, input: Sequence[str], **_request: Any) -> dict[str, Any]:
+        return {
+            "data": [
+                {"index": index, "embedding": [0.0]}
+                for index in range(len(input))
+            ]
+        }
+
+    return EmbeddingRuntime(
+        EmbeddingSettings(model="retrieval-fixture", base_url="http://retrieval-fixture.invalid"),
+        transport=fixed_vectors,
+    )
 
 
 class _EmptyVectorCollection:

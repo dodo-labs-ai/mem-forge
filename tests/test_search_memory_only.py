@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -18,6 +19,7 @@ from memforge.models import Memory, content_hash
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
+from tests.embedding_fixture import unconfigured_embedding
 
 
 class FakeCollection:
@@ -100,10 +102,10 @@ async def test_search_does_not_append_document_results_when_memory_results_are_s
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("PostgreSQL", top_k=5)
 

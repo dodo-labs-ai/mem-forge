@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-__all__ = ["is_litellm_provider_model", "litellm_optional_kwargs"]
+from urllib.parse import urlsplit
+
+__all__ = ["endpoint_origin", "is_litellm_provider_model", "litellm_optional_kwargs"]
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 def is_litellm_provider_model(model: str | None) -> bool:
@@ -29,3 +33,22 @@ def litellm_optional_kwargs(
     if api_key:
         kwargs["api_key"] = api_key
     return kwargs
+
+
+def endpoint_origin(url: str | None) -> tuple[str, str, int] | None:
+    """Return the normalized ``(scheme, host, port)`` an endpoint URL addresses.
+
+    Two URLs with the same origin reach the same server, whatever their paths.
+    Scheme and host compare case-insensitively and a missing port means the
+    scheme's default. A value that is not an absolute HTTP(S) URL has no origin.
+    """
+    try:
+        parsed = urlsplit((url or "").strip())
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").rstrip(".")
+    if scheme not in _DEFAULT_PORTS or not host:
+        return None
+    return scheme, host, port if port is not None else _DEFAULT_PORTS[scheme]

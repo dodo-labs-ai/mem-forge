@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -37,6 +38,7 @@ from memforge.storage.adapters.context import LOCAL_DEV_USER_ID, AccessScope
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.adapters.sqlite.relational import SqliteRelationalStore
 from memforge.storage.database import Database
+from tests.embedding_fixture import unconfigured_embedding
 
 OTHER_USER_ID = "someone-else"
 EARLIER = "2026-07-01"
@@ -583,10 +585,10 @@ def _engine(db: Database, tmp_path: Path, vector_ids: list[str]) -> SearchEngine
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=AppConfig(base_dir=tmp_path / "memforge").retrieval,
     )
-    engine._get_or_compute_embedding = lambda _query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
     return engine
 
 

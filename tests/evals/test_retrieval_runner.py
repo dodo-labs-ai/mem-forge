@@ -6,6 +6,7 @@ from dataclasses import replace
 import pytest
 
 from memforge.config import DEFAULT_RRF_K
+from tests.embedding_fixture import unconfigured_embedding
 
 
 @pytest.mark.asyncio
@@ -114,7 +115,8 @@ async def test_sqlite_runner_reports_requested_and_fallback_intent_resolution(tm
     }
 
 
-def test_search_engine_embedding_provider_degrades_on_exception() -> None:
+@pytest.mark.asyncio
+async def test_search_engine_embedding_provider_degrades_on_exception() -> None:
     from memforge.config import RetrievalConfig
     from memforge.retrieval.search import SearchEngine
 
@@ -125,12 +127,12 @@ def test_search_engine_embedding_provider_degrades_on_exception() -> None:
         relational=object(),
         keyword=object(),
         vector=object(),
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
         embedding_provider=broken_provider,
     )
 
-    assert engine._get_or_compute_embedding("query") is None
+    assert await engine._embed_query("query") is None
 
 
 @pytest.mark.asyncio

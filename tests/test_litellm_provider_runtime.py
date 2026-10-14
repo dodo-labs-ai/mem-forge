@@ -71,12 +71,17 @@ async def test_structured_client_omits_empty_base_url_and_api_key(monkeypatch):
     assert "api_key" not in captured
 
 
-def test_provider_prefixed_embedding_uses_litellm_without_empty_credentials(monkeypatch):
-    from memforge.retrieval import embeddings
+def _embedding_runtime(model: str, *, base_url: str | None = None, api_key: str | None = None):
+    from memforge.llm.embedding import EmbeddingRuntime, EmbeddingSettings
 
+    return EmbeddingRuntime(EmbeddingSettings(model=model, base_url=base_url, api_key=api_key))
+
+
+@pytest.mark.asyncio
+async def test_provider_prefixed_embedding_uses_litellm_without_empty_credentials(monkeypatch):
     captured = {}
 
-    def fake_embedding(**kwargs):
+    async def fake_aembedding(**kwargs):
         captured.update(kwargs)
         return SimpleNamespace(
             data=[
@@ -85,31 +90,47 @@ def test_provider_prefixed_embedding_uses_litellm_without_empty_credentials(monk
             ]
         )
 
-    monkeypatch.setattr(embeddings.litellm, "embedding", fake_embedding)
+    monkeypatch.setattr("litellm.aembedding", fake_aembedding)
 
-    vectors = embeddings.embed_texts(
-        ["alpha", "beta"],
-        base_url="",
-        api_key="",
-        model="provider/embedding-model",
-    )
+    vectors = await _embedding_runtime("ollama/embedding-model").embed_documents(["alpha", "beta"])
 
     assert vectors == [[0.1, 0.2], [0.3, 0.4]]
-    assert captured["model"] == "provider/embedding-model"
+    assert captured["model"] == "ollama/embedding-model"
     assert captured["input"] == ["alpha", "beta"]
+    assert captured["max_retries"] == 0
     assert "api_base" not in captured
     assert "api_key" not in captured
 
 
-def test_provider_prefixed_embedding_batches_inputs_at_transport_limit(monkeypatch):
-    from memforge.retrieval import embeddings
+@pytest.mark.asyncio
+async def test_bare_embedding_model_uses_the_openai_route_with_the_configured_endpoint(monkeypatch):
+    captured = {}
 
+    async def fake_aembedding(**kwargs):
+        captured.update(kwargs)
+        return {"data": [{"index": 0, "embedding": [0.1, 0.2]}]}
+
+    monkeypatch.setattr("litellm.aembedding", fake_aembedding)
+
+    vector = await _embedding_runtime(
+        "text-embedding-3-small",
+        base_url="https://embedding.example.test/v1",
+        api_key="key",
+    ).embed_query("alpha")
+
+    assert vector == [0.1, 0.2]
+    assert captured["model"] == "openai/text-embedding-3-small"
+    assert captured["api_base"] == "https://embedding.example.test/v1"
+    assert captured["api_key"] == "key"
+    assert captured["max_retries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_provider_prefixed_embedding_batches_inputs_at_request_limit(monkeypatch):
     calls: list[list[str]] = []
 
-    def fake_embedding(**kwargs):
+    async def fake_aembedding(**kwargs):
         inputs = list(kwargs["input"])
-        if len(inputs) > 2048:
-            raise ValueError("Embedding Module: Invalid 'input': array length must be 2048 or less.")
         calls.append(inputs)
         return SimpleNamespace(
             data=[
@@ -118,39 +139,27 @@ def test_provider_prefixed_embedding_batches_inputs_at_transport_limit(monkeypat
             ]
         )
 
-    monkeypatch.setattr(embeddings.litellm, "embedding", fake_embedding)
-    texts = [f"item-{index}" for index in range(2049)]
+    monkeypatch.setattr("litellm.aembedding", fake_aembedding)
+    texts = [f"item-{index}" for index in range(70)]
 
-    vectors = embeddings.embed_texts(
-        texts,
-        base_url="",
-        api_key="",
-        model="provider/embedding-model",
-    )
+    vectors = await _embedding_runtime("ollama/embedding-model").embed_documents(texts)
 
-    assert [len(batch) for batch in calls] == [2048, 1]
-    assert vectors == [[float(index)] for index in range(2049)]
+    assert [len(batch) for batch in calls] == [32, 32, 6]
+    assert vectors == [[float(index)] for index in range(70)]
 
 
-def test_provider_prefixed_embedding_rejects_incomplete_batch_response(monkeypatch):
-    from memforge.retrieval import embeddings
+@pytest.mark.asyncio
+async def test_provider_prefixed_embedding_rejects_incomplete_batch_response(monkeypatch):
+    async def fake_aembedding(**_kwargs):
+        return SimpleNamespace(data=[SimpleNamespace(index=0, embedding=[0.1, 0.2])])
 
-    monkeypatch.setattr(
-        embeddings.litellm,
-        "embedding",
-        lambda **_kwargs: SimpleNamespace(data=[SimpleNamespace(index=0, embedding=[0.1, 0.2])]),
-    )
+    monkeypatch.setattr("litellm.aembedding", fake_aembedding)
 
     with pytest.raises(
         ValueError,
         match=r"Embedding response count does not match input count: expected 2, got 1",
     ):
-        embeddings.embed_texts(
-            ["alpha", "beta"],
-            base_url="",
-            api_key="",
-            model="provider/embedding-model",
-        )
+        await _embedding_runtime("ollama/embedding-model").embed_documents(["alpha", "beta"])
 
 
 @pytest.mark.parametrize(
@@ -171,52 +180,37 @@ def test_provider_prefixed_embedding_rejects_incomplete_batch_response(monkeypat
     ],
     ids=["duplicate", "missing", "out_of_range"],
 )
-def test_provider_prefixed_embedding_rejects_invalid_response_indexes(
+@pytest.mark.asyncio
+async def test_provider_prefixed_embedding_rejects_invalid_response_indexes(
     monkeypatch, data
 ):
-    from memforge.retrieval import embeddings
+    async def fake_aembedding(**_kwargs):
+        return SimpleNamespace(data=data)
 
-    monkeypatch.setattr(
-        embeddings.litellm,
-        "embedding",
-        lambda **_kwargs: SimpleNamespace(data=data),
-    )
+    monkeypatch.setattr("litellm.aembedding", fake_aembedding)
 
     with pytest.raises(ValueError, match=r"Embedding response indices"):
-        embeddings.embed_texts(
-            ["alpha", "beta"],
-            base_url="",
-            api_key="",
-            model="provider/embedding-model",
-        )
+        await _embedding_runtime("ollama/embedding-model").embed_documents(["alpha", "beta"])
 
 
-def test_openai_compatible_http_embedding_rejects_invalid_response_indexes(
-    monkeypatch,
-):
-    from memforge.retrieval import embeddings
+@pytest.mark.asyncio
+async def test_openai_compatible_embedding_rejects_invalid_response_indexes(monkeypatch):
+    async def fake_aembedding(**_kwargs):
+        return {
+            "data": [
+                {"index": 0, "embedding": [0.1]},
+                {"index": 0, "embedding": [0.2]},
+            ]
+        }
 
-    class Response:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {
-                "data": [
-                    {"index": 0, "embedding": [0.1]},
-                    {"index": 0, "embedding": [0.2]},
-                ]
-            }
-
-    monkeypatch.setattr(embeddings.httpx, "post", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr("litellm.aembedding", fake_aembedding)
 
     with pytest.raises(ValueError, match=r"Embedding response indices"):
-        embeddings.embed_texts(
-            ["alpha", "beta"],
+        await _embedding_runtime(
+            "text-embedding-3-small",
             base_url="https://embedding.example.test/v1",
             api_key="key",
-            model="text-embedding-3-small",
-        )
+        ).embed_documents(["alpha", "beta"])
 
 
 def test_rerank_model_follows_effective_llm_config() -> None:
@@ -238,3 +232,26 @@ def test_rerank_model_follows_effective_llm_config() -> None:
 
     assert retrieval.rerank_model == "sap/anthropic--claude-4.6-sonnet"
     assert config.retrieval.rerank_model != retrieval.rerank_model
+
+
+@pytest.mark.parametrize(
+    ("url", "origin"),
+    [
+        ("https://api.example.test/v1", ("https", "api.example.test", 443)),
+        ("HTTPS://API.Example.Test:443/other?x=1", ("https", "api.example.test", 443)),
+        ("https://api.example.test./v1", ("https", "api.example.test", 443)),
+        ("http://api.example.test", ("http", "api.example.test", 80)),
+        ("http://localhost:11434/v1", ("http", "localhost", 11434)),
+        ("http://[::1]:8080/v1", ("http", "::1", 8080)),
+        ("  https://api.example.test/v1  ", ("https", "api.example.test", 443)),
+        ("ftp://api.example.test/v1", None),
+        ("api.example.test/v1", None),
+        ("https://api.example.test:not-a-port/v1", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_endpoint_origin_normalizes_scheme_host_and_port(url, origin) -> None:
+    from memforge.llm.providers import endpoint_origin
+
+    assert endpoint_origin(url) == origin

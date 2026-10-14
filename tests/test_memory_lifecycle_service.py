@@ -44,6 +44,7 @@ from memforge.storage.adapters.protocols import ActiveMemorySupportState
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from tests.unit_support_fixture import primary_reference, record_unit_support
+from tests.embedding_fixture import unconfigured_embedding
 
 
 class RecordingCollection:
@@ -133,7 +134,7 @@ def _store(db: Database, collection: RecordingCollection) -> MemoryStore:
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         audit_logger=audit_logger,
     )
 
@@ -1582,7 +1583,7 @@ async def test_create_search_get_memory_round_trip_keeps_provenance_out_of_searc
                 relational=adapters.relational,
                 keyword=adapters.keyword,
                 vector=adapters.vector,
-                embed_cfg={},
+                embedding=unconfigured_embedding(),
                 config=config.retrieval,
                 embedding_provider=lambda _text: None,
             )

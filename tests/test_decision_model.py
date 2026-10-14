@@ -44,6 +44,7 @@ from tests.test_cross_document_relation_classifier import _Client as RelationCli
 from tests.test_cross_document_relation_classifier import _pairs
 from tests.test_entity_resolver import _SCOPE, EntityClient, FakeEntityStore, _match_first_candidate
 from tests.test_revision_work import Store
+from tests.embedding_fixture import fixed_vector_embedding
 
 MAIN_MODEL = "gateway/main-model"
 DECISION_MODEL = "gateway/decision-model"
@@ -272,14 +273,10 @@ async def test_entity_adjudication_runs_on_the_model_its_registration_selects(
     store = FakeEntityStore(EntityResolutionContext(
         exact_matches={}, alias_matches={}, candidates={"pay service": (candidate,)},
     ))
-    monkeypatch.setattr(
-        "memforge.retrieval.embeddings.embed_texts",
-        lambda texts, *_args: [[1.0, 0.0] for _ in texts],
-    )
     client = DecisionEntityClient(respond=_match_first_candidate)
     resolver = EntityResolver(
         store=store,  # type: ignore[arg-type]
-        embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+        embedding=fixed_vector_embedding([1.0, 0.0]),
         structured_llm_client=client,
         llm_model=MAIN_MODEL,
     )

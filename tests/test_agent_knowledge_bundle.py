@@ -18,6 +18,7 @@ from memforge.models import Memory, Visibility, content_hash
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
 from memforge.source_access_transition import SourceAccessTransitionService
+from tests.embedding_fixture import unconfigured_embedding
 
 
 class RecordingCollection:
@@ -72,7 +73,7 @@ async def bundle_stack(tmp_path, monkeypatch):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
     )
 
     async def fake_embed(text: str):

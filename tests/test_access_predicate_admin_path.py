@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -29,6 +30,7 @@ from memforge.retrieval.search import SearchEngine
 from memforge.storage.adapters.context import AccessScope
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
+from tests.embedding_fixture import unconfigured_embedding
 
 
 WORKSPACE = Visibility.WORKSPACE.value
@@ -166,10 +168,10 @@ async def test_search_with_admin_styled_caller_still_hides_other_users_private(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1, 0.1, 0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1, 0.1, 0.1])
 
     # An admin-styled caller from u-1: they cannot escalate by claiming to be
     # an administrator. The scope is the only authority.

@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock
+
 import pytest
 from memforge.models import (
     Memory,
@@ -8,6 +10,7 @@ from memforge.models import (
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.adapters.context import AccessScope
+from tests.embedding_fixture import unconfigured_embedding
 
 
 WORKSPACE = Visibility.WORKSPACE.value
@@ -222,10 +225,10 @@ async def test_search_engine_team_search_excludes_private(db, monkeypatch):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1, 0.1, 0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1, 0.1, 0.1])
 
     team_scope = AccessScope(
         user_id="u-1",
@@ -300,10 +303,10 @@ async def test_agent_hook_uses_personalized_predicate(db, monkeypatch):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1, 0.1, 0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1, 0.1, 0.1])
 
     request = AgentHookContextRequest(
         client="codex",

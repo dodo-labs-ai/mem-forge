@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -19,6 +20,7 @@ from memforge.storage.database import Database
 from memforge.storage.adapters.protocols import EntityLinkCandidate, KeywordCandidate
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from tests.llm_fixture import FixtureBudgetClient
+from tests.embedding_fixture import unconfigured_embedding
 
 
 class FakeCollection:
@@ -146,10 +148,10 @@ async def _title_only_search_engine(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
     return target, engine
 
 
@@ -192,10 +194,10 @@ async def test_search_routes_vector_and_bm25_through_the_adapters(db, monkeypatc
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("PostgreSQL", top_k=10)
     assert [r.memory_id for r in result["results"]] == [active.id]
@@ -219,10 +221,10 @@ async def test_search_exposes_rank_fusion_contributions_for_each_result(db):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("PostgreSQL", top_k=10)
 
@@ -292,10 +294,10 @@ async def test_search_resolves_ranked_intent_without_language_shape_routing(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda value: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search(query, intent=requested_intent, top_k=1)
 
@@ -324,10 +326,10 @@ async def test_requested_relationship_falls_back_without_traversable_entity(db):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda value: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("how is this related", intent="relationship", top_k=1)
 
@@ -345,7 +347,7 @@ async def test_search_rejects_unknown_intent_before_adapter_access():
         relational=object(),
         keyword=object(),
         vector=object(),
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
 
@@ -365,10 +367,10 @@ async def test_search_path_uses_entity_linker_not_legacy_query_analysis(db, monk
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
     assert not hasattr(engine, "_build_known_entities")
 
     result = await engine.search("PostgreSQL", entities=["postgresql"], top_k=10)
@@ -396,10 +398,10 @@ async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch)
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("create blocker hint", top_k=10)
 
@@ -517,7 +519,7 @@ async def test_metadata_query_paths_only_report_retained_channel_hits(
             quoted_score=quoted_score,
         ),
         vector=object(),
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
 
@@ -570,10 +572,10 @@ async def test_search_recalls_compound_query_from_metadata_trigram(db, monkeypat
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("create blockerhints", top_k=10)
 
@@ -612,10 +614,10 @@ async def test_source_filter_prevents_non_matching_metadata_evidence(db, monkeyp
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search(
         "create blocker hint",
@@ -647,11 +649,11 @@ async def test_rerank_prompt_includes_metadata_evidence_for_metadata_hits(db, mo
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(enable_reranking=True, rerank_candidates=10),
         structured_llm_client=reranker,
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("create blocker hint", top_k=10)
 
@@ -676,11 +678,11 @@ async def _rerank_search(db, reranker: RecordingRerankClient) -> list[str]:
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(enable_reranking=True, rerank_candidates=10),
         structured_llm_client=reranker,
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
     result = await engine.search("lifecycle assignment", top_k=10)
     return [r.memory_id for r in result["results"]]
 
@@ -731,10 +733,10 @@ async def test_source_filter_applies_to_vector_hits(db, monkeypatch):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("PostgreSQL", source_filter=MemorySourceFilter(source_ids=("wiki",)), top_k=10)
     assert [r.memory_id for r in result["results"]] == ["m-backed"]
@@ -763,10 +765,10 @@ async def test_structured_source_filter_accepts_multiple_source_ids(db, monkeypa
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search(
         "PostgreSQL",
@@ -814,10 +816,10 @@ async def test_structured_source_filter_applies_to_vector_hits(db, monkeypatch):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search(
         "Scheduler claim",
@@ -862,10 +864,10 @@ async def test_explicit_time_range_filters_vector_hits_before_ranking(db, monkey
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search(
         "Payroll incident",
@@ -901,10 +903,10 @@ async def test_known_item_prefers_rank_one_metadata_over_vector_plus_content(db,
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("ISSUE-12345 lifecycle blocker", top_k=2)
 
@@ -941,10 +943,10 @@ async def test_code_symbol_metadata_hit_resolves_known_item(db, monkeypatch):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("PayrollCutoffCommand", top_k=2)
 
@@ -972,10 +974,10 @@ async def test_code_symbol_without_metadata_support_resolves_known_item(db, monk
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     async def metadata_results(
         _query,
@@ -1023,10 +1025,10 @@ async def test_exact_metadata_channel_evidence_resolves_known_item_independent_o
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda value: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     async def metadata_results(
         _query,
@@ -1063,10 +1065,10 @@ async def test_generic_metadata_token_hit_does_not_force_known_item(db, monkeypa
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda value: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     async def metadata_results(*args, **kwargs):
         return [
@@ -1096,10 +1098,10 @@ async def test_metadata_trigram_hit_does_not_force_known_item(db, monkeypatch):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     async def metadata_results(
         _query,
@@ -1136,10 +1138,10 @@ async def test_explanatory_query_defaults_to_general_hybrid(db, monkeypatch):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search(
         "why does payroll cutoff affect payment retry policy",
@@ -1169,10 +1171,10 @@ async def test_requested_relationship_downweights_broad_entity_fanout(db, monkey
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     async def empty_channel(*args, **kwargs):
         return []
@@ -1263,10 +1265,10 @@ async def test_queried_search_honors_offset_after_ranking(db, monkeypatch):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
     monkeypatch.setattr(engine, "_bm25_search", no_bm25)
 
     result = await engine.search("PostgreSQL pagination", top_k=1, offset=1)
@@ -1288,10 +1290,10 @@ async def test_queried_search_top_k_does_not_change_ranking_prefix(db, monkeypat
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     lexical_order = [f"m-{index}" for index in range(20, 40)] + [f"m-{index}" for index in range(20)]
 
@@ -1353,10 +1355,10 @@ async def test_queried_search_top_k_prefix_stable_with_sqlite_metadata_channel(d
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     first_page = await engine.search("create blocker hint", top_k=10)
     larger_page = await engine.search("create blocker hint", top_k=20)
@@ -1381,7 +1383,7 @@ async def test_queried_search_legacy_config_uses_default_rank_window(db, monkeyp
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=SimpleNamespace(
             embedding_cache_size=256,
             rrf_k=60,
@@ -1389,7 +1391,7 @@ async def test_queried_search_legacy_config_uses_default_rank_window(db, monkeyp
             enable_reranking=False,
         ),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
     seen_limits = []
 
     async def vector_results(_query, _memory_types, _scope, limit):
@@ -1443,10 +1445,10 @@ async def test_search_engine_returns_only_memory_results_even_when_top_k_has_roo
         relational=memory_adapters.relational,
         keyword=memory_adapters.keyword,
         vector=memory_adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
     monkeypatch.setattr(engine, "_bm25_search", no_bm25)
 
     result = await engine.search(
@@ -1500,11 +1502,11 @@ async def test_queryless_source_id_time_range_uses_relational_listing_only(db, m
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: (_ for _ in ()).throw(
-        AssertionError("queryless search must not embed")
+    engine._embed_query = AsyncMock(
+        side_effect=AssertionError("queryless search must not embed")
     )
 
     result = await engine.search(
@@ -1542,7 +1544,7 @@ async def test_queryless_search_compatibility_applies_memory_types_before_pagina
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
 
@@ -1597,7 +1599,7 @@ async def test_recent_memory_listing_pages_with_a_request_bound_keyset_cursor(db
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
     source_filter = MemorySourceFilter(source_ids=("src-jira",))
@@ -1663,7 +1665,7 @@ async def test_recent_memory_cursor_is_opaque_and_bound_to_the_original_filters(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
     source_filter = MemorySourceFilter(source_ids=("src-jira",))
