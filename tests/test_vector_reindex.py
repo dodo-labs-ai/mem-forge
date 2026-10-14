@@ -17,6 +17,7 @@ from pathlib import Path
 import chromadb
 import httpx
 import pytest
+from rich.console import Console
 from click.testing import CliRunner
 
 from memforge import runtime
@@ -1433,7 +1434,8 @@ def _cli(config: AppConfig, db: Database, monkeypatch, *arguments: str, embeddin
     monkeypatch.setenv("MEMFORGE_EMBEDDING_MODEL", embedding_model)
     monkeypatch.setenv("MEMFORGE_EMBEDDING_BASE_URL", ENDPOINT if embedding_model else "")
     monkeypatch.setenv("MEMFORGE_EMBEDDING_API_KEY", "embedding-key" if embedding_model else "")
-    monkeypatch.setenv("COLUMNS", "200")
+    # A fixed width keeps tables and messages on one line whatever the terminal.
+    monkeypatch.setattr("memforge.main.console", Console(width=200))
     return CliRunner().invoke(cli, ["maintenance", "reindex", *arguments])
 
 

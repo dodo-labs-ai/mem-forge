@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 from click.testing import CliRunner
 
 from memforge.config import load_config
@@ -22,7 +23,8 @@ SAVED_KEY = "saved-secret-key-1111"
 def installation(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("MEMFORGE_BASE_DIR", str(tmp_path / "mem"))
     monkeypatch.setenv("MEMFORGE_SECRET_KEY", "VV4JjZLLr2BcgRnhV90gCnxzchn43M900VQy3dXJI30=")
-    monkeypatch.setenv("COLUMNS", "200")
+    # A fixed width keeps tables and messages on one line whatever the terminal.
+    monkeypatch.setattr("memforge.main.console", Console(width=200))
     for name in ("MEMFORGE_ENRICHMENT_MODEL", "MEMFORGE_ENRICHMENT_BASE_URL", "MEMFORGE_ENRICHMENT_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MEMFORGE_EMBEDDING_MODEL", "")
