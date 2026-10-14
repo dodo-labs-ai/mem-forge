@@ -18,6 +18,7 @@ from memforge.models import Entity, EntityAlias, canonicalize_entity_name
 from memforge.storage.database import Database
 from memforge.storage.adapters.protocols import EntityResolutionScope, EntityUpsert
 from tests.llm_fixture import FixtureBudgetClient
+from tests.embedding_fixture import embedding_from_texts, fixed_vector_embedding
 
 
 _SCOPE = EntityResolutionScope(access_context_hash="access-a")
@@ -206,7 +207,7 @@ def _entity_batch_response(
 
 
 @pytest.mark.asyncio
-async def test_resolve_many_batches_lookup_embedding_and_ambiguity(monkeypatch):
+async def test_resolve_many_batches_lookup_embedding_and_ambiguity():
     pay = Entity(id=1, canonical_name="payroll service", display_name="Payroll Service")
     auth = Entity(id=2, canonical_name="authentication service", display_name="Authentication Service")
     known = Entity(id=3, canonical_name="memforge", display_name="MemForge")
@@ -229,14 +230,13 @@ async def test_resolve_many_batches_lookup_embedding_and_ambiguity(monkeypatch):
     )
     embedding_batches: list[list[str]] = []
 
-    def fake_embed_texts(texts, *_args):
+    def embed_batch(texts):
         embedding_batches.append(list(texts))
         return [[1.0, 0.0] for _ in texts]
 
-    monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
     resolver = EntityResolver(
         store=store,  # type: ignore[arg-type]
-        embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+        embedding=embedding_from_texts(embed_batch),
         structured_llm_client=client,
     )
 
@@ -277,7 +277,7 @@ async def test_resolve_many_batches_lookup_embedding_and_ambiguity(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolve_many_binds_adjudication_by_mention_not_position(monkeypatch):
+async def test_resolve_many_binds_adjudication_by_mention_not_position():
     first = Entity(id=1, canonical_name="first service", display_name="First Service")
     second = Entity(id=2, canonical_name="second service", display_name="Second Service")
     store = FakeEntityStore(
@@ -293,13 +293,9 @@ async def test_resolve_many_binds_adjudication_by_mention_not_position(monkeypat
             EntityBatchValidationDecision(mention="first svc", matched_id=1, confidence=0.99),
         ]
     )
-    monkeypatch.setattr(
-        "memforge.retrieval.embeddings.embed_texts",
-        lambda texts, *_args: [[1.0, 0.0] for _ in texts],
-    )
     resolver = EntityResolver(
         store=store,  # type: ignore[arg-type]
-        embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+        embedding=fixed_vector_embedding([1.0, 0.0]),
         structured_llm_client=client,
     )
 
@@ -315,7 +311,7 @@ async def test_resolve_many_binds_adjudication_by_mention_not_position(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_resolve_many_rejects_classifier_id_outside_candidate_set(monkeypatch):
+async def test_resolve_many_rejects_classifier_id_outside_candidate_set():
     candidate = Entity(id=1, canonical_name="payroll service", display_name="Payroll Service")
     store = FakeEntityStore(
         EntityResolutionContext(
@@ -325,13 +321,9 @@ async def test_resolve_many_rejects_classifier_id_outside_candidate_set(monkeypa
         )
     )
     client = _fixed_client([EntityBatchValidationDecision(mention="pay service", matched_id=999, confidence=1.0)])
-    monkeypatch.setattr(
-        "memforge.retrieval.embeddings.embed_texts",
-        lambda texts, *_args: [[1.0, 0.0] for _ in texts],
-    )
     resolver = EntityResolver(
         store=store,  # type: ignore[arg-type]
-        embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+        embedding=fixed_vector_embedding([1.0, 0.0]),
         structured_llm_client=client,
     )
 
@@ -350,7 +342,7 @@ async def test_resolve_many_rejects_classifier_id_outside_candidate_set(monkeypa
     ids=("missing", "duplicate_hides_missing"),
 )
 @pytest.mark.asyncio
-async def test_resolve_many_rejects_incomplete_adjudication_before_entity_writes(monkeypatch, mentions):
+async def test_resolve_many_rejects_incomplete_adjudication_before_entity_writes(mentions):
     first = Entity(id=1, canonical_name="first service", display_name="First Service")
     second = Entity(id=2, canonical_name="second service", display_name="Second Service")
     store = FakeEntityStore(
@@ -361,13 +353,9 @@ async def test_resolve_many_rejects_incomplete_adjudication_before_entity_writes
         )
     )
     client = _fixed_client([EntityBatchValidationDecision(mention=mention, matched_id=1, confidence=0.99) for mention in mentions])
-    monkeypatch.setattr(
-        "memforge.retrieval.embeddings.embed_texts",
-        lambda texts, *_args: [[1.0, 0.0] for _ in texts],
-    )
     resolver = EntityResolver(
         store=store,  # type: ignore[arg-type]
-        embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+        embedding=fixed_vector_embedding([1.0, 0.0]),
         structured_llm_client=client,
     )
 
@@ -382,7 +370,7 @@ async def test_resolve_many_rejects_incomplete_adjudication_before_entity_writes
 
 
 @pytest.mark.asyncio
-async def test_resolve_many_retries_incomplete_adjudication_once(monkeypatch):
+async def test_resolve_many_retries_incomplete_adjudication_once():
     first = Entity(id=1, canonical_name="first service", display_name="First Service")
     second = Entity(id=2, canonical_name="second service", display_name="Second Service")
     store = FakeEntityStore(
@@ -399,13 +387,9 @@ async def test_resolve_many_retries_incomplete_adjudication_once(monkeypatch):
             [EntityBatchValidationDecision(mention="second svc", matched_id=2, confidence=0.99)],
         ]
     )
-    monkeypatch.setattr(
-        "memforge.retrieval.embeddings.embed_texts",
-        lambda texts, *_args: [[1.0, 0.0] for _ in texts],
-    )
     resolver = EntityResolver(
         store=store,  # type: ignore[arg-type]
-        embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+        embedding=fixed_vector_embedding([1.0, 0.0]),
         structured_llm_client=client,
     )
 
@@ -420,7 +404,7 @@ async def test_resolve_many_retries_incomplete_adjudication_once(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolve_many_bounds_context_batches_and_packs_adjudication_by_capacity(monkeypatch):
+async def test_resolve_many_bounds_context_batches_and_packs_adjudication_by_capacity():
     mentions = tuple(f"service {index}" for index in range(5))
     candidates = {
         mention: (Entity(id=index + 1, canonical_name=f"canonical {index}", display_name=f"Canonical {index}"),)
@@ -438,13 +422,9 @@ async def test_resolve_many_bounds_context_batches_and_packs_adjudication_by_cap
 
     store = ChunkedStore(EntityResolutionContext({}, {}, {}))
     client = EntityClient(respond=_match_first_candidate, max_cases=2, max_concurrent=2)
-    monkeypatch.setattr(
-        "memforge.retrieval.embeddings.embed_texts",
-        lambda texts, *_args: [[1.0, 0.0] for _ in texts],
-    )
     resolver = EntityResolver(
         store=store,  # type: ignore[arg-type]
-        embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+        embedding=fixed_vector_embedding([1.0, 0.0]),
         structured_llm_client=client,
         policy=EntityResolutionPolicy(context_batch_size=2),
     )
@@ -462,19 +442,15 @@ async def test_resolve_many_bounds_context_batches_and_packs_adjudication_by_cap
 
 
 @pytest.mark.asyncio
-async def test_resolve_many_fails_before_entity_writes_when_one_mention_exceeds_capacity(monkeypatch):
+async def test_resolve_many_fails_before_entity_writes_when_one_mention_exceeds_capacity():
     candidate = Entity(id=1, canonical_name="payroll service", display_name="Payroll Service")
     store = FakeEntityStore(
         EntityResolutionContext(exact_matches={}, alias_matches={}, candidates={"pay service": (candidate,)})
     )
     client = EntityClient(respond=_match_first_candidate, max_cases=0)
-    monkeypatch.setattr(
-        "memforge.retrieval.embeddings.embed_texts",
-        lambda texts, *_args: [[1.0, 0.0] for _ in texts],
-    )
     resolver = EntityResolver(
         store=store,  # type: ignore[arg-type]
-        embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+        embedding=fixed_vector_embedding([1.0, 0.0]),
         structured_llm_client=client,
     )
 
@@ -486,7 +462,7 @@ async def test_resolve_many_fails_before_entity_writes_when_one_mention_exceeds_
 
 
 @pytest.mark.asyncio
-async def test_resolve_many_keeps_provider_error_type(monkeypatch):
+async def test_resolve_many_keeps_provider_error_type():
     candidate = Entity(id=1, canonical_name="payroll service", display_name="Payroll Service")
     store = FakeEntityStore(
         EntityResolutionContext(exact_matches={}, alias_matches={}, candidates={"pay service": (candidate,)})
@@ -495,13 +471,9 @@ async def test_resolve_many_keeps_provider_error_type(monkeypatch):
     def respond(_prompt: str) -> EntityBatchValidationResponse:
         raise StructuredLlmError("provider down", terminal_category="provider_error", error_code="provider_error")
 
-    monkeypatch.setattr(
-        "memforge.retrieval.embeddings.embed_texts",
-        lambda texts, *_args: [[1.0, 0.0] for _ in texts],
-    )
     resolver = EntityResolver(
         store=store,  # type: ignore[arg-type]
-        embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+        embedding=fixed_vector_embedding([1.0, 0.0]),
         structured_llm_client=EntityClient(respond=respond),
     )
 

@@ -119,6 +119,7 @@ from memforge.storage.source_sync_manifest import SourceSyncManifestStore
 from memforge.scheduler import SOURCE_SCHEDULE_SCAN_JOB_ID, SyncScheduler
 from tests.llm_fixture import AdmittingClient, NoopMemoryExtractor, fixture_request_planner
 from tests.unit_support_fixture import active_support_evidence
+from tests.embedding_fixture import unconfigured_embedding
 
 
 @pytest.fixture
@@ -4661,7 +4662,7 @@ def _audited_memory_store(db: Database) -> MemoryStore:
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         audit_logger=MemoryAuditLogger(
             db,
             default_context=AuditContext(actor_type="test", run_id="run-sync-bookkeeping"),

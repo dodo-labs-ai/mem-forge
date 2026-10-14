@@ -17,6 +17,7 @@ from memforge.models import (
 )
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
+from tests.embedding_fixture import unconfigured_embedding
 
 
 @pytest.mark.asyncio
@@ -36,7 +37,7 @@ async def test_add_source_support_does_not_cross_visibility(tmp_path):
         await db.insert_memory(priv)
 
         adapters = build_sqlite_adapters(db, memory_collection=None)
-        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
+        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embedding=unconfigured_embedding(), dedup_threshold=0.08)
 
         outcome = await store.add_source_support(
             memory_id="m-priv",
@@ -71,7 +72,7 @@ async def test_add_source_support_does_not_cross_private_owner(tmp_path):
         await db.insert_memory(alice)
 
         adapters = build_sqlite_adapters(db, memory_collection=None)
-        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
+        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embedding=unconfigured_embedding(), dedup_threshold=0.08)
 
         outcome = await store.add_source_support(
             memory_id="m-alice",
@@ -106,7 +107,7 @@ async def test_add_source_support_does_not_cross_workspace_project(tmp_path):
         await db.insert_memory(risk)
 
         adapters = build_sqlite_adapters(db, memory_collection=None)
-        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
+        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embedding=unconfigured_embedding(), dedup_threshold=0.08)
 
         outcome = await store.add_source_support(
             memory_id="m-risk",
@@ -144,7 +145,7 @@ async def test_add_source_support_rejects_workspace_writer_with_none_project_aga
     try:
         await db.insert_memory(target)
         adapters = build_sqlite_adapters(db, memory_collection=None)
-        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
+        store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embedding=unconfigured_embedding(), dedup_threshold=0.08)
         outcome = await store.add_source_support(
             memory_id="m-pay",
             doc_id="d-noproj",

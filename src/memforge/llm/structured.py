@@ -29,6 +29,7 @@ from memforge.llm.structured_images import (
     prepare_structured_llm_images as _prepare_structured_llm_images,
 )
 from memforge.llm.structured_image_delivery import ArtifactImageDelivery
+from memforge.llm.transport import is_retryable_provider_error, provider_status_code
 
 type StructuredImageInputs = tuple[StructuredLlmImage, ...] | ArtifactImageDelivery
 
@@ -1086,7 +1087,7 @@ def _safe_provider_error_code(exc: BaseException) -> str:
 
     if isinstance(exc, litellm.ContextWindowExceededError):
         return INPUT_CAPACITY_EXCEEDED
-    if _provider_status_code(exc) == _HTTP_PAYLOAD_TOO_LARGE:
+    if provider_status_code(exc) == _HTTP_PAYLOAD_TOO_LARGE:
         return PAYLOAD_TOO_LARGE
     outer_code = type(exc).__name__
     if outer_code != "APIConnectionError":
@@ -1344,27 +1345,12 @@ def _schema_operation_name(response_format: type[BaseModel]) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 
 
-def _provider_status_code(exc: BaseException) -> int | None:
-    raw = getattr(exc, "status_code", None)
-    try:
-        return int(raw) if raw is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _is_retryable_provider_error(exc: BaseException) -> bool:
-    if isinstance(exc, (TimeoutError, ConnectionError)):
-        return True
-    status_code = _provider_status_code(exc)
-    return status_code in {408, 409, 429} or bool(status_code is not None and status_code >= 500)
-
-
 def _is_non_fallback_provider_error(exc: BaseException) -> bool:
     if isinstance(exc, StructuredLlmError):
         return exc.terminal_category in {"deadline_exceeded", "provider_error"}
-    if _is_retryable_provider_error(exc):
+    if is_retryable_provider_error(exc):
         return True
-    if _provider_status_code(exc) in {401, 403, 404}:
+    if provider_status_code(exc) in {401, 403, 404}:
         return True
     # The JSON-text transport is longer, so it cannot fit where this request did not.
     return _safe_provider_error_code(exc) in {INPUT_CAPACITY_EXCEEDED, PAYLOAD_TOO_LARGE}
@@ -2330,7 +2316,7 @@ class LiteLlmStructuredClient:
                 if not isinstance(exc, Exception):
                     raise
                 state.record_failed_attempt()
-                retry = _is_retryable_provider_error(exc) and state.retry_budget > 0
+                retry = is_retryable_provider_error(exc) and state.retry_budget > 0
                 failure = _structured_failure(exc)
                 state.record_provider_failure_attempt(
                     attempt_index=attempt_index,

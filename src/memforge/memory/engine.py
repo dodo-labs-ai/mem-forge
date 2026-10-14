@@ -12,6 +12,7 @@ import asyncio
 import json
 import hashlib
 
+from memforge.llm.embedding import EmbeddingRuntime
 from memforge.llm.structured import StructuredLlmError, failure_retryable
 import logging
 from collections.abc import Awaitable, Mapping, Sequence
@@ -277,7 +278,7 @@ class MemoryEngine:
         cross_document_candidates: CrossDocumentCandidateRetriever,
         db: Database,
         memory_store: MemoryStore,
-        embed_cfg: dict | None = None,
+        embedding: EmbeddingRuntime | None = None,
         structured_llm_client: Any = None,
         llm_model: str = "claude-sonnet-4-20250514",
         runtime_event_trace_sink: RuntimeEventTraceSink | None = None,
@@ -304,7 +305,7 @@ class MemoryEngine:
         # Entity resolver with embedding + LLM capabilities
         self.entity_resolver = EntityResolver(
             store=db,
-            embed_cfg=embed_cfg,
+            embedding=embedding,
             structured_llm_client=structured_llm_client,
             llm_model=llm_model,
         )

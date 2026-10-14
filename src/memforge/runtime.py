@@ -20,6 +20,7 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.auth import browser_session
 from memforge.genes import GENE_REGISTRY, create_gene, source_type_supports_sync
+from memforge.llm.embedding import EmbeddingRuntime, EmbeddingSettings
 from memforge.llm.providers import is_litellm_provider_model
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
 from memforge.local_agent.source_contract import (
@@ -556,6 +557,18 @@ def _has_structured_llm_credentials(llm: EffectiveLlmConfig) -> bool:
     return bool(llm.enrichment_api_key) or is_litellm_provider_model(llm.enrichment_model)
 
 
+def build_embedding_runtime(llm: EffectiveLlmConfig, config: AppConfig) -> EmbeddingRuntime:
+    """Build the Embedding Runtime for the effective embedding settings."""
+    return EmbeddingRuntime(
+        EmbeddingSettings(
+            model=llm.embedding_model,
+            base_url=llm.embedding_base_url or None,
+            api_key=llm.embedding_api_key or None,
+            cache_size=config.retrieval.embedding_cache_size,
+        )
+    )
+
+
 def _retrieval_config_for_llm(config: AppConfig, llm: EffectiveLlmConfig):
     """Use the effective main model for the optional retrieval rerank."""
     return replace(config.retrieval, rerank_model=llm.enrichment_model)
@@ -604,17 +617,12 @@ def _build_default_search_engine(
 ) -> Any:
     from memforge.retrieval.search import SearchEngine
 
-    embed_cfg = {
-        "base_url": llm.embedding_base_url,
-        "api_key": llm.embedding_api_key,
-        "model": llm.embedding_model,
-    }
     adapters = _build_default_adapters(db, config, audit_logger=audit_logger)
     return SearchEngine(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg=embed_cfg,
+        embedding=build_embedding_runtime(llm, config),
         config=_retrieval_config_for_llm(config, llm),
         structured_llm_client=structured_llm_client,
     )
@@ -657,11 +665,7 @@ def _build_default_sync_runtime(
         structured_llm_client=structured_llm_client,
     )
 
-    embed_cfg = {
-        "base_url": llm.embedding_base_url,
-        "api_key": llm.embedding_api_key,
-        "model": llm.embedding_model,
-    }
+    embedding = build_embedding_runtime(llm, config)
     adapters = _build_default_adapters(
         db,
         config,
@@ -671,7 +675,7 @@ def _build_default_sync_runtime(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg=embed_cfg,
+        embedding=embedding,
         audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="sync")),
     )
     memory_engine = MemoryEngine(
@@ -683,7 +687,7 @@ def _build_default_sync_runtime(
         db=db,
         document_store=doc_store,
         memory_store=memory_store,
-        embed_cfg=embed_cfg,
+        embedding=embedding,
         structured_llm_client=structured_llm_client,
         llm_model=llm.enrichment_model,
         runtime_event_trace_sink=runtime_event_trace_sink,

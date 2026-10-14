@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from memforge.config import AppConfig
 from memforge.models import Memory, SyncState, content_hash
 from memforge.storage.database import Database
+from tests.embedding_fixture import fixed_vector_transport
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -74,18 +75,12 @@ def test_hook_context_skips_trivial_prompt(tmp_path):
 
 
 def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path, monkeypatch):
-    from memforge.retrieval import search as search_module
     from memforge.server.admin_api import create_admin_app
 
-    # Stub the embedding API: the unit test has no real LLM endpoint, but the
-    # hook is now routed through the unified search engine which always asks
-    # for a query embedding. Returning a deterministic vector keeps the vector
-    # channel quiet so BM25 can surface the seeded memory.
-    monkeypatch.setattr(
-        search_module,
-        "embed_texts",
-        lambda texts, **_kwargs: [[0.0] * 8 for _ in texts],
-    )
+    # The hook searches through the search engine, which always embeds the
+    # query. A fixed vector keeps the vector channel quiet so BM25 surfaces the
+    # seeded memory.
+    monkeypatch.setattr("litellm.aembedding", fixed_vector_transport([0.0] * 8))
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "hooks.db"))
@@ -127,14 +122,9 @@ def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path, mon
 
 
 def test_hook_context_recent_changes_use_access_predicate(tmp_path, monkeypatch):
-    from memforge.retrieval import search as search_module
     from memforge.server.admin_api import create_admin_app
 
-    monkeypatch.setattr(
-        search_module,
-        "embed_texts",
-        lambda texts, **_kwargs: [[0.0] * 8 for _ in texts],
-    )
+    monkeypatch.setattr("litellm.aembedding", fixed_vector_transport([0.0] * 8))
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "hooks.db"))

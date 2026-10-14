@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-from memforge.llm.providers import is_litellm_provider_model
+from memforge.llm.embedding import EmbeddingRuntime
 from memforge.memory.index_payloads import (
     embedding_text_hash,
     embedding_vector_hash,
@@ -14,7 +13,6 @@ from memforge.memory.index_payloads import (
 )
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory
-from memforge.retrieval.embeddings import embed_texts
 from memforge.retrieval.vector_metadata import upsert_with_stored_vector_hash
 
 __all__ = ["MemoryIndexRepairResult", "MemoryIndexRepairer"]
@@ -37,11 +35,11 @@ class MemoryIndexRepairer:
         *,
         db,
         memory_collection: Any | None,
-        embed_cfg: dict[str, Any],
+        embedding: EmbeddingRuntime,
     ) -> None:
         self.db = db
         self.memory_collection = memory_collection
-        self.embed_cfg = embed_cfg
+        self.embedding = embedding
         self.search_visible_statuses = set(allowed_search_statuses())
 
     async def repair(self) -> MemoryIndexRepairResult:
@@ -97,7 +95,7 @@ class MemoryIndexRepairer:
 
             expected_embedding_text = await self._memory_embedding_text(memory)
             if existing is None:
-                if not self._has_embedding_config():
+                if not self.embedding.configured:
                     result.unrepaired_memories.append(memory.id)
                     continue
                 vector = await self._embed_memory(memory)
@@ -129,7 +127,7 @@ class MemoryIndexRepairer:
                 or actual_metadata.get("content_hash") != metadata["content_hash"]
             )
             if vector_is_stale:
-                if not self._has_embedding_config():
+                if not self.embedding.configured:
                     result.unrepaired_memories.append(memory.id)
                     continue
                 vector = await self._embed_memory(memory)
@@ -182,28 +180,14 @@ class MemoryIndexRepairer:
         return metadata
 
     async def _embed_memory(self, memory: Memory) -> list[float]:
-        if not self._has_embedding_config():
+        if not self.embedding.configured:
             raise RuntimeError(f"Cannot repair missing memory vector for {memory.id}: embedding config is missing")
         text = await self._memory_embedding_text(memory)
-        return (await asyncio.to_thread(
-            embed_texts,
-            [text],
-            self.embed_cfg["base_url"],
-            self.embed_cfg["api_key"],
-            self.embed_cfg["model"],
-        ))[0]
+        return (await self.embedding.embed_documents([text]))[0]
 
     async def _memory_embedding_text(self, memory: Memory) -> str:
         entity_names = await self.db.get_memory_entity_names(memory.id)
         return memory_embedding_text(memory, entity_names)
-
-    def _has_embedding_config(self) -> bool:
-        model = str(self.embed_cfg.get("model") or "").strip()
-        if not model:
-            return False
-        if is_litellm_provider_model(model):
-            return True
-        return bool(self.embed_cfg.get("base_url") and self.embed_cfg.get("api_key"))
 
     def _collection_records(self, collection: Any) -> dict[str, dict[str, Any]]:
         raw = collection.get(include=["embeddings", "documents", "metadatas"])

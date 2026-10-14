@@ -11,6 +11,7 @@ from memforge.models import (
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.memory.store import MemoryStore
+from tests.embedding_fixture import unconfigured_embedding
 
 WORKSPACE = Visibility.WORKSPACE.value
 PRIVATE = Visibility.PRIVATE.value
@@ -85,7 +86,7 @@ async def test_private_write_does_not_corroborate_workspace(db, monkeypatch):
 
     # A private write with identical content must INSERT, not corroborate.
     adapters = build_sqlite_adapters(db, memory_collection=_FakeColl(seeded=["m-ws"]))
-    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
+    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embedding=unconfigured_embedding(), dedup_threshold=0.08)
 
     async def _stub_embed(text):
         return [0.1, 0.1, 0.1]
@@ -112,7 +113,7 @@ async def test_workspace_write_does_not_corroborate_private(db, monkeypatch):
 
     # A workspace write with identical content must INSERT, not corroborate.
     adapters = build_sqlite_adapters(db, memory_collection=_FakeColl(seeded=["m-priv"]))
-    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
+    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embedding=unconfigured_embedding(), dedup_threshold=0.08)
 
     async def _stub_embed(text):
         return [0.1, 0.1, 0.1]
@@ -137,7 +138,7 @@ async def test_same_user_private_dedup_still_works(db, monkeypatch):
     await db.insert_memory(existing)
 
     adapters = build_sqlite_adapters(db, memory_collection=_FakeColl(seeded=["m-1"]))
-    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
+    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embedding=unconfigured_embedding(), dedup_threshold=0.08)
 
     async def _stub_embed(text):
         return [0.1, 0.1, 0.1]
@@ -164,7 +165,7 @@ async def test_workspace_write_does_not_corroborate_other_project(db, monkeypatc
     await db.insert_memory(risk)
 
     adapters = build_sqlite_adapters(db, memory_collection=_FakeColl(seeded=["m-risk"]))
-    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
+    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embedding=unconfigured_embedding(), dedup_threshold=0.08)
 
     async def _stub_embed(text):
         return [0.1, 0.1, 0.1]
@@ -191,7 +192,7 @@ async def test_private_write_does_not_corroborate_other_users_private(db, monkey
     await db.insert_memory(bob)
 
     adapters = build_sqlite_adapters(db, memory_collection=_FakeColl(seeded=["m-bob"]))
-    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embed_cfg={}, dedup_threshold=0.08)
+    store = MemoryStore(adapters.relational, adapters.keyword, adapters.vector, embedding=unconfigured_embedding(), dedup_threshold=0.08)
 
     async def _stub_embed(text):
         return [0.1, 0.1, 0.1]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -12,6 +13,7 @@ from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
+from tests.embedding_fixture import unconfigured_embedding
 
 
 class FakeCollection:
@@ -104,10 +106,10 @@ async def test_default_search_returns_only_active_memories(db, monkeypatch):
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("PostgreSQL", top_k=10)
 
@@ -131,10 +133,10 @@ async def test_search_results_do_not_expose_top_level_provenance_fields(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=config.retrieval,
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("PostgreSQL", top_k=1)
     search_result = result["results"][0]
@@ -158,10 +160,10 @@ async def test_search_result_without_sources_remains_unverified(db, tmp_path, mo
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=_config(tmp_path).retrieval,
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("HANA", top_k=1)
 
@@ -180,10 +182,10 @@ async def test_search_result_with_source_row_but_no_source_url_is_current(db, tm
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=_config(tmp_path).retrieval,
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("provenance", top_k=1)
 
@@ -209,10 +211,10 @@ async def test_search_result_suggests_detail_for_procedure_memory(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=_config(tmp_path).retrieval,
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("deploy runbook", top_k=1)
     search_result = result["results"][0]
@@ -237,10 +239,10 @@ async def test_search_result_omits_follow_up_for_simple_fact_memory(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=_config(tmp_path).retrieval,
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("hana", top_k=1)
     search_result = result["results"][0]
@@ -280,10 +282,10 @@ async def test_search_results_do_not_resolve_artifacts_through_configured_store(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=_config(tmp_path).retrieval,
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("HANA", top_k=1)
     search_result = result["results"][0]
@@ -308,10 +310,10 @@ async def test_include_superseded_includes_history_but_not_retired_or_pending(db
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        embed_cfg={},
+        embedding=unconfigured_embedding(),
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._embed_query = AsyncMock(return_value=[0.1])
 
     result = await engine.search("PostgreSQL", include_superseded=True, top_k=10)
 
