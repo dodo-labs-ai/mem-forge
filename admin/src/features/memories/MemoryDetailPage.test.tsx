@@ -135,6 +135,29 @@ test("retiring asks for a reason, guards against a changed memory, then shows th
   expect(await screen.findByText("Retired.")).toBeInTheDocument();
 });
 
+test("retiring while the search index is rebuilt says that the change has to wait", async () => {
+  const user = userEvent.setup();
+  const memory = makeMemoryDetail({ source_backed: false });
+  renderDetail(memory, {
+    [`POST /api/v1/memories/${memory.id}/retire`]: () =>
+      errorResponse(409, {
+        error: "reindex_in_progress",
+        message: "The Memory vector index is being rebuilt. Memories cannot be changed until the rebuild has finished.",
+      }),
+  });
+
+  await user.click(await screen.findByRole("button", { name: "More actions" }));
+  await user.click(await screen.findByRole("menuitem", { name: /Retire memory/ }));
+  const dialog = await screen.findByRole("dialog", { name: "Retire this memory?" });
+  await user.type(within(dialog).getByLabelText(/Reason/), "No longer true");
+  await user.click(within(dialog).getByRole("button", { name: "Retire memory" }));
+
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "The search index is being rebuilt, so this change has to wait. Try again when the rebuild has finished. Settings shows its progress.",
+  );
+  expect(within(dialog).getByLabelText(/Reason/)).toHaveValue("No longer true");
+});
+
 test("dismissing a relation asks first and sends the note", async () => {
   const user = userEvent.setup();
   const memory = makeMemoryDetail({ relations: [makeRelation()] });

@@ -345,6 +345,9 @@ class _RankedVectorStore:
         self._results = results
         self.distance_metric = delegate.distance_metric
 
+    async def index_fingerprint(self) -> str | None:
+        return await self._delegate.index_fingerprint()
+
     def similarity(self, distance: float) -> float:
         return self._delegate.similarity(distance)
 

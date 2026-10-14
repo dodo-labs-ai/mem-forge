@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from memforge.llm.embedding import EmbeddingRuntime
+from memforge.llm.embedding import EmbeddingIndexMismatch, EmbeddingRuntime, embed_documents_for_index
 from memforge.memory.index_payloads import (
     embedding_text_hash,
     embedding_vector_hash,
@@ -14,6 +14,7 @@ from memforge.memory.index_payloads import (
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory
 from memforge.retrieval.vector_metadata import upsert_with_stored_vector_hash
+from memforge.vector_index_errors import ReindexInProgress
 
 __all__ = ["MemoryIndexRepairResult", "MemoryIndexRepairer"]
 
@@ -28,7 +29,13 @@ class MemoryIndexRepairResult:
 
 
 class MemoryIndexRepairer:
-    """Repair FTS5 and Chroma indexes from SQLite, the source of truth."""
+    """Repair FTS5 and Chroma indexes from SQLite, the source of truth.
+
+    A vector that is missing or out of date is embedded again only by the
+    embedding model the index was built with. With any other model the Memory
+    is reported as unrepaired: the index has to be rebuilt as a whole. A
+    repair does not run while the index is being rebuilt.
+    """
 
     def __init__(
         self,
@@ -36,13 +43,23 @@ class MemoryIndexRepairer:
         db,
         memory_collection: Any | None,
         embedding: EmbeddingRuntime,
+        index_fingerprint: str | None = None,
     ) -> None:
         self.db = db
         self.memory_collection = memory_collection
         self.embedding = embedding
+        self._index_fingerprint = index_fingerprint
         self.search_visible_statuses = set(allowed_search_statuses())
 
+    async def index_fingerprint(self) -> str | None:
+        """The fingerprint the collection under repair was built with."""
+        return self._index_fingerprint
+
     async def repair(self) -> MemoryIndexRepairResult:
+        if await self.db.vector_reindex_running():
+            raise ReindexInProgress(
+                "The Memory vector index is being rebuilt. Repair the indexes once the rebuild has finished."
+            )
         result = MemoryIndexRepairResult()
         memories = await self._memories()
         result.fts_rows_deleted = await self.db.prune_memory_fts_orphans()
@@ -95,10 +112,10 @@ class MemoryIndexRepairer:
 
             expected_embedding_text = await self._memory_embedding_text(memory)
             if existing is None:
-                if not self.embedding.configured:
+                vector = await self._embed_memory(memory)
+                if vector is None:
                     result.unrepaired_memories.append(memory.id)
                     continue
-                vector = await self._embed_memory(memory)
                 metadata = await self._memory_metadata(
                     memory,
                     None,
@@ -127,10 +144,10 @@ class MemoryIndexRepairer:
                 or actual_metadata.get("content_hash") != metadata["content_hash"]
             )
             if vector_is_stale:
-                if not self.embedding.configured:
+                vector = await self._embed_memory(memory)
+                if vector is None:
                     result.unrepaired_memories.append(memory.id)
                     continue
-                vector = await self._embed_memory(memory)
                 metadata = await self._memory_metadata(
                     memory,
                     actual_metadata,
@@ -179,11 +196,15 @@ class MemoryIndexRepairer:
             metadata["embedding_vector_hash"] = embedding_vector_hash(embedding)
         return metadata
 
-    async def _embed_memory(self, memory: Memory) -> list[float]:
+    async def _embed_memory(self, memory: Memory) -> list[float] | None:
+        """Return the Memory's vector, or ``None`` when no model can embed it for this index."""
         if not self.embedding.configured:
-            raise RuntimeError(f"Cannot repair missing memory vector for {memory.id}: embedding config is missing")
+            return None
         text = await self._memory_embedding_text(memory)
-        return (await self.embedding.embed_documents([text]))[0]
+        try:
+            return (await embed_documents_for_index(self.embedding, self, [text]))[0]
+        except EmbeddingIndexMismatch:
+            return None
 
     async def _memory_embedding_text(self, memory: Memory) -> str:
         entity_names = await self.db.get_memory_entity_names(memory.id)

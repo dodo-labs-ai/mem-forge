@@ -1,7 +1,10 @@
-import type { ModelBinding, ModelKindSettings, ModelSettings, components } from "@/api";
+import type { ModelBinding, ModelKindSettings, ModelSettings, VectorIndex, components } from "@/api";
 
 type ModelProvider = components["schemas"]["ModelProviderResponse"];
 type ModelValidation = components["schemas"]["ModelValidationResult"];
+type EmbeddingProfile = components["schemas"]["EmbeddingProfileResponse"];
+type IndexRecord = components["schemas"]["VectorIndexRecordResponse"];
+type Reindex = components["schemas"]["VectorReindexResponse"];
 
 function provider(overrides: Partial<ModelProvider> & Pick<ModelProvider, "id" | "label">): ModelProvider {
   return {
@@ -13,6 +16,7 @@ function provider(overrides: Partial<ModelProvider> & Pick<ModelProvider, "id" |
     lists_models: true,
     options: [],
     parameters: { generation: [], embedding: ["dimensions"] },
+    token_limits: { generation: ["context_window_tokens", "max_output_tokens"], embedding: [] },
     ...overrides,
   };
 }
@@ -26,6 +30,7 @@ export const PROVIDERS: ModelProvider[] = [
     kinds: ["generation"],
     default_endpoint: "https://api.anthropic.com",
     parameters: { generation: [] },
+    token_limits: { generation: ["context_window_tokens", "max_output_tokens"] },
   }),
   provider({ id: "openrouter", label: "OpenRouter", default_endpoint: "https://openrouter.ai/api/v1" }),
   provider({ id: "ollama", label: "Ollama", auth_strategies: ["none", "api_key"], default_endpoint: "http://localhost:11434" }),
@@ -68,11 +73,34 @@ export function makeBinding(overrides: Partial<ModelBinding> = {}): ModelBinding
     route: "openai/gpt-5.4",
     options: {},
     parameters: {},
+    token_limits: {},
     config_source: "settings",
     state: "ready",
     validation: makeValidation(),
     api_key: { is_set: true, source: "saved", last4: "a91f" },
     saved_at: "2026-03-02T08:59:00Z",
+    profile: null,
+    waits_for_reindex: false,
+    ...overrides,
+  };
+}
+
+const NOMIC_FINGERPRINT = "a1".repeat(32);
+
+/**
+ * The vector space of the local Ollama embedding model: 768 numbers a vector,
+ * and similarity thresholds that were tuned on another model.
+ */
+export function makeProfile(overrides: Partial<EmbeddingProfile> = {}): EmbeddingProfile {
+  return {
+    provider: "ollama",
+    route: "ollama/nomic-embed-text",
+    endpoint: "http://localhost:11434",
+    model_id: "nomic-embed-text",
+    requested_dimensions: null,
+    dimension: 768,
+    fingerprint: NOMIC_FINGERPRINT,
+    thresholds_calibrated: false,
     ...overrides,
   };
 }
@@ -89,8 +117,56 @@ export function makeEmbeddingBinding(overrides: Partial<ModelBinding> = {}): Mod
     route: "ollama/nomic-embed-text",
     validation: makeValidation({ facts: { latency_ms: 96, dimension: 768 } }),
     api_key: { is_set: false, source: null, last4: null },
+    profile: makeProfile(),
     ...overrides,
   });
+}
+
+/** The search index the local Ollama embedding model built: 1,204 memories, in use since March 1. */
+export function makeIndexRecord(overrides: Partial<IndexRecord> = {}): IndexRecord {
+  const profile = overrides.profile === undefined ? makeProfile() : overrides.profile;
+  return {
+    fingerprint: profile?.fingerprint ?? NOMIC_FINGERPRINT,
+    collection: `memories-${profile?.fingerprint ?? NOMIC_FINGERPRINT}`,
+    dimension: profile?.dimension ?? 768,
+    adopted: false,
+    vector_count: 1204,
+    activated_at: "2026-03-01T10:00:00Z",
+    profile,
+    ...overrides,
+  };
+}
+
+/** A rebuild of the search index that is running, 120 of 1,204 memories in. */
+export function makeReindex(overrides: Partial<Reindex> = {}): Reindex {
+  const profile = overrides.profile === undefined ? makeProfile() : overrides.profile;
+  return {
+    state: "running",
+    target: "candidate",
+    fingerprint: profile?.fingerprint ?? NOMIC_FINGERPRINT,
+    profile,
+    memories_total: 1204,
+    memories_indexed: 120,
+    started_at: "2026-03-02T09:04:00Z",
+    finished_at: null,
+    error_code: null,
+    ...overrides,
+  };
+}
+
+/** A search index that fits the embedding model in use and was never rebuilt. */
+export function makeVectorIndex(overrides: Partial<VectorIndex> = {}): VectorIndex {
+  const status = overrides.status ?? "ready";
+  return {
+    status,
+    reindex_required: status === "reindex_required",
+    // A rebuild replaces an index that search reads, unless it is said otherwise.
+    serves_search: status === "not_managed" || ((status === "ready" || status === "reindexing") && overrides.index !== null),
+    reindex_target: null,
+    index: makeIndexRecord(),
+    reindex: null,
+    ...overrides,
+  };
 }
 
 /**
@@ -129,21 +205,30 @@ export function makeDeploymentBinding(overrides: Partial<ModelBinding> = {}): Mo
   });
 }
 
-/** A workspace with both models ready and nothing waiting to be validated. */
+/** A workspace with both models ready, a search index that fits, and nothing waiting to be validated. */
 export function makeModelSettings(overrides: Partial<ModelSettings> = {}): ModelSettings {
   return {
     writable: true,
     litellm_version: "1.86.0",
     generation: { active: makeBinding(), candidate: null },
     embedding: { active: makeEmbeddingBinding(), candidate: null },
+    vector_index: makeVectorIndex(),
     ...overrides,
   };
 }
 
-/** A fresh installation: nothing configured for either kind. */
-export const NO_MODELS: Pick<ModelSettings, "generation" | "embedding"> = {
+/** A fresh installation: nothing configured for either kind, and no search index. */
+export const NO_MODELS: Pick<ModelSettings, "generation" | "embedding" | "vector_index"> = {
   generation: { active: null, candidate: null },
   embedding: { active: null, candidate: null },
+  vector_index: {
+    status: "not_configured",
+    reindex_required: false,
+    serves_search: false,
+    reindex_target: null,
+    index: null,
+    reindex: null,
+  },
 };
 
 export function kindSettings(active: ModelBinding | null, candidate: ModelBinding | null = null): ModelKindSettings {

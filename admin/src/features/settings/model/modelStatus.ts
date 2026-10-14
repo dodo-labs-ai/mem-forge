@@ -2,7 +2,7 @@ import type { ModelValidationFacts } from "@/api";
 import { formatRelative } from "@/lib/format";
 import type { Tone } from "@/patterns";
 import { KEY_VARIABLES } from "./kinds";
-import type { ModelBinding, ModelKind, ModelValidation } from "./types";
+import type { ModelBinding, ModelKind, ModelValidation, StatusSummary } from "./types";
 
 export interface StateBadge {
   label: string;
@@ -35,22 +35,46 @@ const FAILURE_REASONS: Record<string, string> = {
   embedding_dimension_mismatch: "The model returned vectors of another size than the output dimensions set here.",
   embedding_dimension_unstable: "The model returned vectors of different sizes from one request to the next.",
   parameter_not_supported_by_route: "This provider does not take the output dimensions setting. Clear it and validate again.",
+  token_limits_required:
+    "The model answered, but MemForge has no token limits for it. Enter its context window and maximum output, then validate again.",
   credential_unavailable: "The saved API key is not available to the server. Enter it again.",
   api_key_origin_changed: "The saved API key belongs to another endpoint. Enter the API key for this one.",
   not_configured: "The model settings are incomplete.",
 };
 
-export function failureReason(errorCode: string | null | undefined): string {
-  return (errorCode && FAILURE_REASONS[errorCode]) || "The validation request failed.";
+/** The reason for a failure the page has words for, or `undefined` for a code it does not know. */
+export function knownFailureReason(errorCode: string | null | undefined): string | undefined {
+  return errorCode ? FAILURE_REASONS[errorCode] : undefined;
 }
 
-/** Why the latest validation of `binding` failed, naming the server variable its key is read from when that is unset. */
+export function failureReason(errorCode: string | null | undefined): string {
+  return knownFailureReason(errorCode) ?? "The validation request failed.";
+}
+
+/**
+ * Why the latest validation of `binding` failed. What the server reads from
+ * its environment is named by its variables: the API key when that is unset,
+ * and the token limits of a model the deployment manages, which has no form.
+ */
 function failureReasonOf(binding: ModelBinding): string {
   const errorCode = binding.validation?.error_code;
   if (errorCode === "credential_unavailable" && binding.api_key.source === "environment") {
     return `The server reads the API key of this model from ${KEY_VARIABLES[binding.kind]}, which is not set.`;
   }
+  if (errorCode === "token_limits_required" && binding.config_source === "deployment") {
+    return "The model answered, but MemForge has no token limits for it. Set MEMFORGE_LLM_MAX_INPUT_TOKENS, MEMFORGE_LLM_CONTEXT_WINDOW_TOKENS and MEMFORGE_LLM_MAX_OUTPUT_TOKENS on the server.";
+  }
   return failureReason(errorCode);
+}
+
+/**
+ * Whether the latest validation of `binding` found that the server has no
+ * token limits for its model, so that the model needs them stated.
+ */
+export function needsTokenLimits(binding: ModelBinding): boolean {
+  const validation = binding.validation;
+  if (validation === null) return false;
+  return validation.error_code === "token_limits_required" || validationFacts(validation).token_limits_known === false;
 }
 
 function isNumber(value: unknown): value is number {
@@ -69,15 +93,7 @@ export function validationFacts(validation: ModelValidation): ModelValidationFac
   return facts;
 }
 
-export interface ValidationSummary {
-  tone: Tone;
-  /** What the latest validation found, and when. */
-  headline: string;
-  /** What the user should know or do about it. */
-  detail: string | null;
-}
-
-const NEVER_VALIDATED: Record<"active" | "candidate", ValidationSummary> = {
+const NEVER_VALIDATED: Record<"active" | "candidate", StatusSummary> = {
   active: {
     tone: "warn",
     headline: "Not validated yet.",
@@ -90,7 +106,7 @@ const NEVER_VALIDATED: Record<"active" | "candidate", ValidationSummary> = {
  * The latest validation of a model in plain words. A model in use stays in
  * use whatever the result; an edit is put to use only once it passes.
  */
-export function validationSummary(binding: ModelBinding, role: "active" | "candidate", now: Date = new Date()): ValidationSummary {
+export function validationSummary(binding: ModelBinding, role: "active" | "candidate", now: Date = new Date()): StatusSummary {
   const validation = binding.validation;
   if (validation === null) return NEVER_VALIDATED[role];
   const when = formatRelative(validation.checked_at, now);
@@ -112,20 +128,12 @@ export function validationSummary(binding: ModelBinding, role: "active" | "candi
   return { tone: "ok", headline: `Passed validation ${when}.`, detail: null };
 }
 
-/** Consequences of a passed validation that the user has to act on or should know. */
+/** Consequences of a passed validation that the user should know. */
 export function validationNotes(kind: ModelKind, validation: ModelValidation | null): string[] {
   if (validation === null || !validation.passed || kind !== "generation") return [];
-  const facts = validationFacts(validation);
-  const notes: string[] = [];
-  if (facts.token_limits_known === false) {
-    notes.push(
-      "MemForge has no token limits for this model. Before syncing sources, set MEMFORGE_LLM_MAX_INPUT_TOKENS, MEMFORGE_LLM_CONTEXT_WINDOW_TOKENS and MEMFORGE_LLM_MAX_OUTPUT_TOKENS on the server.",
-    );
-  }
-  if (facts.schema_fallback === true) {
-    notes.push("The model does not accept a JSON schema, so MemForge asks it for JSON as text and checks the answer itself.");
-  }
-  return notes;
+  return validationFacts(validation).schema_fallback === true
+    ? ["The model does not accept a JSON schema, so MemForge asks it for JSON as text and checks the answer itself."]
+    : [];
 }
 
 /** "OpenAI", or the raw id for a provider this server no longer lists. */

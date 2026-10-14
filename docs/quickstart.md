@@ -110,10 +110,13 @@ using, then sends one small real request to the model:
 - The embedding model must return two vectors of the same size, twice.
 
 When the request succeeds, your edit becomes the model in use, and the next
-sync and search use it. When it fails, MemForge keeps using the previous model
-and shows why (for example a rejected API key or an unknown model), so a
-typing mistake cannot break a working setup. The failed edit stays in the form
-until you correct it or choose **Discard changes**.
+sync and search use it. An embedding model that changes what the vectors mean
+is the one exception: it is validated and then waits for a reindex (see
+[Changing the embedding model](#changing-the-embedding-model)). When the
+request fails, MemForge keeps using the previous model and shows why (for
+example a rejected API key or an unknown model), so a typing mistake cannot
+break a working setup. The failed edit stays in the form until you correct it
+or choose **Discard changes**.
 
 Each card shows the model in use above the form. **Validate again** repeats
 the request for that model at any time; the model stays in use whatever the
@@ -127,7 +130,69 @@ Each model shows one of three states:
 | --- | --- |
 | Ready | The model passed its latest check. |
 | Not validated | The model has not passed a check yet. Settings that came from `.env` or from an earlier MemForge version start here and are checked in the background when the server starts. |
-| Needs revalidation | The model passed a check before, but something changed since, or its latest check failed. It stays in use; open Settings and choose **Validate again**. |
+| Needs revalidation | The model passed a check before, but something changed since (its settings, its API key or the installed LiteLLM version), or its latest check failed. It stays in use; open Settings and choose **Validate again**. |
+
+### Changing the embedding model
+
+Vectors from two embedding models cannot be compared. Neither can vectors of
+one model at two output sizes. So the vectors of all memories form one index
+that belongs to one embedding model, and changing that model means building
+the index again.
+
+Editing only the API key of the embedding model changes nothing about the
+vectors: the edit is validated and put to use at once. An edit that changes
+the provider, the base URL, the model or its dimensions is different:
+
+1. **Save and validate** checks the new model. When it passes, Settings shows
+   it as validated and waiting for a reindex. The previous model stays in use
+   and search keeps working as before.
+2. **Rebuild search index** runs the reindex: it embeds every searchable
+   memory again with the new model into a new index, verifies that the new
+   index holds one valid vector for each of them, and then switches: the new
+   model and the new index come into use together, and the previous index is
+   deleted. Settings shows the progress.
+
+While a reindex runs, search keeps answering from the previous index. Sources
+do not sync, and memories cannot be created, corrected, retired or decided on
+in a review; such a request is refused with the code `reindex_in_progress`
+and can be repeated afterwards. A reindex does not start while a source is
+syncing. A reindex that fails, or is interrupted by a restart, changes
+nothing: the previous model and index stay in use, Settings shows the reason,
+and you can run it again. A reindex whose process was killed is ended when
+the server next starts on the same machine, and otherwise within a minute;
+until then it still counts as running.
+
+The same rebuild runs from the command line:
+
+```bash
+memforge maintenance reindex --check   # shows the index and what a rebuild would do
+memforge maintenance reindex --apply   # rebuilds the index and switches to it
+```
+
+**When a reindex is required.** If the embedding model in use is not the one
+the index was built with, MemForge does not mix the two: search answers
+without its semantic channel, creating a memory is refused with the code
+`reindex_required` (`vector_index_missing` when the stored vectors fit no
+index) until the index is rebuilt, vector updates that were already queued
+wait, and the health endpoint and Settings say that a reindex is required.
+Every other page of the new admin shows a notice that vector search is off,
+with a link to Settings, also while the reindex that ends this state runs.
+This happens when you change `MEMFORGE_EMBEDDING_MODEL` or
+`MEMFORGE_EMBEDDING_BASE_URL` in `.env` for an installation that already has
+memories. Run the reindex with **Rebuild search index** on the card of the
+embedding model, or put the previous values back.
+
+**Upgrading.** An installation that already has vectors keeps them. The first
+time its embedding model answers, MemForge checks that the stored vectors have
+the length the model returns and adopts them as the index in use, marked as
+adopted because the model they came from is assumed rather than known. If the
+lengths differ, a reindex is required.
+
+**Similarity thresholds.** The thresholds MemForge uses to recognize
+duplicates and near matches were tuned on OpenAI `text-embedding-3-small`.
+They apply unchanged to every other model, and Settings marks such a model as
+*thresholds not calibrated*: expect duplicate detection to be somewhat more or
+less strict than with the tuned model.
 
 ### API keys
 
@@ -154,8 +219,18 @@ If MemForge runs in Docker and your model server runs on your Mac, use
 `http://host.docker.internal:<port>` instead of `http://localhost:<port>`.
 Inside the container, `localhost` points back to the container itself.
 
-MemForge sizes its requests to the model's token limits. For a model LiteLLM
-has no limits for, which is common for local models, set them in `.env`:
+MemForge sizes its requests to the token limits of the generation model: its
+context window and the most it can write in one answer. LiteLLM knows these
+limits for most hosted models. For a model it has no limits for, which is
+common for local models, validation fails with the code
+`token_limits_required` until you give them. Enter the **context window** and
+the **maximum output**, in tokens, with the generation model in Settings, and
+validate again. Take the numbers from the model card or from your model
+server; a context window of 32768 and a maximum output of 4096 are typical
+for a local model.
+
+You can also set the limits in `.env`. A limit entered in Settings is the one
+used; the `.env` values apply to whatever Settings leaves empty:
 
 ```bash
 MEMFORGE_LLM_MAX_INPUT_TOKENS=32768

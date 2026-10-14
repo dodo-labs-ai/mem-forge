@@ -67,9 +67,14 @@ def _refused_connection() -> Exception:
     return failure
 
 
-def _client(**settings: Any) -> LiteLlmStructuredClient:
+TOKEN_LIMITS = {"max_input_tokens": 32_000, "context_window_tokens": 32_000, "max_output_tokens": 4_000}
+
+
+def _client(*, token_limits: dict[str, int] | None = None, **settings: Any) -> LiteLlmStructuredClient:
+    """The runtime's client for a model LiteLLM has no limits for, with the limits given."""
     settings.setdefault("timeout_s", 5.0)
-    return LiteLlmStructuredClient(StructuredLlmConfig.for_invocation(GENERATION, **settings))
+    limits = TOKEN_LIMITS if token_limits is None else token_limits
+    return LiteLlmStructuredClient(StructuredLlmConfig.for_invocation(GENERATION, **limits, **settings))
 
 
 def _schema_property(name: str) -> dict[str, Any]:
@@ -99,7 +104,7 @@ async def test_a_generation_model_that_returns_the_object_passes(monkeypatch) ->
     assert check.error_code is None
     assert check.facts == {
         "latency_ms": check.facts["latency_ms"],
-        "token_limits_known": False,
+        "token_limits_known": True,
         "structured_output_mode": "native_schema",
         "schema_fallback": False,
         "provider_model": "check-model-2026-10",
@@ -192,17 +197,27 @@ async def test_a_provider_failure_is_reported_by_code(monkeypatch, failure, erro
     assert check.facts["latency_ms"] >= 0
 
 
-async def test_the_check_says_whether_the_runtime_knows_the_models_token_limits(monkeypatch) -> None:
-    Provider(monkeypatch)
+async def test_a_model_whose_token_limits_nobody_knows_fails_after_it_has_answered(monkeypatch) -> None:
+    provider = Provider(monkeypatch)
 
-    unknown = await check_generation(_client())
-    configured = await check_generation(
-        _client(max_input_tokens=32_000, context_window_tokens=32_000, max_output_tokens=4_000)
-    )
+    unknown = await check_generation(_client(token_limits={}))
+    configured = await check_generation(_client())
 
-    assert unknown.passed is True
+    assert unknown.passed is False
+    assert unknown.error_code == "token_limits_required"
     assert unknown.facts["token_limits_known"] is False
+    assert unknown.facts["structured_output_mode"] == "native_schema"
+    assert configured.passed is True
     assert configured.facts["token_limits_known"] is True
+    assert len(provider.requests) == 2
+
+
+async def test_a_failed_request_is_reported_before_missing_token_limits(monkeypatch) -> None:
+    Provider(monkeypatch, litellm.AuthenticationError("invalid api key", "openai", "check-model"))
+
+    check = await check_generation(_client(token_limits={}))
+
+    assert check.error_code == "authentication_failed"
 
 
 async def test_a_generation_check_that_outlasts_its_deadline_times_out(monkeypatch) -> None:

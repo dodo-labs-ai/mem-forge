@@ -51,6 +51,15 @@ class VectorStoreContract:
         assert isinstance(adapters.vector.distance_metric, str)
         assert adapters.vector.distance_metric
 
+    # -- Index identity -------------------------------------------------------
+
+    async def test_reports_the_fingerprint_its_index_was_built_with(self, adapters: ContractAdapters) -> None:
+        # None says the index records no fingerprint. Any other answer names
+        # one vector space and does not change between two calls.
+        fingerprint = await adapters.vector.index_fingerprint()
+        assert fingerprint is None or (isinstance(fingerprint, str) and fingerprint)
+        assert await adapters.vector.index_fingerprint() == fingerprint
+
     # -- Distance-to-score conversions --------------------------------------
 
     def test_similarity_is_floored_at_zero(self, adapters: ContractAdapters) -> None:

@@ -5,6 +5,12 @@ built from. It owns everything between "embed these texts" and a list of
 usable vectors: the attempt loop, the logical deadline, the per-request item
 limit, validation of what the provider returned, and the cache of vectors it
 has produced.
+
+A runtime built with the identity of its model also knows the vector space it
+embeds in: once the model has answered, the runtime has the fingerprint of its
+Embedding Profile, and ``embed_documents_for_index`` and
+``embed_query_for_index`` hand its vectors only to an index built with that
+fingerprint.
 """
 
 from __future__ import annotations
@@ -15,10 +21,11 @@ import math
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import litellm
 
+from memforge.llm.embedding_profile import EmbeddingIdentity, EmbeddingProfile
 from memforge.llm.providers import ResolvedInvocation
 from memforge.llm.transport import (
     is_connection_failure,
@@ -32,14 +39,19 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "EmbeddingDeadlineExceeded",
     "EmbeddingError",
+    "EmbeddingIndexMismatch",
     "EmbeddingNotConfigured",
     "EmbeddingProviderError",
     "EmbeddingRuntime",
     "EmbeddingSettings",
     "InvalidEmbeddingResponse",
+    "ProfileObserver",
+    "embed_documents_for_index",
+    "embed_query_for_index",
 ]
 
 EmbeddingTransport = Callable[..., Awaitable[Any]]
+ProfileObserver = Callable[[EmbeddingProfile], Awaitable[None]]
 
 
 class EmbeddingError(RuntimeError):
@@ -79,6 +91,17 @@ class EmbeddingDeadlineExceeded(EmbeddingError):
     """The logical deadline passed before every vector was produced."""
 
 
+class EmbeddingIndexMismatch(EmbeddingError):
+    """The embedding model in use is not the one the vector index was built with.
+
+    Its vectors belong to another vector space, so they are neither compared
+    with the index's vectors nor written among them. The index has to be built
+    again with this model before the two are used together.
+    """
+
+    code = "reindex_required"
+
+
 class InvalidEmbeddingResponse(EmbeddingError, ValueError):
     """The provider answered with an embedding payload that does not hold one valid vector per input.
 
@@ -93,6 +116,10 @@ class EmbeddingSettings:
     # The route, endpoint and credential every request is made with. ``None``
     # is an installation with no embedding model.
     invocation: ResolvedInvocation | None
+    # The settings that decide the model's vector space. A runtime without
+    # them has no fingerprint, and only an index that records none takes its
+    # vectors.
+    identity: EmbeddingIdentity | None = None
     # One budget of time for a whole embed call: every request, every retry and
     # every pause between them.
     timeout_s: float = 60.0
@@ -115,6 +142,9 @@ class EmbeddingRuntime:
     Queries and documents share one vector space and one cache. The cache
     belongs to this instance, so a runtime built from other settings can never
     serve vectors this one produced.
+
+    ``profile_observer`` is told the runtime's Embedding Profile once, when the
+    model's first answer makes it known and before that answer is returned.
     """
 
     def __init__(
@@ -122,9 +152,11 @@ class EmbeddingRuntime:
         settings: EmbeddingSettings,
         *,
         transport: EmbeddingTransport | None = None,
+        profile_observer: ProfileObserver | None = None,
     ) -> None:
         self.settings = settings
         self._transport = transport
+        self._profile_observer = profile_observer
         self._cache = _VectorCache(settings.cache_size)
         self._dimension: int | None = None
         self._provider_model: str | None = None
@@ -138,6 +170,31 @@ class EmbeddingRuntime:
     def dimension(self) -> int | None:
         """The vector length this runtime has observed, once it has embedded."""
         return self._dimension
+
+    @property
+    def fingerprint(self) -> str | None:
+        """The fingerprint of the Embedding Profile this runtime embeds in.
+
+        It is known once the model has answered, because the vector length it
+        answers with is part of the profile.
+        """
+        identity = self.settings.identity
+        if identity is None or self._dimension is None:
+            return None
+        return identity.profile(self._dimension).fingerprint
+
+    def embeds_for(self, index_fingerprint: str | None) -> bool | None:
+        """Whether this runtime's vectors belong in an index with ``index_fingerprint``.
+
+        An index that records no fingerprint is bound to no model and takes
+        any vector. ``None`` means it cannot be said yet: the runtime knows its
+        model and has not seen a vector of it.
+        """
+        if index_fingerprint is None:
+            return True
+        if self.settings.identity is not None and self._dimension is None:
+            return None
+        return self.fingerprint == index_fingerprint
 
     @property
     def provider_model(self) -> str | None:
@@ -200,8 +257,20 @@ class EmbeddingRuntime:
                 f"Embedding deadline exceeded after {timeout_s:g}s"
             ) from exc
         dimension = _single_dimension(produced, expected=self._dimension)
+        first_answer = self._dimension is None
         self._dimension = dimension
+        if first_answer:
+            await self._announce_profile(dimension)
         return produced
+
+    async def _announce_profile(self, dimension: int) -> None:
+        identity = self.settings.identity
+        if identity is None or self._profile_observer is None:
+            return
+        try:
+            await self._profile_observer(identity.profile(dimension))
+        except Exception:
+            logger.exception("The observer of the Embedding Profile failed")
 
     async def _request_slice(
         self,
@@ -254,6 +323,61 @@ class EmbeddingRuntime:
         pauses = self.settings.retry_pauses_s
         scheduled_s = pauses[min(retries_used, len(pauses) - 1)] if pauses else 0.0
         return max(scheduled_s, provider_retry_after_seconds(exc) or 0.0)
+
+
+class _FingerprintedIndex(Protocol):
+    async def index_fingerprint(self) -> str | None: ...
+
+
+async def embed_documents_for_index(
+    runtime: EmbeddingRuntime,
+    index: _FingerprintedIndex,
+    texts: Sequence[str],
+) -> list[list[float]]:
+    """Embed document texts as vectors of ``index``.
+
+    Raises ``EmbeddingIndexMismatch`` when the index was built with another
+    embedding model. When that is already known no request is made. An index
+    that records no fingerprint is asked again after the request: the
+    runtime's first answer can be what gives an installation its first index.
+    """
+    index_fingerprint = await index.index_fingerprint()
+    _require_index(runtime, index_fingerprint, unknown_passes=True)
+    vectors = await runtime.embed_documents(texts)
+    if index_fingerprint is None:
+        index_fingerprint = await index.index_fingerprint()
+    _require_index(runtime, index_fingerprint, unknown_passes=not texts)
+    return vectors
+
+
+async def embed_query_for_index(
+    runtime: EmbeddingRuntime,
+    index: _FingerprintedIndex,
+    text: str,
+) -> list[float]:
+    """Embed one search query as a vector of ``index``, under the rule of ``embed_documents_for_index``."""
+    index_fingerprint = await index.index_fingerprint()
+    _require_index(runtime, index_fingerprint, unknown_passes=True)
+    vector = await runtime.embed_query(text)
+    if index_fingerprint is None:
+        index_fingerprint = await index.index_fingerprint()
+    _require_index(runtime, index_fingerprint, unknown_passes=False)
+    return vector
+
+
+def _require_index(
+    runtime: EmbeddingRuntime,
+    index_fingerprint: str | None,
+    *,
+    unknown_passes: bool,
+) -> None:
+    embeds = runtime.embeds_for(index_fingerprint)
+    if embeds or (embeds is None and unknown_passes):
+        return
+    raise EmbeddingIndexMismatch(
+        "The embedding model in use is not the one the vector index was built with; "
+        "the index has to be rebuilt"
+    )
 
 
 @dataclass

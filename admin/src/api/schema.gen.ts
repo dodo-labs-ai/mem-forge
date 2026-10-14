@@ -1357,6 +1357,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/model-settings/vector-index": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Vector Index
+         * @description Read the Memory vector index in use and the latest rebuild of it.
+         */
+        get: operations["read_vector_index_api_v1_model_settings_vector_index_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/model-settings/vector-index/reindex": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start Vector Reindex
+         * @description Start a rebuild of the vector index. It runs beside the server; read its state with GET.
+         */
+        post: operations["start_vector_reindex_api_v1_model_settings_vector_index_reindex_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/model-settings/{kind}/active/validate": {
         parameters: {
             query?: never;
@@ -2991,6 +3031,64 @@ export interface components {
             /** Note */
             note?: string | null;
         };
+        /** EmbeddingModelHealthResponse */
+        EmbeddingModelHealthResponse: {
+            /**
+             * Configured
+             * @description Whether a binding of this kind is in use.
+             */
+            configured: boolean;
+            /**
+             * Reindex Required
+             * @description True when the vector index has to be rebuilt for the embedding model in use. Until then search answers without its vector channel.
+             */
+            reindex_required: boolean;
+            /**
+             * State
+             * @description The state of that binding; null when none is configured.
+             */
+            state?: ("not_validated" | "ready" | "needs_revalidation") | null;
+            /**
+             * Vector Index
+             * @description The state of the Memory vector index, as the model settings report it.
+             * @enum {string}
+             */
+            vector_index: "ready" | "reindex_required" | "reindexing" | "awaiting_validation" | "not_configured" | "not_managed";
+        };
+        /**
+         * EmbeddingProfileResponse
+         * @description The identity of one vector space: an embedding model's settings and its vector length.
+         */
+        EmbeddingProfileResponse: {
+            /**
+             * Dimension
+             * @description The vector length the model answered with.
+             */
+            dimension: number;
+            /** Endpoint */
+            endpoint: string | null;
+            /**
+             * Fingerprint
+             * @description A hash of the fields above. Vectors are shared only between equal fingerprints.
+             */
+            fingerprint: string;
+            /** Model Id */
+            model_id: string;
+            /** Provider */
+            provider: string;
+            /**
+             * Requested Dimensions
+             * @description The output size requests ask for; null takes the model's own.
+             */
+            requested_dimensions: number | null;
+            /** Route */
+            route: string;
+            /**
+             * Thresholds Calibrated
+             * @description Whether the similarity thresholds were tuned on this model's vectors. When false they still apply, as approximate values nobody has measured for this model.
+             */
+            thresholds_calibrated: boolean;
+        };
         /** EntityAliasResponse */
         EntityAliasResponse: {
             /** Alias */
@@ -4461,6 +4559,8 @@ export interface components {
             parameters: {
                 [key: string]: unknown;
             };
+            /** @description For an embedding binding whose latest check passed for the binding as it is: the Embedding Profile it embeds in. Null otherwise. */
+            profile?: components["schemas"]["EmbeddingProfileResponse"] | null;
             /** Provider */
             provider: string;
             /**
@@ -4478,7 +4578,20 @@ export interface components {
              * @enum {string}
              */
             state: "not_validated" | "ready" | "needs_revalidation";
+            /**
+             * Token Limits
+             * @description The token limits the binding states for its model: context_window_tokens and max_output_tokens. Empty when it states none.
+             */
+            token_limits: {
+                [key: string]: number;
+            };
             validation: components["schemas"]["ModelValidationResult"] | null;
+            /**
+             * Waits For Reindex
+             * @description True for an embedding candidate that passed its check and becomes active once the vector index is rebuilt for it.
+             * @default false
+             */
+            waits_for_reindex: boolean;
         };
         /** ModelCandidateRequest */
         ModelCandidateRequest: {
@@ -4511,6 +4624,13 @@ export interface components {
              * @default
              */
             provider: string;
+            /**
+             * Token Limits
+             * @description For a generation model LiteLLM has no limits for: context_window_tokens and max_output_tokens, whole numbers of tokens.
+             */
+            token_limits?: {
+                [key: string]: unknown;
+            };
         };
         /** ModelDiscoveryRequest */
         ModelDiscoveryRequest: {
@@ -4556,7 +4676,7 @@ export interface components {
         };
         /** ModelHealthResponse */
         ModelHealthResponse: {
-            embedding: components["schemas"]["ModelKindHealthResponse"];
+            embedding: components["schemas"]["EmbeddingModelHealthResponse"];
             generation: components["schemas"]["ModelKindHealthResponse"];
         };
         /** ModelKindHealthResponse */
@@ -4639,6 +4759,13 @@ export interface components {
             parameters: {
                 [key: string]: string[];
             };
+            /**
+             * Token Limits
+             * @description The token limits a binding of each served kind may state for its model: context_window_tokens and max_output_tokens for a generation model.
+             */
+            token_limits: {
+                [key: string]: string[];
+            };
         };
         /** ModelSettingsResponse */
         ModelSettingsResponse: {
@@ -4646,6 +4773,7 @@ export interface components {
             generation: components["schemas"]["ModelKindSettingsResponse"];
             /** Litellm Version */
             litellm_version: string;
+            vector_index: components["schemas"]["VectorIndexResponse"];
             /**
              * Writable
              * @description False when the deployment environment manages model settings (MEMFORGE_LLM_CONFIG_WRITABLE), so every write is refused.
@@ -4663,6 +4791,12 @@ export interface components {
              * @description Whether the checked candidate became the active binding.
              */
             promoted: boolean;
+            /**
+             * Reindex Required
+             * @description True when an embedding candidate passed and stays the candidate until the vector index is rebuilt for it.
+             * @default false
+             */
+            reindex_required: boolean;
             settings: components["schemas"]["ModelKindSettingsResponse"];
             validation: components["schemas"]["ModelValidationResult"];
         };
@@ -5549,6 +5683,107 @@ export interface components {
             msg: string;
             /** Error Type */
             type: string;
+        };
+        /**
+         * VectorIndexRecordResponse
+         * @description One physical Memory vector index.
+         */
+        VectorIndexRecordResponse: {
+            /**
+             * Activated At
+             * @description When the index came into use.
+             */
+            activated_at: string | null;
+            /**
+             * Adopted
+             * @description True when the vectors were in place before the index was recorded: the model they came from is assumed to be the profile's, not known.
+             */
+            adopted: boolean;
+            /**
+             * Collection
+             * @description The name of the collection that holds its vectors.
+             */
+            collection: string;
+            /** Dimension */
+            dimension: number;
+            /**
+             * Fingerprint
+             * @description The fingerprint of the Embedding Profile it was built with.
+             */
+            fingerprint: string;
+            /** @description The Embedding Profile the index was built with. */
+            profile: components["schemas"]["EmbeddingProfileResponse"] | null;
+            /**
+             * Vector Count
+             * @description The vectors the index holds now.
+             */
+            vector_count: number;
+        };
+        /** VectorIndexResponse */
+        VectorIndexResponse: {
+            /** @description The index in use. */
+            index: components["schemas"]["VectorIndexRecordResponse"] | null;
+            /** @description The latest rebuild, running or ended; null when none has been started. */
+            reindex: components["schemas"]["VectorReindexResponse"] | null;
+            /**
+             * Reindex Required
+             * @description True exactly when status is 'reindex_required'.
+             */
+            reindex_required: boolean;
+            /**
+             * Reindex Target
+             * @description The embedding binding a rebuild started now would be for: 'candidate' for a candidate that waits for the index, 'active' when the index in use is missing, was built with another model or was adopted. An active binding that has not passed a check as it stands is checked when the rebuild is started, which is refused with embedding_not_validated when the check fails. Null when there is nothing to rebuild for, and while a rebuild runs.
+             */
+            reindex_target: ("active" | "candidate") | null;
+            /**
+             * Serves Search
+             * @description Whether search reads the index in use: there is one, and the embedding model in use is the one it was built with. A rebuild does not change this before it switches, so during a rebuild that started while a reindex was required it stays false.
+             */
+            serves_search: boolean;
+            /**
+             * Status
+             * @description 'ready': the embedding model in use is the one the index was built with. 'reindex_required': it is another one, or the stored vectors cannot be adopted; until the index is rebuilt vector search is off, a write that needs a new vector is refused and vector work already queued waits. 'reindexing': a rebuild is running. 'awaiting_validation': no index is in use because the embedding model has not passed a check yet. 'not_configured': no embedding model. 'not_managed': the deployment keeps its index by its own means.
+             * @enum {string}
+             */
+            status: "ready" | "reindex_required" | "reindexing" | "awaiting_validation" | "not_configured" | "not_managed";
+        };
+        /**
+         * VectorReindexResponse
+         * @description The latest rebuild of the vector index.
+         */
+        VectorReindexResponse: {
+            /**
+             * Error Code
+             * @description Why a failed rebuild failed: a provider code of the embedding check (provider_unreachable, authentication_failed, rate_limited, timeout, embedding_response_invalid, provider_error, ...), embedding_dimension_mismatch, vector_count_mismatch, vector_invalid, memories_changed, candidate_changed, reindex_lease_lost, interrupted or index_error.
+             */
+            error_code?: string | null;
+            /** Fingerprint */
+            fingerprint: string;
+            /** Finished At */
+            finished_at: string | null;
+            /**
+             * Memories Indexed
+             * @description The Memories embedded into the new index so far.
+             */
+            memories_indexed: number;
+            /**
+             * Memories Total
+             * @description The searchable Memories the rebuild covers; null until it has counted them.
+             */
+            memories_total: number | null;
+            profile: components["schemas"]["EmbeddingProfileResponse"] | null;
+            /** Started At */
+            started_at: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "running" | "succeeded" | "failed";
+            /**
+             * Target
+             * @description The embedding binding the rebuild is for.
+             */
+            target: ("active" | "candidate") | null;
         };
         /**
          * WorkspaceAgentEvaluationResponse
@@ -7837,6 +8072,46 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ModelProviderListResponse"];
+                };
+            };
+        };
+    };
+    read_vector_index_api_v1_model_settings_vector_index_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VectorIndexResponse"];
+                };
+            };
+        };
+    };
+    start_vector_reindex_api_v1_model_settings_vector_index_reindex_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VectorIndexResponse"];
                 };
             };
         };

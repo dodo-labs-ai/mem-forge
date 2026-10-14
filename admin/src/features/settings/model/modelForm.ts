@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { parameterNames, providersFor } from "./providerFields";
+import { needsTokenLimits } from "./modelStatus";
+import { parameterNames, providersFor, tokenLimitNames } from "./providerFields";
 import { endpointOrigin, originName, routeOrigin, type SavedKey } from "./savedKey";
 import type {
   AuthStrategy,
@@ -19,8 +20,8 @@ export const WHOLE_NUMBER_MESSAGE = "Enter a whole number greater than zero.";
 
 /**
  * One model as the user edits it. `apiKey` holds only a key the user typed;
- * a saved key never leaves the server. Extra settings are kept as the text in
- * their fields, by the name the server gives them.
+ * a saved key never leaves the server. Extra settings and token limits are
+ * kept as the text in their fields, by the name the server gives them.
  */
 export interface ModelFormValues {
   provider: string;
@@ -30,6 +31,7 @@ export interface ModelFormValues {
   model: string;
   options: Record<string, string>;
   parameters: Record<string, string>;
+  tokenLimits: Record<string, string>;
 }
 
 function fieldText(values: Record<string, unknown>): Record<string, string> {
@@ -50,6 +52,7 @@ export function blankValues(provider: ModelProvider | undefined): ModelFormValue
     model: "",
     options: {},
     parameters: {},
+    tokenLimits: {},
   };
 }
 
@@ -68,7 +71,19 @@ export function savedValues(
     model: binding.model_id,
     options: fieldText(binding.options),
     parameters: fieldText(binding.parameters),
+    tokenLimits: fieldText(binding.token_limits),
   };
+}
+
+/**
+ * Whether the form shows the token limit fields for the stored model: it
+ * states limits already, or its latest validation found that the server has
+ * none for it. LiteLLM knows the limits of most hosted models, so the fields
+ * stay out of the way until a model needs them.
+ */
+export function offersTokenLimits(stored: ModelBinding | null): boolean {
+  if (stored === null) return false;
+  return Object.keys(stored.token_limits).length > 0 || needsTokenLimits(stored);
 }
 
 /** The form after choosing a provider: the saved values when it is the saved provider, a blank form otherwise. */
@@ -131,6 +146,13 @@ function trimmedFields(values: Record<string, string>, names: readonly string[])
   return fields;
 }
 
+/** The filled-in fields among `names` as the numbers the server stores. */
+function numberFields(values: Record<string, string>, names: readonly string[]): Record<string, number> {
+  const fields: Record<string, number> = {};
+  for (const [name, value] of Object.entries(trimmedFields(values, names))) fields[name] = Number(value);
+  return fields;
+}
+
 /** Everything saving would store, in one comparable shape. A typed key always counts as a change. */
 function storedShape(values: ModelFormValues, provider: ModelProvider, kind: ModelKind): string {
   return JSON.stringify([
@@ -140,6 +162,7 @@ function storedShape(values: ModelFormValues, provider: ModelProvider, kind: Mod
     values.model.trim(),
     trimmedFields(values.options, provider.options),
     trimmedFields(values.parameters, parameterNames(provider, kind)),
+    trimmedFields(values.tokenLimits, tokenLimitNames(provider, kind)),
   ]);
 }
 
@@ -161,17 +184,14 @@ export function isChanged(
  * the key saved for this origin.
  */
 export function candidateRequest(values: ModelFormValues, provider: ModelProvider, kind: ModelKind): ModelCandidateRequest {
-  const parameters: Record<string, number> = {};
-  for (const [name, value] of Object.entries(trimmedFields(values.parameters, parameterNames(provider, kind)))) {
-    parameters[name] = Number(value);
-  }
   const request: ModelCandidateRequest = {
     provider: provider.id,
     model_id: values.model.trim(),
     endpoint: requestedEndpoint(values),
     auth_strategy: values.authStrategy,
     options: trimmedFields(values.options, provider.options),
-    parameters,
+    parameters: numberFields(values.parameters, parameterNames(provider, kind)),
+    token_limits: numberFields(values.tokenLimits, tokenLimitNames(provider, kind)),
   };
   const key = typedKey(values);
   if (key !== "") request.api_key = key;
@@ -242,6 +262,9 @@ export function fieldProblems(values: ModelFormValues, { provider, kind, savedKe
   for (const [name, value] of Object.entries(trimmedFields(values.parameters, parameterNames(provider, kind)))) {
     add(["parameters", name], isWholeNumber(value) ? null : WHOLE_NUMBER_MESSAGE);
   }
+  for (const [name, value] of Object.entries(trimmedFields(values.tokenLimits, tokenLimitNames(provider, kind)))) {
+    add(["tokenLimits", name], isWholeNumber(value) ? null : WHOLE_NUMBER_MESSAGE);
+  }
   return problems;
 }
 
@@ -253,6 +276,7 @@ const valuesSchema = z.object({
   model: z.string(),
   options: z.record(z.string(), z.string()),
   parameters: z.record(z.string(), z.string()),
+  tokenLimits: z.record(z.string(), z.string()),
 });
 
 /** The form schema: every problem `problemsOf` finds is reported on its field. */

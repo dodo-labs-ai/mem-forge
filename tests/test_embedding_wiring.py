@@ -17,6 +17,7 @@ from memforge.llm.providers import ResolvedInvocation
 from memforge.runtime import build_embedding_runtime, resolve_models
 from memforge.storage.database import Database
 from tests.embedding_fixture import embedding_response
+from tests.vector_index_fixture import use_collection_as_index
 
 EMBEDDING_MODEL = "wiring-embedding-model"
 EMBEDDING_BASE_URL = "https://embed.wiring.example.test/v1"
@@ -81,7 +82,7 @@ def provider(monkeypatch) -> RecordingProvider:
 def collection(monkeypatch) -> RecordingCollection:
     """The Memory vector collection every default adapter set is bound to."""
     recording = RecordingCollection()
-    monkeypatch.setattr(runtime, "get_chroma_collection", lambda **_kwargs: recording)
+    use_collection_as_index(monkeypatch, recording)
     return recording
 
 

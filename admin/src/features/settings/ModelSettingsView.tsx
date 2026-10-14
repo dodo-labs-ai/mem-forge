@@ -14,8 +14,9 @@ interface ModelSettingsViewProps {
 
 /**
  * The generation and the embedding model, each on its own card with its own
- * form. When the deployment environment manages the models, the server says
- * so up front and the cards only show what is in use.
+ * form; the embedding model's card also holds the search index. When the
+ * deployment environment manages the models, the server says so up front and
+ * the cards only show what is in use.
  */
 export function ModelSettingsView({ settings, providers }: ModelSettingsViewProps) {
   const [unsaved, setUnsaved] = useState<Record<ModelKind, boolean>>({ generation: false, embedding: false });
@@ -40,6 +41,7 @@ export function ModelSettingsView({ settings, providers }: ModelSettingsViewProp
           kind={kind}
           settings={settings[kind]}
           providers={providers}
+          vectorIndex={kind === "embedding" ? settings.vector_index : undefined}
           writable={settings.writable}
           onUnsavedChange={noteUnsaved}
         />

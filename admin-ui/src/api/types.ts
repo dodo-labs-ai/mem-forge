@@ -764,11 +764,20 @@ export interface ModelKindSettings {
   active: ModelBinding | null;
 }
 
+/** The search index of the embedding model: the vectors of all memories. */
+export interface VectorIndex {
+  /** Whether the index fits the embedding model in use; `not_managed` when the deployment keeps it by its own means. */
+  status: "ready" | "reindex_required" | "reindexing" | "awaiting_validation" | "not_configured" | "not_managed";
+  /** The index in use. */
+  index: { vector_count: number } | null;
+}
+
 export interface ModelSettings {
   /** False when the deployment environment manages the models. */
   writable: boolean;
   generation: ModelKindSettings;
   embedding: ModelKindSettings;
+  vector_index: VectorIndex;
 }
 
 export interface StatBucket {

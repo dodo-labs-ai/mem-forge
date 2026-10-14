@@ -22,7 +22,7 @@ from typing import Any, Callable
 
 from memforge.config import DEFAULT_RANK_WINDOW_SIZE, DEFAULT_RRF_K, DEFAULT_SEARCH_TOP_K, RetrievalConfig
 from memforge.llm.batch_runner import ItemFailure, LlmBatchRunner, LlmRequest
-from memforge.llm.embedding import EmbeddingRuntime
+from memforge.llm.embedding import EmbeddingIndexMismatch, EmbeddingRuntime, embed_query_for_index
 from memforge.llm.structured import RerankResponse
 from memforge.memory.cross_document_relation_reader import (
     RelationGraph,
@@ -417,6 +417,10 @@ class SearchEngine:
         self._config = config
         self._structured_llm_client = structured_llm_client
         self._embedding_provider = embedding_provider
+        # Whether the latest query found the vector index built with another
+        # embedding model than this engine's. Whoever keeps the engine builds
+        # it again when the model in use has changed since.
+        self.serves_another_index = False
 
     # ==================================================================
     # Public API
@@ -1337,7 +1341,18 @@ class SearchEngine:
                 return None
 
         try:
-            return await self._embedding.embed_query(text)
+            vector = await embed_query_for_index(self._embedding, self._vector, text)
+            self.serves_another_index = False
+            return vector
+        except EmbeddingIndexMismatch:
+            # The index was built with another embedding model. Until the two
+            # agree the search answers from its other channels.
+            if not self.serves_another_index:
+                logger.warning(
+                    "Vector search is off: the vector index was built with another embedding model. "
+                    "Searches answer from their other channels until the index is rebuilt."
+                )
+            self.serves_another_index = True
         except Exception:
             logger.exception("Embedding computation failed for query")
         return None

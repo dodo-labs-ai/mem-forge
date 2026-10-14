@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import selectors
 import shutil
+import signal
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -6316,25 +6319,44 @@ def maintenance():
 @maintenance.command("repair-indexes")
 @click.pass_context
 def maintenance_repair_indexes(ctx):
-    """Repair FTS5 and Chroma indexes from SQLite."""
+    """Repair FTS5 and Chroma indexes from SQLite.
+
+    Vectors are repaired in the index in use, with the embedding model it was
+    built with. A change of embedding model is not a repair: see
+    ``maintenance reindex``.
+    """
 
     async def _run():
         from memforge.memory.health import MemoryIndexHealthChecker
         from memforge.memory.repair import MemoryIndexRepairer
-        from memforge.llm.bindings import resolve_active_invocation
-        from memforge.retrieval.embeddings import get_chroma_collection
-        from memforge.runtime import build_embedding_runtime
+        from memforge.model_settings import ModelSettings
+        from memforge.runtime import (
+            DefaultRuntimeProvider,
+            build_active_embedding_runtime,
+            memory_vector_indexes,
+        )
+        from memforge.vector_index_errors import ReindexInProgress
 
         config: AppConfig = ctx.obj["config"]
+        provider = DefaultRuntimeProvider()
         db = await _get_db(config)
-        memory_collection = get_chroma_collection(config.storage.chroma_path, name="memories")
         try:
-            embedding = await resolve_active_invocation(db, config, "embedding")
-            result = await MemoryIndexRepairer(
-                db=db,
-                memory_collection=memory_collection,
-                embedding=build_embedding_runtime(embedding, config),
-            ).repair()
+            # An installation with no index in use gets its first one here,
+            # when its embedding model is known to answer.
+            await ModelSettings(config, provider).vector_index(db)
+            indexes = memory_vector_indexes(provider, db, config)
+            index = None if indexes is None else await indexes.in_use()
+            memory_collection = None if index is None else index.collection
+            try:
+                result = await MemoryIndexRepairer(
+                    db=db,
+                    memory_collection=memory_collection,
+                    embedding=await build_active_embedding_runtime(db, config, provider),
+                    index_fingerprint=None if index is None else index.fingerprint,
+                ).repair()
+            except ReindexInProgress as exc:
+                console.print(f"[red]{exc.message}[/]")
+                raise SystemExit(1) from exc
             report = await MemoryIndexHealthChecker(
                 db=db,
                 memory_collection=memory_collection,
@@ -6351,6 +6373,11 @@ def maintenance_repair_indexes(ctx):
         table.add_row("Memory vectors deleted", str(result.memory_vectors_deleted))
         table.add_row("Unrepaired memories", str(len(result.unrepaired_memories)))
         console.print(table)
+        if index is None:
+            console.print(
+                "[yellow]No Memory vector index is in use, so no vector was repaired. "
+                "Run `memforge maintenance reindex --check`.[/]"
+            )
         if report.ok:
             console.print("[green]Index health is clean.[/]")
         else:
@@ -6359,6 +6386,155 @@ def maintenance_repair_indexes(ctx):
                 console.print(f"  [dim]Unrepaired memory: {memory_id}[/]")
 
     asyncio.run(_run())
+
+
+class _Termination:
+    """Whether the process was asked to terminate while a command ran."""
+
+    requested = False
+
+
+@contextlib.contextmanager
+def _cancelling_on_sigterm() -> Iterator[_Termination]:
+    """Cancel the running task when the process is asked to terminate, as Ctrl-C does.
+
+    What the task is doing then ends the way cancelled work ends, with its
+    clean-up, instead of being cut off with the process. Signals reach a
+    command only in the main thread of a POSIX process; anywhere else the
+    block runs without this.
+    """
+    termination = _Termination()
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    assert task is not None
+
+    def cancel() -> None:
+        termination.requested = True
+        task.cancel()
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, cancel)
+    except (NotImplementedError, RuntimeError, ValueError):
+        yield termination
+        return
+    try:
+        yield termination
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+
+
+_VECTOR_INDEX_STATUS_TEXT = {
+    "ready": "[green]ready[/]: built with the embedding model in use",
+    "reindex_required": "[red]reindex required[/]: vector search is off until the index is rebuilt",
+    "reindexing": "[yellow]a rebuild is running[/]",
+    "awaiting_validation": "[yellow]waiting[/]: the embedding model has not passed a check yet",
+    "not_configured": "[dim]no embedding model is configured[/]",
+}
+
+
+@maintenance.command("reindex")
+@click.option("--check", "mode", flag_value="check", default=True, help="Report the index and what a rebuild would do.")
+@click.option("--apply", "mode", flag_value="apply", help="Rebuild the index and switch to it.")
+@click.pass_context
+def maintenance_reindex(ctx, mode: str):
+    """Rebuild the Memory vector index for the embedding model.
+
+    A rebuild embeds every searchable Memory into a new index, verifies it and
+    switches to it; the previous index is deleted afterwards. It is for an
+    embedding candidate that passed its check and waits for the index, or for
+    the embedding model in use when the index was built with another one.
+    While it runs no Source syncs and no Memory is changed; search keeps
+    answering from the previous index.
+
+    --check, the default, changes nothing and asks no model. --apply checks
+    an embedding model in use that has not passed a check yet before it
+    rebuilds for it. --apply exits with status 1 when the rebuild is refused,
+    fails or is interrupted; the index in use is then the one it was.
+    """
+
+    async def _run() -> int:
+        from memforge.llm.providers import ModelConfigError
+        from memforge.model_settings import ModelSettings
+        from memforge.runtime import DefaultRuntimeProvider
+
+        config: AppConfig = ctx.obj["config"]
+        settings = ModelSettings(config, DefaultRuntimeProvider())
+        db = await _get_db(config)
+        try:
+            view = await settings.vector_index(db)
+            searchable = await db.count_searchable_memories()
+            in_use = view.in_use
+            table = Table(title="Memory vector index", show_header=False)
+            table.add_column("Setting", style="bold")
+            table.add_column("Value")
+            table.add_row("Status", _VECTOR_INDEX_STATUS_TEXT[view.status])
+            if in_use is None:
+                table.add_row("Index in use", "[dim]none[/]")
+            else:
+                model = (in_use["profile"] or {}).get("model_id", "unknown")
+                table.add_row(
+                    "Index in use",
+                    f"{in_use['collection_name']} ({model}, {in_use['dimension']} dimensions"
+                    + (", adopted" if in_use["adopted"] else "")
+                    + ")",
+                )
+            table.add_row("Searchable memories", str(searchable))
+            table.add_row(
+                "A rebuild would be for",
+                {
+                    "candidate": "the embedding candidate that waits for the index",
+                    "active": "the embedding model in use",
+                    None: "[dim]nothing: no rebuild can start[/]",
+                }[view.reindex_target],
+            )
+            console.print(table)
+            if view.status == "ready" and view.reindex_target == "active":
+                console.print(
+                    "The index in use was adopted: its vectors were in place before it was recorded, "
+                    "and the model they came from is assumed. A rebuild is possible, not required."
+                )
+            if mode == "check":
+                if view.reindex_target is not None:
+                    console.print("Run `memforge maintenance reindex --apply` to rebuild the index.")
+                if view.status == "awaiting_validation" and view.reindex_target == "active":
+                    console.print(
+                        "--apply checks the embedding model first: stored vectors of its length "
+                        "can be adopted as they are, and are rebuilt on request."
+                    )
+                return 0
+
+            def progress(indexed: int, total: int) -> None:
+                console.print(f"  [dim]{indexed}/{total} memories embedded[/]")
+
+            with _cancelling_on_sigterm() as termination:
+                try:
+                    finished = await settings.run_reindex(db, progress=progress)
+                except ModelConfigError as exc:
+                    console.print(f"[red]The rebuild did not start ({exc.code}): {exc.message}[/]")
+                    return 1
+                except asyncio.CancelledError:
+                    if not termination.requested:
+                        raise
+                    console.print(
+                        "[red]The rebuild was interrupted. "
+                        "The index in use is unchanged; run the command again.[/]"
+                    )
+                    return 1
+            if finished["state"] != "active":
+                console.print(
+                    f"[red]The rebuild failed ({finished['error_code']}). "
+                    "The index in use is unchanged; run the command again.[/]"
+                )
+                return 1
+            console.print(
+                f"[green]The index was rebuilt: {finished['vector_count']} vectors "
+                f"in {finished['collection_name']}.[/]"
+            )
+            return 0
+        finally:
+            await db.close()
+
+    raise SystemExit(asyncio.run(_run()))
 
 
 # ---------------------------------------------------------------------------

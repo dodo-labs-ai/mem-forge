@@ -1,6 +1,6 @@
 export { ApiProvider, useApi, useWorkspaceTarget } from "./ApiProvider";
 export { createApiClient, unwrap, workspaceResourceUrl, type ApiClient } from "./client";
-export { ApiError, HTTP_STATUS, NoWorkspaceError, isApiErrorStatus } from "./errors";
+export { ApiError, HTTP_STATUS, NoWorkspaceError, isApiErrorStatus, isReindexInProgress, isSearchIndexRefusal } from "./errors";
 export {
   MODEL_KINDS,
   modelSettingsQueryKeys,
@@ -9,6 +9,7 @@ export {
   type ModelKind,
   type ModelKindSettings,
   type ModelSettings,
+  type VectorIndex,
 } from "./modelSettings";
 export {
   RESERVED_PROJECT_KEYS,

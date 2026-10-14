@@ -15,6 +15,7 @@ from memforge.memory.repair import MemoryIndexRepairer
 from memforge.models import Memory, content_hash
 from memforge.storage.database import Database
 from tests.embedding_fixture import embedding_from_texts, embedding_response, fixed_vector_embedding
+from tests.vector_index_fixture import use_collection_as_index
 
 
 class RepairableCollection:
@@ -196,10 +197,7 @@ def test_repair_indexes_command_embeds_at_the_configured_endpoint(tmp_path, monk
 
     monkeypatch.setattr("litellm.aembedding", provider)
     collection = RepairableCollection({})
-    monkeypatch.setattr(
-        "memforge.retrieval.embeddings.get_chroma_collection",
-        lambda *_args, **_kwargs: collection,
-    )
+    use_collection_as_index(monkeypatch, collection)
 
     async def seed() -> None:
         database = Database(load_config().storage.db_path)
@@ -226,10 +224,7 @@ def _seed_memory_without_vector(monkeypatch, tmp_path, memory_id: str) -> Repair
 
     monkeypatch.setenv("MEMFORGE_BASE_DIR", str(tmp_path / "mem"))
     collection = RepairableCollection({})
-    monkeypatch.setattr(
-        "memforge.retrieval.embeddings.get_chroma_collection",
-        lambda *_args, **_kwargs: collection,
-    )
+    use_collection_as_index(monkeypatch, collection)
 
     async def seed() -> None:
         database = Database(load_config().storage.db_path)
