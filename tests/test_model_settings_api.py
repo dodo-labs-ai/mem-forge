@@ -66,6 +66,11 @@ def _config(tmp_path: Path) -> AppConfig:
     config.llm.embedding_base_url = "https://api.openai.com/v1"
     config.llm.embedding_api_key = ""
     config.llm.decision_model = ""
+    # The generation models of these tests are not in LiteLLM's registry, so
+    # their token limits come from the environment.
+    config.llm.max_input_tokens = 64_000
+    config.llm.context_window_tokens = 64_000
+    config.llm.max_output_tokens = 8_000
     config.server.jwt_secret = "test-secret"
     config.sync.scheduler_enabled = False
     config.sync.worker_enabled = False
@@ -171,9 +176,14 @@ def test_the_api_lists_the_provider_descriptors(db, tmp_path) -> None:
         "lists_models": True,
         "options": ["organization"],
         "parameters": {"generation": [], "embedding": ["dimensions"]},
+        "token_limits": {
+            "generation": ["context_window_tokens", "max_output_tokens"],
+            "embedding": [],
+        },
     }
     assert by_id["anthropic"]["kinds"] == ["generation"]
     assert by_id["anthropic"]["parameters"] == {"generation": []}
+    assert by_id["anthropic"]["token_limits"] == {"generation": ["context_window_tokens", "max_output_tokens"]}
     assert by_id["ollama"]["auth_strategies"] == ["none", "api_key"]
     assert by_id["openai_compatible"]["endpoint_required"] is True
     assert by_id["openai_compatible"]["default_endpoint"] is None
@@ -210,11 +220,14 @@ def test_environment_values_read_as_the_active_binding_without_the_key(db, tmp_p
         "route": "anthropic/claude-sonnet-4",
         "options": {},
         "parameters": {},
+        "token_limits": {},
         "config_source": "environment",
         "state": "not_validated",
         "validation": None,
         "api_key": {"is_set": True, "source": "environment", "last4": "3333"},
         "saved_at": None,
+        "profile": None,
+        "waits_for_reindex": False,
     }
     assert ENVIRONMENT_KEY not in response.text
     assert _stored_rows(db) == []
@@ -740,15 +753,7 @@ async def test_promotion_makes_the_sync_worker_embed_with_the_binding_now_active
     before = worker._vector_runtime.memory_store.embedding.settings.invocation
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
-        await client.put(
-            f"{API}/embedding/candidate",
-            json={
-                "provider": "openai_compatible",
-                "endpoint": "https://new-embed.example.test/v1",
-                "model_id": "new-embed-model",
-                "api_key": OTHER_KEY,
-            },
-        )
+        await client.put(f"{API}/embedding/candidate", json={**COMPATIBLE_EMBEDDING, "api_key": OTHER_KEY})
         promoted = await client.post(f"{API}/embedding/candidate/validate")
 
     assert promoted.json()["promoted"] is True
@@ -760,8 +765,8 @@ async def test_promotion_makes_the_sync_worker_embed_with_the_binding_now_active
         EMBEDDING_KEY,
     )
     assert (after.route, after.api_base, after.api_key) == (
-        "openai/new-embed-model",
-        "https://new-embed.example.test/v1",
+        "openai/embed-model",
+        "https://embed.example.test/v1",
         OTHER_KEY,
     )
 
@@ -1175,7 +1180,12 @@ def test_a_server_with_nothing_configured_makes_no_model_request_at_start(
 
     assert health == {
         "generation": {"configured": False, "state": None},
-        "embedding": {"configured": False, "state": None},
+        "embedding": {
+            "configured": False,
+            "state": None,
+            "vector_index": "not_configured",
+            "reindex_required": False,
+        },
     }
     assert providers.generation_requests == []
     assert providers.embedding_requests == []
@@ -1235,7 +1245,12 @@ async def test_a_deployment_managed_installation_keeps_its_checks_in_memory(
         _wait_for_state(client, "generation", "ready")
         active = client.get(API).json()["generation"]["active"]
 
-    assert health["embedding"] == {"configured": True, "state": "ready"}
+    assert health["embedding"] == {
+        "configured": True,
+        "state": "ready",
+        "vector_index": "ready",
+        "reindex_required": False,
+    }
     assert active["state"] == "ready"
     assert active["validation"]["passed"] is True
     assert active["saved_at"] is None
@@ -1289,8 +1304,137 @@ def test_health_tells_when_no_generation_model_is_ready(db, tmp_path, providers)
     assert first_run["models"]["generation"] == {"configured": False, "state": None}
     assert with_candidate["models"]["generation"] == {"configured": False, "state": None}
     assert validated["models"]["generation"] == {"configured": True, "state": "ready"}
-    assert validated["models"]["embedding"] == {"configured": False, "state": None}
+    assert validated["models"]["embedding"] == {
+        "configured": False,
+        "state": None,
+        "vector_index": "not_configured",
+        "reindex_required": False,
+    }
     assert first_run["status"] == validated["status"]
+
+
+# -- Token limits -------------------------------------------------------------------
+
+UNLISTED_GENERATION = {
+    "provider": "openai_compatible",
+    "endpoint": "https://generate.example.test/v1",
+    "model_id": "a-model-litellm-does-not-list",
+}
+TOKEN_LIMITS = {"context_window_tokens": 32_768, "max_output_tokens": 4_096}
+
+
+def _config_without_environment_limits(tmp_path: Path) -> AppConfig:
+    config = _config(tmp_path)
+    config.llm.max_input_tokens = None
+    config.llm.context_window_tokens = None
+    config.llm.max_output_tokens = None
+    return config
+
+
+def test_a_model_litellm_has_no_limits_for_fails_its_check_until_the_limits_are_given(
+    db, tmp_path, providers
+) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config_without_environment_limits(tmp_path)))
+    client.put(f"{API}/generation/candidate", json={**UNLISTED_GENERATION, "api_key": GENERATION_KEY})
+
+    without = client.post(f"{API}/generation/candidate/validate").json()
+    saved = client.put(f"{API}/generation/candidate", json={**UNLISTED_GENERATION, "token_limits": TOKEN_LIMITS})
+    with_limits = client.post(f"{API}/generation/candidate/validate").json()
+
+    assert (without["passed"], without["promoted"], without["error_code"]) == (False, False, "token_limits_required")
+    assert without["validation"]["facts"]["token_limits_known"] is False
+    assert without["settings"]["candidate"]["token_limits"] == {}
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["candidate"]["token_limits"] == TOKEN_LIMITS
+    assert saved.json()["candidate"]["validation"] is None
+    assert (with_limits["passed"], with_limits["promoted"], with_limits["error_code"]) == (True, True, None)
+    assert with_limits["validation"]["facts"]["token_limits_known"] is True
+    assert with_limits["settings"]["active"]["token_limits"] == TOKEN_LIMITS
+    assert len(providers.generation_requests) == 2
+
+
+async def test_the_runtime_sizes_its_requests_with_the_limits_of_the_binding(db, tmp_path, providers) -> None:
+    config = _config_without_environment_limits(tmp_path)
+    settings = _settings(config)
+    await settings.save_candidate(
+        db,
+        "generation",
+        CandidateDraft(**UNLISTED_GENERATION, api_key=GENERATION_KEY, token_limits=TOKEN_LIMITS),
+    )
+    assert (await settings.validate_candidate(db, "generation")).promoted is True
+
+    models = await resolve_models(db, config)
+    budget = DefaultRuntimeProvider().build_structured_llm_client(models, max_concurrent=1).request_budget()
+
+    assert (models.context_window_tokens, models.max_output_tokens, models.max_input_tokens) == (32_768, 4_096, 32_768)
+    assert (budget.context_limit, budget.output_limit, budget.input_limit) == (32_768, 4_096, 32_768)
+    assert "context_window_tokens" not in providers.generation_requests[0]
+    assert "max_output_tokens" not in providers.generation_requests[0]
+
+
+async def test_limits_from_the_environment_apply_to_what_the_binding_leaves_open(db, tmp_path, providers) -> None:
+    config = _config(tmp_path)
+    settings = _settings(config)
+    await settings.save_candidate(db, "generation", CandidateDraft(**UNLISTED_GENERATION, api_key=GENERATION_KEY))
+    from_environment = await settings.validate_candidate(db, "generation")
+    environment_only = await resolve_models(db, config)
+
+    await settings.save_candidate(
+        db,
+        "generation",
+        CandidateDraft(**UNLISTED_GENERATION, token_limits={"context_window_tokens": 16_000}),
+    )
+    partly_stated = await settings.validate_candidate(db, "generation")
+    with_binding = await resolve_models(db, config)
+
+    assert (from_environment.promoted, partly_stated.promoted) == (True, True)
+    assert (
+        environment_only.context_window_tokens,
+        environment_only.max_output_tokens,
+        environment_only.max_input_tokens,
+    ) == (64_000, 8_000, 64_000)
+    assert (
+        with_binding.context_window_tokens,
+        with_binding.max_output_tokens,
+        with_binding.max_input_tokens,
+    ) == (16_000, 8_000, 64_000)
+
+
+def test_changing_the_token_limits_of_a_ready_binding_needs_a_new_check(db, tmp_path, providers) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+    client.put(f"{API}/generation/candidate", json={**UNLISTED_GENERATION, "api_key": GENERATION_KEY})
+    client.post(f"{API}/generation/candidate/validate")
+
+    saved = client.put(f"{API}/generation/candidate", json={**UNLISTED_GENERATION, "token_limits": TOKEN_LIMITS})
+
+    candidate = saved.json()["candidate"]
+    assert (candidate["state"], candidate["token_limits"]) == ("not_validated", TOKEN_LIMITS)
+    assert saved.json()["active"]["token_limits"] == {}
+    assert saved.json()["active"]["state"] == "ready"
+
+
+@pytest.mark.parametrize(
+    ("kind", "body", "error_code"),
+    [
+        ("generation", {**UNLISTED_GENERATION, "token_limits": {"context_window_tokens": 0}}, "token_limit_invalid"),
+        ("generation", {**UNLISTED_GENERATION, "token_limits": {"max_output_tokens": "4096"}}, "token_limit_invalid"),
+        ("generation", {**UNLISTED_GENERATION, "token_limits": {"max_input_tokens": 1}}, "token_limit_not_supported"),
+        (
+            "embedding",
+            {**COMPATIBLE_EMBEDDING, "token_limits": {"context_window_tokens": 8_000}},
+            "token_limit_not_supported",
+        ),
+    ],
+    ids=["zero", "text", "unknown_limit", "embedding_model"],
+)
+def test_a_token_limit_a_binding_cannot_state_is_refused(db, tmp_path, kind, body, error_code) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    response = client.put(f"{API}/{kind}/candidate", json={**body, "api_key": GENERATION_KEY})
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == error_code
+    assert _stored_rows(db) == []
 
 
 # -- Model discovery ----------------------------------------------------------------

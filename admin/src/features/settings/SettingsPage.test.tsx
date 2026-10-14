@@ -12,8 +12,12 @@ import {
   makeDeploymentBinding,
   makeEmbeddingBinding,
   makeEnvironmentBinding,
+  makeIndexRecord,
   makeModelSettings,
+  makeProfile,
+  makeReindex,
   makeValidation,
+  makeVectorIndex,
 } from "@/test/modelSettingsFixtures";
 import { renderRoutes } from "@/test/renderRoutes";
 import { SettingsPage } from "./SettingsPage";
@@ -34,9 +38,35 @@ function Layout() {
   );
 }
 
-function renderPage(settings: ModelSettings = makeModelSettings(), routes: Record<string, Route> = {}) {
+/**
+ * A server that keeps its settings between requests, as the real one keeps
+ * what the page writes. `change` alters them at once; the settings queued
+ * with `thenAnswer` are what the next reads find, one after another, the way
+ * a rebuild moves on between two reads.
+ */
+function settingsServer(initial: ModelSettings = makeModelSettings()) {
+  let current = initial;
+  const upcoming: Array<Partial<ModelSettings>> = [];
+  return {
+    read: () => {
+      current = { ...current, ...upcoming.shift() };
+      return current;
+    },
+    change: (next: Partial<ModelSettings>) => {
+      current = { ...current, ...next };
+      return current;
+    },
+    thenAnswer: (...next: Array<Partial<ModelSettings>>) => {
+      upcoming.push(...next);
+    },
+  };
+}
+
+type SettingsServer = ReturnType<typeof settingsServer>;
+
+function renderPage(settings: ModelSettings | SettingsServer = makeModelSettings(), routes: Record<string, Route> = {}) {
   const api: Record<string, Route> = {
-    [`GET ${SETTINGS_ROUTE}`]: () => settings,
+    [`GET ${SETTINGS_ROUTE}`]: "read" in settings ? settings.read : () => settings,
     [`GET ${SETTINGS_ROUTE}/providers`]: () => ({ providers: PROVIDERS }),
     ...routes,
   };
@@ -54,12 +84,21 @@ function renderPage(settings: ModelSettings = makeModelSettings(), routes: Recor
   );
 }
 
+/** How long a test waits for the page to read a running rebuild again; it does so every two seconds. */
+const NEXT_READ = { timeout: 5_000 };
+/** Room for a test that follows a rebuild over two or three reads. */
+const REBUILD_TEST_MS = 20_000;
+
 async function card(name: "Generation model" | "Embedding model") {
   return screen.findByRole("region", { name });
 }
 
 function inUse(region: HTMLElement) {
   return within(region).getByRole("group", { name: "In use" });
+}
+
+async function searchIndex() {
+  return within(await card("Embedding model")).findByRole("group", { name: "Search index" });
 }
 
 function writes(calls: Request[]): string[] {
@@ -111,15 +150,19 @@ test("shows the models in use with their state, and only the last characters of 
 describe("Save and validate", () => {
   test("saves the edit, validates it, and shows the model that is now in use", async () => {
     const promoted = makeEmbeddingBinding({ model_id: "mxbai-embed-large", route: "ollama/mxbai-embed-large" });
-    const { calls } = renderPage(makeModelSettings(), {
+    const server = settingsServer();
+    const { calls } = renderPage(server, {
       [`PUT ${SETTINGS_ROUTE}/embedding/candidate`]: () =>
-        kindSettings(makeEmbeddingBinding(), { ...promoted, state: "not_validated", validation: null }),
+        server.change({
+          embedding: kindSettings(makeEmbeddingBinding(), { ...promoted, state: "not_validated", validation: null, profile: null }),
+        }).embedding,
       [`POST ${SETTINGS_ROUTE}/embedding/candidate/validate`]: () => ({
         passed: true,
         promoted: true,
+        reindex_required: false,
         error_code: null,
         validation: promoted.validation,
-        settings: kindSettings(promoted),
+        settings: server.change({ embedding: kindSettings(promoted) }).embedding,
       }),
     });
     const embedding = await card("Embedding model");
@@ -144,6 +187,7 @@ describe("Save and validate", () => {
       auth_strategy: "none",
       options: {},
       parameters: {},
+      token_limits: {},
     });
   });
 
@@ -199,13 +243,14 @@ describe("Save and validate", () => {
   });
 
   test("an edit that is already saved is validated without saving it again", async () => {
-    const edit = openAiEmbedding({ state: "not_validated", validation: null });
-    const { calls } = renderPage(makeModelSettings({ embedding: kindSettings(makeEmbeddingBinding(), edit) }), {
+    const edit = openAiEmbedding({ state: "not_validated", validation: null, profile: null });
+    const server = settingsServer(makeModelSettings({ embedding: kindSettings(makeEmbeddingBinding(), edit) }));
+    const { calls } = renderPage(server, {
       [`POST ${SETTINGS_ROUTE}/embedding/candidate/validate`]: () => ({
         passed: true,
         promoted: true,
         validation: makeValidation(),
-        settings: kindSettings(openAiEmbedding()),
+        settings: server.change({ embedding: kindSettings(openAiEmbedding()) }).embedding,
       }),
     });
     const embedding = await card("Embedding model");
@@ -220,9 +265,11 @@ describe("Save and validate", () => {
   });
 
   test("Discard changes drops a saved edit and shows the model in use again", async () => {
-    const edit = openAiEmbedding({ state: "not_validated", validation: null });
-    const { calls } = renderPage(makeModelSettings({ embedding: kindSettings(makeEmbeddingBinding(), edit) }), {
-      [`DELETE ${SETTINGS_ROUTE}/embedding/candidate`]: () => kindSettings(makeEmbeddingBinding()),
+    const edit = openAiEmbedding({ state: "not_validated", validation: null, profile: null });
+    const server = settingsServer(makeModelSettings({ embedding: kindSettings(makeEmbeddingBinding(), edit) }));
+    const { calls } = renderPage(server, {
+      [`DELETE ${SETTINGS_ROUTE}/embedding/candidate`]: () =>
+        server.change({ embedding: kindSettings(makeEmbeddingBinding()) }).embedding,
     });
     const embedding = await card("Embedding model");
 
@@ -410,6 +457,7 @@ describe("a model that pairs a base URL with credentials from the server environ
       auth_strategy: "environment",
       options: {},
       parameters: {},
+      token_limits: {},
     });
   });
 
@@ -564,11 +612,13 @@ describe("the model in use", () => {
     expect(writes(calls)).toEqual([`POST ${SETTINGS_ROUTE}/generation/active/validate`]);
   });
 
-  test("says what the server still needs when the model's token limits are unknown", async () => {
-    const local = makeBinding({ validation: makeValidation({ facts: { latency_ms: 300, token_limits_known: false } }) });
+  test("a model that states its token limits shows them", async () => {
+    const local = makeBinding({ token_limits: { context_window_tokens: 32768, max_output_tokens: 4096 } });
     renderPage(makeModelSettings({ generation: kindSettings(local) }));
 
-    expect(await screen.findByText(/set MEMFORGE_LLM_MAX_INPUT_TOKENS/)).toBeInTheDocument();
+    const used = inUse(await card("Generation model"));
+    expect(within(used).getByText("32,768 tokens")).toBeInTheDocument();
+    expect(within(used).getByText("4,096 tokens")).toBeInTheDocument();
   });
 
   test("a model named by environment variables says that a saved one takes its place", async () => {
@@ -714,5 +764,432 @@ describe("leaving with unsaved changes", () => {
     await userEvent.click(screen.getByRole("link", { name: "Sources" }));
 
     expect(await screen.findByRole("heading", { name: "Sources page" })).toBeInTheDocument();
+  });
+});
+
+describe("the search index", () => {
+  test("says which model built it, how many memories it holds, and what is special about it", async () => {
+    renderPage(
+      makeModelSettings({ vector_index: makeVectorIndex({ reindex_target: "active", index: makeIndexRecord({ adopted: true }) }) }),
+    );
+
+    const index = await searchIndex();
+    expect(within(index).getByText("Ollama nomic-embed-text")).toBeInTheDocument();
+    expect(within(index).getByText("1,204")).toBeInTheDocument();
+    expect(within(index).getByText("768")).toBeInTheDocument();
+    expect(within(index).getByRole("status")).toHaveTextContent("Vector search is on.");
+    expect(within(index).getByText("Carried over")).toBeInTheDocument();
+    expect(within(index).getByText(/takes them to come from the model in use/)).toBeInTheDocument();
+    expect(within(index).getByText("Thresholds not calibrated")).toBeInTheDocument();
+    expect(within(index).getByText(/were tuned on another model/)).toBeInTheDocument();
+    expect(within(index).getByRole("button", { name: "Rebuild search index" })).toBeEnabled();
+  });
+
+  test("an index that fits its model, with thresholds tuned on it, offers no rebuild", async () => {
+    const tuned = makeProfile({
+      provider: "openai",
+      route: "openai/text-embedding-3-small",
+      endpoint: "https://api.openai.com/v1",
+      model_id: "text-embedding-3-small",
+      dimension: 1536,
+      thresholds_calibrated: true,
+    });
+    renderPage(
+      makeModelSettings({
+        embedding: kindSettings(openAiEmbedding({ profile: tuned })),
+        vector_index: makeVectorIndex({ index: makeIndexRecord({ profile: tuned }) }),
+      }),
+    );
+
+    const index = await searchIndex();
+    expect(within(index).getByText("OpenAI text-embedding-3-small")).toBeInTheDocument();
+    expect(within(index).queryByText("Thresholds not calibrated")).not.toBeInTheDocument();
+    expect(within(index).queryByText("Carried over")).not.toBeInTheDocument();
+    expect(within(index).queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  test(
+    "an installation whose index does not fit its model rebuilds it from here, and sees the rebuild through",
+    async () => {
+      const required = makeVectorIndex({ status: "reindex_required", reindex_target: "active", index: null });
+      const server = settingsServer(makeModelSettings({ vector_index: required }));
+      const { calls } = renderPage(server, {
+        [`POST ${SETTINGS_ROUTE}/vector-index/reindex`]: () =>
+          server.change({
+            vector_index: makeVectorIndex({
+              status: "reindexing",
+              index: null,
+              reindex: makeReindex({ target: "active", memories_total: null, memories_indexed: 0 }),
+            }),
+          }).vector_index,
+      });
+
+      const index = await searchIndex();
+      expect(within(index).getByRole("status")).toHaveTextContent("Vector search is off.");
+      expect(within(index).getByRole("status")).toHaveTextContent("The vectors stored so far do not fit Ollama nomic-embed-text.");
+      server.thenAnswer(
+        {
+          vector_index: makeVectorIndex({
+            status: "reindexing",
+            index: null,
+            reindex: makeReindex({ target: "active", memories_indexed: 602 }),
+          }),
+        },
+        {
+          vector_index: makeVectorIndex({
+            reindex: makeReindex({ target: "active", state: "succeeded", memories_indexed: 1204, finished_at: new Date().toISOString() }),
+          }),
+        },
+      );
+      await userEvent.click(within(index).getByRole("button", { name: "Rebuild search index" }));
+
+      expect(await within(index).findByText("Counting the memories to embed…")).toBeInTheDocument();
+      expect(within(index).getByText(/Search ranks by matching words until the index is ready\./)).toBeInTheDocument();
+      expect(within(index).queryByRole("button")).not.toBeInTheDocument();
+      expect(await within(index).findByText("602 of 1,204 memories embedded", undefined, NEXT_READ)).toBeInTheDocument();
+      expect(within(index).getByRole("progressbar")).toHaveAttribute("aria-valuenow", "50");
+
+      expect(await within(index).findByText("Vector search is on.", undefined, NEXT_READ)).toBeInTheDocument();
+      expect(within(index).getByRole("status")).toHaveTextContent("The index was rebuilt just now.");
+      expect(within(index).getByText("1,204")).toBeInTheDocument();
+      expect(within(index).queryByRole("progressbar")).not.toBeInTheDocument();
+      expect(writes(calls)).toEqual([`POST ${SETTINGS_ROUTE}/vector-index/reindex`]);
+    },
+    REBUILD_TEST_MS,
+  );
+
+  test("a rebuild that cannot start says why", async () => {
+    renderPage(makeModelSettings({ vector_index: makeVectorIndex({ status: "reindex_required", reindex_target: "active" }) }), {
+      [`POST ${SETTINGS_ROUTE}/vector-index/reindex`]: () =>
+        errorResponse(409, {
+          error: "sync_in_progress",
+          message: "A Source is syncing. Rebuild the vector index once no Source is syncing.",
+        }),
+    });
+    const index = await searchIndex();
+
+    await userEvent.click(within(index).getByRole("button", { name: "Rebuild search index" }));
+
+    const alert = await within(index).findByRole("alert");
+    expect(alert).toHaveTextContent("Couldn't start the rebuild");
+    expect(alert).toHaveTextContent("A source is syncing. Start the rebuild once no source is syncing.");
+    expect(within(index).getByRole("button", { name: "Rebuild search index" })).toBeEnabled();
+  });
+
+  test("a rebuild that is running when the page opens shows its progress and holds the embedding model", async () => {
+    renderPage(makeModelSettings({ vector_index: makeVectorIndex({ status: "reindexing", reindex: makeReindex() }) }));
+
+    const index = await searchIndex();
+    expect(within(index).getByText("120 of 1,204 memories embedded")).toBeInTheDocument();
+    expect(within(index).getByText(/Search keeps working on the current index until the new one is ready\./)).toBeInTheDocument();
+    expect(within(index).getByText(/Source syncs and changes to memories wait/)).toBeInTheDocument();
+
+    const embedding = await card("Embedding model");
+    expect(within(embedding).getByLabelText("Model")).toBeDisabled();
+    expect(within(embedding).getByText("The embedding model can be changed once the search index is rebuilt.")).toBeInTheDocument();
+    expect(within(await card("Generation model")).getByLabelText("Model")).toBeEnabled();
+  });
+
+  test("an installation the deployment manages can still rebuild its index", async () => {
+    renderPage(
+      makeModelSettings({
+        writable: false,
+        vector_index: makeVectorIndex({ status: "reindex_required", reindex_target: "active" }),
+      }),
+    );
+
+    expect(within(await searchIndex()).getByRole("button", { name: "Rebuild search index" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Save and validate" })).not.toBeInTheDocument();
+  });
+
+  test("a deployment that keeps the index by its own means shows nothing about it", async () => {
+    renderPage(
+      makeModelSettings({
+        vector_index: makeVectorIndex({ status: "not_managed", index: null }),
+      }),
+    );
+
+    const embedding = await card("Embedding model");
+    expect(within(embedding).queryByRole("group", { name: "Search index" })).not.toBeInTheDocument();
+    expect(within(embedding).queryByRole("button", { name: /rebuild/i })).not.toBeInTheDocument();
+  });
+});
+
+describe("an embedding model whose vectors cannot be compared with the stored ones", () => {
+  const LARGE = makeProfile({
+    model_id: "mxbai-embed-large",
+    route: "ollama/mxbai-embed-large",
+    dimension: 1024,
+    fingerprint: "c3".repeat(32),
+  });
+  /** The saved edit once it has passed validation: only the search index keeps it from use. */
+  const waiting = makeEmbeddingBinding({
+    model_id: "mxbai-embed-large",
+    route: "ollama/mxbai-embed-large",
+    validation: makeValidation({ facts: { latency_ms: 90, dimension: 1024 } }),
+    profile: LARGE,
+    waits_for_reindex: true,
+  });
+  const WAITING_INDEX = makeVectorIndex({ reindex_target: "candidate" });
+  const REBUILDING = makeVectorIndex({
+    status: "reindexing",
+    reindex: makeReindex({ profile: LARGE, memories_total: null, memories_indexed: 0 }),
+  });
+
+  function waitingSettings() {
+    return makeModelSettings({ embedding: kindSettings(makeEmbeddingBinding(), waiting), vector_index: WAITING_INDEX });
+  }
+
+  test(
+    "passes validation, waits, and is put to use by the rebuild its action starts",
+    async () => {
+      const server = settingsServer();
+      const { calls } = renderPage(server, {
+        [`PUT ${SETTINGS_ROUTE}/embedding/candidate`]: () =>
+          server.change({
+            embedding: kindSettings(makeEmbeddingBinding(), {
+              ...waiting,
+              state: "not_validated",
+              validation: null,
+              profile: null,
+              waits_for_reindex: false,
+            }),
+          }).embedding,
+        [`POST ${SETTINGS_ROUTE}/embedding/candidate/validate`]: () => ({
+          passed: true,
+          promoted: false,
+          reindex_required: true,
+          error_code: null,
+          validation: waiting.validation,
+          settings: server.change(waitingSettings()).embedding,
+        }),
+        [`POST ${SETTINGS_ROUTE}/vector-index/reindex`]: () => server.change({ vector_index: REBUILDING }).vector_index,
+      });
+      const embedding = await card("Embedding model");
+
+      await userEvent.clear(within(embedding).getByLabelText("Model"));
+      await userEvent.type(within(embedding).getByLabelText("Model"), "mxbai-embed-large");
+      await userEvent.click(within(embedding).getByRole("button", { name: "Save and validate" }));
+
+      const notice = (await within(embedding).findByText("These settings passed validation and wait for the search index")).closest(
+        '[role="status"]',
+      ) as HTMLElement;
+      expect(notice).toHaveTextContent("the search index is rebuilt before MemForge uses the model");
+      expect(notice).toHaveTextContent("Thresholds not calibrated");
+      expect(notice).toHaveTextContent("MemForge keeps using Ollama nomic-embed-text.");
+      expect(within(inUse(embedding)).getByText("nomic-embed-text")).toBeInTheDocument();
+      expect(within(embedding).queryByRole("button", { name: "Save and validate" })).not.toBeInTheDocument();
+
+      server.thenAnswer(
+        { vector_index: { ...REBUILDING, reindex: makeReindex({ profile: LARGE, memories_indexed: 301 }) } },
+        {
+          embedding: kindSettings({ ...waiting, waits_for_reindex: false }),
+          vector_index: makeVectorIndex({
+            index: makeIndexRecord({ profile: LARGE }),
+            reindex: makeReindex({ profile: LARGE, state: "succeeded", memories_indexed: 1204, finished_at: new Date().toISOString() }),
+          }),
+        },
+      );
+      await userEvent.click(within(embedding).getByRole("button", { name: "Rebuild search index" }));
+
+      const index = await searchIndex();
+      expect(await within(index).findByText("Rebuilding the search index.")).toBeInTheDocument();
+      expect(within(index).getByRole("status")).toHaveTextContent("Every memory is embedded again with Ollama mxbai-embed-large.");
+      expect(within(embedding).getByRole("button", { name: "Rebuilding…" })).toBeDisabled();
+      expect(within(embedding).getByLabelText("Model")).toBeDisabled();
+      expect(await within(index).findByText("301 of 1,204 memories embedded", undefined, NEXT_READ)).toBeInTheDocument();
+      expect(within(index).getByText(/Search keeps working on the current index/)).toBeInTheDocument();
+
+      expect(await within(embedding).findByText("Search index rebuilt", undefined, NEXT_READ)).toBeInTheDocument();
+      expect(within(embedding).getByText("MemForge now uses this model.")).toBeInTheDocument();
+      expect(within(inUse(embedding)).getByText("mxbai-embed-large")).toBeInTheDocument();
+      expect(within(index).getByText("Ollama mxbai-embed-large")).toBeInTheDocument();
+      expect(within(index).getByRole("status")).toHaveTextContent("Vector search is on. The index was rebuilt just now.");
+      expect(within(embedding).getByRole("button", { name: "Save and validate" })).toBeDisabled();
+      expect(writes(calls)).toEqual([
+        `PUT ${SETTINGS_ROUTE}/embedding/candidate`,
+        `POST ${SETTINGS_ROUTE}/embedding/candidate/validate`,
+        `POST ${SETTINGS_ROUTE}/vector-index/reindex`,
+      ]);
+    },
+    REBUILD_TEST_MS,
+  );
+
+  test(
+    "a rebuild that fails gives the reason, changes nothing in use, and can be run again",
+    async () => {
+      const server = settingsServer(waitingSettings());
+      const { calls } = renderPage(server, {
+        [`POST ${SETTINGS_ROUTE}/vector-index/reindex`]: () => server.change({ vector_index: REBUILDING }).vector_index,
+      });
+      const embedding = await card("Embedding model");
+      const failed = makeVectorIndex({
+        reindex_target: "candidate",
+        reindex: makeReindex({
+          profile: LARGE,
+          state: "failed",
+          error_code: "rate_limited",
+          memories_indexed: 301,
+          finished_at: new Date().toISOString(),
+        }),
+      });
+
+      server.thenAnswer({ vector_index: failed });
+      await userEvent.click(within(embedding).getByRole("button", { name: "Rebuild search index" }));
+
+      const index = await searchIndex();
+      const failure = (await within(index).findByText("The rebuild failed just now", undefined, NEXT_READ)).closest(
+        '[role="status"]',
+      ) as HTMLElement;
+      expect(failure).toHaveTextContent("The provider is limiting requests right now. Try again in a moment.");
+      expect(failure).toHaveTextContent("The model and the index in use are unchanged.");
+      expect(within(inUse(embedding)).getByText("nomic-embed-text")).toBeInTheDocument();
+      expect(within(index).getByText("Vector search is on.")).toBeInTheDocument();
+      expect(within(embedding).getByText("These settings passed validation and wait for the search index")).toBeInTheDocument();
+
+      await userEvent.click(within(embedding).getByRole("button", { name: "Run the rebuild again" }));
+
+      expect(await within(index).findByText("Rebuilding the search index.")).toBeInTheDocument();
+      expect(within(index).queryByText("The rebuild failed just now")).not.toBeInTheDocument();
+      expect(writes(calls)).toEqual([
+        `POST ${SETTINGS_ROUTE}/vector-index/reindex`,
+        `POST ${SETTINGS_ROUTE}/vector-index/reindex`,
+      ]);
+    },
+    REBUILD_TEST_MS,
+  );
+
+  test("says that search ranks by matching words meanwhile when the index in use does not fit the model in use", async () => {
+    const off = makeVectorIndex({ status: "reindex_required", reindex_target: "candidate" });
+    renderPage(makeModelSettings({ embedding: kindSettings(makeEmbeddingBinding(), waiting), vector_index: off }));
+    const embedding = await card("Embedding model");
+
+    const notice = within(embedding)
+      .getByText("These settings passed validation and wait for the search index")
+      .closest('[role="status"]') as HTMLElement;
+    expect(notice).toHaveTextContent("meanwhile search ranks by matching words, as it does now, and source syncs and changes to memories wait.");
+    expect(notice).not.toHaveTextContent("search keeps working");
+  });
+
+  test("a rebuild another process already started is followed instead of reported as a failure", async () => {
+    const server = settingsServer(waitingSettings());
+    renderPage(server, {
+      [`POST ${SETTINGS_ROUTE}/vector-index/reindex`]: () => {
+        server.change({ vector_index: { ...REBUILDING, reindex: makeReindex({ profile: LARGE }) } });
+        return errorResponse(409, { error: "reindex_in_progress", message: "The Memory vector index is already being rebuilt." });
+      },
+    });
+    const embedding = await card("Embedding model");
+
+    await userEvent.click(within(embedding).getByRole("button", { name: "Rebuild search index" }));
+
+    expect(await within(await searchIndex()).findByText("120 of 1,204 memories embedded")).toBeInTheDocument();
+    expect(within(embedding).queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  test("changing the waiting settings makes the action save and validate again", async () => {
+    renderPage(waitingSettings());
+    const embedding = await card("Embedding model");
+    expect(within(embedding).getByRole("button", { name: "Rebuild search index" })).toBeEnabled();
+
+    await userEvent.type(within(embedding).getByLabelText("Output dimensions"), "512");
+
+    expect(within(embedding).getByRole("button", { name: "Save and validate" })).toBeEnabled();
+    expect(within(embedding).queryByRole("button", { name: "Rebuild search index" })).not.toBeInTheDocument();
+  });
+});
+
+describe("the token limits of a generation model", () => {
+  const LIMITS_UNKNOWN = makeValidation({ passed: false, error_code: "token_limits_required", facts: { latency_ms: 300, token_limits_known: false } });
+
+  function localModel(overrides: Partial<ModelBinding> = {}): ModelBinding {
+    return makeBinding({
+      provider: "ollama",
+      endpoint: "http://localhost:11434",
+      origin: "http://localhost:11434",
+      auth_strategy: "none",
+      model_id: "qwen3:14b",
+      route: "ollama/qwen3:14b",
+      api_key: { is_set: false, source: null, last4: null },
+      ...overrides,
+    });
+  }
+
+  test("stay out of the way for a model the server has limits for", async () => {
+    renderPage();
+    const generation = await card("Generation model");
+
+    expect(within(generation).queryByRole("group", { name: "Token limits" })).not.toBeInTheDocument();
+    expect(within(generation).queryByLabelText("Context window")).not.toBeInTheDocument();
+  });
+
+  test("are asked for once validation finds that the server has none, and are saved with the model", async () => {
+    const refused = localModel({ state: "not_validated", validation: LIMITS_UNKNOWN });
+    const limited = localModel({ token_limits: { context_window_tokens: 32768, max_output_tokens: 4096 } });
+    const { calls } = renderPage(makeModelSettings({ generation: kindSettings(null, refused) }), {
+      [`PUT ${SETTINGS_ROUTE}/generation/candidate`]: () => kindSettings(null, { ...limited, state: "not_validated", validation: null }),
+      [`POST ${SETTINGS_ROUTE}/generation/candidate/validate`]: () => ({
+        passed: true,
+        promoted: true,
+        reindex_required: false,
+        error_code: null,
+        validation: limited.validation,
+        settings: kindSettings(limited),
+      }),
+    });
+    const generation = await card("Generation model");
+
+    expect(within(generation).getByText("These settings failed validation and are not in use").closest('[role="status"]')).toHaveTextContent(
+      "The model answered, but MemForge has no token limits for it. Enter its context window and maximum output, then validate again.",
+    );
+    const limits = within(generation).getByRole("group", { name: "Token limits" });
+    expect(limits).toHaveAccessibleDescription(
+      "MemForge sizes every request to these limits, so that the model is never sent more than it can read or asked for more than it can write. It has none for this model: take them from the model card or from your model server.",
+    );
+    await userEvent.type(within(limits).getByLabelText("Context window"), "32768");
+    await userEvent.type(within(limits).getByLabelText("Maximum output"), "4096");
+    await userEvent.click(within(generation).getByRole("button", { name: "Save and validate" }));
+
+    expect(await within(generation).findByText("Validation passed")).toBeInTheDocument();
+    expect(within(inUse(generation)).getByText("32,768 tokens")).toBeInTheDocument();
+    expect(within(generation).getByLabelText("Context window")).toHaveValue("32768");
+    expect(await bodyOf(calls, "PUT", `${SETTINGS_ROUTE}/generation/candidate`)).toEqual({
+      provider: "ollama",
+      model_id: "qwen3:14b",
+      endpoint: "http://localhost:11434",
+      auth_strategy: "none",
+      options: {},
+      parameters: {},
+      token_limits: { context_window_tokens: 32768, max_output_tokens: 4096 },
+    });
+  });
+
+  test("of a model that states them can be changed, as whole numbers of tokens", async () => {
+    const limited = localModel({ token_limits: { context_window_tokens: 32768, max_output_tokens: 4096 } });
+    const { calls } = renderPage(makeModelSettings({ generation: kindSettings(limited) }));
+    const generation = await card("Generation model");
+    const limits = within(generation).getByRole("group", { name: "Token limits" });
+
+    expect(within(limits).getByLabelText("Context window")).toHaveValue("32768");
+    expect(within(limits).getByLabelText("Maximum output")).toHaveValue("4096");
+    expect(limits).toHaveAccessibleDescription(
+      "MemForge sizes every request to these limits, so that the model is never sent more than it can read or asked for more than it can write.",
+    );
+    expect(within(generation).getByRole("button", { name: "Save and validate" })).toBeDisabled();
+
+    await userEvent.clear(within(limits).getByLabelText("Maximum output"));
+    await userEvent.type(within(limits).getByLabelText("Maximum output"), "8k");
+    expect(within(generation).getByText("Unsaved changes")).toBeInTheDocument();
+    await userEvent.click(within(generation).getByRole("button", { name: "Save and validate" }));
+
+    expect(await within(limits).findByText("Enter a whole number greater than zero.")).toBeInTheDocument();
+    expect(within(limits).getByLabelText("Maximum output")).toHaveAttribute("aria-invalid", "true");
+    expect(writes(calls)).toEqual([]);
+  });
+
+  test("are not offered for an embedding model", async () => {
+    renderPage();
+
+    expect(within(await card("Embedding model")).queryByRole("group", { name: "Token limits" })).not.toBeInTheDocument();
   });
 });

@@ -19,6 +19,7 @@ from memforge.storage.database import Database
 from tests.test_sync_bookkeeping import _hold_document
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from tests.embedding_fixture import unconfigured_embedding
+from tests.vector_index_fixture import use_collection_as_index
 
 
 METADATA_CONTENT = (
@@ -1871,10 +1872,7 @@ async def test_retire_memory_route_cleans_search_indexes(
         content="Retiring a memory should hide it from search.",
     )
     collection = FakeCollection()
-    monkeypatch.setattr(
-        "memforge.runtime.get_chroma_collection",
-        lambda **kwargs: collection,
-    )
+    use_collection_as_index(monkeypatch, collection)
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
@@ -1904,10 +1902,7 @@ async def test_admin_pending_review_status_cleans_search_indexes(
         content="Admin pending review should hide quarantined memories from search.",
     )
     collection = FakeCollection()
-    monkeypatch.setattr(
-        "memforge.runtime.get_chroma_collection",
-        lambda **kwargs: collection,
-    )
+    use_collection_as_index(monkeypatch, collection)
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:

@@ -890,9 +890,21 @@ class VectorStore(Protocol):
     distance_metric is a declared label used only by a calibration check to
     assert thresholds match the metric. There is no metric-enum machinery:
     the single in-scope implementation is cosine.
+
+    An index holds the vectors of one embedding model. index_fingerprint()
+    names that model's vector space, recorded once for the whole index.
     """
 
     distance_metric: str
+
+    async def index_fingerprint(self) -> str | None:
+        """The fingerprint of the Embedding Profile the index was built with.
+
+        The caller embeds for the index only with an Embedding Runtime of the
+        same fingerprint. ``None`` means the index records none, and then no
+        check is made.
+        """
+        ...
 
     def similarity(self, distance: float) -> float: ...
     def within_dedup_threshold(self, distance_threshold: float, score: float) -> bool: ...

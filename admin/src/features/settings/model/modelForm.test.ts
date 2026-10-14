@@ -4,6 +4,7 @@ import {
   makeBinding,
   makeEmbeddingBinding,
   makeEnvironmentBinding,
+  makeValidation,
   providerById,
 } from "@/test/modelSettingsFixtures";
 import {
@@ -21,6 +22,7 @@ import {
   fieldProblems,
   formOrigin,
   isChanged,
+  offersTokenLimits,
   savedValues,
   valuesForProvider,
   type ModelFormValues,
@@ -51,15 +53,21 @@ describe("savedValues", () => {
       model: "gpt-5.4",
       options: {},
       parameters: {},
+      tokenLimits: {},
     });
   });
 
-  test("shows extra settings as the text of their fields", () => {
+  test("shows extra settings and token limits as the text of their fields", () => {
     const stored = makeEmbeddingBinding({ provider: "openai", options: { organization: "org-1" }, parameters: { dimensions: 256 } });
+    const local = makeBinding({ token_limits: { context_window_tokens: 32768, max_output_tokens: 4096 } });
 
     expect(savedValues(stored, "embedding", PROVIDERS)).toMatchObject({
       options: { organization: "org-1" },
       parameters: { dimensions: "256" },
+    });
+    expect(savedValues(local, "generation", PROVIDERS).tokenLimits).toEqual({
+      context_window_tokens: "32768",
+      max_output_tokens: "4096",
     });
   });
 
@@ -110,6 +118,7 @@ describe("candidateRequest", () => {
       auth_strategy: "api_key",
       options: {},
       parameters: {},
+      token_limits: {},
     });
     expect(candidateRequest(edited({ apiKey: " sk-new " }), OPENAI, "generation").api_key).toBe("sk-new");
   });
@@ -140,6 +149,31 @@ describe("candidateRequest", () => {
     });
     expect(candidateRequest(values, OPENAI, "generation").parameters).toEqual({});
     expect(candidateRequest(edited({ ...values, provider: "ollama" }), OLLAMA, "embedding").options).toEqual({});
+  });
+
+  test("sends the token limits that are filled in as numbers, for a generation model only", () => {
+    const values = edited({ tokenLimits: { context_window_tokens: " 32768 ", max_output_tokens: "" } });
+
+    expect(candidateRequest(values, OPENAI, "generation").token_limits).toEqual({ context_window_tokens: 32768 });
+    expect(candidateRequest(values, OPENAI, "embedding").token_limits).toEqual({});
+  });
+});
+
+describe("offersTokenLimits", () => {
+  test("keeps the fields out of the way for a model the server has limits for", () => {
+    expect(offersTokenLimits(makeBinding())).toBe(false);
+    expect(offersTokenLimits(makeBinding({ state: "not_validated", validation: null }))).toBe(false);
+    expect(offersTokenLimits(null)).toBe(false);
+  });
+
+  test("offers them once a validation found that the server has none", () => {
+    const refused = makeValidation({ passed: false, error_code: "token_limits_required", facts: { token_limits_known: false } });
+
+    expect(offersTokenLimits(makeBinding({ state: "not_validated", validation: refused }))).toBe(true);
+  });
+
+  test("offers them for a model that states limits, so they can be changed", () => {
+    expect(offersTokenLimits(makeBinding({ token_limits: { max_output_tokens: 4096 } }))).toBe(true);
   });
 });
 
@@ -254,6 +288,16 @@ describe("fieldProblems", () => {
     expect(dimensions("")).toEqual([]);
     for (const value of ["0", "-1", "1.5", "many"]) {
       expect(dimensions(value)).toEqual([{ path: ["parameters", "dimensions"], message: WHOLE_NUMBER_MESSAGE }]);
+    }
+  });
+
+  test("takes only whole numbers greater than zero as token limits", () => {
+    const limit = (value: string) =>
+      fieldProblems(edited({ tokenLimits: { context_window_tokens: value } }), { provider: OPENAI, kind: "generation", savedKey: KEPT });
+    expect(limit("32768")).toEqual([]);
+    expect(limit("")).toEqual([]);
+    for (const value of ["0", "32k", "4096.5"]) {
+      expect(limit(value)).toEqual([{ path: ["tokenLimits", "context_window_tokens"], message: WHOLE_NUMBER_MESSAGE }]);
     }
   });
 

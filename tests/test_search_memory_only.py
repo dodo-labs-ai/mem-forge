@@ -20,6 +20,7 @@ from memforge.retrieval.search import SearchEngine
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
 from tests.embedding_fixture import unconfigured_embedding
+from tests.vector_index_fixture import use_collection_as_index
 
 
 class FakeCollection:
@@ -67,7 +68,7 @@ def _memory(mem_id: str, content: str) -> Memory:
 
 @pytest.mark.asyncio
 async def test_build_search_engine_has_no_document_vector(db, tmp_path, monkeypatch):
-    monkeypatch.setattr(runtime, "get_chroma_collection", lambda **kwargs: FakeCollection())
+    use_collection_as_index(monkeypatch, FakeCollection())
 
     cfg = _config(tmp_path)
     engine = await runtime.build_search_engine(db, cfg)

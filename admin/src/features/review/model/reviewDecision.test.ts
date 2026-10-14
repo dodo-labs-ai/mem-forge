@@ -90,6 +90,15 @@ describe("decisionFailure", () => {
     expect(failure).toMatchObject({ message: "Review participants changed", reloadable: true });
   });
 
+  test("a decision that waits for the search index is not a changed review", () => {
+    const failure = decisionFailure(new ApiError(409, "The search index is being rebuilt, so this change has to wait.", "reindex_in_progress"));
+    expect(failure).toEqual({
+      message: "The search index is being rebuilt, so this change has to wait.",
+      hint: null,
+      reloadable: false,
+    });
+  });
+
   test("passes other errors through", () => {
     expect(decisionFailure(new Error("Network down"))).toEqual({ message: "Network down", hint: null, reloadable: false });
   });

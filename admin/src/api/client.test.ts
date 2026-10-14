@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { fakeFetch } from "@/test/fakeApi";
 import { createApiClient, unwrap, workspaceResourceUrl } from "./client";
-import { ApiError, NoWorkspaceError } from "./errors";
+import { ApiError, NoWorkspaceError, isReindexInProgress, isSearchIndexRefusal } from "./errors";
 import { STANDALONE_TARGET, createWorkspaceController } from "./workspace";
 
 const ORIGIN = "http://admin.test";
@@ -106,8 +106,55 @@ describe("unwrap", () => {
     const response = new Response(null, { status: 403 });
     const error = { detail: { error: "project_management_forbidden", message: "Only a workspace admin can change projects." } };
     await expect(unwrap(Promise.resolve({ error, response }))).rejects.toEqual(
-      new ApiError(403, "Only a workspace admin can change projects."),
+      new ApiError(403, "Only a workspace admin can change projects.", "project_management_forbidden"),
     );
+  });
+
+  test("explains a change refused while the search index is rebuilt, and keeps its code", async () => {
+    const response = new Response(null, { status: 409 });
+    const error = {
+      detail: {
+        error: "reindex_in_progress",
+        message: "The Memory vector index is being rebuilt. Memories cannot be changed until the rebuild has finished.",
+      },
+    };
+    const refused = await unwrap(Promise.resolve({ error, response })).catch((caught: unknown) => caught);
+
+    expect(refused).toEqual(
+      new ApiError(
+        409,
+        "The search index is being rebuilt, so this change has to wait. Try again when the rebuild has finished. Settings shows its progress.",
+        "reindex_in_progress",
+      ),
+    );
+    expect(isReindexInProgress(refused)).toBe(true);
+    expect(isSearchIndexRefusal(refused)).toBe(true);
+  });
+
+  test("a change that waits for an index of the model in use keeps the server's words, and is known by its code", async () => {
+    const message = "The vector index has to be rebuilt for the embedding model in use before this change can be made.";
+
+    for (const code of ["reindex_required", "vector_index_missing"]) {
+      const response = new Response(null, { status: 409 });
+      const refused = await unwrap(Promise.resolve({ error: { detail: { error: code, message } }, response })).catch(
+        (caught: unknown) => caught,
+      );
+
+      expect(refused).toEqual(new ApiError(409, message, code));
+      expect(isSearchIndexRefusal(refused)).toBe(true);
+      expect(isReindexInProgress(refused)).toBe(false);
+    }
+  });
+
+  test("a failure that is not about the search index is not taken for one", async () => {
+    const response = new Response(null, { status: 409 });
+    const changed = await unwrap(Promise.resolve({ error: { detail: "Review participants changed" }, response })).catch(
+      (error: unknown) => error,
+    );
+
+    expect(changed).toMatchObject({ code: null, message: "Review participants changed" });
+    expect(isSearchIndexRefusal(changed)).toBe(false);
+    expect(isSearchIndexRefusal(new Error("Network down"))).toBe(false);
   });
 
   test("joins validation messages", async () => {

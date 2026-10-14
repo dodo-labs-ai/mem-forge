@@ -2,6 +2,157 @@
 
 ## Unreleased
 
+- The Memory vector index belongs to one embedding model, and changing that
+  model rebuilds it. An Embedding Profile is the identity of a vector space:
+  the provider, the LiteLLM route, the endpoint, the model id, the requested
+  output dimensions and the vector length the model answered with; its
+  fingerprint is a hash of those six fields. The endpoint enters it in one
+  spelling (scheme and host in lower case, no default port, no trailing
+  slash), so writing the base URL of the same server another way needs no
+  reindex. SQLite migration 114 adds
+  `vector_indexes`, which records each physical index once: its fingerprint,
+  collection name, state (`building`, `active`, `failed`, `retired`), whether
+  it was adopted, vector length, counts, times, error code and the process
+  that runs its rebuild; at most one is `active`. A new index is the Chroma
+  collection named `memories-` and the first 32 characters of its
+  fingerprint.
+  Every reader and writer opens the index through
+  `memforge.retrieval.vector_index.open_memory_vector_index(db, chroma_path)`,
+  at each operation, so all of them follow a rebuilt index the moment it is
+  in use; `memforge.retrieval.embeddings.get_chroma_collection` is removed.
+  An Embedding Runtime knows the fingerprint it embeds in once its model has
+  answered, and its vectors reach an index only when the fingerprints are
+  equal: with another model, search answers from its keyword and entity
+  channels without an error, a write that needs a new vector fails as
+  retryable and leaves nothing behind (`EmbeddingIndexMismatch`, answered by
+  the API as 409 `reindex_required`, or 409 `vector_index_missing` when no
+  index is in use), pending vector work in the outbox waits without using up
+  an attempt, and index repair reports the Memory as unrepaired. A cache of vectors belongs to one
+  runtime and is checked against the index like a fresh vector. Validating an
+  embedding candidate whose fingerprint is the index's makes it active at
+  once. Any other candidate that passes stays the candidate, `ready`, with
+  `waits_for_reindex: true`, and `POST /{kind}/candidate/validate` answers
+  `promoted: false, reindex_required: true`. A reindex is started with
+  `POST /api/v1/model-settings/vector-index/reindex` (202) and runs beside the
+  server: it embeds every searchable Memory from SQLite into a new index,
+  verifies that the vector count equals the count of searchable Memories and
+  that every vector has the profile's length and finite values, then in one
+  transaction makes the new index the one in use and the candidate the active
+  binding, and afterwards deletes the previous collection, together with
+  stored vectors in the `memories` collection that no index adopted. Deleting
+  a collection also removes the directory of its vector segment, which
+  ChromaDB leaves on disk. A
+  deletion that fails leaves the switch in place and is made up for when the
+  server next starts or a reindex is next started. Search reads the
+  previous index until that transaction. A reindex that fails changes nothing
+  in use, drops what it built, records an error code and can be started again.
+  A running reindex holds a 60-second lease that it renews every 15 seconds
+  whatever it is doing, and records the host, process ID and a per-process
+  token of its runner. One whose process was killed is recorded as
+  `interrupted` when a server starts, or a reindex is started, on the same
+  host and finds that process gone, and otherwise once the lease has run out;
+  a server brings the index into order at start before it checks any model.
+  `memforge maintenance reindex --apply` records `interrupted` at once on
+  SIGTERM, as on Ctrl-C, and exits with status 1.
+  `GET /api/v1/model-settings/vector-index` and the new `vector_index`
+  field of `GET /api/v1/model-settings` report `status` (`ready`,
+  `reindex_required`, `reindexing`, `awaiting_validation`, `not_configured`,
+  `not_managed`), `serves_search` (whether search reads the index in use,
+  which stays false through a reindex that started while one was required),
+  `reindex_target` (`candidate`, `active` or null; `active` also for a model
+  in use that has not passed a check as it stands, when its settings are not
+  the index's, the index was adopted, or vectors are stored and no index is
+  in use, in which case starting the reindex checks the model first), the index
+  in use and the latest reindex with its progress; `GET /api/v1/health` gains
+  `models.embedding.vector_index` and `models.embedding.reindex_required`. A
+  reindex is refused with 409 `sync_in_progress` while any Source activity
+  lease is current, `reindex_in_progress` while another runs,
+  `reindex_not_required` when the index fits the model and was not adopted,
+  and `embedding_not_validated` when the model has not passed a check. The
+  first three are decided in the transaction that admits the reindex, so a
+  request made before another reindex switched cannot build over its result.
+  While
+  one runs, no Source activity lease is granted, so a Source sync does not
+  start and a queued run stays pending; index repair and the worker's idle
+  vector and relation work do not run; the embedding candidate cannot be
+  saved, validated or discarded; and a write that inserts or deletes a Memory
+  row, or changes its type, content, visibility, owner, project, repository
+  or status, is refused by database triggers with the code
+  `reindex_in_progress`, which the API answers as 409 with that code in
+  `detail.error`. A write refused this way is rolled back on its connection,
+  and the daily expiry job leaves expired Memories to its next run. The
+  routes that create, correct, retire, purge or decide on
+  Memories and that delete a project check for a running reindex first.
+  `memforge maintenance reindex --check` reports the index and what a rebuild
+  would do, and `--apply` runs the same rebuild in the command's own process,
+  with exit status 1 when it is refused or fails. An installation with no
+  recorded index gets one the first time its embedding model answers, at
+  validation or at the first embedding request: stored vectors in the
+  `memories` collection whose sampled length is the model's are adopted where
+  they are (`adopted: true`, the model they came from assumed), an
+  installation with no vectors gets a new empty index, and one whose stored
+  vectors have another length has no index in use and reports
+  `reindex_required` until it is rebuilt. Stored vectors are adopted for a
+  candidate only when it names the model the active binding names. Changing
+  `MEMFORGE_EMBEDDING_MODEL` or `MEMFORGE_EMBEDDING_BASE_URL` for an
+  installation with an index therefore requires a reindex. A profile whose
+  model the similarity thresholds were not tuned on reads
+  `thresholds_calibrated: false`; only OpenAI `text-embedding-3-small` at
+  1536 dimensions reads true, and the thresholds themselves are unchanged. A
+  binding's digest now covers the key it refers to and its token limits, so
+  replacing or removing the saved key of a ready binding makes it
+  `needs_revalidation`. A generation binding may carry `token_limits`
+  (`context_window_tokens`, `max_output_tokens`), accepted by
+  `PUT /{kind}/candidate` and returned with every binding; the runtime sizes
+  requests with them and takes the `MEMFORGE_LLM_*` limits for whatever the
+  binding leaves open. A generation model whose limits neither LiteLLM, the
+  binding nor the environment knows now fails validation with
+  `token_limits_required`, after its request has been answered; an active
+  binding of such a model reads `needs_revalidation` or `not_validated` until
+  the limits are given. In Python, `VectorStore` gains
+  `async def index_fingerprint() -> str | None`; `EmbeddingSettings` takes
+  `identity=` and `EmbeddingRuntime` has `fingerprint`;
+  `memforge.llm.embedding.embed_documents_for_index` and
+  `embed_query_for_index` embed for an index under the fingerprint rule;
+  `ResolvedModels` carries `embedding_identity`; `MemoryStore.collection` is
+  replaced by `await MemoryStore.index_collection()`; a runtime provider that
+  has this service manage its index implements
+  `memory_vector_indexes(db, config)`, as `DefaultRuntimeProvider` does.
+  Cloud: the vector store contract gains exactly one method,
+  `async def index_fingerprint(self) -> str | None`, which returns the
+  fingerprint recorded for the whole index, or `None` for an index that
+  records none. `MemoryStore`, `SearchEngine` and index repair call it before
+  they embed and refuse vectors of another fingerprint; with `None` no check
+  is made, so a store that returns `None` behaves as before. A store without
+  the method fails every Memory write that needs a vector with
+  `AttributeError`, while search catches the error, logs
+  `Embedding computation failed for query` for each query and answers without
+  vector hits, so the method has to be in place before this version is taken
+  up. The HANA vector
+  store has to add the method and decide where it records the fingerprint of
+  its table; to have it checked, build the Embedding Runtime with
+  `EmbeddingSettings(invocation=..., identity=embedding_identity(binding))`
+  and record `identity.profile(dimension).fingerprint`. A provider that does
+  not implement `memory_vector_indexes` gets no `vector_indexes` reads or
+  writes on its workspace store, no rebuild, no write guard, and
+  `vector_index.status: "not_managed"`; `POST .../vector-index/reindex`
+  answers 405 `reindex_not_available`. For such a provider, a store whose
+  fingerprint is not the runtime's shows in shared code only as refused
+  writes (409 `reindex_required`) and as one warning per search engine,
+  `Vector search is off: the vector index was built with another embedding
+  model`; health reads `not_managed` and `reindex_required: false`, so the
+  deployment has to report the mismatch by its own means.
+  `DefaultRuntimeProvider` implements
+  it for a `memforge.storage.database.Database` and returns `None` for any
+  other store, so a provider that subclasses it stays unmanaged as long as
+  its workspace store is not a `Database`. `SourceSyncWorker`,
+  `ModelSettings` and the admin routes call the new storage methods only for
+  a managed index. An environment generation model
+  LiteLLM has no limits for (a `sap/...` route without an entry in its
+  registry) now needs `MEMFORGE_LLM_MAX_INPUT_TOKENS`,
+  `MEMFORGE_LLM_CONTEXT_WINDOW_TOKENS` and `MEMFORGE_LLM_MAX_OUTPUT_TOKENS`
+  to read `ready` in `GET /api/v1/health`; it is used either way. No HANA
+  schema change is required by this release.
 - Model settings are two bindings, one for the generation model and one for
   the embedding model, and replace the single LLM configuration. A binding
   names a provider descriptor (`openai`, `anthropic`, `openrouter`, `ollama`,
@@ -125,6 +276,35 @@
   embedding inputs, keeps the outcome in memory, and reports it in
   `GET /api/v1/health`; confirm that this start-up request is acceptable on
   AI Core. No HANA schema change.
+- The admin UI V2 Settings page shows the search index, which is the Memory
+  vector index, on the card of the embedding model: the model that built it,
+  the number of memories it holds, whether vector search is on, and the marks
+  **Carried over** for an adopted index and **Thresholds not calibrated** for
+  a model the similarity thresholds were not tuned on. An embedding edit that
+  passes validation and waits for the index says so, and the action of its
+  form becomes **Rebuild search index**. An installation whose index does not
+  fit its embedding model, or was adopted, starts the rebuild from the index
+  itself, also with `MEMFORGE_LLM_CONFIG_WRITABLE=false`. While a rebuild
+  runs, the page reads the model settings every two seconds, shows how many
+  memories are embedded and that search keeps working on the current index,
+  or, for a rebuild that started while vector search was off, that search
+  ranks by matching words until the index is ready, and holds the form of the
+  embedding model. An index that does not fit a model of the same name says
+  what differs: the base URL, the vector size asked for or the size returned.
+  A rebuild that fails shows its
+  reason and **Run the rebuild again**; one that succeeds shows the new model
+  in use. A deployment whose index reads `not_managed` sees none of this.
+  While vector search is off because a rebuild is required, and through the
+  rebuild that follows, every other product page shows a notice with a link
+  to Settings. A change that is
+  refused with `reindex_in_progress` is explained in the same words on every
+  page, and a Review decision refused for the state of the index keeps the
+  Review as it is instead of offering a reload; `ApiError` carries the code of
+  a coded refusal as `code`. The card of the generation model has **Context
+  window** and **Maximum output** fields for a model that states token limits
+  or whose validation failed with `token_limits_required`. The V1 admin UI's
+  Settings page says in one line whether the search index is ready, being
+  rebuilt or has to be rebuilt.
 - The admin UI V2 Settings page has one card for the generation model and one
   for the embedding model. Each shows the model in use with its state (Ready,
   Not validated, Needs revalidation), what its latest validation found and a

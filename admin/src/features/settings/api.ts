@@ -19,13 +19,20 @@ export function useModelProviders() {
   });
 }
 
-/** Puts the settings of one kind, as a write answered them, into the settings every page reads. */
+/**
+ * Puts the settings of one kind, as a write answered them, into the settings
+ * every page reads. A write to the embedding model also has the settings read
+ * again: the search index is judged against that model, and the answer to the
+ * write does not carry it.
+ */
 function useStoreKindSettings(kind: ModelKind) {
   const queryClient = useQueryClient();
-  return (settings: ModelKindSettings) =>
+  return (settings: ModelKindSettings) => {
     queryClient.setQueryData<ModelSettings>(modelSettingsQueryKeys.settings, (current) =>
       current ? { ...current, [kind]: settings } : current,
     );
+    if (kind === "embedding") void queryClient.invalidateQueries({ queryKey: modelSettingsQueryKeys.settings });
+  };
 }
 
 /** Saves an edit to a model. The model in use is unchanged until the edit passes validation. */
@@ -51,7 +58,9 @@ export function useDiscardCandidate(kind: ModelKind) {
 
 /**
  * Validates the saved edit with one real request, which can take up to a
- * minute. An edit that passes becomes the model in use. When the request
+ * minute. An edit that passes becomes the model in use, except an embedding
+ * model whose vectors cannot be compared with the stored ones: it stays the
+ * saved edit until the search index is rebuilt for it. When the request
  * itself fails the settings are read again, since the server may have changed
  * them.
  */
@@ -83,5 +92,28 @@ export function useDiscoverModels(kind: ModelKind) {
   return useMutation({
     mutationFn: (body: ModelDiscoveryRequest) =>
       unwrap(api.POST("/api/v1/model-settings/{kind}/discover-models", { params: { path: { kind } }, body })),
+  });
+}
+
+/**
+ * Starts a rebuild of the search index. The server answers at once and the
+ * rebuild runs beside it; the settings every page reads then follow it until
+ * it ends. A start that is refused reads the settings again, since the server
+ * may have validated the embedding model first, or a rebuild may already be
+ * running.
+ */
+export function useStartReindex() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => unwrap(api.POST("/api/v1/model-settings/vector-index/reindex")),
+    onSuccess: async (vectorIndex) => {
+      // A read that began before the rebuild would put the index back as it was.
+      await queryClient.cancelQueries({ queryKey: modelSettingsQueryKeys.settings });
+      queryClient.setQueryData<ModelSettings>(modelSettingsQueryKeys.settings, (current) =>
+        current ? { ...current, vector_index: vectorIndex } : current,
+      );
+    },
+    onError: () => queryClient.invalidateQueries({ queryKey: modelSettingsQueryKeys.settings }),
   });
 }

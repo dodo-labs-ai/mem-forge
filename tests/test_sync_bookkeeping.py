@@ -9014,6 +9014,7 @@ async def test_source_sync_worker_drains_vector_outbox_without_a_source_run(
         attempted_tasks = 3
         delivered_tasks = 3
         failed_tasks = 0
+        error_types = ()
 
     class MemoryStore:
         def __init__(self) -> None:
@@ -9066,6 +9067,7 @@ async def test_source_sync_worker_drains_review_owned_vector_outbox(
         attempted_tasks = 2
         delivered_tasks = 2
         failed_tasks = 0
+        error_types = ()
 
     class MemoryStore:
         def __init__(self) -> None:

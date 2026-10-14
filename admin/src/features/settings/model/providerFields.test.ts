@@ -8,6 +8,8 @@ import {
   parameterField,
   parameterNames,
   providersFor,
+  tokenLimitField,
+  tokenLimitNames,
 } from "./providerFields";
 
 test("each kind is offered the providers that serve it", () => {
@@ -29,6 +31,17 @@ test("only an embedding model takes output dimensions", () => {
   expect(parameterNames(providerById("openai"), "embedding")).toEqual(["dimensions"]);
   expect(parameterNames(providerById("openai"), "generation")).toEqual([]);
   expect(parameterNames(providerById("anthropic"), "embedding")).toEqual([]);
+});
+
+test("only a generation model states token limits, each named in tokens", () => {
+  expect(tokenLimitNames(providerById("openai"), "generation")).toEqual(["context_window_tokens", "max_output_tokens"]);
+  expect(tokenLimitNames(providerById("openai"), "embedding")).toEqual([]);
+  expect(tokenLimitNames(providerById("anthropic"), "embedding")).toEqual([]);
+  expect(tokenLimitField("context_window_tokens")).toEqual({
+    label: "Context window",
+    hint: "In tokens: the most the model takes in one request, its answer included.",
+  });
+  expect(tokenLimitField("max_output_tokens").label).toBe("Maximum output");
 });
 
 test("the base URL field shows the provider's own address, or says when one is needed", () => {

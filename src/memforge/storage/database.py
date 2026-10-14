@@ -14,13 +14,14 @@ import hashlib
 import json
 import logging
 import sqlite3
+import time
 import uuid
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Collection, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, AsyncIterator, Collection, Mapping, Sequence
 
 import aiosqlite
 
@@ -230,6 +231,12 @@ from memforge.evals.offline_evaluation import (
 )
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
 from memforge.memory.review_decision import ReviewVectorTask
+from memforge.vector_index_errors import (
+    REINDEX_IN_PROGRESS,
+    REINDEX_NOT_REQUIRED,
+    REINDEX_NOT_REQUIRED_MESSAGE,
+    VectorReindexRefused,
+)
 from memforge.retrieval.access_predicate import readable_source_sql, visible_entity_sql, visible_sql
 from memforge.retrieval.metadata_text import metadata_alias_text, metadata_compact_text
 from memforge.source_access import infer_legacy_source_access
@@ -653,10 +660,35 @@ def _model_binding_from_row(row: Any) -> dict[str, Any]:
         "model_id": stored["model_id"],
         "route": stored["route"],
         "parameters": json.loads(stored["parameters_json"] or "{}"),
+        "token_limits": json.loads(stored["token_limits_json"] or "{}"),
         "config_source": stored["config_source"],
         "state": stored["state"],
         "validation": validation,
         "updated_at": stored["updated_at"],
+    }
+
+
+def _vector_index_from_row(row: Any) -> dict[str, Any]:
+    stored = dict(row)
+    return {
+        "id": stored["id"],
+        "fingerprint": stored["fingerprint"],
+        "collection_name": stored["collection_name"],
+        "state": stored["state"],
+        "adopted": bool(stored["adopted"]),
+        "dimension": stored["dimension"],
+        "profile": json.loads(stored["profile_json"] or "{}"),
+        "binding_slot": stored["binding_slot"],
+        "binding_saved_at": stored["binding_saved_at"],
+        "memory_count": stored["memory_count"],
+        "vector_count": stored["vector_count"],
+        "error_code": stored["error_code"],
+        "lease_expires_epoch": stored["lease_expires_epoch"],
+        "runner": json.loads(stored["runner_json"]) if stored["runner_json"] else None,
+        "created_at": stored["created_at"],
+        "started_at": stored["started_at"],
+        "finished_at": stored["finished_at"],
+        "activated_at": stored["activated_at"],
     }
 
 
@@ -970,6 +1002,40 @@ CREATE INDEX IF NOT EXISTS idx_cross_document_relation_dismissals_high
     ON cross_document_relation_dismissals(memory_high_id);
 """
 
+
+# The columns of a Memory row its vector and the vector's metadata are made from.
+_MEMORY_VECTOR_COLUMNS = (
+    "memory_type",
+    "content",
+    "content_hash",
+    "visibility",
+    "owner_user_id",
+    "project_key",
+    "repo_identifier",
+    "status",
+)
+_VECTOR_REINDEX_RUNNING_SQL = (
+    "SELECT 1 FROM vector_indexes "
+    "WHERE state = 'building' AND lease_expires_epoch > CAST(strftime('%s', 'now') AS INTEGER)"
+)
+# While a vector index is building under a current lease, a write that would
+# change which Memories are searchable, or what a vector is made from, is
+# refused with the code a caller reports. The triggers are attached each time
+# the database is opened, after its migrations: a migration that rebuilds the
+# memories table drops whatever is attached to it.
+_REINDEX_WRITE_REFUSAL_TRIGGERS = tuple(
+    f"""CREATE TRIGGER IF NOT EXISTS memories_{name}_refused_during_reindex
+BEFORE {event} ON memories
+WHEN EXISTS ({_VECTOR_REINDEX_RUNNING_SQL})
+BEGIN
+    SELECT RAISE(ABORT, '{REINDEX_IN_PROGRESS}');
+END"""
+    for name, event in (
+        ("insert", "INSERT"),
+        ("delete", "DELETE"),
+        ("update", f"UPDATE OF {', '.join(_MEMORY_VECTOR_COLUMNS)}"),
+    )
+)
 
 SCHEMA = """
 -- ---------------------------------------------------------------
@@ -1954,6 +2020,7 @@ CREATE TABLE IF NOT EXISTS model_bindings (
     validation_facts_json    TEXT,
     validation_error_code    TEXT,
     updated_at       TEXT NOT NULL,
+    token_limits_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (kind, slot)
 );
 CREATE TABLE IF NOT EXISTS model_secrets (
@@ -1963,6 +2030,36 @@ CREATE TABLE IF NOT EXISTS model_secrets (
     last4       TEXT NOT NULL,
     created_at  TEXT NOT NULL
 );
+
+-- ---------------------------------------------------------------
+-- Vector indexes: each physical Memory vector index, recorded once with the
+-- fingerprint of the Embedding Profile it was built with. One index is in
+-- use; one may be building.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS vector_indexes (
+    id                   TEXT PRIMARY KEY,
+    fingerprint          TEXT NOT NULL,
+    collection_name      TEXT NOT NULL,
+    state                TEXT NOT NULL CHECK (state IN ('building', 'active', 'failed', 'retired')),
+    adopted              INTEGER NOT NULL DEFAULT 0,
+    dimension            INTEGER NOT NULL,
+    profile_json         TEXT NOT NULL DEFAULT '{}',
+    binding_slot         TEXT CHECK (binding_slot IN ('active', 'candidate')),
+    binding_saved_at     TEXT,
+    memory_count         INTEGER,
+    vector_count         INTEGER NOT NULL DEFAULT 0,
+    error_code           TEXT,
+    lease_expires_epoch  INTEGER,
+    runner_json          TEXT,
+    created_at           TEXT NOT NULL,
+    started_at           TEXT,
+    finished_at          TEXT,
+    activated_at         TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vector_indexes_one_active
+    ON vector_indexes(state) WHERE state = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vector_indexes_one_building
+    ON vector_indexes(state) WHERE state = 'building';
 
 -- ---------------------------------------------------------------
 -- Users
@@ -4660,6 +4757,39 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             )""",
         ],
     ),
+    (
+        114,
+        "Record each Memory vector index with the fingerprint it was built with",
+        # One index is in use and one may be building. A generation binding
+        # may state its model's token limits.
+        [
+            "ALTER TABLE model_bindings ADD COLUMN token_limits_json TEXT NOT NULL DEFAULT '{}'",
+            """CREATE TABLE IF NOT EXISTS vector_indexes (
+                id                   TEXT PRIMARY KEY,
+                fingerprint          TEXT NOT NULL,
+                collection_name      TEXT NOT NULL,
+                state                TEXT NOT NULL CHECK (state IN ('building', 'active', 'failed', 'retired')),
+                adopted              INTEGER NOT NULL DEFAULT 0,
+                dimension            INTEGER NOT NULL,
+                profile_json         TEXT NOT NULL DEFAULT '{}',
+                binding_slot         TEXT CHECK (binding_slot IN ('active', 'candidate')),
+                binding_saved_at     TEXT,
+                memory_count         INTEGER,
+                vector_count         INTEGER NOT NULL DEFAULT 0,
+                error_code           TEXT,
+                lease_expires_epoch  INTEGER,
+                runner_json          TEXT,
+                created_at           TEXT NOT NULL,
+                started_at           TEXT,
+                finished_at          TEXT,
+                activated_at         TEXT
+            )""",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_vector_indexes_one_active "
+            "ON vector_indexes(state) WHERE state = 'active'",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_vector_indexes_one_building "
+            "ON vector_indexes(state) WHERE state = 'building'",
+        ],
+    ),
 ]
 
 
@@ -4724,6 +4854,9 @@ class Database:
         # keys of that table (see translate_llm_config).
         self._holds_llm_config = False
         self._wal_holds_plaintext_keys = False
+        # A database opened read-only keeps the schema it has, which may have
+        # no record of vector indexes; it then has no index in use.
+        self._records_vector_indexes = True
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -4746,11 +4879,14 @@ class Database:
             await self._db.execute("PRAGMA query_only = ON")
             await self._assert_evidence_unit_support_marker()
             self._holds_llm_config = await self._table_exists_unlocked("llm_config")
+            self._records_vector_indexes = await self._table_exists_unlocked("vector_indexes")
             return
         await self._refuse_reference_scoped_support_unlocked()
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.executescript(SCHEMA)
         await self._run_migrations()
+        for trigger in _REINDEX_WRITE_REFUSAL_TRIGGERS:
+            await self._db.execute(trigger)
         await self._assert_memory_source_ids_resolved()
         await self._assert_evidence_unit_support_marker()
         await self._db.commit()
@@ -5704,6 +5840,23 @@ class Database:
     def db(self) -> aiosqlite.Connection:
         assert self._db is not None, "Database not connected"
         return self._db
+
+    @asynccontextmanager
+    async def _write_transaction(self) -> AsyncIterator[None]:
+        """Hold the write lock for one transaction, which the block commits.
+
+        When the block raises, what it wrote is rolled back and the connection
+        is left outside a transaction. A write that is refused part-way, as a
+        change to a Memory row is while the vector index is rebuilt, then
+        neither keeps the database locked against other connections nor
+        leaves its statements to the next commit.
+        """
+        async with self._write_lock:
+            try:
+                yield
+            except BaseException:
+                await self.db.rollback()
+                raise
 
     # ==================================================================
     # Documents
@@ -8708,6 +8861,10 @@ class Database:
         lease_seconds: int,
         now: datetime | None = None,
     ) -> SourceActivityLease:
+        if await self._vector_reindex_running_unlocked():
+            raise SourceActivityConflict(
+                f"{REINDEX_IN_PROGRESS}: no Source activity starts while the Memory vector index is rebuilt"
+            )
         now = now or datetime.now(timezone.utc)
         now_iso = _utc_iso(now)
         lease_until = now + timedelta(seconds=max(1, lease_seconds))
@@ -13259,7 +13416,7 @@ class Database:
         memory_id: str,
         new_content: str,
     ) -> None:
-        async with self._write_lock:
+        async with self._write_transaction():
             from memforge.models import content_hash
 
             async with self.db.execute(
@@ -13298,7 +13455,7 @@ class Database:
         *,
         reason: str | None = None,
     ) -> None:
-        async with self._write_lock:
+        async with self._write_transaction():
             await self._update_memory_status_unlocked(memory_id, status, reason=reason)
             await self.db.commit()
 
@@ -13378,7 +13535,7 @@ class Database:
 
     async def purge_memory(self, memory_id: str) -> bool:
         """Hard-delete a memory and its local indexes/provenance."""
-        async with self._write_lock:
+        async with self._write_transaction():
             async with self.db.execute(
                 "SELECT id FROM memories WHERE id = ?",
                 (memory_id,),
@@ -13458,7 +13615,7 @@ class Database:
         entity_names = await self.get_memory_entity_names(memory.id)
         entities_text = " ".join(entity_names)
         search_visible = memory.status in search_visible_statuses
-        async with self._write_lock:
+        async with self._write_transaction():
             await self.db.execute(
                 """UPDATE memories SET
                     memory_type = ?, content = ?, content_hash = ?,
@@ -13516,7 +13673,7 @@ class Database:
         Secondary Configured Sources that overlap the same provider document are
         attached only through an explicit Lifecycle Plan carrying ``source_id``.
         """
-        async with self._write_lock:
+        async with self._write_transaction():
             outcome = await self._corroborate_memory_unlocked(
                 memory_id,
                 doc_id,
@@ -13857,7 +14014,7 @@ class Database:
         (which leaves ``entity_refs`` empty by design).
         """
         replacement_kind = _validate_replacement_kind(replacement_kind)
-        async with self._write_lock:
+        async with self._write_transaction():
             now = _now_iso()
             await self.db.execute(
                 """UPDATE memories SET
@@ -14118,7 +14275,7 @@ class Database:
 
     async def retire_expired_memories(self) -> int:
         """Retire active memories whose ``valid_until`` date has passed."""
-        async with self._write_lock:
+        async with self._write_transaction():
             now = _now_iso()
             today = _today_iso()
             async with self.db.execute(
@@ -15359,7 +15516,7 @@ class Database:
         retire_reason: str = "source_deleted",
     ) -> bool:
         """Recompute source counts and retire memories with no valid source support."""
-        async with self._write_lock:
+        async with self._write_transaction():
             retired = await self._refresh_memory_support_state_unlocked(
                 memory_id,
                 retire_reason=retire_reason,
@@ -18508,7 +18665,8 @@ class Database:
                         lease_started_iso,
                     ),
                 )
-                if not cursor.rowcount:
+                if not cursor.rowcount or await self._vector_reindex_running_unlocked():
+                    # A run waits, pending, for a rebuild of the vector index to finish.
                     await self.db.rollback()
                     return None
                 source_activity = await self._acquire_source_activity_unlocked(
@@ -22090,33 +22248,69 @@ class Database:
         updated_at: str,
         state: str,
         validation: Mapping[str, Any],
+        vector_index: Mapping[str, Any] | None = None,
     ) -> bool:
         """Make the candidate of ``kind`` its active binding, with its validation.
 
         ``updated_at`` names the candidate that passed its check. Returns False,
         changing nothing, when the candidate has been saved again since.
+
+        ``vector_index`` is the first vector index of an installation that has
+        none in use: it is recorded as the index in use in the same
+        transaction, so an embedding candidate never becomes active without
+        the index its vectors go to. When another index came into use
+        meanwhile, nothing changes and False is returned. The same holds for
+        an embedding candidate while the vector index is being rebuilt: the
+        rebuild decides which embedding binding is in use when it ends.
         """
         async with self._write_lock:
-            async with self.db.execute(
-                "SELECT 1 FROM model_bindings WHERE kind = ? AND slot = 'candidate' AND updated_at = ?",
-                (kind, updated_at),
-            ) as cursor:
-                if await cursor.fetchone() is None:
+            try:
+                if kind == "embedding" and await self._vector_reindex_running_unlocked():
                     return False
-            await self.db.execute(
-                "DELETE FROM model_bindings WHERE kind = ? AND slot = 'active'",
-                (kind,),
-            )
-            await self.db.execute(
-                """UPDATE model_bindings
-                      SET slot = 'active', state = ?, validated_at = ?, validation_digest = ?,
-                          validation_facts_json = ?, validation_error_code = ?, updated_at = ?
-                    WHERE kind = ? AND slot = 'candidate'""",
-                (state, *_model_validation_columns(validation), _now_iso(), kind),
-            )
-            await self._delete_unreferenced_model_secrets_unlocked()
-            await self.db.commit()
+                if not await self._promote_model_candidate_unlocked(
+                    kind,
+                    updated_at=updated_at,
+                    state=state,
+                    validation=validation,
+                ):
+                    await self.db.rollback()
+                    return False
+                if vector_index is not None and not await self._insert_active_vector_index_unlocked(vector_index):
+                    await self.db.rollback()
+                    return False
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
             return True
+
+    async def _promote_model_candidate_unlocked(
+        self,
+        kind: str,
+        *,
+        updated_at: str,
+        state: str,
+        validation: Mapping[str, Any],
+    ) -> bool:
+        async with self.db.execute(
+            "SELECT 1 FROM model_bindings WHERE kind = ? AND slot = 'candidate' AND updated_at = ?",
+            (kind, updated_at),
+        ) as cursor:
+            if await cursor.fetchone() is None:
+                return False
+        await self.db.execute(
+            "DELETE FROM model_bindings WHERE kind = ? AND slot = 'active'",
+            (kind,),
+        )
+        await self.db.execute(
+            """UPDATE model_bindings
+                  SET slot = 'active', state = ?, validated_at = ?, validation_digest = ?,
+                      validation_facts_json = ?, validation_error_code = ?, updated_at = ?
+                WHERE kind = ? AND slot = 'candidate'""",
+            (state, *_model_validation_columns(validation), _now_iso(), kind),
+        )
+        await self._delete_unreferenced_model_secrets_unlocked()
+        return True
 
     async def get_model_secret(self, secret_id: str) -> dict[str, Any] | None:
         async with self.db.execute(
@@ -22131,10 +22325,10 @@ class Database:
         await self.db.execute(
             """INSERT INTO model_bindings (
                    kind, slot, provider, endpoint, origin, auth_strategy, options_json,
-                   secret_ref, model_id, route, parameters_json, config_source, state,
-                   validated_at, validation_digest, validation_facts_json,
-                   validation_error_code, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   secret_ref, model_id, route, parameters_json, token_limits_json,
+                   config_source, state, validated_at, validation_digest,
+                   validation_facts_json, validation_error_code, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(kind, slot) DO UPDATE SET
                    provider = excluded.provider,
                    endpoint = excluded.endpoint,
@@ -22145,6 +22339,7 @@ class Database:
                    model_id = excluded.model_id,
                    route = excluded.route,
                    parameters_json = excluded.parameters_json,
+                   token_limits_json = excluded.token_limits_json,
                    config_source = excluded.config_source,
                    state = excluded.state,
                    validated_at = excluded.validated_at,
@@ -22164,6 +22359,7 @@ class Database:
                 record["model_id"],
                 record["route"],
                 json.dumps(record.get("parameters") or {}, sort_keys=True),
+                json.dumps(record.get("token_limits") or {}, sort_keys=True),
                 record["config_source"],
                 record["state"],
                 *(_model_validation_columns(validation) if validation else (None, None, None, None)),
@@ -22185,6 +22381,341 @@ class Database:
                     SELECT secret_ref FROM model_bindings WHERE secret_ref IS NOT NULL
                 )"""
         )
+
+    # ==================================================================
+    # Vector indexes
+    # ==================================================================
+
+    async def get_active_vector_index(self) -> dict[str, Any] | None:
+        """Return the Memory vector index in use, or ``None`` when there is none."""
+        if not self._records_vector_indexes:
+            return None
+        return await self._one_vector_index("state = 'active'")
+
+    async def get_vector_index(self, index_id: str) -> dict[str, Any] | None:
+        return await self._one_vector_index("id = ?", (index_id,))
+
+    async def get_latest_vector_reindex(self) -> dict[str, Any] | None:
+        """Return the most recent rebuild of the vector index, whatever became of it."""
+        return await self._one_vector_index("started_at IS NOT NULL ORDER BY started_at DESC, rowid DESC")
+
+    async def list_vector_indexes(self, state: str) -> list[dict[str, Any]]:
+        async with self.db.execute(
+            "SELECT * FROM vector_indexes WHERE state = ? ORDER BY created_at, rowid",
+            (state,),
+        ) as cursor:
+            return [_vector_index_from_row(row) async for row in cursor]
+
+    async def vector_reindex_running(self) -> bool:
+        """Whether a rebuild of the vector index holds a current lease."""
+        return await self._vector_reindex_running_unlocked()
+
+    async def _vector_reindex_running_unlocked(self) -> bool:
+        if not self._records_vector_indexes:
+            return False
+        async with self.db.execute(
+            "SELECT 1 FROM vector_indexes WHERE state = 'building' AND lease_expires_epoch > ?",
+            (int(time.time()),),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def _one_vector_index(self, where: str, params: Sequence[Any] = ()) -> dict[str, Any] | None:
+        async with self.db.execute(f"SELECT * FROM vector_indexes WHERE {where} LIMIT 1", params) as cursor:
+            row = await cursor.fetchone()
+        return None if row is None else _vector_index_from_row(row)
+
+    async def record_active_vector_index(self, record: Mapping[str, Any]) -> bool:
+        """Record ``record`` as the index in use of an installation that has none.
+
+        Returns False, recording nothing, when an index is already in use.
+        """
+        async with self._write_lock:
+            try:
+                recorded = await self._insert_active_vector_index_unlocked(record)
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+            return recorded
+
+    async def _insert_active_vector_index_unlocked(self, record: Mapping[str, Any]) -> bool:
+        async with self.db.execute("SELECT 1 FROM vector_indexes WHERE state = 'active'") as cursor:
+            if await cursor.fetchone() is not None:
+                return False
+        now = _now_iso()
+        await self.db.execute(
+            """INSERT INTO vector_indexes (
+                   id, fingerprint, collection_name, state, adopted, dimension, profile_json,
+                   vector_count, created_at, activated_at
+               ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)""",
+            (
+                record["id"],
+                record["fingerprint"],
+                record["collection_name"],
+                1 if record.get("adopted") else 0,
+                record["dimension"],
+                json.dumps(record.get("profile") or {}, sort_keys=True),
+                int(record.get("vector_count") or 0),
+                now,
+                now,
+            ),
+        )
+        return True
+
+    async def start_vector_reindex(
+        self,
+        record: Mapping[str, Any],
+        *,
+        lease_seconds: int,
+    ) -> dict[str, Any]:
+        """Admit a rebuild of the vector index and record the index it builds.
+
+        A rebuild is admitted only when no other rebuild holds a current lease,
+        the index in use is not already the one the rebuild would build (an
+        index built with the same fingerprint, or one held in the collection
+        the rebuild would fill), and no Source activity is running. The three
+        are checked and the new index is recorded in one transaction, so a
+        Source activity admitted afterwards sees the rebuild, and a rebuild
+        decided on before another one ended never builds over its result.
+        Raises ``VectorReindexRefused`` otherwise. A rebuild whose lease has
+        run out was interrupted and is recorded as failed. ``record["runner"]``
+        names the process that runs the rebuild.
+        """
+        now = _now_iso()
+        now_epoch = int(time.time())
+        async with self._write_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                await self._fail_interrupted_vector_reindex_unlocked(now=now, now_epoch=now_epoch)
+                async with self.db.execute("SELECT 1 FROM vector_indexes WHERE state = 'building'") as cursor:
+                    if await cursor.fetchone() is not None:
+                        raise VectorReindexRefused(
+                            REINDEX_IN_PROGRESS,
+                            "The Memory vector index is already being rebuilt.",
+                        )
+                async with self.db.execute(
+                    """SELECT 1 FROM vector_indexes
+                        WHERE state = 'active'
+                          AND (collection_name = ? OR (fingerprint = ? AND adopted = 0))""",
+                    (record["collection_name"], record["fingerprint"]),
+                ) as cursor:
+                    if await cursor.fetchone() is not None:
+                        raise VectorReindexRefused(REINDEX_NOT_REQUIRED, REINDEX_NOT_REQUIRED_MESSAGE)
+                async with self.db.execute(
+                    "SELECT 1 FROM source_activity_leases WHERE lease_until > ? LIMIT 1",
+                    (_utc_iso(None),),
+                ) as cursor:
+                    if await cursor.fetchone() is not None:
+                        raise VectorReindexRefused(
+                            "sync_in_progress",
+                            "A Source is syncing. Rebuild the vector index once no Source is syncing.",
+                        )
+                await self.db.execute(
+                    """INSERT INTO vector_indexes (
+                           id, fingerprint, collection_name, state, adopted, dimension, profile_json,
+                           binding_slot, binding_saved_at, memory_count, vector_count,
+                           lease_expires_epoch, runner_json, created_at, started_at
+                       ) VALUES (?, ?, ?, 'building', 0, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?)""",
+                    (
+                        record["id"],
+                        record["fingerprint"],
+                        record["collection_name"],
+                        record["dimension"],
+                        json.dumps(record.get("profile") or {}, sort_keys=True),
+                        record["binding_slot"],
+                        record.get("binding_saved_at"),
+                        now_epoch + max(1, lease_seconds),
+                        json.dumps(record["runner"], sort_keys=True) if record.get("runner") else None,
+                        now,
+                        now,
+                    ),
+                )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        started = await self.get_vector_index(str(record["id"]))
+        assert started is not None
+        return started
+
+    async def fail_interrupted_vector_reindex(self) -> dict[str, Any] | None:
+        """Record a rebuild whose lease has run out as failed, and return it."""
+        async with self._write_lock:
+            try:
+                interrupted = await self._fail_interrupted_vector_reindex_unlocked(
+                    now=_now_iso(),
+                    now_epoch=int(time.time()),
+                )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        return None if interrupted is None else await self.get_vector_index(interrupted)
+
+    async def _fail_interrupted_vector_reindex_unlocked(self, *, now: str, now_epoch: int) -> str | None:
+        async with self.db.execute(
+            "SELECT id FROM vector_indexes WHERE state = 'building' AND lease_expires_epoch <= ?",
+            (now_epoch,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        await self.db.execute(
+            """UPDATE vector_indexes
+                  SET state = 'failed', error_code = 'interrupted', finished_at = ?,
+                      lease_expires_epoch = NULL
+                WHERE id = ?""",
+            (now, row["id"]),
+        )
+        return str(row["id"])
+
+    async def renew_vector_reindex(
+        self,
+        index_id: str,
+        *,
+        lease_seconds: int,
+        memory_count: int | None = None,
+        vector_count: int | None = None,
+    ) -> bool:
+        """Extend the lease of a running rebuild and record how far it is.
+
+        Returns False when the rebuild no longer holds its lease: it ran out, or
+        the rebuild was recorded as failed.
+        """
+        now_epoch = int(time.time())
+        async with self._write_transaction():
+            cursor = await self.db.execute(
+                """UPDATE vector_indexes
+                      SET lease_expires_epoch = ?,
+                          memory_count = COALESCE(?, memory_count),
+                          vector_count = COALESCE(?, vector_count)
+                    WHERE id = ? AND state = 'building' AND lease_expires_epoch > ?""",
+                (now_epoch + max(1, lease_seconds), memory_count, vector_count, index_id, now_epoch),
+            )
+            await self.db.commit()
+            return cursor.rowcount == 1
+
+    async def fail_vector_reindex(self, index_id: str, *, error_code: str) -> bool:
+        """Record a running rebuild as failed. The index in use is not touched."""
+        async with self._write_transaction():
+            cursor = await self.db.execute(
+                """UPDATE vector_indexes
+                      SET state = 'failed', error_code = ?, finished_at = ?, lease_expires_epoch = NULL
+                    WHERE id = ? AND state = 'building'""",
+                (error_code, _now_iso(), index_id),
+            )
+            await self.db.commit()
+            return cursor.rowcount == 1
+
+    async def count_searchable_memories(self) -> int:
+        """Count the Memories a search can return, each of which has one vector."""
+        statuses = allowed_search_statuses()
+        placeholders = ", ".join("?" for _ in statuses)
+        async with self.db.execute(
+            f"SELECT COUNT(*) FROM memories WHERE status IN ({placeholders})",
+            statuses,
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0])
+
+    async def list_searchable_memory_ids(self, *, after: str = "", limit: int) -> list[str]:
+        """List the IDs of searchable Memories in ID order, a page at a time."""
+        statuses = allowed_search_statuses()
+        placeholders = ", ".join("?" for _ in statuses)
+        async with self.db.execute(
+            f"""SELECT id FROM memories
+                 WHERE status IN ({placeholders}) AND id > ?
+                 ORDER BY id LIMIT ?""",
+            (*statuses, after, limit),
+        ) as cursor:
+            return [str(row["id"]) async for row in cursor]
+
+    async def activate_vector_index(
+        self,
+        index_id: str,
+        *,
+        vector_count: int,
+        promote_candidate: Mapping[str, Any] | None = None,
+    ) -> str | None:
+        """Put a verified index into use, in one transaction, and end its rebuild.
+
+        The index in use until now is retired and the built index takes its
+        place. ``promote_candidate`` names the embedding candidate the index
+        was built for (``updated_at``, ``state``, ``validation``): it becomes
+        the active embedding binding in the same transaction, so the binding
+        in use and the index in use never disagree.
+
+        Returns ``None`` when the switch was made, and otherwise the code of
+        why nothing changed: the rebuild lost its lease, the candidate was
+        saved again, or the count of searchable Memories is no longer the one
+        the index was verified against.
+        """
+        now_epoch = int(time.time())
+        now = _now_iso()
+        async with self._write_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                refusal = await self._activate_vector_index_unlocked(
+                    index_id,
+                    vector_count=vector_count,
+                    promote_candidate=promote_candidate,
+                    now=now,
+                    now_epoch=now_epoch,
+                )
+                if refusal is None:
+                    await self.db.commit()
+                else:
+                    await self.db.rollback()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        return refusal
+
+    async def _activate_vector_index_unlocked(
+        self,
+        index_id: str,
+        *,
+        vector_count: int,
+        promote_candidate: Mapping[str, Any] | None,
+        now: str,
+        now_epoch: int,
+    ) -> str | None:
+        async with self.db.execute(
+            "SELECT 1 FROM vector_indexes WHERE id = ? AND state = 'building' AND lease_expires_epoch > ?",
+            (index_id, now_epoch),
+        ) as cursor:
+            if await cursor.fetchone() is None:
+                return "reindex_lease_lost"
+        if await self.count_searchable_memories() != vector_count:
+            return "memories_changed"
+        if promote_candidate is not None and not await self._promote_model_candidate_unlocked(
+            "embedding",
+            updated_at=promote_candidate["updated_at"],
+            state=promote_candidate["state"],
+            validation=promote_candidate["validation"],
+        ):
+            return "candidate_changed"
+        await self.db.execute(
+            "UPDATE vector_indexes SET state = 'retired', finished_at = ? WHERE state = 'active'",
+            (now,),
+        )
+        await self.db.execute(
+            """UPDATE vector_indexes
+                  SET state = 'active', vector_count = ?, memory_count = ?, error_code = NULL,
+                      lease_expires_epoch = NULL, finished_at = ?, activated_at = ?
+                WHERE id = ?""",
+            (vector_count, vector_count, now, now, index_id),
+        )
+        return None
+
+    async def delete_vector_index(self, index_id: str) -> None:
+        """Forget an index that is not in use, once its vectors are deleted."""
+        async with self._write_transaction():
+            await self.db.execute(
+                "DELETE FROM vector_indexes WHERE id = ? AND state IN ('retired', 'failed')",
+                (index_id,),
+            )
+            await self.db.commit()
 
     # ==================================================================
     # Users

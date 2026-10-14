@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from typing import Any, Awaitable, Callable, Sequence
 
-from memforge.llm.embedding import EmbeddingRuntime
+from memforge.llm.embedding import EmbeddingIndexMismatch, EmbeddingRuntime, embed_documents_for_index
 from memforge.memory.audit import AuditContext, MemoryAuditEvent, MemoryAuditLogger
 from memforge.memory.evidence import (
     AuthorityCase,
@@ -52,6 +52,7 @@ from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, VectorStore
 from memforge.source_activity import SourceActivityConflict, SourceActivityLease
 from memforge.source_projection import SourceProjection
+from memforge.vector_index_errors import NoVectorIndex
 
 logger = logging.getLogger(__name__)
 
@@ -212,10 +213,12 @@ class MemoryStore:
         self.dedup_threshold = dedup_threshold
         self.audit_logger = audit_logger
 
-    @property
-    def collection(self) -> Any:
-        """The underlying memory vector collection (index-health and tests)."""
-        return self.vector.collection
+    async def index_collection(self) -> Any | None:
+        """The collection of the vector index in use, for index health checks."""
+        open_collection = getattr(self.vector, "open_collection", None)
+        if open_collection is not None:
+            return await open_collection()
+        return getattr(self.vector, "collection", None)
 
     @property
     def db(self) -> Any:
@@ -392,6 +395,21 @@ class MemoryStore:
                 await self._reconcile_lifecycle_vector_target(task.memory_id)
                 await complete(task.id)
                 delivered_tasks += 1
+            except (EmbeddingIndexMismatch, NoVectorIndex) as exc:
+                # The index cannot take this model's vectors until it is
+                # rebuilt. The work waits, with no attempt counted against it.
+                logger.warning(
+                    "%s vector delivery waits for the vector index scope=%s reason=%s",
+                    owner_kind,
+                    scope,
+                    exc.code,
+                )
+                return LifecycleVectorDeliveryResult(
+                    state=LifecycleVectorDeliveryState.PENDING,
+                    attempted_tasks=delivered_tasks,
+                    delivered_tasks=delivered_tasks,
+                    error_types=(type(exc).__name__,),
+                )
             except Exception as exc:
                 error_types.append(type(exc).__name__)
                 retry_delay = min(
@@ -457,7 +475,7 @@ class MemoryStore:
             error_types=tuple(dict.fromkeys(error_types)),
         )
 
-    async def _current_lifecycle_vector_projection(
+    async def vector_projection(
         self,
         memory_id: str,
     ) -> tuple[str, str | None, dict[str, Any] | None]:
@@ -482,7 +500,7 @@ class MemoryStore:
         """Materialize one Memory from current truth and close transition races."""
 
         for _ in range(LIFECYCLE_VECTOR_TARGET_STABILITY_ATTEMPTS):
-            projection = await self._current_lifecycle_vector_projection(memory_id)
+            projection = await self.vector_projection(memory_id)
             operation, indexed_text, metadata = projection
             if operation == LifecycleVectorOperation.DELETE.value:
                 await self.vector.delete([memory_id])
@@ -493,7 +511,7 @@ class MemoryStore:
                     embeddings=[await self._embed(indexed_text)],
                     metadatas=[metadata],
                 )
-            if await self._current_lifecycle_vector_projection(memory_id) == projection:
+            if await self.vector_projection(memory_id) == projection:
                 return
         raise RuntimeError("lifecycle vector target changed during bounded delivery")
 
@@ -2451,5 +2469,5 @@ class MemoryStore:
     # -------------------------------------------------------------------
 
     async def _embed(self, text: str) -> list[float]:
-        """Return the vector for one Memory embedding text."""
-        return (await self.embedding.embed_documents([text]))[0]
+        """Return the vector for one Memory embedding text, as a vector of the index in use."""
+        return (await embed_documents_for_index(self.embedding, self.vector, [text]))[0]

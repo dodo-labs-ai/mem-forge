@@ -4,7 +4,7 @@ import { Outlet } from "react-router-dom";
 import { afterEach, expect, test, vi } from "vitest";
 import type { ModelSettings } from "@/api";
 import { errorResponse, type Route } from "@/test/fakeApi";
-import { NO_MODELS, makeModelSettings } from "@/test/modelSettingsFixtures";
+import { NO_MODELS, makeModelSettings, makeVectorIndex } from "@/test/modelSettingsFixtures";
 import { renderRoutes } from "@/test/renderRoutes";
 import type { AdminExtension } from "../extension/contract";
 import { ExtensionProvider } from "../extension/ExtensionProvider";
@@ -54,7 +54,20 @@ test("a fresh installation is told, on the page it lands on, to set up a generat
   expect(screen.queryByRole("status")).not.toBeInTheDocument();
 });
 
-test("nothing is shown while the generation model is ready", async () => {
+test("an installation whose search index has to be rebuilt is told that vector search is off, with the way to Settings", async () => {
+  openApp("/sources", makeModelSettings({ vector_index: makeVectorIndex({ status: "reindex_required", reindex_target: "active" }) }));
+
+  const notice = await screen.findByRole("status");
+  expect(notice).toHaveTextContent("Vector search is off");
+  expect(notice).toHaveTextContent("Search ranks by matching words until the index is rebuilt in Settings.");
+
+  await userEvent.click(within(notice).getByRole("link", { name: "Open Settings" }));
+
+  expect(await screen.findByRole("heading", { name: "Settings page" })).toBeInTheDocument();
+  expect(screen.queryByRole("status")).not.toBeInTheDocument();
+});
+
+test("nothing is shown while the generation model is ready and the search index fits", async () => {
   const { calls } = openApp("/sources", makeModelSettings());
 
   await waitFor(() => expect(calls).toHaveLength(1));
