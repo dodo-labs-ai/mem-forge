@@ -5586,13 +5586,13 @@ export interface components {
          *     sync running in this process carries its live counters (``phase``,
          *     ``docs_*``, ``memories_*``, ``current_title``). The last recorded sync
          *     carries its totals, ``run_id``, ``failed_docs`` and
-         *     ``absence_check_skipped_reason``, which says why that run removed nothing
-         *     although its scope listing was due (ADR 0045). Fields outside the chosen
-         *     shape are absent.
+         *     ``absence_check_skipped_reason``, which names the step that kept that run
+         *     from removing anything although its scope listing was due. Fields outside
+         *     the chosen shape are absent.
          */
         SourceSyncStatusResponse: {
             /** Absence Check Skipped Reason */
-            absence_check_skipped_reason?: string | null;
+            absence_check_skipped_reason?: ("scope_listing_failed" | "absence_confirmation_failed") | null;
             /** Created At */
             created_at?: string | null;
             /** Current Title */
