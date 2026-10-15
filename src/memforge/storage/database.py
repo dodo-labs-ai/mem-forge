@@ -4790,6 +4790,11 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ON vector_indexes(state) WHERE state = 'building'",
         ],
     ),
+    (
+        115,
+        "Rebuild each Memory's FTS5 row from its linked entities",
+        [],
+    ),
 ]
 
 
@@ -5139,6 +5144,9 @@ class Database:
             if version == 104:
                 recorded = await self._move_stored_input_to_source_units_unlocked()
                 logger.info("Recorded the stored input of %d current Source Unit revisions", recorded)
+            if version == 115:
+                rebuilt = await self._rebuild_all_memory_fts_unlocked()
+                logger.info("Rebuilt the FTS5 rows of %d Memories", rebuilt)
             await self.db.execute(
                 "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, _now_iso()),
@@ -10245,6 +10253,10 @@ class Database:
                 memory.id,
                 [int(value) for value in raw.get("entity_ids", [])],
             )
+            await self._rebuild_memory_fts_unlocked(
+                memory.id,
+                search_visible_statuses=set(allowed_search_statuses()),
+            )
             document_source = raw.get("document_source")
             if isinstance(document_source, Mapping):
                 doc_id = document_source.get("doc_id")
@@ -12806,6 +12818,10 @@ class Database:
         async with self._write_lock:
             try:
                 await self._insert_memory_unlocked(mem)
+                await self._rebuild_memory_fts_unlocked(
+                    mem.id,
+                    search_visible_statuses=set(allowed_search_statuses()),
+                )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
@@ -12813,6 +12829,7 @@ class Database:
         return mem.id
 
     async def _insert_memory_unlocked(self, mem: Memory) -> None:
+        """Insert the memory row; callers link its entities, then rebuild its FTS5 row."""
         _validate_visibility(mem.visibility, mem.owner_user_id)
         project_key = _normalize_project_key(mem.project_key)
         now = _now_iso()
@@ -12850,11 +12867,6 @@ class Database:
                 mem.created_at.isoformat() if mem.created_at else now,
                 mem.updated_at.isoformat() if mem.updated_at else now,
             ),
-        )
-        entities_text = " ".join(mem.entity_refs)
-        await self.db.execute(
-            "INSERT INTO memories_fts (memory_id, content, entities_text) VALUES (?, ?, ?)",
-            (mem.id, mem.content, entities_text),
         )
 
     async def _upsert_memory_preserving_created_at_unlocked(self, mem: Memory) -> None:
@@ -13164,6 +13176,19 @@ class Database:
                 (memory_id, row["content"], " ".join(entity_names)),
             )
         return True
+
+    async def _rebuild_all_memory_fts_unlocked(self) -> int:
+        search_visible_statuses = set(allowed_search_statuses())
+        memory_ids = [
+            str(row["id"])
+            for row in await self.db.execute_fetchall("SELECT id FROM memories ORDER BY id")
+        ]
+        for memory_id in memory_ids:
+            await self._rebuild_memory_fts_unlocked(
+                memory_id,
+                search_visible_statuses=search_visible_statuses,
+            )
+        return len(memory_ids)
 
     async def prune_memory_fts_orphans(self) -> int:
         """Remove FTS rows whose memory ID is not present in SQLite memories."""
@@ -15594,10 +15619,12 @@ class Database:
     # ==================================================================
 
     async def link_memory_entity(self, memory_id: str, entity_id: int) -> None:
-        async with self._write_lock:
-            await self.db.execute(
-                "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id) VALUES (?, ?)",
-                (memory_id, entity_id),
+        """Link one entity to a memory and refresh the memory's FTS5 row."""
+        async with self._write_transaction():
+            await self._link_memory_entities_unlocked(memory_id, (entity_id,))
+            await self._rebuild_memory_fts_unlocked(
+                memory_id,
+                search_visible_statuses=set(allowed_search_statuses()),
             )
             await self.db.commit()
 
@@ -15612,7 +15639,7 @@ class Database:
         return results
 
     async def get_memory_entity_names(self, memory_id: str) -> list[str]:
-        """Return canonical entity names linked to a memory, in insertion order."""
+        """Return canonical entity names linked to a memory, in entity ID order."""
         results: list[str] = []
         async with self.db.execute(
             """SELECT e.canonical_name
@@ -16022,6 +16049,13 @@ class Database:
                 if target_row is None:
                     raise LookupError("Target entity not found")
                 target = _entity_from_row(dict(target_row))
+                relinked_memory_ids = [
+                    str(row["memory_id"])
+                    for row in await self.db.execute_fetchall(
+                        "SELECT memory_id FROM memory_entities WHERE entity_id = ? ORDER BY memory_id",
+                        (source_id,),
+                    )
+                ]
 
                 await self.db.execute(
                     """UPDATE OR IGNORE memory_entities
@@ -16056,6 +16090,12 @@ class Database:
                 await self.db.execute("DELETE FROM entities WHERE id = ?", (source_id,))
                 await self.db.execute("DELETE FROM entity_alias_search_fts WHERE entity_id = ?", (source_id,))
                 await self._refresh_entity_alias_search_unlocked(target_id)
+                search_visible_statuses = set(allowed_search_statuses())
+                for memory_id in relinked_memory_ids:
+                    await self._rebuild_memory_fts_unlocked(
+                        memory_id,
+                        search_visible_statuses=search_visible_statuses,
+                    )
                 await self.db.commit()
             except BaseException:
                 rollback_task = asyncio.create_task(self.db.rollback())
