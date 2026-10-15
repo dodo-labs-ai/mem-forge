@@ -4654,11 +4654,20 @@ export interface components {
         ModelDiscoveryResponse: {
             /** Error Code */
             error_code?: string | null;
+            /**
+             * Kind Filtered
+             * @description Whether models holds only models of the requested kind. False when the endpoint lists its models without saying which kind each one is.
+             * @default false
+             */
+            kind_filtered: boolean;
             /** Latency Ms */
             latency_ms?: number | null;
             /** Message */
             message: string;
-            /** Models */
+            /**
+             * Models
+             * @description The listed models of the requested kind, or every listed model when kind_filtered is false.
+             */
             models?: components["schemas"]["ModelOption"][];
             /**
              * Models Supported
@@ -4701,10 +4710,20 @@ export interface components {
         };
         /** ModelOption */
         ModelOption: {
+            /**
+             * Context Window Tokens
+             * @description The context window the listing gives for the model, in tokens; null when it gives none.
+             */
+            context_window_tokens?: number | null;
             /** Id */
             id: string;
             /** Label */
             label?: string | null;
+            /**
+             * Max Output Tokens
+             * @description The largest output the listing gives for the model, in tokens; null when it gives none.
+             */
+            max_output_tokens?: number | null;
         };
         /** ModelProviderListResponse */
         ModelProviderListResponse: {

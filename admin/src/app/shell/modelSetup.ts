@@ -31,6 +31,15 @@ export function modelSetupMessage(settings: ModelSettings): ModelSetupMessage | 
       body: "MemForge uses it as it is, and validates it in the background after the server starts.",
     };
   }
+  if (!model.validation.passed && model.validation.error_code === "token_limits_required") {
+    return {
+      title: "One more step: set the token limits of the generation model",
+      body:
+        model.config_source === "deployment"
+          ? "The model answered, but MemForge has no token limits for it. Set them on the server; Settings names the variables."
+          : "The model answered, but MemForge has no token limits for it. Enter them in Settings.",
+    };
+  }
   if (!model.validation.passed) {
     return {
       title: "The generation model failed its latest validation",

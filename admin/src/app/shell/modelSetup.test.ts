@@ -49,6 +49,20 @@ describe("modelSetupMessage", () => {
       "The generation model needs revalidation",
     );
   });
+
+  test("a model in use that only lacks token limits is shown the step left, not a failure", () => {
+    const refused = makeValidation({ passed: false, error_code: "token_limits_required" });
+    const message = (overrides: Parameters<typeof makeBinding>[0]) =>
+      modelSetupMessage(makeModelSettings({ generation: kindSettings(makeBinding({ state: "needs_revalidation", validation: refused, ...overrides })) }));
+
+    expect(message({})).toEqual({
+      title: "One more step: set the token limits of the generation model",
+      body: "The model answered, but MemForge has no token limits for it. Enter them in Settings.",
+    });
+    expect(message({ config_source: "deployment" })?.body).toBe(
+      "The model answered, but MemForge has no token limits for it. Set them on the server; Settings names the variables.",
+    );
+  });
 });
 
 describe("searchIndexMessage", () => {

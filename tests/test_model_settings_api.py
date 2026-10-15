@@ -1488,7 +1488,12 @@ def test_discovery_lists_the_models_of_an_endpoint(db, tmp_path, monkeypatch) ->
 
     assert payload["ok"] is True
     assert payload["models_supported"] is True
-    assert payload["models"] == [{"id": "model-a", "label": None}, {"id": "model-b", "label": "Model B"}]
+    assert payload["models"] == [
+        {"id": "model-a", "label": None, "context_window_tokens": None, "max_output_tokens": None},
+        {"id": "model-b", "label": "Model B", "context_window_tokens": None, "max_output_tokens": None},
+    ]
+    assert payload["kind_filtered"] is False
+    assert payload["message"] == "Connected. Found 2 models; the endpoint does not say which are embedding models."
     assert payload["error_code"] is None
     assert endpoint.requests == [
         (
@@ -1497,6 +1502,196 @@ def test_discovery_lists_the_models_of_an_endpoint(db, tmp_path, monkeypatch) ->
         )
     ]
     assert [options["follow_redirects"] for options in endpoint.client_options] == [False]
+
+
+OPENROUTER_CHAT_MODELS = {
+    "data": [
+        {
+            "id": "anthropic/claude-haiku-5.5",
+            "name": "Anthropic: Claude Haiku 5.5",
+            "context_length": 1_000_000,
+            "top_provider": {"context_length": 1_000_000, "max_completion_tokens": 128_000},
+        },
+        {"id": "openai/gpt-5-mini", "name": "OpenAI: GPT-5 Mini", "top_provider": {"max_completion_tokens": None}},
+    ]
+}
+OPENROUTER_EMBEDDING_MODELS = {
+    "data": [
+        {"id": "openai/text-embedding-3-small", "name": "OpenAI: Text Embedding 3 Small", "context_length": 8_192},
+        {"id": "qwen/qwen3-embedding-8b", "name": "Qwen: Qwen3 Embedding 8B"},
+    ]
+}
+
+
+def _openrouter(url, request):
+    if url == "https://openrouter.ai/api/v1/embeddings/models":
+        return httpx.Response(200, json=OPENROUTER_EMBEDDING_MODELS, request=request)
+    if url == "https://openrouter.ai/api/v1/models":
+        return httpx.Response(200, json=OPENROUTER_CHAT_MODELS, request=request)
+    return httpx.Response(404, json={}, request=request)
+
+
+def test_openrouter_lists_each_kind_from_its_own_listing(db, tmp_path, monkeypatch) -> None:
+    endpoint = Endpoint(monkeypatch, _openrouter)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    embedding = _discover(client, "embedding", provider="openrouter", api_key=OTHER_KEY)
+    generation = _discover(client, "generation", provider="openrouter", api_key=OTHER_KEY)
+
+    assert [url for url, _headers in endpoint.requests] == [
+        "https://openrouter.ai/api/v1/embeddings/models",
+        "https://openrouter.ai/api/v1/models",
+    ]
+    assert [model["id"] for model in embedding["models"]] == ["openai/text-embedding-3-small", "qwen/qwen3-embedding-8b"]
+    assert (embedding["kind_filtered"], embedding["message"]) == (True, "Connected. Found 2 embedding models.")
+    assert [model["id"] for model in generation["models"]] == ["anthropic/claude-haiku-5.5", "openai/gpt-5-mini"]
+    assert generation["message"] == "Connected. Found 2 generation models."
+
+
+def test_discovery_carries_the_token_limits_a_listing_gives(db, tmp_path, monkeypatch) -> None:
+    Endpoint(monkeypatch, _openrouter)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    generation = _discover(client, "generation", provider="openrouter", api_key=OTHER_KEY)
+
+    assert generation["models"] == [
+        {
+            "id": "anthropic/claude-haiku-5.5",
+            "label": "Anthropic: Claude Haiku 5.5",
+            "context_window_tokens": 1_000_000,
+            "max_output_tokens": 128_000,
+        },
+        {
+            "id": "openai/gpt-5-mini",
+            "label": "OpenAI: GPT-5 Mini",
+            "context_window_tokens": None,
+            "max_output_tokens": None,
+        },
+    ]
+
+
+def test_a_pasted_listing_path_is_read_as_the_base_url_it_follows(db, tmp_path, monkeypatch) -> None:
+    endpoint = Endpoint(monkeypatch, _openrouter)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(
+        client,
+        "embedding",
+        provider="openrouter",
+        endpoint="https://openrouter.ai/api/v1/models",
+        api_key=OTHER_KEY,
+    )
+    saved = client.put(
+        f"{API}/generation/candidate",
+        json={
+            "provider": "openrouter",
+            "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+            "model_id": "anthropic/claude-haiku-5.5",
+            "api_key": OTHER_KEY,
+        },
+    )
+
+    assert payload["message"] == "Connected. Found 2 embedding models."
+    assert [url for url, _headers in endpoint.requests] == ["https://openrouter.ai/api/v1/embeddings/models"]
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["candidate"]["endpoint"] == "https://openrouter.ai/api/v1"
+
+
+OPENAI_MODELS = {
+    "object": "list",
+    "data": [
+        {"id": "gpt-5-mini", "object": "model", "owned_by": "system"},
+        {"id": "text-embedding-3-small", "object": "model", "owned_by": "system"},
+        {"id": "dall-e-3", "object": "model", "owned_by": "system"},
+        {"id": "whisper-1", "object": "model", "owned_by": "system"},
+        {"id": "gpt-4o-mini-tts", "object": "model", "owned_by": "system"},
+        {"id": "omni-moderation-latest", "object": "model", "owned_by": "system"},
+        {"id": "text-embedding-3-large", "object": "model", "owned_by": "system"},
+        {"id": "o4-mini", "object": "model", "owned_by": "system"},
+    ],
+}
+
+
+def test_openai_tells_the_kinds_apart_by_model_id_in_its_one_listing(db, tmp_path, monkeypatch) -> None:
+    endpoint = Endpoint(monkeypatch, lambda url, request: httpx.Response(200, json=OPENAI_MODELS, request=request))
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    embedding = _discover(client, "embedding", provider="openai", api_key=OTHER_KEY)
+    generation = _discover(client, "generation", provider="openai", api_key=OTHER_KEY)
+
+    assert [url for url, _headers in endpoint.requests] == ["https://api.openai.com/v1/models"] * 2
+    assert [model["id"] for model in embedding["models"]] == ["text-embedding-3-small", "text-embedding-3-large"]
+    assert [model["id"] for model in generation["models"]] == ["gpt-5-mini", "o4-mini"]
+    assert (embedding["kind_filtered"], generation["kind_filtered"]) == (True, True)
+
+
+OLLAMA_TAGS = {
+    "models": [
+        {"name": "qwen3:14b", "model": "qwen3:14b", "details": {"family": "qwen3", "families": ["qwen3"]}},
+        {"name": "bge-m3:latest", "model": "bge-m3:latest", "details": {"family": "bert", "families": ["bert"]}},
+        {
+            "name": "qwen3-embedding:8b",
+            "model": "qwen3-embedding:8b",
+            "details": {"family": "qwen3", "families": ["qwen3"]},
+        },
+        {"name": "custom-encoder:1", "model": "custom-encoder:1", "capabilities": ["embedding"]},
+        {"name": "custom-chat:1", "model": "custom-chat:1", "capabilities": ["completion", "tools"]},
+    ]
+}
+
+
+def test_ollama_lists_its_tags_and_tells_the_kinds_apart_by_capability_family_or_name(
+    db, tmp_path, monkeypatch
+) -> None:
+    endpoint = Endpoint(
+        monkeypatch,
+        lambda url, request: (
+            httpx.Response(200, json=OLLAMA_TAGS, request=request)
+            if url == "http://localhost:11434/api/tags"
+            else httpx.Response(404, json={}, request=request)
+        ),
+    )
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    embedding = _discover(client, "embedding", provider="ollama")
+    generation = _discover(client, "generation", provider="ollama", endpoint="http://localhost:11434/v1")
+
+    assert [url for url, _headers in endpoint.requests] == ["http://localhost:11434/api/tags"] * 2
+    assert [model["id"] for model in embedding["models"]] == [
+        "bge-m3:latest",
+        "qwen3-embedding:8b",
+        "custom-encoder:1",
+    ]
+    assert [model["id"] for model in generation["models"]] == ["qwen3:14b", "custom-chat:1"]
+
+
+def test_a_listing_with_no_model_of_the_kind_says_so_instead_of_offering_the_others(
+    db, tmp_path, monkeypatch
+) -> None:
+    Endpoint(
+        monkeypatch,
+        lambda url, request: httpx.Response(200, json={"data": [{"id": "gpt-5-mini"}, {"id": "o4-mini"}]}, request=request),
+    )
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(client, "embedding", provider="openai", api_key=OTHER_KEY)
+
+    assert (payload["ok"], payload["models_supported"], payload["kind_filtered"]) == (True, True, True)
+    assert payload["models"] == []
+    assert payload["message"] == (
+        "Connected, but this endpoint listed no embedding models. Type the model id if you know it."
+    )
+
+
+def test_a_provider_is_not_asked_for_a_kind_it_does_not_serve(db, tmp_path, monkeypatch) -> None:
+    endpoint = Endpoint(monkeypatch)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    payload = _discover(client, "embedding", provider="anthropic", api_key=OTHER_KEY)
+
+    assert (payload["ok"], payload["models_supported"]) == (True, False)
+    assert payload["message"] == "Anthropic serves no embedding models."
+    assert endpoint.requests == []
 
 
 def test_discovery_uses_the_default_endpoint_and_key_header_of_the_provider(db, tmp_path, monkeypatch) -> None:

@@ -17,6 +17,8 @@ export type ModelValidationOutcome = Schemas["ModelValidationResponse"];
 export type ModelCandidateRequest = Schemas["ModelCandidateRequest"];
 export type ModelDiscoveryRequest = Schemas["ModelDiscoveryRequest"];
 export type ModelDiscoveryResult = Schemas["ModelDiscoveryResponse"];
+/** One model an endpoint listed, with the token limits the listing gives for it. */
+export type ModelOption = Schemas["ModelOption"];
 /** The vector space of an embedding model: its settings and the size of its vectors. */
 export type EmbeddingProfile = Schemas["EmbeddingProfileResponse"];
 /** The latest rebuild of the search index, running or ended. */
