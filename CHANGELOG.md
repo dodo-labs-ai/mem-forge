@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- A fresh install no longer reports its health as degraded after the first
+  sync. A Memory created by a sync wrote the entity names as the extraction
+  spelled them into its keyword search row, while the entities it was
+  linked to were stored under their canonical names, so the index
+  consistency check counted one `fts_entities_mismatch` for every Memory with
+  an entity. The keyword search row of a new Memory now holds the canonical
+  names of the entities it is linked to, written in the same transaction as
+  the links. Linking an entity to a Memory and merging two entities update
+  the row in the same way. Keyword search used the extraction's spelling
+  until now, so a Memory whose entity was resolved to a differently named
+  entity or alias was not found by that entity's name. Upgrading rebuilds
+  every keyword search row once, which clears the reported issues;
+  `memforge maintenance repair-indexes` clears them too. Cloud: no change.
+  The HANA store has no entity keyword row and searches Memory content only.
+  The local-dev SQLite store uses this package's database, so it gets the
+  fix and the one-time rebuild with the pin.
 - A Markdown document with an HTML part that has no text to cite, such as a
   row of badges, an image or `<picture>`, a centred `<div>` wrapper, a
   `</details>` closer or a lone `<br>`, no longer makes every Memory taken

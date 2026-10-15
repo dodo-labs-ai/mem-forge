@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from memforge.memory.health import MemoryIndexHealthChecker
 from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryRequest,
     RelationDiscoveryWorkSelection,
@@ -896,6 +897,47 @@ async def test_merge_entities_rolls_back_partial_work_after_cancellation(db, mon
     alias = await db.get_entity_by_alias("old payroll alias")
     assert alias is not None
     assert alias.canonical_id == source_id
+
+
+async def _fts_entities_text(db: Database, memory_id: str) -> str:
+    async with db.db.execute(
+        "SELECT entities_text FROM memories_fts WHERE memory_id = ?",
+        (memory_id,),
+    ) as cursor:
+        [row] = await cursor.fetchall()
+    return row["entities_text"]
+
+
+async def _fts_issue_kinds(db: Database) -> list[str]:
+    report = await MemoryIndexHealthChecker(db).check()
+    return [issue.kind for issue in report.issues if "fts" in issue.kind]
+
+
+@pytest.mark.asyncio
+async def test_inserted_memory_fts_row_follows_linked_entities(db):
+    memory = _memory("m-entities")
+    memory.entity_refs = ["Payroll Control Center"]
+    await db.insert_memory(memory)
+    assert await _fts_entities_text(db, "m-entities") == ""
+
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center")
+    await db.link_memory_entity("m-entities", entity_id)
+
+    assert await _fts_entities_text(db, "m-entities") == "payroll control center"
+    assert await _fts_issue_kinds(db) == []
+
+
+@pytest.mark.asyncio
+async def test_merge_entities_rewrites_fts_entities_of_relinked_memories(db):
+    await db.insert_memory(_memory("m-merged"))
+    source_id = await db.upsert_entity("old payroll name", "Old Payroll Name")
+    target_id = await db.upsert_entity("payroll control center", "Payroll Control Center")
+    await db.link_memory_entity("m-merged", source_id)
+
+    await db.merge_entities(source_id=source_id, target_id=target_id)
+
+    assert await _fts_entities_text(db, "m-merged") == "payroll control center"
+    assert await _fts_issue_kinds(db) == []
 
 
 @pytest.mark.asyncio
