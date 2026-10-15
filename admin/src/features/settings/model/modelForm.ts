@@ -8,6 +8,7 @@ import type {
   ModelCandidateRequest,
   ModelDiscoveryRequest,
   ModelKind,
+  ModelOption,
   ModelProvider,
 } from "./types";
 
@@ -84,6 +85,69 @@ export function savedValues(
 export function offersTokenLimits(stored: ModelBinding | null): boolean {
   if (stored === null) return false;
   return Object.keys(stored.token_limits).length > 0 || needsTokenLimits(stored);
+}
+
+/** Whether any of the token limit fields holds a value. */
+export function hasTokenLimitValues(tokenLimits: Record<string, string>): boolean {
+  return Object.values(tokenLimits).some((value) => value.trim() !== "");
+}
+
+/** The token limits a listed model comes with, among the fields in `names`, as the text of those fields. */
+export function listedTokenLimits(model: ModelOption, names: readonly string[]): Record<string, string> {
+  const listed: Record<string, unknown> = { ...model };
+  const limits: Record<string, string> = {};
+  for (const name of names) {
+    const tokens = listed[name];
+    if (typeof tokens === "number" && Number.isInteger(tokens) && tokens > 0) limits[name] = String(tokens);
+  }
+  return limits;
+}
+
+function sameFields(a: Record<string, string>, b: Record<string, string>, names: readonly string[]): boolean {
+  return names.every((name) => (a[name] ?? "").trim() === (b[name] ?? "").trim());
+}
+
+/**
+ * The token limit fields after a listed model is chosen, or `null` to leave
+ * them as they are. Fields that are empty, or that still hold the limits an
+ * earlier choice filled in, take the limits the listing gives for the model;
+ * limits the user entered are kept.
+ */
+export function tokenLimitsForChoice(
+  current: Record<string, string>,
+  names: readonly string[],
+  filledBefore: Record<string, string> | null,
+  listed: Record<string, string>,
+): Record<string, string> | null {
+  const replaceable = !hasTokenLimitValues(trimmedFields(current, names)) || (filledBefore !== null && sameFields(current, filledBefore, names));
+  if (!replaceable) return null;
+  const next: Record<string, string> = { ...current };
+  for (const name of names) next[name] = listed[name] ?? "";
+  return sameFields(next, current, names) ? null : next;
+}
+
+/** The token limits the form filled in from the model list, and the model they belong to. */
+export interface ListedLimits {
+  model: string;
+  limits: Record<string, string>;
+}
+
+/**
+ * The token limit fields after the user types `typed` in the Model field, or
+ * `null` to leave them as they are. Limits the listing gave for another model
+ * are cleared, since they do not describe the model now named; limits the
+ * user entered are kept.
+ */
+export function tokenLimitsForTypedModel(
+  current: Record<string, string>,
+  names: readonly string[],
+  filled: ListedLimits | null,
+  typed: string,
+): Record<string, string> | null {
+  if (filled === null || typed.trim() === filled.model || !sameFields(current, filled.limits, names)) return null;
+  const next: Record<string, string> = { ...current };
+  for (const name of names) next[name] = "";
+  return sameFields(next, current, names) ? null : next;
 }
 
 /** The form after choosing a provider: the saved values when it is the saved provider, a blank form otherwise. */

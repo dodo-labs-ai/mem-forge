@@ -136,7 +136,7 @@ test("shows the models in use with their state, and only the last characters of 
   expect(within(used).getByText(/^Passed validation/)).toBeInTheDocument();
 
   expect(within(generation).getByRole("combobox", { name: "Provider" })).toHaveTextContent("OpenAI");
-  expect(within(generation).getByLabelText("Base URL")).toHaveValue("https://api.openai.com/v1");
+  expect(within(generation).getByLabelText("Base URL (optional)")).toHaveValue("https://api.openai.com/v1");
   expect(within(generation).getByLabelText("Model")).toHaveValue("gpt-5.4");
   expect(within(generation).getByLabelText("API key")).toHaveValue("");
   expect(within(generation).getByText("The saved key (****a91f) is used. Leave blank to keep it.")).toBeInTheDocument();
@@ -172,9 +172,9 @@ describe("Save and validate", () => {
     expect(within(embedding).getByText("Unsaved changes")).toBeInTheDocument();
     await userEvent.click(within(embedding).getByRole("button", { name: "Save and validate" }));
 
-    expect(await within(embedding).findByText("Validation passed")).toBeInTheDocument();
-    expect(within(embedding).getByText("MemForge now uses this model.")).toBeInTheDocument();
-    expect(within(inUse(embedding)).getByText("mxbai-embed-large")).toBeInTheDocument();
+    expect(await within(inUse(embedding)).findByText("mxbai-embed-large")).toBeInTheDocument();
+    expect(within(inUse(embedding)).getByText(/^Passed validation/)).toBeInTheDocument();
+    expect(within(embedding).getAllByText(/passed/i)).toHaveLength(1);
     expect(within(embedding).queryByText("Unsaved changes")).not.toBeInTheDocument();
     expect(writes(calls)).toEqual([
       `PUT ${SETTINGS_ROUTE}/embedding/candidate`,
@@ -260,7 +260,8 @@ describe("Save and validate", () => {
     expect(within(embedding).getByLabelText("Model")).toHaveValue("text-embedding-3-small");
     await userEvent.click(within(embedding).getByRole("button", { name: "Save and validate" }));
 
-    expect(await within(embedding).findByText("Validation passed")).toBeInTheDocument();
+    expect(await within(inUse(embedding)).findByText("text-embedding-3-small")).toBeInTheDocument();
+    expect(within(embedding).queryByText("These settings are saved but not in use")).not.toBeInTheDocument();
     expect(writes(calls)).toEqual([`POST ${SETTINGS_ROUTE}/embedding/candidate/validate`]);
   });
 
@@ -290,11 +291,40 @@ describe("the fields a provider needs", () => {
     await userEvent.click(within(generation).getByRole("combobox", { name: "Provider" }));
     await userEvent.click(await screen.findByRole("option", { name: "Ollama" }));
 
-    expect(within(generation).getByLabelText("Base URL")).toHaveValue("http://localhost:11434");
+    expect(within(generation).getByLabelText("Base URL (optional)")).toHaveValue("http://localhost:11434");
     expect(within(generation).getByRole("combobox", { name: "Authentication" })).toHaveTextContent("No authentication");
     expect(within(generation).queryByLabelText("API key")).not.toBeInTheDocument();
     expect(within(generation).getByLabelText("Model")).toHaveValue("");
     expect(within(generation).queryByLabelText("Organization ID")).not.toBeInTheDocument();
+  });
+
+  test("the authentication choice is left out for a provider that accepts one way only", async () => {
+    const providers = PROVIDERS.map((provider) =>
+      provider.id === "openrouter" ? { ...provider, auth_strategies: ["api_key" as const] } : provider,
+    );
+    renderPage(makeModelSettings(), { [`GET ${SETTINGS_ROUTE}/providers`]: () => ({ providers }) });
+    const generation = await card("Generation model");
+    expect(within(generation).getByRole("combobox", { name: "Authentication" })).toBeInTheDocument();
+
+    await userEvent.click(within(generation).getByRole("combobox", { name: "Provider" }));
+    await userEvent.click(await screen.findByRole("option", { name: "OpenRouter" }));
+
+    expect(within(generation).queryByRole("combobox", { name: "Authentication" })).not.toBeInTheDocument();
+    expect(within(generation).getByLabelText("API key")).toBeInTheDocument();
+  });
+
+  test("optional fields say so, and a base URL with a provider default says what it defaults to", async () => {
+    renderPage();
+    const generation = await card("Generation model");
+    const embedding = await card("Embedding model");
+
+    expect(within(generation).getByLabelText("Base URL (optional)")).toHaveAccessibleDescription(
+      "Defaults to the OpenAI API at https://api.openai.com/v1; change it only for a proxy or another server.",
+    );
+    expect(within(generation).getByLabelText("Organization ID (optional)")).toBeInTheDocument();
+    expect(within(generation).getByLabelText("Model")).toBeInTheDocument();
+    expect(within(generation).getByLabelText("API key")).toBeInTheDocument();
+    expect(within(embedding).getByLabelText("Output dimensions (optional)")).toBeInTheDocument();
   });
 
   test("an endpoint without an address of its own must be given one", async () => {
@@ -334,8 +364,8 @@ describe("the fields a provider needs", () => {
   test("choosing credentials from the server environment puts the provider's own address in place of a typed one", async () => {
     renderPage();
     const generation = await card("Generation model");
-    await userEvent.clear(within(generation).getByLabelText("Base URL"));
-    await userEvent.type(within(generation).getByLabelText("Base URL"), "https://proxy.example.test/v1");
+    await userEvent.clear(within(generation).getByLabelText("Base URL (optional)"));
+    await userEvent.type(within(generation).getByLabelText("Base URL (optional)"), "https://proxy.example.test/v1");
 
     await userEvent.click(within(generation).getByRole("combobox", { name: "Authentication" }));
     await userEvent.click(await screen.findByRole("option", { name: "Credentials from the server environment" }));
@@ -348,13 +378,13 @@ describe("the fields a provider needs", () => {
     const { calls } = renderPage();
     const embedding = await card("Embedding model");
 
-    await userEvent.type(within(embedding).getByLabelText("Output dimensions"), "1.5");
+    await userEvent.type(within(embedding).getByLabelText("Output dimensions (optional)"), "1.5");
     await userEvent.click(within(embedding).getByRole("button", { name: "Save and validate" }));
 
     expect(await within(embedding).findByText("Enter a whole number greater than zero.")).toBeInTheDocument();
-    expect(within(embedding).getByLabelText("Output dimensions")).toHaveAttribute("aria-invalid", "true");
+    expect(within(embedding).getByLabelText("Output dimensions (optional)")).toHaveAttribute("aria-invalid", "true");
     expect(writes(calls)).toEqual([]);
-    expect(within(await card("Generation model")).queryByLabelText("Output dimensions")).not.toBeInTheDocument();
+    expect(within(await card("Generation model")).queryByLabelText("Output dimensions (optional)")).not.toBeInTheDocument();
   });
 });
 
@@ -364,8 +394,8 @@ test("moving the base URL to another origin asks for the API key again before an
   });
   const generation = await card("Generation model");
 
-  await userEvent.clear(within(generation).getByLabelText("Base URL"));
-  await userEvent.type(within(generation).getByLabelText("Base URL"), "https://proxy.example.test/v1");
+  await userEvent.clear(within(generation).getByLabelText("Base URL (optional)"));
+  await userEvent.type(within(generation).getByLabelText("Base URL (optional)"), "https://proxy.example.test/v1");
   expect(
     within(generation).getByText(
       "The saved key belongs to https://api.openai.com and is not sent anywhere else. Enter the key for this endpoint.",
@@ -521,13 +551,14 @@ test("a model whose key variable is not set on the server asks for a key instead
 });
 
 describe("Load models", () => {
-  test("offers the models that fit the kind and fills an empty model field", async () => {
+  test("offers the models the endpoint listed for the kind, and leaves the choice to the user", async () => {
     const { calls } = renderPage(makeModelSettings(), {
       [`POST ${SETTINGS_ROUTE}/embedding/discover-models`]: () => ({
         ok: true,
         models_supported: true,
-        models: [{ id: "mxbai-embed-large" }, { id: "llama3.3" }, { id: "nomic-embed-text" }],
-        message: "Connected. Found 3 models.",
+        kind_filtered: true,
+        models: [{ id: "mxbai-embed-large" }, { id: "nomic-embed-text" }],
+        message: "Connected. Found 2 embedding models.",
         latency_ms: 42,
       }),
     });
@@ -536,8 +567,11 @@ describe("Load models", () => {
 
     await userEvent.click(within(embedding).getByRole("button", { name: "Load models" }));
 
-    expect(await within(embedding).findByText("Connected. Found 3 models. (42 ms)")).toBeInTheDocument();
-    expect(within(embedding).getByLabelText("Model")).toHaveValue("mxbai-embed-large");
+    expect(await within(embedding).findByText("Connected. Found 2 embedding models. (42 ms)")).toBeInTheDocument();
+    expect(within(embedding).getByLabelText("Model")).toHaveValue("");
+    expect(
+      within(embedding).getByText("2 listed embedding models. Type in the Model field to filter them, or pick one."),
+    ).toBeInTheDocument();
     const suggestions = within(embedding).getByRole("group", { name: "Suggested models" });
     expect(within(suggestions).getAllByRole("button").map((button) => button.textContent)).toEqual([
       "mxbai-embed-large",
@@ -551,6 +585,156 @@ describe("Load models", () => {
       auth_strategy: "none",
       api_key: null,
     });
+  });
+
+  test("fills an empty model field when the endpoint lists exactly one model of the kind", async () => {
+    renderPage(makeModelSettings(), {
+      [`POST ${SETTINGS_ROUTE}/embedding/discover-models`]: () => ({
+        ok: true,
+        models_supported: true,
+        kind_filtered: true,
+        models: [{ id: "nomic-embed-text" }],
+        message: "Connected. Found 1 embedding model.",
+      }),
+    });
+    const embedding = await card("Embedding model");
+    await userEvent.clear(within(embedding).getByLabelText("Model"));
+
+    await userEvent.click(within(embedding).getByRole("button", { name: "Load models" }));
+
+    expect(await within(embedding).findByText("Connected. Found 1 embedding model.")).toBeInTheDocument();
+    expect(within(embedding).getByLabelText("Model")).toHaveValue("nomic-embed-text");
+  });
+
+  test("typing in the model field narrows the suggestions, also once it holds a whole model id", async () => {
+    renderPage(makeModelSettings(), {
+      [`POST ${SETTINGS_ROUTE}/embedding/discover-models`]: () => ({
+        ok: true,
+        models_supported: true,
+        kind_filtered: true,
+        models: [{ id: "nomic-embed-text-v2" }, { id: "mxbai-embed-large" }, { id: "nomic-embed-text" }],
+        message: "Connected. Found 3 embedding models.",
+      }),
+    });
+    const embedding = await card("Embedding model");
+    const modelField = within(embedding).getByLabelText("Model");
+    await userEvent.clear(modelField);
+    await userEvent.click(within(embedding).getByRole("button", { name: "Load models" }));
+    await within(embedding).findByRole("group", { name: "Suggested models" });
+
+    await userEvent.type(modelField, "nomic-embed-text");
+
+    const suggestions = within(embedding).getByRole("group", { name: "Suggested models" });
+    expect(within(suggestions).getAllByRole("button").map((button) => button.textContent)).toEqual([
+      "nomic-embed-text",
+      "nomic-embed-text-v2",
+    ]);
+    expect(within(suggestions).getByRole("button", { name: "nomic-embed-text" })).toHaveAttribute("aria-pressed", "true");
+    expect(within(embedding).getByText("2 of 3 listed embedding models match “nomic-embed-text”. Clear the Model field to see them all.")).toBeInTheDocument();
+  });
+
+  test("says that the endpoint listed no model of the kind instead of offering the others", async () => {
+    renderPage(makeModelSettings(), {
+      [`POST ${SETTINGS_ROUTE}/embedding/discover-models`]: () => ({
+        ok: true,
+        models_supported: true,
+        kind_filtered: true,
+        models: [],
+        message: "Connected, but this endpoint listed no embedding models. Type the model id if you know it.",
+      }),
+    });
+    const embedding = await card("Embedding model");
+
+    await userEvent.click(within(embedding).getByRole("button", { name: "Load models" }));
+
+    const notice = await within(embedding).findByText(
+      "Connected, but this endpoint listed no embedding models. Type the model id if you know it.",
+    );
+    expect(notice.closest('[role="status"]')).toHaveClass("bg-tone-warn-soft");
+    expect(within(embedding).queryByRole("group", { name: "Suggested models" })).not.toBeInTheDocument();
+    expect(within(embedding).getByLabelText("Model")).toHaveValue("nomic-embed-text");
+  });
+
+  test("picking a model whose listing gives token limits fills the empty limit fields and says where they came from", async () => {
+    const { calls } = renderPage(makeModelSettings(), {
+      [`POST ${SETTINGS_ROUTE}/generation/discover-models`]: () => ({
+        ok: true,
+        models_supported: true,
+        kind_filtered: true,
+        models: [
+          { id: "anthropic/claude-haiku-5.5", context_window_tokens: 1000000, max_output_tokens: 128000 },
+          { id: "openai/gpt-5-mini", context_window_tokens: 400000, max_output_tokens: null },
+          { id: "meta/llama-unlisted" },
+        ],
+        message: "Connected. Found 3 generation models.",
+      }),
+      [`PUT ${SETTINGS_ROUTE}/generation/candidate`]: () => errorResponse(HTTP_UNPROCESSABLE, { error: "x", message: "Stop here." }),
+    });
+    const generation = await card("Generation model");
+    await userEvent.click(within(generation).getByRole("combobox", { name: "Provider" }));
+    await userEvent.click(await screen.findByRole("option", { name: "OpenRouter" }));
+    await userEvent.type(within(generation).getByLabelText("API key"), "sk-or-key");
+    expect(within(generation).queryByRole("group", { name: "Token limits" })).not.toBeInTheDocument();
+
+    const modelField = within(generation).getByLabelText("Model");
+    const pick = async (model: string) => {
+      await userEvent.clear(modelField);
+      const suggestions = within(generation).getByRole("group", { name: "Suggested models" });
+      await userEvent.click(within(suggestions).getByRole("button", { name: model }));
+    };
+    await userEvent.click(within(generation).getByRole("button", { name: "Load models" }));
+    await within(generation).findByRole("group", { name: "Suggested models" });
+    await pick("openai/gpt-5-mini");
+    expect(within(generation).getByLabelText("Context window (optional)")).toHaveValue("400000");
+    await pick("anthropic/claude-haiku-5.5");
+
+    const limits = within(generation).getByRole("group", { name: "Token limits" });
+    expect(within(limits).getByLabelText("Context window (optional)")).toHaveValue("1000000");
+    expect(within(limits).getByLabelText("Maximum output (optional)")).toHaveValue("128000");
+    expect(within(limits).getByText("Filled in from the OpenRouter model list. You can change them.")).toBeInTheDocument();
+
+    await userEvent.clear(within(limits).getByLabelText("Maximum output (optional)"));
+    await userEvent.type(within(limits).getByLabelText("Maximum output (optional)"), "64000");
+    expect(within(limits).queryByText(/Filled in from the OpenRouter model list/)).not.toBeInTheDocument();
+    await pick("openai/gpt-5-mini");
+    expect(within(limits).getByLabelText("Context window (optional)")).toHaveValue("1000000");
+
+    await userEvent.click(within(generation).getByRole("button", { name: "Save and validate" }));
+    await within(generation).findByRole("alert");
+    expect(await bodyOf(calls, "PUT", `${SETTINGS_ROUTE}/generation/candidate`)).toMatchObject({
+      provider: "openrouter",
+      model_id: "openai/gpt-5-mini",
+      token_limits: { context_window_tokens: 1000000, max_output_tokens: 64000 },
+    });
+  });
+
+  test("typing another model id clears the token limits the listing gave for the model picked before", async () => {
+    renderPage(makeModelSettings(), {
+      [`POST ${SETTINGS_ROUTE}/generation/discover-models`]: () => ({
+        ok: true,
+        models_supported: true,
+        kind_filtered: true,
+        models: [{ id: "anthropic/claude-haiku-5.5", context_window_tokens: 1000000, max_output_tokens: 128000 }],
+        message: "Connected. Found 1 generation model.",
+      }),
+    });
+    const generation = await card("Generation model");
+    await userEvent.click(within(generation).getByRole("combobox", { name: "Provider" }));
+    await userEvent.click(await screen.findByRole("option", { name: "OpenRouter" }));
+    await userEvent.type(within(generation).getByLabelText("API key"), "sk-or-key");
+    const modelField = within(generation).getByLabelText("Model");
+    await userEvent.clear(modelField);
+    await userEvent.click(within(generation).getByRole("button", { name: "Load models" }));
+    const suggestions = await within(generation).findByRole("group", { name: "Suggested models" });
+    await userEvent.click(within(suggestions).getByRole("button", { name: "anthropic/claude-haiku-5.5" }));
+    const limits = within(generation).getByRole("group", { name: "Token limits" });
+    expect(within(limits).getByLabelText("Context window (optional)")).toHaveValue("1000000");
+
+    await userEvent.clear(modelField);
+    await userEvent.type(modelField, "mistral/my-own-model");
+
+    expect(within(generation).queryByRole("group", { name: "Token limits" })).not.toBeInTheDocument();
+    expect(within(generation).queryByText(/Filled in from the OpenRouter model list/)).not.toBeInTheDocument();
   });
 
   test("applies the base URL the server suggests", async () => {
@@ -569,7 +753,7 @@ describe("Load models", () => {
     await userEvent.click(within(embedding).getByRole("button", { name: "Load models" }));
     await userEvent.click(await within(embedding).findByRole("button", { name: "Use host.docker.internal" }));
 
-    expect(within(embedding).getByLabelText("Base URL")).toHaveValue("http://host.docker.internal:11434");
+    expect(within(embedding).getByLabelText("Base URL (optional)")).toHaveValue("http://host.docker.internal:11434");
     expect(within(embedding).queryByText("Could not reach localhost.")).not.toBeInTheDocument();
   });
 
@@ -1092,7 +1276,7 @@ describe("an embedding model whose vectors cannot be compared with the stored on
     const embedding = await card("Embedding model");
     expect(within(embedding).getByRole("button", { name: "Rebuild search index" })).toBeEnabled();
 
-    await userEvent.type(within(embedding).getByLabelText("Output dimensions"), "512");
+    await userEvent.type(within(embedding).getByLabelText("Output dimensions (optional)"), "512");
 
     expect(within(embedding).getByRole("button", { name: "Save and validate" })).toBeEnabled();
     expect(within(embedding).queryByRole("button", { name: "Rebuild search index" })).not.toBeInTheDocument();
@@ -1139,9 +1323,12 @@ describe("the token limits of a generation model", () => {
     });
     const generation = await card("Generation model");
 
-    expect(within(generation).getByText("These settings failed validation and are not in use").closest('[role="status"]')).toHaveTextContent(
+    const step = within(generation).getByText("One more step: enter the token limits").closest('[role="status"]') as HTMLElement;
+    expect(step).toHaveTextContent(
       "The model answered, but MemForge has no token limits for it. Enter its context window and maximum output, then validate again.",
     );
+    expect(step).toHaveClass("bg-tone-warn-soft");
+    expect(within(generation).queryByText("These settings failed validation and are not in use")).not.toBeInTheDocument();
     const limits = within(generation).getByRole("group", { name: "Token limits" });
     expect(limits).toHaveAccessibleDescription(
       "MemForge sizes every request to these limits, so that the model is never sent more than it can read or asked for more than it can write. It has none for this model: take them from the model card or from your model server.",
@@ -1150,9 +1337,8 @@ describe("the token limits of a generation model", () => {
     await userEvent.type(within(limits).getByLabelText("Maximum output"), "4096");
     await userEvent.click(within(generation).getByRole("button", { name: "Save and validate" }));
 
-    expect(await within(generation).findByText("Validation passed")).toBeInTheDocument();
-    expect(within(inUse(generation)).getByText("32,768 tokens")).toBeInTheDocument();
-    expect(within(generation).getByLabelText("Context window")).toHaveValue("32768");
+    expect(await within(inUse(generation)).findByText("32,768 tokens")).toBeInTheDocument();
+    expect(within(generation).getByLabelText("Context window (optional)")).toHaveValue("32768");
     expect(await bodyOf(calls, "PUT", `${SETTINGS_ROUTE}/generation/candidate`)).toEqual({
       provider: "ollama",
       model_id: "qwen3:14b",
@@ -1170,20 +1356,20 @@ describe("the token limits of a generation model", () => {
     const generation = await card("Generation model");
     const limits = within(generation).getByRole("group", { name: "Token limits" });
 
-    expect(within(limits).getByLabelText("Context window")).toHaveValue("32768");
-    expect(within(limits).getByLabelText("Maximum output")).toHaveValue("4096");
+    expect(within(limits).getByLabelText("Context window (optional)")).toHaveValue("32768");
+    expect(within(limits).getByLabelText("Maximum output (optional)")).toHaveValue("4096");
     expect(limits).toHaveAccessibleDescription(
       "MemForge sizes every request to these limits, so that the model is never sent more than it can read or asked for more than it can write.",
     );
     expect(within(generation).getByRole("button", { name: "Save and validate" })).toBeDisabled();
 
-    await userEvent.clear(within(limits).getByLabelText("Maximum output"));
-    await userEvent.type(within(limits).getByLabelText("Maximum output"), "8k");
+    await userEvent.clear(within(limits).getByLabelText("Maximum output (optional)"));
+    await userEvent.type(within(limits).getByLabelText("Maximum output (optional)"), "8k");
     expect(within(generation).getByText("Unsaved changes")).toBeInTheDocument();
     await userEvent.click(within(generation).getByRole("button", { name: "Save and validate" }));
 
     expect(await within(limits).findByText("Enter a whole number greater than zero.")).toBeInTheDocument();
-    expect(within(limits).getByLabelText("Maximum output")).toHaveAttribute("aria-invalid", "true");
+    expect(within(limits).getByLabelText("Maximum output (optional)")).toHaveAttribute("aria-invalid", "true");
     expect(writes(calls)).toEqual([]);
   });
 

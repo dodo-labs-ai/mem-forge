@@ -68,6 +68,16 @@ function failureReasonOf(binding: ModelBinding): string {
 }
 
 /**
+ * Whether the latest validation of `binding` failed only because the server
+ * has no token limits for its model. The model answered, so entering the
+ * limits is the one step left, not a fault to fix.
+ */
+export function awaitsTokenLimits(binding: ModelBinding): boolean {
+  const validation = binding.validation;
+  return validation !== null && !validation.passed && validation.error_code === "token_limits_required";
+}
+
+/**
  * Whether the latest validation of `binding` found that the server has no
  * token limits for its model, so that the model needs them stated.
  */
@@ -110,6 +120,14 @@ export function validationSummary(binding: ModelBinding, role: "active" | "candi
   const validation = binding.validation;
   if (validation === null) return NEVER_VALIDATED[role];
   const when = formatRelative(validation.checked_at, now);
+  if (awaitsTokenLimits(binding)) {
+    const reason = failureReasonOf(binding);
+    return {
+      tone: "warn",
+      headline: `One more step: ${binding.config_source === "deployment" ? "set" : "enter"} the token limits.`,
+      detail: role === "active" ? `${reason} MemForge keeps using this model.` : reason,
+    };
+  }
   if (!validation.passed) {
     const reason = failureReasonOf(binding);
     return {

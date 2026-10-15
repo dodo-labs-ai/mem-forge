@@ -707,7 +707,7 @@ def _environment_settings(llm: "LlmConfig", kind: ModelKind) -> tuple[str, str, 
 
 
 def _normalized_endpoint(descriptor: ProviderDescriptor, endpoint: str | None) -> str | None:
-    value = (endpoint or "").strip().rstrip("/") or descriptor.default_endpoint
+    value = descriptor.base_endpoint(endpoint or "") or descriptor.default_endpoint
     if value is None:
         if descriptor.endpoint_required:
             raise ModelConfigError(
