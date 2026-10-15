@@ -152,11 +152,24 @@ class _ResolvedCliTarget:
 
 
 def setup_logging(verbose: bool = False) -> None:
+    """Log to stderr: formatted for a terminal, one plain line per record otherwise.
+
+    A container or service manager collects stderr as text without a terminal
+    width, where boxed tracebacks wrap into unreadable columns.
+    """
     level = logging.DEBUG if verbose else logging.INFO
+    if log_console.is_terminal:
+        logging.basicConfig(
+            level=level,
+            format="%(message)s",
+            handlers=[RichHandler(console=log_console, rich_tracebacks=True)],
+            force=True,
+        )
+        return
     logging.basicConfig(
         level=level,
-        format="%(message)s",
-        handlers=[RichHandler(console=log_console, rich_tracebacks=True)],
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
         force=True,
     )
 
