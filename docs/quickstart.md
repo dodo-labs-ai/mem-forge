@@ -98,8 +98,19 @@ and fill in what it asks for:
 | OpenAI-compatible endpoint | A proxy or local server that speaks the OpenAI API, such as LM Studio or vLLM | Base URL, model, and an API key if the server wants one |
 | LiteLLM route (advanced) | Any other provider LiteLLM supports | The model as `provider/model`, and an API key or the provider's own environment variables |
 
-Where the provider can list its models, **Load models** fills the model field
-for you.
+Fields you can leave blank are marked *(optional)*; the others are required,
+except that an API key already saved can be left blank to keep it. A provider
+with an address of its own uses it when the base URL is left as it is.
+
+Where the provider can list its models, **Load models** offers the models of
+the kind you are setting up: OpenRouter's embedding list for the embedding
+model, OpenAI's embedding models for the embedding model and its other text
+models for the generation model, and Ollama's models by what each one can do.
+An OpenAI-compatible endpoint does not say which of its models embed, so all of
+them are offered. When the endpoint lists no model of the kind, Settings says
+so and you type the model id. Load models fills the model field only when the
+endpoint lists exactly one model of the kind; otherwise pick one, or type in
+the field to narrow the list.
 
 ### Save and validate
 
@@ -210,8 +221,10 @@ another base URL, enter an API key for that address. A model from `.env` can
 name a `provider/model` route with a base URL and no key; Settings shows such
 a model and, before it saves a change to it, asks you to either remove the
 base URL or choose **API key** (or, for a server that needs no key, the Ollama
-or OpenAI-compatible provider). A base URL is stored and
-shown as you type it, so it must not contain a user name or a password.
+or OpenAI-compatible provider). A base URL is stored as the address the API's
+paths start from: a request path pasted at its end, such as
+`/chat/completions`, `/embeddings` or `/models`, is left out. It must not
+contain a user name or a password.
 
 ### Models on your own machine
 
@@ -222,12 +235,15 @@ Inside the container, `localhost` points back to the container itself.
 MemForge sizes its requests to the token limits of the generation model: its
 context window and the most it can write in one answer. LiteLLM knows these
 limits for most hosted models. For a model it has no limits for, which is
-common for local models, validation fails with the code
-`token_limits_required` until you give them. Enter the **context window** and
-the **maximum output**, in tokens, with the generation model in Settings, and
-validate again. Take the numbers from the model card or from your model
-server; a context window of 32768 and a maximum output of 4096 are typical
-for a local model.
+common for local models, validation stops with the code
+`token_limits_required` and Settings shows one more step: enter the
+**context window** and the **maximum output**, in tokens, with the generation
+model, and validate again. Take the numbers from the model card or from your
+model server; a context window of 32768 and a maximum output of 4096 are
+typical for a local model. When you pick a model from **Load models** and the
+provider's list gives its limits, as OpenRouter's does, Settings fills the
+empty limit fields with them and says they came from that list; you can still
+change them.
 
 You can also set the limits in `.env`. A limit entered in Settings is the one
 used; the `.env` values apply to whatever Settings leaves empty:

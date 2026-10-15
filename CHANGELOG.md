@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- Settings → Load models lists the models of the kind being set up. OpenRouter
+  embedding models come from its embedding list (`/embeddings/models`) instead
+  of its chat models; OpenAI's one list is split by model id; Ollama is asked
+  for its local models (`/api/tags`) and each is sorted by its capabilities,
+  family or name. An OpenAI-compatible endpoint does not say which models
+  embed, so all of them are offered and the message says so. A list with no
+  model of the kind says that, and that the model id can be typed, instead of
+  offering the others. Load models fills the model field only when exactly one
+  model of the kind is listed, and typing in the field narrows the list, also
+  once it holds a whole model id. A listed model carries the token limits the
+  listing gives (OpenRouter's `context_length` and
+  `top_provider.max_completion_tokens`); picking it fills empty token limit
+  fields of the generation model and says where they came from; typing another
+  model id clears limits filled in this way. A validation that fails only for
+  want of token limits shows the step that is left in amber, on Settings and
+  in the notice on other pages, and a passed validation is reported once, by
+  the model in use. A
+  base URL pasted with a request path at its end (`/chat/completions`,
+  `/embeddings`, `/models`, `/embeddings/models`, Ollama's `/api/...` or
+  `/v1`, Anthropic's `/v1/messages`) is stored without it. Optional fields
+  are marked "(optional)", and a base URL with a provider default names it.
+  Cloud: no change needed; the discovery response only gains fields
+  (`kind_filtered`, and token limits on each model), and Cloud's LiteLLM gateway
+  models are LiteLLM routes with no base URL, which the new base URL reading
+  leaves alone.
 - A fresh install no longer reports its health as degraded after the first
   sync. A Memory created by a sync wrote the entity names as the extraction
   spelled them into its keyword search row, while the entities it was

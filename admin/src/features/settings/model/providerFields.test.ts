@@ -9,6 +9,7 @@ import {
   parameterNames,
   providersFor,
   tokenLimitField,
+  tokenLimitLabel,
   tokenLimitNames,
 } from "./providerFields";
 
@@ -37,21 +38,35 @@ test("only a generation model states token limits, each named in tokens", () => 
   expect(tokenLimitNames(providerById("openai"), "generation")).toEqual(["context_window_tokens", "max_output_tokens"]);
   expect(tokenLimitNames(providerById("openai"), "embedding")).toEqual([]);
   expect(tokenLimitNames(providerById("anthropic"), "embedding")).toEqual([]);
-  expect(tokenLimitField("context_window_tokens")).toEqual({
+  expect(tokenLimitField("context_window_tokens", { required: true })).toEqual({
     label: "Context window",
     hint: "In tokens: the most the model takes in one request, its answer included.",
   });
-  expect(tokenLimitField("max_output_tokens").label).toBe("Maximum output");
+  expect(tokenLimitField("max_output_tokens", { required: true }).label).toBe("Maximum output");
 });
 
-test("the base URL field shows the provider's own address, or says when one is needed", () => {
-  expect(endpointField(providerById("openai"), "api_key")).toMatchObject({
-    label: "Base URL",
-    placeholder: "https://api.openai.com/v1",
+test("a token limit is marked optional until validation finds that the model needs it", () => {
+  expect(tokenLimitField("context_window_tokens", { required: false }).label).toBe("Context window (optional)");
+  expect(tokenLimitLabel("max_output_tokens")).toBe("Maximum output");
+});
+
+test("the base URL field is optional where the provider has an address of its own, and says which", () => {
+  expect(endpointField(providerById("openrouter"), "api_key")).toEqual({
+    label: "Base URL (optional)",
+    placeholder: "https://openrouter.ai/api/v1",
+    hint: "Defaults to the OpenRouter API at https://openrouter.ai/api/v1; change it only for a proxy or another server.",
     fixed: false,
   });
-  expect(endpointField(providerById("openai_compatible"), "api_key").placeholder).toBe("https://api.example.com/v1");
   expect(endpointField(providerById("litellm"), "api_key").label).toBe("Base URL (optional)");
+});
+
+test("an endpoint without an address of its own needs a base URL, and the field says what to enter", () => {
+  expect(endpointField(providerById("openai_compatible"), "api_key")).toEqual({
+    label: "Base URL",
+    placeholder: "https://api.example.com/v1",
+    hint: "The address the API's paths start from. A /chat/completions or /models path at its end is left out.",
+    fixed: false,
+  });
 });
 
 test("the base URL is fixed while credentials come from the server environment", () => {
@@ -66,11 +81,18 @@ test("the base URL is fixed while credentials come from the server environment",
 
 test("the model field asks for a route where the provider takes one", () => {
   expect(modelField(providerById("litellm"))).toMatchObject({ label: "Model route", placeholder: "provider/model" });
-  expect(modelField(providerById("openai"))).toEqual({ label: "Model", placeholder: "Model id", hint: null });
+  expect(modelField(providerById("openai"))).toEqual({
+    label: "Model",
+    placeholder: "Model id",
+    hint: "Type a model id, or load the provider's models and type here to filter them.",
+  });
 });
 
-test("extra settings have their own labels, and an unknown one is named after itself", () => {
-  expect(optionField("organization").label).toBe("Organization ID");
-  expect(parameterField("dimensions").label).toBe("Output dimensions");
-  expect(optionField("api_version")).toEqual({ label: "Api version", hint: "Optional." });
+test("extra settings are optional, have their own labels, and an unknown one is named after itself", () => {
+  expect(optionField("organization").label).toBe("Organization ID (optional)");
+  expect(parameterField("dimensions")).toEqual({
+    label: "Output dimensions (optional)",
+    hint: "Leave blank for the model's own vector size.",
+  });
+  expect(optionField("api_version")).toEqual({ label: "Api version (optional)", hint: null });
 });

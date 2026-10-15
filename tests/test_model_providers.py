@@ -62,6 +62,51 @@ def test_each_descriptor_states_what_it_serves_and_how_it_is_reached(
 
 
 @pytest.mark.parametrize(
+    ("provider", "pasted", "base"),
+    [
+        ("openrouter", "https://openrouter.ai/api/v1/models", "https://openrouter.ai/api/v1"),
+        ("openrouter", "https://openrouter.ai/api/v1/embeddings/models/", "https://openrouter.ai/api/v1"),
+        ("openrouter", "https://openrouter.ai/api/v1/chat/completions", "https://openrouter.ai/api/v1"),
+        ("openai", "https://api.openai.com/v1/embeddings", "https://api.openai.com/v1"),
+        ("openai", "https://api.openai.com/v1/Models", "https://api.openai.com/v1"),
+        ("openai_compatible", "http://localhost:8000/v1/completions", "http://localhost:8000/v1"),
+        ("openai_compatible", "https://proxy.example.test/models", "https://proxy.example.test"),
+        ("openai_compatible", "https://proxy.example.test/v1/models?tenant=a", "https://proxy.example.test/v1/models?tenant=a"),
+        ("anthropic", "https://api.anthropic.com/v1/messages", "https://api.anthropic.com"),
+        ("anthropic", "https://api.anthropic.com/v1", "https://api.anthropic.com"),
+        ("ollama", "http://localhost:11434/api/tags", "http://localhost:11434"),
+        ("ollama", "http://localhost:11434/v1", "http://localhost:11434"),
+        ("ollama", "http://localhost:11434/v1/chat/completions", "http://localhost:11434"),
+        ("litellm", "https://gateway.example.test/v1/models", "https://gateway.example.test/v1/models"),
+        ("openai", " https://api.openai.com/v1/ ", "https://api.openai.com/v1"),
+    ],
+    ids=[
+        "openrouter_models",
+        "openrouter_embedding_models",
+        "openrouter_chat",
+        "openai_embeddings",
+        "openai_models_any_case",
+        "compatible_completions",
+        "compatible_models_at_root",
+        "query_kept",
+        "anthropic_messages",
+        "anthropic_version",
+        "ollama_tags",
+        "ollama_openai_api",
+        "ollama_openai_chat",
+        "litellm_route_decides",
+        "whitespace_and_slash",
+    ],
+)
+def test_a_base_url_pasted_with_a_request_path_is_read_without_it(provider, pasted, base) -> None:
+    descriptor = provider_descriptor(provider)
+
+    assert descriptor.base_endpoint(pasted) == base
+    if provider != "litellm" and "?" not in pasted:
+        assert _binding(provider, endpoint=pasted).endpoint == base
+
+
+@pytest.mark.parametrize(
     ("provider", "kind", "model_id", "route"),
     [
         ("openai", "generation", "gpt-5-mini", "openai/gpt-5-mini"),

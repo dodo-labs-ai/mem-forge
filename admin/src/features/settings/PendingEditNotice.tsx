@@ -1,6 +1,6 @@
-import { AlertCircle, Clock, RefreshCw } from "lucide-react";
+import { AlertCircle, Clock, ListChecks, RefreshCw } from "lucide-react";
 import { Notice } from "@/patterns";
-import { providerLabel, validationSummary } from "./model/modelStatus";
+import { awaitsTokenLimits, providerLabel, validationSummary } from "./model/modelStatus";
 import { THRESHOLDS_NOT_CALIBRATED } from "./model/searchIndex";
 import type { ModelBinding, ModelKind, ModelProvider } from "./model/types";
 
@@ -17,9 +17,10 @@ interface PendingEditNoticeProps {
 
 /**
  * Says that the saved edit is not the model in use, and what keeps it from
- * use: it has not been validated, its validation failed, or it passed and the
- * search index has to be rebuilt for it first. The model in use is named so
- * it is clear nothing stopped working.
+ * use: it has not been validated, its validation failed, the model answered
+ * and only its token limits are missing, or it passed and the search index has
+ * to be rebuilt for it first. The model in use is named so it is clear nothing
+ * stopped working.
  */
 export function PendingEditNotice({ kind, edit, inUse, providers, vectorSearchOn = true }: PendingEditNoticeProps) {
   const stillInUse =
@@ -47,6 +48,14 @@ export function PendingEditNotice({ kind, edit, inUse, providers, vectorSearchOn
   }
 
   const summary = validationSummary(edit, "candidate");
+  if (awaitsTokenLimits(edit)) {
+    return (
+      <Notice tone="warn" icon={ListChecks} title="One more step: enter the token limits">
+        <p>{summary.detail}</p>
+        <p>{stillInUse}</p>
+      </Notice>
+    );
+  }
   const failed = edit.validation !== null && !edit.validation.passed;
   return (
     <Notice

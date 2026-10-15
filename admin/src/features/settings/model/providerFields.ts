@@ -13,19 +13,27 @@ export const AUTH_HINTS: Partial<Record<AuthStrategy, string>> = {
     "MemForge sends no key of its own. The provider's credentials are read from the environment variables of the MemForge server.",
 };
 
-interface ExtraField {
-  label: string;
-  hint: string;
+/** Marks the label of a field that can be left blank; a field without the mark has to be filled in. */
+export function optionalLabel(label: string): string {
+  return `${label} (optional)`;
 }
 
-/** The provider settings beyond endpoint, key and model, by the name the server gives them. */
+interface ExtraField {
+  label: string;
+  hint: string | null;
+}
+
+/** The provider settings beyond endpoint, key and model, by the name the server gives them. Each is optional. */
 const OPTION_FIELDS: Record<string, ExtraField> = {
-  organization: { label: "Organization ID", hint: "Optional. Needed only when the key belongs to more than one organization." },
+  organization: {
+    label: optionalLabel("Organization ID"),
+    hint: "Needed only when the key belongs to more than one organization.",
+  },
 };
 
-/** The request settings a kind of model accepts, by the name the server gives them. */
+/** The request settings a kind of model accepts, by the name the server gives them. Each is optional. */
 const PARAMETER_FIELDS: Record<string, ExtraField> = {
-  dimensions: { label: "Output dimensions", hint: "Optional. Leave blank for the model's own vector size." },
+  dimensions: { label: optionalLabel("Output dimensions"), hint: "Leave blank for the model's own vector size." },
 };
 
 /** The token limits a model may state, by the name the server gives them. Each is a number of tokens. */
@@ -37,21 +45,36 @@ const TOKEN_LIMIT_FIELDS: Record<string, ExtraField> = {
   max_output_tokens: { label: "Maximum output", hint: "In tokens: the most the model writes in one answer." },
 };
 
-function fallbackField(name: string): ExtraField {
+function fallbackLabel(name: string): string {
   const words = name.replaceAll("_", " ");
-  return { label: words.charAt(0).toUpperCase() + words.slice(1), hint: "Optional." };
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+function optionalFallback(name: string): ExtraField {
+  return { label: optionalLabel(fallbackLabel(name)), hint: null };
 }
 
 export function optionField(name: string): ExtraField {
-  return OPTION_FIELDS[name] ?? fallbackField(name);
+  return OPTION_FIELDS[name] ?? optionalFallback(name);
 }
 
 export function parameterField(name: string): ExtraField {
-  return PARAMETER_FIELDS[name] ?? fallbackField(name);
+  return PARAMETER_FIELDS[name] ?? optionalFallback(name);
 }
 
-export function tokenLimitField(name: string): ExtraField {
-  return TOKEN_LIMIT_FIELDS[name] ?? fallbackField(name);
+/**
+ * A token limit field. The limits are optional while LiteLLM or the server
+ * environment has them for the model, and required once validation found that
+ * nothing has.
+ */
+export function tokenLimitField(name: string, { required }: { required: boolean }): ExtraField {
+  const field = TOKEN_LIMIT_FIELDS[name] ?? { label: fallbackLabel(name), hint: null };
+  return required ? field : { ...field, label: optionalLabel(field.label) };
+}
+
+/** What a token limit is called where it is shown rather than edited. */
+export function tokenLimitLabel(name: string): string {
+  return TOKEN_LIMIT_FIELDS[name]?.label ?? fallbackLabel(name);
 }
 
 /** The providers that serve models of `kind`, in the order the server lists them. */
@@ -88,7 +111,8 @@ export interface EndpointFieldCopy extends TextFieldCopy {
 /**
  * How the base URL field reads for a provider. Credentials from the server
  * environment go only to the provider's own address, so the field is fixed
- * while that way of authenticating is chosen.
+ * while that way of authenticating is chosen. A provider with an address of
+ * its own uses it for a blank field, so the field is optional and says so.
  */
 export function endpointField(provider: ModelProvider, authStrategy: AuthStrategy): EndpointFieldCopy {
   const ownAddress = provider.default_endpoint;
@@ -104,17 +128,27 @@ export function endpointField(provider: ModelProvider, authStrategy: AuthStrateg
     };
   }
   if (provider.endpoint_required) {
-    return { label: "Base URL", placeholder: "https://api.example.com/v1", hint: null, fixed: false };
+    return {
+      label: "Base URL",
+      placeholder: "https://api.example.com/v1",
+      hint: "The address the API's paths start from. A /chat/completions or /models path at its end is left out.",
+      fixed: false,
+    };
   }
   if (ownAddress === null) {
     return {
-      label: "Base URL (optional)",
+      label: optionalLabel("Base URL"),
       placeholder: "Decided by the route",
       hint: "Leave blank unless the route needs the address of a specific server.",
       fixed: false,
     };
   }
-  return { label: "Base URL", placeholder: ownAddress, hint: null, fixed: false };
+  return {
+    label: optionalLabel("Base URL"),
+    placeholder: ownAddress,
+    hint: `Defaults to the ${provider.label} API at ${ownAddress}; change it only for a proxy or another server.`,
+    fixed: false,
+  };
 }
 
 /** How the model field reads for a provider. */
@@ -126,5 +160,9 @@ export function modelField(provider: ModelProvider): TextFieldCopy {
       hint: "The provider and the model, separated by a slash, as LiteLLM names them.",
     };
   }
-  return { label: "Model", placeholder: "Model id", hint: null };
+  return {
+    label: "Model",
+    placeholder: "Model id",
+    hint: provider.lists_models ? "Type a model id, or load the provider's models and type here to filter them." : null,
+  };
 }

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { PROVIDERS, makeBinding, makeEmbeddingBinding, makeValidation } from "@/test/modelSettingsFixtures";
 import {
+  awaitsTokenLimits,
   failureReason,
   needsTokenLimits,
   providerLabel,
@@ -79,9 +80,13 @@ describe("validationSummary", () => {
     const saved = makeBinding({ state: "not_validated", validation: refused });
     const deployed = makeBinding({ state: "not_validated", validation: refused, config_source: "deployment" });
 
-    expect(validationSummary(saved, "candidate", NOW).detail).toBe(
-      "The model answered, but MemForge has no token limits for it. Enter its context window and maximum output, then validate again.",
-    );
+    expect(validationSummary(saved, "candidate", NOW)).toEqual({
+      tone: "warn",
+      headline: "One more step: enter the token limits.",
+      detail:
+        "The model answered, but MemForge has no token limits for it. Enter its context window and maximum output, then validate again.",
+    });
+    expect(validationSummary(deployed, "active", NOW).headline).toBe("One more step: set the token limits.");
     expect(validationSummary(deployed, "active", NOW).detail).toBe(
       "The model answered, but MemForge has no token limits for it. Set MEMFORGE_LLM_MAX_INPUT_TOKENS, MEMFORGE_LLM_CONTEXT_WINDOW_TOKENS and MEMFORGE_LLM_MAX_OUTPUT_TOKENS on the server. MemForge keeps using this model.",
     );
@@ -110,6 +115,15 @@ test("validation facts are read by type, and anything else is left out", () => {
   const validation = makeValidation({ facts: { latency_ms: "fast", dimension: 768, provider_model: "", token_limits_known: false } });
 
   expect(validationFacts(validation)).toEqual({ dimension: 768, token_limits_known: false });
+});
+
+test("only a validation that failed for want of token limits awaits them", () => {
+  const refused = makeValidation({ passed: false, error_code: "token_limits_required", facts: { token_limits_known: false } });
+
+  expect(awaitsTokenLimits(makeBinding({ validation: refused }))).toBe(true);
+  expect(awaitsTokenLimits(makeBinding({ validation: makeValidation({ passed: false, error_code: "timeout", facts: {} }) }))).toBe(false);
+  expect(awaitsTokenLimits(makeBinding({ validation: makeValidation({ facts: { token_limits_known: false } }) }))).toBe(false);
+  expect(awaitsTokenLimits(makeBinding({ validation: null }))).toBe(false);
 });
 
 test("a model needs its token limits stated once a validation found that the server has none", () => {
