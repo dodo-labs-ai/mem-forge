@@ -185,6 +185,7 @@ def test_an_api_key_binding_compiles_with_its_key_and_default_endpoint() -> None
         route="anthropic/claude-sonnet-4",
         api_base="https://api.anthropic.com",
         api_key="anthropic-key",
+        provider="anthropic",
     )
 
 
@@ -215,7 +216,7 @@ def test_the_environment_strategy_passes_no_key_so_the_sdk_resolves_it() -> None
 
     invocation = compile_binding(binding, None)
 
-    assert invocation == ResolvedInvocation(route="sap/anthropic--claude-4.6-sonnet")
+    assert invocation == ResolvedInvocation(route="sap/anthropic--claude-4.6-sonnet", provider="litellm")
     assert invocation.request_kwargs() == {}
 
 
@@ -351,3 +352,55 @@ def test_a_binding_is_bound_to_the_normalized_origin_of_its_endpoint(endpoint, o
 def test_a_route_without_an_endpoint_is_bound_to_the_provider_of_its_route() -> None:
     assert _binding("litellm", model_id="groq/llama-3").origin == "provider:groq"
     assert _binding("litellm", model_id="voyage/voyage-3", kind="embedding").origin == "provider:voyage"
+
+
+@pytest.mark.parametrize(
+    ("provider", "model_id", "parameters"),
+    [
+        ("openrouter", "anthropic/claude-haiku-5.5", {"extra_body": {"reasoning": {"enabled": False}}}),
+        ("openrouter", "openai/gpt-5-mini", {"extra_body": {"reasoning": {"enabled": False}}}),
+        ("anthropic", "claude-haiku-4-5", {}),
+        ("openai", "gpt-5.1", {"reasoning_effort": "none"}),
+        ("openai", "gpt-5-mini", {"reasoning_effort": "minimal"}),
+        ("openai", "o4-mini", {"reasoning_effort": "low"}),
+        ("openai", "gpt-4o-mini", {}),
+        ("openai", "gpt-5-chat-latest", {}),
+        ("openai", "a-model-litellm-does-not-know", {}),
+        ("ollama", "qwen3", {"think": False}),
+        ("ollama", "gpt-oss:20b", {"think": "low"}),
+        ("openai_compatible", "gpt-5-mini", {}),
+        ("openai_compatible", "qwen3", {}),
+        ("litellm", "sap/anthropic--claude-4.6-sonnet", {}),
+        ("litellm", "sap/gpt-5-mini", {}),
+        ("litellm", "openrouter/anthropic/claude-haiku-5.5", {}),
+        ("litellm", "openai/gpt-5-mini", {}),
+        ("litellm", "ollama_chat/qwen3", {}),
+    ],
+)
+def test_each_descriptor_says_how_its_generation_model_answers_without_reasoning(
+    provider, model_id, parameters
+) -> None:
+    descriptor = provider_descriptor(provider)
+    route = descriptor.compile_route("generation", model_id)
+
+    assert descriptor.reasoning_off(route) == parameters
+
+
+def test_reasoning_off_parameters_are_a_fresh_value_for_every_request() -> None:
+    """LiteLLM merges into ``extra_body`` in place, so no request may share it with the next."""
+    descriptor = provider_descriptor("openrouter")
+    first = descriptor.reasoning_off("openrouter/anthropic/claude-haiku-5.5")
+    first["extra_body"]["reasoning"]["enabled"] = True
+
+    assert descriptor.reasoning_off("openrouter/anthropic/claude-haiku-5.5") == {
+        "extra_body": {"reasoning": {"enabled": False}}
+    }
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "openrouter", "ollama", "openai_compatible", "litellm"])
+def test_a_compiled_invocation_names_the_descriptor_it_was_compiled_from(provider) -> None:
+    model_id = "sap/anthropic--claude-4.6-sonnet" if provider == "litellm" else "model-a"
+    endpoint = "https://models.example.test/v1" if provider == "openai_compatible" else None
+    binding = _binding(provider, model_id=model_id, endpoint=endpoint, secret_ref="secret:one")
+
+    assert compile_binding(binding, "key").provider == provider

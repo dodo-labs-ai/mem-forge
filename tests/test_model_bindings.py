@@ -208,6 +208,7 @@ async def test_environment_values_describe_a_kind_with_nothing_stored(db, tmp_pa
         route="anthropic/claude-sonnet-4",
         api_base="https://api.anthropic.com",
         api_key=GENERATION_KEY,
+        provider="anthropic",
     )
 
 
@@ -231,6 +232,7 @@ async def test_a_stored_binding_wins_over_the_environment(db, tmp_path) -> None:
         route="openai/gpt-5-mini",
         api_base="https://api.openai.com/v1",
         api_key="stored-openai-key-3333",
+        provider="openai",
     )
 
 
@@ -246,6 +248,7 @@ async def test_each_kind_resolves_on_its_own(db, tmp_path) -> None:
         route="ollama/nomic-embed-text",
         api_base="http://localhost:11434",
         api_key="no-api-key",
+        provider="ollama",
     )
 
 
@@ -288,8 +291,8 @@ async def test_a_deployment_managed_installation_compiles_from_the_environment_a
     assert binding.config_source == "deployment"
     assert binding.provider == "litellm"
     assert binding.auth_strategy == "environment"
-    assert models.generation == ResolvedInvocation(route="sap/anthropic--claude-4.6-sonnet")
-    assert models.embedding == ResolvedInvocation(route="sap/text-embedding-3-small")
+    assert models.generation == ResolvedInvocation(route="sap/anthropic--claude-4.6-sonnet", provider="litellm")
+    assert models.embedding == ResolvedInvocation(route="sap/text-embedding-3-small", provider="litellm")
     assert sqlite3.connect(db.db_path).execute("SELECT kind, slot FROM model_bindings").fetchall() == stored_before
 
 
