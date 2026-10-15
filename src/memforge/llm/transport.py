@@ -2,15 +2,27 @@
 
 Generation and embedding both reach their providers through the in-process
 LiteLLM SDK. This module holds what the two paths share: HTTP clients that
-refuse redirects, the SDK's own retries and help notice switched off, and the
-rule for which provider failures are worth another attempt. Each caller owns
-its attempt loop, its pauses and its logical deadline.
+refuse redirects and end each exchange at its timeout, the SDK's own retries
+and help notice switched off, and the rule for which provider failures are
+worth another attempt. Each caller owns its attempt loop, its pauses and its
+logical deadline.
 
 LiteLLM sends a request through one of two kinds of HTTP client. Its
 OpenAI-compatible routes, which carry every model of an OpenAI-compatible
 endpoint, share one process-wide client. Every other route, ``anthropic/``
-among them, uses a client LiteLLM builds for that provider. Both kinds refuse
-redirects here.
+and ``openrouter/`` among them, uses a client LiteLLM builds for that
+provider. Both kinds refuse redirects here, and both end a request at the
+timeout it was sent with.
+
+That timeout is a deadline for the whole exchange. An HTTP client applies a
+timeout to each wait on its own: connecting, writing, every read. A provider
+that keeps the connection busy, sending a byte now and then while the model
+is still working, never makes one wait that long, so the request would stay
+open for as long as the provider likes. Here the exchange as a whole fails as
+a read timeout when its timeout runs out, which the SDK reports as a timeout
+and ``is_retryable_provider_error`` counts as transient. Some routes do not
+send the caller's timeout at all, so every caller also bounds its own call
+with its logical deadline.
 
 LiteLLM also looks a model up by itself, to learn its limits and prices. For an
 Ollama model that lookup is a request, with the key the process environment
@@ -29,6 +41,7 @@ import asyncio
 import functools
 import math
 import threading
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -39,6 +52,7 @@ from litellm.types.utils import ModelInfoBase
 __all__ = [
     "NoRedirectAsyncClient",
     "disable_sdk_default_retries",
+    "end_provider_client_exchanges_at_their_timeout",
     "install_no_redirect_http_client",
     "is_connection_failure",
     "is_retryable_provider_error",
@@ -46,12 +60,48 @@ __all__ = [
     "provider_retry_after_seconds",
     "provider_status_code",
     "refuse_redirects_in_provider_clients",
+    "send_within_timeout",
     "silence_sdk_help_notice",
 ]
 
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
 _REFUSES_REDIRECTS_MARK = "_memforge_refuses_redirects"
+_ENDS_EXCHANGES_AT_THEIR_TIMEOUT_MARK = "_memforge_ends_exchanges_at_their_timeout"
 _LOOKS_UP_AT_ENVIRONMENT_SERVER_ONLY_MARK = "_memforge_looks_up_at_environment_server_only"
+
+
+_Send = Callable[..., Awaitable[httpx.Response]]
+
+
+async def send_within_timeout(send: _Send, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+    """Send ``request`` with ``send`` and have the answer within the request's timeout.
+
+    The timeout counts from sending the request to the last byte of an answer
+    that is read whole. A streamed answer is bounded until its headers arrive,
+    and whoever reads its body bounds the rest. A request sent with no timeout
+    is sent unbounded.
+    """
+    seconds = _exchange_timeout_s(request)
+    if seconds is None:
+        return await send(request, **kwargs)
+    bound = asyncio.timeout(seconds)
+    try:
+        async with bound:
+            return await send(request, **kwargs)
+    except TimeoutError as exc:
+        if not bound.expired():
+            raise
+        raise httpx.ReadTimeout(
+            f"No complete answer within the request timeout of {seconds:g}s",
+            request=request,
+        ) from exc
+
+
+def _exchange_timeout_s(request: httpx.Request) -> float | None:
+    """The longest wait the request allows, which is how long its whole exchange may take."""
+    waits = (request.extensions.get("timeout") or {}).values()
+    limits = [float(wait) for wait in waits if wait is not None]
+    return max(limits) if limits else None
 
 
 class NoRedirectAsyncClient(httpx.AsyncClient):
@@ -65,6 +115,8 @@ class NoRedirectAsyncClient(httpx.AsyncClient):
     it builds, on whichever event loop is running, while a pooled connection
     only works on the loop that opened it. Each event loop therefore sends
     through its own connection pool.
+
+    Each exchange ends at the timeout the request was sent with.
     """
 
     def __init__(self) -> None:
@@ -74,7 +126,7 @@ class NoRedirectAsyncClient(httpx.AsyncClient):
 
     async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
         kwargs["follow_redirects"] = False
-        return await self._pool().send(request, **kwargs)
+        return await send_within_timeout(self._pool().send, request, **kwargs)
 
     async def aclose(self) -> None:
         with self._pools_lock:
@@ -101,7 +153,8 @@ def install_no_redirect_http_client() -> httpx.AsyncClient:
     """Make LiteLLM's shared HTTP client one that refuses redirects.
 
     A client that already refuses redirects is kept, so a host process may
-    install its own before importing MemForge.
+    install its own before importing MemForge; that client's timeouts are the
+    host's to choose.
     """
     session = litellm.aclient_session
     if isinstance(session, httpx.AsyncClient) and not session.follow_redirects:
@@ -129,6 +182,27 @@ def refuse_redirects_in_provider_clients() -> None:
         return client
 
     setattr(create_client, _REFUSES_REDIRECTS_MARK, True)
+    AsyncHTTPHandler.create_client = create_client
+
+
+def end_provider_client_exchanges_at_their_timeout() -> None:
+    """Make every HTTP client LiteLLM builds for a provider end a request at its timeout.
+
+    LiteLLM sends each request of a provider route through ``send`` of the
+    client ``AsyncHTTPHandler.create_client`` builds. Each client gets that
+    method bounded by ``send_within_timeout`` as it is built.
+    """
+    build_client = AsyncHTTPHandler.create_client
+    if getattr(build_client, _ENDS_EXCHANGES_AT_THEIR_TIMEOUT_MARK, False):
+        return
+
+    @functools.wraps(build_client)
+    def create_client(self: AsyncHTTPHandler, *args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        client = build_client(self, *args, **kwargs)
+        client.send = functools.partial(send_within_timeout, client.send)
+        return client
+
+    setattr(create_client, _ENDS_EXCHANGES_AT_THEIR_TIMEOUT_MARK, True)
     AsyncHTTPHandler.create_client = create_client
 
 
@@ -257,6 +331,7 @@ def _answered_status_code(exc: BaseException) -> int | None:
 
 install_no_redirect_http_client()
 refuse_redirects_in_provider_clients()
+end_provider_client_exchanges_at_their_timeout()
 keep_ollama_model_lookups_off_request_endpoints()
 disable_sdk_default_retries()
 silence_sdk_help_notice()

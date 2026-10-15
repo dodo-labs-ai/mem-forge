@@ -25,6 +25,7 @@ from memforge.runtime import DefaultRuntimeProvider, SourceSyncWorker, resolve_m
 from memforge.server import model_settings_api
 from memforge.server.admin_api import create_admin_app
 from memforge.storage.database import Database
+from tests.stalling_endpoint_fixture import GIVES_UP_AFTER_S, STALL_MODES, stalling_endpoint
 from tests.test_model_bindings import _database_with_llm_config
 
 SECRET_KEY = "VV4JjZLLr2BcgRnhV90gCnxzchn43M900VQy3dXJI30="
@@ -2009,6 +2010,22 @@ def test_discovery_refuses_an_endpoint_that_carries_a_credential(db, tmp_path, m
     assert (payload["ok"], payload["stage"], payload["error_code"]) == (False, "validation", "endpoint_invalid")
     assert "pw-secret" not in response.text
     assert endpoint.requests == []
+
+
+@pytest.mark.parametrize("mode", STALL_MODES)
+def test_discovery_of_an_endpoint_that_does_not_finish_answering_ends_as_a_timeout(
+    db, tmp_path, monkeypatch, mode
+) -> None:
+    monkeypatch.setattr(model_settings_api, "_LISTING_TIMEOUT_S", 0.5)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    with stalling_endpoint(mode) as base_url:
+        started = time.monotonic()
+        payload = _discover(client, provider="openai_compatible", endpoint=f"{base_url}/v1", api_key=OTHER_KEY)
+        elapsed_s = time.monotonic() - started
+
+    assert (payload["ok"], payload["stage"], payload["error_code"]) == (False, "timeout", "timeout")
+    assert elapsed_s < GIVES_UP_AFTER_S / 2
 
 
 # -- Keys never leave ---------------------------------------------------------------
