@@ -10,11 +10,14 @@ import litellm
 import pytest
 from litellm.caching.llm_caching_handler import LLMClientCache
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+from pydantic import ConfigDict
 
 from memforge.llm.bindings import build_binding, compile_binding
 from memforge.llm.embedding import EmbeddingProviderError, EmbeddingRuntime, EmbeddingSettings
 from memforge.llm.providers import ResolvedInvocation
-from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError
+from memforge.llm.structured import (
+    LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError, StructuredResponseModel,
+)
 from memforge.llm.transport import (
     NoRedirectAsyncClient,
     install_no_redirect_http_client,
@@ -518,3 +521,93 @@ def test_keeping_ollama_lookups_off_request_endpoints_wraps_the_lookup_once() ->
     keep_ollama_model_lookups_off_request_endpoints()
 
     assert litellm.OllamaConfig.get_model_info is lookup
+
+
+class _RankingAnswer(StructuredResponseModel):
+    """An answer the model may reason toward: a schema that is not a direct answer."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    ranking: list[int] = []
+
+
+def _chat_reply(request: httpx.Request) -> httpx.Response:
+    """Answer a chat request in the wire shape of the provider it was sent to."""
+    answer = json.dumps({"ranking": []})
+    if request.url.path.endswith("/v1/messages"):
+        return httpx.Response(200, json={
+            "id": "msg-1", "type": "message", "role": "assistant", "model": "chat-model",
+            "content": [{"type": "text", "text": answer}], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+    if request.url.path.endswith("/api/chat"):
+        return httpx.Response(200, json={
+            "model": "chat-model", "message": {"role": "assistant", "content": answer},
+            "done": True, "done_reason": "stop", "prompt_eval_count": 1, "eval_count": 1,
+        })
+    return httpx.Response(200, json={
+        "id": "chat-1", "object": "chat.completion", "created": 1, "model": "chat-model",
+        "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": answer}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    })
+
+
+@pytest.fixture
+async def chat_endpoint(monkeypatch):
+    """An in-memory chat endpoint behind every HTTP client LiteLLM sends generation requests through."""
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _chat_reply(request)
+
+    shared = _InMemoryClient(respond)
+    monkeypatch.setattr(litellm, "aclient_session", shared)
+    monkeypatch.setattr(
+        AsyncHTTPHandler,
+        "_create_async_transport",
+        staticmethod(lambda **_options: httpx.MockTransport(respond)),
+    )
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
+    monkeypatch.setattr(litellm, "module_level_client", _OllamaLookups())
+    yield requests
+    await GLOBAL_LOGGING_WORKER.flush()
+    await shared.aclose()
+
+
+@pytest.mark.parametrize(
+    ("provider", "model_id", "endpoint_url", "reasoning_off"),
+    [
+        ("openrouter", "anthropic/claude-haiku-5.5", "https://router.example.test/api/v1",
+         {"reasoning": {"enabled": False}}),
+        ("ollama", "qwen3", "https://ollama-chat.example.test", {"think": False}),
+        ("openai", "gpt-5-mini", "https://openai-chat.example.test/v1", {"reasoning_effort": "minimal"}),
+        ("anthropic", "claude-haiku-4-5", "https://anthropic-chat.example.test", {}),
+    ],
+)
+async def test_only_a_direct_answer_asks_the_provider_to_answer_without_reasoning(
+    chat_endpoint, provider, model_id, endpoint_url, reasoning_off
+) -> None:
+    """LiteLLM writes the descriptor's reasoning-off parameters into the provider's request body."""
+    keyless = provider == "ollama"
+    binding = build_binding(
+        kind="generation",
+        provider=provider,
+        model_id=model_id,
+        endpoint=endpoint_url,
+        auth_strategy="none" if keyless else "api_key",
+        secret_ref=None if keyless else "secret:test",
+        config_source="settings",
+    )
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig.for_invocation(compile_binding(binding, None if keyless else "endpoint-key"), timeout_s=5.0)
+    )
+
+    await client.rerank_memories("Rank the matching memories")
+    await client.answer_schema("Rank the matching memories", response_format=_RankingAnswer, max_tokens=256)
+
+    direct, reasoned = (json.loads(request.content) for request in chat_endpoint)
+    assert {name: direct[name] for name in set(direct) - set(reasoned)} == reasoning_off
+    assert set(reasoned) <= set(direct)
