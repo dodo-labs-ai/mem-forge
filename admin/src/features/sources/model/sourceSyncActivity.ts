@@ -5,6 +5,13 @@ export type SourceSyncRetryTarget =
   | { execution_kind: "local_agent_job"; execution_id: string }
   | { execution_kind: "source_sync_run"; execution_id: string };
 
+export type AbsenceCheckSkippedReason = NonNullable<SyncStatus["absence_check_skipped_reason"]>;
+
+const ABSENCE_CHECK_SKIPPED_NOTICES: Record<AbsenceCheckSkippedReason, string> = {
+  scope_listing_failed: "the list of items in scope could not be read in full",
+  absence_confirmation_failed: "the source could not confirm which missing items were deleted",
+};
+
 export type SourceSyncActivityState =
   | "queued"
   | "active"
@@ -26,7 +33,7 @@ export interface SourceSyncActivity {
   nextAttemptAt?: string | null;
   retryTarget?: SourceSyncRetryTarget;
   /** Why a finished run removed nothing although it was due to check for deleted items. */
-  absenceCheckSkippedReason?: string | null;
+  absenceCheckSkippedReason?: AbsenceCheckSkippedReason | null;
 }
 
 export interface SourceSyncPresentation {
@@ -226,8 +233,13 @@ export function presentSourceSyncActivity(
       activity.progress,
       fallbackItems,
     );
-    const reason = activity.absenceCheckSkippedReason?.trim();
-    return reason ? { ...presentation, notice: `Deletion check skipped: ${reason}` } : presentation;
+    const reason = activity.absenceCheckSkippedReason;
+    return reason
+      ? {
+          ...presentation,
+          notice: `Deletion check skipped: ${ABSENCE_CHECK_SKIPPED_NOTICES[reason]}. Nothing was removed; the next sync checks again.`,
+        }
+      : presentation;
   }
 
   const snapshot = activity.progress;

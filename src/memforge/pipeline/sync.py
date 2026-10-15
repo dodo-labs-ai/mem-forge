@@ -45,6 +45,7 @@ from memforge.llm.structured import (
 )
 from memforge.llm.structured import failure_retryable as retries_failure
 from memforge.models import (
+    AbsenceCheckSkippedReason,
     ChangelogEntry,
     ContentItem,
     DocumentRecord,
@@ -557,6 +558,14 @@ def summarize_failed_documents(docs_failed: int, failed_docs: list[FailedDoc]) -
 _MAX_RETAINED_DOCUMENT_ERROR_CHARS = 512
 
 
+class AbsenceCheckSkipped(Exception):
+    """A sync run's absence check did not complete; ``reason`` says which step failed."""
+
+    def __init__(self, reason: AbsenceCheckSkippedReason) -> None:
+        super().__init__(reason)
+        self.reason: AbsenceCheckSkippedReason = reason
+
+
 class MemoryExtractionFailure(RuntimeError):
     """Extraction exhausted its own retry policy; do not replay the document.
 
@@ -870,7 +879,7 @@ class GeneSyncOrchestrator:
         reused_projection_count = 0
         total_item_count = 0
         failure_retryable = True
-        absence_check_skipped_reason: str | None = None
+        absence_check_skipped_reason: AbsenceCheckSkippedReason | None = None
         recovered_completed_results: tuple[dict[str, Any], ...] = ()
         recovered_deferred_results: tuple[dict[str, Any], ...] = ()
         recovered_failed_results: tuple[dict[str, Any], ...] = ()
@@ -1401,16 +1410,18 @@ class GeneSyncOrchestrator:
                         source_id=source_id,
                         indexed_doc_ids=indexed_doc_ids,
                     )
-                except Exception as exc:
+                except AbsenceCheckSkipped as exc:
                     # The run's content is committed; only the absence proof is
                     # missing, so every unlisted Document keeps its Support and
-                    # the next run lists again. The run records why, so its
-                    # sync activity shows that nothing was removed.
-                    absence_check_skipped_reason = str(exc) or type(exc).__name__
+                    # the next run lists again. The run records which step
+                    # failed, so its sync activity shows that nothing was
+                    # removed; the provider's error stays in the log.
+                    absence_check_skipped_reason = exc.reason
                     logger.warning(
-                        "Absence check skipped for %s: its scope listing did not complete: %s",
+                        "Absence check skipped for %s (%s): %s",
                         source_id,
-                        absence_check_skipped_reason,
+                        exc.reason,
+                        exc.__cause__,
                     )
 
             if absent_doc_ids is not None:
@@ -3534,7 +3545,8 @@ class GeneSyncOrchestrator:
         """The held Documents this run's scope listing proves the provider no longer has.
 
         ``None`` when the Gene cannot list its scope. A listing or confirmation
-        that fails raises, and the caller removes nothing in this run. An unlisted
+        that fails raises ``AbsenceCheckSkipped`` naming the step, and the
+        caller removes nothing in this run. An unlisted
         Document of an existence listing is absent. One of a query listing is
         absent only when the provider reports it not found; one that still
         exists keeps its Unit and Support and is not refreshed while it stays
@@ -3542,21 +3554,27 @@ class GeneSyncOrchestrator:
         """
 
         list_scope = getattr(gene, "list_scope", None)
-        listing = await list_scope() if callable(list_scope) else None
+        try:
+            listing = await list_scope() if callable(list_scope) else None
+        except Exception as exc:
+            raise AbsenceCheckSkipped("scope_listing_failed") from exc
         if listing is None:
             return None
         unlisted = indexed_doc_ids - listing.doc_ids
         if not unlisted or listing.kind is ScopeListingKind.EXISTENCE:
             return unlisted
-        items = []
-        for doc_id in sorted(unlisted):
-            try:
-                items.append(await stored_source_item(self.db, source_id=source_id, document_id=doc_id))
-            except StoredDocumentUnavailable as exc:
-                # Nothing identifies the Document to ask its provider for, so
-                # its absence cannot be proven and it is kept.
-                logger.warning("Cannot confirm whether unlisted Document %s still exists: %s", doc_id, exc)
-        absent = set(await gene.confirm_absent(items)) & unlisted
+        try:
+            items = []
+            for doc_id in sorted(unlisted):
+                try:
+                    items.append(await stored_source_item(self.db, source_id=source_id, document_id=doc_id))
+                except StoredDocumentUnavailable as exc:
+                    # Nothing identifies the Document to ask its provider for,
+                    # so its absence cannot be proven and it is kept.
+                    logger.warning("Cannot confirm whether unlisted Document %s still exists: %s", doc_id, exc)
+            absent = set(await gene.confirm_absent(items)) & unlisted
+        except Exception as exc:
+            raise AbsenceCheckSkipped("absence_confirmation_failed") from exc
         logger.info(
             "Scope listing of %s left %d held Documents unlisted; %d are absent at the provider",
             source_id,
