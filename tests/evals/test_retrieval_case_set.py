@@ -39,6 +39,12 @@ def test_load_case_set_validates_manifest_cases_and_scope_shape() -> None:
         "requested_known_item_is_honored",
         "requested_relationship_falls_back",
         "requested_relationship_is_honored",
+        "product_name_question_prefers_semantic_answer",
+        "unicode_product_name_question_prefers_semantic_answer",
+        "bare_code_symbol_lookup",
+        "code_symbol_with_words_keeps_exact_symbol_first",
+        "slash_prose_question_stays_general",
+        "file_name_question_is_known_item",
     )
 
     title_case = case_set.get_case("metadata_title_exact")

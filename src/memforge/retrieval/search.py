@@ -41,7 +41,11 @@ from memforge.retrieval.intents import (
     validate_requested_intent,
 )
 from memforge.retrieval.query_analyzer import QueryAnalysis
-from memforge.retrieval.query_plan import build_lexical_query_plan
+from memforge.retrieval.query_plan import (
+    LexicalQueryPlan,
+    MetadataLexicalQueryPlan,
+    build_lexical_query_plan,
+)
 from memforge.retrieval.rank_fusion import (
     RankedChannelItem,
     weighted_reciprocal_rank_fusion,
@@ -84,12 +88,6 @@ _METADATA_SUBCHANNEL_WEIGHTS = {
 }
 _METADATA_IDENTIFIER_CHANNELS = {"bm25_metadata_tokens", "metadata_alias"}
 
-_EXTERNAL_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b|#\d+\b|\bINC\d+\b", re.IGNORECASE)
-_CODE_SYMBOL_RE = re.compile(
-    r"(?:\b[A-Za-z][A-Za-z0-9]*[./][A-Za-z0-9_./-]+\b)"
-    r"|(?:\b[A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*\b)"
-    r"|(?:\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b)"
-)
 _QUOTED_IDENTITY_RE = re.compile(r'"([^"\n]+)"|“([^”\n]+)”')
 _MAX_QUOTED_IDENTITY_LENGTH = 256
 # Requested output for one listwise ranking: a short array of memory numbers.
@@ -112,12 +110,6 @@ class _RankedCandidate:
     project_key: str | None = None
     repo_identifier: str | None = None
     retrieval_evidence: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class _QueryFeatures:
-    has_external_id: bool
-    has_code_symbol: bool
 
 
 @dataclass(frozen=True)
@@ -166,15 +158,6 @@ def _age_days(dt: datetime | None) -> float:
 def _recency_score(age_days: float, half_life: float = 90.0) -> float:
     """Exponential decay: exp(-0.693 * age_days / half_life)."""
     return math.exp(-0.693 * age_days / half_life)
-
-
-def _compute_query_features(
-    query: str,
-) -> _QueryFeatures:
-    return _QueryFeatures(
-        has_external_id=bool(_EXTERNAL_ID_RE.search(query)),
-        has_code_symbol=bool(_CODE_SYMBOL_RE.search(query)),
-    )
 
 
 def _has_strong_metadata_identity(
@@ -624,6 +607,7 @@ class SearchEngine:
         analysis.use_graph = bool(graph_candidates)
 
         # ----- 2. Run active channels in parallel -----
+        lexical_plan = build_lexical_query_plan(query)
         configured_window = max(
             1,
             int(getattr(self._config, "rank_window_size", DEFAULT_RANK_WINDOW_SIZE)),
@@ -646,7 +630,7 @@ class SearchEngine:
 
         tasks.append(asyncio.ensure_future(
             self._metadata_searches(
-                query,
+                lexical_plan,
                 requested_intent,
                 memory_types,
                 scope,
@@ -714,11 +698,9 @@ class SearchEngine:
             else:
                 logger.warning("Unknown retrieval channel result ignored: %s", name)
 
-        features = _compute_query_features(query)
         intent_resolution = resolve_retrieval_intent(
             requested_intent,
-            has_external_id=features.has_external_id,
-            has_code_symbol=features.has_code_symbol,
+            identity=lexical_plan.identity,
             has_strong_metadata_identity=_has_strong_metadata_identity(query, metadata_hits),
             has_traversable_entity=bool(graph_candidates),
         )
@@ -847,7 +829,7 @@ class SearchEngine:
 
     async def _bm25_metadata_search(
         self,
-        query: str,
+        query_plan: MetadataLexicalQueryPlan,
         memory_types: list[str] | None,
         scope: AccessScope,
         limit: int,
@@ -856,7 +838,6 @@ class SearchEngine:
         time_range: MemoryTimeRange | None,
     ) -> list[KeywordCandidate]:
         """Query the source-metadata keyword channel."""
-        query_plan = build_lexical_query_plan(query).metadata
         if not query_plan.ordinary_terms and not query_plan.exact_anchors:
             return []
         return await self._keyword.search_metadata(
@@ -871,7 +852,7 @@ class SearchEngine:
 
     async def _metadata_searches(
         self,
-        query: str,
+        lexical_plan: LexicalQueryPlan,
         requested_intent: RankedRetrievalIntent | None,
         memory_types: list[str] | None,
         scope: AccessScope,
@@ -882,22 +863,23 @@ class SearchEngine:
     ) -> tuple[list[KeywordCandidate], dict[str, tuple[str, ...]]]:
         """Run the full metadata query plus one explicitly quoted identity."""
 
-        queries = [("full_query", query)]
+        query = lexical_plan.raw_query
+        queries = [("full_query", lexical_plan.metadata)]
         quoted_identity = _quoted_identity_query(query) if requested_intent == "known_item" else None
         if quoted_identity is not None and quoted_identity != query.strip():
-            queries.append(("quoted_identity", quoted_identity))
+            queries.append(("quoted_identity", build_lexical_query_plan(quoted_identity).metadata))
 
         result_sets = await asyncio.gather(
             *(
                 self._bm25_metadata_search(
-                    metadata_query,
+                    metadata_plan,
                     memory_types,
                     scope,
                     limit,
                     source_filter=source_filter,
                     time_range=time_range,
                 )
-                for _, metadata_query in queries
+                for _, metadata_plan in queries
             )
         )
         best_hits: dict[tuple[str, str], KeywordCandidate] = {}
