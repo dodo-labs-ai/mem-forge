@@ -658,6 +658,7 @@ async def test_the_runtime_uses_a_promoted_binding(db, tmp_path, providers) -> N
         route="openai/gpt-5-mini",
         api_base="https://api.openai.com/v1",
         api_key=GENERATION_KEY,
+        provider="openai",
     )
 
 

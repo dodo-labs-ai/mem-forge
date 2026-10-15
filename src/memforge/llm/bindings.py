@@ -312,6 +312,7 @@ def compile_binding(binding: ModelBinding, credential: str | None) -> ResolvedIn
         api_base=binding.endpoint,
         api_key=api_key,
         extra_params={**binding.options, **binding.parameters},
+        provider=binding.provider,
     )
 
 

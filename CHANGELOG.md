@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Closed-choice model calls no longer fail with `output_truncated` because the
+  model spent their small output budget reasoning before it answered. These
+  calls (relation classification, cross-document relations, change impact,
+  candidate admission, agent-session authority, entity adjudication,
+  reranking, the offline semantic judge and the generation model check) are
+  sized for a short JSON answer, and a model that reasons by default, such as
+  `anthropic/claude-haiku-5.5` on OpenRouter, could use all of it and return
+  no answer or half of one. They now ask the model to answer directly, as each
+  provider allows: OpenRouter is sent `reasoning: {"enabled": false}`, OpenAI
+  the lowest `reasoning_effort` LiteLLM knows the model takes, and Ollama
+  `think: false` (`"low"` for gpt-oss, which cannot stop thinking). Anthropic
+  models do not think unless asked, and OpenAI-compatible endpoints and
+  LiteLLM routes are sent nothing. A provider whose rejection names the
+  parameter is asked again without it, and is not sent it for that model
+  again; other rejections are handled as before. Claim extraction, claim
+  revision, Support assessment and knowledge patches keep the provider's
+  default. When any call is still cut off at its output limit after reasoning
+  used most of it, it is sent once more with the limit raised by that
+  reasoning, within the model's output limit and context window, and a repair
+  or JSON-text attempt of the same call keeps that limit; the call's
+  telemetry, the Source Unit LLM summary (`reasoning_budget_retries`) and the
+  `reasoning_budget_recovered` quality signal show it. Cloud: no change
+  needed. Cloud's AI Core models are bindings of the LiteLLM route provider,
+  so their requests gain no parameter; only the once-raised `max_tokens` can
+  differ, and only when an AI Core reply reports reasoning that used up its
+  budget.
 - Settings → Load models lists the models of the kind being set up. OpenRouter
   embedding models come from its embedding list (`/embeddings/models`) instead
   of its chat models; OpenAI's one list is split by model id; Ollama is asked
