@@ -6357,6 +6357,12 @@
             ],
             "title": "Error Code"
           },
+          "kind_filtered": {
+            "default": false,
+            "description": "Whether models holds only models of the requested kind. False when the endpoint lists its models without saying which kind each one is.",
+            "title": "Kind Filtered",
+            "type": "boolean"
+          },
           "latency_ms": {
             "anyOf": [
               {
@@ -6373,6 +6379,7 @@
             "type": "string"
           },
           "models": {
+            "description": "The listed models of the requested kind, or every listed model when kind_filtered is false.",
             "items": {
               "$ref": "#/components/schemas/ModelOption"
             },
@@ -6518,6 +6525,18 @@
       },
       "ModelOption": {
         "properties": {
+          "context_window_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The context window the listing gives for the model, in tokens; null when it gives none.",
+            "title": "Context Window Tokens"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -6532,6 +6551,18 @@
               }
             ],
             "title": "Label"
+          },
+          "max_output_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The largest output the listing gives for the model, in tokens; null when it gives none.",
+            "title": "Max Output Tokens"
           }
         },
         "required": [

@@ -21,9 +21,13 @@ import {
   environmentEndpointMessage,
   fieldProblems,
   formOrigin,
+  hasTokenLimitValues,
   isChanged,
+  listedTokenLimits,
   offersTokenLimits,
   savedValues,
+  tokenLimitsForChoice,
+  tokenLimitsForTypedModel,
   valuesForProvider,
   type ModelFormValues,
 } from "./modelForm";
@@ -174,6 +178,66 @@ describe("offersTokenLimits", () => {
 
   test("offers them for a model that states limits, so they can be changed", () => {
     expect(offersTokenLimits(makeBinding({ token_limits: { max_output_tokens: 4096 } }))).toBe(true);
+  });
+});
+
+describe("token limits from a model list", () => {
+  const NAMES = ["context_window_tokens", "max_output_tokens"];
+  const HAIKU = { context_window_tokens: "1000000", max_output_tokens: "128000" };
+  const EMPTY = { context_window_tokens: "", max_output_tokens: "" };
+
+  test("are the limits the listing gives, among the fields the form has", () => {
+    expect(
+      listedTokenLimits({ id: "anthropic/claude-haiku-5.5", context_window_tokens: 1000000, max_output_tokens: 128000 }, NAMES),
+    ).toEqual(HAIKU);
+    expect(listedTokenLimits({ id: "openai/gpt-5-mini", context_window_tokens: 400000, max_output_tokens: null }, NAMES)).toEqual({
+      context_window_tokens: "400000",
+    });
+    expect(listedTokenLimits({ id: "text-embedding-3-small", context_window_tokens: 8192 }, [])).toEqual({});
+  });
+
+  test("fill empty fields", () => {
+    expect(tokenLimitsForChoice({}, NAMES, null, HAIKU)).toEqual(HAIKU);
+    expect(tokenLimitsForChoice(EMPTY, NAMES, null, { context_window_tokens: "400000" })).toEqual({
+      context_window_tokens: "400000",
+      max_output_tokens: "",
+    });
+  });
+
+  test("replace what an earlier choice filled in, and clear it for a model the listing gives none for", () => {
+    const earlier = { context_window_tokens: "400000", max_output_tokens: "" };
+
+    expect(tokenLimitsForChoice(earlier, NAMES, earlier, HAIKU)).toEqual(HAIKU);
+    expect(tokenLimitsForChoice(HAIKU, NAMES, HAIKU, {})).toEqual(EMPTY);
+  });
+
+  test("leave limits the user entered alone", () => {
+    const typed = { context_window_tokens: "32768", max_output_tokens: "" };
+
+    expect(tokenLimitsForChoice(typed, NAMES, null, HAIKU)).toBeNull();
+    expect(tokenLimitsForChoice(typed, NAMES, HAIKU, HAIKU)).toBeNull();
+    expect(tokenLimitsForChoice(EMPTY, NAMES, null, {})).toBeNull();
+  });
+
+  test("clear when the user types another model than the one they were listed for", () => {
+    const filled = { model: "anthropic/claude-haiku-5.5", limits: HAIKU };
+
+    expect(tokenLimitsForTypedModel(HAIKU, NAMES, filled, "mistral/my-own-model")).toEqual(EMPTY);
+    expect(tokenLimitsForTypedModel(HAIKU, NAMES, filled, "")).toEqual(EMPTY);
+  });
+
+  test("stay while the Model field names the listed model, or when the user entered them", () => {
+    const filled = { model: "anthropic/claude-haiku-5.5", limits: HAIKU };
+    const edited = { ...HAIKU, max_output_tokens: "64000" };
+
+    expect(tokenLimitsForTypedModel(HAIKU, NAMES, filled, " anthropic/claude-haiku-5.5 ")).toBeNull();
+    expect(tokenLimitsForTypedModel(edited, NAMES, filled, "mistral/my-own-model")).toBeNull();
+    expect(tokenLimitsForTypedModel(HAIKU, NAMES, null, "mistral/my-own-model")).toBeNull();
+  });
+
+  test("count as values only when one is filled in", () => {
+    expect(hasTokenLimitValues(EMPTY)).toBe(false);
+    expect(hasTokenLimitValues({ max_output_tokens: " 4096 " })).toBe(true);
   });
 });
 

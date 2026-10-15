@@ -6,6 +6,7 @@ discovery, and the Memory vector index that belongs to the embedding model.
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -33,6 +34,7 @@ from memforge.llm.providers import (
     AuthStrategy,
     ModelConfigError,
     ModelKind,
+    ModelListing,
     ProviderDescriptor,
     endpoint_carries_credentials,
     endpoint_origin,
@@ -373,6 +375,14 @@ class ModelValidationResponse(BaseModel):
 class ModelOption(BaseModel):
     id: str
     label: str | None = None
+    context_window_tokens: int | None = Field(
+        default=None,
+        description="The context window the listing gives for the model, in tokens; null when it gives none.",
+    )
+    max_output_tokens: int | None = Field(
+        default=None,
+        description="The largest output the listing gives for the model, in tokens; null when it gives none.",
+    )
 
 
 class ModelDiscoveryRequest(BaseModel):
@@ -388,7 +398,20 @@ class ModelDiscoveryRequest(BaseModel):
 class ModelDiscoveryResponse(BaseModel):
     ok: bool
     models_supported: bool = False
-    models: list[ModelOption] = Field(default_factory=list)
+    models: list[ModelOption] = Field(
+        default_factory=list,
+        description=(
+            "The listed models of the requested kind, or every listed model when "
+            "kind_filtered is false."
+        ),
+    )
+    kind_filtered: bool = Field(
+        default=False,
+        description=(
+            "Whether models holds only models of the requested kind. False when the endpoint "
+            "lists its models without saying which kind each one is."
+        ),
+    )
     stage: DiscoveryStage | None = None
     error_code: str | None = None
     status: int | None = None
@@ -578,12 +601,19 @@ def build_model_settings_router(
             descriptor = provider_descriptor(req.provider)
         except ModelConfigError as exc:
             raise _http_error(exc) from exc
-        endpoint = (req.endpoint or "").strip() or descriptor.default_endpoint or ""
-        if not descriptor.lists_models:
+        endpoint = descriptor.base_endpoint(req.endpoint or "") or descriptor.default_endpoint or ""
+        listing = descriptor.listing
+        if listing is None:
             return ModelDiscoveryResponse(
                 ok=True,
                 models_supported=False,
                 message=f"{descriptor.label} has no model list. Enter the model yourself.",
+            )
+        if kind not in listing.paths:
+            return ModelDiscoveryResponse(
+                ok=True,
+                models_supported=False,
+                message=f"{descriptor.label} serves no {kind} models.",
             )
         origin = endpoint_origin(endpoint)
         if origin is None:
@@ -614,7 +644,14 @@ def build_model_settings_router(
                         "Enter the API key for this endpoint, then try again."
                     ),
                 )
-        return await _discover_models(descriptor, endpoint=endpoint, api_key=api_key, strategy=strategy)
+        return await _discover_models(
+            descriptor,
+            listing,
+            kind,
+            endpoint=endpoint,
+            api_key=api_key,
+            strategy=strategy,
+        )
 
     return router
 
@@ -809,12 +846,12 @@ def _suggest_host_endpoint(endpoint: str) -> str | None:
     return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
-def _model_list_urls(endpoint: str) -> list[str]:
+def _model_list_urls(endpoint: str, listing: ModelListing, kind: ModelKind) -> list[str]:
     root = endpoint.strip().rstrip("/")
-    urls = [f"{root}/models"]
-    parsed = urlsplit(root)
-    if not parsed.path.rstrip("/").endswith("/v1"):
-        urls.append(f"{root}/v1/models")
+    path = listing.paths[kind]
+    urls = [f"{root}{path}"]
+    if listing.tries_v1 and not urlsplit(root).path.rstrip("/").endswith("/v1"):
+        urls.append(f"{root}/v1{path}")
     return list(dict.fromkeys(urls))
 
 
@@ -830,36 +867,154 @@ def _model_list_headers(descriptor: ProviderDescriptor, api_key: str | None) -> 
     return headers
 
 
-def _extract_model_options(payload: Any) -> list[ModelOption]:
+# Ollama families of models that only embed text; Ollama names a model's family
+# by its architecture.
+_EMBEDDING_FAMILIES = frozenset({"bert", "nomic-bert", "xlm-roberta"})
+# A word in a model id that names a model which does not answer in text: an
+# image, audio or moderation model of an OpenAI-style listing.
+_NON_TEXT_MODEL = re.compile(
+    r"(?<![a-z0-9])(dall-e|image|whisper|tts|transcribe|audio|realtime|moderation|sora)(?![a-z])"
+)
+
+
+def _listed_entries(payload: Any) -> list[Any]:
     if isinstance(payload, dict):
         raw_items = payload.get("data")
         if raw_items is None:
             raw_items = payload.get("models")
     else:
         raw_items = payload
+    return raw_items if isinstance(raw_items, list) else []
 
-    if not isinstance(raw_items, list):
-        return []
 
+def _token_count(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def _first_token_count(*values: Any) -> int | None:
+    for value in values:
+        count = _token_count(value)
+        if count is not None:
+            return count
+    return None
+
+
+def _model_option(item: Any) -> ModelOption | None:
+    """Read one listed model, with the token limits its entry gives.
+
+    The context window is read from ``context_length`` (OpenRouter and others),
+    ``context_window`` or ``max_model_len`` (vLLM); the largest output from
+    ``top_provider.max_completion_tokens`` (OpenRouter) or
+    ``max_completion_tokens``.
+    """
+    if isinstance(item, str):
+        return ModelOption(id=item) if item else None
+    if not isinstance(item, dict):
+        return None
+    raw_id = item.get("id") or item.get("name") or item.get("model")
+    if raw_id is None or not str(raw_id):
+        return None
+    model_id = str(raw_id)
+    raw_label = item.get("display_name") or item.get("label") or item.get("name")
+    top_provider = item.get("top_provider")
+    if not isinstance(top_provider, dict):
+        top_provider = {}
+    return ModelOption(
+        id=model_id,
+        label=None if raw_label is None or str(raw_label) == model_id else str(raw_label),
+        context_window_tokens=_first_token_count(
+            item.get("context_length"),
+            item.get("context_window"),
+            item.get("max_model_len"),
+        ),
+        max_output_tokens=_first_token_count(
+            top_provider.get("max_completion_tokens"),
+            item.get("max_completion_tokens"),
+        ),
+    )
+
+
+def _declared_kinds(item: Any) -> frozenset[ModelKind] | None:
+    """The kinds a listed entry declares through ``capabilities``, as Ollama writes them.
+
+    ``completion`` is a generation model and ``embedding`` an embedding model.
+    Returns ``None`` for an entry that declares no capabilities.
+    """
+    capabilities = item.get("capabilities") if isinstance(item, dict) else None
+    if not isinstance(capabilities, list):
+        return None
+    kinds: set[ModelKind] = set()
+    if "completion" in capabilities:
+        kinds.add("generation")
+    if "embedding" in capabilities:
+        kinds.add("embedding")
+    return frozenset(kinds)
+
+
+def _entry_kinds(item: Any, model_id: str) -> frozenset[ModelKind]:
+    """The kinds one entry of a listing that holds every model serves.
+
+    What the entry declares decides. Otherwise an Ollama family of embedding
+    models, or ``embed`` in the id, makes it an embedding model; an id that
+    names an image, audio or moderation model makes it neither; any other
+    model generates text.
+    """
+    declared = _declared_kinds(item)
+    if declared is not None:
+        return declared
+    details = item.get("details") if isinstance(item, dict) else None
+    if isinstance(details, dict):
+        families = details.get("families")
+        named = {details.get("family"), *(families if isinstance(families, list) else ())}
+        if named & _EMBEDDING_FAMILIES:
+            return frozenset({"embedding"})
+    lowered = model_id.lower()
+    if "embed" in lowered:
+        return frozenset({"embedding"})
+    if _NON_TEXT_MODEL.search(lowered):
+        return frozenset()
+    return frozenset({"generation"})
+
+
+def _extract_model_options(payload: Any, listing: ModelListing, kind: ModelKind) -> tuple[list[ModelOption], int]:
+    """Read the models of ``kind`` from a listing, with the number of models it listed.
+
+    A listing of one kind holds only models of that kind, and a listing that
+    does not tell the kinds apart gives every model it lists.
+    """
     seen: set[str] = set()
+    listed = 0
     models: list[ModelOption] = []
-    for item in raw_items:
-        model_id: str | None = None
-        label: str | None = None
-        if isinstance(item, str):
-            model_id = item
-        elif isinstance(item, dict):
-            raw_id = item.get("id") or item.get("name") or item.get("model")
-            if raw_id is not None:
-                model_id = str(raw_id)
-            raw_label = item.get("display_name") or item.get("label") or item.get("name")
-            if raw_label is not None and str(raw_label) != model_id:
-                label = str(raw_label)
-        if not model_id or model_id in seen:
+    for item in _listed_entries(payload):
+        option = _model_option(item)
+        if option is None or option.id in seen:
             continue
-        seen.add(model_id)
-        models.append(ModelOption(id=model_id, label=label))
-    return models
+        seen.add(option.id)
+        listed += 1
+        if listing.kind_signal != "entry" or kind in _entry_kinds(item, option.id):
+            models.append(option)
+    return models, listed
+
+
+def _listing_message(models: list[ModelOption], listed: int, kind: ModelKind, *, kind_filtered: bool) -> str:
+    def counted(count: int, noun: str) -> str:
+        return f"{count} {noun}{'s' if count != 1 else ''}"
+
+    if listed == 0:
+        return "Connected, but this endpoint returned no models."
+    if not kind_filtered:
+        return (
+            f"Connected. Found {counted(listed, 'model')}; the endpoint does not say "
+            f"which are {kind} models."
+        )
+    if not models:
+        return (
+            f"Connected, but this endpoint listed no {kind} models. "
+            "Type the model id if you know it."
+        )
+    return f"Connected. Found {counted(len(models), f'{kind} model')}."
 
 
 def _discovery_error(
@@ -907,12 +1062,14 @@ def _refused_listing(
 
 async def _discover_models(
     descriptor: ProviderDescriptor,
+    listing: ModelListing,
+    kind: ModelKind,
     *,
     endpoint: str,
     api_key: str | None,
     strategy: AuthStrategy,
 ) -> ModelDiscoveryResponse:
-    """List the models an endpoint offers, without ever leaving its origin.
+    """List the models of ``kind`` an endpoint offers, without ever leaving its origin.
 
     The request carries the API key, so it does not follow redirects: an answer
     that points to another origin fails the listing, and one that points
@@ -926,7 +1083,7 @@ async def _discover_models(
     non_json_latency_ms: int | None = None
 
     async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
-        for url in _model_list_urls(value):
+        for url in _model_list_urls(value, listing, kind):
             started = time.perf_counter()
             try:
                 resp = await client.get(url, headers=headers)
@@ -1006,16 +1163,14 @@ async def _discover_models(
                 non_json_latency_ms = latency_ms
                 continue
 
-            models = _extract_model_options(data)
+            models, listed = _extract_model_options(data, listing, kind)
+            kind_filtered = listing.kind_signal != "none"
             return ModelDiscoveryResponse(
                 ok=True,
                 models_supported=True,
                 models=models,
-                message=(
-                    f"Connected. Found {len(models)} model{'s' if len(models) != 1 else ''}."
-                    if models
-                    else "Connected, but this endpoint returned no models."
-                ),
+                kind_filtered=kind_filtered,
+                message=_listing_message(models, listed, kind, kind_filtered=kind_filtered),
                 latency_ms=latency_ms,
             )
 

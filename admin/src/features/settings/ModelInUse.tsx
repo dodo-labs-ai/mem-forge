@@ -6,7 +6,7 @@ import { ErrorNotice, PropertyList, type Property } from "@/patterns";
 import { Button } from "@/ui/button";
 import { useValidateActive } from "./api";
 import { providerLabel, validationFacts, validationNotes, validationSummary } from "./model/modelStatus";
-import { AUTH_LABELS, tokenLimitField } from "./model/providerFields";
+import { AUTH_LABELS, tokenLimitLabel } from "./model/providerFields";
 import { maskedKey } from "./model/savedKey";
 import type { ModelBinding, ModelKind, ModelProvider } from "./model/types";
 import { StatusLine } from "./StatusLine";
@@ -41,7 +41,7 @@ function modelProperties(model: ModelBinding, providers: readonly ModelProvider[
   if (model.endpoint) properties.push({ label: "Base URL", value: <Code>{model.endpoint}</Code> });
   properties.push(authenticationProperty(model));
   for (const [name, tokens] of Object.entries(model.token_limits)) {
-    properties.push({ label: tokenLimitField(name).label, value: `${formatCount(tokens)} tokens` });
+    properties.push({ label: tokenLimitLabel(name), value: `${formatCount(tokens)} tokens` });
   }
   const facts = model.validation?.passed ? validationFacts(model.validation) : {};
   if (facts.dimension !== undefined) properties.push({ label: "Vector size", value: facts.dimension });

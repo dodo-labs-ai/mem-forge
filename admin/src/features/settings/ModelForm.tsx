@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Check, CircleCheck, ListRestart, Loader2, RefreshCw, Undo2 } from "lucide-react";
-import { useEffect, useId, useMemo } from "react";
+import { useEffect, useId, useMemo, useState, type ChangeEvent } from "react";
 import { FormProvider, useForm, useWatch } from "react-hook-form";
 import { isReindexInProgress } from "@/api";
 import { errorMessage } from "@/lib/errors";
@@ -14,22 +14,26 @@ import { describedBy } from "./describedBy";
 import { DiscoveryNotice } from "./DiscoveryNotice";
 import { EndpointConflictNotice } from "./EndpointConflictNotice";
 import { FormField } from "./FormField";
-import { discoveryFailure, discoveryOutcome } from "./model/discoveryOutcome";
+import { discoveryFailure, discoveryOutcome, onlyListedModel } from "./model/discoveryOutcome";
 import {
   candidateRequest,
   discoveryRequest,
   environmentEndpointConflict,
   fieldProblems,
   formOrigin,
+  hasTokenLimitValues,
   isChanged,
+  listedTokenLimits,
   modelFormSchema,
   offersTokenLimits,
   savedValues,
+  tokenLimitsForChoice,
+  tokenLimitsForTypedModel,
   valuesForProvider,
+  type ListedLimits,
   type ModelFormValues,
 } from "./model/modelForm";
 import { needsTokenLimits } from "./model/modelStatus";
-import { preferredModel } from "./model/modelSuggestions";
 import {
   AUTH_HINTS,
   AUTH_LABELS,
@@ -44,7 +48,7 @@ import {
 } from "./model/providerFields";
 import { savedKeyFor } from "./model/savedKey";
 import { rebuildLabel, startRefusalReason } from "./model/searchIndex";
-import type { AuthStrategy, ModelKind, ModelKindSettings, ModelProvider, VectorIndex } from "./model/types";
+import type { AuthStrategy, ModelKind, ModelKindSettings, ModelOption, ModelProvider, VectorIndex } from "./model/types";
 import { ModelSuggestions } from "./ModelSuggestions";
 import { PendingEditNotice } from "./PendingEditNotice";
 import { TokenLimitFields } from "./TokenLimitFields";
@@ -66,6 +70,9 @@ interface ModelFormProps {
  * The form that changes one model. It edits the saved edit when there is one
  * and the model in use otherwise. Its one action saves the form and validates
  * what was saved with a real request; only an edit that passes is put to use.
+ *
+ * Load models offers the provider's models of the kind. Picking one whose
+ * listing gives token limits fills the empty token limit fields with them.
  *
  * An embedding model whose vectors cannot be compared with the stored ones
  * passes validation and then waits: the action becomes the rebuild of the
@@ -96,6 +103,8 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
     name: ["provider", "endpoint", "authStrategy", "apiKey", "model", "options", "parameters", "tokenLimits"],
   });
   const values: ModelFormValues = { provider: providerId, endpoint, authStrategy, apiKey, model, options, parameters, tokenLimits };
+  /** The token limits the form filled in from the model list, while it is the source of what the fields hold. */
+  const [listedLimits, setListedLimits] = useState<ListedLimits | null>(null);
   const provider = findProvider(providerId);
   const changed = isChanged(saved, values, provider, kind);
 
@@ -133,6 +142,7 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
 
   function showStored(next: ModelKindSettings) {
     reset(savedValues(next.candidate ?? next.active, kind, providers));
+    setListedLimits(null);
   }
 
   function validateSaved() {
@@ -162,6 +172,7 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
     validate.reset();
     rebuild.reset();
     discovery.reset();
+    setListedLimits(null);
     if (candidate === null) {
       reset(saved);
       return;
@@ -173,6 +184,7 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
     const next = findProvider(id);
     if (!next) return;
     reset(valuesForProvider(next, saved));
+    setListedLimits(null);
     discovery.reset();
   }
 
@@ -188,12 +200,30 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
     discovery.reset();
   }
 
+  function chooseModel(choice: ModelOption) {
+    setValue("model", choice.id, { shouldValidate: formState.isSubmitted });
+    if (!provider) return;
+    const names = tokenLimitNames(provider, kind);
+    const listed = listedTokenLimits(choice, names);
+    const next = tokenLimitsForChoice(getValues("tokenLimits"), names, listedLimits?.limits ?? null, listed);
+    if (next === null) return;
+    setValue("tokenLimits", next, { shouldValidate: formState.isSubmitted });
+    setListedLimits(Object.keys(listed).length > 0 ? { model: choice.id, limits: next } : null);
+  }
+
+  function followTypedModel(typed: string) {
+    if (listedLimits === null || typed.trim() === listedLimits.model) return;
+    const next = provider ? tokenLimitsForTypedModel(getValues("tokenLimits"), tokenLimitNames(provider, kind), listedLimits, typed) : null;
+    if (next !== null) setValue("tokenLimits", next, { shouldValidate: formState.isSubmitted });
+    setListedLimits(null);
+  }
+
   async function loadModels() {
     if (!(await trigger("endpoint"))) return;
     discovery.mutate(discoveryRequest(getValues()), {
       onSuccess: (result) => {
-        const suggestion = result.ok ? preferredModel(kind, discoveryOutcome(result).models) : undefined;
-        if (suggestion && getValues("model").trim() === "") setValue("model", suggestion);
+        const only = result.ok ? onlyListedModel(discoveryOutcome(result)) : undefined;
+        if (only && getValues("model").trim() === "") chooseModel(only);
       },
     });
   }
@@ -209,7 +239,15 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
   const savedKey = savedKeyOf(values, provider);
   const endpointConflict = provider ? environmentEndpointConflict(values, provider) : null;
   const endpointHint = endpointConflict === null ? endpointCopy?.hint : null;
-  const limitNames = provider && offersTokenLimits(stored) ? tokenLimitNames(provider, kind) : [];
+  const limitNames =
+    provider && (offersTokenLimits(stored) || hasTokenLimitValues(tokenLimits)) ? tokenLimitNames(provider, kind) : [];
+  const limitsFromList =
+    provider &&
+    listedLimits !== null &&
+    model.trim() === listedLimits.model &&
+    limitNames.every((name) => (tokenLimits[name] ?? "").trim() === (listedLimits.limits[name] ?? ""))
+      ? provider.label
+      : null;
   const rebuilt = rebuild.isSuccess && vectorIndex?.reindex?.state === "succeeded" && candidate === null;
   const rebuildAction = vectorIndex && candidate?.waits_for_reindex && !changed ? rebuildLabel(vectorIndex) : null;
   const rebuildingForEdit = rebuilding && candidate?.waits_for_reindex === true;
@@ -331,7 +369,13 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
                 const id = `${baseId}-option-${name}`;
                 return (
                   <FormField key={name} label={copy.label} htmlFor={id} hint={copy.hint} hintId={`${id}-hint`}>
-                    <Input id={id} spellCheck={false} aria-describedby={`${id}-hint`} className={INPUT_CLASS} {...register(`options.${name}`)} />
+                    <Input
+                      id={id}
+                      spellCheck={false}
+                      aria-describedby={describedBy(copy.hint && `${id}-hint`)}
+                      className={INPUT_CLASS}
+                      {...register(`options.${name}`)}
+                    />
                   </FormField>
                 );
               })}
@@ -352,7 +396,7 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
                     aria-invalid={errors.model ? true : undefined}
                     aria-describedby={describedBy(errors.model && `${ids.model}-error`, modelCopy.hint && `${ids.model}-hint`)}
                     className={INPUT_CLASS}
-                    {...register("model")}
+                    {...register("model", { onChange: (event: ChangeEvent<HTMLInputElement>) => followTypedModel(event.target.value) })}
                   />
                   {provider.lists_models ? (
                     <Button type="button" variant="outline" onClick={loadModels} disabled={discovery.isPending}>
@@ -365,7 +409,13 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
 
               {outcome ? <DiscoveryNotice outcome={outcome} onUseEndpoint={applySuggestedEndpoint} /> : null}
               {outcome ? (
-                <ModelSuggestions kind={kind} models={outcome.models} typed={model} onSelect={(choice) => setValue("model", choice)} />
+                <ModelSuggestions
+                  kind={kind}
+                  models={outcome.models}
+                  kindFiltered={outcome.kindFiltered}
+                  typed={model}
+                  onSelect={chooseModel}
+                />
               ) : null}
 
               {parameterNames(provider, kind).map((name) => {
@@ -387,7 +437,7 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
                       inputMode="numeric"
                       spellCheck={false}
                       aria-invalid={error ? true : undefined}
-                      aria-describedby={describedBy(error && `${id}-error`, `${id}-hint`)}
+                      aria-describedby={describedBy(error && `${id}-error`, copy.hint && `${id}-hint`)}
                       className={`${INPUT_CLASS} max-w-40`}
                       {...register(`parameters.${name}`)}
                     />
@@ -400,6 +450,7 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
                   id={`${baseId}-token-limits`}
                   names={limitNames}
                   missing={stored !== null && needsTokenLimits(stored)}
+                  listedBy={limitsFromList}
                 />
               ) : null}
             </>
@@ -418,11 +469,6 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
             providers={providers}
             vectorSearchOn={vectorIndex?.serves_search}
           />
-        ) : null}
-        {validate.data?.promoted && active?.state === "ready" && !changed && !locked ? (
-          <Notice tone="ok" icon={CircleCheck} title="Validation passed">
-            MemForge now uses this model.
-          </Notice>
         ) : null}
         {rebuilt && !changed && !locked ? (
           <Notice tone="ok" icon={CircleCheck} title="Search index rebuilt">

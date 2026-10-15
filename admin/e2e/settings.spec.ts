@@ -447,7 +447,7 @@ test("Settings saves and validates a model, and asks before leaving with unsaved
   await expect(page).toHaveURL(/\/v2\/settings$/);
 
   await generation.getByRole("button", { name: "Save and validate" }).click();
-  await expect(generation.getByText("Validation passed")).toBeVisible();
+  await expect(generation.getByRole("group", { name: "In use" }).getByText(/^Passed validation/)).toBeVisible();
   await expect(generation.getByRole("group", { name: "In use" })).toContainText("gpt-5.4-mini");
   expect(writes).toEqual([
     {
@@ -524,7 +524,7 @@ test("a model that pairs a base URL with environment credentials is saved only o
   await expect(conflict).toHaveCount(0);
   await generation.getByRole("button", { name: "Save and validate" }).click();
 
-  await expect(generation.getByText("Validation passed")).toBeVisible();
+  await expect(generation.getByRole("group", { name: "In use" }).getByText(/^Passed validation/)).toBeVisible();
   const inUse = generation.getByRole("group", { name: "In use" });
   await expect(inUse).toContainText("openai/gpt-5.4-mini");
   await expect(inUse).not.toContainText("http://127.0.0.1:4000/v1");
@@ -613,7 +613,7 @@ test("a fresh installation is led from the page it lands on to Settings, until a
   await generation.getByLabel("Model", { exact: true }).fill("gpt-5.4");
   await generation.getByRole("button", { name: "Save and validate" }).click();
 
-  await expect(generation.getByText("Validation passed")).toBeVisible();
+  await expect(generation.getByRole("group", { name: "In use" }).getByText(/^Passed validation/)).toBeVisible();
   await expect(generation.getByText("Ready", { exact: true })).toBeVisible();
   await expect(generation.getByRole("group", { name: "In use" })).toContainText("****77c2");
   expect(writes[0]).toEqual({
@@ -753,7 +753,7 @@ test("a generation model without known token limits is asked for them, and passe
   await generation.getByLabel("Model", { exact: true }).fill("qwen3:14b");
   await generation.getByRole("button", { name: "Save and validate" }).click();
 
-  const failure = generation.getByRole("status").filter({ hasText: "These settings failed validation and are not in use" });
+  const failure = generation.getByRole("status").filter({ hasText: "One more step: enter the token limits" });
   await expect(failure).toContainText(
     "The model answered, but MemForge has no token limits for it. Enter its context window and maximum output, then validate again.",
   );
@@ -763,7 +763,7 @@ test("a generation model without known token limits is asked for them, and passe
   await limits.getByLabel("Maximum output").fill("4096");
   await generation.getByRole("button", { name: "Save and validate" }).click();
 
-  await expect(generation.getByText("Validation passed")).toBeVisible();
+  await expect(generation.getByRole("group", { name: "In use" }).getByText(/^Passed validation/)).toBeVisible();
   const inUse = generation.getByRole("group", { name: "In use" });
   await expect(inUse).toContainText("qwen3:14b");
   await expect(inUse).toContainText("32,768 tokens");

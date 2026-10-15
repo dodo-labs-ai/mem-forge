@@ -1,50 +1,63 @@
 import { expect, test } from "vitest";
-import { MAX_SHOWN_SUGGESTIONS, modelSuggestionList, preferredModel, suggestedModels } from "./modelSuggestions";
+import { MAX_SHOWN_SUGGESTIONS, modelSuggestionList } from "./modelSuggestions";
+import type { ModelOption } from "./types";
 
-const MODELS = ["anthropic/claude-sonnet-4-6", "text-embedding-3-small", "openai/gpt-5.4", "nomic-embed-text"];
+function listed(...ids: string[]): ModelOption[] {
+  return ids.map((id) => ({ id }));
+}
 
-test("each kind is offered the models that fit it", () => {
-  expect(suggestedModels("generation", MODELS)).toEqual(["anthropic/claude-sonnet-4-6", "openai/gpt-5.4"]);
-  expect(suggestedModels("embedding", MODELS)).toEqual(["text-embedding-3-small", "nomic-embed-text"]);
+const EMBEDDING = listed("openai/text-embedding-3-small", "openai/text-embedding-3-large", "qwen/qwen3-embedding-8b");
+
+function ids(models: readonly ModelOption[]): string[] {
+  return models.map((model) => model.id);
+}
+
+test("every listed model is offered, and the summary says how to filter them", () => {
+  const list = modelSuggestionList("embedding", EMBEDDING, "", true);
+
+  expect(ids(list.shown)).toEqual(ids(EMBEDDING));
+  expect(list.summary).toBe("3 listed embedding models. Type in the Model field to filter them, or pick one.");
 });
 
-test("every model is offered when none fits", () => {
-  expect(suggestedModels("embedding", ["gpt-5.4"])).toEqual(["gpt-5.4"]);
-});
-
-test("the first fitting model is preferred", () => {
-  expect(preferredModel("embedding", MODELS)).toBe("text-embedding-3-small");
-  expect(preferredModel("embedding", [])).toBeUndefined();
-});
-
-test("the summary says whether the list was narrowed to the kind", () => {
-  expect(modelSuggestionList("generation", MODELS, "").summary).toBe(
-    "2 generation suggestions from 4 listed models. Pick one or type any model id.",
-  );
-  expect(modelSuggestionList("embedding", ["nomic-embed-text"], "").summary).toBe(
-    "1 model available from this endpoint. Pick one or type any model id.",
-  );
-});
-
-test("typing part of a name narrows the suggestions", () => {
-  const list = modelSuggestionList("generation", MODELS, "GPT");
-
-  expect(list.shown).toEqual(["openai/gpt-5.4"]);
-  expect(list.summary).toBe(
-    "2 generation suggestions from 4 listed models. Showing 1; type part of a name to narrow the list. Pick one or type any model id.",
+test("a listing that does not tell the kinds apart is offered as models, not as models of the kind", () => {
+  expect(modelSuggestionList("embedding", listed("BAAI/bge-m3", "llama-3.1-8b"), "", false).summary).toBe(
+    "2 listed models. Type in the Model field to filter them, or pick one.",
   );
 });
 
-test("a whole model name, or text that matches nothing, keeps every suggestion", () => {
-  expect(modelSuggestionList("generation", MODELS, "openai/gpt-5.4").shown).toHaveLength(2);
-  expect(modelSuggestionList("generation", MODELS, "my-own-model").shown).toHaveLength(2);
+test("typing part of an id narrows the suggestions", () => {
+  const list = modelSuggestionList("embedding", EMBEDDING, "OPENAI", true);
+
+  expect(ids(list.shown)).toEqual(["openai/text-embedding-3-small", "openai/text-embedding-3-large"]);
+  expect(list.summary).toBe("2 of 3 listed embedding models match “OPENAI”. Clear the Model field to see them all.");
+});
+
+test("a whole model id still narrows the list, with that model first", () => {
+  const models = listed("openai/gpt-5-mini-high", "openai/gpt-5", "openai/gpt-5-mini");
+
+  const list = modelSuggestionList("generation", models, "openai/gpt-5-mini", true);
+
+  expect(ids(list.shown)).toEqual(["openai/gpt-5-mini", "openai/gpt-5-mini-high"]);
+  expect(list.summary).toBe("2 of 3 listed generation models match “openai/gpt-5-mini”. Clear the Model field to see them all.");
+});
+
+test("text that matches no listed model offers none and says the id is used as typed", () => {
+  const list = modelSuggestionList("embedding", EMBEDDING, "my-own-model", true);
+
+  expect(list.shown).toEqual([]);
+  expect(list.summary).toBe("No listed embedding model matches “my-own-model”. The model id is used as typed.");
 });
 
 test("a long list is cut to a readable number", () => {
-  const many = Array.from({ length: 300 }, (_, index) => `model-${index}`);
+  const many = Array.from({ length: 300 }, (_, index) => ({ id: `model-${index}` }));
 
-  const list = modelSuggestionList("generation", many, "");
+  const list = modelSuggestionList("generation", many, "", true);
 
   expect(list.shown).toHaveLength(MAX_SHOWN_SUGGESTIONS);
-  expect(list.summary).toContain(`Showing ${MAX_SHOWN_SUGGESTIONS}; type part of a name to narrow the list.`);
+  expect(list.summary).toBe(
+    `300 listed generation models. Showing the first ${MAX_SHOWN_SUGGESTIONS}. Type in the Model field to filter them, or pick one.`,
+  );
+  expect(modelSuggestionList("generation", many, "model-1", true).summary).toBe(
+    `111 of 300 listed generation models match “model-1”. Showing the first ${MAX_SHOWN_SUGGESTIONS}. Clear the Model field to see them all.`,
+  );
 });
