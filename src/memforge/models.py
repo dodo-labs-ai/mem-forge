@@ -609,6 +609,12 @@ class FailedDoc:
     error: str
 
 
+# Why a sync run removed nothing although its scope listing was due: the
+# Gene's scope listing did not complete, or the provider could not confirm
+# which unlisted Documents are gone.
+AbsenceCheckSkippedReason = Literal["scope_listing_failed", "absence_confirmation_failed"]
+
+
 @dataclass
 class SyncState:
     source: str
@@ -621,9 +627,7 @@ class SyncState:
     error_message: str | None = None
     failed_docs: list[FailedDoc] = field(default_factory=list)
     failure_retryable: bool = True
-    # Why this run removed nothing although its scope listing was due: the
-    # listing or the provider's absence confirmation did not complete (ADR 0045).
-    absence_check_skipped_reason: str | None = None
+    absence_check_skipped_reason: AbsenceCheckSkippedReason | None = None
     runtime_bundles: tuple[AgentRuntimeBundle, ...] = field(
         default=(),
         repr=False,

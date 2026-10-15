@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 
@@ -480,7 +481,14 @@ def test_agent_session_rejects_ordinary_sync_and_hides_historical_sync_failure(t
         asyncio.run(database.close())
 
 
-def test_source_list_returns_why_the_latest_sync_skipped_its_absence_check(tmp_path):
+@pytest.mark.parametrize(
+    ("recorded", "reported"),
+    [
+        ("absence_confirmation_failed", "absence_confirmation_failed"),
+        ("Jira search total changed during pagination", "scope_listing_failed"),
+    ],
+)
+def test_source_list_returns_why_the_latest_sync_skipped_its_absence_check(tmp_path, recorded, reported):
     database = _connect_database(tmp_path)
     source_id = "src-absence-check-skipped"
     owner_headers = {"x-test-user": "owner-user", "x-test-workspace-role": "member"}
@@ -503,7 +511,7 @@ def test_source_list_returns_why_the_latest_sync_skipped_its_absence_check(tmp_p
                     source=source_id,
                     last_sync_at=finished_at,
                     last_sync_status="success",
-                    absence_check_skipped_reason="Jira search total changed during pagination",
+                    absence_check_skipped_reason=recorded,
                 ),
                 started_at=started_at,
                 finished_at=finished_at,
@@ -517,7 +525,7 @@ def test_source_list_returns_why_the_latest_sync_skipped_its_absence_check(tmp_p
         assert listed.status_code == 200, listed.text
         source = next(row for row in listed.json()["data"] if row["id"] == source_id)
         assert source["sync"]["status"] == "success"
-        assert source["sync"]["absence_check_skipped_reason"] == "Jira search total changed during pagination"
+        assert source["sync"]["absence_check_skipped_reason"] == reported
     finally:
         asyncio.run(database.close())
 

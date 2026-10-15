@@ -140,6 +140,7 @@ from memforge.vector_index_errors import (
 )
 from memforge.memory.store import MemoryStore
 from memforge.models import (
+    AbsenceCheckSkippedReason,
     ConfigField,
     ConfigFieldType,
     Entity,
@@ -1743,9 +1744,9 @@ class SourceSyncStatusResponse(BaseModel):
     sync running in this process carries its live counters (``phase``,
     ``docs_*``, ``memories_*``, ``current_title``). The last recorded sync
     carries its totals, ``run_id``, ``failed_docs`` and
-    ``absence_check_skipped_reason``, which says why that run removed nothing
-    although its scope listing was due (ADR 0045). Fields outside the chosen
-    shape are absent.
+    ``absence_check_skipped_reason``, which names the step that kept that run
+    from removing anything although its scope listing was due. Fields outside
+    the chosen shape are absent.
     """
 
     status: SourceSyncStatus
@@ -1771,7 +1772,7 @@ class SourceSyncStatusResponse(BaseModel):
     memories_extracted: int | None = None
     memories_stored: int | None = None
     failed_docs: list[SourceSyncFailedDocResponse] | None = None
-    absence_check_skipped_reason: str | None = None
+    absence_check_skipped_reason: AbsenceCheckSkippedReason | None = None
 
 
 class SourceAccessTransitionResponse(BaseModel):
