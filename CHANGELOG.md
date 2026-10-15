@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Logs written where stderr is not a terminal, such as a Docker container or a
+  service manager, are one plain line per record with the timestamp, level and
+  logger, and tracebacks print in full. Before, boxed tracebacks wrapped into
+  an 80-column frame that cut every line apart. A terminal keeps the formatted
+  output. Cloud: arrives with the pin; Cloud's CF logs become plain lines.
+
 - A sync run that skipped its absence check records which step failed instead
   of the provider's error text: `sync.absence_check_skipped_reason` is
   `scope_listing_failed` or `absence_confirmation_failed`. The provider's error
