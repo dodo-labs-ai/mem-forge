@@ -12,7 +12,7 @@ Default base URL: `http://127.0.0.1:8765`.
 
 | Area | Endpoint | Purpose |
 | --- | --- | --- |
-| Health | `GET /api/health` | Runtime and storage health |
+| Health | `GET /api/v1/health` | Runtime and storage health |
 | Sources | `GET /api/sources` | List configured sources |
 | Sources | `POST /api/sources` | Add a source configuration |
 | Sources | `POST /api/sources/{source_id}/sync` | Queue or run a source sync |
