@@ -9,9 +9,12 @@ from memforge.memory.evidence import EvidenceRole
 from memforge.pipeline.evidence_fragments import (
     EvidenceCandidateRange,
     EvidenceFragmentKind,
+    FragmentCompilationError,
     FragmentCompilationErrorCode,
+    build_revision_fragment_index,
     compile_fragments,
     revision_changed_structural_ranges,
+    verify_text_evidence_view,
 )
 from memforge.source_projection import (
     AnchorKind,
@@ -583,6 +586,60 @@ def test_html_comments_are_nonselectable_framing_in_a_complete_document(content)
 
     assert [fragment.presentation_text for fragment in catalog.fragments] == [body]
     assert catalog.errors == ()
+
+
+@pytest.mark.parametrize("framing", [
+    '<p>\n  <a href="ci.yml"><img alt="CI" src="badge.svg"></a>\n  <img alt="License" src="license.svg">\n</p>',
+    '<p align="center">\n  <picture>\n    <source srcset="dark.gif">\n    <img src="light.gif" alt="Demo">\n'
+    '  </picture>\n</p>',
+    '<div align="center">\n\n# Project\n\n</div>',
+    "<details>\n<summary>More</summary>\n\nOptional detail.\n\n</details>",
+    "<br>",
+])
+def test_markdown_with_uncitable_html_region_still_verifies_pinned_evidence(framing) -> None:
+    body = "Agents cite the source text they rest on."
+    revision = _revision(f"{framing}\n\n{body}\n", MARKDOWN_PROFILE)
+
+    index = build_revision_fragment_index(revision)
+    fragment = next(item for item in index.fragments if item.presentation_text == body)
+
+    assert index.errors and not any(error.fatal for error in index.errors)
+    assert index.complete
+    verify_text_evidence_view(
+        revision,
+        anchor=fragment.anchor,
+        raw_content_sha256=fragment.raw_content_sha256,
+        presentation_sha256=fragment.presentation_sha256,
+        excerpt=fragment.presentation_text,
+        text_view=fragment.text_view,
+        index=index,
+    )
+
+
+def test_fatal_index_error_still_refuses_pinned_evidence() -> None:
+    revision = _revision("Agents cite the source text they rest on.", MARKDOWN_PROFILE)
+    index = build_revision_fragment_index(revision)
+    fragment = index.fragments[0]
+    failed = replace(index, errors=(
+        FragmentCompilationError(
+            code=FragmentCompilationErrorCode.UNSUPPORTED_PROFILE,
+            observation_revision_id=revision.id,
+            message="profile unavailable",
+            fatal=True,
+        ),
+    ))
+
+    assert not failed.complete
+    with pytest.raises(ValueError, match="complete pinned representation"):
+        verify_text_evidence_view(
+            revision,
+            anchor=fragment.anchor,
+            raw_content_sha256=fragment.raw_content_sha256,
+            presentation_sha256=fragment.presentation_sha256,
+            excerpt=fragment.presentation_text,
+            text_view=fragment.text_view,
+            index=failed,
+        )
 
 
 @pytest.mark.parametrize("content", ["<!-- <!-- nested -->", "<!-- unterminated", "<!-- note --!>"])

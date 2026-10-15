@@ -309,6 +309,19 @@ class RevisionFragmentIndex:
     fragments: tuple[EvidenceFragment, ...]
     errors: tuple[FragmentCompilationError, ...]
 
+    @property
+    def complete(self) -> bool:
+        """Whether no fatal error invalidated the index.
+
+        A non-fatal error marks one region with nothing to cite, such as an
+        image-only HTML block or an unsafe element. Every Fragment present is
+        still exactly what the Revision compiles to under its pinned profile,
+        so pinned Evidence in it stays verifiable. A complete index may still
+        hold no Fragments when every region is uncitable.
+        """
+
+        return not any(error.fatal for error in self.errors)
+
 
 @dataclass(frozen=True, slots=True)
 class _FragmentCandidate:
@@ -738,7 +751,7 @@ def observation_presentation(revision: SourceObservationRevision) -> str | None:
     if contract is None or contract.canonical_schema is None:
         return None
     index = build_revision_fragment_index(revision)
-    if any(error.fatal for error in index.errors):
+    if not index.complete:
         return None
     document = _JsonDocument.parse(revision.content)
     framing = [
@@ -1339,8 +1352,8 @@ def _html_candidates(
 ) -> tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]]:
     parser = _OffsetHTMLParser(source)
     parser.close_checked()
-    # Valid comments are framing, with no selectable text. Their presence must
-    # not make an otherwise complete Markdown representation fail verification.
+    # Valid comments are framing, with no selectable text, rather than a region
+    # whose content cannot be cited.
     if parser.failure is None and re.fullmatch(r"(?:\s*<!--(?:(?!-->|<!--).)*-->\s*)+", source, re.DOTALL):
         return (), ()
     if parser.failure is not None:
@@ -2207,7 +2220,7 @@ def verify_text_evidence_view(
     if anchor.observation_revision_id != revision.id or anchor.observation_id != revision.observation_id:
         raise ValueError("text view revision identity mismatch")
     index = index if index is not None else build_revision_fragment_index(revision)
-    if index.observation_revision_id != revision.id or index.errors:
+    if index.observation_revision_id != revision.id or not index.complete:
         raise ValueError("text view requires a complete pinned representation")
     selected = ([selected_fragment] if selected_fragment is not None else
                 [fragment for fragment in index.fragments if fragment.anchor == anchor])
@@ -2229,7 +2242,7 @@ def changed_interpretation_ranges(base: SourceObservationRevision, target: Sourc
 
     def indexed_material(revision):
         index = build_revision_fragment_index(revision)
-        if index.errors:
+        if not index.complete:
             raise ValueError("interpretation comparison requires complete pinned representations")
         materials = {f.anchor: (f.kind.value, f.fragment_type, f.content_value,
                      tuple(value for _, _, value in f.interpretation_origins)) for f in index.fragments}

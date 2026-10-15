@@ -146,6 +146,34 @@ def test_sqlite_delivery_preserves_view_and_history_but_rejects_corrupt_origins(
         Database._project_memory_evidence_item({**row, 'text_view_json': json.dumps(descriptor)})
 
 
+README_BADGES = '<p>\n  <a href="ci.yml"><img alt="CI" src="badge.svg"></a>\n  <img alt="License" src="license.svg">\n</p>'
+
+
+def markdown_projection(body, prior=None):
+    from memforge.source_representation import MARKDOWN_STRUCTURAL_PROFILE
+    value = projection(f'<p>{hashlib.sha256(body.encode()).hexdigest()}</p>', prior)
+    revision = value.observation_revisions[0]
+    return replace(value, observation_revisions=(replace(revision, content=body,
+        semantic_hash=hashlib.sha256(body.encode()).hexdigest(), evidence_profile=MARKDOWN_STRUCTURAL_PROFILE),))
+
+
+def test_sqlite_delivery_verifies_markdown_evidence_beside_an_image_only_html_block():
+    from memforge.storage.database import Database
+    body = 'Agents cite the source text they rest on.'
+    revision = markdown_projection(f'# Project\n\n{README_BADGES}\n\n{body}\n').observation_revisions[0]
+    fragment = next(f for f in build_revision_fragment_index(revision).fragments if f.presentation_text == body)
+    delivered = Database._project_memory_evidence_item(stored_view_row(fragment, revision))
+    assert delivered.text_view == fragment.text_view and delivered.excerpt == body
+
+
+def test_markdown_edit_beside_an_image_only_html_block_authorizes_the_changed_paragraph():
+    base = markdown_projection(f'{README_BADGES}\n\nTeams store memories in Postgres.\n')
+    target = markdown_projection(f'{README_BADGES}\n\nTeams store memories in SQLite.\n', base)
+    context = RevisionAssessmentContext(projection=target, base=base, access_context_hash='scope')
+    changed = next(f for f in context.full_fragments if f.presentation_text == 'Teams store memories in SQLite.')
+    assert authority(base, target).authorizes(changed)
+
+
 @pytest.mark.parametrize('source_type', ['confluence', 'jira', 'markdown-structural', 'plain-text'])
 @pytest.mark.parametrize('old_count,new_count', [(1, 2), (2, 1), (2, 0)])
 def test_duplicate_population_reads_all_current_without_inventing_removed_occurrence(source_type, old_count, new_count):
