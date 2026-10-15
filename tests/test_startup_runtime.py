@@ -3285,16 +3285,43 @@ def test_config_env_overrides_startup_runtime_values(monkeypatch, tmp_path):
     assert cfg.server.admin_api_port == 9876
 
 
-def test_cli_logging_uses_stderr_for_stdio_safety():
-    from memforge.main import setup_logging
+def test_cli_logging_uses_stderr_for_stdio_safety(monkeypatch):
+    import memforge.main as main_module
+    from rich.console import Console
 
+    monkeypatch.setattr(main_module, "log_console", Console(stderr=True, force_terminal=True))
     root = logging.getLogger()
     previous_handlers = root.handlers[:]
     previous_level = root.level
     try:
-        setup_logging(verbose=False)
+        main_module.setup_logging(verbose=False)
         handler = next(h for h in root.handlers if isinstance(h, RichHandler))
         assert handler.console.stderr is True
     finally:
         root.handlers = previous_handlers
         root.setLevel(previous_level)
+
+
+def test_logging_without_a_terminal_writes_one_plain_line_per_record(monkeypatch, capsys):
+    import memforge.main as main_module
+    from rich.console import Console
+
+    monkeypatch.setattr(main_module, "log_console", Console(stderr=True, force_terminal=False))
+    root = logging.getLogger()
+    previous_handlers = root.handlers[:]
+    previous_level = root.level
+    try:
+        main_module.setup_logging(verbose=False)
+        assert not any(isinstance(h, RichHandler) for h in root.handlers)
+        try:
+            raise ValueError("text view requires a complete pinned representation")
+        except ValueError:
+            logging.getLogger("memforge.test").exception("Relation discovery work failed")
+    finally:
+        root.handlers = previous_handlers
+        root.setLevel(previous_level)
+
+    err = capsys.readouterr().err
+    assert " ERROR memforge.test: Relation discovery work failed" in err
+    assert "ValueError: text view requires a complete pinned representation" in err
+    assert "│" not in err
