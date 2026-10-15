@@ -19,7 +19,7 @@ async def test_sqlite_runner_executes_core_hard_cases(tmp_path) -> None:
         db_path=tmp_path / "retrieval-eval.db",
     )
 
-    assert report.case_count == 12
+    assert report.case_count == 18
     assert report.hard_failures == ()
 
     assert report.case_results["exact_external_id_lookup"].ranked_ids[0] == "mem-blocker-hint"
@@ -35,12 +35,26 @@ async def test_sqlite_runner_executes_core_hard_cases(tmp_path) -> None:
         f"mem-process-tree-{index:02d}" for index in range(1, 7)
     }.issubset(cluster_case.ranked_ids[:10])
     assert report.case_results["queryless_source_listing"].total_candidates == 23
+    for case_id in (
+        "product_name_question_prefers_semantic_answer",
+        "unicode_product_name_question_prefers_semantic_answer",
+    ):
+        product_case = report.case_results[case_id]
+        assert product_case.retrieval_intent["resolved_intent"] == "general_hybrid"
+        assert product_case.ranked_ids[:2] == ("mem-workspace-setup", "mem-memforge-release-notes")
+    assert report.case_results["bare_code_symbol_lookup"].retrieval_intent["resolved_intent"] == "known_item"
+    symbol_with_words = report.case_results["code_symbol_with_words_keeps_exact_symbol_first"]
+    assert symbol_with_words.retrieval_intent["resolved_intent"] == "general_hybrid"
+    assert symbol_with_words.ranked_ids[0] == "mem-blocker-hints-command"
+    file_name_case = report.case_results["file_name_question_is_known_item"]
+    assert file_name_case.retrieval_intent["resolved_intent"] == "known_item"
+    assert file_name_case.ranked_ids[0] == "mem-compose-services"
 
     assert report.qrels["metadata_title_exact"] == {"mem-access-review": 3}
     assert report.run["exact_external_id_lookup"]["mem-blocker-hint"] > 0
     assert report.run["exact_external_id_lookup"]["mem-blocker-hint"] == 1.0
     assert report.to_json()["summary"] == {
-        "case_count": 12,
+        "case_count": 18,
         "hard_failures": 0,
     }
     assert list(tmp_path.glob("retrieval-eval-*.db")) == []
