@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -16,15 +17,30 @@ from pathlib import Path
 import pytest
 
 
+def _unused_loopback_url() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    return f"http://127.0.0.1:{port}"
+
+
 @pytest.fixture(autouse=True)
 def _isolate_memforge_plugin_config(monkeypatch, tmp_path):
-    monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
+    # Nothing on this machine may answer a hook: a MemForge server running on
+    # the default local port, or a client configured for a real service,
+    # would turn every "the service is unreachable" case into a real call.
+    # Tests that need a reachable service patch the transport themselves.
+    monkeypatch.setenv("MEMFORGE_API_URL", _unused_loopback_url())
     # Remote endpoint behavior is not under test in this module; keep its
     # edition explicit so only capability-discovery tests perform I/O.
     monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
     monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
-    monkeypatch.delenv("MEMFORGE_WORKSPACE_BINDINGS_FILE", raising=False)
+    monkeypatch.delenv("MEMFORGE_HOOK_CLIENT", raising=False)
+    monkeypatch.delenv("MEMFORGE_HOOK_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_BINDINGS_FILE", str(tmp_path / "missing-workspace-bindings.json"))
+    monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(tmp_path / "agent-queue.sqlite"))
     monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(tmp_path / "missing-codex-config.toml"))
     try:
         from memforge import plugin_config
@@ -1105,6 +1121,8 @@ def test_mcp_and_hook_share_cloud_resource_url(monkeypatch):
 
 def test_mcp_roots_and_hook_workspace_share_repository_workspace_override(monkeypatch, tmp_path):
     from memforge import hook_adapter, plugin_config, plugin_mcp_proxy
+
+    monkeypatch.delenv("MEMFORGE_API_URL")
 
     repository = tmp_path / "repository"
     repository.mkdir()
@@ -4712,6 +4730,8 @@ def test_post_json_keeps_service_failures_retryable(monkeypatch):
 def test_post_json_targets_zero_configuration_local_oss(monkeypatch):
     from memforge import hook_adapter
 
+    monkeypatch.delenv("MEMFORGE_API_URL")
+
     urls: list[str] = []
 
     class FakeResponse:
@@ -4849,6 +4869,8 @@ MEMFORGE_WORKSPACE_ID = "team_alpha"
 def test_post_json_uses_codex_plugin_config_for_workspace_and_token(monkeypatch, tmp_path):
     from memforge import hook_adapter
     from memforge import plugin_config
+
+    monkeypatch.delenv("MEMFORGE_API_URL")
 
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
