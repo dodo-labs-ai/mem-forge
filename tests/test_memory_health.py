@@ -89,6 +89,11 @@ async def test_health_reports_active_missing_from_fts_and_chroma(db: Database):
 async def test_health_reports_non_active_present_in_fts_and_chroma(db: Database):
     retired = _memory("mem-retired", "Retired fact", "retired")
     await db.insert_memory(retired)
+    await db.db.execute(
+        "INSERT INTO memories_fts (memory_id, content, entities_text) VALUES (?, ?, ?)",
+        (retired.id, retired.content, ""),
+    )
+    await db.db.commit()
     checker = MemoryIndexHealthChecker(
         db=db,
         memory_collection=InspectableCollection({retired.id: {"status": "retired"}}),
@@ -312,3 +317,31 @@ async def test_health_reports_confluence_document_missing_pdf_uri(db: Database):
     assert ("confluence_pdf_uri_missing", "confluence-123") in {
         (issue.kind, issue.memory_id) for issue in report.issues
     }
+
+
+@pytest.mark.asyncio
+async def test_upgrade_rebuilds_fts_entities_written_with_extraction_spelling(tmp_path):
+    database = Database(str(tmp_path / "earlier.db"))
+    await database.connect()
+    memory = _memory("mem-extraction-spelling", "MemForge syncs Jira", "active")
+    await database.insert_memory(memory)
+    for canonical_name, display_name in (("memforge", "MemForge"), ("jira", "Jira")):
+        entity_id = await database.upsert_entity(canonical_name, display_name)
+        await database.link_memory_entity(memory.id, entity_id)
+    await database.db.execute(
+        "UPDATE memories_fts SET entities_text = ? WHERE memory_id = ?",
+        ("Jira MemForge", memory.id),
+    )
+    await database.db.execute("DELETE FROM schema_migrations WHERE version = 115")
+    await database.db.commit()
+    report = await MemoryIndexHealthChecker(db=database).check()
+    assert ("fts_entities_mismatch", memory.id) in {(issue.kind, issue.memory_id) for issue in report.issues}
+    await database.close()
+
+    reopened = Database(str(tmp_path / "earlier.db"))
+    await reopened.connect()
+    try:
+        report = await MemoryIndexHealthChecker(db=reopened).check()
+        assert [issue.kind for issue in report.issues if "fts" in issue.kind] == []
+    finally:
+        await reopened.close()
