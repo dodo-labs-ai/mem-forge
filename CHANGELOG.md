@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- A sync run that skipped its absence check records which step failed instead
+  of the provider's error text: `sync.absence_check_skipped_reason` is
+  `scope_listing_failed` or `absence_confirmation_failed`. The provider's error
+  stays in the log. A run recorded with error text reads as
+  `scope_listing_failed`. The admin UI V2 Source drawer explains the step in
+  plain words and says that nothing was removed and the next sync checks
+  again. Cloud: arrives with the pin; the HANA store keeps the value as text,
+  so no schema change.
+
 - A search question that names a product written in camel case, such as
   "How do I configure workspaces in MemForge?" or "GitHub 的同步是怎么工作的？",
   is ranked as an open question (`general_hybrid`) instead of a lookup of one

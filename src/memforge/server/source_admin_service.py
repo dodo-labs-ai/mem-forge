@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, get_args
 
 from memforge.genes import source_type_supports_sync
+from memforge.models import AbsenceCheckSkippedReason
 from memforge.local_agent.source_contract import (
     execution_owner_user_id,
     is_local_agent_backed_source,
@@ -246,7 +247,9 @@ async def list_source_admin_rows(
                     "memories_extracted": latest.get("memories_extracted", 0),
                     "error_message": latest.get("error_message"),
                     "failed_docs": latest.get("failed_docs", []),
-                    "absence_check_skipped_reason": latest.get("absence_check_skipped_reason"),
+                    "absence_check_skipped_reason": _absence_check_skipped_reason(
+                        latest.get("absence_check_skipped_reason")
+                    ),
                     "progress": {
                         "schema_version": 1,
                         "phase": "processing",
@@ -267,3 +270,17 @@ async def list_source_admin_rows(
                 row["sync"] = None
         rows.append(row)
     return rows
+
+
+def _absence_check_skipped_reason(stored: Any) -> AbsenceCheckSkippedReason | None:
+    """The step a sync run's absence check stopped at, as recorded with the run.
+
+    Any other stored text is a provider's error from a scope listing that did
+    not complete.
+    """
+
+    if not stored:
+        return None
+    if stored in get_args(AbsenceCheckSkippedReason):
+        return stored
+    return "scope_listing_failed"

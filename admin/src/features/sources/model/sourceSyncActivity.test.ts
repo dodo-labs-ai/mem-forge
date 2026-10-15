@@ -361,13 +361,22 @@ test("notes a finished sync that skipped its deletion check", () => {
     finished_at: "2026-07-08T10:01:00Z",
     error_message: null,
     progress: { schema_version: 1, phase: "processing", progress: { completed: 3, unit: "issue" } },
-    absence_check_skipped_reason: "Jira search total changed during pagination",
+    absence_check_skipped_reason: "scope_listing_failed",
   };
   assert.deepEqual(presentSourceSyncActivity(sourceSyncActivityFromStatus(finishedSync), "Jira", "issues"), {
     message: "Up to date",
     detail: "3 issues",
-    notice: "Deletion check skipped: Jira search total changed during pagination",
+    notice:
+      "Deletion check skipped: the list of items in scope could not be read in full. Nothing was removed; the next sync checks again.",
   });
+  assert.equal(
+    presentSourceSyncActivity(
+      sourceSyncActivityFromStatus({ ...finishedSync, absence_check_skipped_reason: "absence_confirmation_failed" }),
+      "Jira",
+      "issues",
+    ).notice,
+    "Deletion check skipped: the source could not confirm which missing items were deleted. Nothing was removed; the next sync checks again.",
+  );
   assert.equal(
     presentSourceSyncActivity(
       sourceSyncActivityFromStatus({ ...finishedSync, absence_check_skipped_reason: null }),

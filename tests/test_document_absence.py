@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import json
 from datetime import datetime, timezone
 
@@ -219,19 +220,21 @@ async def test_an_issue_that_reenters_the_query_is_refreshed_and_a_later_deletio
 
 
 @pytest.mark.asyncio
-async def test_an_incomplete_listing_removes_nothing_and_the_run_still_succeeds(workspace):
+async def test_an_incomplete_listing_removes_nothing_and_the_run_still_succeeds(workspace, caplog):
     project = JiraProject(existing={0, 1})
     await _synced(workspace, project)
 
     project.move_on(existing={0})
     project.listing_error = RuntimeError("Jira search total changed during pagination")
-    state = await workspace.sync(project)
+    with caplog.at_level(logging.WARNING, logger="memforge.pipeline.sync"):
+        state = await workspace.sync(project)
 
     assert state.last_sync_status == "success"
     assert workspace.tombstoned() == []
     assert await workspace.held() == {"jira-0", "jira-1"}
-    assert state.absence_check_skipped_reason == "Jira search total changed during pagination"
-    assert await workspace.recorded_skip_reason() == "Jira search total changed during pagination"
+    assert state.absence_check_skipped_reason == "scope_listing_failed"
+    assert await workspace.recorded_skip_reason() == "scope_listing_failed"
+    assert "Jira search total changed during pagination" in caplog.text
 
     project.listing_error = None
     state = await workspace.sync(project)
@@ -269,7 +272,8 @@ async def test_a_failed_confirmation_removes_nothing_and_the_run_still_succeeds(
     assert state.last_sync_status == "success"
     assert workspace.tombstoned() == []
     assert await workspace.held() == {"jira-0", "jira-1"}
-    assert await workspace.recorded_skip_reason() == "connection reset"
+    assert state.absence_check_skipped_reason == "absence_confirmation_failed"
+    assert await workspace.recorded_skip_reason() == "absence_confirmation_failed"
 
 
 @pytest.mark.asyncio
