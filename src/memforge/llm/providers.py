@@ -10,11 +10,15 @@ A ``ResolvedInvocation`` is everything the LiteLLM SDK is given for one
 configured model: the route, the endpoint, the credential and a short list of
 permitted extra parameters. The generation client and the Embedding Runtime are
 built from one and pass the SDK nothing else about where a request goes.
+
+A descriptor also says how a request asks its model to answer without reasoning
+first. Closed-choice calls size their output for the answer alone, and a model
+that reasons by default would spend that output before it answers.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal, get_args
@@ -76,6 +80,51 @@ _EXTRA_PARAMETER_TYPES: Mapping[str, type] = MappingProxyType(
 )
 
 
+def _sends_nothing(route: str) -> dict[str, Any]:
+    """Ask for nothing: the model answers directly unless asked to reason, or no
+    parameter is known to be safe for every route the descriptor serves."""
+    return {}
+
+
+def _openrouter_reasoning_off(route: str) -> dict[str, Any]:
+    """OpenRouter's own ``reasoning`` request field, which LiteLLM writes into
+    the request body from ``extra_body``."""
+    return {"extra_body": {"reasoning": {"enabled": False}}}
+
+
+def _openai_lowest_reasoning_effort(route: str) -> dict[str, Any]:
+    """The lowest ``reasoning_effort`` LiteLLM accepts for the model, if it takes one.
+
+    LiteLLM's model map says which models reason and which effort levels each
+    takes beyond ``low``; a model it does not know is sent nothing.
+    """
+    model = route.partition("/")[2]
+    try:
+        supported = litellm.get_supported_openai_params(model=model, custom_llm_provider="openai") or ()
+        if "reasoning_effort" not in supported or not litellm.supports_reasoning(model=route):
+            return {}
+        info = litellm.get_model_info(route)
+    except Exception:
+        return {}
+    for level in ("none", "minimal"):
+        if info.get(f"supports_{level}_reasoning_effort"):
+            return {"reasoning_effort": level}
+    if info.get("supports_low_reasoning_effort") is False:
+        return {}
+    return {"reasoning_effort": "low"}
+
+
+def _ollama_thinking_off(route: str) -> dict[str, Any]:
+    """Ollama's ``think`` request field, which LiteLLM passes through as given.
+
+    A gpt-oss model cannot stop thinking and takes a level instead, as LiteLLM's
+    own mapping of ``reasoning_effort`` for Ollama does.
+    """
+    if route.partition("/")[2].startswith("gpt-oss"):
+        return {"think": "low"}
+    return {"think": False}
+
+
 class ModelConfigError(ValueError):
     """Model settings that cannot be used, named by a stable machine-readable code."""
 
@@ -94,6 +143,9 @@ class ResolvedInvocation:
     api_base: str | None = None
     api_key: str | None = field(default=None, repr=False)
     extra_params: Mapping[str, Any] = field(default_factory=dict)
+    # The descriptor the invocation was compiled from. An invocation named by
+    # its route alone has none, and its requests carry nothing provider-specific.
+    provider: str | None = None
 
     def __post_init__(self) -> None:
         for name, value in self.extra_params.items():
@@ -169,6 +221,9 @@ class ProviderDescriptor:
     # The request paths the SDK and the model listing write after the base URL.
     # A base URL pasted with one of them at its end is read without it.
     request_paths: tuple[str, ...] = ()
+    # The SDK keyword arguments that ask the generation model at a route to
+    # answer without reasoning first, as LiteLLM passes them to this provider.
+    reasoning_off: Callable[[str], dict[str, Any]] = _sends_nothing
 
     @property
     def model_is_route(self) -> bool:
@@ -235,6 +290,7 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         listing=ModelListing(paths={"generation": "/models", "embedding": "/models"}, kind_signal="entry"),
         options=("organization",),
         request_paths=_OPENAI_REQUEST_PATHS,
+        reasoning_off=_openai_lowest_reasoning_effort,
     ),
     ProviderDescriptor(
         id="anthropic",
@@ -247,6 +303,8 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         key_header="x-api-key",
         # LiteLLM writes ``/v1/messages`` after the base URL itself.
         request_paths=("/v1", "/v1/messages", "/v1/models"),
+        # An Anthropic model thinks only when a request asks it to.
+        reasoning_off=_sends_nothing,
     ),
     ProviderDescriptor(
         id="openrouter",
@@ -260,6 +318,7 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
             kind_signal="listing",
         ),
         request_paths=_OPENAI_REQUEST_PATHS,
+        reasoning_off=_openrouter_reasoning_off,
     ),
     ProviderDescriptor(
         id="ollama",
@@ -285,6 +344,7 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
             "/v1",
             *(f"/v1{path}" for path in _OPENAI_REQUEST_PATHS),
         ),
+        reasoning_off=_ollama_thinking_off,
     ),
     ProviderDescriptor(
         id="openai_compatible",
@@ -295,12 +355,18 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         endpoint_required=True,
         listing=ModelListing(paths={"generation": "/models", "embedding": "/models"}, kind_signal="none"),
         request_paths=_OPENAI_REQUEST_PATHS,
+        # Any server may answer here, and no reasoning parameter is one every
+        # such server accepts.
+        reasoning_off=_sends_nothing,
     ),
     ProviderDescriptor(
         id="litellm",
         label="LiteLLM route (advanced)",
         kinds=("generation", "embedding"),
         auth_strategies=("api_key", "environment"),
+        # A route may name any LiteLLM provider, gateways among them, and no
+        # reasoning parameter is one every such provider accepts.
+        reasoning_off=_sends_nothing,
     ),
 )
 

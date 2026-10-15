@@ -91,9 +91,14 @@ class CapabilityProbe(StructuredResponseModel):
 
 
 class CapabilityCheckResponse(StructuredResponseModel):
-    """The nested object a generation model must return to pass its check."""
+    """The nested object a generation model must return to pass its check.
+
+    The check is answered directly, as every closed-choice call is, so it sends
+    the model the same request parameters those calls send.
+    """
 
     model_config = ConfigDict(extra="forbid")
+    direct_answer = True
 
     probe: CapabilityProbe
 

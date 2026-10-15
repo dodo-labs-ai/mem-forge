@@ -171,6 +171,7 @@ async def test_the_environment_settings_resolve_to_the_configured_endpoint(db, t
         route=f"openai/{EMBEDDING_MODEL}",
         api_base=EMBEDDING_BASE_URL,
         api_key=EMBEDDING_API_KEY,
+        provider="openai_compatible",
     )
 
 
@@ -184,7 +185,7 @@ async def test_a_provider_route_without_endpoint_or_key_is_left_for_the_provider
 
     models = await resolve_models(db, config)
 
-    assert models.embedding == ResolvedInvocation(route="ollama/nomic-embed-text")
+    assert models.embedding == ResolvedInvocation(route="ollama/nomic-embed-text", provider="litellm")
     assert build_embedding_runtime(models.embedding, config).configured is True
 
 

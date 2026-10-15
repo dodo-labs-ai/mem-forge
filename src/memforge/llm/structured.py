@@ -13,7 +13,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field as dataclass_field
 from threading import Lock
 from time import perf_counter
-from typing import Annotated, Any, Callable, Iterator, Literal, Mapping, get_args, get_origin
+from typing import Annotated, Any, Callable, ClassVar, Iterator, Literal, Mapping, get_args, get_origin
 from weakref import WeakKeyDictionary
 
 import litellm
@@ -22,7 +22,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from memforge.llm.failure_trace import (
     FailureTraceSink, capture_call, current_capture, local_failure_trace_sink_from_env,
 )
-from memforge.llm.providers import ResolvedInvocation, litellm_optional_kwargs
+from memforge.llm.providers import (
+    ModelConfigError, ResolvedInvocation, litellm_optional_kwargs, provider_descriptor,
+)
 from memforge.llm.structured_images import (
     StructuredLlmImage,
     StructuredLlmImageError,
@@ -199,6 +201,11 @@ class StructuredResponseModel(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
+    # A closed choice the model answers directly. Its callers size the output
+    # for the answer alone, so its requests ask the model not to reason first,
+    # in the way the provider descriptor says.
+    direct_answer: ClassVar[bool] = False
+
     @model_validator(mode="before")
     @classmethod
     def _decode_stringified_containers(cls, data: object) -> object:
@@ -249,6 +256,7 @@ class AgentSessionAuthorityResponse(StructuredResponseModel):
     """Schema returned by agent-session authority classification."""
 
     model_config = ConfigDict(extra="forbid")
+    direct_answer = True
 
     decisions: list[AgentSessionAuthorityDecision]
 
@@ -388,6 +396,7 @@ class CandidateAdmissionResponse(StructuredResponseModel):
     """Exactly one decision for every Candidate in an admission request."""
 
     model_config = ConfigDict(extra="forbid")
+    direct_answer = True
 
     decisions: list[CandidateAdmissionDecision]
 
@@ -437,6 +446,7 @@ class MemoryRelationResponse(StructuredResponseModel):
     """Schema for a complete batch of exact Memory-pair decisions."""
 
     model_config = ConfigDict(extra="ignore")
+    direct_answer = True
 
     decisions: list[MemoryRelationDecision]
 
@@ -454,6 +464,7 @@ class CrossDocumentRelationResponse(StructuredResponseModel):
     """Exactly one decision for every cross-document pair in the request."""
 
     model_config = ConfigDict(extra="forbid")
+    direct_answer = True
 
     decisions: list[CrossDocumentRelationDecision]
 
@@ -567,6 +578,7 @@ class EntityBatchValidationResponse(StructuredResponseModel):
     """One decision per mention in an entity ambiguity adjudication request."""
 
     model_config = ConfigDict(extra="forbid")
+    direct_answer = True
 
     decisions: list[EntityBatchValidationDecision]
 
@@ -575,6 +587,7 @@ class RerankResponse(StructuredResponseModel):
     """Schema returned by memory reranking."""
 
     model_config = ConfigDict(extra="ignore")
+    direct_answer = True
 
     ranking: list[int] = Field(default_factory=list)
 
@@ -583,6 +596,7 @@ class OfflineSemanticJudgeResponse(StructuredResponseModel):
     """One bounded, content-free decision for an offline semantic criterion."""
 
     model_config = ConfigDict(extra="forbid")
+    direct_answer = True
 
     verdict: Literal[
         "criterion_satisfied",
@@ -630,6 +644,9 @@ class StructuredLlmConfig:
     decision_native_schema_transport: NativeSchemaTransport = "auto"
     # The extra request parameters of the resolved invocation.
     extra_params: Mapping[str, Any] = dataclass_field(default_factory=dict)
+    # The provider descriptor of the resolved invocation, which says how a
+    # direct-answer request asks the model not to reason first.
+    provider: str | None = None
 
     @classmethod
     def for_invocation(cls, invocation: ResolvedInvocation, **settings: Any) -> StructuredLlmConfig:
@@ -639,6 +656,7 @@ class StructuredLlmConfig:
             base_url=invocation.api_base,
             api_key=invocation.api_key,
             extra_params=invocation.extra_params,
+            provider=invocation.provider,
             **settings,
         )
 
@@ -687,6 +705,9 @@ class StructuredLlmCallTelemetry:
     model: str | None = None
     # The model id the provider reported in its latest answer, if it reported one.
     provider_model: str | None = None
+    # Times the call was sent again with its output budget raised by the
+    # reasoning that used the budget up; at most one.
+    reasoning_budget_retries: int = 0
 
 
 @dataclass(frozen=True)
@@ -707,6 +728,7 @@ class StructuredLlmMetricsSummary:
     terminal_category_counts: Mapping[str, int]
     operation_counts: Mapping[str, int]
     error_code_counts: Mapping[str, int]
+    reasoning_budget_retries: int = 0
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -714,6 +736,7 @@ class StructuredLlmMetricsSummary:
             "provider_attempts": self.provider_attempts,
             "retries": self.retries,
             "schema_fallbacks": self.schema_fallbacks,
+            "reasoning_budget_retries": self.reasoning_budget_retries,
             "reported_input_tokens": self.reported_input_tokens,
             "reported_output_tokens": self.reported_output_tokens,
             "reported_total_tokens": self.reported_total_tokens,
@@ -784,6 +807,7 @@ class StructuredLlmMetricsCollector:
             provider_attempts=sum(call.attempt_count for call in calls),
             retries=sum(call.retry_count for call in calls),
             schema_fallbacks=sum(call.fallback_count for call in calls),
+            reasoning_budget_retries=sum(call.reasoning_budget_retries for call in calls),
             reported_input_tokens=reported_input_tokens,
             reported_output_tokens=reported_output_tokens,
             reported_total_tokens=reported_total_tokens,
@@ -833,6 +857,9 @@ class _StructuredCallState:
     attempt_count: int = 0
     retry_count: int = 0
     fallback_count: int = 0
+    reasoning_budget_retries: int = 0
+    # The output budget reasoning was shown to need; every later attempt of the call uses it.
+    reasoning_max_tokens: int | None = None
     final_mode: Literal["native_schema", "json_text"] = "native_schema"
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -952,6 +979,7 @@ class _StructuredCallState:
             diagnostic_attempts=tuple(self.diagnostic_attempts),
             model=self.model,
             provider_model=self.provider_model,
+            reasoning_budget_retries=self.reasoning_budget_retries,
         )
 
 
@@ -1009,6 +1037,8 @@ class ChangeImpactWireResult(BaseModel):
 
 
 class ChangeImpactWireResponse(BaseModel):
+    direct_answer: ClassVar[bool] = True
+
     results: list[ChangeImpactWireResult]
 
 
@@ -1328,6 +1358,19 @@ _PROVIDER_REQUEST_HEADER_NAMES = (
 )
 
 
+def _response_reasoning_tokens(response: object) -> int | None:
+    """The output tokens the provider reports its model spent reasoning, if it reports them."""
+
+    details = _object_value(_object_value(response, "usage"), "completion_tokens_details")
+    raw = _object_value(details, "reasoning_tokens")
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return None
+
+
 def _response_provider_request_id(response: object) -> str | None:
     hidden = _object_value(response, "_hidden_params")
     headers = _object_value(hidden, "additional_headers")
@@ -1389,6 +1432,23 @@ def _schema_operation_name(response_format: type[BaseModel]) -> str:
         return "change_impact"
     name = response_format.__name__.removesuffix("Response")
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+# Words a provider's or LiteLLM's rejection uses when it is the reasoning-off
+# parameter it refuses: ``reasoning``, ``reasoning_effort``, ``think`` or ``thinking``.
+_REASONING_REJECTION_TERMS = ("reasoning", "think")
+
+
+def _is_reasoning_off_rejection(exc: BaseException) -> bool:
+    """Whether the provider, or LiteLLM before it, refused the request for the
+    parameters that turn reasoning off, as its message names them."""
+
+    if provider_status_code(exc) not in {400, 422} or _safe_provider_error_code(exc) in {
+        INPUT_CAPACITY_EXCEEDED, PAYLOAD_TOO_LARGE,
+    }:
+        return False
+    message = str(exc).lower()
+    return any(term in message for term in _REASONING_REJECTION_TERMS)
 
 
 def _is_non_fallback_provider_error(exc: BaseException) -> bool:
@@ -1672,6 +1732,16 @@ _REFUSAL_ERROR_CODES: dict[type[BaseModel], str] = {
 }
 
 
+def _response_truncated(response: object) -> bool:
+    """Whether the reply stopped at its output limit."""
+
+    return _response_finish_reason(response) in _TRUNCATED_FINISH_REASONS or _response_stop_reason(response) == "max_tokens"
+
+
+def _output_truncated_error() -> StructuredLlmError:
+    return StructuredLlmError("structured response reached its output limit", error_code=OUTPUT_TRUNCATED)
+
+
 def _raise_for_unfinished_response(response: object, response_format: type[BaseModel]) -> None:
     """Reject replies the provider did not finish, even when they parse.
 
@@ -1681,8 +1751,8 @@ def _raise_for_unfinished_response(response: object, response_format: type[BaseM
 
     finish = _response_finish_reason(response)
     stop = _response_stop_reason(response)
-    if finish in _TRUNCATED_FINISH_REASONS or stop == "max_tokens":
-        raise StructuredLlmError("structured response reached its output limit", error_code=OUTPUT_TRUNCATED)
+    if _response_truncated(response):
+        raise _output_truncated_error()
     refusal_code = _REFUSAL_ERROR_CODES.get(response_format)
     message = _object_value(_first_response_choice(response), "message")
     if refusal_code is not None and (
@@ -1699,6 +1769,15 @@ class LiteLlmStructuredClient:
     alias. If a gateway rejects schema output, the client falls back once to a
     plain JSON prompt with the same schema. Both paths validate against the same
     pydantic model before returning to callers.
+
+    A schema that is a direct answer is requested with the parameters the
+    provider descriptor gives for answering without reasoning first. A provider
+    whose rejection of a request names those parameters is sent the request
+    without them, and is not sent them again for that model. A reply cut off at
+    its output limit after reasoning used most of that limit is requested once
+    more, with the limit raised by the reasoning it used, and the call's later
+    attempts keep the raised limit, so a model that reasons anyway still gets
+    the room its answer was sized for.
     """
 
     def __init__(
@@ -1714,6 +1793,8 @@ class LiteLlmStructuredClient:
         self._telemetry_sink = telemetry_sink
         self._failure_trace_sink = failure_trace_sink if failure_trace_sink is not None else local_failure_trace_sink_from_env()
         self._request_budgets = {}
+        # Routes whose provider refused the reasoning-off parameters.
+        self._reasoning_off_refused: set[str] = set()
 
     @property
     def max_concurrent(self) -> int:
@@ -2255,6 +2336,8 @@ class LiteLlmStructuredClient:
         validation_failure: _StructuredLlmFailure | None = None,
         validation_source: Literal["native_schema", "json_text"] | None = None,
     ):
+        if state.reasoning_max_tokens is not None:
+            max_tokens = max(max_tokens, state.reasoning_max_tokens)
         request_prompt = (
             prompt
             if native_schema
@@ -2285,20 +2368,49 @@ class LiteLlmStructuredClient:
             provider_kwargs["placeholder_values"] = {
                 prompt_template_variable: request_prompt
             }
-        response, attempt_index = await self._completion_with_retries(
-            model_name=model_name,
-            messages=messages,
-            max_tokens=max_tokens,
-            provider_kwargs=provider_kwargs,
-            response_format=response_format if native_schema else None,
-            native_schema_transport=native_schema_transport,
-            deadline=deadline,
-            state=state,
-        )
         structured_mode: Literal["native_schema", "json_text"] = (
             "native_schema" if native_schema else "json_text"
         )
         schema_transport = native_schema_transport if native_schema else "json_text"
+        direct_answer = bool(getattr(response_format, "direct_answer", False))
+
+        async def complete(output_tokens: int):
+            return await self._completion_with_retries(
+                model_name=model_name,
+                messages=messages,
+                max_tokens=output_tokens,
+                provider_kwargs=provider_kwargs,
+                reasoning_off=self._reasoning_off(model_name) if direct_answer else {},
+                response_format=response_format if native_schema else None,
+                native_schema_transport=native_schema_transport,
+                deadline=deadline,
+                state=state,
+            )
+
+        response, attempt_index = await complete(max_tokens)
+        raised_tokens = self._output_tokens_after_reasoning(
+            response, requested=max_tokens, model_name=model_name, state=state,
+        )
+        if raised_tokens is not None:
+            state.record_invalid_response_attempt(
+                response,
+                attempt_index=attempt_index,
+                structured_mode=structured_mode,
+                schema_transport=schema_transport,
+                requested_max_tokens=max_tokens,
+                exc=_output_truncated_error(),
+            )
+            state.reasoning_budget_retries += 1
+            logger.warning(
+                "Structured LLM reasoning used most of the %d output tokens of model %s for schema %s; "
+                "requesting it once more with %d",
+                max_tokens,
+                model_name,
+                response_format.__name__,
+                raised_tokens,
+            )
+            max_tokens = state.reasoning_max_tokens = raised_tokens
+            response, attempt_index = await complete(max_tokens)
         try:
             _raise_for_unfinished_response(response, response_format)
             raw_content = _message_content(response)
@@ -2324,6 +2436,42 @@ class LiteLlmStructuredClient:
                 raise
             raise _InvalidModelOutput(type(exc).__name__) from exc
 
+    def _reasoning_off(self, model_name: str) -> dict[str, Any]:
+        """The parameters that ask ``model_name`` to answer without reasoning first."""
+
+        if self.config.provider is None or model_name in self._reasoning_off_refused:
+            return {}
+        try:
+            return provider_descriptor(self.config.provider).reasoning_off(model_name)
+        except ModelConfigError:
+            return {}
+
+    def _output_tokens_after_reasoning(
+        self, response: object, *, requested: int, model_name: str, state: _StructuredCallState,
+    ) -> int | None:
+        """The output budget to request a reply again with, when reasoning used up the first.
+
+        Applies once per logical call, to a reply cut off at its limit whose
+        reasoning took most of it. The raised budget stays within the model's
+        output limit and, with the prompt the provider counted, its context
+        window, and holds for the call's later repair or JSON-text attempts.
+        """
+
+        if state.reasoning_budget_retries or not _response_truncated(response):
+            return None
+        reasoning_tokens = _response_reasoning_tokens(response)
+        if reasoning_tokens is None or 2 * reasoning_tokens <= requested:
+            return None
+        try:
+            budget = self.request_budget(model_name)
+        except ValueError:
+            return None
+        raised = min(requested + reasoning_tokens, budget.output_limit)
+        usage = _response_usage(response)
+        if usage is not None:
+            raised = min(raised, budget.context_limit - usage[0])
+        return raised if raised > requested else None
+
     async def _completion_with_retries(
         self,
         *,
@@ -2331,6 +2479,7 @@ class LiteLlmStructuredClient:
         messages: list[dict[str, str]],
         max_tokens: int,
         provider_kwargs: dict[str, Any],
+        reasoning_off: Mapping[str, Any],
         response_format: type[BaseModel] | None,
         native_schema_transport: NativeSchemaTransport,
         deadline: float,
@@ -2341,17 +2490,20 @@ class LiteLlmStructuredClient:
             response_format,
             native_schema_transport,
         )
+        reasoning_off_refused = False
         while True:
             remaining_s = max(0.001, deadline - loop.time())
             state.attempt_count += 1
             attempt_index = state.attempt_count
             failure: _StructuredLlmFailure | None = None
             retry = False
+            rejected = False
+            request_kwargs = {**provider_kwargs, **reasoning_off}
             capture = current_capture()
             if capture is not None:
                 capture.begin_attempt(dict(model=model_name, messages=messages,
                     max_tokens=max_tokens, timeout=remaining_s, num_retries=0,
-                    **provider_kwargs, **schema_kwargs))
+                    **request_kwargs, **schema_kwargs))
             try:
                 transport = litellm.acompletion if self._completion_transport is None else self._completion_transport
                 response = await transport(
@@ -2367,7 +2519,7 @@ class LiteLlmStructuredClient:
                         api_key=self.config.api_key,
                     ),
                     **self.config.extra_params,
-                    **provider_kwargs,
+                    **request_kwargs,
                     **schema_kwargs,
                 )
             except BaseException as exc:
@@ -2377,6 +2529,7 @@ class LiteLlmStructuredClient:
                     raise
                 state.record_failed_attempt()
                 retry = is_retryable_provider_error(exc) and state.retry_budget > 0
+                rejected = bool(reasoning_off) and _is_reasoning_off_rejection(exc)
                 failure = _structured_failure(exc)
                 state.record_provider_failure_attempt(
                     attempt_index=attempt_index,
@@ -2389,6 +2542,11 @@ class LiteLlmStructuredClient:
                     requested_max_tokens=max_tokens,
                     failure=failure,
                 )
+            if failure is not None and rejected:
+                # The provider refuses to answer this model without reasoning;
+                # the request is sent once more as the provider's default asks.
+                reasoning_off, reasoning_off_refused = {}, True
+                continue
             if failure is not None and not retry:
                 raise failure.to_error()
             if retry:
@@ -2400,6 +2558,13 @@ class LiteLlmStructuredClient:
             if capture is not None:
                 capture.response(response)
             state.record_response(response)
+            if reasoning_off_refused:
+                self._reasoning_off_refused.add(model_name)
+                logger.warning(
+                    "Structured LLM provider refused the reasoning-off parameters of model %s; "
+                    "its direct-answer requests are sent without them",
+                    model_name,
+                )
             return response, attempt_index
 
     def _native_schema_transport(self, model_name: str) -> NativeSchemaTransport:
@@ -2426,6 +2591,7 @@ class LiteLlmStructuredClient:
             "attempt_count": telemetry.attempt_count,
             "retry_count": telemetry.retry_count,
             "fallback_count": telemetry.fallback_count,
+            "reasoning_budget_retries": telemetry.reasoning_budget_retries,
             "final_mode": telemetry.final_mode,
             "elapsed_ms": telemetry.elapsed_ms,
             "terminal_category": telemetry.terminal_category,
@@ -2436,13 +2602,15 @@ class LiteLlmStructuredClient:
             "diagnostic_attempt_count": len(telemetry.diagnostic_attempts),
         }
         logger.info("structured_llm_call %s", json.dumps(payload, sort_keys=True, separators=(",", ":")))
-        recovered_with_fallback = telemetry.terminal_category == "success" and telemetry.fallback_count > 0
         if telemetry.terminal_category == "cancelled":
             outcome = "expected"
             reason_code = "call_cancelled"
+        elif telemetry.terminal_category == "success" and telemetry.fallback_count > 0:
+            outcome, reason_code = "degraded", "schema_fallback_recovered"
+        elif telemetry.terminal_category == "success" and telemetry.reasoning_budget_retries > 0:
+            outcome, reason_code = "degraded", "reasoning_budget_recovered"
         elif telemetry.terminal_category == "success":
-            outcome = "degraded" if recovered_with_fallback else "expected"
-            reason_code = "schema_fallback_recovered" if recovered_with_fallback else "schema_conformant"
+            outcome, reason_code = "expected", "schema_conformant"
         else:
             outcome = "rejected" if telemetry.terminal_category == "invalid_response" else "failed"
             reason_code = (
