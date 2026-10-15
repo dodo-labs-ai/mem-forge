@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- A Markdown document with an HTML part that has no text to cite, such as a
+  row of badges, an image or `<picture>`, a centred `<div>` wrapper, a
+  `</details>` closer or a lone `<br>`, no longer makes every Memory taken
+  from that document unreadable. Before, opening such a Memory in the admin
+  UI or through MCP `get_memory` failed with "Pinned text Evidence integrity
+  verification failed", every relation discovery job that read it failed,
+  and an edit to the document ended its next sync without extracting
+  anything. Most GitHub READMEs have such parts. Evidence still has to match
+  its source exactly. Only a document that cannot be read at all, such as one
+  in an unsupported format, still fails this check. Memories already stored
+  read correctly without a re-sync. Relation discovery work that already used
+  up its retries can be queued again from the relation discovery work admin
+  action (`POST /api/v1/relation-discovery/work/rerun` with state
+  `exhausted`). Cloud: arrives with the pin; the HANA store uses the same
+  check, so it needs no change.
 - Logs written where stderr is not a terminal, such as a Docker container or a
   service manager, are one plain line per record with the timestamp, level and
   logger, and tracebacks print in full. Before, boxed tracebacks wrapped into

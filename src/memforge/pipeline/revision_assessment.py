@@ -350,7 +350,7 @@ class RevisionAssessmentContext:
     def index(self, revision):
         if revision.id not in self.indexes:
             index = build_revision_fragment_index(revision)
-            if any(error.fatal for error in index.errors):
+            if not index.complete:
                 raise SupportRevalidationLimitation(
                     SupportRevalidationLimitationCode.UNSUPPORTED_REPRESENTATION
                     if any(error.code.value == "unsupported_profile" for error in index.errors)
