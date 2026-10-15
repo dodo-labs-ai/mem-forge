@@ -65,6 +65,7 @@ from memforge.memory.engine import (
     SourceUnitLifecycleDeferred,
     SourceUnitLifecycleExecutionError,
 )
+from memforge.memory.health import MemoryIndexHealthChecker
 from memforge.memory.evidence import (
     AuthorityCase,
     CandidateMemory,
@@ -1828,6 +1829,55 @@ async def test_entity_resolution_reads_each_mention_with_its_own_memory_text(db:
     )
 
     assert received == [{"payroll service": [payroll.content], "ledger": [payroll.content]}]
+
+
+@pytest.mark.asyncio
+async def test_created_memory_fts_row_carries_its_linked_entity_names(db: Database) -> None:
+    ledger_id = await db.upsert_entity("ledger", "Ledger")
+    projection = _projection(
+        run_id="projection-entity-fts",
+        body="Release notes for the quarter follow. The Payroll Service posts runs to the Ledger.",
+    )
+    revision = _body_revision(projection)
+    payroll = RawMemory(
+        content="The Payroll Service posts runs to the Ledger.",
+        memory_type="fact",
+        entity_refs=["Payroll Service", "Ledger"],
+        evidence_quote="The Payroll Service posts runs to the Ledger.",
+        source_observation_id=_body_observation(projection).id,
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
+    )
+
+    await engine.prepare_and_commit_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=_selected(projection, [payroll]),
+        doc_type="document",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=revision.content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
+
+    [memory] = await db.list_memories()
+    assert ledger_id in await db.get_memory_entity_ids(memory.id)
+    async with db.db.execute(
+        "SELECT entities_text FROM memories_fts WHERE memory_id = ?",
+        (memory.id,),
+    ) as cursor:
+        [fts_row] = await cursor.fetchall()
+    assert fts_row["entities_text"] == "ledger payroll service"
+    report = await MemoryIndexHealthChecker(db).check()
+    assert [issue.kind for issue in report.issues if "fts" in issue.kind] == []
 
 
 @pytest.mark.asyncio
