@@ -6,6 +6,7 @@ discovery, and the Memory vector index that belongs to the embedding model.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from collections.abc import Callable, Mapping
@@ -867,6 +868,11 @@ def _model_list_headers(descriptor: ProviderDescriptor, api_key: str | None) -> 
     return headers
 
 
+# How long one model listing request may take, from sending it to the last
+# byte of the answer. The HTTP client's own timeout bounds each wait on its
+# own, which an endpoint that sends a byte now and then never runs out of.
+_LISTING_TIMEOUT_S = 5.0
+
 # Ollama families of models that only embed text; Ollama names a model's family
 # by its architecture.
 _EMBEDDING_FAMILIES = frozenset({"bert", "nomic-bert", "xlm-roberta"})
@@ -1073,7 +1079,9 @@ async def _discover_models(
 
     The request carries the API key, so it does not follow redirects: an answer
     that points to another origin fails the listing, and one that points
-    elsewhere on the same origin only rules out the address that gave it.
+    elsewhere on the same origin only rules out the address that gave it. An
+    address that has not answered in full within ``_LISTING_TIMEOUT_S`` fails
+    the listing as a timeout.
     """
     value = endpoint.strip()
     host = urlsplit(value).hostname or "the endpoint"
@@ -1082,12 +1090,13 @@ async def _discover_models(
     redirected: tuple[int, int] | None = None
     non_json_latency_ms: int | None = None
 
-    async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+    async with httpx.AsyncClient(timeout=_LISTING_TIMEOUT_S, follow_redirects=False) as client:
         for url in _model_list_urls(value, listing, kind):
             started = time.perf_counter()
             try:
-                resp = await client.get(url, headers=headers)
-            except httpx.TimeoutException:
+                async with asyncio.timeout(_LISTING_TIMEOUT_S):
+                    resp = await client.get(url, headers=headers)
+            except (TimeoutError, httpx.TimeoutException):
                 return _discovery_error(
                     endpoint=value,
                     stage="timeout",
