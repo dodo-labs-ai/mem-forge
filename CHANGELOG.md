@@ -28,6 +28,20 @@
   so their requests gain no parameter; only the once-raised `max_tokens` can
   differ, and only when an AI Core reply reports reasoning that used up its
   budget.
+- Settings → Load models ends a listing request at five seconds, counted from
+  sending it to the last byte of the answer. Before, the five seconds applied
+  to each wait on its own, so an endpoint that sent a byte now and then could
+  keep Load models waiting indefinitely. LiteLLM requests made through the
+  HTTP clients MemForge sets up, on the shared OpenAI-compatible client and on
+  the clients built for `openrouter/`, `anthropic/` and every other provider
+  route, now also end at their timeout as a whole and fail as a timeout that
+  is retried like any other; before, a provider that kept the connection busy
+  could hold a direct LiteLLM call open far past its timeout. Generation,
+  embedding and capability checks were already bounded by their own
+  deadlines and behave as before. Cloud: no change needed; no request
+  parameter is added, so the `sap/` routes of the `litellm` provider receive
+  the same requests as before, and their requests through LiteLLM's SAP
+  client end at the timeout MemForge already sends them with.
 - Settings → Load models lists the models of the kind being set up. OpenRouter
   embedding models come from its embedding list (`/embeddings/models`) instead
   of its chat models; OpenAI's one list is split by model id; Ollama is asked

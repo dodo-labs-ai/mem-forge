@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import httpx
 import litellm
@@ -13,20 +14,32 @@ from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from pydantic import ConfigDict
 
 from memforge.llm.bindings import build_binding, compile_binding
-from memforge.llm.embedding import EmbeddingProviderError, EmbeddingRuntime, EmbeddingSettings
+from memforge.llm.embedding import (
+    EmbeddingDeadlineExceeded,
+    EmbeddingProviderError,
+    EmbeddingRuntime,
+    EmbeddingSettings,
+)
 from memforge.llm.providers import ResolvedInvocation
 from memforge.llm.structured import (
-    LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError, StructuredResponseModel,
+    LiteLlmStructuredClient,
+    StructuredLlmConfig,
+    StructuredLlmError,
+    StructuredResponseModel,
+    failure_retryable,
 )
 from memforge.llm.transport import (
     NoRedirectAsyncClient,
+    end_provider_client_exchanges_at_their_timeout,
     install_no_redirect_http_client,
     is_retryable_provider_error,
     keep_ollama_model_lookups_off_request_endpoints,
     provider_retry_after_seconds,
     provider_status_code,
     refuse_redirects_in_provider_clients,
+    send_within_timeout,
 )
+from tests.stalling_endpoint_fixture import GIVES_UP_AFTER_S, STALL_MODES, stalling_endpoint
 
 
 class _StatusError(Exception):
@@ -611,3 +624,190 @@ async def test_only_a_direct_answer_asks_the_provider_to_answer_without_reasonin
     direct, reasoned = (json.loads(request.content) for request in chat_endpoint)
     assert {name: direct[name] for name in set(direct) - set(reasoned)} == reasoning_off
     assert set(reasoned) <= set(direct)
+
+
+# -- Request timeouts ---------------------------------------------------------------
+
+_REQUEST_TIMEOUT_S = 0.5
+# A request ended at its timeout ends well before the stalling endpoint gives up.
+_ENDED_AT_ITS_TIMEOUT_S = GIVES_UP_AFTER_S / 2
+_MESSAGES = [{"role": "user", "content": "Rank the matching memories"}]
+
+
+@pytest.fixture
+async def fresh_provider_clients(monkeypatch):
+    """Provider clients built for this test, under the policy the runtime installs.
+
+    LiteLLM keeps one module-level client for Ollama requests. This test gets
+    its own, so it never sends through one built under another test's stand-in.
+    """
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.llms.custom_httpx.async_client_cleanup import close_litellm_async_clients
+
+    assert isinstance(litellm.aclient_session, NoRedirectAsyncClient)
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
+    module_client = AsyncHTTPHandler(timeout=litellm.request_timeout)
+    monkeypatch.setattr(litellm, "module_level_aclient", module_client)
+    yield
+    await GLOBAL_LOGGING_WORKER.flush()
+    await close_litellm_async_clients()
+    await module_client.close()
+
+
+def _completion(route: str, *, path: str = "/v1", **request):
+    async def call(base_url: str):
+        return await litellm.acompletion(
+            model=route,
+            messages=_MESSAGES,
+            api_base=f"{base_url}{path}",
+            api_key="endpoint-key",
+            timeout=_REQUEST_TIMEOUT_S,
+            num_retries=0,
+            **request,
+        )
+
+    return call
+
+
+def _embedding(route: str, *, path: str = "/v1"):
+    async def call(base_url: str):
+        return await litellm.aembedding(
+            model=route,
+            input=["alpha"],
+            api_base=f"{base_url}{path}",
+            api_key="endpoint-key",
+            timeout=_REQUEST_TIMEOUT_S,
+            max_retries=0,
+        )
+
+    return call
+
+
+_SDK_REQUESTS = {
+    "openrouter completion": _completion(
+        "openrouter/anthropic/claude-haiku-test", extra_body={"reasoning": {"effort": "none"}}
+    ),
+    "openai completion": _completion("openai/chat-test"),
+    "anthropic completion": _completion("anthropic/claude-test", path=""),
+    "openai embedding": _embedding("openai/text-embedding-test"),
+    "openrouter embedding": _embedding("openrouter/openai/text-embedding-test"),
+}
+
+
+@pytest.mark.parametrize("mode", STALL_MODES)
+@pytest.mark.parametrize("request_name", list(_SDK_REQUESTS))
+async def test_a_model_request_ends_at_its_timeout_however_the_endpoint_stalls(
+    fresh_provider_clients, mode, request_name
+) -> None:
+    """A provider that keeps the connection busy cannot hold a request past its timeout."""
+    with stalling_endpoint(mode) as base_url:
+        started = time.monotonic()
+        with pytest.raises(litellm.Timeout) as raised:
+            await _SDK_REQUESTS[request_name](base_url)
+        elapsed_s = time.monotonic() - started
+
+    assert elapsed_s < _ENDED_AT_ITS_TIMEOUT_S
+    assert is_retryable_provider_error(raised.value) is True
+
+
+async def test_an_exchange_that_outlasts_its_timeout_fails_as_a_read_timeout() -> None:
+    request = httpx.Request("POST", "https://models.example.test/v1/chat/completions")
+    request.extensions["timeout"] = httpx.Timeout(0.05).as_dict()
+
+    async def never_answers(_request: httpx.Request, **_options) -> httpx.Response:
+        await asyncio.sleep(60)
+        raise AssertionError("unreachable")
+
+    with pytest.raises(httpx.ReadTimeout) as raised:
+        await send_within_timeout(never_answers, request)
+
+    assert raised.value.request is request
+
+
+async def test_a_request_without_a_timeout_is_sent_unbounded() -> None:
+    request = httpx.Request("GET", "https://models.example.test/v1/models")
+    request.extensions["timeout"] = httpx.Timeout(None).as_dict()
+
+    async def answers(_request: httpx.Request, **_options) -> httpx.Response:
+        return httpx.Response(200)
+
+    assert (await send_within_timeout(answers, request)).status_code == 200
+
+
+async def test_a_timeout_the_send_raises_itself_is_left_as_it_is() -> None:
+    request = httpx.Request("GET", "https://models.example.test/v1/models")
+    request.extensions["timeout"] = httpx.Timeout(5.0).as_dict()
+    own = TimeoutError("the transport's own")
+
+    async def raises(_request: httpx.Request, **_options) -> httpx.Response:
+        raise own
+
+    with pytest.raises(TimeoutError) as raised:
+        await send_within_timeout(raises, request)
+
+    assert raised.value is own
+
+
+def test_ending_provider_client_exchanges_at_their_timeout_wraps_the_builder_once() -> None:
+    builder = AsyncHTTPHandler.create_client
+
+    end_provider_client_exchanges_at_their_timeout()
+
+    assert AsyncHTTPHandler.create_client is builder
+
+
+@pytest.mark.parametrize(
+    "route", ["openrouter/anthropic/claude-haiku-test", "openai/chat-test", "anthropic/claude-test"]
+)
+async def test_a_structured_call_to_a_trickling_endpoint_ends_at_its_deadline_as_a_transient_failure(
+    fresh_provider_clients, route
+) -> None:
+    with stalling_endpoint("trickle") as base_url:
+        client = LiteLlmStructuredClient(
+            StructuredLlmConfig(
+                model=route,
+                base_url=base_url if route.startswith("anthropic/") else f"{base_url}/v1",
+                api_key="endpoint-key",
+                timeout_s=_REQUEST_TIMEOUT_S,
+            )
+        )
+        started = time.monotonic()
+        with pytest.raises(StructuredLlmError) as raised:
+            await client.rerank_memories("Rank the matching memories")
+        elapsed_s = time.monotonic() - started
+
+    assert elapsed_s < _ENDED_AT_ITS_TIMEOUT_S
+    assert raised.value.terminal_category == "deadline_exceeded"
+    assert failure_retryable(raised.value) is True
+
+
+@pytest.mark.parametrize(
+    ("route", "path"),
+    [
+        ("openai/text-embedding-test", "/v1"),
+        ("openrouter/openai/text-embedding-test", "/v1"),
+        # LiteLLM sends an Ollama embedding without the caller's timeout; the
+        # runtime's own deadline ends it.
+        ("ollama/nomic-embed-text", ""),
+    ],
+)
+async def test_an_embedding_from_a_trickling_endpoint_ends_at_its_deadline_as_a_transient_failure(
+    fresh_provider_clients, route, path
+) -> None:
+    with stalling_endpoint("trickle") as base_url:
+        runtime = EmbeddingRuntime(
+            EmbeddingSettings(
+                invocation=ResolvedInvocation(
+                    route=route, api_base=f"{base_url}{path}", api_key="endpoint-key"
+                ),
+                timeout_s=_REQUEST_TIMEOUT_S,
+                cache_size=0,
+            )
+        )
+        started = time.monotonic()
+        with pytest.raises(EmbeddingDeadlineExceeded) as raised:
+            await runtime.embed_query("alpha")
+        elapsed_s = time.monotonic() - started
+
+    assert elapsed_s < _ENDED_AT_ITS_TIMEOUT_S
+    assert failure_retryable(raised.value) is True
