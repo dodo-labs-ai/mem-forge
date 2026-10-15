@@ -200,11 +200,13 @@ class MemoryVectorIndexes:
         target: ReindexTarget,
         *,
         progress: ReindexProgress | None = None,
+        on_switch: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Build, verify and switch to the index ``start_rebuild`` recorded.
 
-        Returns the record as the rebuild left it: in use, or failed with the
-        code of the reason.
+        ``on_switch`` is called as soon as the rebuilt index is in use, before
+        the replaced index is deleted. Returns the record as the rebuild left
+        it: in use, or failed with the code of the reason.
         """
         index_id = str(record["id"])
         lease = asyncio.create_task(self._keep_lease(index_id))
@@ -230,6 +232,8 @@ class MemoryVectorIndexes:
             logger.exception("The rebuild of the Memory vector index failed")
             await self._abandon(record, "index_error")
         else:
+            if on_switch is not None:
+                on_switch()
             logger.info(
                 "The Memory vector index was rebuilt: %d vectors in %s",
                 vector_count,

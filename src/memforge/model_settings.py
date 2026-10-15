@@ -600,9 +600,7 @@ class ModelSettings:
         *,
         on_switch: Callable[[], None] | None,
     ) -> None:
-        finished = await indexes.rebuild(record, target)
-        if finished["state"] == "active" and on_switch is not None:
-            on_switch()
+        await indexes.rebuild(record, target, on_switch=on_switch)
 
     async def _reindex_target(self, db: "Database") -> tuple["MemoryVectorIndexes", "ReindexTarget"]:
         """Decide which embedding binding a rebuild started now is for."""

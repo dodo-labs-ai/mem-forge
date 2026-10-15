@@ -178,6 +178,11 @@ async def _reindex_ended(client: httpx.AsyncClient) -> dict:
     raise AssertionError("the rebuild did not end")
 
 
+async def _rebuild_task_done(app) -> None:
+    """Wait for the background rebuild to finish deleting the index it replaced."""
+    await asyncio.gather(*app.state.model_settings._reindex_tasks)
+
+
 # -- Validate, then reindex ---------------------------------------------------------
 
 
@@ -296,6 +301,7 @@ async def test_a_reindex_builds_verifies_switches_and_deletes_the_previous_index
     async with _client(app) as client:
         started = await client.post(f"{API}/vector-index/reindex")
         ended = await _reindex_ended(client)
+        await _rebuild_task_done(app)
         read = (await client.get(API)).json()
 
     assert started.status_code == 202, started.text
