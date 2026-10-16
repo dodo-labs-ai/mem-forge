@@ -69,6 +69,22 @@ docker compose --env-file .env.mirrors.example up --build
 Copy `.env.mirrors.example` to `.env` only when you also want to edit local
 model keys or ports.
 
+### Reaching model providers through a proxy
+
+The API container calls the model providers itself. If they are reachable only
+through a proxy on your machine, add it to `.env` and restart the stack.
+`host.docker.internal` is the host as the container sees it, and the proxy must
+accept connections from the container:
+
+```bash
+HTTPS_PROXY=http://host.docker.internal:7890
+HTTP_PROXY=http://host.docker.internal:7890
+NO_PROXY=localhost,127.0.0.1,api,admin-ui,host.docker.internal
+```
+
+A model server on your machine, such as Ollama at `host.docker.internal`, is
+reached directly through `NO_PROXY`.
+
 The API image uses WeasyPrint for Confluence PDF export. This keeps the image
 much lighter than bundling a browser runtime while preserving print-oriented
 HTML layout for source evidence PDFs.
