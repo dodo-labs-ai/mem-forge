@@ -8,12 +8,19 @@ const STANDALONE_TARGET: WorkspaceApiTarget = Object.freeze({
   resourceBaseUrl: "/api/v1",
   localAgentBaseUrl: LOCAL_AGENT_HOST_BASE_URL,
   workspaceId: "local",
+  shared: false,
 });
 
 export interface WorkspaceApiTarget {
   resourceBaseUrl: string;
   localAgentBaseUrl: string;
   workspaceId: string | null;
+  /**
+   * Whether other people use this workspace too. Only then do Sources and
+   * Memories say who can use them; in a workspace of one, everything belongs
+   * to its one user.
+   */
+  shared: boolean;
 }
 
 export interface WorkspaceApiController {
@@ -32,6 +39,7 @@ export const hostClient = axios.create({
 });
 
 let currentTarget: Readonly<WorkspaceApiTarget> | null = null;
+const targetListeners = new Set<() => void>();
 
 function normalizeBaseUrl(baseUrl: string): string {
   const normalized = baseUrl.trim().replace(/\/+$/, "");
@@ -43,10 +51,13 @@ function normalizeTarget(target: WorkspaceApiTarget): Readonly<WorkspaceApiTarge
     resourceBaseUrl: normalizeBaseUrl(target.resourceBaseUrl),
     localAgentBaseUrl: normalizeBaseUrl(target.localAgentBaseUrl),
     workspaceId: target.workspaceId?.trim() || null,
+    // Only a target that says it has one user hides who can use what.
+    shared: target.shared !== false,
   });
 }
 
-function sameTarget(
+/** Whether both targets send requests to the same workspace. */
+function sameRequests(
   left: Readonly<WorkspaceApiTarget> | null,
   right: Readonly<WorkspaceApiTarget> | null,
 ): boolean {
@@ -65,17 +76,32 @@ export function createWorkspaceApiController(
     current: () => currentTarget,
     setTarget: (target: WorkspaceApiTarget | null) => {
       const nextTarget = target === null ? null : normalizeTarget(target);
-      if (sameTarget(currentTarget, nextTarget)) return;
+      const requestsChanged = !sameRequests(currentTarget, nextTarget);
+      if (!requestsChanged && currentTarget?.shared === nextTarget?.shared) return;
 
       currentTarget = nextTarget;
-      resourceClient.defaults.baseURL =
-        nextTarget?.resourceBaseUrl ?? STANDALONE_TARGET.resourceBaseUrl;
-      resourceClient.defaults.params = nextTarget?.workspaceId
-        ? { workspace_id: nextTarget.workspaceId }
-        : {};
-      queryClient.clear();
+      if (requestsChanged) {
+        resourceClient.defaults.baseURL =
+          nextTarget?.resourceBaseUrl ?? STANDALONE_TARGET.resourceBaseUrl;
+        resourceClient.defaults.params = nextTarget?.workspaceId
+          ? { workspace_id: nextTarget.workspaceId }
+          : {};
+        queryClient.clear();
+      }
+      targetListeners.forEach((listener) => listener());
     },
   });
+}
+
+/** Whether other people use the selected workspace; the standalone workspace has one user. */
+export function currentWorkspaceIsShared(): boolean {
+  return (currentTarget ?? STANDALONE_TARGET).shared;
+}
+
+/** Calls `listener` whenever the selected workspace target changes. */
+export function subscribeWorkspaceTarget(listener: () => void): () => void {
+  targetListeners.add(listener);
+  return () => targetListeners.delete(listener);
 }
 
 export function currentLocalAgentBaseUrl(): string {

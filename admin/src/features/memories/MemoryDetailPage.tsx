@@ -1,6 +1,6 @@
 import { AlertCircle, ArrowLeft, Lock, RefreshCw, SearchX } from "lucide-react";
 import { Link, useParams } from "react-router-dom";
-import { HTTP_STATUS, isApiErrorStatus, useProjects, useWorkspaceTarget } from "@/api";
+import { HTTP_STATUS, isApiErrorStatus, useProjects, useSharedWorkspace, useWorkspaceTarget } from "@/api";
 import { useSourceTypeLabels } from "@/features/sources";
 import { errorMessage } from "@/lib/errors";
 import { formatDate, formatDateTime } from "@/lib/format";
@@ -47,12 +47,13 @@ interface MemoryDetailsCardProps {
 }
 
 function MemoryDetailsCard({ memory, projects, typeLabels }: MemoryDetailsCardProps) {
+  const sharedWorkspace = useSharedWorkspace();
   const project = projectBadge(memory.project_key, projects);
   const sources = (memory.sources ?? []).map((source) => sourceName(source, typeLabels));
   const items: Property[] = [
     { label: "Type", value: <MemoryTypeBadge type={memory.memory_type} /> },
     { label: "Status", value: <MemoryStatusLabel status={memory.status} /> },
-    { label: "Access", value: <AccessValue memory={memory} /> },
+    ...(sharedWorkspace ? [{ label: "Access", value: <AccessValue memory={memory} /> }] : []),
     { label: "Project", value: project ? <ProjectLabel project={project} /> : "None" },
     { label: "Sources", value: sources.length > 0 ? sources.join(", ") : "None" },
     ...(memory.created_at ? [{ label: "Created", value: formatDate(memory.created_at) }] : []),
@@ -95,6 +96,7 @@ export function MemoryDetailPage() {
   const memoryQuery = useMemory(memoryId);
   const projects = useProjects();
   const typeLabels = useSourceTypeLabels();
+  const sharedWorkspace = useSharedWorkspace();
 
   if (memoryQuery.isPending) {
     return (
@@ -115,7 +117,11 @@ export function MemoryDetailPage() {
             <EmptyState
               icon={SearchX}
               title="Memory not found"
-              description="It may have been removed, or it belongs to a source you cannot access. Private memories are visible only to their owner."
+              description={
+                sharedWorkspace
+                  ? "It may have been removed, or it belongs to a source you cannot access. Private memories are visible only to their owner."
+                  : "It may have been removed."
+              }
               action={
                 <Link to={MEMORIES_PATH} className={buttonVariants({ variant: "outline" })}>
                   <ArrowLeft />

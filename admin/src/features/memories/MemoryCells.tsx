@@ -1,6 +1,7 @@
 import { ArrowUpRight, Link2 } from "lucide-react";
 import type { MouseEvent } from "react";
 import { Link } from "react-router-dom";
+import { useSharedWorkspace } from "@/api";
 import { formatCount, formatRelative, pluralize } from "@/lib/format";
 import { MemoryStatusLabel, MemoryTypeBadge, OnlyMeLabel, ProjectLabel, SourceLabel } from "./MemoryBadges";
 import { useMemoryTable } from "./memoryTableContext";
@@ -39,6 +40,7 @@ function RelationHintLink({ hint }: { hint: RelationHint }) {
 
 export function MemoryCell({ row }: { row: MemoryRow }) {
   const { projects, typeLabels } = useMemoryTable();
+  const sharedWorkspace = useSharedWorkspace();
   const project = row.context ? projectBadge(row.context.projectKey, projects) : null;
   const sources = row.context ? sourceSummary(row.context.sources) : null;
   return (
@@ -56,7 +58,7 @@ export function MemoryCell({ row }: { row: MemoryRow }) {
             ) : null}
           </span>
         ) : null}
-        {row.context?.isPrivate ? <OnlyMeLabel /> : null}
+        {sharedWorkspace && row.context?.isPrivate ? <OnlyMeLabel /> : null}
         {row.relationHints.map((hint) => (
           <RelationHintLink key={hint.kind} hint={hint} />
         ))}

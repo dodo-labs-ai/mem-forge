@@ -572,6 +572,7 @@ def test_tool_client_forwards_search_to_hosted_workspace(monkeypatch):
     assert captured["authorization"] == "Bearer tok"
     assert json.loads(captured["body"].decode()) == {
         "top_k": 20,
+        "include_private": True,
         "include_superseded": False,
         "query": "artifact cache",
         "intent": "known_item",
@@ -609,6 +610,25 @@ def test_tool_client_forwards_structured_memory_search_facets():
                 "include_private": True,
                 "active_repo_identifier": "github.example.com/acme/memforge-cloud",
                 "status": "active",
+            },
+        )
+    ]
+
+
+def test_tool_client_search_can_leave_out_the_callers_private_memories():
+    client = _RecordingClient({"results": []})
+
+    client.search(query="release process", include_private=False)
+
+    assert client.calls == [
+        (
+            "POST",
+            "/api/v1/memories/search",
+            {
+                "query": "release process",
+                "top_k": 20,
+                "include_private": False,
+                "include_superseded": False,
             },
         )
     ]

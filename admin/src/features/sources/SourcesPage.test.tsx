@@ -2,7 +2,7 @@ import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, test, vi } from "vitest";
 import { toast } from "sonner";
-import type { WorkspaceTarget } from "@/api";
+import { STANDALONE_TARGET, type WorkspaceTarget } from "@/api";
 import { errorResponse, type Route } from "@/test/fakeApi";
 import { renderRoutes } from "@/test/renderRoutes";
 import { makeLocalAgentJob, makeSource } from "@/test/sourceFixtures";
@@ -54,6 +54,28 @@ test("lists sources by project and surfaces the ones that need the user", async 
   const needsYou = screen.getByRole("region", { name: "Needs you" });
   expect(within(needsYou).getByText("Payroll Jira")).toBeInTheDocument();
   expect(within(needsYou).getByRole("button", { name: "Choose a project" })).toBeInTheDocument();
+});
+
+test("a workspace of one leaves out who can use each source", async () => {
+  renderPage([makeSource({ access_policy: "private" })]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  expect(within(table).queryByRole("columnheader", { name: "Access" })).not.toBeInTheDocument();
+  expect(within(table).queryByText("Only me")).not.toBeInTheDocument();
+  await userEvent.click(await within(table).findByText("Payroll wiki"));
+  const drawer = await screen.findByRole("dialog", { name: "Payroll wiki" });
+  expect(within(drawer).queryByText("Access")).not.toBeInTheDocument();
+});
+
+test("a shared workspace shows who can use each source", async () => {
+  renderPage([makeSource({ access_policy: "private" })], {}, { ...STANDALONE_TARGET, shared: true });
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  expect(within(table).getByRole("columnheader", { name: "Access" })).toBeInTheDocument();
+  await userEvent.click(await within(table).findByText("Payroll wiki"));
+  const drawer = await screen.findByRole("dialog", { name: "Payroll wiki" });
+  expect(within(drawer).getByText("Access")).toBeInTheDocument();
+  expect(within(drawer).getByText("Only me")).toBeInTheDocument();
 });
 
 test("Sync now starts a sync for that source", async () => {
@@ -124,6 +146,7 @@ test("waits for durable Jira authentication and refreshes readiness in the selec
     resourceBaseUrl: "/api/cloud/workspaces/team_alpha/v1",
     localAgentBaseUrl: "/api/cloud/workspaces/team_alpha/local-agent",
     workspaceId: "team_alpha",
+    shared: true,
   });
   const table = await screen.findByRole("table", { name: "Sources" });
   await userEvent.click(await within(table).findByRole("button", { name: "Sign in" }));

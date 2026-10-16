@@ -1,4 +1,4 @@
-export { ApiProvider, useApi, useWorkspaceTarget } from "./ApiProvider";
+export { ApiProvider, useApi, useSharedWorkspace, useWorkspaceTarget } from "./ApiProvider";
 export { createApiClient, unwrap, workspaceResourceUrl, type ApiClient } from "./client";
 export { ApiError, HTTP_STATUS, NoWorkspaceError, isApiErrorStatus, isReindexInProgress, isSearchIndexRefusal } from "./errors";
 export {

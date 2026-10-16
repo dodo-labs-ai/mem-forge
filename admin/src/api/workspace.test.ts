@@ -6,6 +6,7 @@ const WORKSPACE_A: WorkspaceTarget = {
   localAgentBaseUrl: "/api/cloud/workspaces/ws-a/local-agent",
   workspaceId: "ws-a",
   label: "Payroll",
+  shared: true,
 };
 
 test("a new workspace drops cached data and notifies subscribers", () => {
@@ -34,6 +35,19 @@ test("a renamed workspace keeps cached data and notifies subscribers", () => {
   expect(controller.current()?.label).toBe("Payroll EU");
 });
 
+test("a workspace that becomes shared keeps cached data and notifies subscribers", () => {
+  const onChange = vi.fn();
+  const listener = vi.fn();
+  const controller = createWorkspaceController(onChange, { ...WORKSPACE_A, shared: false });
+  controller.subscribe(listener);
+
+  controller.setTarget(WORKSPACE_A);
+
+  expect(onChange).not.toHaveBeenCalled();
+  expect(listener).toHaveBeenCalledTimes(1);
+  expect(controller.current()?.shared).toBe(true);
+});
+
 test("setting the same target changes nothing", () => {
   const onChange = vi.fn();
   const listener = vi.fn();
@@ -44,4 +58,17 @@ test("setting the same target changes nothing", () => {
 
   expect(onChange).not.toHaveBeenCalled();
   expect(listener).not.toHaveBeenCalled();
+});
+
+test("a target that does not say it has one user is shared", () => {
+  const controller = createWorkspaceController(vi.fn());
+  const unmarked = {
+    resourceBaseUrl: WORKSPACE_A.resourceBaseUrl,
+    localAgentBaseUrl: WORKSPACE_A.localAgentBaseUrl,
+    workspaceId: WORKSPACE_A.workspaceId,
+  };
+
+  controller.setTarget(unmarked as WorkspaceTarget);
+
+  expect(controller.current()?.shared).toBe(true);
 });

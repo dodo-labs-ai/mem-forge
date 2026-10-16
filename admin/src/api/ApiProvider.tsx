@@ -29,3 +29,8 @@ export function useWorkspaceTarget(): WorkspaceTarget | null {
   const { workspace } = useApiContext();
   return useSyncExternalStore(workspace.subscribe, workspace.current, workspace.current);
 }
+
+/** Whether other people use the current workspace, so Sources and Memories say who can use them. */
+export function useSharedWorkspace(): boolean {
+  return useWorkspaceTarget()?.shared ?? false;
+}

@@ -310,6 +310,10 @@ SOURCE_STATUSES = {SOURCE_ACTIVE_STATUS, SOURCE_PAUSED_STATUS}
 ACTIVE_MEMORY_STATUSES = (MemoryStatus.ACTIVE.value,)
 MAX_REVIEW_PAGE_SIZE = 500
 """The most Reviews one page of the Review queue returns."""
+INCLUDE_PRIVATE_DESCRIPTION = (
+    "Include the caller's own private Memories. Other users' private Memories are never returned."
+)
+"""What ``include_private`` means on every Memory read that accepts it."""
 
 
 def _workspace_default_scope(
@@ -321,8 +325,9 @@ def _workspace_default_scope(
     """Build the workspace-default AccessScope for an admin-API HTTP read.
 
     The caller's identity is server-derived (``resolve_principal(request)``);
-    active Memories are read unless the caller names other statuses; private
-    rows surface only when the caller opts in via ``include_private``. Per-id
+    active Memories are read unless the caller names other statuses; the
+    caller's own private rows surface when ``include_private`` is set, and
+    other users' private rows never do. Per-id
     and list readers do not receive a request-time `scope_mode`, so the scope
     mode is fixed at ``project-first``: cross-project rows stay visible and
     the ranker handles the affinity weighting.
@@ -1397,7 +1402,7 @@ class RecentMemoryListRequest(BaseModel):
     memory_types: list[str] | None = None
     page_size: int = Field(default=50, ge=1, le=50)
     cursor: str | None = None
-    include_private: bool = False
+    include_private: bool = Field(default=True, description=INCLUDE_PRIVATE_DESCRIPTION)
 
     @field_validator("source_ids")
     @classmethod
@@ -1443,7 +1448,7 @@ class MemorySearchRequest(BaseModel):
     active_project: str | None = None
     active_repo_identifier: str | None = None
     scope_mode: Literal["project", "project-first", "workspace"] = "project-first"
-    include_private: bool = False
+    include_private: bool = Field(default=True, description=INCLUDE_PRIVATE_DESCRIPTION)
     status: str | None = None
     source_filter: SourceFacetFilterRequest | None = None
     # NO user_id field. The caller's identity is server-derived from
@@ -5874,7 +5879,7 @@ def create_admin_app(
         source: str | None = None,
         project: str | None = None,
         search: str | None = None,
-        include_private: bool = False,
+        include_private: bool = Query(default=True, description=INCLUDE_PRIVATE_DESCRIPTION),
         limit: int = 50,
         offset: int = 0,
         db: Database = Depends(get_db),
@@ -5890,8 +5895,9 @@ def create_admin_app(
 
         The access predicate gates every row: workspace rows are visible
         across every project (the ranker handles project relevance, not
-        the predicate), and the caller's own private rows surface only
-        when ``include_private=True``.
+        the predicate), and the caller's own private rows are included
+        unless ``include_private=false``. Other users' private rows are
+        never listed.
         """
         scope = _workspace_default_scope(
             request,

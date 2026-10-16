@@ -6,7 +6,7 @@ import { ActionsCell, NameCell } from "./SourceTableCells";
 /** Module-level so the table keeps row identity across renders; cells read the page through SourceTableContext. */
 const column = dataColumns<SourceRow>();
 
-export const SOURCE_COLUMNS = [
+const SHARED_WORKSPACE_COLUMNS = [
   column.display({
     id: "source",
     header: "Source",
@@ -28,3 +28,10 @@ export const SOURCE_COLUMNS = [
     meta: { className: "w-[1%] whitespace-nowrap" },
   }),
 ];
+
+/** A workspace of one has nobody to share a Source with, so it leaves out who can use each one. */
+const PERSONAL_WORKSPACE_COLUMNS = SHARED_WORKSPACE_COLUMNS.filter((sourceColumn) => sourceColumn.id !== "access");
+
+export function sourceColumns(sharedWorkspace: boolean) {
+  return sharedWorkspace ? SHARED_WORKSPACE_COLUMNS : PERSONAL_WORKSPACE_COLUMNS;
+}
