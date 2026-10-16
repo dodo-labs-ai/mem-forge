@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { cn } from "@/lib/utils";
+import { useSharedWorkspace } from "@/state/sharedWorkspace";
 import { formatDuration, timeAgo } from "@/utils/date";
 import { sourceActionLayout } from "./sourceActions";
 import { SourceReadinessAlert } from "./SourceReadinessAlert";
@@ -110,6 +111,7 @@ export function SourceRow({
 }) {
   const isPaused = source.status === "paused";
   const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
+  const sharedWorkspace = useSharedWorkspace();
   const localExecution = isLocalAgentBackedSource(source);
   const connectionRequiresAction = source.connection_status?.state === "action_required";
   const signInRequired = connectionRequiresAction
@@ -156,10 +158,10 @@ export function SourceRow({
               <h3 className="max-w-full break-words text-sm font-medium">{source.name}</h3>
               <span className="text-xs text-muted-foreground">{sourceLabel.name}</span>
               <SourceLifecycleIndicator status={source.status} />
-              <SourceAccessAlertBadge source={source} />
+              {sharedWorkspace && <SourceAccessAlertBadge source={source} />}
             </div>
             <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground empty:hidden">
-              <SourceAccessLabel source={source} />
+              {sharedWorkspace && <SourceAccessLabel source={source} />}
               {showReadinessAlert && (
                 <SourceReadinessAlert
                   localExecution={localExecution}
@@ -319,7 +321,7 @@ export function SourceRow({
         </div>
       )}
 
-      {source.access_state === "changing" && source.access_transition && (
+      {sharedWorkspace && source.access_state === "changing" && source.access_transition && (
         <SourceAccessTransitionStatus
           source={source}
           onRetry={onRetryAccess}

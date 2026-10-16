@@ -267,6 +267,7 @@ def test_search_cli_forwards_mcp_shape(monkeypatch):
                 "top_k": 3,
                 "intent": "general_hybrid",
                 "memory_types": ["fact"],
+                "include_private": True,
                 "include_superseded": True,
             },
         )
@@ -304,6 +305,7 @@ def test_search_cli_forwards_exact_source_ids(monkeypatch):
                 "api_token": "token-1",
                 "query": "",
                 "top_k": 20,
+                "include_private": True,
                 "include_superseded": False,
                 "source_filter": {"source_ids": ["src-mounttai"]},
                 "time_range": {
@@ -314,6 +316,23 @@ def test_search_cli_forwards_exact_source_ids(monkeypatch):
             },
         )
     ]
+
+
+@pytest.mark.parametrize("command", ["search", "memory search"])
+def test_search_cli_includes_the_callers_own_private_memories(monkeypatch, command):
+    FakeToolClient.reset({"results": []})
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient, raising=False)
+
+    result = CliRunner().invoke(
+        cli,
+        [*command.split(), "release process"],
+        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com"},
+    )
+
+    assert result.exit_code == 0, result.output
+    [(name, kwargs)] = FakeToolClient.calls
+    assert name == "search"
+    assert kwargs["include_private"] is True
 
 
 def test_search_cli_rejects_legacy_source_name_filter(monkeypatch):

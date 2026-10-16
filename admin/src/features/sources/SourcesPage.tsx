@@ -1,6 +1,6 @@
 import { Files, Plus } from "lucide-react";
 import { useRef, useState } from "react";
-import { useProjects } from "@/api";
+import { useProjects, useSharedWorkspace } from "@/api";
 import { localSyncState, useLocalSyncStatus } from "@/features/local-sync";
 import { pluralize } from "@/lib/format";
 import {
@@ -36,7 +36,7 @@ import {
   type SourceRow,
 } from "./model/sourceRows";
 import type { Source } from "./model/types";
-import { SOURCE_COLUMNS } from "./sourceColumns";
+import { sourceColumns } from "./sourceColumns";
 import { SourceTableContext } from "./sourceTableContext";
 import { SourceDetailDrawer } from "./SourceDetailDrawer";
 import { useSourceActions } from "./useSourceActions";
@@ -60,6 +60,7 @@ export function SourcesPage() {
   const daemonQuery = useLocalSyncStatus();
   const typeLabels = useSourceTypeLabels();
   const resolvedBySource = useResolvedProjects(sourcesQuery.sources);
+  const sharedWorkspace = useSharedWorkspace();
 
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<SourceFilter>("all");
@@ -212,7 +213,7 @@ export function SourcesPage() {
           >
             <DataTable
               aria-label="Sources"
-              columns={SOURCE_COLUMNS}
+              columns={sourceColumns(sharedWorkspace)}
               data={tableGroups}
               getRowId={(row) => row.key}
               onRowClick={(row) => setOpenRowKey(row.key)}

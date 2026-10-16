@@ -20,6 +20,7 @@ from memforge.models import (
     Visibility,
     content_hash,
 )
+from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 from memforge.storage.database import Database
 from tests.embedding_fixture import unconfigured_embedding
 
@@ -53,6 +54,49 @@ def _memory(mid: str, content: str, *, visibility: str, owner: str | None) -> Me
     )
 
 
+def _install_search_engine(monkeypatch, vector_ids: list[str]) -> None:
+    """Serve admin searches from SQLite with a vector channel that matches ``vector_ids``."""
+
+    async def fake_build_search_engine(_provider, db, config, *, audit_logger=None):
+        from memforge.config import RetrievalConfig
+        from memforge.retrieval.search import SearchEngine
+        from memforge.storage.adapters.sqlite import build_sqlite_adapters
+
+        class _Coll:
+            def upsert(self, **_):
+                pass
+
+            def query(self, **_):
+                return {
+                    "ids": [list(vector_ids)],
+                    "distances": [[0.1] * len(vector_ids)],
+                }
+
+            def delete(self, **_):
+                pass
+
+            def get(self, **_):
+                return {"ids": []}
+
+        adapters = build_sqlite_adapters(db, _Coll())
+        return SearchEngine(
+            relational=adapters.relational,
+            keyword=adapters.keyword,
+            vector=adapters.vector,
+            embedding=unconfigured_embedding(),
+            config=RetrievalConfig(),
+            embedding_provider=lambda _query: [0.1, 0.1, 0.1],
+        )
+
+    from memforge import runtime as runtime_module
+
+    monkeypatch.setattr(
+        runtime_module.DefaultRuntimeProvider,
+        "build_search_engine",
+        fake_build_search_engine,
+    )
+
+
 @pytest.mark.asyncio
 async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatch):
     # Seed U2's private memory. Send a search whose body claims to be U2. The
@@ -71,45 +115,7 @@ async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatc
             _memory("p-shared", "team meeting notes", visibility=WORKSPACE, owner=None),
         )
 
-        async def fake_build_search_engine(_provider, db, config, *, audit_logger=None):
-            from memforge.config import RetrievalConfig
-            from memforge.retrieval.search import SearchEngine
-            from memforge.storage.adapters.sqlite import build_sqlite_adapters
-
-            class _Coll:
-                def upsert(self, **_):
-                    pass
-
-                def query(self, **_):
-                    return {
-                        "ids": [["p-u2-private", "p-shared"]],
-                        "distances": [[0.1, 0.1]],
-                    }
-
-                def delete(self, **_):
-                    pass
-
-                def get(self, **_):
-                    return {"ids": []}
-
-            adapters = build_sqlite_adapters(db, _Coll())
-            engine = SearchEngine(
-                relational=adapters.relational,
-                keyword=adapters.keyword,
-                vector=adapters.vector,
-                embedding=unconfigured_embedding(),
-                config=RetrievalConfig(),
-                embedding_provider=lambda _query: [0.1, 0.1, 0.1],
-            )
-            return engine
-
-        from memforge import runtime as runtime_module
-
-        monkeypatch.setattr(
-            runtime_module.DefaultRuntimeProvider,
-            "build_search_engine",
-            fake_build_search_engine,
-        )
+        _install_search_engine(monkeypatch, ["p-u2-private", "p-shared"])
 
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
@@ -157,3 +163,78 @@ async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatc
         assert "p-shared" in ids
     finally:
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_reads_include_the_callers_own_private_memories_by_default(tmp_path, monkeypatch):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "own-private.db"))
+    await database.connect()
+    try:
+        await database.insert_memory(
+            _memory("p-own-private", "release checklist notes", visibility=PRIVATE, owner=LOCAL_DEV_USER_ID),
+        )
+        await database.insert_memory(
+            _memory("p-u2-private", "release checklist secrets", visibility=PRIVATE, owner="u-2"),
+        )
+        await database.insert_memory(
+            _memory("p-shared", "release checklist overview", visibility=WORKSPACE, owner=None),
+        )
+        _install_search_engine(monkeypatch, ["p-own-private", "p-u2-private", "p-shared"])
+
+        app = create_admin_app(db=database, config=cfg)
+        with TestClient(app) as client:
+            searched = client.post("/api/v1/memories/search", json={"query": "release checklist", "top_k": 10})
+            searched_without_private = client.post(
+                "/api/v1/memories/search",
+                json={"query": "release checklist", "top_k": 10, "include_private": False},
+            )
+            listed = client.get("/api/v1/memories")
+            listed_without_private = client.get("/api/v1/memories", params={"include_private": "false"})
+
+        for response in (searched, searched_without_private, listed, listed_without_private):
+            assert response.status_code == 200, response.text
+        assert {row["memory_id"] for row in searched.json()["results"]} == {"p-own-private", "p-shared"}
+        assert {row["memory_id"] for row in searched_without_private.json()["results"]} == {"p-shared"}
+        assert {row["id"] for row in listed.json()["data"]} == {"p-own-private", "p-shared"}
+        assert {row["id"] for row in listed_without_private.json()["data"]} == {"p-shared"}
+    finally:
+        await database.close()
+
+
+def test_recent_memory_listing_includes_the_callers_own_private_memories_by_default(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    scopes = []
+
+    class FakeSearchEngine:
+        async def list_recent_memories(self, *, request_scope, **_kwargs):
+            scopes.append(request_scope)
+            return {"results": [], "result_kind": "current_memories", "is_changelog": False, "next_cursor": None}
+
+    class FakeRuntimeProvider:
+        async def build_search_engine(self, _db, _config, *, audit_logger=None):
+            return FakeSearchEngine()
+
+    app = create_admin_app(
+        config=_config(tmp_path),
+        runtime_provider=FakeRuntimeProvider(),
+        principal_resolver=lambda _request: "u-1",
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/memories/recent",
+            json={
+                "time_range": {
+                    "start_at": "2026-07-21T00:00:00+00:00",
+                    "end_at": "2026-07-28T00:00:00+00:00",
+                },
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    [scope] = scopes
+    assert scope.user_id == "u-1"
+    assert scope.include_private is True

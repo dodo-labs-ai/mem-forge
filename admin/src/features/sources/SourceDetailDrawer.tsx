@@ -1,4 +1,5 @@
 import { Info } from "lucide-react";
+import { useSharedWorkspace } from "@/api";
 import { formatCount, formatDateTime, formatInterval, formatRelative, formatUntil } from "@/lib/format";
 import { ActionCard, DetailDrawer, DrawerSection, Notice, PropertyList, StatusBadge } from "@/patterns";
 import { Button } from "@/ui/button";
@@ -17,6 +18,7 @@ interface SourceDetailDrawerProps {
 }
 
 export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpenChange }: SourceDetailDrawerProps) {
+  const sharedWorkspace = useSharedWorkspace();
   if (row === null) return <DetailDrawer open={false} onOpenChange={onOpenChange} title="" children={null} />;
   const { source, activity, attention } = row;
   const presentation = activity ? presentSourceSyncActivity(activity, source.name, "items") : null;
@@ -47,7 +49,9 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpe
         layout="row"
         items={[
           { label: "Runs on", value: sourceRunsOn(row).label },
-          { label: "Access", value: source.access_policy === "private" ? "Only me" : "Workspace" },
+          ...(sharedWorkspace
+            ? [{ label: "Access", value: source.access_policy === "private" ? "Only me" : "Workspace" }]
+            : []),
           { label: "Saves to", value: projectName },
         ]}
       />
