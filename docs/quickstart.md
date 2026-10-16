@@ -373,7 +373,7 @@ and run the printed CLI command. See [local-repo-sync.md](local-repo-sync.md).
 
 | Source | What is synced |
 | --- | --- |
-| Claude Code, Codex | Decisions, conventions and corrections from your sessions (private to you) |
+| Claude Code, Codex | Decisions, conventions and corrections from your sessions |
 | Confluence | Pages, including exported PDFs; accepts a root, space or page URL |
 | Jira | Tickets, decisions and work items |
 | GitHub Repository | Repository files from GitHub or GitHub Enterprise, scoped by folders and file types |

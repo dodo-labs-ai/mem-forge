@@ -35,6 +35,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { LIST_PAGE_SIZE } from "@/lib/constants";
+import { useSharedWorkspace } from "@/state/sharedWorkspace";
 import { timeAgo } from "@/utils/date";
 import {
   SHARED_PROJECT_KEY,
@@ -197,6 +198,7 @@ function OverviewCard({
 }
 
 export function MemoriesPage() {
+  const sharedWorkspace = useSharedWorkspace();
   const [search, setSearch] = useState("");
   const [type, setType] = useState("all");
   const [status, setStatus] = useState("all");
@@ -540,7 +542,7 @@ export function MemoriesPage() {
                         reviewId && memory.status === "pending_review"
                           ? `/review/${reviewId}`
                           : `/memories/${memory.id}`;
-                      const isPrivate = memory.visibility === "private";
+                      const isPrivate = sharedWorkspace && memory.visibility === "private";
                       const projectKey = memory.project_key;
                       const projectName = projectKey ? projectByKey.get(projectKey)?.name : undefined;
                       const isSharedProject = projectKey === SHARED_PROJECT_KEY;

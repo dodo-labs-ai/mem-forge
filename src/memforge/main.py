@@ -2047,6 +2047,7 @@ def search(
     kwargs: dict = {
         "query": query,
         "top_k": top_k,
+        "include_private": True,
         "include_superseded": include_superseded,
     }
     if intent is not None:
@@ -2148,6 +2149,7 @@ def memory_search(
     kwargs: dict = {
         "query": query,
         "top_k": top_k,
+        "include_private": True,
         "include_superseded": include_superseded,
     }
     if memory_types:

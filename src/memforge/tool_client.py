@@ -97,13 +97,14 @@ class ToolClient:
         time_range: dict[str, Any] | None = None,
         entities: list[str] | tuple[str, ...] | None = None,
         source_filter: dict[str, Any] | None = None,
-        include_private: bool = False,
+        include_private: bool = True,
         include_superseded: bool = False,
         active_repo_identifier: str | None = None,
         status: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "top_k": top_k,
+            "include_private": include_private,
             "include_superseded": include_superseded,
         }
         if query:
@@ -118,8 +119,6 @@ class ToolClient:
             body["entities"] = list(entities)
         if source_filter:
             body["source_filter"] = source_filter
-        if include_private:
-            body["include_private"] = True
         if active_repo_identifier:
             body["active_repo_identifier"] = active_repo_identifier
         if status:

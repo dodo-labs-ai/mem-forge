@@ -2,7 +2,14 @@ import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, test, vi } from "vitest";
 import { makeMemory, makeRelatedMemory, makeRelation, makeRelationPair } from "@/test/memoryFixtures";
-import { memoriesRoutes, memoryListRoute, RELATION_TOTALS, renderMemories, WORKSPACE_MEMORIES } from "@/test/renderMemories";
+import {
+  memoriesRoutes,
+  memoryListRoute,
+  RELATION_TOTALS,
+  renderMemories,
+  SHARED_WORKSPACE,
+  WORKSPACE_MEMORIES,
+} from "@/test/renderMemories";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -32,6 +39,7 @@ test("shows the overview and each memory with its project, source, access and re
         makeMemory({ id: "mem-private", content: "Prefer merge over rebase.", visibility: "private", project_key: "SHARED" }),
       ]),
     }),
+    SHARED_WORKSPACE,
   );
 
   const overview = await screen.findByRole("region", { name: "Overview" });
@@ -54,6 +62,14 @@ test("shows the overview and each memory with its project, source, access and re
   const privateRow = within(table).getByRole("link", { name: "Prefer merge over rebase." }).closest("tr")!;
   expect(within(privateRow).getByText("Only me")).toBeInTheDocument();
   expect(within(privateRow).getByText("Shared")).toBeInTheDocument();
+});
+
+test("a workspace of one does not mark its memories as visible only to their owner", async () => {
+  renderMemories("/memories");
+
+  const table = await screen.findByRole("table", { name: "Memories" });
+  const privateRow = (await within(table).findByRole("link", { name: "Prefer merge over rebase." })).closest("tr")!;
+  expect(within(privateRow).queryByText("Only me")).not.toBeInTheDocument();
 });
 
 test("the list shows active memories until a status filter asks for another status", async () => {

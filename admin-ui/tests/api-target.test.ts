@@ -6,8 +6,11 @@ import {
   LOCAL_AGENT_HOST_BASE_URL,
   createWorkspaceApiController,
   currentLocalAgentBaseUrl,
+  currentWorkspaceIsShared,
   resourceClient,
+  subscribeWorkspaceTarget,
   workspaceResourceUrl,
+  type WorkspaceApiTarget,
 } from "../src/api/client.js";
 
 let clearCount = 0;
@@ -18,8 +21,13 @@ const queryClient = {
 };
 
 const workspaceApi = createWorkspaceApiController(queryClient);
+let targetNotifications = 0;
+subscribeWorkspaceTarget(() => {
+  targetNotifications += 1;
+});
 assert.equal(resourceClient.defaults.baseURL, "/api/v1");
 assert.equal(workspaceApi.current(), null);
+assert.equal(currentWorkspaceIsShared(), false, "the standalone workspace has one user");
 assert.equal(
   currentLocalAgentBaseUrl(),
   LOCAL_AGENT_HOST_BASE_URL,
@@ -39,6 +47,7 @@ workspaceApi.setTarget({
   resourceBaseUrl: "/api/v1/",
   localAgentBaseUrl: "/api/cloud/workspaces/mount_tai/local-agent/",
   workspaceId: "mount_tai",
+  shared: true,
 });
 assert.equal(resourceClient.defaults.baseURL, "/api/v1");
 assert.deepEqual(resourceClient.defaults.params, { workspace_id: "mount_tai" });
@@ -46,8 +55,11 @@ assert.deepEqual(workspaceApi.current(), {
   resourceBaseUrl: "/api/v1",
   localAgentBaseUrl: "/api/cloud/workspaces/mount_tai/local-agent",
   workspaceId: "mount_tai",
+  shared: true,
 });
 assert.equal(clearCount, 1);
+assert.equal(currentWorkspaceIsShared(), true);
+assert.equal(targetNotifications, 1);
 const resourceHref = workspaceResourceUrl("/api/v1/source-units/unit-1/content?view=raw&workspace_id=old#evidence", "https://admin.test");
 assert.equal(resourceHref, "https://admin.test/api/v1/source-units/unit-1/content?view=raw&workspace_id=mount_tai#evidence");
 assert.equal(workspaceResourceUrl("https://wiki.example.test/api/v1/page", "https://admin.test"), "https://wiki.example.test/api/v1/page");
@@ -56,8 +68,27 @@ workspaceApi.setTarget({
   resourceBaseUrl: "/api/v1",
   localAgentBaseUrl: "/api/cloud/workspaces/mount_tai/local-agent",
   workspaceId: "mount_tai",
+  shared: true,
 });
 assert.equal(clearCount, 1, "a semantically identical target must preserve the query cache");
+assert.equal(targetNotifications, 1, "a semantically identical target must not notify subscribers");
+
+workspaceApi.setTarget({
+  resourceBaseUrl: "/api/v1",
+  localAgentBaseUrl: "/api/cloud/workspaces/mount_tai/local-agent",
+  workspaceId: "mount_tai",
+  shared: false,
+});
+assert.equal(clearCount, 1, "a change of sharing alone must preserve the query cache");
+assert.equal(targetNotifications, 2, "a change of sharing must notify subscribers");
+assert.equal(currentWorkspaceIsShared(), false);
+
+workspaceApi.setTarget({
+  resourceBaseUrl: "/api/v1",
+  localAgentBaseUrl: "/api/cloud/workspaces/mount_tai/local-agent",
+  workspaceId: "mount_tai",
+} as WorkspaceApiTarget);
+assert.equal(currentWorkspaceIsShared(), true, "a target that does not say it has one user keeps the access controls");
 
 workspaceApi.setTarget(null);
 assert.equal(resourceClient.defaults.baseURL, "/api/v1");

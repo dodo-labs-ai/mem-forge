@@ -126,9 +126,8 @@ async def test_list_memories_excludes_other_users_private(seeded_app):
         assert simple.status_code == 200, simple.text
         simple_ids = {row["id"] for row in simple.json()["data"]}
         assert "m-u2-private" not in simple_ids
-        # U1's own private row is also hidden from the workspace default;
-        # only WORKSPACE rows survive.
-        assert "m-u1-private" not in simple_ids
+        # U1's own private row is listed by default.
+        assert "m-u1-private" in simple_ids
         assert "m-shared" in simple_ids
 
         # Search-mode list path.
@@ -155,6 +154,22 @@ async def test_list_memories_personalized_includes_only_owners_private(seeded_ap
     ids = {row["id"] for row in response.json()["data"]}
     assert "m-shared" in ids
     assert "m-u1-private" in ids
+    assert "m-u2-private" not in ids
+
+
+@pytest.mark.asyncio
+async def test_list_memories_without_private_lists_only_workspace_rows(seeded_app):
+    app, _database = seeded_app
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/v1/memories",
+            params={"include_private": "false", "limit": 50},
+        )
+
+    assert response.status_code == 200, response.text
+    ids = {row["id"] for row in response.json()["data"]}
+    assert "m-shared" in ids
+    assert "m-u1-private" not in ids
     assert "m-u2-private" not in ids
 
 

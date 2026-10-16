@@ -29,6 +29,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useSharedWorkspace } from "@/state/sharedWorkspace";
 import {
   parseConfluenceWikiUrl,
 } from "./confluenceConfig";
@@ -44,7 +45,7 @@ import {
   SourceAccessSelection,
   SourceAccessSummary,
 } from "./SourceAccessSection";
-import { sourceAccessSummary } from "./sourceAccess";
+import { PERSONAL_WORKSPACE_ACCESS_POLICY, sourceAccessSummary } from "./sourceAccess";
 import {
   booleanValue,
   buildDefaultConfig,
@@ -165,9 +166,11 @@ function SourceConfigForm({
   const isEdit = Boolean(source);
   const adapter = sourceSetupAdapterFor(sourceType);
   const [name, setName] = useState(source?.name ?? "");
-  const [accessPolicy, setAccessPolicy] = useState<SourceAccessPolicy | null>(
+  const sharedWorkspace = useSharedWorkspace();
+  const [chosenAccessPolicy, setAccessPolicy] = useState<SourceAccessPolicy | null>(
     () => source?.access_policy ?? null,
   );
+  const accessPolicy = sharedWorkspace ? chosenAccessPolicy : PERSONAL_WORKSPACE_ACCESS_POLICY;
   const [config, setConfig] = useState<ConfigForm>(() => ({
     ...buildDefaultConfig(schema),
     ...adapter.normalizeInitialConfig((source?.config ?? {}) as ConfigForm),
@@ -609,7 +612,7 @@ function SourceConfigForm({
       sourceName={name}
       connection={adapter.connection}
       isEdit={isEdit}
-      sections={sections}
+      sections={sharedWorkspace ? sections : sections.filter((section) => section.id !== "access")}
       openSection={focusSection}
       onOpenSectionChange={setFocusSection}
       error={saveSource.isError ? extractSaveError(saveSource.error) : null}

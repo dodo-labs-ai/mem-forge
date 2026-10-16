@@ -824,8 +824,9 @@ export interface paths {
          *
          *     The access predicate gates every row: workspace rows are visible
          *     across every project (the ranker handles project relevance, not
-         *     the predicate), and the caller's own private rows surface only
-         *     when ``include_private=True``.
+         *     the predicate), and the caller's own private rows are included
+         *     unless ``include_private=false``. Other users' private rows are
+         *     never listed.
          */
         get: operations["list_memories_api_v1_memories_get"];
         put?: never;
@@ -4338,7 +4339,8 @@ export interface components {
             entities?: string[] | null;
             /**
              * Include Private
-             * @default false
+             * @description Include the caller's own private Memories. Other users' private Memories are never returned.
+             * @default true
              */
             include_private: boolean;
             /**
@@ -4947,7 +4949,8 @@ export interface components {
             cursor?: string | null;
             /**
              * Include Private
-             * @default false
+             * @description Include the caller's own private Memories. Other users' private Memories are never returned.
+             * @default true
              */
             include_private: boolean;
             /** Memory Types */
@@ -7169,6 +7172,7 @@ export interface operations {
                 source?: string | null;
                 project?: string | null;
                 search?: string | null;
+                /** @description Include the caller's own private Memories. Other users' private Memories are never returned. */
                 include_private?: boolean;
                 limit?: number;
                 offset?: number;

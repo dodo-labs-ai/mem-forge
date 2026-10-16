@@ -19,6 +19,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { useSharedWorkspace } from "@/state/sharedWorkspace";
 
 import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
@@ -28,7 +29,7 @@ import {
   SourceAccessSelection,
   SourceAccessSummary,
 } from "./SourceAccessSection";
-import { sourceAccessSummary } from "./sourceAccess";
+import { PERSONAL_WORKSPACE_ACCESS_POLICY, sourceAccessSummary } from "./sourceAccess";
 import {
   buildDefaultTeamsSourceConfig,
   buildTeamsSourcePayload,
@@ -65,9 +66,11 @@ export function TeamsSourceSetup({
   const [config, setConfig] = useState<TeamsSourceConfig>(
     () => initial?.config ?? buildDefaultTeamsSourceConfig(),
   );
-  const [accessPolicy, setAccessPolicy] = useState<SourceAccessPolicy | null>(
+  const sharedWorkspace = useSharedWorkspace();
+  const [chosenAccessPolicy, setAccessPolicy] = useState<SourceAccessPolicy | null>(
     () => source?.access_policy ?? null,
   );
+  const accessPolicy = sharedWorkspace ? chosenAccessPolicy : PERSONAL_WORKSPACE_ACCESS_POLICY;
   const [selections, setSelections] = useState<Map<string, TeamsSelectionItem>>(
     () => new Map((initial?.conversationIds ?? []).map((id) => [id, existingTeamsSelection(id)])),
   );
@@ -453,7 +456,7 @@ export function TeamsSourceSetup({
       sourceName={config.name}
       connection={{ mode: "device", label: "Local sync" }}
       isEdit={isEdit}
-      sections={sections}
+      sections={sharedWorkspace ? sections : sections.filter((section) => section.id !== "access")}
       openSection={focusSection}
       onOpenSectionChange={setFocusSection}
       error={saveSource.isError ? errorMessage(saveSource.error) : null}

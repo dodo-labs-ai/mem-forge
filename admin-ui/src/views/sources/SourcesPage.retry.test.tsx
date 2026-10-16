@@ -9,6 +9,8 @@ import { SourcesPage } from "./SourcesPage";
 
 vi.mock("@/api/client", () => ({
   currentLocalAgentBaseUrl: () => "/api/cloud/workspaces/ws-a/local-agent",
+  currentWorkspaceIsShared: () => true,
+  subscribeWorkspaceTarget: () => () => {},
   resourceClient: { get: vi.fn(), post: vi.fn(), put: vi.fn() },
 }));
 vi.mock("@/api/localAgentJobs", () => ({
