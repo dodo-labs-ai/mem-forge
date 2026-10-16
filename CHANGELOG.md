@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.2.0b1 - 2026-10-16
+
+The first beta. MemForge runs for one user on one machine from the Docker
+Compose stack, with the models chosen in Settings. APIs, storage formats and
+plugin packaging may still change before 0.2.0, and upgrading an installation
+or backing up and restoring its data is not supported yet: start a beta
+installation on a fresh `memforge-data` volume, and if an upgrade fails,
+start again on a fresh volume and sync the sources again. The package is `memforge-ai` 0.2.0b1; the agent
+plugins are versioned `0.2.0-beta.1`, the same version in semver spelling.
+
 - Settings is easier to follow while models are set up. A model id typed,
   pasted or filled in by the browser that exactly matches a model from Load
   models now counts as picking it, so the token limits the provider's list

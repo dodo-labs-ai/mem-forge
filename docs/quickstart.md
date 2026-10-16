@@ -85,6 +85,17 @@ NO_PROXY=localhost,127.0.0.1,api,admin-ui,host.docker.internal
 A model server on your machine, such as Ollama at `host.docker.internal`, is
 reached directly through `NO_PROXY`.
 
+The image build downloads packages too. When the build can reach them only
+through the same proxy, pass it to the build; Docker uses these values while
+building and does not keep them in the image:
+
+```bash
+docker compose build \
+  --build-arg HTTPS_PROXY=http://host.docker.internal:7890 \
+  --build-arg HTTP_PROXY=http://host.docker.internal:7890
+docker compose up
+```
+
 The API image uses WeasyPrint for Confluence PDF export. This keeps the image
 much lighter than bundling a browser runtime while preserving print-oriented
 HTML layout for source evidence PDFs.

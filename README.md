@@ -8,7 +8,7 @@ up to date. Built from your docs, tickets, chat and agent sessions.
 <p>
   <a href="https://github.com/shno-labs/mem-forge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/shno-labs/mem-forge/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="License Apache 2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
-  <img alt="Status alpha" src="https://img.shields.io/badge/status-alpha-f59e0b">
+  <img alt="Status beta" src="https://img.shields.io/badge/status-beta-3b82f6">
 </p>
 
 <p align="center">
@@ -18,21 +18,23 @@ up to date. Built from your docs, tickets, chat and agent sessions.
   </picture>
 </p>
 
-> **Status: alpha.** APIs, storage formats and plugin packaging may change.
-> The open-source build runs for one user on one machine.
+> **Status: beta.** APIs, storage formats and plugin packaging may still change,
+> and upgrading an installation or backing up and restoring its data is not
+> supported yet. The open-source build runs for one user on one machine.
 
 ## Quick start
 
-You need Docker with Compose v2 and a model API key (Anthropic for the
-generation model by default, OpenAI for the embedding model).
+You need Docker with Compose v2 and an API key for a model provider
+(OpenRouter, OpenAI or Anthropic), or a model server such as Ollama.
 
 ```bash
 git clone https://github.com/shno-labs/mem-forge.git && cd mem-forge
-cp .env.example .env   # set MEMFORGE_ENRICHMENT_API_KEY and MEMFORGE_EMBEDDING_API_KEY
+cp .env.example .env
 docker compose up --build
 ```
 
-The admin UI is at http://localhost:5174. Then install the agent plugin:
+Open the admin UI at http://localhost:5174 and choose a generation model and an
+embedding model in Settings. Then install the agent plugin:
 
 ```text
 # Claude Code (inside a session)
