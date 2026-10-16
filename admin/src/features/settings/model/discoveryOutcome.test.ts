@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { discoveryOutcome, onlyListedModel } from "./discoveryOutcome";
+import { discoveryFailure, discoveryOutcome, namedListedModel, onlyListedModel } from "./discoveryOutcome";
 
 test("an endpoint that listed models of the kind succeeds and reports the latency", () => {
   expect(
@@ -77,4 +77,20 @@ test("only the one listed model of the kind is put in the field by itself", () =
   expect(onlyListedModel(listing(true, "qwen3:14b"))).toEqual({ id: "qwen3:14b" });
   expect(onlyListedModel(listing(true, "qwen3:14b", "llama3.3"))).toBeUndefined();
   expect(onlyListedModel(listing(false, "served-model"))).toBeUndefined();
+});
+
+test("a model field names a listed model by its exact id, without surrounding spaces", () => {
+  const outcome = discoveryOutcome({
+    ok: true,
+    models_supported: true,
+    kind_filtered: true,
+    models: [{ id: "nomic-embed-text" }, { id: "nomic-embed-text-v2" }],
+    message: "Connected. Found 2 embedding models.",
+  });
+
+  expect(namedListedModel(outcome, " nomic-embed-text ")).toEqual({ id: "nomic-embed-text" });
+  expect(namedListedModel(outcome, "nomic-embed")).toBeUndefined();
+  expect(namedListedModel(outcome, "")).toBeUndefined();
+  expect(namedListedModel(null, "nomic-embed-text")).toBeUndefined();
+  expect(namedListedModel(discoveryFailure("Network error"), "nomic-embed-text")).toBeUndefined();
 });

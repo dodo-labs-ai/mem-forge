@@ -107,8 +107,8 @@ and fill in what it asks for:
 | Anthropic | Claude models (generation only) | API key, model |
 | OpenRouter | Any model OpenRouter offers | API key, model |
 | Ollama | Models running on your machine | Model; the address if it is not `http://localhost:11434` |
-| OpenAI-compatible endpoint | A proxy or local server that speaks the OpenAI API, such as LM Studio or vLLM | Base URL, model, and an API key if the server wants one |
-| LiteLLM route (advanced) | Any other provider LiteLLM supports | The model as `provider/model`, and an API key or the provider's own environment variables |
+| OpenAI-compatible endpoint | A proxy or local server that speaks the OpenAI API, such as LM Studio, vLLM or a LiteLLM Proxy | Base URL, model, and an API key if the server wants one |
+| Other provider (LiteLLM route) | Any other provider LiteLLM supports, such as Bedrock or Vertex AI | The model as a LiteLLM route such as `bedrock/...`, and an API key or the provider's own environment variables |
 
 Fields you can leave blank are marked *(optional)*; the others are required,
 except that an API key already saved can be left blank to keep it. A provider
@@ -252,10 +252,12 @@ common for local models, validation stops with the code
 **context window** and the **maximum output**, in tokens, with the generation
 model, and validate again. Take the numbers from the model card or from your
 model server; a context window of 32768 and a maximum output of 4096 are
-typical for a local model. When you pick a model from **Load models** and the
-provider's list gives its limits, as OpenRouter's does, Settings fills the
-empty limit fields with them and says they came from that list; you can still
-change them.
+typical for a local model. When the model field names a model from **Load
+models**, picked from the list or typed, and the provider's list gives its
+limits, as OpenRouter's does, Settings fills the empty limit fields with them
+and says they came from that list; you can still change them. For a provider
+whose list can give the limits, the token limits step also offers **Fill from
+the model list**, which loads the list and fills in the limits of the model.
 
 You can also set the limits in `.env`. A limit entered in Settings is the one
 used; the `.env` values apply to whatever Settings leaves empty:

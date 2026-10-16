@@ -151,6 +151,16 @@ export function endpointField(provider: ModelProvider, authStrategy: AuthStrateg
   };
 }
 
+/**
+ * A line under the provider field for a provider whose name does not say what
+ * it reaches: the one that takes any LiteLLM route, for providers without an
+ * entry of their own.
+ */
+export function providerHint(provider: ModelProvider | undefined): string | null {
+  if (!provider?.model_is_route) return null;
+  return "Any provider LiteLLM supports that is not listed above. Enter the model as a LiteLLM route, such as bedrock/… or vertex_ai/…, and give the credentials that provider needs.";
+}
+
 /** How the model field reads for a provider. */
 export function modelField(provider: ModelProvider): TextFieldCopy {
   if (provider.model_is_route) {

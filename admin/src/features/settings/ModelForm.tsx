@@ -14,7 +14,7 @@ import { describedBy } from "./describedBy";
 import { DiscoveryNotice } from "./DiscoveryNotice";
 import { EndpointConflictNotice } from "./EndpointConflictNotice";
 import { FormField } from "./FormField";
-import { discoveryFailure, discoveryOutcome, onlyListedModel } from "./model/discoveryOutcome";
+import { discoveryFailure, discoveryOutcome, namedListedModel, onlyListedModel } from "./model/discoveryOutcome";
 import {
   candidateRequest,
   discoveryRequest,
@@ -23,6 +23,7 @@ import {
   formOrigin,
   hasTokenLimitValues,
   isChanged,
+  listedLimitsGap,
   listedTokenLimits,
   modelFormSchema,
   offersTokenLimits,
@@ -33,7 +34,7 @@ import {
   type ListedLimits,
   type ModelFormValues,
 } from "./model/modelForm";
-import { needsTokenLimits } from "./model/modelStatus";
+import { awaitsTokenLimits, needsTokenLimits } from "./model/modelStatus";
 import {
   AUTH_HINTS,
   AUTH_LABELS,
@@ -43,6 +44,7 @@ import {
   optionField,
   parameterField,
   parameterNames,
+  providerHint,
   providersFor,
   tokenLimitNames,
 } from "./model/providerFields";
@@ -71,8 +73,11 @@ interface ModelFormProps {
  * and the model in use otherwise. Its one action saves the form and validates
  * what was saved with a real request; only an edit that passes is put to use.
  *
- * Load models offers the provider's models of the kind. Picking one whose
- * listing gives token limits fills the empty token limit fields with them.
+ * Load models offers the provider's models of the kind. A model field that
+ * names one of them, picked from the list or typed, fills the empty token
+ * limit fields with the limits the listing gives for it. When validation finds
+ * that only the token limits are missing and the provider's listing can give
+ * them, the step offers to fill them in from the listing.
  *
  * An embedding model whose vectors cannot be compared with the stored ones
  * passes validation and then waits: the action becomes the rebuild of the
@@ -105,6 +110,8 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
   const values: ModelFormValues = { provider: providerId, endpoint, authStrategy, apiKey, model, options, parameters, tokenLimits };
   /** The token limits the form filled in from the model list, while it is the source of what the fields hold. */
   const [listedLimits, setListedLimits] = useState<ListedLimits | null>(null);
+  /** The model whose token limits were last looked up in the model list from the token limits step. */
+  const [limitsLookup, setLimitsLookup] = useState<string | null>(null);
   const provider = findProvider(providerId);
   const changed = isChanged(saved, values, provider, kind);
 
@@ -143,6 +150,7 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
   function showStored(next: ModelKindSettings) {
     reset(savedValues(next.candidate ?? next.active, kind, providers));
     setListedLimits(null);
+    setLimitsLookup(null);
   }
 
   function validateSaved() {
@@ -173,6 +181,7 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
     rebuild.reset();
     discovery.reset();
     setListedLimits(null);
+    setLimitsLookup(null);
     if (candidate === null) {
       reset(saved);
       return;
@@ -185,6 +194,7 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
     if (!next) return;
     reset(valuesForProvider(next, saved));
     setListedLimits(null);
+    setLimitsLookup(null);
     discovery.reset();
   }
 
@@ -202,6 +212,11 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
 
   function chooseModel(choice: ModelOption) {
     setValue("model", choice.id, { shouldValidate: formState.isSubmitted });
+    applyListedModel(choice);
+  }
+
+  /** Fills the token limit fields from what the listing gives for `choice`, as far as they are empty or listed. */
+  function applyListedModel(choice: ModelOption) {
     if (!provider) return;
     const names = tokenLimitNames(provider, kind);
     const listed = listedTokenLimits(choice, names);
@@ -211,6 +226,7 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
     setListedLimits(Object.keys(listed).length > 0 ? { model: choice.id, limits: next } : null);
   }
 
+  /** Clears the token limits the listing gave for another model than the one `typed` names. */
   function followTypedModel(typed: string) {
     if (listedLimits === null || typed.trim() === listedLimits.model) return;
     const next = provider ? tokenLimitsForTypedModel(getValues("tokenLimits"), tokenLimitNames(provider, kind), listedLimits, typed) : null;
@@ -218,14 +234,35 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
     setListedLimits(null);
   }
 
+  /**
+   * Follows a new value of the model field. The field reports every value it
+   * takes as an input event, typed, pasted or filled in by the browser's
+   * autofill alike, and naming a listed model counts as choosing it.
+   */
+  function followModelField(typed: string) {
+    const named = namedListedModel(outcome, typed);
+    if (named) applyListedModel(named);
+    else followTypedModel(typed);
+  }
+
   async function loadModels() {
     if (!(await trigger("endpoint"))) return;
     discovery.mutate(discoveryRequest(getValues()), {
       onSuccess: (result) => {
-        const only = result.ok ? onlyListedModel(discoveryOutcome(result)) : undefined;
-        if (only && getValues("model").trim() === "") chooseModel(only);
+        if (!result.ok) return;
+        const loaded = discoveryOutcome(result);
+        const typed = getValues("model");
+        const named = namedListedModel(loaded, typed);
+        const only = onlyListedModel(loaded);
+        if (named) applyListedModel(named);
+        else if (only && typed.trim() === "") chooseModel(only);
       },
     });
+  }
+
+  function fillLimitsFromList() {
+    setLimitsLookup(getValues("model").trim());
+    void loadModels();
   }
 
   function applySuggestedEndpoint(suggestion: string) {
@@ -234,6 +271,7 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
   }
 
   const endpointCopy = provider ? endpointField(provider, authStrategy) : null;
+  const providerCopy = providerHint(provider);
   const modelCopy = provider ? modelField(provider) : null;
   const authHint = AUTH_HINTS[authStrategy];
   const savedKey = savedKeyOf(values, provider);
@@ -248,6 +286,22 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
     limitNames.every((name) => (tokenLimits[name] ?? "").trim() === (listedLimits.limits[name] ?? ""))
       ? provider.label
       : null;
+  const offersListedLimits =
+    provider !== undefined &&
+    provider.lists_token_limits &&
+    limitNames.length > 0 &&
+    candidate !== null &&
+    candidate.provider === provider.id &&
+    awaitsTokenLimits(candidate);
+  const lookedUp = offersListedLimits && limitsLookup === model.trim() && outcome !== null && !discovery.isPending;
+  const limitsGap = lookedUp ? listedLimitsGap(outcome, model, limitNames, provider.label) : null;
+  const listFill = offersListedLimits
+    ? {
+        onFill: limitsFromList !== null || (lookedUp && outcome.tone !== "danger") ? null : fillLimitsFromList,
+        loading: limitsLookup !== null && discovery.isPending,
+        message: limitsGap,
+      }
+    : undefined;
   const rebuilt = rebuild.isSuccess && vectorIndex?.reindex?.state === "succeeded" && candidate === null;
   const rebuildAction = vectorIndex && candidate?.waits_for_reindex && !changed ? rebuildLabel(vectorIndex) : null;
   const rebuildingForEdit = rebuilding && candidate?.waits_for_reindex === true;
@@ -266,9 +320,20 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
     <FormProvider {...form}>
       <form onSubmit={submit} noValidate aria-label={`${title} settings`} className="space-y-4">
         <fieldset disabled={locked} className="min-w-0 space-y-4">
-          <FormField label="Provider" htmlFor={ids.provider} labelId={ids.providerLabel}>
+          <FormField
+            label="Provider"
+            htmlFor={ids.provider}
+            labelId={ids.providerLabel}
+            hint={providerCopy}
+            hintId={`${ids.provider}-hint`}
+          >
             <Select disabled={locked} value={providerId} onValueChange={(next) => (typeof next === "string" ? chooseProvider(next) : undefined)}>
-              <SelectTrigger id={ids.provider} aria-labelledby={ids.providerLabel} className="w-full">
+              <SelectTrigger
+                id={ids.provider}
+                aria-labelledby={ids.providerLabel}
+                aria-describedby={describedBy(providerCopy && `${ids.provider}-hint`)}
+                className="w-full"
+              >
                 <SelectValue>
                   {(selected: string) => findProvider(selected)?.label ?? (selected || "Choose a provider")}
                 </SelectValue>
@@ -396,7 +461,7 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
                     aria-invalid={errors.model ? true : undefined}
                     aria-describedby={describedBy(errors.model && `${ids.model}-error`, modelCopy.hint && `${ids.model}-hint`)}
                     className={INPUT_CLASS}
-                    {...register("model", { onChange: (event: ChangeEvent<HTMLInputElement>) => followTypedModel(event.target.value) })}
+                    {...register("model", { onChange: (event: ChangeEvent<HTMLInputElement>) => followModelField(event.target.value) })}
                   />
                   {provider.lists_models ? (
                     <Button type="button" variant="outline" onClick={loadModels} disabled={discovery.isPending}>
@@ -463,11 +528,11 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
 
         {candidate !== null && !locked ? (
           <PendingEditNotice
-            kind={kind}
             edit={candidate}
             inUse={active}
             providers={providers}
             vectorSearchOn={vectorIndex?.serves_search}
+            listFill={listFill}
           />
         ) : null}
         {rebuilt && !changed && !locked ? (

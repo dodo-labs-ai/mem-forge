@@ -23,6 +23,7 @@ import {
   formOrigin,
   hasTokenLimitValues,
   isChanged,
+  listedLimitsGap,
   listedTokenLimits,
   offersTokenLimits,
   savedValues,
@@ -31,6 +32,7 @@ import {
   valuesForProvider,
   type ModelFormValues,
 } from "./modelForm";
+import { discoveryFailure, type DiscoveryOutcome } from "./discoveryOutcome";
 import type { SavedKey } from "./savedKey";
 
 const OPENAI = providerById("openai");
@@ -238,6 +240,42 @@ describe("token limits from a model list", () => {
   test("count as values only when one is filled in", () => {
     expect(hasTokenLimitValues(EMPTY)).toBe(false);
     expect(hasTokenLimitValues({ max_output_tokens: " 4096 " })).toBe(true);
+  });
+
+  describe("say what the list lacks for filling in every limit of a model", () => {
+    const listed = (models: DiscoveryOutcome["models"]): DiscoveryOutcome => ({
+      tone: "ok",
+      message: "Connected.",
+      models,
+      kindFiltered: true,
+      suggestedEndpoint: null,
+    });
+
+    test("nothing when it gives all of them", () => {
+      const outcome = listed([{ id: "acme/model", context_window_tokens: 262144, max_output_tokens: 32768 }]);
+      expect(listedLimitsGap(outcome, " acme/model ", NAMES, "OpenRouter")).toBeNull();
+    });
+
+    test("the model, when the list does not include it", () => {
+      expect(listedLimitsGap(listed([{ id: "acme/other" }]), "acme/model", NAMES, "OpenRouter")).toBe(
+        "The OpenRouter model list does not include acme/model. Take its token limits from the model card.",
+      );
+    });
+
+    test("the limits it gives none of, or only some of", () => {
+      expect(listedLimitsGap(listed([{ id: "acme/model" }]), "acme/model", NAMES, "OpenRouter")).toBe(
+        "The OpenRouter model list gives no token limits for acme/model. Take them from the model card.",
+      );
+      expect(listedLimitsGap(listed([{ id: "qwen3", context_window_tokens: 40960 }]), "qwen3", NAMES, "OpenAI-compatible endpoint")).toBe(
+        "The OpenAI-compatible endpoint model list gives no maximum output for qwen3. Take it from the model card.",
+      );
+    });
+
+    test("that the list could not be loaded", () => {
+      expect(listedLimitsGap(discoveryFailure("Network error"), "acme/model", NAMES, "OpenRouter")).toBe(
+        "Couldn't load the OpenRouter model list.",
+      );
+    });
   });
 });
 

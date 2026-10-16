@@ -7,6 +7,7 @@ import {
   optionField,
   parameterField,
   parameterNames,
+  providerHint,
   providersFor,
   tokenLimitField,
   tokenLimitLabel,
@@ -95,4 +96,12 @@ test("extra settings are optional, have their own labels, and an unknown one is 
     hint: "Leave blank for the model's own vector size.",
   });
   expect(optionField("api_version")).toEqual({ label: "Api version (optional)", hint: null });
+});
+
+test("only the provider that takes any LiteLLM route says under its name what it reaches", () => {
+  expect(providerHint(providerById("litellm"))).toBe(
+    "Any provider LiteLLM supports that is not listed above. Enter the model as a LiteLLM route, such as bedrock/… or vertex_ai/…, and give the credentials that provider needs.",
+  );
+  expect(PROVIDERS.filter((provider) => providerHint(provider) !== null).map((provider) => provider.id)).toEqual(["litellm"]);
+  expect(providerHint(undefined)).toBeNull();
 });

@@ -96,6 +96,7 @@ function provider(id: string, label: string, overrides: Record<string, unknown> 
     endpoint_required: false,
     model_is_route: false,
     lists_models: true,
+    lists_token_limits: false,
     options: [],
     parameters: { generation: [], embedding: ["dimensions"] },
     token_limits: { generation: ["context_window_tokens", "max_output_tokens"], embedding: [] },
@@ -112,8 +113,12 @@ const PROVIDERS = [
     token_limits: { generation: ["context_window_tokens", "max_output_tokens"] },
   }),
   provider("ollama", "Ollama", { auth_strategies: ["none", "api_key"], default_endpoint: "http://localhost:11434" }),
-  provider("openai_compatible", "OpenAI-compatible endpoint", { auth_strategies: ["api_key", "none"], endpoint_required: true }),
-  provider("litellm", "LiteLLM route (advanced)", { model_is_route: true, lists_models: false }),
+  provider("openai_compatible", "OpenAI-compatible endpoint", {
+    auth_strategies: ["api_key", "none"],
+    endpoint_required: true,
+    lists_token_limits: true,
+  }),
+  provider("litellm", "Other provider (LiteLLM route)", { model_is_route: true, lists_models: false }),
 ];
 
 function passed(facts: Record<string, unknown>): Validation {

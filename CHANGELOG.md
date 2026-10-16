@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Settings is easier to follow while models are set up. A model id typed,
+  pasted or filled in by the browser that exactly matches a model from Load
+  models now counts as picking it, so the token limits the provider's list
+  gives fill the empty limit fields, as a click on the suggestion did. When
+  validation stops at the token limits step and the provider's list can give
+  them (OpenRouter and OpenAI-compatible endpoints), the step offers **Fill
+  from the model list**, and says plainly when the list does not include the
+  model or gives no limits for it; the providers expose this as the new
+  `lists_token_limits` field of `GET /api/v1/model-settings/providers`. A card
+  with no model in use shows only the Not set up badge and one line on what
+  MemForge does without one, instead of repeating it in an In use panel and in
+  the notice of a saved edit. An empty search index still reads "Vector search
+  is on." and adds that memories become searchable once a source is synced.
+  The provider "LiteLLM route (advanced)" is renamed "Other provider (LiteLLM
+  route)" and says under the Provider field which providers it is for; a
+  LiteLLM Proxy, which speaks the OpenAI API, belongs under OpenAI-compatible
+  endpoint. A generation model LiteLLM has no metadata for, whose token limits
+  are all configured, no longer logs `request_budget_metadata_unavailable` as a
+  warning on every request: it is logged at debug level, and a warning remains
+  for a limit that nothing configures. Cloud: no change needed; no Cloud test
+  or UI matches the old provider label. Cloud's AI Core models are bindings of
+  that provider, so wherever Cloud's Settings shows them the provider reads
+  "Other provider (LiteLLM route)".
 - `memforge search` and `memforge memory search` find your own private
   memories, which include every memory from a Claude Code or Codex session and
   every memory created by hand, so they no longer come back empty on an

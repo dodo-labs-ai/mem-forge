@@ -53,6 +53,9 @@ export function rebuildLabel(vectorIndex: VectorIndex): string {
   return failedRebuild(vectorIndex) === null ? "Rebuild search index" : "Run the rebuild again";
 }
 
+/** An index that is ready holds one vector for every memory, so an empty one means there are no memories yet. */
+const NOTHING_TO_SEARCH_YET = "No memories yet: add a source and sync it, and they become searchable as they are written.";
+
 const WITHOUT_VECTORS = "Search ranks by matching words, and new memories cannot be created, until the index is rebuilt.";
 
 /** "vectors of 768 numbers", or the size a model answers with when none is asked for. */
@@ -140,11 +143,11 @@ export function searchIndexSummary(
     index !== null && reindex?.state === "succeeded" && reindex.fingerprint === index.fingerprint && reindex.finished_at
       ? reindex.finished_at
       : null;
-  return {
-    tone: "ok",
-    headline: "Vector search is on.",
-    detail: rebuilt === null ? null : `The index was rebuilt ${formatRelative(rebuilt, now)}.`,
-  };
+  const details = [
+    rebuilt === null ? null : `The index was rebuilt ${formatRelative(rebuilt, now)}.`,
+    index?.vector_count === 0 ? NOTHING_TO_SEARCH_YET : null,
+  ].filter((detail) => detail !== null);
+  return { tone: "ok", headline: "Vector search is on.", detail: details.length === 0 ? null : details.join(" ") };
 }
 
 export interface SearchIndexMark {

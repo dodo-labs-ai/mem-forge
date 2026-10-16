@@ -6645,6 +6645,11 @@
             "title": "Lists Models",
             "type": "boolean"
           },
+          "lists_token_limits": {
+            "description": "Whether the model listing can give the token limits of a listed model: its context window and its largest output.",
+            "title": "Lists Token Limits",
+            "type": "boolean"
+          },
           "model_is_route": {
             "description": "Whether the model is entered as a full LiteLLM provider/model route.",
             "title": "Model Is Route",
@@ -6702,6 +6707,7 @@
           "endpoint_required",
           "model_is_route",
           "lists_models",
+          "lists_token_limits",
           "options",
           "parameters",
           "token_limits"
