@@ -4764,6 +4764,11 @@ export interface components {
              */
             lists_models: boolean;
             /**
+             * Lists Token Limits
+             * @description Whether the model listing can give the token limits of a listed model: its context window and its largest output.
+             */
+            lists_token_limits: boolean;
+            /**
              * Model Is Route
              * @description Whether the model is entered as a full LiteLLM provider/model route.
              */

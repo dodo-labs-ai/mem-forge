@@ -1,6 +1,6 @@
 import { useId } from "react";
 import { StatusBadge } from "@/patterns";
-import { KIND_DESCRIPTIONS, KIND_TITLES } from "./model/kinds";
+import { KIND_DESCRIPTIONS, KIND_TITLES, WITHOUT_A_MODEL } from "./model/kinds";
 import { stateBadge } from "./model/modelStatus";
 import type { ModelKind, ModelKindSettings, ModelProvider, VectorIndex } from "./model/types";
 import { ModelForm } from "./ModelForm";
@@ -20,7 +20,8 @@ interface ModelCardProps {
 
 /**
  * One kind of model: the one in use with its state, and the form that changes
- * it. The embedding model also shows the search index it builds.
+ * it. While none is set up, the card says what MemForge does without one. The
+ * embedding model also shows the search index it builds.
  */
 export function ModelCard({ kind, settings, providers, vectorIndex, writable, onUnsavedChange }: ModelCardProps) {
   const titleId = useId();
@@ -35,10 +36,11 @@ export function ModelCard({ kind, settings, providers, vectorIndex, writable, on
             {title}
           </h2>
           <p className="text-sm text-muted-foreground">{KIND_DESCRIPTIONS[kind]}</p>
+          {settings.active === null ? <p className="text-sm text-subtle-foreground">{WITHOUT_A_MODEL[kind]}</p> : null}
         </div>
         <StatusBadge tone={badge.tone}>{badge.label}</StatusBadge>
       </div>
-      <ModelInUse kind={kind} model={settings.active} providers={providers} />
+      {settings.active !== null ? <ModelInUse kind={kind} model={settings.active} providers={providers} /> : null}
       {vectorIndex ? <SearchIndex vectorIndex={vectorIndex} embedding={settings} providers={providers} /> : null}
       {writable ? (
         <ModelForm

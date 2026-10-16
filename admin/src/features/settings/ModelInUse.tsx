@@ -11,11 +11,6 @@ import { maskedKey } from "./model/savedKey";
 import type { ModelBinding, ModelKind, ModelProvider } from "./model/types";
 import { StatusLine } from "./StatusLine";
 
-const WITHOUT_A_MODEL: Record<ModelKind, string> = {
-  generation: "No generation model is in use. A source sync stores content but writes no memories until one is.",
-  embedding: "No embedding model is in use. Search ranks by matching words until one is.",
-};
-
 const KEY_SOURCES = { saved: "Saved in Settings", environment: "From the server environment" } as const;
 
 function Code({ children }: { children: string }) {
@@ -51,8 +46,8 @@ function modelProperties(model: ModelBinding, providers: readonly ModelProvider[
 
 interface ModelInUseProps {
   kind: ModelKind;
-  /** The model the server uses, or `null` when the kind has none. */
-  model: ModelBinding | null;
+  /** The model the server uses. */
+  model: ModelBinding;
   providers: readonly ModelProvider[];
 }
 
@@ -69,33 +64,27 @@ export function ModelInUse({ kind, model, providers }: ModelInUseProps) {
       <h3 id={headingId} className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
         In use
       </h3>
-      {model === null ? (
-        <p className="text-sm text-subtle-foreground">{WITHOUT_A_MODEL[kind]}</p>
-      ) : (
-        <>
-          <PropertyList layout="row" items={modelProperties(model, providers)} />
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div role="status" className="min-w-0 flex-1 space-y-1.5">
-              <StatusLine summary={validationSummary(model, "active")} />
-              {validationNotes(kind, model.validation).map((note) => (
-                <p key={note} className="text-xs text-tone-warn-foreground">
-                  {note}
-                </p>
-              ))}
-              {model.config_source === "environment" ? (
-                <p className="text-xs text-muted-foreground">
-                  Set by the MEMFORGE_* environment variables of the server. A model saved here takes their place.
-                </p>
-              ) : null}
-            </div>
-            <Button type="button" variant="outline" size="sm" onClick={() => validate.mutate()} disabled={validate.isPending}>
-              {validate.isPending ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-              {validate.isPending ? "Validating…" : "Validate again"}
-            </Button>
-          </div>
-          {validate.isError ? <ErrorNotice title="Couldn't validate" message={errorMessage(validate.error)} /> : null}
-        </>
-      )}
+      <PropertyList layout="row" items={modelProperties(model, providers)} />
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div role="status" className="min-w-0 flex-1 space-y-1.5">
+          <StatusLine summary={validationSummary(model, "active")} />
+          {validationNotes(kind, model.validation).map((note) => (
+            <p key={note} className="text-xs text-tone-warn-foreground">
+              {note}
+            </p>
+          ))}
+          {model.config_source === "environment" ? (
+            <p className="text-xs text-muted-foreground">
+              Set by the MEMFORGE_* environment variables of the server. A model saved here takes their place.
+            </p>
+          ) : null}
+        </div>
+        <Button type="button" variant="outline" size="sm" onClick={() => validate.mutate()} disabled={validate.isPending}>
+          {validate.isPending ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+          {validate.isPending ? "Validating…" : "Validate again"}
+        </Button>
+      </div>
+      {validate.isError ? <ErrorNotice title="Couldn't validate" message={errorMessage(validate.error)} /> : null}
     </div>
   );
 }
