@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `.env.example` leaves the models empty, so a new installation starts with no
+  model and you choose one in Settings. It no longer names
+  `claude-sonnet-4-20250514` and `text-embedding-3-small`; set
+  `MEMFORGE_ENRICHMENT_MODEL` and `MEMFORGE_EMBEDDING_MODEL` to configure the
+  models in `.env` instead. An existing `.env` is not affected.
 - Closed-choice model calls no longer fail with `output_truncated` because the
   model spent their small output budget reasoning before it answered. These
   calls (relation classification, cross-document relations, change impact,

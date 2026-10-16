@@ -17,13 +17,9 @@ cd mem-forge
 cp .env.example .env
 ```
 
-Set the model keys in `.env`, or leave them empty and set them later in the
-admin UI (step 2):
-
-```bash
-MEMFORGE_ENRICHMENT_API_KEY=...
-MEMFORGE_EMBEDDING_API_KEY=...
-```
+Leave the model settings in `.env` empty: you choose the models and enter
+their keys in the admin UI (step 2). To name them in `.env` instead, see
+[Configuring models in `.env`](#configuring-models-in-env).
 
 Then start the stack:
 
@@ -72,6 +68,22 @@ docker compose --env-file .env.mirrors.example up --build
 
 Copy `.env.mirrors.example` to `.env` only when you also want to edit local
 model keys or ports.
+
+### Reaching model providers through a proxy
+
+The API container calls the model providers itself. If they are reachable only
+through a proxy on your machine, add it to `.env` and restart the stack.
+`host.docker.internal` is the host as the container sees it, and the proxy must
+accept connections from the container:
+
+```bash
+HTTPS_PROXY=http://host.docker.internal:7890
+HTTP_PROXY=http://host.docker.internal:7890
+NO_PROXY=localhost,127.0.0.1,api,admin-ui,host.docker.internal
+```
+
+A model server on your machine, such as Ollama at `host.docker.internal`, is
+reached directly through `NO_PROXY`.
 
 The API image uses WeasyPrint for Confluence PDF export. This keeps the image
 much lighter than bundling a browser runtime while preserving print-oriented
@@ -272,7 +284,8 @@ from then on the saved model is used. A plain generation model name is an
 Anthropic model, and `provider/model` is a LiteLLM route. A plain embedding
 model name is sent to the OpenAI-compatible endpoint at the base URL, and a
 name that starts with a provider LiteLLM knows (`ollama/nomic-embed-text`) is a
-LiteLLM route.
+LiteLLM route. A base URL left unset is `https://api.anthropic.com` for
+generation and `https://api.openai.com/v1` for embedding.
 
 Restart the stack after editing `.env`:
 
