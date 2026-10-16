@@ -175,6 +175,7 @@ def test_the_api_lists_the_provider_descriptors(db, tmp_path) -> None:
         "endpoint_required": False,
         "model_is_route": False,
         "lists_models": True,
+        "lists_token_limits": False,
         "options": ["organization"],
         "parameters": {"generation": [], "embedding": ["dimensions"]},
         "token_limits": {
@@ -190,6 +191,11 @@ def test_the_api_lists_the_provider_descriptors(db, tmp_path) -> None:
     assert by_id["openai_compatible"]["default_endpoint"] is None
     assert by_id["litellm"]["model_is_route"] is True
     assert by_id["litellm"]["lists_models"] is False
+    assert by_id["litellm"]["label"] == "Other provider (LiteLLM route)"
+    assert {provider["id"] for provider in providers if provider["lists_token_limits"]} == {
+        "openrouter",
+        "openai_compatible",
+    }
 
 
 def test_a_fresh_installation_reads_as_writable_with_no_bindings(db, tmp_path) -> None:

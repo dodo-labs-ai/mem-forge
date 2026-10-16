@@ -14,6 +14,7 @@ function provider(overrides: Partial<ModelProvider> & Pick<ModelProvider, "id" |
     endpoint_required: false,
     model_is_route: false,
     lists_models: true,
+    lists_token_limits: false,
     options: [],
     parameters: { generation: [], embedding: ["dimensions"] },
     token_limits: { generation: ["context_window_tokens", "max_output_tokens"], embedding: [] },
@@ -32,15 +33,21 @@ export const PROVIDERS: ModelProvider[] = [
     parameters: { generation: [] },
     token_limits: { generation: ["context_window_tokens", "max_output_tokens"] },
   }),
-  provider({ id: "openrouter", label: "OpenRouter", default_endpoint: "https://openrouter.ai/api/v1" }),
+  provider({
+    id: "openrouter",
+    label: "OpenRouter",
+    default_endpoint: "https://openrouter.ai/api/v1",
+    lists_token_limits: true,
+  }),
   provider({ id: "ollama", label: "Ollama", auth_strategies: ["none", "api_key"], default_endpoint: "http://localhost:11434" }),
   provider({
     id: "openai_compatible",
     label: "OpenAI-compatible endpoint",
     auth_strategies: ["api_key", "none"],
     endpoint_required: true,
+    lists_token_limits: true,
   }),
-  provider({ id: "litellm", label: "LiteLLM route (advanced)", model_is_route: true, lists_models: false }),
+  provider({ id: "litellm", label: "Other provider (LiteLLM route)", model_is_route: true, lists_models: false }),
 ];
 
 export function providerById(id: string): ModelProvider {

@@ -62,6 +62,21 @@ def test_each_descriptor_states_what_it_serves_and_how_it_is_reached(
 
 
 @pytest.mark.parametrize(
+    ("provider", "lists_token_limits"),
+    [
+        ("openai", False),
+        ("anthropic", False),
+        ("openrouter", True),
+        ("ollama", False),
+        ("openai_compatible", True),
+        ("litellm", False),
+    ],
+)
+def test_only_a_listing_whose_entries_can_carry_token_limits_offers_them(provider, lists_token_limits) -> None:
+    assert provider_descriptor(provider).lists_token_limits is lists_token_limits
+
+
+@pytest.mark.parametrize(
     ("provider", "pasted", "base"),
     [
         ("openrouter", "https://openrouter.ai/api/v1/models", "https://openrouter.ai/api/v1"),

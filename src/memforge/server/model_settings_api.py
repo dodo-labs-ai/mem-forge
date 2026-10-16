@@ -125,6 +125,12 @@ class ModelProviderResponse(BaseModel):
         description="Whether the model is entered as a full LiteLLM provider/model route.",
     )
     lists_models: bool = Field(description="Whether the endpoint can list its models.")
+    lists_token_limits: bool = Field(
+        description=(
+            "Whether the model listing can give the token limits of a listed model: its "
+            "context window and its largest output."
+        ),
+    )
     options: list[str] = Field(description="The names of the non-secret options the provider accepts.")
     parameters: dict[ModelKind, list[str]] = Field(
         description="The request parameters a binding of each served kind may set.",
@@ -680,6 +686,7 @@ def _descriptor_response(descriptor: ProviderDescriptor) -> ModelProviderRespons
         endpoint_required=descriptor.endpoint_required,
         model_is_route=descriptor.model_is_route,
         lists_models=descriptor.lists_models,
+        lists_token_limits=descriptor.lists_token_limits,
         options=list(descriptor.options),
         parameters={kind: list(parameters_for_kind(kind)) for kind in descriptor.kinds},
         token_limits={kind: list(token_limits_for_kind(kind)) for kind in descriptor.kinds},

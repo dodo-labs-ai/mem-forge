@@ -44,6 +44,16 @@ describe("searchIndexSummary", () => {
     });
   });
 
+  test("an empty index keeps vector search on and says how memories get into it", () => {
+    const empty = makeVectorIndex({ index: makeIndexRecord({ vector_count: 0 }) });
+
+    expect(searchIndexSummary(empty, EMBEDDING, PROVIDERS, NOW)).toEqual({
+      tone: "ok",
+      headline: "Vector search is on.",
+      detail: "No memories yet: add a source and sync it, and they become searchable as they are written.",
+    });
+  });
+
   test("an index that a rebuild put in place says when", () => {
     const rebuilt = makeVectorIndex({
       reindex: makeReindex({ state: "succeeded", memories_indexed: 1204, finished_at: "2026-03-02T09:03:00Z" }),

@@ -1,4 +1,4 @@
-import { screen, within } from "@testing-library/react";
+import { fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Link, Outlet } from "react-router-dom";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -441,7 +441,7 @@ describe("a model that pairs a base URL with credentials from the server environ
     renderEnvironmentModel();
     const generation = await card("Generation model");
 
-    expect(within(inUse(generation)).getByText("LiteLLM route (advanced)")).toBeInTheDocument();
+    expect(within(inUse(generation)).getByText("Other provider (LiteLLM route)")).toBeInTheDocument();
     expect(within(inUse(generation)).getByText("http://127.0.0.1:4000/v1")).toBeInTheDocument();
     expect(within(generation).getByLabelText("Base URL")).toHaveValue("http://127.0.0.1:4000/v1");
     const notice = within(generation).getByText(CONFLICT_TITLE).closest('[role="status"]') as HTMLElement;
@@ -737,6 +737,72 @@ describe("Load models", () => {
     expect(within(generation).queryByText(/Filled in from the OpenRouter model list/)).not.toBeInTheDocument();
   });
 
+  describe("a model field that names a listed model counts as picking it", () => {
+    const LISTED = {
+      ok: true,
+      models_supported: true,
+      kind_filtered: true,
+      models: [
+        { id: "anthropic/claude-haiku-5.5", context_window_tokens: 1000000, max_output_tokens: 128000 },
+        { id: "openai/gpt-5-mini", context_window_tokens: 400000, max_output_tokens: null },
+      ],
+      message: "Connected. Found 2 generation models.",
+    };
+
+    async function openRouterForm() {
+      const generation = await card("Generation model");
+      await userEvent.click(within(generation).getByRole("combobox", { name: "Provider" }));
+      await userEvent.click(await screen.findByRole("option", { name: "OpenRouter" }));
+      await userEvent.type(within(generation).getByLabelText("API key"), "sk-or-key");
+      return generation;
+    }
+
+    function expectListedLimits(generation: HTMLElement) {
+      const limits = within(generation).getByRole("group", { name: "Token limits" });
+      expect(within(limits).getByLabelText("Context window (optional)")).toHaveValue("1000000");
+      expect(within(limits).getByLabelText("Maximum output (optional)")).toHaveValue("128000");
+      expect(within(limits).getByText("Filled in from the OpenRouter model list. You can change them.")).toBeInTheDocument();
+    }
+
+    test("typed", async () => {
+      renderPage(makeModelSettings(), { [`POST ${SETTINGS_ROUTE}/generation/discover-models`]: () => LISTED });
+      const generation = await openRouterForm();
+      const modelField = within(generation).getByLabelText("Model");
+      await userEvent.click(within(generation).getByRole("button", { name: "Load models" }));
+      await within(generation).findByRole("group", { name: "Suggested models" });
+
+      await userEvent.type(modelField, "anthropic/claude-haiku-5.5");
+      expectListedLimits(generation);
+
+      await userEvent.type(modelField, "-beta");
+      expect(within(generation).queryByRole("group", { name: "Token limits" })).not.toBeInTheDocument();
+    });
+
+    test("filled in by the browser", async () => {
+      renderPage(makeModelSettings(), { [`POST ${SETTINGS_ROUTE}/generation/discover-models`]: () => LISTED });
+      const generation = await openRouterForm();
+      await userEvent.click(within(generation).getByRole("button", { name: "Load models" }));
+      await within(generation).findByRole("group", { name: "Suggested models" });
+
+      // Autofill sets the whole value at once and reports it with one input event, without keystrokes.
+      fireEvent.input(within(generation).getByLabelText("Model"), { target: { value: "anthropic/claude-haiku-5.5" } });
+
+      expectListedLimits(generation);
+    });
+
+    test("already in the field when the models are loaded", async () => {
+      renderPage(makeModelSettings(), { [`POST ${SETTINGS_ROUTE}/generation/discover-models`]: () => LISTED });
+      const generation = await openRouterForm();
+      await userEvent.type(within(generation).getByLabelText("Model"), "anthropic/claude-haiku-5.5");
+      expect(within(generation).queryByRole("group", { name: "Token limits" })).not.toBeInTheDocument();
+
+      await userEvent.click(within(generation).getByRole("button", { name: "Load models" }));
+      await within(generation).findByRole("group", { name: "Suggested models" });
+
+      expectListedLimits(generation);
+    });
+  });
+
   test("applies the base URL the server suggests", async () => {
     renderPage(makeModelSettings(), {
       [`POST ${SETTINGS_ROUTE}/embedding/discover-models`]: () => ({
@@ -762,8 +828,11 @@ describe("Load models", () => {
     const generation = await card("Generation model");
 
     await userEvent.click(within(generation).getByRole("combobox", { name: "Provider" }));
-    await userEvent.click(await screen.findByRole("option", { name: "LiteLLM route (advanced)" }));
+    await userEvent.click(await screen.findByRole("option", { name: "Other provider (LiteLLM route)" }));
 
+    expect(within(generation).getByRole("combobox", { name: "Provider" })).toHaveAccessibleDescription(
+      "Any provider LiteLLM supports that is not listed above. Enter the model as a LiteLLM route, such as bedrock/… or vertex_ai/…, and give the credentials that provider needs.",
+    );
     expect(within(generation).getByLabelText("Model route")).toHaveAttribute("placeholder", "provider/model");
     expect(within(generation).getByLabelText("Base URL (optional)")).toHaveValue("");
     expect(within(generation).queryByRole("button", { name: "Load models" })).not.toBeInTheDocument();
@@ -820,7 +889,12 @@ test("a fresh installation says no model is in use and asks for one before savin
   const generation = await card("Generation model");
 
   expect(within(generation).getByText("Not set up")).toBeInTheDocument();
-  expect(within(inUse(generation)).getByText(/No generation model is in use/)).toBeInTheDocument();
+  expect(within(generation).getByText("Until one is set up, a source sync stores content but writes no memories.")).toBeInTheDocument();
+  expect(within(generation).queryByRole("group", { name: "In use" })).not.toBeInTheDocument();
+  expect(within(generation).queryByText(/is in use/)).not.toBeInTheDocument();
+  const embedding = await card("Embedding model");
+  expect(within(embedding).getByText("Until one is set up, search ranks by matching words.")).toBeInTheDocument();
+  expect(within(embedding).queryByRole("group", { name: "In use" })).not.toBeInTheDocument();
   expect(within(generation).getByText("Stored encrypted on the server and never shown again.")).toBeInTheDocument();
   await userEvent.click(within(generation).getByRole("button", { name: "Save and validate" }));
 
@@ -1328,6 +1402,8 @@ describe("the token limits of a generation model", () => {
       "The model answered, but MemForge has no token limits for it. Enter its context window and maximum output, then validate again.",
     );
     expect(step).toHaveClass("bg-tone-warn-soft");
+    expect(step).not.toHaveTextContent(/is in use/);
+    expect(within(step).queryByRole("button", { name: "Fill from the model list" })).not.toBeInTheDocument();
     expect(within(generation).queryByText("These settings failed validation and are not in use")).not.toBeInTheDocument();
     const limits = within(generation).getByRole("group", { name: "Token limits" });
     expect(limits).toHaveAccessibleDescription(
@@ -1371,6 +1447,72 @@ describe("the token limits of a generation model", () => {
     expect(await within(limits).findByText("Enter a whole number greater than zero.")).toBeInTheDocument();
     expect(within(limits).getByLabelText("Maximum output (optional)")).toHaveAttribute("aria-invalid", "true");
     expect(writes(calls)).toEqual([]);
+  });
+
+  describe("can be filled in from a model list that gives them", () => {
+    const awaiting = makeBinding({
+      provider: "openrouter",
+      endpoint: "https://openrouter.ai/api/v1",
+      origin: "https://openrouter.ai",
+      model_id: "acme/new-model",
+      route: "openrouter/acme/new-model",
+      state: "not_validated",
+      validation: LIMITS_UNKNOWN,
+    });
+
+    function listing(models: Array<Record<string, unknown>>) {
+      return () => ({
+        ok: true,
+        models_supported: true,
+        kind_filtered: true,
+        models,
+        message: `Connected. Found ${models.length} generation models.`,
+      });
+    }
+
+    async function fillFromList(models: Array<Record<string, unknown>>) {
+      const { calls } = renderPage(makeModelSettings({ generation: kindSettings(makeBinding(), awaiting) }), {
+        [`POST ${SETTINGS_ROUTE}/generation/discover-models`]: listing(models),
+      });
+      const generation = await card("Generation model");
+      const step = within(generation).getByText("One more step: enter the token limits").closest('[role="status"]') as HTMLElement;
+      await userEvent.click(within(step).getByRole("button", { name: "Fill from the model list" }));
+      await within(generation).findByText(/^Connected\. Found/);
+      return { calls, generation, step };
+    }
+
+    test("and say where they came from", async () => {
+      const { calls, generation, step } = await fillFromList([
+        { id: "acme/new-model", context_window_tokens: 262144, max_output_tokens: 32768 },
+        { id: "acme/old-model", context_window_tokens: 8192, max_output_tokens: 2048 },
+      ]);
+
+      const limits = within(generation).getByRole("group", { name: "Token limits" });
+      expect(within(limits).getByLabelText("Context window")).toHaveValue("262144");
+      expect(within(limits).getByLabelText("Maximum output")).toHaveValue("32768");
+      expect(within(limits).getByText("Filled in from the OpenRouter model list. You can change them.")).toBeInTheDocument();
+      expect(within(step).queryByRole("button", { name: "Fill from the model list" })).not.toBeInTheDocument();
+      expect(within(step).getByText("MemForge keeps using OpenAI gpt-5.4.")).toBeInTheDocument();
+      expect(writes(calls)).toEqual([`POST ${SETTINGS_ROUTE}/generation/discover-models`]);
+    });
+
+    test("and say so plainly when the list does not include the model", async () => {
+      const { generation, step } = await fillFromList([{ id: "acme/old-model", context_window_tokens: 8192, max_output_tokens: 2048 }]);
+
+      expect(
+        within(step).getByText("The OpenRouter model list does not include acme/new-model. Take its token limits from the model card."),
+      ).toBeInTheDocument();
+      expect(within(step).queryByRole("button", { name: "Fill from the model list" })).not.toBeInTheDocument();
+      expect(within(generation).getByLabelText("Context window")).toHaveValue("");
+    });
+
+    test("and say so plainly when the list gives no limits for the model", async () => {
+      const { step } = await fillFromList([{ id: "acme/new-model" }]);
+
+      expect(
+        within(step).getByText("The OpenRouter model list gives no token limits for acme/new-model. Take them from the model card."),
+      ).toBeInTheDocument();
+    });
   });
 
   test("are not offered for an embedding model", async () => {
