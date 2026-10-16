@@ -1,4 +1,4 @@
-import { STANDALONE_TARGET, type components } from "@/api";
+import { STANDALONE_TARGET, type WorkspaceTarget, type components } from "@/api";
 import { MemoriesRoutes } from "@/features/memories";
 import type { Route as FakeRoute } from "./fakeApi";
 import { makeMemory } from "./memoryFixtures";
@@ -69,13 +69,23 @@ export function memoriesRoutes(overrides: Record<string, FakeRoute> = {}): Recor
   };
 }
 
+/** The standalone workspace, which one person uses. */
+export const PERSONAL_WORKSPACE: WorkspaceTarget = { ...STANDALONE_TARGET, label: "Team Alpha" };
+
+/** The same workspace used by several people. */
+export const SHARED_WORKSPACE: WorkspaceTarget = { ...PERSONAL_WORKSPACE, shared: true };
+
 /** Renders the Memories routes at `path` against a fake API; returns the recorded requests and the router. */
-export function renderMemories(path: string, routes: Record<string, FakeRoute> = memoriesRoutes()) {
+export function renderMemories(
+  path: string,
+  routes: Record<string, FakeRoute> = memoriesRoutes(),
+  workspace: WorkspaceTarget = PERSONAL_WORKSPACE,
+) {
   return renderRoutes(
     [
       { path: "/memories/*", element: <MemoriesRoutes /> },
       { path: "*", element: null },
     ],
-    { path, api: routes, workspace: { ...STANDALONE_TARGET, label: "Team Alpha" } },
+    { path, api: routes, workspace },
   );
 }

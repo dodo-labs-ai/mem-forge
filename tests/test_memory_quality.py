@@ -1513,7 +1513,7 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
     payload = response.json()
     expected_scope = AccessScope(
         user_id=LOCAL_DEV_USER_ID,
-        include_private=False,
+        include_private=True,
         allowed_statuses=allowed_search_statuses(False),
         active_project=None,
         # The request omits active_project, so the project-aware default

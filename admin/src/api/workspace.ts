@@ -12,6 +12,12 @@ export interface WorkspaceTarget {
   workspaceId: string | null;
   /** Name of the workspace, shown in the browser tab title. */
   label?: string;
+  /**
+   * Whether other people use this workspace too. Only then do Sources and
+   * Memories say who can use them; in a workspace of one, everything belongs
+   * to its one user.
+   */
+  shared: boolean;
 }
 
 export const RESOURCE_PREFIX = "/api/v1";
@@ -21,6 +27,7 @@ export const STANDALONE_TARGET: WorkspaceTarget = Object.freeze({
   resourceBaseUrl: RESOURCE_PREFIX,
   localAgentBaseUrl: LOCAL_AGENT_PREFIX,
   workspaceId: "local",
+  shared: false,
 });
 
 export interface WorkspaceController {
@@ -39,6 +46,8 @@ function normalize(target: WorkspaceTarget | null): WorkspaceTarget | null {
       ...target,
       resourceBaseUrl: trimTrailingSlash(target.resourceBaseUrl),
       localAgentBaseUrl: trimTrailingSlash(target.localAgentBaseUrl),
+      // Only a target that says it has one user hides who can use what.
+      shared: target.shared !== false,
     }
   );
 }
@@ -56,7 +65,7 @@ function sameRequests(a: WorkspaceTarget | null, b: WorkspaceTarget | null): boo
 /**
  * Creates the workspace target holder. `onChange` runs whenever requests go to
  * a different workspace, so the caller can drop data cached for the previous
- * one; a new label alone only notifies subscribers.
+ * one; a new label or sharing alone only notifies subscribers.
  */
 export function createWorkspaceController(
   onChange: () => void,
@@ -69,7 +78,8 @@ export function createWorkspaceController(
     setTarget(next) {
       const normalized = normalize(next);
       const requestsChanged = !sameRequests(target, normalized);
-      if (!requestsChanged && target?.label === normalized?.label) return;
+      const presentationChanged = target?.label !== normalized?.label || target?.shared !== normalized?.shared;
+      if (!requestsChanged && !presentationChanged) return;
       target = normalized;
       if (requestsChanged) onChange();
       listeners.forEach((listener) => listener());

@@ -67,7 +67,7 @@ more than one workspace, local folders, the host CLI and network details.
 and your Claude Code and Codex sessions land in one store and come back from
 one `search` call. From sessions it keeps what you decided or corrected, not
 everything the agent said. A decision you made in Claude Code is there when you
-open Codex, and session memories stay private to you.
+open Codex.
 
 **It follows the source.** When a page or ticket changes, the next sync
 rechecks the memories built on it. Each one is kept, replaced or retired, or it

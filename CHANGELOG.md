@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- `memforge search` and `memforge memory search` find your own private
+  memories, which include every memory from a Claude Code or Codex session and
+  every memory created by hand, so they no longer come back empty on an
+  installation that holds only those. Memory reads through the API include
+  the caller's own private memories unless the request sets `include_private`
+  to `false`: `POST /api/v1/memories/search`, `POST /api/v1/memories/recent`,
+  `GET /api/v1/memories` and `ToolClient.search` now default it to `true`.
+  Other users' private memories are never returned. In a workspace of one, the
+  admin UIs no longer show access choices: a new Source is created private
+  without asking who can use it, and the "Only me" labels, the Access column
+  and detail row, the Change access action and the access-change banners are
+  left out. Cloud: `include_private` defaults to `true` on the same routes, so
+  a client that leaves it out now also gets the caller's own private memories;
+  other members' private memories stay hidden. The admin UIs show the access
+  controls only for a workspace target marked `shared`, so the Cloud extension
+  should pass `shared: true` to `setTarget` and add `shared` to its mirror of
+  `WorkspaceTarget`; a target that leaves `shared` out keeps the access
+  controls.
 - `.env.example` leaves the models empty, so a new installation starts with no
   model and you choose one in Settings. It no longer names
   `claude-sonnet-4-20250514` and `text-embedding-3-small`; set

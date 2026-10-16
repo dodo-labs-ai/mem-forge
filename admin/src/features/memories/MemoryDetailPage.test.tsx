@@ -3,9 +3,9 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, expect, test, vi } from "vitest";
 import { errorResponse } from "@/test/fakeApi";
 import { makeMemoryDetail, makeRelation } from "@/test/memoryFixtures";
-import { memoriesRoutes, renderMemories } from "@/test/renderMemories";
+import { memoriesRoutes, renderMemories, SHARED_WORKSPACE } from "@/test/renderMemories";
 import { renderRoutes } from "@/test/renderRoutes";
-import { STANDALONE_TARGET } from "@/api";
+import { STANDALONE_TARGET, type WorkspaceTarget } from "@/api";
 import { MemoryDetailPage } from "./MemoryDetailPage";
 import type { MemoryDetail } from "./model/types";
 
@@ -13,15 +13,16 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function renderDetail(memory: MemoryDetail, extraRoutes = {}) {
+function renderDetail(memory: MemoryDetail, extraRoutes = {}, workspace?: WorkspaceTarget) {
   return renderMemories(
     `/memories/${memory.id}`,
     memoriesRoutes({ [`GET /api/v1/memories/${memory.id}`]: () => memory, ...extraRoutes }),
+    workspace,
   );
 }
 
 test("shows the memory's details, relations and evidence", async () => {
-  renderDetail(makeMemoryDetail());
+  renderDetail(makeMemoryDetail(), {}, SHARED_WORKSPACE);
 
   expect(await screen.findByRole("heading", { level: 1, name: /Cut-off runs the same way/ })).toBeInTheDocument();
   const details = screen.getByRole("region", { name: "Details" });
@@ -46,6 +47,21 @@ test("shows the memory's details, relations and evidence", async () => {
   expect(within(evidence).getByRole("link", { name: "Open content" })).toHaveAttribute(
     "href", expect.stringContaining("workspace_id=local"),
   );
+});
+
+test("a workspace of one leaves out who can use the memory", async () => {
+  renderDetail(makeMemoryDetail({ visibility: "private" }));
+
+  const details = await screen.findByRole("region", { name: "Details" });
+  expect(within(details).queryByText("Access")).not.toBeInTheDocument();
+  expect(within(details).queryByText("Only me")).not.toBeInTheDocument();
+});
+
+test("a private memory in a shared workspace reads as Only me", async () => {
+  renderDetail(makeMemoryDetail({ visibility: "private" }), {}, SHARED_WORKSPACE);
+
+  const details = await screen.findByRole("region", { name: "Details" });
+  expect(within(details).getByText("Only me")).toBeInTheDocument();
 });
 
 test("content, PDF and artifact links retain the selected workspace while source links stay external", async () => {

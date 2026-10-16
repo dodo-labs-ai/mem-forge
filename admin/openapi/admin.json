@@ -5562,7 +5562,8 @@
             "title": "Entities"
           },
           "include_private": {
-            "default": false,
+            "default": true,
+            "description": "Include the caller's own private Memories. Other users' private Memories are never returned.",
             "title": "Include Private",
             "type": "boolean"
           },
@@ -7081,7 +7082,8 @@
             "title": "Cursor"
           },
           "include_private": {
-            "default": false,
+            "default": true,
+            "description": "Include the caller's own private Memories. Other users' private Memories are never returned.",
             "title": "Include Private",
             "type": "boolean"
           },
@@ -11400,7 +11402,7 @@
     },
     "/api/v1/memories": {
       "get": {
-        "description": "List memories with pagination and filters.\n\nFilters: type (fact/decision/convention/procedure), status, source,\nproject, free-text search. Supports limit/offset pagination.\n\nWithout ``status`` the list holds active Memories, so its total for a\nproject equals that project's ``memory_count``; ``status`` lists the\nMemories in exactly that lifecycle status instead.\n\nThe access predicate gates every row: workspace rows are visible\nacross every project (the ranker handles project relevance, not\nthe predicate), and the caller's own private rows surface only\nwhen ``include_private=True``.",
+        "description": "List memories with pagination and filters.\n\nFilters: type (fact/decision/convention/procedure), status, source,\nproject, free-text search. Supports limit/offset pagination.\n\nWithout ``status`` the list holds active Memories, so its total for a\nproject equals that project's ``memory_count``; ``status`` lists the\nMemories in exactly that lifecycle status instead.\n\nThe access predicate gates every row: workspace rows are visible\nacross every project (the ranker handles project relevance, not\nthe predicate), and the caller's own private rows are included\nunless ``include_private=false``. Other users' private rows are\nnever listed.",
         "operationId": "list_memories_api_v1_memories_get",
         "parameters": [
           {
@@ -11484,11 +11486,13 @@
             }
           },
           {
+            "description": "Include the caller's own private Memories. Other users' private Memories are never returned.",
             "in": "query",
             "name": "include_private",
             "required": false,
             "schema": {
-              "default": false,
+              "default": true,
+              "description": "Include the caller's own private Memories. Other users' private Memories are never returned.",
               "title": "Include Private",
               "type": "boolean"
             }

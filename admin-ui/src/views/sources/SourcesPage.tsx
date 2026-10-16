@@ -34,6 +34,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { useSharedWorkspace } from "@/state/sharedWorkspace";
 import { timeAgo } from "@/utils/date";
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { SourceSetupDialog } from "./SourceSetupDialog";
@@ -1029,7 +1030,8 @@ function SourceActionsMenu({
   const canToggleStatus = capabilities.can_configure;
   const canForceResync = capabilities.can_force_resync;
   const canDelete = capabilities.can_delete;
-  const canChangeAccess = capabilities.can_change_access && source.access_state === "active";
+  const sharedWorkspace = useSharedWorkspace();
+  const canChangeAccess = sharedWorkspace && capabilities.can_change_access && source.access_state === "active";
   const toggleStatusLabel = isPaused ? "Resume source" : "Pause source";
   const ToggleStatusIcon = isPaused ? Play : Pause;
   const forceResyncDisabledHint = isPaused

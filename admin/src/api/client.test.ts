@@ -39,6 +39,7 @@ describe("createApiClient", () => {
       resourceBaseUrl: "/api/cloud/workspaces/ws-1/v1/",
       localAgentBaseUrl: "/api/cloud/workspaces/ws-1/local-agent",
       workspaceId: "ws-1",
+      shared: true,
     });
     const api = createApiClient(workspace, ORIGIN);
 
@@ -74,6 +75,7 @@ describe("createApiClient", () => {
       ...STANDALONE_TARGET,
       localAgentBaseUrl: "/api/cloud/workspaces/ws-1/local-agent",
       workspaceId: "ws-1",
+      shared: true,
     });
     const api = createApiClient(workspace, ORIGIN);
     await unwrap(api.GET("/api/cloud/local-agent/jobs/{job_id}", { params: { path: { job_id: "laj-auth" } } }));
