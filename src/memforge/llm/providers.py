@@ -195,6 +195,9 @@ class ModelListing:
     # Whether a base URL entered without an API version is also asked under
     # ``/v1``, where OpenAI-style servers keep their API.
     tries_v1: bool = True
+    # Whether an entry can give the token limits of its model: the context
+    # window and the largest output.
+    gives_token_limits: bool = False
 
 
 @dataclass(frozen=True)
@@ -234,6 +237,11 @@ class ProviderDescriptor:
     def lists_models(self) -> bool:
         """Whether the endpoint answers a model listing request."""
         return self.listing is not None
+
+    @property
+    def lists_token_limits(self) -> bool:
+        """Whether the model listing can give the token limits of a listed model."""
+        return self.listing is not None and self.listing.gives_token_limits
 
     def base_endpoint(self, endpoint: str) -> str:
         """Return ``endpoint`` as the base URL requests are written after.
@@ -316,6 +324,7 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         listing=ModelListing(
             paths={"generation": "/models", "embedding": "/embeddings/models"},
             kind_signal="listing",
+            gives_token_limits=True,
         ),
         request_paths=_OPENAI_REQUEST_PATHS,
         reasoning_off=_openrouter_reasoning_off,
@@ -353,7 +362,12 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         auth_strategies=("api_key", "none"),
         route_prefixes={"generation": "openai", "embedding": "openai"},
         endpoint_required=True,
-        listing=ModelListing(paths={"generation": "/models", "embedding": "/models"}, kind_signal="none"),
+        # vLLM and some gateways give a model's context window in its entry.
+        listing=ModelListing(
+            paths={"generation": "/models", "embedding": "/models"},
+            kind_signal="none",
+            gives_token_limits=True,
+        ),
         request_paths=_OPENAI_REQUEST_PATHS,
         # Any server may answer here, and no reasoning parameter is one every
         # such server accepts.
@@ -361,7 +375,7 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
     ),
     ProviderDescriptor(
         id="litellm",
-        label="LiteLLM route (advanced)",
+        label="Other provider (LiteLLM route)",
         kinds=("generation", "embedding"),
         auth_strategies=("api_key", "environment"),
         # A route may name any LiteLLM provider, gateways among them, and no

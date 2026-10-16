@@ -20,8 +20,8 @@ interface TokenLimitFieldsProps {
  * The context window and the maximum output of a generation model. LiteLLM
  * knows them for most hosted models; a model it has no limits for, which is
  * common for local ones, passes validation only once they are entered here.
- * A provider whose model list gives the limits fills them in when a model is
- * picked from it.
+ * A provider whose model list gives the limits fills them in when the model
+ * field names one of its models.
  */
 export function TokenLimitFields({ id, names, missing, listedBy }: TokenLimitFieldsProps) {
   const { register, formState } = useFormContext<ModelFormValues>();

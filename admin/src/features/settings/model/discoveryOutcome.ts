@@ -40,3 +40,13 @@ export function discoveryFailure(message: string): DiscoveryOutcome {
 export function onlyListedModel(outcome: DiscoveryOutcome): ModelOption | undefined {
   return outcome.kindFiltered && outcome.models.length === 1 ? outcome.models[0] : undefined;
 }
+
+/**
+ * The listed model the model field names, however the name got there: picked
+ * from the list, typed, pasted or filled in by the browser. Naming a listed
+ * model counts as choosing it.
+ */
+export function namedListedModel(outcome: DiscoveryOutcome | null, typed: string): ModelOption | undefined {
+  const id = typed.trim();
+  return id === "" ? undefined : outcome?.models.find((model) => model.id === id);
+}

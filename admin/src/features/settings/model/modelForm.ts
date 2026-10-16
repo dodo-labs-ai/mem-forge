@@ -1,6 +1,7 @@
 import { z } from "zod";
+import type { DiscoveryOutcome } from "./discoveryOutcome";
 import { needsTokenLimits } from "./modelStatus";
-import { parameterNames, providersFor, tokenLimitNames } from "./providerFields";
+import { parameterNames, providersFor, tokenLimitLabel, tokenLimitNames } from "./providerFields";
 import { endpointOrigin, originName, routeOrigin, type SavedKey } from "./savedKey";
 import type {
   AuthStrategy,
@@ -148,6 +149,31 @@ export function tokenLimitsForTypedModel(
   const next: Record<string, string> = { ...current };
   for (const name of names) next[name] = "";
   return sameFields(next, current, names) ? null : next;
+}
+
+/**
+ * Why the model list of `listedBy` could not fill in every token limit of
+ * `model`, in plain words, or `null` when it gives all of them. The list may
+ * not load, may not include the model, or may give none or only some of its
+ * limits.
+ */
+export function listedLimitsGap(
+  outcome: DiscoveryOutcome,
+  model: string,
+  names: readonly string[],
+  listedBy: string,
+): string | null {
+  const list = `The ${listedBy} model list`;
+  if (outcome.tone === "danger") return `Couldn't load the ${listedBy} model list.`;
+  const id = model.trim();
+  const option = outcome.models.find((listed) => listed.id === id);
+  if (option === undefined) return `${list} does not include ${id}. Take its token limits from the model card.`;
+  const listed = listedTokenLimits(option, names);
+  const missing = names.filter((name) => listed[name] === undefined);
+  if (missing.length === 0) return null;
+  if (missing.length === names.length) return `${list} gives no token limits for ${id}. Take them from the model card.`;
+  const what = missing.map((name) => tokenLimitLabel(name).toLowerCase()).join(" or ");
+  return `${list} gives no ${what} for ${id}. Take ${missing.length === 1 ? "it" : "them"} from the model card.`;
 }
 
 /** The form after choosing a provider: the saved values when it is the saved provider, a blank form otherwise. */
