@@ -17,13 +17,9 @@ cd mem-forge
 cp .env.example .env
 ```
 
-Set the model keys in `.env`, or leave them empty and set them later in the
-admin UI (step 2):
-
-```bash
-MEMFORGE_ENRICHMENT_API_KEY=...
-MEMFORGE_EMBEDDING_API_KEY=...
-```
+Leave the model settings in `.env` empty: you choose the models and enter
+their keys in the admin UI (step 2). To name them in `.env` instead, see
+[Configuring models in `.env`](#configuring-models-in-env).
 
 Then start the stack:
 
@@ -272,7 +268,8 @@ from then on the saved model is used. A plain generation model name is an
 Anthropic model, and `provider/model` is a LiteLLM route. A plain embedding
 model name is sent to the OpenAI-compatible endpoint at the base URL, and a
 name that starts with a provider LiteLLM knows (`ollama/nomic-embed-text`) is a
-LiteLLM route.
+LiteLLM route. A base URL left unset is `https://api.anthropic.com` for
+generation and `https://api.openai.com/v1` for embedding.
 
 Restart the stack after editing `.env`:
 
