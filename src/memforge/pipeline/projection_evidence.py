@@ -24,6 +24,7 @@ from memforge.pipeline.projection_context import (
 from memforge.source_projection import (
     AnchorKind,
     SourceAnchor,
+    SourceObservation,
     SourceProjection,
 )
 
@@ -48,6 +49,7 @@ def build_projected_claim_evidence(
     repo_identifier: str | None,
     access_context_hash: str,
     extractor_run_id: str | None,
+    carried_observations: Sequence[SourceObservation] = (),
 ) -> ProjectedClaimEvidence:
     """Build deterministic Evidence Units staged for the atomic Lifecycle Plan.
 
@@ -55,10 +57,16 @@ def build_projected_claim_evidence(
     names its exact supporting parts; each claim becomes one Evidence Unit
     whose identity hashes those parts. An Evidence Unit's time is the source
     time of the Observation Revision its Primary part is anchored to.
+
+    A part may name any member of the Unit revision, a carried member
+    included. A partial projection names its carried members by revision
+    only, so ``carried_observations`` supplies their Observations, as the
+    committed Unit revision stores them.
     """
 
     if len(projection.source_units) != 1 or len(projection.source_unit_revisions) != 1:
         raise ValueError("claim evidence materialization requires one Source Unit projection")
+    member_observations = _member_observations(projection, carried_observations)
     units_by_id: dict[str, EvidenceUnit] = {}
     references_by_id: dict[str, EvidenceReference] = {}
     canonical_memories_by_claim_hash: dict[str, RawMemory] = {}
@@ -69,6 +77,7 @@ def build_projected_claim_evidence(
         unit, supporting_references, context_references, canonical_memory = (
             _materialize_claim_evidence(
                 projection=projection,
+                observations=member_observations,
                 raw=raw,
                 doc_id=doc_id,
                 source_type=source_type,
@@ -123,9 +132,29 @@ def _resolved_fragment_audit_metadata(
     return metadata
 
 
+def _member_observations(
+    projection: SourceProjection,
+    carried_observations: Sequence[SourceObservation],
+) -> Mapping[str, SourceObservation]:
+    """The Observation of every member of the projection's Unit revision."""
+
+    observations = {observation.id: observation for observation in carried_observations}
+    observations.update((observation.id, observation) for observation in projection.observations)
+    members = set(projection.source_unit_revisions[0].observation_revision_ids)
+    missing = {
+        revision.observation_id
+        for revision in projection.observation_revisions
+        if revision.id in members and revision.observation_id not in observations
+    }
+    if missing:
+        raise ValueError(f"Unit members lack their Observations: {sorted(missing)}")
+    return observations
+
+
 def _materialize_claim_evidence(
     *,
     projection: SourceProjection,
+    observations: Mapping[str, SourceObservation],
     raw: RawMemory,
     doc_id: str,
     source_type: str,
@@ -157,7 +186,6 @@ def _materialize_claim_evidence(
         revision.observation_id: revision
         for revision in projection.observation_revisions
     }
-    observations = {observation.id: observation for observation in projection.observations}
     supporting: list[EvidenceReference] = []
     for part in selection.parts:
         if part.anchor.observation_revision_id not in member_revision_ids:

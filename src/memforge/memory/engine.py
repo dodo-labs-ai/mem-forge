@@ -1446,8 +1446,15 @@ class MemoryEngine:
                 evidence_memories.append(review.candidate)
                 if review.rejection_rebind is not None:
                     evidence_memories.append(review.rejection_rebind)
+        # A partial projection names its carried members by revision; their
+        # Observations are the committed Unit revision's.
+        carried_observations = ()
+        if projection.carried_observation_revision_ids:
+            committed = await self.db.get_current_source_unit_projection(projection.source_units[0].id)
+            carried_observations = committed.observations if committed is not None else ()
         projected_evidence = build_projected_claim_evidence(
             projection=projection,
+            carried_observations=carried_observations,
             raw_memories=evidence_memories,
             doc_id=doc_id,
             source_type=source_type,
