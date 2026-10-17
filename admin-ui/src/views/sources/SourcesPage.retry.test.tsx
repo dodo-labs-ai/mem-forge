@@ -232,3 +232,27 @@ it("opens content settings for a file-limit failure without starting sync", asyn
   expect(resourceClient.post).not.toHaveBeenCalled();
   expect(createLocalAgentJob).not.toHaveBeenCalled();
 });
+
+it("the last sync details say how many items still fail and that Sync retries them", async () => {
+  vi.mocked(getCurrentLocalAgentJobs).mockResolvedValue([]);
+  vi.mocked(resourceClient.get).mockImplementation(async (path) => ({ data: path === "/sources"
+    ? [{
+        ...source,
+        last_sync: "2026-09-01T00:00:00Z",
+        sync: { ...source.sync, status: "partial", docs_failed: 1 },
+        failed_items: {
+          count: 2,
+          retrying_after_upgrade: 0,
+          items: [
+            { document_id: "doc-1", title: "Payroll FAQ", stage: "fetch", message: "403 Forbidden" },
+            { document_id: "doc-2", title: null, stage: "derivation", message: "Model output was invalid" },
+          ],
+        },
+      }]
+    : otherResponse(path) }));
+  mount();
+
+  fireEvent.click(await screen.findByRole("button", { name: "Show last sync details for Local fixture" }));
+
+  expect(await screen.findByText(/2 items still fail\. Sync\s+retries every failed item\./)).toBeTruthy();
+});

@@ -68,9 +68,12 @@ _LOCAL_AGENT_JOB_CONFIG_FIELDS_BY_SOURCE_TYPE = {
         }
     ),
 }
+# ``retry_failed_items`` marks a job a person requested: the sync its snapshot
+# starts retries every failed Document of the Source.
 LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS = frozenset(
     {
         "force_full_sync",
+        "retry_failed_items",
     }
 )
 LOCAL_AGENT_JOB_MAX_ATTEMPTS = 5

@@ -1991,8 +1991,10 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             reusable_projection_doc_ids=frozenset(),
             projection_scope_attestations=(),
             record_terminal_result=True,
+            failed_item_retry=None,
         ):
             del (
+                failed_item_retry,
                 authoritative_snapshot,
                 reprocess_doc_ids,
                 execution_mode,
@@ -2115,8 +2117,10 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             reusable_projection_doc_ids=frozenset(),
             projection_scope_attestations=(),
             record_terminal_result=True,
+            failed_item_retry=None,
         ):
             del (
+                failed_item_retry,
                 authoritative_snapshot,
                 reprocess_doc_ids,
                 execution_mode,
@@ -3030,6 +3034,7 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
             input_snapshot_id: str | None = None,
             source_config_revision: str | None = None,
             predecessor_activity_id: str | None = None,
+            retry_failed_items: bool = False,
         ):
             self.enqueued.append(
                 {
@@ -3039,6 +3044,7 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
                     "input_snapshot_id": input_snapshot_id,
                     "source_config_revision": source_config_revision,
                     "predecessor_activity_id": predecessor_activity_id,
+                    "retry_failed_items": retry_failed_items,
                 }
             )
 
@@ -3104,6 +3110,7 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
                 await db.get_source(source_id)
             ),
             "predecessor_activity_id": "test-job",
+            "retry_failed_items": False,
         }
     ]
 

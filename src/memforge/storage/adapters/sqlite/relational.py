@@ -38,6 +38,7 @@ from memforge.memory.lifecycle_plan import (
 from memforge.memory.cross_document_relation import CrossDocumentRelationOutcome, CurrentCrossDocumentRelation
 from memforge.memory.relation_discovery_contract import RelationDiscoveryWork, RelationDiscoveryWorkSelection
 from memforge.memory.review_decision import ReviewVectorTask
+from memforge.source_item_failures import SourceItemFailure
 from memforge.models import (
     DocumentRecord,
     Entity,
@@ -769,11 +770,38 @@ class SqliteRelationalStore:
     ) -> dict[str, tuple[str, ...]]:
         return dict(await self._db.get_source_unit_support_unit_ids(source_unit_id))
 
+    def is_transient_error(self, error: BaseException) -> bool:
+        return self._db.is_transient_error(error)
+
     async def stage_derivation_work(self, *, derivation_id: str, work: DerivationWork) -> DerivationWork:
         return await self._db.stage_derivation_work(derivation_id=derivation_id, work=work)
 
     async def record_derivation_work(self, *, derivation_id: str, work: DerivationWork) -> DerivationWork:
         return await self._db.record_derivation_work(derivation_id=derivation_id, work=work)
+
+    async def upsert_source_item_failure(
+        self,
+        failure: SourceItemFailure,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
+        await self._db.upsert_source_item_failure(failure, source_activity=source_activity)
+
+    async def list_source_item_failures(
+        self,
+        *,
+        source_id: str | None = None,
+    ) -> tuple[SourceItemFailure, ...]:
+        return await self._db.list_source_item_failures(source_id=source_id)
+
+    async def delete_source_item_failures(
+        self,
+        source_id: str,
+        document_ids: Collection[str],
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
+        await self._db.delete_source_item_failures(source_id, document_ids, source_activity=source_activity)
 
     async def apply_source_projection_lifecycle(
         self,
@@ -1013,6 +1041,9 @@ class SqliteRelationalStore:
     async def has_ready_relation_discovery_work(self, *, max_attempts: int) -> bool:
         return await self._db.has_ready_relation_discovery_work(max_attempts=max_attempts)
 
+    async def exhaust_expired_relation_discovery_work(self, *, max_attempts: int, release: str) -> int:
+        return await self._db.exhaust_expired_relation_discovery_work(max_attempts=max_attempts, release=release)
+
     async def complete_relation_discovery_work(
         self,
         work_id: str,
@@ -1040,6 +1071,7 @@ class SqliteRelationalStore:
         error_code: str,
         next_attempt_at: str | None,
         exhausted: bool,
+        release: str,
     ) -> None:
         await self._db.fail_relation_discovery_work(
             work_id,
@@ -1049,10 +1081,20 @@ class SqliteRelationalStore:
             error_code=error_code,
             next_attempt_at=next_attempt_at,
             exhausted=exhausted,
+            release=release,
         )
 
     async def count_relation_discovery_work(self, selection: RelationDiscoveryWorkSelection) -> int:
         return await self._db.count_relation_discovery_work(selection)
+
+    async def rerun_relation_discovery_work(
+        self,
+        selection: RelationDiscoveryWorkSelection,
+        *,
+        actor: str,
+        reason: str | None = None,
+    ) -> int:
+        return await self._db.rerun_relation_discovery_work(selection, actor=actor, reason=reason)
 
     async def obsolete_relation_discovery_work(
         self,

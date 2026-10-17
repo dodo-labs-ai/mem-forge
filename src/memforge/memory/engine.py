@@ -28,10 +28,10 @@ from memforge.evals.agent_evaluation import (
     assessment_sink_for_runtime_sink,
     bind_source_lifecycle_outcome,
     source_lifecycle_execution_identity,
-    current_deployment_revision,
     publish_agent_assessments,
     publish_runtime_events,
 )
+from memforge.release import current_deployment_revision
 from memforge.memory.candidate_admission import (
     CANDIDATE_ADMISSION_CONTRACT,
     CandidateAdmissionError,
@@ -125,7 +125,12 @@ __all__ = [
 
 
 class SourceUnitLifecycleExecutionError(RuntimeError):
-    """A failed lifecycle execution carrying its content-free terminal bundle."""
+    """A failed lifecycle execution carrying its content-free terminal bundle.
+
+    ``retryable`` is the classification of the failure it wraps
+    (``failure_retryable``), and ``stage`` the lifecycle stage that failed, when
+    the engine knows it.
+    """
 
     def __init__(
         self,
@@ -134,11 +139,13 @@ class SourceUnitLifecycleExecutionError(RuntimeError):
         *,
         retryable: bool = True,
         commit_attempted: bool = True,
+        stage: str | None = None,
     ) -> None:
         super().__init__(message)
         self.runtime_bundle = runtime_bundle
         self.retryable = retryable
         self.commit_attempted = commit_attempted
+        self.stage = stage
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,7 +215,7 @@ class SourceUnitLifecycleDeferred(SourceUnitLifecycleExecutionError):
         *,
         handle: "DeferredProjectedLifecycleHandle",
     ) -> None:
-        super().__init__(message, runtime_bundle, retryable=False)
+        super().__init__(message, runtime_bundle, retryable=False, stage="lifecycle_commit")
         self.handle = handle
 
 
@@ -513,7 +520,8 @@ class MemoryEngine:
             raise SourceUnitLifecycleExecutionError(
                 str(exc),
                 bundle,
-                retryable=failure_retryable(exc),
+                retryable=failure_retryable(exc, store=self.db),
+                stage=runtime_context.stage,
             ) from exc
 
     async def _materialize_prepared_projected_plan(
@@ -742,7 +750,8 @@ class MemoryEngine:
             raise SourceUnitLifecycleExecutionError(
                 str(exc),
                 failure_bundle,
-                retryable=failure_retryable(exc),
+                retryable=failure_retryable(exc, store=self.db),
+                stage="lifecycle_commit",
             ) from exc
 
         if runtime_bundle is not None:
@@ -801,6 +810,7 @@ class MemoryEngine:
                 handle._runtime_bundle,
                 retryable=False,
                 commit_attempted=False,
+                stage="lifecycle_commit",
             )
         prepared.allowed_blocker_source_unit_ids.update(
             handle.blocking_source_unit_ids
@@ -1323,6 +1333,7 @@ class MemoryEngine:
                     message, failure_bundle,
                     retryable=result.failure.retryable,
                     commit_attempted=False,
+                    stage=_runtime_context.stage,
                 )
             operations = tuple(result.operations) + tuple(
                 ReconcileOperation(

@@ -15,7 +15,13 @@ class SourceActivityKind(str, Enum):
 
 
 class SourceActivityConflict(ValueError):
-    """Raised when a Source-scoped mutation cannot acquire admission."""
+    """Raised when a Source-scoped mutation cannot acquire admission.
+
+    Work that loses its admission may succeed once it holds the Source again,
+    so the failure is retryable.
+    """
+
+    retryable = True
 
 
 class SourceSyncRunActive(SourceActivityConflict):

@@ -2226,6 +2226,17 @@
           "database": {
             "$ref": "#/components/schemas/ComponentHealth"
           },
+          "failed_items": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ComponentHealth"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Failed Documents across Sources, as the failure ledger records them. The payload counts failed_items and retrying_after_upgrade, the rows an earlier release recorded that this release is retrying."
+          },
           "genes": {
             "additionalProperties": {
               "$ref": "#/components/schemas/ComponentHealth"
@@ -8102,6 +8113,115 @@
         "title": "SourceFacetFilterRequest",
         "type": "object"
       },
+      "SourceFailedItemResponse": {
+        "description": "One failed Document of a Source, as the failure ledger records it.",
+        "properties": {
+          "document_id": {
+            "title": "Document Id",
+            "type": "string"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "failures_in_release": {
+            "title": "Failures In Release",
+            "type": "integer"
+          },
+          "first_failed_at": {
+            "title": "First Failed At",
+            "type": "string"
+          },
+          "last_failed_at": {
+            "title": "Last Failed At",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "release": {
+            "description": "The release whose code failed.",
+            "title": "Release",
+            "type": "string"
+          },
+          "retryable": {
+            "description": "Whether a scheduled sync of the same release retries the Document.",
+            "title": "Retryable",
+            "type": "boolean"
+          },
+          "retrying_after_upgrade": {
+            "description": "An earlier release recorded the failure, and this release retries the Document once.",
+            "title": "Retrying After Upgrade",
+            "type": "boolean"
+          },
+          "stage": {
+            "description": "The step that failed, such as fetch, normalize, projection or derivation.",
+            "title": "Stage",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "document_id",
+          "title",
+          "stage",
+          "error_code",
+          "message",
+          "retryable",
+          "release",
+          "failures_in_release",
+          "first_failed_at",
+          "last_failed_at",
+          "retrying_after_upgrade"
+        ],
+        "title": "SourceFailedItemResponse",
+        "type": "object"
+      },
+      "SourceFailedItemsResponse": {
+        "description": "The Source's failed Documents: retried by the failure ledger, not by holding back the sync cursor.\n\n``items`` lists the most recently failed first and is bounded; ``count`` is\nthe total. A sync of the Source retries every one of them.",
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SourceFailedItemResponse"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "retrying_after_upgrade": {
+            "title": "Retrying After Upgrade",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "count",
+          "retrying_after_upgrade",
+          "items"
+        ],
+        "title": "SourceFailedItemsResponse",
+        "type": "object"
+      },
       "SourceListPreferenceRequest": {
         "properties": {
           "sort_mode": {
@@ -8374,6 +8494,17 @@
           "execution": {
             "$ref": "#/components/schemas/SourceExecutionResponse"
           },
+          "failed_items": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceFailedItemsResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The Source's failed Documents; null for a Source that does not sync."
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -8470,6 +8601,7 @@
           "doc_count",
           "memory_count",
           "sync",
+          "failed_items",
           "client",
           "ownership",
           "capabilities",

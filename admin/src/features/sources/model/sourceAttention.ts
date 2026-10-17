@@ -1,5 +1,7 @@
+import { pluralize } from "@/lib/format";
 import { isManagedSourceType } from "./managedSources";
 import { sourceProjectBinding } from "./projectBinding";
+import { failedItemsTitle, sourceFailedItems } from "./sourceFailedItems";
 import type { SourceReadiness } from "./sourceReadiness";
 import { presentSourceSyncActivity, type SourceSyncActivity } from "./sourceSyncActivity";
 import type { Source } from "./types";
@@ -118,7 +120,18 @@ export function sourceAttention({ source, readiness, activity, now = new Date() 
     };
   }
 
-  if (activity?.state === "partial") {
+  // A queued or running sync retries every failed item, so they wait for its result.
+  const failedItems = isActive(activity) ? null : sourceFailedItems(source, activity);
+  if (failedItems) {
+    return {
+      reason: "partially_synced",
+      title: failedItemsTitle(failedItems.count),
+      detail: `${pluralize(failedItems.count, "item")} could not be synced. Syncing this source retries every failed item.`,
+      action: "view_details",
+      actionLabel: "View details",
+    };
+  }
+  if (activity?.state === "partial" && source.failed_items == null) {
     return {
       reason: "partially_synced",
       title: "Some items failed",

@@ -788,6 +788,26 @@ async def test_journal_reuses_completed_requests_and_records_failures():
     assert {work.status for work in store.works.values()} == {"completed"}
 
 
+async def test_journal_resends_every_request_under_another_release(monkeypatch):
+    store = MemoryWorkStore()
+    monkeypatch.setenv("MEMFORGE_DEPLOYMENT_REVISION", "release-a")
+    first = FixtureBudgetClient(respond=answer, input_tokens=3)
+    await LlmBatchRunner(first, model=FIXTURE_MODEL).run_items(item_task(first, ids(4), journal=fixture_journal(store)))
+
+    same = FixtureBudgetClient(respond=answer, input_tokens=3)
+    reused = LlmBatchRunner(same, model=FIXTURE_MODEL)
+    await reused.run_items(item_task(same, ids(4), journal=fixture_journal(store)))
+    assert (reused.stats.reused, same.prompts) == (len(first.prompts), [])
+
+    monkeypatch.setenv("MEMFORGE_DEPLOYMENT_REVISION", "release-b")
+    later = FixtureBudgetClient(respond=answer, input_tokens=3)
+    runner = LlmBatchRunner(later, model=FIXTURE_MODEL)
+    await runner.run_items(item_task(later, ids(4), journal=fixture_journal(store)))
+
+    assert runner.stats.reused == 0
+    assert later.prompts == first.prompts
+
+
 async def test_a_journaled_response_that_no_longer_decodes_is_a_typed_failure():
     class CompletedStore:
         async def stage_derivation_work(self, *, derivation_id, work):

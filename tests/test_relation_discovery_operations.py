@@ -31,6 +31,7 @@ from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryWorkState,
 )
 from memforge.models import DocumentRecord, Memory, MemoryReview, ReviewStatus, content_hash
+from memforge.release import current_release
 from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 from memforge.storage.database import Database
 from tests.relation_evidence_fixture import primary_evidence_unit_fixture, primary_observation_revision_fixture
@@ -116,7 +117,10 @@ async def _work(
     classifier_version: str | None = None,
     updated_at: str = UPDATED,
     next_attempt_at: str | None = None,
+    release: str | None = None,
 ) -> str:
+    """Seed work in one state; failed work records this release unless another is named."""
+
     work_id = f"work-{memory.id}"
     await db._enqueue_relation_discovery_work_unlocked(  # noqa: SLF001
         "plan-1",
@@ -135,7 +139,7 @@ async def _work(
     await db.db.execute(
         """UPDATE relation_discovery_work
               SET status = ?, attempts = ?, error = ?, error_code = ?,
-                  classifier_version = ?, updated_at = ?, next_attempt_at = ?
+                  classifier_version = ?, updated_at = ?, next_attempt_at = ?, release = ?
             WHERE id = ?""",
         (
             status,
@@ -145,6 +149,7 @@ async def _work(
             classifier_version,
             updated_at,
             next_attempt_at,
+            release or (current_release() if status == "failed" else None),
             work_id,
         ),
     )
@@ -384,6 +389,66 @@ async def test_rerun_of_completed_work_keeps_its_classifier_version_until_it_com
         (work["completed_old"],),
     )
     assert dict(row) == {"status": "pending", "completed_at": None, "classifier_version": "memory-relation-v4-sparse"}
+
+
+@pytest.mark.asyncio
+async def test_start_reruns_once_the_exhausted_work_an_earlier_release_failed(db: Database, tmp_path) -> None:
+    earlier = await _work(
+        db, await _memory(db, "mem-r1"), status="failed", attempts=MAX_ATTEMPTS, error_code="output_invalid",
+        release="0.0.1",
+    )
+    unrecorded = await _work(
+        db, await _memory(db, "mem-r2"), status="failed", attempts=1, error_code="request_error",
+    )
+    await db.db.execute("UPDATE relation_discovery_work SET release = NULL WHERE id = ?", (unrecorded,))
+    await db.db.commit()
+    current = await _work(
+        db, await _memory(db, "mem-r3"), status="failed", attempts=MAX_ATTEMPTS, error_code="TimeoutError"
+    )
+    retrying = await _work(
+        db, await _memory(db, "mem-r4"), status="failed", attempts=1, error_code="TimeoutError",
+        next_attempt_at=RETRY_SCHEDULED_AT, release="0.0.1",
+    )
+
+    with _client(db, tmp_path):
+        pass
+    with _client(db, tmp_path):
+        pass
+
+    rows = {
+        row["id"]: dict(row)
+        for row in await db.db.execute_fetchall(
+            "SELECT id, status, attempts, run_generation, release FROM relation_discovery_work"
+        )
+    }
+    for work_id in (earlier, unrecorded):
+        assert rows[work_id] == {
+            "id": work_id, "status": "pending", "attempts": 0, "run_generation": 1, "release": None,
+        }
+    assert (rows[current]["status"], rows[current]["run_generation"]) == ("failed", 0)
+    assert (rows[retrying]["status"], rows[retrying]["attempts"]) == ("failed", 1)
+    events = await db.db.execute_fetchall(
+        "SELECT actor_id, memory_id, reason FROM memory_audit_events WHERE event_type = ? ORDER BY memory_id",
+        (RELATION_DISCOVERY_RERUN_EVENT,),
+    )
+    assert [(event["actor_id"], event["memory_id"]) for event in events] == [
+        (f"release:{current_release()}", "mem-r1"),
+        (f"release:{current_release()}", "mem-r2"),
+    ]
+    assert all(current_release() in event["reason"] for event in events)
+
+
+@pytest.mark.asyncio
+async def test_migration_117_records_the_release_of_relation_work_failures(db: Database) -> None:
+    await db.db.execute("ALTER TABLE relation_discovery_work DROP COLUMN release")
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 117")
+    await db.db.commit()
+
+    await db._run_migrations()  # noqa: SLF001
+    await db._run_migrations()  # noqa: SLF001
+
+    columns = {row[1] for row in await db.db.execute_fetchall("PRAGMA table_info(relation_discovery_work)")}
+    assert "release" in columns
 
 
 # ---------------------------------------------------------------------------

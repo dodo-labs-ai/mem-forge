@@ -19,7 +19,6 @@ from memforge.evals.agent_evaluation import (
     bind_source_lifecycle_outcome,
     bind_quality_signals,
     build_workspace_online_evaluation_view,
-    current_deployment_revision,
     evaluate_runtime_events,
     event_public_payload,
     runtime_event_otel_attributes,
@@ -30,6 +29,7 @@ from memforge.evals.agent_evaluation import (
     summarize_agent_assessments,
     summarize_agent_runtime_events,
 )
+from memforge.release import current_deployment_revision
 from memforge.storage.database import Database, MIGRATIONS
 
 

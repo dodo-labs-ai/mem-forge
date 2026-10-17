@@ -13,6 +13,9 @@ from memforge.memory.lifecycle_plan import (
     LifecycleGateState,
 )
 from memforge.server.admin_api import ONLINE_EVALUATION_ROW_LIMIT, create_admin_app
+from memforge.source_item_failures import SourceItemFailure
+
+FAILED_AT = datetime(2026, 6, 13, 0, 0, 5, tzinfo=timezone.utc)
 
 
 def _config(tmp_path) -> AppConfig:
@@ -73,6 +76,18 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
         async def count_documents(self, source: str | None = None) -> int:
             assert source == "src-neutral"
             return 3
+
+        async def list_source_item_failures(self, *, source_id: str | None = None) -> tuple:
+            if source_id is None:
+                return ()
+            assert source_id == "src-neutral"
+            return (
+                SourceItemFailure(
+                    source_id=source_id, document_id="doc-1", stage="lifecycle_commit",
+                    error_class="builtins.KeyError", message="boom", retryable=False, release="0.0.1",
+                    failures_in_release=1, first_failed_at=FAILED_AT, last_failed_at=FAILED_AT, title="Design",
+                ),
+            )
 
         async def get_sync_history(self, source: str | None = None, limit: int = 20) -> list[dict]:
             assert source == "src-neutral"
@@ -171,6 +186,26 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
         "next_run_at": "2026-06-13T01:00:00+00:00",
         "updated_at": "2026-06-13T00:00:00+00:00",
     }
+    # An earlier release recorded the failure, so this release is retrying it.
+    assert source["failed_items"] == {
+        "count": 1,
+        "retrying_after_upgrade": 1,
+        "items": [
+            {
+                "document_id": "doc-1",
+                "title": "Design",
+                "stage": "lifecycle_commit",
+                "error_code": None,
+                "message": "boom",
+                "retryable": False,
+                "release": "0.0.1",
+                "failures_in_release": 1,
+                "first_failed_at": FAILED_AT.isoformat(),
+                "last_failed_at": FAILED_AT.isoformat(),
+                "retrying_after_upgrade": True,
+            }
+        ],
+    }
 
 
 def test_source_list_projects_a_retried_sync_as_a_fresh_attempt(tmp_path):
@@ -195,6 +230,9 @@ def test_source_list_projects_a_retried_sync_as_a_fresh_attempt(tmp_path):
     class RetrySourceReader:
         async def claim_due_scheduled_sources(self, **_: object) -> list[dict]:
             return []
+
+        async def list_source_item_failures(self, *, source_id: str | None = None) -> tuple:
+            return ()
 
         async def list_sources(self) -> list[dict]:
             return [
@@ -276,6 +314,9 @@ def test_source_projects_route_uses_storage_neutral_admin_reader(tmp_path):
             exclude_source_ids: set[str] | None = None,
         ) -> list[dict]:
             return []
+
+        async def list_source_item_failures(self, *, source_id: str | None = None) -> tuple:
+            return ()
 
         async def get_source(self, source_id: str) -> dict | None:
             assert source_id == "src-neutral"
@@ -792,6 +833,9 @@ def test_source_schedule_routes_use_storage_neutral_store(tmp_path):
             exclude_source_ids: set[str] | None = None,
         ) -> list[dict]:
             return []
+
+        async def list_source_item_failures(self, *, source_id: str | None = None) -> tuple:
+            return ()
 
         async def get_source(self, source_id: str) -> dict | None:
             assert source_id == "src-neutral"

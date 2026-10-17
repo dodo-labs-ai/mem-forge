@@ -2,6 +2,83 @@
 
 ## Unreleased
 
+- A Document that fails no longer holds its Source back, and a release that
+  fixes the failure retries it without any action from you.
+  - Every Document that fails in a sync, at any step from fetching it to
+    committing its Memories, is recorded in a failure ledger with the step, the
+    reason, whether the failure may pass on its own, and the release that met
+    it. The sync advances its cursor and ends `partial`; a failure of the sync
+    itself, such as an authentication error, still keeps the cursor. A Document
+    leaves the ledger as soon as it commits, or when it leaves the Source.
+  - A failure may pass on its own only when its cause proves it transient: a
+    model or provider call that timed out, was rate limited (429), met a server
+    error (5xx) or a dropped connection, including a Gene's own HTTP errors; a
+    storage error the store classifies as transient; or the loss of the Source
+    activity fence. A scheduled sync retries such a failure until it has failed
+    at the same step with the same error class in three consecutive runs. It
+    leaves any other failure of the same release alone while the provider
+    returns the Document unchanged, and processes it again once the provider
+    changes it.
+  - Clicking **Sync** retries every failed Document of the Source, also for a
+    Source collected by the local agent and when the click joins a sync that is
+    already pending or running. A retried Document is read again from its
+    provider when the Source can ask for one Document by id; otherwise the
+    revision that failed is fetched again.
+  - At startup a new release retries once each failure an earlier release
+    recorded: it queues a reprocess of those Documents for each Source, or a
+    sync for a Source that never completed one. A release is the installed
+    `memforge-ai` version, joined with `MEMFORGE_DEPLOYMENT_REVISION` (or the
+    Cloud Foundry application version) when one is set. A derivation another
+    release staged is superseded with `DERIVATION_RELEASE_SUPERSEDED` and
+    derived again, and batch outputs and model work journals are keyed by the
+    release.
+  - Relation discovery work records the release of its last failure, and at
+    startup each release re-runs once, through the audited operator re-run, the
+    exhausted work an earlier release failed. Work whose lease expires on its
+    last attempt ends exhausted with `lease_expired` instead of staying
+    `running`.
+  - `GET /api/v1/sources` lists each Source's failed Documents under
+    `failed_items`, and `GET /api/v1/health` counts them under `failed_items`.
+    The admin UI V2 Sources page shows "Some items failed (N)" with each item's
+    step and reason, and "Retrying N items after upgrade" while a new release
+    retries them. The admin UI V1 last sync details count the items that still
+    fail, and its "Refresh source" action is named "Rebuild memories".
+  - Cloud: the HANA stores implement the failure ledger
+    (`upsert_source_item_failure` and `delete_source_item_failures`, both fenced
+    by an optional `source_activity`, and `list_source_item_failures`) over a
+    `source_item_failures` table keyed by Source and Document and deleted with
+    its Source; a nullable `release` column on Source derivations, read into
+    `SourceDerivationAttempt.release`; `is_transient_error(error)`, true for the
+    `hdbcli` errors of a lock wait timeout, a deadlock rollback and a lost
+    connection, with samples in `ContractAdapters.transient_errors`; and
+    `retry_failed_items` and `rerun_retry_failed_items` columns (`INTEGER NOT
+    NULL DEFAULT 0`) on `source_sync_runs`, set by a `manual` or `force` enqueue
+    or `retry_failed_items=True`, set on a pending run a request coalesces into,
+    set as `rerun_retry_failed_items` with `rerun_requested` on a running run
+    without it, copied into the rerun successor and into a failed run that
+    returns to pending, and read into `SourceSyncRun`. The HANA relational store
+    adds a nullable `release` column to `relation_discovery_work`, written by
+    `fail_relation_discovery_work(..., release=...)`, cleared on completion and
+    re-run, and filtered by `RelationDiscoveryWorkSelection.release_other_than`
+    as `release IS NULL OR release <> ?`; it implements
+    `exhaust_expired_relation_discovery_work`, counts such work as ready in
+    `has_ready_relation_discovery_work`, and takes `reason` in
+    `rerun_relation_discovery_work`. Core-integration `WorkspaceDatabase` and
+    `WORKSPACE_SYNC_RUNTIME_METHODS` add `upsert_source_item_failure`,
+    `list_source_item_failures`, `delete_source_item_failures`,
+    `is_transient_error`, `exhaust_expired_relation_discovery_work` and
+    `rerun_relation_discovery_work`. Cloud's runtime provider's
+    `run_source_sync` accepts `failed_item_retry`, its sync service's
+    `enqueue_source` accepts `retry_failed_items`, its local-agent job enqueuer
+    keeps a job payload's `retry_failed_items` when a scheduled job coalesces
+    into it and does not coalesce a job that sets it into a leased job without
+    it, its source admin reader implements `list_source_item_failures`, and its
+    health report fills `failed_items`. Each workspace has its own store, so the
+    Cloud worker's workspace loop calls `SyncService.enqueue_release_recovery()`
+    and `rerun_relation_discovery_failed_by_another_release(store)` once per
+    workspace for each release it runs (for example by tracking the last release
+    per workspace id); the per-workspace admin app also calls both when its
+    lifespan starts.
 - Upgrading an installation keeps its data recoverable. When a release has
   schema migrations the database has not applied yet, it first saves a
   recovery point, a copy of the database made with the SQLite backup API and

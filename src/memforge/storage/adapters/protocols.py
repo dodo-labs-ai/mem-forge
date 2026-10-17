@@ -49,6 +49,7 @@ from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryWorkSelection,
 )
 from memforge.memory.review_decision import ReviewVectorTask
+from memforge.source_item_failures import SourceItemFailure
 from memforge.source_projection import (
     ProjectionCoverage,
     ProjectionScopeTransition,
@@ -552,9 +553,55 @@ class RelationalStore(Protocol):
         self,
         source_unit_id: str,
     ) -> Mapping[str, tuple[str, ...]]: ...
+
+    def is_transient_error(self, error: BaseException) -> bool:
+        """Whether one of this adapter's own driver errors may succeed when the work runs again.
+
+        The adapter owns this classification for the driver it binds: a lock or
+        busy timeout, a deadlock rollback or a lost connection is transient. An
+        error of any other type, or a driver error that repeats for the same
+        statement, is not.
+        """
+        ...
+
     async def stage_derivation_work(self, *, derivation_id: str, work: DerivationWork) -> DerivationWork: ...
 
     async def record_derivation_work(self, *, derivation_id: str, work: DerivationWork) -> DerivationWork: ...
+
+    async def upsert_source_item_failure(
+        self,
+        failure: SourceItemFailure,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
+        """Insert the failure ledger row, or replace the Document's row in its Source.
+
+        With ``source_activity``, the write commits only while that Source
+        activity lease is current, and raises ``SourceActivityConflict``
+        otherwise.
+        """
+        ...
+
+    async def list_source_item_failures(
+        self,
+        *,
+        source_id: str | None = None,
+    ) -> tuple[SourceItemFailure, ...]:
+        """The ledger rows of one Source, or of every Source, ordered by Source and Document."""
+        ...
+
+    async def delete_source_item_failures(
+        self,
+        source_id: str,
+        document_ids: Collection[str],
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
+        """Delete the ledger rows of these Documents of the Source; a Document without a row is ignored.
+
+        ``source_activity`` fences the delete as it fences an upsert.
+        """
+        ...
 
     async def apply_source_projection_lifecycle(
         self,
@@ -664,6 +711,9 @@ class RelationalStore(Protocol):
         next_attempt_at: str | None = None,
     ) -> None: ...
     async def has_ready_relation_discovery_work(self, *, max_attempts: int) -> bool: ...
+    async def exhaust_expired_relation_discovery_work(self, *, max_attempts: int, release: str) -> int:
+        """Record work whose lease expired on its last attempt as exhausted by ``release``; returns how many."""
+        ...
     async def lease_relation_discovery_work(
         self,
         *,
@@ -692,13 +742,23 @@ class RelationalStore(Protocol):
         error_code: str,
         next_attempt_at: str | None,
         exhausted: bool,
+        release: str,
     ) -> None:
-        """Record a failure; exhausted work is not retried, other work is retried at ``next_attempt_at``."""
+        """Record a failure of ``release``; exhausted work is not retried, other work is retried at ``next_attempt_at``."""
         ...
     async def count_relation_discovery_work(
         self,
         selection: RelationDiscoveryWorkSelection,
     ) -> int: ...
+    async def rerun_relation_discovery_work(
+        self,
+        selection: RelationDiscoveryWorkSelection,
+        *,
+        actor: str,
+        reason: str | None = None,
+    ) -> int:
+        """Queue the selected completed or exhausted work again, auditing each item's last state; returns how many."""
+        ...
     async def obsolete_relation_discovery_work(
         self,
         work_id: str,

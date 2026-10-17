@@ -19,6 +19,7 @@ from memforge.llm.batch_runner import ItemFailure
 from memforge.llm.structured import (
     StructuredLlmError,
     StructuredLlmMetricsCollector,
+    TransientErrorClassifier,
     failure_retryable,
     structured_llm_line_scope,
 )
@@ -172,7 +173,7 @@ async def assess_relations(
             )
         except Exception as error:  # noqa: BLE001 - classified by _failure
             return RelationLine(
-                failure=_failure(error, "assess_claim_revisions"),
+                failure=_failure(error, "assess_claim_revisions", store=work_store),
                 metrics=_add_calls(ReconciliationMetrics(relation_pair_count=pair_count), line, started),
             )
     entries = []
@@ -351,8 +352,13 @@ async def reconcile_memories(
     )
 
 
-def _failure(error: Exception, operation: str) -> ReconciliationFailure:
-    """Fail closed: the revision is not committed and no Candidate falls back to ADD."""
+def _failure(
+    error: Exception, operation: str, *, store: TransientErrorClassifier | None = None,
+) -> ReconciliationFailure:
+    """Fail closed: the revision is not committed and no Candidate falls back to ADD.
+
+    ``store`` classifies the storage errors of the work this operation persisted.
+    """
     if isinstance(error, ReconciliationContractError):
         logger.warning("Relation-first reconciliation failed closed: %s", error)
         error_type, reason_code = "relation_first_error", error.reason_code
@@ -371,7 +377,7 @@ def _failure(error: Exception, operation: str) -> ReconciliationFailure:
         error_code=getattr(error, "error_code", None),
         validation_fields=getattr(error, "validation_fields", ()),
         diagnostic=getattr(error, "diagnostic", None),
-        retryable=failure_retryable(error),
+        retryable=failure_retryable(error, store=store),
     )
 
 
