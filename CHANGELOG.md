@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Upgrading an installation keeps its data recoverable. When a release has
+  schema migrations the database has not applied yet, it first saves a
+  recovery point, a copy of the database made with the SQLite backup API and
+  a copy of the Chroma vector index, under `backups/` in the data directory
+  (`/data/backups` in the `memforge-data` volume). It keeps the newest
+  recovery point of each of the three most recent schema versions it upgraded
+  from, and the newest three taken before a restore. Each migration then
+  applies in one transaction together with the record that it was applied,
+  so a migration that fails, or a process stopped part-way, leaves the
+  database at the previous migration, and the next start applies it again
+  and keeps the recovery point taken before the upgrade began; the error
+  names the migration and that recovery point. A release refuses to start on
+  a database a newer release has upgraded, changes nothing, and names the
+  recovery point to restore. The new `memforge backup list` and
+  `memforge backup restore ID` commands list and restore recovery points; a
+  restore keeps the data it replaces as another recovery point, and MemForge
+  refuses to start after a restore that stopped part-way until it is run
+  again. Upgrading and restoring are refused while another MemForge process
+  has the data open. Recovery points do not include source documents, which
+  no migration changes. The quickstart's new Upgrading section gives the
+  Docker commands; an installation started with 0.2.0b1 gets its first
+  recovery point when the first release that changes the schema starts.
+  Cloud: no change needed; Cloud keeps its data in HANA with its own schema
+  handling, and its SQLite store opens databases without recovery points,
+  with each migration in its own transaction.
+
 - A Source Unit revision whose re-read Support chooses as its Primary an
   unchanged Observation that a partial sync did not return now commits, with
   its Evidence read from that Observation as the Unit last stored it. It

@@ -217,6 +217,7 @@ from memforge.source_projection import (
 from memforge.source_projection_config import projection_scope_transition_id, source_access_context
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.storage.document_store import LocalDocumentStore
+from memforge.storage.recovery_points import RecoveryPoints, UpgradeError
 from memforge.storage.source_cleanup import SourceArtifactCleanupService
 from memforge.server.review_admin_service import (
     QueuedMemoryReview, QueuedLifecycleReview, ReviewQueue,
@@ -4302,8 +4303,13 @@ def create_admin_app(
             owned_db = Database(
                 config.storage.db_path,
                 document_store=document_store or LocalDocumentStore(config.storage.docs_path),
+                recovery_points=RecoveryPoints.for_config(config),
             )
-            await owned_db.connect()
+            try:
+                await owned_db.connect()
+            except UpgradeError as exc:
+                logger.error("MemForge did not start: %s", exc)
+                raise
             try:
                 # A database made before model bindings holds its model
                 # settings in one row; this configuration completes them.
