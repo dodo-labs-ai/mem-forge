@@ -42,6 +42,7 @@ export function makeSource(overrides: Partial<Source> = {}): Source {
       error_message: null,
       progress: null,
     },
+    failed_items: null,
     connection_status: { state: "ready", reason: null },
     created_at: "2026-09-01T00:00:00Z",
     project_binding: { mode: "fixed", project_key: "PAY" },
@@ -50,6 +51,26 @@ export function makeSource(overrides: Partial<Source> = {}): Source {
     enabled_for_me: true,
     pinned_for_me: false,
     sync_schedule: null,
+    ...overrides,
+  };
+}
+
+type FailedItem = NonNullable<Source["failed_items"]>["items"][number];
+
+/** A failed item as the server's failure record lists it; override what a test needs. */
+export function makeFailedItem(overrides: Partial<FailedItem> = {}): FailedItem {
+  return {
+    document_id: "doc-1",
+    title: "Payroll FAQ",
+    stage: "fetch",
+    error_code: null,
+    message: "403 Forbidden",
+    retryable: false,
+    release: "1.4.0",
+    failures_in_release: 1,
+    first_failed_at: "2026-09-29T10:59:00Z",
+    last_failed_at: "2026-09-29T10:59:00Z",
+    retrying_after_upgrade: false,
     ...overrides,
   };
 }

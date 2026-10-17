@@ -7,6 +7,8 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Literal, Protocol, cast, runtime_checkable
 
+from memforge.source_item_failures import SourceItemFailure
+
 
 SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES = 1440
 SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES = 5
@@ -89,6 +91,14 @@ class SourceAdminReader(Protocol):
     async def get_sync_history(
         self, source: str | None = None, limit: int = 20
     ) -> list[dict[str, Any]]: ...
+
+    async def list_source_item_failures(
+        self,
+        *,
+        source_id: str | None = None,
+    ) -> tuple[SourceItemFailure, ...]:
+        """The failure ledger rows of one Source, or of every Source."""
+        ...
 
     async def get_latest_source_sync_run(
         self,

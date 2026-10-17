@@ -38,12 +38,12 @@ assert.equal(
 );
 
 const forceResync = sourceActionLayout.menu.find((action) => action.id === "force-resync");
-assert.equal(forceResync?.label, "Refresh source");
+assert.equal(forceResync?.label, "Rebuild memories");
 assert.equal(forceResync?.tone, "neutral");
 assert.equal("disabled" in (forceResync ?? {}), false);
 assert.equal(
   forceResync?.description,
-  "Look for new, changed, or removed documents. Existing memories are not rebuilt unless source content changed.",
+  "Read every document again and rebuild its memories with the current version, even when its content did not change.",
 );
 assert.equal(getSourceActionEndpoint("src-1", "force-resync"), "/sources/src-1/force-resync");
 

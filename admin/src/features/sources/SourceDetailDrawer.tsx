@@ -1,8 +1,9 @@
-import { Info } from "lucide-react";
+import { Info, RefreshCw } from "lucide-react";
 import { useSharedWorkspace } from "@/api";
 import { formatCount, formatDateTime, formatInterval, formatRelative, formatUntil } from "@/lib/format";
 import { ActionCard, DetailDrawer, DrawerSection, Notice, PropertyList, StatusBadge } from "@/patterns";
 import { Button } from "@/ui/button";
+import { failedItemsTitle, retryingAfterUpgradeTitle } from "./model/sourceFailedItems";
 import { presentSourceSyncActivity } from "./model/sourceSyncActivity";
 import type { SourceRow } from "./model/sourceRows";
 import { sourceRunsOn } from "./sourceRunsOn";
@@ -23,7 +24,7 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpe
   const { source, activity, attention } = row;
   const presentation = activity ? presentSourceSyncActivity(activity, source.name, "items") : null;
   const schedule = source.sync_schedule;
-  const failedItems = activity?.error?.items ?? [];
+  const { failedItems } = row;
   const sync = actions.syncControl(source, activity);
 
   return (
@@ -115,16 +116,38 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpe
         />
       </DrawerSection>
 
-      {failedItems.length > 0 ? (
-        <DrawerSection title="Items that failed">
+      {failedItems ? (
+        <DrawerSection title={failedItemsTitle(failedItems.count)}>
+          {failedItems.retryingAfterUpgrade > 0 ? (
+            <Notice tone="live" icon={RefreshCw} title={retryingAfterUpgradeTitle(failedItems.retryingAfterUpgrade)}>
+              MemForge was upgraded. The sync on its way retries each item that failed before the upgrade once with the
+              new version.
+            </Notice>
+          ) : null}
+          <p className="text-sm text-muted-foreground">
+            Syncing this source retries every failed item. If a reason points to access or sign-in, fix that first,
+            then sync.
+          </p>
           <ul className="divide-y rounded-lg border">
-            {failedItems.map((item) => (
-              <li key={item.doc_id} className="space-y-0.5 p-3">
-                <p className="truncate font-medium text-foreground">{item.title || item.doc_id}</p>
-                <p className="text-xs text-muted-foreground">{item.error}</p>
+            {failedItems.items.map((item) => (
+              <li key={item.documentId} className="space-y-0.5 p-3">
+                <div className="flex items-center gap-2">
+                  <p className="min-w-0 flex-1 truncate font-medium text-foreground">{item.title}</p>
+                  {item.retryingAfterUpgrade ? <StatusBadge tone="live">Retrying</StatusBadge> : null}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {item.stage ? <span className="font-medium text-subtle-foreground">{item.stage}: </span> : null}
+                  {item.reason}
+                </p>
               </li>
             ))}
           </ul>
+          {failedItems.count > failedItems.items.length ? (
+            <p className="text-xs text-muted-foreground">
+              Showing the {formatCount(failedItems.items.length)} most recent of {formatCount(failedItems.count)} failed
+              items.
+            </p>
+          ) : null}
         </DrawerSection>
       ) : null}
     </DetailDrawer>

@@ -651,6 +651,11 @@ class SourceSyncRun:
     rerun_source_config_revision: str | None = None
     predecessor_activity_id: str | None = None
     rerun_predecessor_activity_id: str | None = None
+    # Whether the run retries every Document of its Source's failure ledger: a
+    # person requested it, or a request coalesced into it. A rerun successor
+    # takes ``rerun_retry_failed_items``.
+    retry_failed_items: bool = False
+    rerun_retry_failed_items: bool = False
     # Documents an operator reprocess processes; empty for a sync.
     reprocess_document_ids: tuple[str, ...] = ()
     coalesced: bool = False

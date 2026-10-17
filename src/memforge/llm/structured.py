@@ -13,12 +13,13 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field as dataclass_field
 from threading import Lock
 from time import perf_counter
-from typing import Annotated, Any, Callable, ClassVar, Iterator, Literal, Mapping, get_args, get_origin
+from typing import Annotated, Any, Callable, ClassVar, Iterator, Literal, Mapping, Protocol, get_args, get_origin
 from weakref import WeakKeyDictionary
 
 import litellm
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from memforge.llm.embedding import EmbeddingDeadlineExceeded, EmbeddingProviderError
 from memforge.llm.failure_trace import (
     FailureTraceSink, capture_call, current_capture, local_failure_trace_sink_from_env,
 )
@@ -61,24 +62,56 @@ type NativeSchemaTransport = Literal[
 TRANSIENT_TERMINAL_CATEGORIES: frozenset[str] = frozenset({"provider_error", "deadline_exceeded"})
 
 
-def failure_retryable(error: BaseException) -> bool:
-    """Whether the sync that hit ``error`` retries the work at once; one rule for every stage.
+class TransientErrorClassifier(Protocol):
+    """A store that names which of its own driver errors may succeed when the work runs again.
 
-    A failed model call is retried only when it was transient: a provider error
-    (rate limit and 5xx included) or a timeout. A request error (a 400, an
-    unexpected exception) or an invalid response fails the same way again, so
-    it is not retried within the run and the revision stays uncommitted. The
-    Unit is derived again only when a later run projects it again: the provider
-    changes the Document and an incremental sync picks it up, or an operator
-    reprocesses it. Recovery of a staged derivation ends that derivation on such
-    a failure (ADR 0040), so it is not retried either. Any other failure states
-    it with its ``retryable`` attribute and is retried by default.
+    Each store adapter owns this classification for the driver it binds: a lock
+    or busy timeout, a lost connection or a 5xx from an object store is
+    transient; a constraint violation, a missing table or a malformed statement
+    is not.
+    """
+
+    def is_transient_error(self, error: BaseException) -> bool: ...
+
+
+def failure_retryable(error: BaseException, *, store: TransientErrorClassifier | None = None) -> bool:
+    """Whether a Source Unit derivation or lifecycle failure may succeed when the run is retried.
+
+    A failure is retryable only when its cause proves it transient:
+
+    - a failed model call whose terminal category is transient (a provider
+      error, rate limit and 5xx included, or a deadline overrun), an embedding
+      call that overran its deadline or never reached the provider, or a raw
+      provider error that ``is_retryable_provider_error`` accepts, such as a
+      Gene's httpx timeout, connection failure, 429 or 5xx;
+    - a storage error that ``store`` classifies as transient (a store that
+      names no transient errors classifies none);
+    - an exception that declares itself retryable through its ``retryable``
+      attribute, such as the loss of the Source activity fence.
+
+    Every other failure fails the same way again: a request error, an invalid
+    model response, and any exception that declares nothing. Such a failure is
+    not retried within the run and the revision stays uncommitted; recovery of a
+    staged derivation ends that derivation and continues with the next. The Unit
+    is derived again when a later run projects it again: the provider changes
+    the Document and an incremental sync picks it up, or an operator reprocesses
+    it.
     """
 
     category = getattr(error, "terminal_category", None)
     if category is not None:
         return category in TRANSIENT_TERMINAL_CATEGORIES
-    return bool(getattr(error, "retryable", True))
+    declared = getattr(error, "retryable", None)
+    if declared is not None:
+        return bool(declared)
+    if isinstance(error, EmbeddingDeadlineExceeded):
+        return True
+    if isinstance(error, EmbeddingProviderError) and error.unreachable:
+        return True
+    if is_retryable_provider_error(error):
+        return True
+    classify = getattr(store, "is_transient_error", None)
+    return classify is not None and bool(classify(error))
 
 
 # Request-size failures: a smaller request can succeed where this one cannot,

@@ -188,6 +188,18 @@ export interface SyncStatus {
   progress_updated_at?: string | null;
 }
 
+export interface SourceFailedItems {
+  count: number;
+  /** Failed items an earlier version recorded, which this version retries once. */
+  retrying_after_upgrade: number;
+  items: Array<{
+    document_id: string;
+    title: string | null;
+    stage: string;
+    message: string;
+  }>;
+}
+
 export type SyncProgressPhase =
   | "waiting_for_device"
   | "waiting_for_cloud"
@@ -325,6 +337,8 @@ export interface Source {
   doc_count: number;
   memory_count?: number;
   sync?: SyncStatus | null;
+  /** The source's items that failed and stay failed until a sync commits them; null for a source that does not sync. */
+  failed_items?: SourceFailedItems | null;
   connection_status?: SourceConnectionStatus | null;
   created_at: string;
   /**

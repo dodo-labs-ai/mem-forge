@@ -267,7 +267,8 @@ async def test_stored_input_that_would_move_the_unit_fails_closed(db):
 
     state = await harness.reprocess("PAY-2")
 
-    assert state.last_sync_status == "failed"
+    # The Document's failure is recorded in the failure ledger, so the run is partial.
+    assert (state.last_sync_status, state.docs_processed) == ("partial", 0)
     [failed] = state.failed_docs
     assert failed.error.startswith("stored_input_incomplete")
     assert harness.engine.projected_lifecycle_calls == []

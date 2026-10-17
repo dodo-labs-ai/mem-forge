@@ -927,6 +927,7 @@ def test_local_source_sync_enqueues_canonical_owner_job(tmp_path):
             "source_id": created.json()["id"],
             "source_type": "teams",
             "force_full_sync": True,
+            "retry_failed_items": True,
         }
     finally:
         asyncio.run(database.close())

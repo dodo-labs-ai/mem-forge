@@ -12,6 +12,10 @@ from hashlib import sha256
 RELATION_DISCOVERY_ERROR_MAX_CHARS = 4000
 # Audit event recorded for each work item an operator re-runs, before it is reset.
 RELATION_DISCOVERY_RERUN_EVENT = "relation_discovery_rerun"
+# The error code of work whose lease expired on its last attempt: the worker
+# that held it stopped before it finished, and no attempt is left.
+RELATION_DISCOVERY_LEASE_EXPIRED = "lease_expired"
+RELATION_DISCOVERY_LEASE_EXPIRED_ERROR = "The lease of the last attempt expired before the work finished"
 
 
 class RelationDiscoveryWorkStatus(str, Enum):
@@ -25,9 +29,10 @@ class RelationDiscoveryWorkStatus(str, Enum):
 class RelationDiscoveryWorkState(str, Enum):
     """Operator-facing states.
 
-    Exhausted is failed work that is not retried: it used every attempt, or its
-    failure repeats on every attempt and so has no retry scheduled. Failed is
-    work waiting for its scheduled retry.
+    Exhausted is failed work that is not retried: it used every attempt, its
+    lease expired on its last attempt, or its failure repeats on every attempt
+    and so has no retry scheduled. Failed is work waiting for its scheduled
+    retry.
     """
 
     EXHAUSTED = "exhausted"
@@ -46,10 +51,15 @@ class RelationDiscoveryWorkSelection:
     updated_from: datetime | None = None
     updated_to: datetime | None = None
     classifier_version: str | None = None
+    # Only failed work whose failure another release recorded: a release other
+    # than this one, or none.
+    release_other_than: str | None = None
 
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
             raise ValueError("relation discovery selection requires positive max attempts")
+        if self.release_other_than is not None and self.state is RelationDiscoveryWorkState.COMPLETED:
+            raise ValueError("only failed relation discovery work records the release of its failure")
 
     @property
     def rerunnable(self) -> bool:
@@ -89,6 +99,9 @@ def relation_discovery_work_selection_sql(
         if value is not None:
             clauses.append(f"{column} {operator} ?")
             params.append(value)
+    if selection.release_other_than is not None:
+        clauses.append("(release IS NULL OR release <> ?)")
+        params.append(selection.release_other_than)
     return " AND ".join(clauses), tuple(params)
 
 
@@ -162,10 +175,10 @@ class RelationDiscoveryRequest:
 class RelationDiscoveryWork:
     """A leased durable request; attempts are fenced by worker and lease token.
 
-    ``run_generation`` counts operator re-runs, so each run of the same request
+    ``run_generation`` counts re-runs, so each run of the same request
     records a distinct relation run. ``error`` and ``error_code`` describe the
-    last failure; ``classifier_version`` names the classifier of the last
-    completed run.
+    last failure and ``release`` the release whose code met it;
+    ``classifier_version`` names the classifier of the last completed run.
     """
 
     request: RelationDiscoveryRequest
@@ -183,6 +196,7 @@ class RelationDiscoveryWork:
     created_at: str | None = None
     updated_at: str | None = None
     completed_at: str | None = None
+    release: str | None = None
 
 
 def relation_discovery_request_id(

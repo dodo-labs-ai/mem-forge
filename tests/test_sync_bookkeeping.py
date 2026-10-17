@@ -2926,6 +2926,14 @@ class RecordingMemoryEngine(NoopMemoryEngine):
         return await super().prepare_and_commit_projected_lifecycle(**kwargs)
 
 
+class LockedProjectedMemoryEngine(NoopMemoryEngine):
+    """Fails every lifecycle commit while another connection holds the database lock."""
+
+    async def prepare_and_commit_projected_lifecycle(self, **kwargs):
+        del kwargs
+        raise sqlite3.OperationalError("database is locked")
+
+
 class FailingProjectedMemoryEngine(NoopMemoryEngine):
     def __init__(self) -> None:
         self.calls = 0
@@ -5118,7 +5126,7 @@ async def test_failed_newer_provider_target_still_supersedes_recovered_intent(
         lifecycle_cycle_id="run-recovery-provider-newer-failed",
     )
 
-    assert state.last_sync_status == "failed"
+    assert state.last_sync_status == "partial"
     assert state.docs_processed == 0
     assert state.docs_failed == 1
     assert engine.semantic_calls == 2
@@ -5259,7 +5267,7 @@ async def test_recovered_external_blocker_does_not_stop_provider_discovery(
 
     assert gene.authenticated is True
     assert gene.discovered is True
-    assert state.last_sync_status == "failed"
+    assert state.last_sync_status == "partial"
     assert state.docs_failed == 1
     assert state.failure_retryable is False
     assert engine.semantic_calls == 1
@@ -5352,12 +5360,12 @@ async def test_policy_replacement_failure_preserves_recoverable_new_work(
         db=db,
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
-        memory_engine=FailingProjectedMemoryEngine(),
+        memory_engine=LockedProjectedMemoryEngine(),
         memory_store=None,
         max_concurrent=1,
     )
 
-    with pytest.raises(RuntimeError, match="lifecycle apply failed"):
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
         await recovery._resume_source_derivations(
             source_id=source_id,
             run_id="run-v9-policy-replacement-failure",
@@ -5611,7 +5619,7 @@ async def test_sync_memory_observer_records_lifecycle_exit_when_document_fails(d
         gene=BlockingFetchGene(1, release), source_name="Jira Board", source_id=source_id
     )
 
-    assert state.last_sync_status == "failed"
+    assert state.last_sync_status == "partial"
     exits = [event for _level, event in log.records if event["stage"] == "document_lifecycle_exit"]
     assert exits
     assert all(event["ok"] is False for event in exits)
@@ -6378,7 +6386,7 @@ async def test_gene_reported_source_updated_at_becomes_memory_source_updated_at(
 
 
 @pytest.mark.asyncio
-async def test_deletion_failure_marks_sync_failed(db: Database):
+async def test_deletion_failure_fails_the_document_of_a_partial_sync(db: Database):
     source_id = "src-deletion-failure"
     await _insert_source_and_doc(db, source_id)
     item = ContentItem(
@@ -6414,10 +6422,10 @@ async def test_deletion_failure_marks_sync_failed(db: Database):
     )
 
     history = await db.get_sync_history(source=source_id, limit=1)
-    assert state.last_sync_status == "failed"
+    assert state.last_sync_status == "partial"
     assert state.docs_failed == 1
     assert "delete document failed" in state.failed_docs[0].error
-    assert history[0]["status"] == "failed"
+    assert history[0]["status"] == "partial"
 
 
 @pytest.mark.asyncio
@@ -10127,7 +10135,7 @@ async def test_full_document_extraction_failure_is_audited(db: Database):
     )
 
     rows = await db.list_memory_audit_events(event_type="memory_extraction_failed")
-    assert state.last_sync_status == "failed"
+    assert state.last_sync_status == "partial"
     assert state.docs_updated == 0
     assert state.docs_failed == 1
     assert state.failed_docs
@@ -10201,7 +10209,7 @@ async def test_document_retry_does_not_retain_failed_traceback_locals(
     gc.collect()
     assert extractor.calls == 3
     assert all(reference() is None for reference in retained)
-    assert state.last_sync_status == "failed"
+    assert state.last_sync_status == "partial"
     assert state.failed_docs[0].error == "RuntimeError: error details omitted"
     assert private_request_detail not in state.failed_docs[0].error
 
@@ -10582,7 +10590,7 @@ async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(d
         source_id=source_id,
     )
 
-    assert failed_state.last_sync_status == "failed"
+    assert failed_state.last_sync_status == "partial"
     assert failing_engine.calls == 3
     assert failing_engine.lifecycle_attempt_counts == [1, 2, 3]
     assert len(set(failing_engine.lifecycle_execution_owner_ids)) == 1
@@ -10648,7 +10656,7 @@ async def test_non_retryable_lifecycle_failure_stops_document_and_run_retry(
     )
 
     assert engine.calls == 1
-    assert state.last_sync_status == "failed"
+    assert state.last_sync_status == "partial"
     assert state.failure_retryable is False
     assert state.docs_failed == 1
 
@@ -11213,7 +11221,7 @@ async def test_lifecycle_failure_never_attempts_document_snapshot_restore(
         source_id=source_id,
     )
 
-    assert state.last_sync_status == "failed"
+    assert state.last_sync_status == "partial"
     assert state.docs_processed == 0
     assert state.docs_failed == 1
     assert engine.calls == 3
@@ -11261,7 +11269,7 @@ async def test_extraction_failure_never_requires_document_snapshot_restore(
         source_id=source_id,
     )
 
-    assert state.last_sync_status == "failed"
+    assert state.last_sync_status == "partial"
     assert state.docs_failed == 1
     assert extractor.calls == 1
     assert restore_calls == 0
@@ -11528,7 +11536,7 @@ async def test_missing_required_confluence_pdf_fails_sync_without_hiding_gap(db:
         source_id=source_id,
     )
 
-    assert state.last_sync_status == "failed"
+    assert state.last_sync_status == "partial"
     assert state.docs_processed == 0
     assert state.docs_failed == 1
     assert state.error_message == (
@@ -11654,7 +11662,7 @@ async def test_confluence_pdf_storage_failure_is_not_reported_as_export_failure(
         source_id=source_id,
     )
 
-    assert state.last_sync_status == "failed"
+    assert state.last_sync_status == "partial"
     assert state.docs_failed == 1
     assert "disk full while storing PDF" in state.failed_docs[0].error
     assert "Confluence PDF export failed" not in state.failed_docs[0].error

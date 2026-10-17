@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any, Literal, Mapping, Protocol, Sequence
 
 from pydantic import BaseModel
 
+from memforge.release import current_release
+
 if TYPE_CHECKING:
     from memforge.llm.batch_runner import ItemFailure, LlmRequest
 
@@ -69,15 +71,21 @@ class DerivationWorkStore(Protocol):
 
     async def record_derivation_work(self, *, derivation_id: str, work: DerivationWork) -> DerivationWork: ...
 
+    def is_transient_error(self, error: BaseException) -> bool:
+        """Whether one of this store's own driver errors may succeed when the work runs again."""
+        ...
+
 
 class DerivationWorkJournal:
     """Persist each batch-runner request as one resumable DerivationWork.
 
     A request is identified by its rendered prompt and schema under one task
-    scope, capacity policy, model and output limit. The prompt already names
-    the items, their carried state and their position, so a retried sync reuses
-    every request that completed and resends only the rest. Stored results are
-    the raw validated responses; the runner decodes them again on reuse.
+    scope, capacity policy, model, output limit and release. The prompt already
+    names the items, their carried state and their position, so a retried sync
+    of the same release reuses every request that completed and resends only
+    the rest; another release, whose decoding or post-processing may differ,
+    sends every request again. Stored results are the raw validated responses;
+    the runner decodes them again on reuse.
     """
 
     def __init__(
@@ -107,6 +115,7 @@ class DerivationWorkJournal:
             "budget": self._budget_identity,
             "model": self._model,
             "output": request.max_tokens,
+            "release": current_release(),
         })
         work = await self._store.stage_derivation_work(derivation_id=self._derivation_id, work=work)
         self._items[work.id] = tuple(item_ids)

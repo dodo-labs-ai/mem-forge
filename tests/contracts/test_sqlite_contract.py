@@ -10,6 +10,7 @@ mirror of this module without repeating any of the test bodies themselves.
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
 
 import chromadb
@@ -26,6 +27,23 @@ from tests.contracts._support import (
 from tests.contracts.test_keyword_contract import KeywordSearchContract
 from tests.contracts.test_relational_contract import RelationalStoreContract
 from tests.contracts.test_vector_contract import VectorStoreContract
+
+
+def _lock_error(path) -> sqlite3.OperationalError:
+    """The error SQLite raises for a write while another connection holds the write lock."""
+    holder = sqlite3.connect(path)
+    holder.execute("CREATE TABLE probe (id INTEGER)")
+    holder.execute("BEGIN IMMEDIATE")
+    waiter = sqlite3.connect(path, timeout=0)
+    try:
+        waiter.execute("INSERT INTO probe (id) VALUES (1)")
+    except sqlite3.OperationalError as error:
+        return error
+    finally:
+        waiter.close()
+        holder.rollback()
+        holder.close()
+    raise AssertionError("a write under another connection's write lock succeeded")
 
 
 def _sqlite_adapters_factory(tmp_path) -> AdaptersFactory:
@@ -61,6 +79,7 @@ def _sqlite_adapters_factory(tmp_path) -> AdaptersFactory:
             relational=adapters.relational,
             keyword=adapters.keyword,
             vector=adapters.vector,
+            transient_errors=(_lock_error(tmp_path / f"lock-{uuid.uuid4().hex[:8]}.db"),),
         )
 
         async def teardown() -> None:

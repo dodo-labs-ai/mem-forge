@@ -2,6 +2,7 @@ import { isLocalAgentBackedSource } from "./localAgentSources";
 import { SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY } from "@/api";
 import { groupSourcesByProject, projectGroupKey, type ResolvedBySource } from "./projectGrouping";
 import { sourceAttention, type SourceAttention } from "./sourceAttention";
+import { sourceFailedItems, type SourceFailedItems } from "./sourceFailedItems";
 import { organizeSourceGroups, type SourceListSortMode } from "./sourceListOrganization";
 import { resolveSourceReadiness, type LocalDaemonReadiness, type SourceReadiness } from "./sourceReadiness";
 import { selectSourceSyncActivity, type SourceSyncActivity } from "./sourceSyncActivity";
@@ -18,6 +19,7 @@ export interface SourceRow {
   activity: SourceSyncActivity | undefined;
   readiness: SourceReadiness | null;
   attention: SourceAttention | null;
+  failedItems: SourceFailedItems | null;
 }
 
 export interface SourceRowGroup {
@@ -71,7 +73,13 @@ export function describeSource(
     daemon,
     connectionStatus: source.connection_status,
   });
-  return { source, activity, readiness, attention: sourceAttention({ source, readiness, activity, now }) };
+  return {
+    source,
+    activity,
+    readiness,
+    attention: sourceAttention({ source, readiness, activity, now }),
+    failedItems: sourceFailedItems(source, activity),
+  };
 }
 
 function groupTitle(group: SourceProjectGroup): string {

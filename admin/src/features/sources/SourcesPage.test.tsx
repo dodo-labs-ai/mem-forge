@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import { STANDALONE_TARGET, type WorkspaceTarget } from "@/api";
 import { errorResponse, type Route } from "@/test/fakeApi";
 import { renderRoutes } from "@/test/renderRoutes";
-import { makeLocalAgentJob, makeSource } from "@/test/sourceFixtures";
+import { makeFailedItem, makeLocalAgentJob, makeSource } from "@/test/sourceFixtures";
 import { SourcesPage } from "./SourcesPage";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -296,4 +296,61 @@ test("Pipeline checks opens the source on the Evaluation page", async () => {
 
   expect(router.state.location.pathname).toBe("/evaluation");
   expect(router.state.location.search).toBe("?source_id=src-wiki");
+});
+
+test("the drawer lists each failed item with its step and reason, and Sync is its retry", async () => {
+  const source = makeSource({
+    sync: {
+      status: "partial", run_id: "run-1", started_at: null, finished_at: "2026-09-29T11:00:00Z", error_message: null, progress: null,
+    },
+    failed_items: {
+      count: 2,
+      retrying_after_upgrade: 0,
+      items: [
+        makeFailedItem(),
+        makeFailedItem({ document_id: "doc-2", title: "Leave policy", stage: "derivation", message: "Model output was invalid" }),
+      ],
+    },
+  });
+  renderPage([source]);
+
+  const needsYou = await screen.findByRole("region", { name: "Needs you" });
+  expect(within(needsYou).getByText("Some items failed (2)")).toBeInTheDocument();
+  await userEvent.click(within(needsYou).getByRole("button", { name: "View details" }));
+
+  const drawer = await screen.findByRole("dialog", { name: "Payroll wiki" });
+  const section = within(drawer).getByRole("heading", { name: "Some items failed (2)" }).closest("section")!;
+  expect(within(section).getByText("Payroll FAQ")).toBeInTheDocument();
+  expect(within(section).getByText("Reading:")).toBeInTheDocument();
+  expect(within(section).getByText("403 Forbidden")).toBeInTheDocument();
+  expect(within(section).getByText("Creating memories:")).toBeInTheDocument();
+  expect(within(section).getByText(/Syncing this source retries every failed item/)).toBeInTheDocument();
+  expect(within(drawer).queryByRole("button", { name: /^Retry/ })).not.toBeInTheDocument();
+  expect(within(drawer).getByRole("button", { name: "Sync now" })).toBeEnabled();
+});
+
+test("a sync after an upgrade shows that it retries the items an earlier version failed", async () => {
+  const source = makeSource({
+    sync: { status: "running", run_id: "ssr-release", started_at: "2026-09-29T11:05:00Z", finished_at: null, error_message: null, progress: null },
+    failed_items: {
+      count: 3,
+      retrying_after_upgrade: 2,
+      items: [
+        makeFailedItem({ retrying_after_upgrade: true }),
+        makeFailedItem({ document_id: "doc-2", title: "Leave policy", retrying_after_upgrade: true }),
+        makeFailedItem({ document_id: "doc-3", title: "Holiday calendar", release: "1.5.0" }),
+      ],
+    },
+  });
+  renderPage([source]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  expect(await within(table).findByText("Retrying 2 items after upgrade")).toBeInTheDocument();
+  expect(screen.queryByRole("region", { name: "Needs you" })).not.toBeInTheDocument();
+
+  await userEvent.click(within(table).getByText("Payroll wiki"));
+  const drawer = await screen.findByRole("dialog", { name: "Payroll wiki" });
+  const notice = within(drawer).getByText("Retrying 2 items after upgrade").closest("[role=status]");
+  expect(notice).toHaveTextContent("MemForge was upgraded");
+  expect(within(drawer).getAllByText("Retrying")).toHaveLength(2);
 });

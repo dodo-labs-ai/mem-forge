@@ -509,6 +509,7 @@ function LastSyncDetails({
       ? formatDuration(sync.started_at, sync.finished_at)
       : null;
   const failedCount = sync.docs_failed ?? 0;
+  const failedItemCount = source.failed_items?.count ?? 0;
   const isProblemStatus = sync.status === "partial" || sync.status === "failed";
 
   return (
@@ -563,6 +564,12 @@ function LastSyncDetails({
               {sync.error_message && (
                 <p className="rounded-md bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
                   {sync.error_message}
+                </p>
+              )}
+              {failedItemCount > 0 && (
+                <p className="text-xs text-muted-foreground">
+                  {failedItemCount === 1 ? "1 item still fails" : `${failedItemCount} items still fail`}. Sync
+                  retries every failed item.
                 </p>
               )}
             </div>

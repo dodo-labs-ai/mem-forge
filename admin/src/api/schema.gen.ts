@@ -3227,6 +3227,8 @@ export interface components {
         HealthResponse: {
             audit_failures?: components["schemas"]["ComponentHealth"] | null;
             database: components["schemas"]["ComponentHealth"];
+            /** @description Failed Documents across Sources, as the failure ledger records them. The payload counts failed_items and retrying_after_upgrade, the rows an earlier release recorded that this release is retrying. */
+            failed_items?: components["schemas"]["ComponentHealth"] | null;
             /**
              * Genes
              * @default {}
@@ -5322,6 +5324,61 @@ export interface components {
             /** Source Ids */
             source_ids?: string[] | null;
         };
+        /**
+         * SourceFailedItemResponse
+         * @description One failed Document of a Source, as the failure ledger records it.
+         */
+        SourceFailedItemResponse: {
+            /** Document Id */
+            document_id: string;
+            /** Error Code */
+            error_code: string | null;
+            /** Failures In Release */
+            failures_in_release: number;
+            /** First Failed At */
+            first_failed_at: string;
+            /** Last Failed At */
+            last_failed_at: string;
+            /** Message */
+            message: string;
+            /**
+             * Release
+             * @description The release whose code failed.
+             */
+            release: string;
+            /**
+             * Retryable
+             * @description Whether a scheduled sync of the same release retries the Document.
+             */
+            retryable: boolean;
+            /**
+             * Retrying After Upgrade
+             * @description An earlier release recorded the failure, and this release retries the Document once.
+             */
+            retrying_after_upgrade: boolean;
+            /**
+             * Stage
+             * @description The step that failed, such as fetch, normalize, projection or derivation.
+             */
+            stage: string;
+            /** Title */
+            title: string | null;
+        };
+        /**
+         * SourceFailedItemsResponse
+         * @description The Source's failed Documents: retried by the failure ledger, not by holding back the sync cursor.
+         *
+         *     ``items`` lists the most recently failed first and is bounded; ``count`` is
+         *     the total. A sync of the Source retries every one of them.
+         */
+        SourceFailedItemsResponse: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["SourceFailedItemResponse"][];
+            /** Retrying After Upgrade */
+            retrying_after_upgrade: number;
+        };
         /** SourceListPreferenceRequest */
         SourceListPreferenceRequest: {
             /**
@@ -5428,6 +5485,8 @@ export interface components {
             /** Enabled For Me */
             enabled_for_me: boolean;
             execution: components["schemas"]["SourceExecutionResponse"];
+            /** @description The Source's failed Documents; null for a Source that does not sync. */
+            failed_items: components["schemas"]["SourceFailedItemsResponse"] | null;
             /** Id */
             id: string;
             /** Last Sync */

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 
-from memforge.llm.structured import failure_retryable
+from memforge.llm.structured import TRANSIENT_TERMINAL_CATEGORIES
 from memforge.memory.cross_document_relation import (
     CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
     CrossDocumentRelationClassification,
@@ -39,6 +39,7 @@ from memforge.memory.relation_discovery_contract import (
     resolve_relation_discovery_actor_user_id,
 )
 from memforge.models import Memory, MemoryStatus
+from memforge.release import current_release
 from memforge.storage.adapters.protocols import RelationalStore
 
 
@@ -83,8 +84,10 @@ class RelationDiscoverySliceResult:
     llm_calls: int = 0
     prompt_chars: int = 0
     elapsed_ms: int = 0
+    # Work whose lease expired on its last attempt, which the slice recorded as exhausted.
+    expired_work: int = 0
     # Work that used every attempt, counted across the store after a slice that
-    # attempted work.
+    # attempted or exhausted work.
     exhausted_work: int = 0
 
 
@@ -110,9 +113,18 @@ class RelationDiscovery:
         source_id: str | None = None,
     ) -> RelationDiscoverySliceResult:
         policy = budget or DEFAULT_RELATION_DISCOVERY_BUDGET
+        release = current_release()
         started = time.perf_counter()
         attempted = completed = failed = obsolete = 0
         checked_pairs = llm_calls = prompt_chars = 0
+        # A worker that stopped during the last attempt leaves its work running
+        # with no attempt to lease it again; that work ends exhausted.
+        expired = await self._store.exhaust_expired_relation_discovery_work(
+            max_attempts=policy.max_attempts,
+            release=release,
+        )
+        if expired:
+            logger.warning("Relation discovery recorded %d work item(s) whose last attempt expired as exhausted", expired)
 
         while attempted < policy.max_work_items:
             if time.perf_counter() - started >= policy.max_wall_time_seconds:
@@ -163,7 +175,7 @@ class RelationDiscovery:
                 logger.exception("Relation discovery work %s failed", work.request.id)
                 # A failure that repeats on every attempt ends the work now
                 # instead of spending the remaining attempts on it.
-                exhausted = work.attempts >= policy.max_attempts or not failure_retryable(recorded_error)
+                exhausted = work.attempts >= policy.max_attempts or _repeats_on_every_attempt(recorded_error)
                 retry_at = None
                 if not exhausted:
                     exponent = max(0, work.attempts - 1)
@@ -180,6 +192,7 @@ class RelationDiscovery:
                     error_code=relation_discovery_error_code(recorded_error),
                     next_attempt_at=(retry_at.isoformat() if retry_at is not None else None),
                     exhausted=exhausted,
+                    release=release,
                 )
                 failed += 1
 
@@ -190,7 +203,7 @@ class RelationDiscovery:
                     max_attempts=policy.max_attempts,
                 )
             )
-            if attempted
+            if attempted or expired
             else 0
         )
         return RelationDiscoverySliceResult(
@@ -202,6 +215,7 @@ class RelationDiscovery:
             llm_calls=llm_calls,
             prompt_chars=prompt_chars,
             elapsed_ms=max(0, round((time.perf_counter() - started) * 1000)),
+            expired_work=expired,
             exhausted_work=exhausted_work,
         )
 
@@ -391,10 +405,54 @@ class _WorkProcessingError(RuntimeError):
     prompt_chars: int
 
 
+async def rerun_relation_discovery_failed_by_another_release(
+    store: RelationalStore,
+    *,
+    budget: RelationDiscoveryBudget | None = None,
+) -> int:
+    """Re-run, once, the exhausted work another release failed; returns how many.
+
+    Each release re-runs the work an earlier release, or no recorded release,
+    exhausted, so a fix in the new code reaches it without an operator. The
+    re-run starts a new generation with every attempt; if that work fails
+    again, it records this release and waits for the next one. Failed work
+    with a retry scheduled is retried by this release's code on its schedule.
+    """
+
+    release = current_release()
+    policy = budget or DEFAULT_RELATION_DISCOVERY_BUDGET
+    rerun = await store.rerun_relation_discovery_work(
+        RelationDiscoveryWorkSelection(
+            state=RelationDiscoveryWorkState.EXHAUSTED,
+            max_attempts=policy.max_attempts,
+            release_other_than=release,
+        ),
+        actor=f"release:{release}",
+        reason=f"Release {release} re-runs the relation discovery work an earlier release exhausted",
+    )
+    if rerun:
+        logger.info("Release %s re-runs %d relation discovery work item(s) an earlier release exhausted", release, rerun)
+    return rerun
+
+
 def relation_discovery_error_code(error: BaseException) -> str:
     """A stable code for one failure: the classifier's code, else the exception type."""
 
     return str(getattr(error, "error_code", None) or type(error).__name__)
+
+
+def _repeats_on_every_attempt(error: BaseException) -> bool:
+    """Whether a relation discovery failure declares that it fails the same way again.
+
+    Each work item has its own attempt budget, which bounds a failure that
+    declares nothing, so such a failure is attempted again until the budget
+    runs out. A model failure repeats unless its terminal category is transient.
+    """
+
+    category = getattr(error, "terminal_category", None)
+    if category is not None:
+        return category not in TRANSIENT_TERMINAL_CATEGORIES
+    return not getattr(error, "retryable", True)
 
 
 def _relation_run_id(
