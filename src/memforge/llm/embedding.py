@@ -299,9 +299,14 @@ class EmbeddingRuntime:
             except Exception as exc:
                 if not is_retryable_provider_error(exc) or attempts.retries_left <= 0:
                     raise _provider_error(exc) from exc
+                remaining_s = deadline - loop.time()
+                # An attempt that would be retried but ended after the deadline
+                # ends the call at its deadline.
+                if remaining_s <= 0:
+                    raise TimeoutError from exc
                 pause_s = self._retry_pause_s(exc, retries_used=attempts.retries_used)
                 # A pause that outlasts the deadline leaves no attempt to wait for.
-                if pause_s >= deadline - loop.time():
+                if pause_s >= remaining_s:
                     raise _provider_error(exc) from exc
                 attempts.retries_left -= 1
                 attempts.retries_used += 1

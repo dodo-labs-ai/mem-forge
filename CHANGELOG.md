@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- An embedding request that fails with a retryable error after the embedding
+  deadline has already passed now ends the call as a deadline overrun
+  (`EmbeddingDeadlineExceeded`, reported as `timeout`), the same as when the
+  deadline interrupts the request. It previously depended on event-loop timing
+  and could end as a provider error instead. Cloud: no change needed.
+
 ## 0.2.0b1 - 2026-10-16
 
 The first beta. MemForge runs for one user on one machine from the Docker
