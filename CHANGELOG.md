@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A Source Unit revision whose re-read Support chooses as its Primary an
+  unchanged Observation that a partial sync did not return now commits, with
+  its Evidence read from that Observation as the Unit last stored it. It
+  previously failed with a `KeyError` while building the lifecycle plan, which
+  stopped every later sync of the Source. Cloud: no change needed.
+
 - An embedding request that fails with a retryable error after the embedding
   deadline has already passed now ends the call as a deadline overrun
   (`EmbeddingDeadlineExceeded`, reported as `timeout`), the same as when the
