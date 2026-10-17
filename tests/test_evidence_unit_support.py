@@ -7,6 +7,7 @@ from tests.revision_client_fixture import RevisionClientFixture
 import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -47,10 +48,11 @@ from memforge.pipeline.projection_context import ExtractionAuthority, Extraction
 from memforge.pipeline.projection_evidence import build_projected_claim_evidence
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.source_projection_adapters import project_source_item
-from memforge.source_projection import AnchorKind, SourceAnchor
+from memforge.source_projection import AnchorKind, ProjectionCoverage, SourceAnchor
 from memforge.source_access import source_is_discoverable
 from memforge.storage.database import Database
 from tests.llm_fixture import NoopMemoryExtractor, fixture_request_planner
+from tests.test_revision_assessment import revisions
 from tests.unit_support_fixture import active_support_evidence, record_unit_context, record_unit_support
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
@@ -650,6 +652,73 @@ def test_claim_without_resolved_evidence_selection_is_rejected() -> None:
             access_context_hash="workspace",
             extractor_run_id=projection.run_id,
         )
+
+
+def _claim_on_carried_member():
+    """A partial revision whose claim chose its unchanged, carried member as Primary.
+
+    The provider returned only the edited body Observation; the context
+    Observation is carried from the base Unit revision unchanged.
+    """
+    base, current = revisions("Two reviewers approve US releases.\n", "Two reviewers approve US releases today.\n")
+    carried_at = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
+    edited, carried = current.observation_revisions
+    current = replace(
+        current,
+        observations=current.observations[:1],
+        observation_revisions=(
+            replace(edited, observed_at=datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc)),
+            replace(carried, observed_at=carried_at),
+        ),
+        coverage=ProjectionCoverage.PARTIAL_PROJECTION,
+        carried_observation_revision_ids=(carried.id,),
+        deltas=(replace(current.deltas[0], coverage=ProjectionCoverage.PARTIAL_PROJECTION, added_observation_ids=()),),
+    )
+    context = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
+    catalog = context.catalog(context.full_fragments)
+    primary = next(fragment for fragment in catalog.fragments if fragment.anchor.observation_id == "obs-context")
+    claim = RawMemory(
+        content="Release rules apply to the US.",
+        memory_type="fact",
+        resolved_evidence_selection=catalog.resolve_selection(primary_ref=primary.reference),
+    )
+    return base, current, claim, carried_at
+
+
+def _claim_evidence(projection, claim, **kwargs):
+    return build_projected_claim_evidence(
+        projection=projection,
+        raw_memories=(claim,),
+        doc_id="doc-1",
+        source_type=projection.source_type,
+        project_key=None,
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        access_context_hash="scope",
+        extractor_run_id=projection.run_id,
+        **kwargs,
+    )
+
+
+def test_evidence_with_primary_on_a_carried_member_reads_its_committed_observation() -> None:
+    base, current, claim, carried_at = _claim_on_carried_member()
+
+    evidence = _claim_evidence(current, claim, carried_observations=base.observations)
+
+    [unit] = evidence.units
+    assert unit.source_anchor == "obs-context"
+    assert unit.source_metadata["observation_type"] == "document_context"
+    assert unit.observed_at == carried_at
+    [primary] = [reference for reference in evidence.references if reference.role is EvidenceRole.PRIMARY]
+    assert primary.anchor.observation_revision_id == "rev-context"
+
+
+def test_evidence_for_a_partial_projection_requires_every_member_observation() -> None:
+    _, current, claim, _ = _claim_on_carried_member()
+
+    with pytest.raises(ValueError, match=r"Unit members lack their Observations: \['obs-context'\]"):
+        _claim_evidence(current, claim)
 
 
 @pytest.mark.asyncio
