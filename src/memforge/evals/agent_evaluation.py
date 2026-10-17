@@ -22,6 +22,8 @@ from functools import lru_cache
 from threading import Lock
 from typing import Callable, ContextManager, Iterator, Literal, Mapping, Protocol, Sequence
 
+from memforge.release import current_deployment_revision
+
 
 AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v3"
 AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v5"
@@ -1256,28 +1258,6 @@ def runtime_session_id(projection_run_id: str) -> str:
     return "mfs1-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
 
 
-def current_deployment_revision() -> str | None:
-    """Return a bounded deploy identity without depending on a Cloud adapter."""
-
-    configured = os.environ.get("MEMFORGE_DEPLOYMENT_REVISION", "").strip()
-    if configured:
-        return _safe_revision(configured)
-    raw_vcap = os.environ.get("VCAP_APPLICATION", "").strip()
-    if not raw_vcap:
-        return None
-    try:
-        payload = json.loads(raw_vcap)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, Mapping):
-        return None
-    for key in ("application_version", "version"):
-        value = payload.get(key)
-        if isinstance(value, str) and (revision := _safe_revision(value)) is not None:
-            return revision
-    return None
-
-
 def runtime_event_otel_attributes(event: AgentRuntimeEvent) -> Mapping[str, object]:
     """Return a bounded, content-free projection for an OTLP exporter."""
 
@@ -1954,10 +1934,3 @@ def _require_model(value: str | None) -> None:
         raise ValueError("model must be a bounded machine-readable identifier")
 
 
-def _safe_revision(value: str) -> str | None:
-    if not value or len(value) > 255 or any(
-        ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
-        for ch in value
-    ):
-        return None
-    return value

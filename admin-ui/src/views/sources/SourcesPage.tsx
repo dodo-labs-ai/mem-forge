@@ -486,7 +486,7 @@ export function SourcesPage() {
         next.delete(`${context?.workspaceKey}:${source.id}`);
         return next;
       });
-      handleAuthorityError(error, "Failed to start refresh.");
+      handleAuthorityError(error, "Failed to start rebuilding memories.");
     },
     onSettled: () => {
       void Promise.all([
@@ -1035,7 +1035,7 @@ function SourceActionsMenu({
   const toggleStatusLabel = isPaused ? "Resume source" : "Pause source";
   const ToggleStatusIcon = isPaused ? Play : Pause;
   const forceResyncDisabledHint = isPaused
-    ? "Resume the source first to refresh."
+    ? "Resume the source first to rebuild its memories."
     : undefined;
 
   useLayoutEffect(() => {

@@ -143,7 +143,9 @@ async def _committed_source_unit(
     return committed
 
 
-def _document_content_item(document: DocumentRecord) -> ContentItem:
+def document_content_item(document: DocumentRecord) -> ContentItem:
+    """The item that asks a Document's provider for it again, as the Document row describes it."""
+
     return ContentItem(
         item_id=document.doc_id,
         title=document.title,
@@ -182,7 +184,7 @@ async def _unit_stored_item(db: RelationalStore, *, source_unit_id: str, documen
     document = await db.get_document(document_id)
     if document is None:
         raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.DOCUMENT_MISSING, document_id)
-    return _document_content_item(document)
+    return document_content_item(document)
 
 
 async def rediscover_source_document(

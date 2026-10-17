@@ -1,6 +1,7 @@
 import { Clock, Lock, Users } from "lucide-react";
 import { formatCount, formatInterval, formatRelative, formatUntil, pluralize } from "@/lib/format";
 import { StatusBadge } from "@/patterns";
+import { retryingAfterUpgradeTitle } from "./model/sourceFailedItems";
 import { presentSourceSyncActivity, sourceSyncActivityIsVisible } from "./model/sourceSyncActivity";
 import type { SourceRow } from "./model/sourceRows";
 import { SourceIcon } from "./SourceIcon";
@@ -75,6 +76,8 @@ export function LastSyncCell({ row }: { row: SourceRow }) {
         <StatusBadge tone={attention.reason === "overdue" ? "warn" : "danger"}>
           {attention.title}
         </StatusBadge>
+      ) : live && row.failedItems?.retryingAfterUpgrade ? (
+        <StatusBadge tone="live">{retryingAfterUpgradeTitle(row.failedItems.retryingAfterUpgrade)}</StatusBadge>
       ) : presentation ? (
         <StatusBadge tone="live">{presentation.message}</StatusBadge>
       ) : (

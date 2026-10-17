@@ -18,6 +18,8 @@ from memforge.source_access import (
     source_is_discoverable,
     source_owner_user_id,
 )
+from memforge.release import current_release
+from memforge.source_item_failures import SourceItemFailure
 from memforge.sync_progress import source_progress_unit, source_sync_progress_from_pipeline
 from memforge.storage.admin_source import SourceAdminReader
 
@@ -27,6 +29,8 @@ VIEWER_ROLE = "viewer"
 SELF_HOSTED_OWNER_ROLE = "owner"
 LOCAL_WORKSPACE_ROLE = SELF_HOSTED_OWNER_ROLE
 MANAGED_SOURCE_TYPES = frozenset({"agent_session"})
+# The failed Documents a Source row lists; its count covers every one.
+MAX_LISTED_FAILED_ITEMS = 100
 
 
 def normalize_workspace_role(role: str | None) -> str:
@@ -195,8 +199,13 @@ async def list_source_admin_rows(
         row.setdefault("client", None)
         if not source_type_supports_sync(str(row.get("type") or "")):
             row["sync"] = None
+            row["failed_items"] = None
             rows.append(row)
             continue
+        row["failed_items"] = source_failed_items_payload(
+            await reader.list_source_item_failures(source_id=source_id),
+            release=current_release(),
+        )
         durable_run = await reader.get_latest_source_sync_run(
             source_id=source_id,
             workspace_id=workspace_id,
@@ -270,6 +279,32 @@ async def list_source_admin_rows(
                 row["sync"] = None
         rows.append(row)
     return rows
+
+
+def source_failed_items_payload(failures: tuple[SourceItemFailure, ...], *, release: str) -> dict[str, Any]:
+    """The Source's failed Documents, the most recently failed first, and how many this release is retrying."""
+
+    listed = sorted(failures, key=lambda failure: (failure.last_failed_at, failure.document_id), reverse=True)
+    return {
+        "count": len(failures),
+        "retrying_after_upgrade": sum(failure.recorded_by_another_release(release) for failure in failures),
+        "items": [
+            {
+                "document_id": failure.document_id,
+                "title": failure.title,
+                "stage": failure.stage,
+                "error_code": failure.error_code,
+                "message": failure.message,
+                "retryable": failure.retryable,
+                "release": failure.release,
+                "failures_in_release": failure.failures_in_release,
+                "first_failed_at": failure.first_failed_at.isoformat(),
+                "last_failed_at": failure.last_failed_at.isoformat(),
+                "retrying_after_upgrade": failure.recorded_by_another_release(release),
+            }
+            for failure in listed[:MAX_LISTED_FAILED_ITEMS]
+        ],
+    }
 
 
 def _absence_check_skipped_reason(stored: Any) -> AbsenceCheckSkippedReason | None:

@@ -7587,6 +7587,7 @@ async def test_projected_memory_support_survives_relation_work_retry_and_empty_c
         error_code="TimeoutError",
         next_attempt_at="2999-01-01T00:00:00+00:00",
         exhausted=False,
+        release="1.0.0",
     )
     assert await db.has_ready_relation_discovery_work(max_attempts=5) is False
     assert (
@@ -7979,6 +7980,7 @@ async def test_relation_work_failed_without_a_scheduled_retry_is_exhausted_befor
             error_code="request_error",
             next_attempt_at=None,
             exhausted=False,
+            release="1.0.0",
         )
 
     await db.fail_relation_discovery_work(
@@ -7989,6 +7991,7 @@ async def test_relation_work_failed_without_a_scheduled_retry_is_exhausted_befor
         error_code="request_error",
         next_attempt_at=None,
         exhausted=True,
+        release="1.0.0",
     )
 
     assert work.attempts == 1

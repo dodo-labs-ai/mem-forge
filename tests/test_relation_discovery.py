@@ -33,6 +33,7 @@ from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryWorkStatus,
 )
 from memforge.models import DocumentRecord, Memory, MemoryStatus, content_hash
+from memforge.release import current_release
 from memforge.storage.adapters.protocols import (
     build_active_memory_unit_support_states,
 )
@@ -130,6 +131,9 @@ class _Store:
         self.disabled_lookup_user_id = None
         self.lease_kwargs = None
         self.exhausted_selection = None
+        # Work whose lease expired on its last attempt, and the release that exhausted it.
+        self.expired_work = 0
+        self.expiry_release = None
         # Source time of each Memory's Primary Evidence; the fixture time otherwise.
         self.observed_at: dict[str, str] = {}
         self.work = RelationDiscoveryWork(
@@ -149,6 +153,11 @@ class _Store:
             lease_owner="worker-1",
             lease_token="token-1",
         )
+
+    async def exhaust_expired_relation_discovery_work(self, *, max_attempts, release):
+        self.expiry_release = release
+        expired, self.expired_work = self.expired_work, 0
+        return expired
 
     async def lease_relation_discovery_work(self, **kwargs):
         self.lease_kwargs = kwargs
@@ -458,6 +467,24 @@ async def test_relation_discovery_reports_exhausted_work_after_attempting_work()
 
 
 @pytest.mark.asyncio
+async def test_a_slice_exhausts_work_whose_lease_expired_on_its_last_attempt(monkeypatch) -> None:
+    monkeypatch.setenv("MEMFORGE_DEPLOYMENT_REVISION", "release-2")
+    challenger = _memory("challenger", "Current claim")
+    store = _Store(challenger, ())
+    store.leased = True
+    store.expired_work = 2
+
+    result = await _discovery(store, (), _Classifier()).process_slice(
+        worker_id="worker-1",
+        budget=RelationDiscoveryBudget(max_attempts=3),
+    )
+
+    assert (result.attempted_work, result.expired_work, result.exhausted_work) == (0, 2, 7)
+    assert store.expiry_release == current_release()
+    assert current_release().endswith("+release-2")
+
+
+@pytest.mark.asyncio
 async def test_idle_relation_discovery_slice_does_not_count_exhausted_work() -> None:
     challenger = _memory("challenger", "Current claim")
     store = _Store(challenger, ())
@@ -466,6 +493,7 @@ async def test_idle_relation_discovery_slice_does_not_count_exhausted_work() -> 
     result = await _discovery(store, (), _Classifier()).process_slice(worker_id="worker-1")
 
     assert result.attempted_work == 0
+    assert result.expired_work == 0
     assert result.exhausted_work == 0
     assert store.exhausted_selection is None
 
@@ -516,6 +544,24 @@ async def test_failure_that_repeats_on_every_attempt_finishes_the_work_on_its_fi
     assert store.failure["error_code"] == terminal_category
     assert store.failure["exhausted"] is exhausted
     assert (store.failure["next_attempt_at"] is None) is exhausted
+    assert store.failure["release"] == current_release()
+
+
+@pytest.mark.asyncio
+async def test_a_failure_that_declares_nothing_is_attempted_again_within_the_attempt_budget() -> None:
+    challenger = _memory("challenger", "Current claim")
+    candidate = _memory("candidate", "Other claim")
+    store = _CompletionFailingStore(challenger, (candidate,))
+
+    await _discovery(store, (candidate,), _Classifier()).process_slice(
+        worker_id="worker-1", budget=RelationDiscoveryBudget(max_work_items=1),
+    )
+
+    assert store.work.attempts < DEFAULT_RELATION_DISCOVERY_BUDGET.max_attempts
+    assert store.failure is not None
+    assert store.failure["error_code"] == "ValueError"
+    assert store.failure["exhausted"] is False
+    assert store.failure["next_attempt_at"] is not None
 
 
 @pytest.mark.asyncio

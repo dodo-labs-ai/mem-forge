@@ -15,6 +15,11 @@ Invariants covered:
 * bounded entity exact/alias/candidate lookup with learned-alias access fencing
 * project lifecycle (create/list/update + project deletion that rebuckets
   named memories into UNSORTED in one transaction)
+* transient error classification: the driver errors the factory names are
+  transient, and an error of no driver is not
+* the failure ledger: a row round-trips with its discovered item, an upsert
+  replaces the Document's row, rows list by Source, and a delete removes only
+  the named Documents of its Source
 
 Invariants intentionally NOT covered here because the public protocol does
 not expose them in a way every adapter can satisfy uniformly: graph 1-hop
@@ -30,6 +35,7 @@ from datetime import datetime, timezone
 import pytest
 
 from memforge.models import (
+    ContentItem,
     EntityAlias,
     RESERVED_PROJECT_KEYS,
     SHARED_PROJECT_KEY,
@@ -37,6 +43,7 @@ from memforge.models import (
     Visibility,
 )
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
+from memforge.source_item_failures import SourceItemFailure
 from memforge.storage.adapters.protocols import (
     EntityResolutionScope,
     EntityUpsert,
@@ -51,6 +58,46 @@ from tests.contracts._support import (
     make_memory,
     make_scope,
 )
+
+
+LEDGER_FAILED_AT = datetime(2026, 10, 17, 8, 30, tzinfo=timezone.utc)
+
+
+def _ledger_item(document_id: str) -> ContentItem:
+    return ContentItem(
+        item_id=document_id, title=f"Title {document_id}", source_url=f"https://example.test/{document_id}",
+        last_modified=LEDGER_FAILED_AT, content_type="application/json", space_or_project="PAY", version="3",
+        author="Ann", labels=["payroll"], extra={"issue_key": document_id.upper()},
+    )
+
+
+def _ledger_row(
+    source_id: str,
+    document_id: str,
+    *,
+    stage: str = "lifecycle_commit",
+    retryable: bool = True,
+    release: str = "1.0.0",
+    failures_in_release: int = 1,
+    failed_at: datetime = LEDGER_FAILED_AT,
+    item: ContentItem | None = None,
+) -> SourceItemFailure:
+    return SourceItemFailure(
+        source_id=source_id,
+        document_id=document_id,
+        stage=stage,
+        error_class="builtins.KeyError",
+        message="'obs-carried-member'",
+        retryable=retryable,
+        release=release,
+        failures_in_release=failures_in_release,
+        first_failed_at=LEDGER_FAILED_AT,
+        last_failed_at=failed_at,
+        title=f"Title {document_id}" if item is not None else None,
+        error_code="KEY_MISSING" if item is not None else None,
+        source_unit_id=f"unit-{document_id}" if item is not None else None,
+        item=item,
+    )
 
 
 class RelationalStoreContract:
@@ -74,6 +121,66 @@ class RelationalStoreContract:
 
     async def test_satisfies_relational_store_protocol(self, adapters: ContractAdapters) -> None:
         assert isinstance(adapters.relational, RelationalStore)
+
+    # -- Transient error classification --------------------------------------
+
+    async def test_classifies_its_driver_transient_errors_as_transient(self, adapters: ContractAdapters) -> None:
+        assert adapters.transient_errors, "the factory names the transient errors of the adapter's driver"
+        for error in adapters.transient_errors:
+            assert adapters.relational.is_transient_error(error) is True, repr(error)
+
+    async def test_an_error_of_no_driver_is_not_transient(self, adapters: ContractAdapters) -> None:
+        for error in (KeyError("observation"), ValueError("invalid payload"), RuntimeError("failed")):
+            assert adapters.relational.is_transient_error(error) is False, repr(error)
+
+    # -- Failure ledger -------------------------------------------------------
+
+    async def test_a_failure_ledger_row_round_trips(self, adapters: ContractAdapters) -> None:
+        store = adapters.relational
+        failure = _ledger_row("src-ledger", "doc-1", item=_ledger_item("doc-1"))
+        bare = _ledger_row("src-ledger", "doc-2", retryable=False)
+
+        await store.upsert_source_item_failure(failure)
+        await store.upsert_source_item_failure(bare)
+
+        assert await store.list_source_item_failures(source_id="src-ledger") == (failure, bare)
+
+    async def test_an_upsert_replaces_the_documents_row(self, adapters: ContractAdapters) -> None:
+        store = adapters.relational
+        await store.upsert_source_item_failure(_ledger_row("src-ledger", "doc-1", item=_ledger_item("doc-1")))
+        later = _ledger_row(
+            "src-ledger", "doc-1", stage="fetch", release="2.0.0", failures_in_release=2,
+            failed_at=LEDGER_FAILED_AT.replace(day=18),
+        )
+
+        await store.upsert_source_item_failure(later)
+
+        assert await store.list_source_item_failures(source_id="src-ledger") == (later,)
+
+    async def test_ledger_rows_list_by_source_and_delete_by_document(self, adapters: ContractAdapters) -> None:
+        store = adapters.relational
+        rows = [
+            _ledger_row("src-ledger-b", "doc-1"),
+            _ledger_row("src-ledger-a", "doc-2"),
+            _ledger_row("src-ledger-a", "doc-1"),
+        ]
+        for row in rows:
+            await store.upsert_source_item_failure(row)
+
+        listed = await store.list_source_item_failures()
+        assert [(row.source_id, row.document_id) for row in listed if row.source_id.startswith("src-ledger-")] == [
+            ("src-ledger-a", "doc-1"), ("src-ledger-a", "doc-2"), ("src-ledger-b", "doc-1"),
+        ]
+
+        await store.delete_source_item_failures("src-ledger-a", ["doc-1", "doc-unknown"])
+        await store.delete_source_item_failures("src-ledger-b", [])
+
+        assert [row.document_id for row in await store.list_source_item_failures(source_id="src-ledger-a")] == [
+            "doc-2",
+        ]
+        assert [row.document_id for row in await store.list_source_item_failures(source_id="src-ledger-b")] == [
+            "doc-1",
+        ]
 
     # -- Round-trip ---------------------------------------------------------
 

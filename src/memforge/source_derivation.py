@@ -33,7 +33,6 @@ from memforge.evals.agent_evaluation import (
     RuntimeEventTraceSink,
     assessment_sink_for_runtime_sink,
     bind_quality_signals,
-    current_deployment_revision,
     evaluate_runtime_events,
     publish_agent_assessments,
     publish_runtime_events,
@@ -41,6 +40,7 @@ from memforge.evals.agent_evaluation import (
     runtime_trace_id,
 )
 from memforge.pipeline.bounded_work import collect_bounded
+from memforge.release import current_deployment_revision, current_release
 from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
     PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION,
@@ -76,6 +76,8 @@ SOURCE_DERIVATION_SUPERSEDED = "superseded"
 DERIVATION_INPUT_SUPERSEDED = "DERIVATION_INPUT_SUPERSEDED"
 # The staged derivation failed in a way that repeats on every attempt.
 DERIVATION_DETERMINISTIC_FAILURE = "DERIVATION_DETERMINISTIC_FAILURE"
+# Another release staged the derivation; this release derives the Unit again.
+DERIVATION_RELEASE_SUPERSEDED = "DERIVATION_RELEASE_SUPERSEDED"
 
 SOURCE_DERIVATION_BATCH_PENDING = "pending"
 SOURCE_DERIVATION_BATCH_COMPLETED = "completed"
@@ -173,6 +175,8 @@ class SourceDerivationManifest:
     batches: tuple[SourceDerivationBatchManifest, ...]
     terminal_reason_code: str | None = None
     authority_plan_identity: Mapping[str, object] | None = None
+    # The release that computes the derivation; part of its identity.
+    release: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +213,9 @@ class SourceDerivationAttempt:
     created_at: str
     updated_at: str
     completed_at: str | None
+    # The release that staged the derivation; ``None`` for one staged before
+    # derivations recorded their release.
+    release: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -745,7 +752,11 @@ def source_derivation_manifest(
     authority_plan_identity: Mapping[str, object] | None = None,
     committed_base_unit_revision_id: str | None = None,
 ) -> SourceDerivationManifest:
-    """Build one stable manifest for an immutable target Source Unit revision."""
+    """Build one stable manifest for an immutable target Source Unit revision.
+
+    The release that computes the derivation is part of its identity, so work
+    another release staged or cached is never resumed or replayed.
+    """
 
     if len(projection.deltas) != 1 or len(projection.source_unit_revisions) != 1:
         raise ValueError("Source derivation requires exactly one Source Unit revision")
@@ -767,6 +778,7 @@ def source_derivation_manifest(
     context_payload = source_unit_derivation_context_to_payload(context)
     context_payload_hash = hashlib.sha256(_canonical_json(context_payload).encode("utf-8")).hexdigest()
     context_identity_hash = source_derivation_context_identity_hash(context)
+    release = current_release()
     manifest_batches = tuple(
         SourceDerivationBatchManifest(
             batch_id=batch.id,
@@ -774,6 +786,7 @@ def source_derivation_manifest(
                 target_revision_id=target_revision_id,
                 batch=batch,
                 evidence_work_identity_hash=evidence_work_identity_hash,
+                release=release,
             ),
             primary_observation_ids=batch.primary_observation_ids,
         )
@@ -791,6 +804,7 @@ def source_derivation_manifest(
         "terminal_reason_code": terminal_reason_code,
         "evidence_work_identity_hash": evidence_work_identity_hash,
         "authority_plan_identity": authority_plan_identity,
+        "release": release,
     }
     derivation_id = "sdrv-" + hashlib.sha256(_canonical_json(identity_payload).encode("utf-8")).hexdigest()[:32]
     return SourceDerivationManifest(
@@ -809,6 +823,7 @@ def source_derivation_manifest(
         batches=manifest_batches,
         terminal_reason_code=terminal_reason_code,
         authority_plan_identity=authority_plan_identity,
+        release=release,
     )
 
 
@@ -1133,8 +1148,10 @@ def _batch_input_payload_hash(
     target_revision_id: str,
     batch: ExtractionRequest,
     evidence_work_identity_hash: str | None = None,
+    release: str,
 ) -> str:
     payload = {
+        "release": release,
         "target_unit_revision_id": target_revision_id,
         "extraction_contract_version": PROJECTION_EXTRACTION_CONTRACT_VERSION,
         "evidence_work_identity_hash": evidence_work_identity_hash,

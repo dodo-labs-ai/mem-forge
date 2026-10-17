@@ -81,7 +81,10 @@ from memforge.memory.cross_source_review_conversion import (
     build_conversion_plan,
     delete_converted_reviews,
 )
-from memforge.memory.relation_discovery import DEFAULT_RELATION_DISCOVERY_BUDGET
+from memforge.memory.relation_discovery import (
+    DEFAULT_RELATION_DISCOVERY_BUDGET,
+    rerun_relation_discovery_failed_by_another_release,
+)
 from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryWork,
     RelationDiscoveryWorkSelection,
@@ -825,6 +828,14 @@ class HealthResponse(BaseModel):
     index_consistency: ComponentHealth | None = None
     audit_failures: ComponentHealth | None = None
     genes: dict[str, ComponentHealth] = {}
+    failed_items: ComponentHealth | None = Field(
+        default=None,
+        description=(
+            "Failed Documents across Sources, as the failure ledger records them. The payload counts "
+            "failed_items and retrying_after_upgrade, the rows an earlier release recorded that this "
+            "release is retrying."
+        ),
+    )
     models: ModelHealthResponse = Field(
         description=(
             "Whether a generation model and an embedding model are configured, and the "
@@ -1741,6 +1752,36 @@ class SourceSyncFailedDocResponse(BaseModel):
     error: str
 
 
+class SourceFailedItemResponse(BaseModel):
+    """One failed Document of a Source, as the failure ledger records it."""
+
+    document_id: str
+    title: str | None
+    stage: str = Field(description="The step that failed, such as fetch, normalize, projection or derivation.")
+    error_code: str | None
+    message: str
+    retryable: bool = Field(description="Whether a scheduled sync of the same release retries the Document.")
+    release: str = Field(description="The release whose code failed.")
+    failures_in_release: int
+    first_failed_at: str
+    last_failed_at: str
+    retrying_after_upgrade: bool = Field(
+        description="An earlier release recorded the failure, and this release retries the Document once.",
+    )
+
+
+class SourceFailedItemsResponse(BaseModel):
+    """The Source's failed Documents: retried by the failure ledger, not by holding back the sync cursor.
+
+    ``items`` lists the most recently failed first and is bounded; ``count`` is
+    the total. A sync of the Source retries every one of them.
+    """
+
+    count: int
+    retrying_after_upgrade: int
+    items: list[SourceFailedItemResponse]
+
+
 class SourceSyncStatusResponse(BaseModel):
     """A Source's latest sync, read from one of three places.
 
@@ -1855,6 +1896,9 @@ class SourceResponse(BaseModel):
     )
     sync_schedule: SourceSyncScheduleResponse | None = None
     sync: SourceSyncStatusResponse | None
+    failed_items: SourceFailedItemsResponse | None = Field(
+        description="The Source's failed Documents; null for a Source that does not sync.",
+    )
     client: str | None = Field(
         description="The agent client (for example codex or claude-code) of an agent-session Source; null otherwise.",
     )
@@ -4339,6 +4383,16 @@ def create_admin_app(
             runtime_provider=runtime_provider,
             workspace_id=workspace_id,
         )
+        # Each Document and each relation discovery work item an earlier
+        # release failed is retried once by this one.
+        try:
+            await app.state.sync_service.enqueue_release_recovery()
+        except Exception:
+            logger.exception("Could not queue the retry of the failed Documents an earlier release recorded")
+        try:
+            await rerun_relation_discovery_failed_by_another_release(app.state.db)
+        except Exception:
+            logger.exception("Could not re-run the relation discovery work an earlier release exhausted")
         # The checks make model requests, so they run beside the server and
         # never hold up its start.
         app.state.model_validation_task = asyncio.create_task(_validate_models_after_startup(app))
@@ -4758,6 +4812,7 @@ def create_admin_app(
             ),
             audit_failures=(_runtime_component_to_response(report.audit_failures) if report.audit_failures else None),
             genes={name: _runtime_component_to_response(component) for name, component in report.genes.items()},
+            failed_items=(_runtime_component_to_response(report.failed_items) if report.failed_items else None),
             models=await model_health_response(request.app.state.model_settings, db),
         )
 
@@ -7879,7 +7934,7 @@ def create_admin_app(
         job_id = f"laj-{uuid.uuid4().hex}"
         payload = local_agent_sync_job_payload(
             source,
-            {"force_full_sync": force_full_sync},
+            {"force_full_sync": force_full_sync, "retry_failed_items": True},
         )
         transition = await db.get_open_projection_scope_transition(source["id"])
         if transition is not None:
@@ -8049,6 +8104,7 @@ def create_admin_app(
                 input_snapshot_id=input_snapshot_id,
                 source_config_revision=str(lease_payload["source_config_revision"]),
                 predecessor_activity_id=(req.local_agent_job_id if req else None),
+                retry_failed_items=bool(lease_payload.get("retry_failed_items")),
             )
         except SourcePausedError:
             raise _source_paused_http_error()

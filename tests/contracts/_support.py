@@ -33,6 +33,10 @@ class ContractAdapters:
     relational: RelationalStore
     keyword: KeywordSearch
     vector: VectorStore
+    # Errors the relational adapter's own driver raised for a condition that
+    # passes, such as a lock or busy timeout, a deadlock rollback or a lost
+    # connection. The adapter must classify each one as transient.
+    transient_errors: tuple[BaseException, ...] = ()
 
 
 @dataclass(frozen=True)
