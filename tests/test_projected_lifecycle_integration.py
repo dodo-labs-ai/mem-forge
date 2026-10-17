@@ -6041,6 +6041,72 @@ async def test_noop_revalidates_revised_required_jira_description_in_partial_pro
     )
 
 
+class _CarriedPrimarySupportClient(_NoopClient):
+    """Support Assessment finds the claim stated in a member the provider did not return."""
+
+    def __init__(self, memory_id: str, *, primary_text: str) -> None:
+        super().__init__(memory_id)
+        self.primary_text = primary_text
+
+    async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+        if response_format is ChangeImpactWireResponse:
+            return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
+        payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
+        rows = [*payload["current"]["primary_candidates"], *payload["carried_witness_catalog"]]
+        primary_ref = next(ref for ref, text, *_ in rows if ref.startswith("PRM-") and self.primary_text in text)
+        return SupportAssessmentWireResponse.model_validate({"results": [
+            {
+                "work_id": work["work_id"], "status": "supported", "primary_ref": primary_ref,
+                "required_refs": [], "evidence_displays": evidence_displays(primary_ref, []),
+            }
+            for work in payload["works"]
+        ]})
+
+
+@pytest.mark.asyncio
+async def test_noop_commits_support_on_a_member_the_partial_projection_carried(db: Database) -> None:
+    await _set_fixture_source_type(db, "jira")
+    first = _jira_projection(run_id="carried-primary-1", description="A7 applies only to regular payroll.")
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(
+        db, projection=first, memory_id="mem-carried-primary", memory_content="A7 is retained for regular payroll.",
+        source_type="jira", access_context_hash=_WORKSPACE_ACCESS_CONTEXT_HASH,
+    )
+    await db.enable_lifecycle_gate("src-1")
+    # The description changed; the comment stating the decision was not returned and is carried unchanged.
+    second = _jira_projection(
+        run_id="carried-primary-2", description="A7 applies only to regular payroll runs.",
+        comment_id="503", comment_body="Payroll freezes on Friday.", comments_truncated=True,
+        prior=first.source_unit_revisions[0], prior_observations=_revisions_by_observation(first),
+    )
+    [carried] = [revision for revision in second.observation_revisions
+                 if revision.id in second.carried_observation_revision_ids]
+    assert carried.observation_id not in {observation.id for observation in second.observations}
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters), db=db, memory_store=_OutboxDrainer(db),
+        structured_llm_client=_CarriedPrimarySupportClient(incumbent.id, primary_text="Decision: retain A7"),
+    )
+
+    stats = await engine.prepare_and_commit_projected_lifecycle(
+        projection=second, doc_id="confluence-123", raw_memories=[], doc_type="ticket", project_key="ENG",
+        repo_identifier=None, document_content="PAY-12", update_mode="diff_guided",
+        changed_hunks="description wording clarified", update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
+    )
+
+    assert stats["noop"] == 1
+    assert (await db.get_current_source_unit_revision(second.source_units[0].id)).id == (
+        second.source_unit_revisions[0].id
+    )
+    [evidence] = await active_support_evidence(db, incumbent.id, source_id="src-1")
+    assert evidence.role is EvidenceRole.PRIMARY
+    assert evidence.anchor.observation_revision_id == carried.id
+    unit = await db.get_evidence_unit(evidence.evidence_unit_id)
+    assert unit.source_anchor == carried.observation_id
+    assert unit.source_metadata["observation_type"] == "comment"
+
+
 @pytest.mark.asyncio
 async def test_noop_uses_canonical_field_type_to_resolve_duplicate_text(
     db: Database,
