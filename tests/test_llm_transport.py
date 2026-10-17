@@ -41,6 +41,11 @@ from memforge.llm.transport import (
 )
 from tests.stalling_endpoint_fixture import GIVES_UP_AFTER_S, STALL_MODES, stalling_endpoint
 
+# The time a call that is not about its deadline is given. The first request a
+# process sends through a provider's SDK also imports that SDK's modules, which
+# on a busy machine takes seconds of the call's own time.
+_UNHURRIED_CALL_S = 60.0
+
 
 class _StatusError(Exception):
     def __init__(self, status_code: object) -> None:
@@ -388,7 +393,7 @@ async def test_a_bare_generation_model_does_not_send_its_key_and_prompt_on_to_a_
             model="claude-sonnet-4-20250514",
             base_url="https://generate-moved.example.test",
             api_key="endpoint-key",
-            timeout_s=5.0,
+            timeout_s=_UNHURRIED_CALL_S,
         )
     )
 
@@ -499,7 +504,7 @@ async def test_a_keyless_ollama_endpoint_is_never_sent_the_ollama_key_of_the_env
         config_source="settings",
     )
     client = LiteLlmStructuredClient(
-        StructuredLlmConfig.for_invocation(compile_binding(binding, None), timeout_s=5.0)
+        StructuredLlmConfig.for_invocation(compile_binding(binding, None), timeout_s=_UNHURRIED_CALL_S)
     )
 
     await client.rerank_memories("Rank the matching memories")
@@ -615,7 +620,9 @@ async def test_only_a_direct_answer_asks_the_provider_to_answer_without_reasonin
         config_source="settings",
     )
     client = LiteLlmStructuredClient(
-        StructuredLlmConfig.for_invocation(compile_binding(binding, None if keyless else "endpoint-key"), timeout_s=5.0)
+        StructuredLlmConfig.for_invocation(
+            compile_binding(binding, None if keyless else "endpoint-key"), timeout_s=_UNHURRIED_CALL_S
+        )
     )
 
     await client.rerank_memories("Rank the matching memories")
