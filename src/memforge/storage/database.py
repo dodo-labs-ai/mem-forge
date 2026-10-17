@@ -41,6 +41,14 @@ from memforge.local_agent.source_contract import (
 )
 from memforge.storage.admin_source import is_pause_only_source_update
 from memforge.storage.document_store import DocumentStore
+from memforge.storage.recovery_points import (
+    PRE_UPGRADE,
+    DataRootLock,
+    RecoveryPoint,
+    RecoveryPoints,
+    UpgradeError,
+    installed_release,
+)
 from memforge.source_activity import (
     SourceActivityConflict,
     SourceActivityKind,
@@ -2447,6 +2455,10 @@ CREATE INDEX IF NOT EXISTS idx_agent_assessment_input_fingerprint
 # ---------------------------------------------------------------------------
 # Migrations - empty for v1; start from v2 onwards.
 # Each entry: (version, description, [sql_statements])
+#
+# A migration applies in one transaction together with the row that records
+# it: it either commits whole or leaves the database as it was, and a start
+# after a failure or an interruption applies it again from the beginning.
 # ---------------------------------------------------------------------------
 
 MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
@@ -3330,7 +3342,6 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         44,
         "Allow managed-capture concepts to follow Source access",
         [
-            "PRAGMA foreign_keys = OFF",
             """CREATE TABLE agent_concepts_access_new (
                 id                  TEXT PRIMARY KEY,
                 source_id           TEXT NOT NULL,
@@ -3354,7 +3365,6 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE agent_concepts_access_new RENAME TO agent_concepts",
             "CREATE INDEX IF NOT EXISTS idx_agent_concepts_owner_repo "
             "ON agent_concepts(owner_user_id, repo_identifier)",
-            "PRAGMA foreign_keys = ON",
         ],
     ),
     (
@@ -4452,7 +4462,6 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         90,
         "Add Evidence Unit scoped Support and Context projection",
         [
-            "PRAGMA foreign_keys = OFF",
             "ALTER TABLE evidence_units ADD COLUMN part_set_digest TEXT",
             """CREATE TABLE evidence_context_migration_map (
                 evidence_unit_id TEXT NOT NULL,
@@ -4797,6 +4806,29 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
     ),
 ]
 
+# Migrations that rebuild a table other tables refer to run with foreign key
+# enforcement off. SQLite ignores that setting inside a transaction, so the
+# migration runner turns enforcement off before the migration's transaction
+# begins and on again once it has ended.
+_MIGRATIONS_WITHOUT_FOREIGN_KEYS = frozenset({44, 90})
+
+
+def latest_schema_version() -> int:
+    """Return the newest schema version this release migrates a database to."""
+    return max(version for version, _description, _statements in MIGRATIONS)
+
+
+def _pending_migration_versions(applied: Collection[int]) -> list[int]:
+    return [version for version, _description, _statements in MIGRATIONS if version not in applied]
+
+
+class MigrationFailed(UpgradeError):
+    """A pending migration failed and was rolled back."""
+
+
+class SchemaNewerThanRelease(UpgradeError):
+    """The database records a migration this release does not know."""
+
 
 # ---------------------------------------------------------------------------
 # Database class
@@ -4849,9 +4881,25 @@ def _truncate_write_ahead_log(path: str, *, wait_s: float) -> bool:
 class Database:
     """Async SQLite database layer for MemForge."""
 
-    def __init__(self, db_path: str, *, document_store: DocumentStore | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        document_store: DocumentStore | None = None,
+        recovery_points: RecoveryPoints | None = None,
+    ) -> None:
+        """Describe the database at ``db_path``; ``connect`` opens it.
+
+        With ``recovery_points``, the data root is guarded: the open database
+        holds its data-root lock, pending migrations are refused while another
+        MemForge process has the data open, an existing database is taken as a
+        recovery point before they apply, and the data is refused while a
+        restore that stopped part-way has not been run again.
+        """
         self.db_path = db_path
         self._document_store = document_store
+        self._recovery_points = recovery_points
+        self._data_root_lock: DataRootLock | None = None
         self._db: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
         # Whether the database still holds its model settings in the llm_config
@@ -4868,11 +4916,30 @@ class Database:
     # ------------------------------------------------------------------
 
     async def connect(self, *, run_migrations: bool = True) -> None:
-        """Open the database, optionally in a non-mutating evaluation mode."""
+        """Open the database, optionally in a non-mutating evaluation mode.
 
+        A database that records a migration newer than this release knows is
+        refused before anything is written. When opening fails, the
+        connection and the data-root lock are released before the error is
+        raised.
+        """
+        try:
+            await self._open(run_migrations=run_migrations)
+        except BaseException:
+            if self._db is not None:
+                await self._db.close()
+                self._db = None
+            self._release_data_root_lock()
+            raise
+
+    async def _open(self, *, run_migrations: bool) -> None:
         path = Path(self.db_path).expanduser()
         if run_migrations:
             path.parent.mkdir(parents=True, exist_ok=True)
+            if self._recovery_points is not None:
+                self._data_root_lock = self._recovery_points.lock()
+                self._data_root_lock.acquire(exclusive=False)
+                self._recovery_points.refuse_interrupted_restore()
             self._db = await _open_aiosqlite_connection(str(path))
         else:
             read_only_uri = f"{path.resolve().as_uri()}?mode=ro"
@@ -4880,6 +4947,8 @@ class Database:
         self._db.row_factory = aiosqlite.Row
         await self._db.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         await self._db.execute("PRAGMA foreign_keys = ON")
+        applied = await self._applied_migration_versions_unlocked()
+        self._refuse_newer_schema(applied)
         if not run_migrations:
             await self._db.execute("PRAGMA query_only = ON")
             await self._assert_evidence_unit_support_marker()
@@ -4887,15 +4956,99 @@ class Database:
             self._records_vector_indexes = await self._table_exists_unlocked("vector_indexes")
             return
         await self._refuse_reference_scoped_support_unlocked()
+        recovery_point = None
+        if _pending_migration_versions(applied) and self._data_root_lock is not None:
+            self._data_root_lock.acquire(exclusive=True)
+            # Another process may have applied them before the lock was free.
+            applied = await self._applied_migration_versions_unlocked()
+            self._refuse_newer_schema(applied)
+            if _pending_migration_versions(applied) and await self._holds_tables_unlocked():
+                recovery_point = await self._pre_upgrade_recovery_point(applied)
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.executescript(SCHEMA)
-        await self._run_migrations()
+        await self._run_migrations(recovery_point=recovery_point)
         for trigger in _REINDEX_WRITE_REFUSAL_TRIGGERS:
             await self._db.execute(trigger)
         await self._assert_memory_source_ids_resolved()
         await self._assert_evidence_unit_support_marker()
         await self._db.commit()
+        if self._data_root_lock is not None:
+            self._data_root_lock.acquire(exclusive=False)
         self._holds_llm_config = await self._table_exists_unlocked("llm_config")
+
+    def _release_data_root_lock(self) -> None:
+        if self._data_root_lock is not None:
+            self._data_root_lock.release()
+            self._data_root_lock = None
+
+    async def _applied_migration_versions_unlocked(self) -> set[int]:
+        if not await self._table_exists_unlocked("schema_migrations"):
+            return set()
+        async with self.db.execute("SELECT version FROM schema_migrations") as cursor:
+            return {int(row[0]) async for row in cursor}
+
+    async def _holds_tables_unlocked(self) -> bool:
+        async with self.db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1") as cursor:
+            return await cursor.fetchone() is not None
+
+    def _refuse_newer_schema(self, applied: set[int]) -> None:
+        """Refuse a database a newer release has migrated, naming the recovery point to restore."""
+        recorded = max(applied, default=0)
+        readable = latest_schema_version()
+        if recorded <= readable:
+            return
+        message = (
+            f"The database {self.db_path} has schema {recorded}, written by a newer MemForge release. "
+            f"This release ({installed_release()}) reads schema {readable} and older, and has not changed it. "
+            "Run the newer release again"
+        )
+        point = None if self._recovery_points is None else self._recovery_points.newest_readable(readable)
+        if point is not None:
+            message += (
+                f", or go back to the data as it was before that upgrade with this release: "
+                f"stop MemForge and run `memforge backup restore {point.id}`. "
+                "The restore keeps the current data as a recovery point."
+            )
+        elif self._recovery_points is not None:
+            message += (
+                f". No recovery point in {self._recovery_points.directory} holds schema {readable} or older."
+            )
+        else:
+            message += "."
+        raise SchemaNewerThanRelease(message)
+
+    async def _pre_upgrade_recovery_point(self, applied: set[int]) -> RecoveryPoint:
+        """Return the recovery point of the data as it was before this release upgrades it.
+
+        A start that finds an upgrade this release began and stopped part-way
+        keeps the point taken before it; otherwise the data is taken as a new
+        point.
+        """
+        assert self._recovery_points is not None
+        resumed = await asyncio.to_thread(
+            self._recovery_points.upgrade_in_progress,
+            max(applied, default=0),
+            installed_release(),
+        )
+        if resumed is not None:
+            logger.info("Continuing the upgrade begun after recovery point %s", resumed.id)
+            return resumed
+        logger.info(
+            "Taking a recovery point of schema %d before upgrading it to schema %d",
+            max(applied, default=0),
+            latest_schema_version(),
+        )
+        try:
+            point = await asyncio.to_thread(self._recovery_points.create, PRE_UPGRADE)
+        except UpgradeError:
+            raise
+        except Exception as exc:
+            raise UpgradeError(
+                f"MemForge could not take a recovery point in {self._recovery_points.directory} before "
+                f"upgrading the database, which stays at schema {max(applied, default=0)}: {exc}"
+            ) from exc
+        await asyncio.to_thread(self._recovery_points.prune, PRE_UPGRADE)
+        return point
 
     async def _table_exists_unlocked(self, table: str) -> bool:
         async with self.db.execute(
@@ -5060,110 +5213,136 @@ class Database:
         ):
             await self.db.execute(sql)
 
-    async def _run_migrations(self) -> None:
-        """Apply pending schema migrations tracked in schema_migrations."""
-        applied: set[int] = set()
-        async with self.db.execute("SELECT version FROM schema_migrations") as cur:
-            async for row in cur:
-                applied.add(row[0])
+    async def _run_migrations(self, *, recovery_point: RecoveryPoint | None = None) -> None:
+        """Apply the pending schema migrations, each in a transaction of its own.
 
+        A migration that fails is rolled back with everything it wrote, and
+        the error names it and the schema the database stays at. A process
+        stopped part-way through a migration leaves the same state: SQLite
+        discards the uncommitted transaction, and the next start applies the
+        migration again from the beginning. ``recovery_point`` is the point
+        taken before these migrations, which the error names for a restore.
+        """
+        applied = await self._applied_migration_versions_unlocked()
         for version, description, statements in MIGRATIONS:
             if version in applied:
                 continue
-            if version == 66:
-                await self._assert_memory_source_ids_resolved()
-            if version == 53:
-                async with self.db.execute("PRAGMA table_info(memories)") as cursor:
-                    memory_columns = {str(row[1]) async for row in cursor}
-                if "memory_level" in memory_columns:
-                    async with self.db.execute("SELECT id FROM memories WHERE memory_level = 'consolidated'") as cursor:
-                        consolidated_memory_ids = [str(row[0]) async for row in cursor]
-                    for memory_id in consolidated_memory_ids:
-                        await self.purge_memory(memory_id)
-            if version == 79:
-                await self._migrate_agent_runtime_event_v3_unlocked()
-            for sql in statements:
+            without_foreign_keys = version in _MIGRATIONS_WITHOUT_FOREIGN_KEYS
+            if without_foreign_keys:
+                await self.db.execute("PRAGMA foreign_keys = OFF")
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
                 try:
-                    await self.db.execute(sql)
-                except Exception as e:
-                    message = str(e).lower()
-                    legacy_scope_backfill = version == 15 and "no such column" in message and "scope" in sql.lower()
-                    if "duplicate column" in message or legacy_scope_backfill:
-                        logger.debug(
-                            "Migration %d: expected-absent column on this DB, skipping: %s",
-                            version,
-                            sql,
-                        )
-                    else:
-                        raise
-            if version == 53:
-                await self._drop_columns_if_present_unlocked("memories", "curation_cluster_id", "memory_level")
-            if version == 96:
-                await self._drop_columns_if_present_unlocked("memories", "contradiction_count")
-            if version == 106:
-                await self._drop_columns_if_present_unlocked("cross_document_relations", "reason")
-            if version == 105:
-                superseded = await self._remove_source_activity_epoch_unlocked()
-                logger.info("Superseded %d unapplied derivations staged with a Source activity epoch", superseded)
-            if version == 107:
-                await self._drop_columns_if_present_unlocked("memories", "confidence")
-                await self._drop_columns_if_present_unlocked("agent_claims", "confidence")
-            if version == 26:
-                await self._backfill_relation_run_snapshot_audit()
-            if version in (30, 31, 66):
-                await self._rebuild_memory_metadata_fts_unlocked()
-            if version == 42:
-                await self._migrate_source_access_policy_unlocked()
-            if version == 45:
-                await self._partition_legacy_agent_session_sources_unlocked()
-            if version == 88:
-                profile_report = await self._backfill_evidence_representation_profiles_unlocked()
-                logger.info(
-                    "Evidence profile backfill scanned=%d backfilled=%d unresolved=%d",
-                    profile_report.scanned_revision_count,
-                    profile_report.backfilled_revision_count,
-                    len(profile_report.unresolved_revision_ids),
-                )
-                if profile_report.unresolved_revision_ids:
-                    logger.warning(
-                        "Evidence profile backfill left %d revisions unselectable; "
-                        "run the report method for exact revision ids",
-                        len(profile_report.unresolved_revision_ids),
+                    await self._apply_migration_unlocked(version, statements)
+                    await self.db.execute(
+                        "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
+                        (version, description, _now_iso()),
                     )
-            if version == 90:
-                await self._backfill_evidence_context_associations_unlocked()
-            if version == 102:
-                classified = await self._classify_jira_changelog_revisions_unlocked()
-                logger.info("Classified %d stored Jira changelog revisions", classified)
-            if version == 103:
-                superseded = await self._supersede_stored_input_reprocess_derivations_unlocked()
-                logger.info("Superseded %d unapplied reprocess derivations staged from stored input", superseded)
-            if version == 111:
-                deactivated = await self._deactivate_context_without_declared_reply_unlocked()
-                logger.info("Deactivated %d Context associations without a declared reply", deactivated)
-            if version == 104:
-                recorded = await self._move_stored_input_to_source_units_unlocked()
-                logger.info("Recorded the stored input of %d current Source Unit revisions", recorded)
-            if version == 115:
-                rebuilt = await self._rebuild_all_memory_fts_unlocked()
-                logger.info("Rebuilt the FTS5 rows of %d Memories", rebuilt)
-            await self.db.execute(
-                "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
-                (version, description, _now_iso()),
-            )
-            await self.db.commit()
-            if version in {44, 90}:
-                # SQLite ignores attempts to enable foreign keys while a
-                # transaction is active. Migration 44 disables them before a
-                # table rebuild, so restore the connection invariant only
-                # after the migration transaction has committed.
-                await self.db.execute("PRAGMA foreign_keys = ON")
-                async with self.db.execute("PRAGMA foreign_keys") as cursor:
-                    foreign_keys = await cursor.fetchone()
-                if not foreign_keys or int(foreign_keys[0]) != 1:
-                    raise RuntimeError("failed to restore SQLite foreign key enforcement")
+                    await self.db.commit()
+                except BaseException as exc:
+                    await self.db.rollback()
+                    if not isinstance(exc, Exception):
+                        raise
+                    message = (
+                        f"Migration {version} ({description}) failed and was rolled back; the database "
+                        f"stays at schema {max(applied, default=0)}. {type(exc).__name__}: {exc}."
+                    )
+                    if recovery_point is not None:
+                        message += (
+                            f" The data as it was before this upgrade is kept as recovery point "
+                            f"{recovery_point.id}."
+                        )
+                    raise MigrationFailed(message) from exc
+            finally:
+                if without_foreign_keys:
+                    await self.db.execute("PRAGMA foreign_keys = ON")
+                    async with self.db.execute("PRAGMA foreign_keys") as cursor:
+                        foreign_keys = await cursor.fetchone()
+                    if not foreign_keys or int(foreign_keys[0]) != 1:
+                        raise RuntimeError("failed to restore SQLite foreign key enforcement")
+            applied.add(version)
             logger.info("Applied migration %d: %s", version, description)
         await self._assert_memory_source_ids_resolved()
+
+    async def _apply_migration_unlocked(self, version: int, statements: Sequence[str]) -> None:
+        """Run one migration's statements and data steps inside the transaction the runner holds."""
+        if version == 66:
+            await self._assert_memory_source_ids_resolved()
+        if version == 53:
+            async with self.db.execute("PRAGMA table_info(memories)") as cursor:
+                memory_columns = {str(row[1]) async for row in cursor}
+            if "memory_level" in memory_columns:
+                async with self.db.execute("SELECT id FROM memories WHERE memory_level = 'consolidated'") as cursor:
+                    consolidated_memory_ids = [str(row[0]) async for row in cursor]
+                for memory_id in consolidated_memory_ids:
+                    await self._purge_memory_unlocked(memory_id)
+        if version == 79:
+            await self._migrate_agent_runtime_event_v3_unlocked()
+        for sql in statements:
+            try:
+                await self.db.execute(sql)
+            except Exception as e:
+                message = str(e).lower()
+                legacy_scope_backfill = version == 15 and "no such column" in message and "scope" in sql.lower()
+                if "duplicate column" in message or legacy_scope_backfill:
+                    logger.debug(
+                        "Migration %d: expected-absent column on this DB, skipping: %s",
+                        version,
+                        sql,
+                    )
+                else:
+                    raise
+        if version == 53:
+            await self._drop_columns_if_present_unlocked("memories", "curation_cluster_id", "memory_level")
+        if version == 96:
+            await self._drop_columns_if_present_unlocked("memories", "contradiction_count")
+        if version == 106:
+            await self._drop_columns_if_present_unlocked("cross_document_relations", "reason")
+        if version == 105:
+            superseded = await self._remove_source_activity_epoch_unlocked()
+            logger.info("Superseded %d unapplied derivations staged with a Source activity epoch", superseded)
+        if version == 107:
+            await self._drop_columns_if_present_unlocked("memories", "confidence")
+            await self._drop_columns_if_present_unlocked("agent_claims", "confidence")
+        if version == 26:
+            await self._backfill_relation_run_snapshot_audit()
+        if version in (30, 31, 66):
+            await self._rebuild_memory_metadata_fts_unlocked()
+        if version == 42:
+            await self._migrate_source_access_policy_unlocked()
+        if version == 45:
+            await self._partition_legacy_agent_session_sources_unlocked()
+        if version == 88:
+            profile_report = await self._backfill_evidence_representation_profiles_unlocked()
+            logger.info(
+                "Evidence profile backfill scanned=%d backfilled=%d unresolved=%d",
+                profile_report.scanned_revision_count,
+                profile_report.backfilled_revision_count,
+                len(profile_report.unresolved_revision_ids),
+            )
+            if profile_report.unresolved_revision_ids:
+                logger.warning(
+                    "Evidence profile backfill left %d revisions unselectable; "
+                    "run the report method for exact revision ids",
+                    len(profile_report.unresolved_revision_ids),
+                )
+        if version == 90:
+            await self._backfill_evidence_context_associations_unlocked()
+        if version == 102:
+            classified = await self._classify_jira_changelog_revisions_unlocked()
+            logger.info("Classified %d stored Jira changelog revisions", classified)
+        if version == 103:
+            superseded = await self._supersede_stored_input_reprocess_derivations_unlocked()
+            logger.info("Superseded %d unapplied reprocess derivations staged from stored input", superseded)
+        if version == 111:
+            deactivated = await self._deactivate_context_without_declared_reply_unlocked()
+            logger.info("Deactivated %d Context associations without a declared reply", deactivated)
+        if version == 104:
+            recorded = await self._move_stored_input_to_source_units_unlocked()
+            logger.info("Recorded the stored input of %d current Source Unit revisions", recorded)
+        if version == 115:
+            rebuilt = await self._rebuild_all_memory_fts_unlocked()
+            logger.info("Rebuilt the FTS5 rows of %d Memories", rebuilt)
 
     async def translate_llm_config(self, defaults: "LlmConfig") -> int:
         """Turn the settings of the llm_config table into active model bindings and drop the table.
@@ -5837,12 +6016,13 @@ class Database:
                 )
 
     async def close(self) -> None:
-        """Close the database connection."""
+        """Close the database connection and release the data-root lock."""
         if self._db:
             if self._wal_holds_plaintext_keys:
                 await self.erase_plaintext_keys()
             await self._db.close()
             self._db = None
+        self._release_data_root_lock()
 
     @property
     def db(self) -> aiosqlite.Connection:
@@ -13561,72 +13741,78 @@ class Database:
     async def purge_memory(self, memory_id: str) -> bool:
         """Hard-delete a memory and its local indexes/provenance."""
         async with self._write_transaction():
-            async with self.db.execute(
-                "SELECT id FROM memories WHERE id = ?",
-                (memory_id,),
-            ) as cursor:
-                exists = await cursor.fetchone()
-            if not exists:
-                return False
+            purged = await self._purge_memory_unlocked(memory_id)
+            if purged:
+                await self.db.commit()
+            return purged
 
-            now = _now_iso()
-            await self.db.execute(
-                """UPDATE memories SET
-                    superseded_by = NULL, superseded_at = NULL,
-                    replacement_reason = NULL, replacement_kind = NULL,
-                    status = 'retired',
-                    retirement_reason = 'privacy_removed',
-                    retired_at = COALESCE(retired_at, ?), updated_at = ?
-                   WHERE superseded_by = ?""",
-                (now, now, memory_id),
-            )
-            await self.db.execute(
-                "DELETE FROM memory_sources WHERE memory_id = ?",
-                (memory_id,),
-            )
-            await self._delete_evidence_graph_for_memory_unlocked(memory_id)
-            await self.db.execute(
-                "DELETE FROM memory_entities WHERE memory_id = ?",
-                (memory_id,),
-            )
-            await self.db.execute(
-                "DELETE FROM memory_review_related_challengers WHERE challenger_memory_id = ?",
-                (memory_id,),
-            )
-            await self.db.execute(
-                """DELETE FROM memory_review_related_challengers
-                   WHERE review_id IN (
-                       SELECT id FROM memory_reviews
-                       WHERE incumbent_memory_id = ? OR challenger_memory_id = ?
-                   )""",
-                (memory_id, memory_id),
-            )
-            await self.db.execute(
-                """DELETE FROM memory_reviews
-                   WHERE incumbent_memory_id = ? OR challenger_memory_id = ?""",
-                (memory_id, memory_id),
-            )
-            await self.db.execute(
-                "DELETE FROM memories_fts WHERE memory_id = ?",
-                (memory_id,),
-            )
-            await self.db.execute(
-                """DELETE FROM agent_claim_citations
-                   WHERE claim_id IN (
-                       SELECT id FROM agent_claims WHERE memory_id = ?
-                   )""",
-                (memory_id,),
-            )
-            await self.db.execute(
-                "DELETE FROM agent_claims WHERE memory_id = ?",
-                (memory_id,),
-            )
-            await self.db.execute(
-                "DELETE FROM memories WHERE id = ?",
-                (memory_id,),
-            )
-            await self.db.commit()
-            return True
+    async def _purge_memory_unlocked(self, memory_id: str) -> bool:
+        """Delete a memory and its local indexes/provenance in the caller's transaction."""
+        async with self.db.execute(
+            "SELECT id FROM memories WHERE id = ?",
+            (memory_id,),
+        ) as cursor:
+            exists = await cursor.fetchone()
+        if not exists:
+            return False
+
+        now = _now_iso()
+        await self.db.execute(
+            """UPDATE memories SET
+                superseded_by = NULL, superseded_at = NULL,
+                replacement_reason = NULL, replacement_kind = NULL,
+                status = 'retired',
+                retirement_reason = 'privacy_removed',
+                retired_at = COALESCE(retired_at, ?), updated_at = ?
+               WHERE superseded_by = ?""",
+            (now, now, memory_id),
+        )
+        await self.db.execute(
+            "DELETE FROM memory_sources WHERE memory_id = ?",
+            (memory_id,),
+        )
+        await self._delete_evidence_graph_for_memory_unlocked(memory_id)
+        await self.db.execute(
+            "DELETE FROM memory_entities WHERE memory_id = ?",
+            (memory_id,),
+        )
+        await self.db.execute(
+            "DELETE FROM memory_review_related_challengers WHERE challenger_memory_id = ?",
+            (memory_id,),
+        )
+        await self.db.execute(
+            """DELETE FROM memory_review_related_challengers
+               WHERE review_id IN (
+                   SELECT id FROM memory_reviews
+                   WHERE incumbent_memory_id = ? OR challenger_memory_id = ?
+               )""",
+            (memory_id, memory_id),
+        )
+        await self.db.execute(
+            """DELETE FROM memory_reviews
+               WHERE incumbent_memory_id = ? OR challenger_memory_id = ?""",
+            (memory_id, memory_id),
+        )
+        await self.db.execute(
+            "DELETE FROM memories_fts WHERE memory_id = ?",
+            (memory_id,),
+        )
+        await self.db.execute(
+            """DELETE FROM agent_claim_citations
+               WHERE claim_id IN (
+                   SELECT id FROM agent_claims WHERE memory_id = ?
+               )""",
+            (memory_id,),
+        )
+        await self.db.execute(
+            "DELETE FROM agent_claims WHERE memory_id = ?",
+            (memory_id,),
+        )
+        await self.db.execute(
+            "DELETE FROM memories WHERE id = ?",
+            (memory_id,),
+        )
+        return True
 
     async def restore_memory_snapshot(
         self,

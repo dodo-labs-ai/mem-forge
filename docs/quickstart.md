@@ -32,7 +32,8 @@ proxies `/api/*` requests to the `api` container. The API is also available
 directly at `http://localhost:8765`.
 
 Runtime data is stored in the `memforge-data` Docker volume. Remove that volume
-only when you intentionally want a clean local instance.
+only when you intentionally want a clean local instance. To move to a new
+release, see [Upgrading](#upgrading).
 
 ### Network scope
 
@@ -531,6 +532,87 @@ To run a one-off sync of every configured source, or of one source by name:
 memforge sync
 memforge sync --source "Source name"
 ```
+
+## Upgrading
+
+Get the new release and rebuild the stack. The `memforge-data` volume, with
+your memories, sources and settings, is kept:
+
+```bash
+git pull            # or: git checkout <release tag>
+docker compose up -d --build
+```
+
+When the new release has schema migrations that the data has not applied
+yet, it upgrades the data before it serves anything:
+
+1. It takes a **recovery point**: a copy of the database, made with the SQLite
+   backup API, and of the vector index, saved under `/data/backups` in the
+   volume. The copy is made only while no other MemForge process has the data
+   open. The newest recovery point of each of the three most recent schema
+   versions is kept, and so are the newest three taken before a restore;
+   older ones are deleted.
+2. It applies the database migrations of the new release, each one together
+   with the record that it was applied. A migration that fails is rolled back
+   whole, and so is one interrupted by a crash or a stopped container: the
+   database stays as the last completed migration left it, and the next start
+   applies the remaining migrations again. That start keeps the recovery point
+   taken before the upgrade began rather than taking another.
+
+If a migration fails, the `api` container exits and `docker compose logs api`
+names the migration and the recovery point taken before it. An upgrade needs
+free disk space for one more copy of the database and the vector index.
+
+A release refuses to start on data that a newer release has upgraded, and
+names the recovery point to restore. Going back to an older release therefore
+means restoring the recovery point taken before the upgrade.
+
+### Restoring a recovery point
+
+List the recovery points. While the stack runs:
+
+```bash
+docker compose exec api memforge backup list
+```
+
+When the `api` container is not running, for example after an upgrade it
+refused or that failed:
+
+```bash
+docker compose run --rm api memforge backup list
+```
+
+Each recovery point shows the schema version of the data it holds and the
+release that took it before upgrading. A restore replaces the database and
+vector index with the recovery point and is refused while MemForge runs, so
+stop the `api` service first:
+
+```bash
+docker compose stop api
+docker compose run --rm api memforge backup restore <ID>
+```
+
+The restore asks for confirmation (`--yes` skips it) and keeps the data it
+replaces as a new recovery point, so it can be undone the same way. If a
+restore stops before it finishes, MemForge refuses to start until the same
+restore is run again. Then start the release you want to run. To go back to
+the release before the upgrade, check it out and rebuild:
+
+```bash
+git checkout <previous release tag>
+docker compose up -d --build
+```
+
+Starting the newer release again instead upgrades the restored data again.
+
+Recovery points live in the same `memforge-data` volume: they undo an upgrade,
+but do not protect against losing the volume. They hold the database and the
+vector index, not the source documents under `/data/documents`, which no
+upgrade changes and a restore leaves as they are; sync a source again to
+refresh its documents.
+
+From source, run the same commands with `uv run memforge backup list` and
+`uv run memforge backup restore <ID>` after stopping `memforge api`.
 
 ## 8. Development From Source
 
