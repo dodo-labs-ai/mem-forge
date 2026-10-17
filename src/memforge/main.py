@@ -175,13 +175,26 @@ def setup_logging(verbose: bool = False) -> None:
 
 
 async def _get_db(config: AppConfig):
-    """Open the local database for a command that runs with ``config``."""
+    """Open the local database for a command that runs with ``config``.
+
+    Opening applies the migrations of this release, after taking a recovery
+    point of an existing database. A database this release cannot open, or
+    an upgrade that fails, ends the command with the reason.
+    """
     from memforge.storage.database import Database
 
     from memforge.storage.document_store import LocalDocumentStore
+    from memforge.storage.recovery_points import RecoveryPoints, UpgradeError
 
-    db = Database(config.storage.db_path, document_store=LocalDocumentStore(config.storage.docs_path))
-    await db.connect()
+    db = Database(
+        config.storage.db_path,
+        document_store=LocalDocumentStore(config.storage.docs_path),
+        recovery_points=RecoveryPoints.for_config(config),
+    )
+    try:
+        await db.connect()
+    except UpgradeError as exc:
+        raise click.ClickException(str(exc)) from exc
     try:
         await db.translate_llm_config(config.llm)
     except BaseException:
@@ -6550,6 +6563,108 @@ def maintenance_reindex(ctx, mode: str):
             await db.close()
 
     raise SystemExit(asyncio.run(_run()))
+
+
+# ---------------------------------------------------------------------------
+# backup group
+# ---------------------------------------------------------------------------
+
+
+@cli.group("backup")
+def backup():
+    """List and restore the recovery points of the local data.
+
+    MemForge takes a recovery point of the database and the vector index
+    before a new release upgrades them, and keeps the newest one of each of
+    the three most recent schema versions. Restoring one puts the data back
+    as it was before that upgrade.
+    """
+    pass
+
+
+def _byte_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    value = size / 1024
+    for unit in ("KB", "MB"):
+        if value < 1024:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+@backup.command("list")
+@click.pass_context
+def backup_list(ctx):
+    """List the recovery points, newest first."""
+    from memforge.storage.database import latest_schema_version
+    from memforge.storage.recovery_points import RecoveryPoints
+
+    points = RecoveryPoints.for_config(ctx.obj["config"])
+    found = points.list()
+    if not found:
+        console.print(f"No recovery points in {points.directory}.")
+        return
+    readable = latest_schema_version()
+    table = Table(title=f"Recovery points in {points.directory}")
+    table.add_column("ID", style="bold")
+    table.add_column("Taken")
+    table.add_column("Schema", justify="right")
+    table.add_column("Taken by")
+    table.add_column("Vectors")
+    table.add_column("Size", justify="right")
+    for point in found:
+        schema = str(point.schema_version)
+        if point.schema_version > readable:
+            schema += " [dim](newer release)[/]"
+        table.add_row(
+            point.id,
+            point.created_at.astimezone().strftime("%Y-%m-%d %H:%M"),
+            schema,
+            point.taken_by_release,
+            "yes" if point.includes_vectors else "no",
+            _byte_size(point.size_bytes()),
+        )
+    console.print(table)
+    console.print(f"This release reads schema {readable} and older. Restore one with `memforge backup restore ID`.")
+
+
+@backup.command("restore")
+@click.argument("point_id", metavar="ID")
+@click.option("--yes", is_flag=True, help="Restore without asking for confirmation.")
+@click.pass_context
+def backup_restore(ctx, point_id: str, yes: bool):
+    """Put the database and vector index of recovery point ID back in place.
+
+    The data being replaced is first kept as a new recovery point, so a
+    restore can itself be undone. Stop the MemForge server first: the restore
+    is refused while any MemForge process has the data open. Source documents
+    are left as they are. The next start of a release newer than the restored
+    data upgrades it again.
+    """
+    from memforge.storage.database import latest_schema_version
+    from memforge.storage.recovery_points import RecoveryPoints, UpgradeError
+
+    points = RecoveryPoints.for_config(ctx.obj["config"])
+    try:
+        point = points.get(point_id)
+        if not yes:
+            click.confirm(
+                f"Replace the database and vector index in {ctx.obj['config'].base_dir} with recovery point "
+                f"{point.id} (schema {point.schema_version}, taken {point.created_at.astimezone():%Y-%m-%d %H:%M})?",
+                abort=True,
+            )
+        result = points.restore(point.id, readable_schema_version=latest_schema_version())
+    except UpgradeError as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print(f"[green]Restored recovery point {result.restored.id}.[/]")
+    if result.replaced is not None:
+        console.print(f"The data it replaced is kept as recovery point {result.replaced.id}.")
+    if result.restored.schema_version < latest_schema_version():
+        console.print(
+            f"The restored data has schema {result.restored.schema_version}; this release upgrades it to "
+            f"schema {latest_schema_version()} when it next starts. Start the release you want to run."
+        )
 
 
 # ---------------------------------------------------------------------------

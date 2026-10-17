@@ -18,9 +18,12 @@ up to date. Built from your docs, tickets, chat and agent sessions.
   </picture>
 </p>
 
-> **Status: beta.** APIs, storage formats and plugin packaging may still change,
-> and upgrading an installation or backing up and restoring its data is not
-> supported yet. The open-source build runs for one user on one machine.
+> **Status: beta.** APIs, storage formats and plugin packaging may still change.
+> A new release saves a recovery point of the database and vector index before
+> it upgrades them, rolls back a migration that fails, and refuses data a newer
+> release wrote; restoring the recovery point goes back
+> ([Upgrading](https://github.com/shno-labs/mem-forge/blob/main/docs/quickstart.md#upgrading)).
+> The open-source build runs for one user on one machine.
 
 ## Quick start
 
