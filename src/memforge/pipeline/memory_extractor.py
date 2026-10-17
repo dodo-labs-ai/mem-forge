@@ -28,6 +28,7 @@ from memforge.pipeline.extraction_contract import (
 
 from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
+    FragmentSelectionErrorCode,
     ProjectionFragmentCatalog,
 )
 from memforge.pipeline.projection_context import ExtractionAuthority
@@ -69,9 +70,23 @@ final content and metadata, then select required_refs in the same response.
 
 Do not return Observation or Revision IDs, offsets, hashes, profile names, catalog digests, Context refs, or lifecycle actions. Split a candidate that would otherwise need multiple independently claim-bearing Primary refs.
 
-""" + MEMORY_CLAIM_EVIDENCE_RULES + DURABLE_MEMORY_QUALITY_RULES + EVIDENCE_DISPLAY_RULES + """`required_only_candidates` may be selected as Required but never as Primary. Do not originate a Memory whose central assertion is stated only by required_only_candidates; preserve other useful claims with eligible Primary evidence. Fragment refs are valid only in this catalog. Never invent or transform a ref.
+""" + MEMORY_CLAIM_EVIDENCE_RULES + DURABLE_MEMORY_QUALITY_RULES + EVIDENCE_DISPLAY_RULES + """`required_only_candidates` may be selected as Required but never as Primary. Do not originate a Memory whose central assertion is stated only by required_only_candidates; a primary_candidates reply that agrees with, answers or decides on such content states its own stance and is that Memory's Primary. Preserve other useful claims with eligible Primary evidence. Fragment refs are valid only in this catalog. Never invent or transform a ref.
 
 Return ONLY a JSON object with a "memories" array. Use {{"memories": []}} when there are no memories."""
+
+# The one correction of a response whose selections this catalog cannot bind;
+# ``{error}`` names each rejected selection and the refs it may use instead.
+_SELECTION_CORRECTION_BLOCK = (
+    "\n\n<correction>\n"
+    "The previous response selected Evidence this catalog cannot bind:\n"
+    "{error}\n"
+    "Return the complete response again, with every Memory, including those that were valid. "
+    "Choose each primary_ref from primary_candidates; a required_only_candidates ref may be "
+    "selected only in required_refs. When a new reply agrees with, answers or decides on earlier "
+    "content, select the reply as Primary and the earlier content as Required. Omit a Memory "
+    "whose central assertion has no eligible Primary. Use only the refs supplied above.\n"
+    "</correction>"
+)
 
 
 class ExtractionReading:
@@ -226,10 +241,12 @@ class MemoryExtractor:
 
         Each ReadingGroup that holds authorized Primary is one runner item, so a
         request that times out, exceeds capacity or keeps returning invalid
-        output is halved and resent. A ReadingGroup that alone exceeds the
-        route's capacity, or whose output alone stays invalid, is diagnosed and
-        skipped. An execution or Evidence-binding error fails the work without
-        returning a successful subset.
+        output is halved and resent. A response binds whole: one candidate whose
+        selection the request's catalog cannot bind rejects it, and the runner
+        corrects it once, naming each rejected selection and the refs it may
+        use. A ReadingGroup that alone exceeds the route's capacity, or whose
+        output alone stays invalid or unbound, is diagnosed and skipped. An
+        execution error fails the work without returning a successful subset.
         """
 
         if not self.structured_llm_client:
@@ -259,6 +276,17 @@ class MemoryExtractor:
             rendered[tuple(item_ids)] = (request, request_catalog)
             return request
 
+        selections = _SelectionResolution()
+
+        def decode(response, item_ids, _parts):
+            request, request_catalog = rendered[tuple(item_ids)]
+            memories = selections.bind(
+                response.memories, catalog=request_catalog, request_key=tuple(item_ids),
+                prompt_hash=hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
+            )
+            # Every item of a request shares that request's bound Memories.
+            return tuple((item_id, (tuple(item_ids), (request, memories))) for item_id in item_ids)
+
         started = perf_counter()
         metrics: dict[str, object] = {
             "extraction_model": self.model,
@@ -279,9 +307,9 @@ class MemoryExtractor:
             outcomes = await runner.run_items(ItemTask(
                 item_ids=tuple(reading.items),
                 render=render,
-                # Every item of a request shares that request's response.
-                decode=lambda response, item_ids, _parts: ((item_id, (item_ids, response)) for item_id in item_ids),
+                decode=decode,
                 call=invoke,
+                correction=_SELECTION_CORRECTION_BLOCK,
             ))
         except Exception as error:
             logger.error("Unexpected projection Fragment extraction error: %s", error)
@@ -314,62 +342,77 @@ class MemoryExtractor:
                 },
             )
         skipped = reading.report_unread({item_id: outcome.error_code for item_id, outcome in failures.items()})
-        responses = dict(chunks[0] for chunks in outcomes.values() if not isinstance(chunks, ItemFailure))
-        memories: list[RawMemory] = []
-        resolution = _SelectionResolution()
-        image_count = image_bytes = 0
-        for item_ids, response in responses.items():
-            request, request_catalog = rendered[tuple(item_ids)]
-            image_count += len(request.images)
-            image_bytes += sum(len(image.body) for image in request.images)
-            memories.extend(resolution.resolve(
-                response.memories, catalog=request_catalog,
-                prompt_hash=hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
-                returned=len(response.memories),
-            ))
-        metadata = {
+        bound = dict(chunks[0] for chunks in outcomes.values() if not isinstance(chunks, ItemFailure))
+        memories = [memory for _request, request_memories in bound.values() for memory in request_memories]
+        requests = [request for request, _memories in bound.values()]
+        return MemoryExtractionResult(memories=memories, metadata={
             **metrics,
             **elapsed(),
-            "structured_llm_calls": runner.stats.calls,
-            "extraction_request_count": len(responses),
+            "extraction_request_count": len(bound),
             "skipped_reading_group_count": len(skipped),
-            "image_count": image_count,
-            "image_bytes": image_bytes,
-            **resolution.metrics(),
-        }
-        if resolution.returned != resolution.resolved:
-            return MemoryExtractionResult(
-                error_type="projection_extraction_incomplete",
-                error="Some extracted claims could not be bound to authentic Evidence.",
-                metadata={**metadata, "safe_error_code": "EXTRACTION_EVIDENCE_UNRESOLVED"},
-            )
-        return MemoryExtractionResult(memories=memories, metadata=metadata)
+            "image_count": sum(len(request.images) for request in requests),
+            "image_bytes": sum(len(image.body) for request in requests for image in request.images),
+            **selections.metrics(
+                skipped=sum(isinstance(outcome.error, UnresolvedSelection) for outcome in failures.values()),
+            ),
+        })
+
+
+class UnresolvedSelection(ValueError):
+    """A response with candidates whose selections the request's catalog cannot bind.
+
+    Its message names each rejected selection by its response location, with
+    the refs that location may use, for the response's one correction.
+    """
+
+    def __init__(self, rejections: tuple[tuple[int, FragmentSelectionError], ...]) -> None:
+        super().__init__("\n".join(_rejection_line(index, error) for index, error in rejections))
+        self.rejections = rejections
+
+
+def _rejection_line(index: int, error: FragmentSelectionError) -> str:
+    location = f"memories[{index}]" + (f".{error.location}" if error.location else "")
+    line = f"- {location}: {error}"
+    if error.allowed_refs is not None:
+        role = "Primary refs" if error.code is FragmentSelectionErrorCode.INELIGIBLE_ROLE else "refs"
+        line += f". Allowed {role}: {', '.join(error.allowed_refs)}"
+    return line
 
 
 class _SelectionResolution:
-    """Resolve each extracted candidate's selectors into exact Evidence, across one operation's requests."""
+    """Bind each response's candidates to exact Evidence, across one operation's requests.
+
+    A response binds whole or not at all. Every rejected candidate is counted and
+    signalled when it is read, whether its response is then corrected, halved or
+    skipped; bound candidates are signalled once their response is accepted.
+    """
 
     def __init__(self) -> None:
-        self.returned = 0
         self.resolved = 0
         self.rejection_counts: dict[str, int] = {}
-    def resolve(self, candidates, *, catalog, prompt_hash: str, returned: int) -> list[RawMemory]:
-        self.returned += returned
-        memories = []
+        self.corrected_requests = 0
+        self._rejected_requests: set[tuple[str, ...]] = set()
+
+    def bind(self, candidates, *, catalog, prompt_hash: str, request_key: tuple[str, ...]) -> list[RawMemory]:
+        """The response's Memories; raises ``UnresolvedSelection`` when any candidate cannot be bound."""
+
+        memories: list[RawMemory] = []
+        accepted: list[QualitySignal] = []
+        rejections: list[tuple[int, FragmentSelectionError]] = []
         for candidate_index, candidate in enumerate(candidates):
-            normalized_required = candidate.required_refs
             candidate_hash = catalog.selection_fingerprint(
                 candidate_content_hash=hashlib.sha256(candidate.content.encode("utf-8")).hexdigest(),
                 primary_ref=candidate.primary_ref,
-                required_refs=normalized_required,
+                required_refs=candidate.required_refs,
             )
             try:
                 selection = catalog.resolve_selection(
                     primary_ref=candidate.primary_ref,
-                    required_refs=normalized_required,
+                    required_refs=candidate.required_refs,
                     display_text_by_ref={display.ref: display.text for display in candidate.evidence_displays},
                 )
             except FragmentSelectionError as error:
+                rejections.append((candidate_index, error))
                 self.rejection_counts[error.code.value] = self.rejection_counts.get(error.code.value, 0) + 1
                 record_quality_signal(
                     QualitySignal(
@@ -381,7 +424,7 @@ class _SelectionResolution:
                     )
                 )
                 continue
-            record_quality_signal(
+            accepted.append(
                 QualitySignal(
                     event_name="evidence_admission_outcome",
                     outcome="expected",
@@ -390,7 +433,6 @@ class _SelectionResolution:
                     candidate_hash=candidate_hash,
                 )
             )
-            self.resolved += 1
             memories.append(
                 RawMemory(
                     content=candidate.content,
@@ -408,11 +450,23 @@ class _SelectionResolution:
                     resolved_evidence_selection=selection,
                 )
             )
+        if rejections:
+            self._rejected_requests.add(request_key)
+            raise UnresolvedSelection(tuple(rejections))
+        for signal in accepted:
+            record_quality_signal(signal)
+        self.resolved += len(memories)
+        if request_key in self._rejected_requests:
+            self.corrected_requests += 1
         return memories
 
-    def metrics(self) -> dict[str, object]:
+    def metrics(self, *, skipped: int) -> dict[str, object]:
+        """Per-reason rejections, and how the rejected requests ended: corrected, or skipped ReadingGroups."""
+
         return {
             "resolved_fragment_selection_count": self.resolved,
-            "rejected_fragment_selection_count": self.returned - self.resolved,
-            "fragment_selection_rejection_counts": self.rejection_counts,
+            "rejected_fragment_selection_count": sum(self.rejection_counts.values()),
+            "fragment_selection_rejection_counts": dict(sorted(self.rejection_counts.items())),
+            "selection_corrected_request_count": self.corrected_requests,
+            "selection_skipped_reading_group_count": skipped,
         }

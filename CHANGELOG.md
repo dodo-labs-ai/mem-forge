@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- Claim Extraction no longer fails a Document when the model cites Evidence its
+  request cannot bind. On an incremental update only the changed content may be
+  a Memory's Primary Evidence, and earlier content may only be Required; a model
+  that chose an earlier message as Primary, for example for a new Teams reply
+  that agrees with it, failed the Document with `EXTRACTION_EVIDENCE_UNRESOLVED`
+  at every sync.
+  - A response binds whole or not at all. When any of its candidates names an
+    unknown, duplicate or Required-only ref as it is used, the request is sent
+    once more with a correction that names each rejected selection, its
+    location in the response and the refs it may use. A request still unbound
+    is halved, and a ReadingGroup that alone stays unbound is skipped with the
+    `extraction_reading_group_unread` diagnostic, like one whose output stays
+    invalid; the Document commits with the rest and records no failure. A
+    skipped ReadingGroup is read again when its Document changes or is
+    reprocessed. Duplicate refs are still never removed on the model's behalf.
+  - The extraction prompt (`projection-extraction-v23`) says that a new reply
+    that agrees with, answers or decides on earlier content states its own
+    stance, so the reply is Primary and the earlier content Required, and that
+    only a pure repeat that adds no stance yields no Memory; the rule against
+    a signpost as Primary now applies among the refs eligible as Primary. A
+    derivation staged under `projection-extraction-v22` is superseded and
+    derived again.
+  - Extraction results and derivation batch telemetry count the rejected
+    selections per reason over every attempt
+    (`fragment_selection_rejection_counts`, `rejected_fragment_selection_count`),
+    the requests bound after their correction
+    (`selection_corrected_request_count`) and the ReadingGroups skipped unbound
+    (`selection_skipped_reading_group_count`), summed per Source Unit. Every
+    rejected candidate still records an `evidence_admission_outcome` quality
+    signal with its reason.
+  - The unused selector correction module, the structured client's
+    `correct_projection_fragment_selectors` with its
+    `ProjectionFragmentSelectorCorrectionResponse`, and the
+    `selector_correction_*` and `selector_normalization_*` telemetry are
+    removed; stored batch outputs that carry those keys still load. The batch
+    runner's `ItemTask` takes the `correction` block its task sends back.
+  - Cloud: no HANA schema, storage protocol or configuration change; the new
+    contract version arrives with the pin. Cloud's HANA workspace store test
+    that expects derivation batch telemetry to keep the `selector_correction_*`
+    keys must expect the selection keys above instead.
+
 - A Document that fails no longer holds its Source back, and a release that
   fixes the failure retries it without any action from you.
   - Every Document that fails in a sync, at any step from fetching it to

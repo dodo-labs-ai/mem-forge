@@ -149,33 +149,34 @@ def test_projection_fanout_aggregates_discarded_orphan_summary_metric() -> None:
     assert metrics["discarded_orphan_artifact_summary_count"] == 3
 
 
-def test_projection_fanout_aggregates_selector_normalization_telemetry() -> None:
+def test_projection_fanout_aggregates_selection_rejections_and_their_outcomes() -> None:
     metrics = _aggregate_extraction_metrics(
         (
             MemoryExtractionResult(
                 metadata={
-                    "selector_normalized_candidate_count": 1,
-                    "selector_normalization_count": 2,
-                    "selector_normalization_fingerprints": ["a" * 64],
+                    "rejected_fragment_selection_count": 3,
+                    "fragment_selection_rejection_counts": {"ineligible_role": 2, "unknown_ref": 1},
+                    "selection_corrected_request_count": 1,
+                    "selection_skipped_reading_group_count": 0,
                 }
             ),
             MemoryExtractionResult(
                 metadata={
-                    "selector_normalized_candidate_count": 2,
-                    "selector_normalization_count": 3,
-                    "selector_normalization_fingerprints": ["b" * 64, "c" * 64],
+                    "rejected_fragment_selection_count": 2,
+                    "fragment_selection_rejection_counts": {"ineligible_role": 2, "not_a_code": 9},
+                    "selection_corrected_request_count": 0,
+                    "selection_skipped_reading_group_count": 1,
+                    "skipped_reading_group_count": 1,
                 }
             ),
         )
     )
 
-    assert metrics["selector_normalized_candidate_count"] == 3
-    assert metrics["selector_normalization_count"] == 5
-    assert metrics["selector_normalization_fingerprints"] == [
-        "a" * 64,
-        "b" * 64,
-        "c" * 64,
-    ]
+    assert metrics["rejected_fragment_selection_count"] == 5
+    assert metrics["fragment_selection_rejection_counts"] == {"ineligible_role": 4, "unknown_ref": 1}
+    assert metrics["selection_corrected_request_count"] == 1
+    assert metrics["selection_skipped_reading_group_count"] == 1
+    assert metrics["skipped_reading_group_count"] == 1
 
 
 @pytest.mark.asyncio

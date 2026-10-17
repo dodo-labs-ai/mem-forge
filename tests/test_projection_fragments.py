@@ -17,7 +17,6 @@ from memforge.evals.agent_evaluation import QualitySignalCollector, quality_sign
 from memforge.llm.structured import (
     ProjectionFragmentMemoryCandidate,
     ProjectionFragmentMemoryExtractionResponse,
-    ProjectionFragmentSelectorCorrectionResponse,
     StructuredLlmImage,
 )
 from memforge.agent_knowledge import (
@@ -31,7 +30,6 @@ from memforge.memory.evidence import (
 from memforge.models import DocumentRecord
 from memforge.pipeline.memory_extractor import ExtractionReading, MemoryExtractor
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-from memforge.pipeline.fragment_selector_correction import correct_fragment_selectors_once
 from memforge.pipeline.projection_context import (
     ExtractionAuthority,
     ExtractionRequest,
@@ -902,7 +900,14 @@ async def test_prompt_requires_owned_primary_without_suppressing_other_eligible_
     assert '"required_only_candidates"' in prompts[0]
     assert (
         "Do not originate a Memory whose central assertion is stated only by required_only_candidates; "
-        "preserve other useful claims with eligible Primary evidence."
+        "a primary_candidates reply that agrees with, answers or decides on such content states its own "
+        "stance and is that Memory's Primary. Preserve other useful claims with eligible Primary evidence."
+    ) in prompts[0]
+    assert "Among refs eligible as Primary, a\nsignpost that only introduces an assertion elsewhere" in prompts[0]
+    assert (
+        "A new reply that agrees with, answers or decides on earlier content states its\n"
+        "own stance: select the reply as Primary and the earlier content it settles as\n"
+        "Required. Only a pure repeat that adds no stance yields no Memory."
     ) in prompts[0]
 
 
@@ -1089,7 +1094,7 @@ def test_inspected_artifact_uses_same_ref_shape_as_text_required() -> None:
 
 
 @pytest.mark.asyncio
-async def test_extractor_rejects_malformed_batch_without_normalizing_or_pruning() -> None:
+async def test_extractor_skips_a_malformed_batch_without_normalizing_or_pruning() -> None:
     projection = _projection(
         context_profile=BINARY_PROFILE,
         context_content="",
@@ -1110,9 +1115,6 @@ async def test_extractor_rejects_malformed_batch_without_normalizing_or_pruning(
     class Client(RevisionClientFixture):
         def request_fits(self, prompt, **kwargs):
             return True
-
-        async def correct_projection_fragment_selectors(self, prompt: str, **kwargs):
-            return ProjectionFragmentSelectorCorrectionResponse(corrections=[])
 
         async def extract_projection_fragment_memories(self, prompt: str, **kwargs):
             return ProjectionFragmentMemoryExtractionResponse.model_validate(
@@ -1177,16 +1179,16 @@ async def test_extractor_rejects_malformed_batch_without_normalizing_or_pruning(
             ),
         )
 
-    assert result.error_type == "projection_extraction_incomplete"
-    assert result.metadata["safe_error_code"] == "EXTRACTION_EVIDENCE_UNRESOLVED"
+    # Every response keeps the same duplicates: the request and its correction,
+    # then each halved ReadingGroup and its correction. Nothing is normalized,
+    # and each ReadingGroup is skipped rather than bound in part.
+    assert result.error_type is None
     assert result.memories == []
-    assert result.metadata["fragment_selection_rejection_counts"] == {"duplicate_ref": 5}
-    assert not any(key.startswith("selector_normalization") for key in result.metadata)
-    assert not any(signal.reason_code == "fragment_selector_normalized"
-                   for signal in collector.snapshot())
-
-    with pytest.raises(ValueError, match="failed derivation batches have no reusable output"):
-        memory_extraction_output_payload(result)
+    assert result.metadata["structured_llm_calls"] == 6
+    assert result.metadata["fragment_selection_rejection_counts"] == {"duplicate_ref": 30}
+    assert result.metadata["selection_skipped_reading_group_count"] == 2
+    assert result.metadata["skipped_reading_group_count"] == 2
+    assert [signal.reason_code for signal in collector.snapshot()] == ["duplicate_ref"] * 30
 
 
 @pytest.mark.asyncio
@@ -1244,12 +1246,12 @@ async def test_extractor_persists_only_resolved_parts_and_never_falls_back() -> 
     assert restored.memories[0].resolved_evidence_selection == (
         memory.resolved_evidence_selection
     )
-    assert "selector_normalization_count" not in restored.metadata
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["valid", "unknown", "duplicate", "required_only"])
-async def test_extraction_binds_once_without_selector_repair_or_partial_success(mode) -> None:
+@pytest.mark.parametrize("corrected", [True, False])
+async def test_extraction_corrects_an_unbound_selection_once_then_skips_its_reading_group(mode, corrected) -> None:
     projection = _projection()
     catalog = _compile(projection, access_context_hash="access-1")
     primary = next(f.reference for f in catalog.fragments if f.primary_eligible)
@@ -1262,84 +1264,61 @@ async def test_extraction_binds_once_without_selector_repair_or_partial_success(
         primary_ref=required if mode == "required_only" else "unknown" if mode == "unknown" else primary,
         required_refs=[primary] if mode == "duplicate" else [],
      evidence_displays=evidence_displays(required if mode == "required_only" else "unknown" if mode == "unknown" else primary, [primary] if mode == "duplicate" else []))
+    bound_extra = ProjectionFragmentMemoryCandidate(
+        content="Two reviewers are required.", memory_type="convention", primary_ref=primary,
+        required_refs=[required], evidence_displays=evidence_displays(primary, [required]))
 
     class Client(RevisionClientFixture):
-        extraction_calls = 0
-        correction_calls = 0
+        def __init__(self):
+            self.prompts = []
 
         def request_fits(self, prompt, **kwargs):
             return True
 
         async def extract_projection_fragment_memories(self, prompt, **kwargs):
-            self.extraction_calls += 1
-            return ProjectionFragmentMemoryExtractionResponse(memories=[stable] if mode == "valid" else [stable, extra])
-
-        async def correct_projection_fragment_selectors(self, prompt, **kwargs):
-            self.correction_calls += 1
-            raise AssertionError("the extraction contract has no selector repair stage")
+            self.prompts.append(prompt)
+            if mode == "valid":
+                return ProjectionFragmentMemoryExtractionResponse(memories=[stable])
+            if corrected and "<correction>" in prompt:
+                return ProjectionFragmentMemoryExtractionResponse(memories=[stable, bound_extra])
+            return ProjectionFragmentMemoryExtractionResponse(memories=[stable, extra])
 
     client = Client()
     result = await MemoryExtractor(structured_llm_client=client).extract_projection_fragment_memories(
         catalog, source_type="github_repo",
         revision_context=RevisionAssessmentContext(projection=projection, base=None, access_context_hash="access-1"),
     )
-    assert client.extraction_calls == 1 and client.correction_calls == 0
-    assert result.metadata["structured_llm_calls"] == 1
-    if mode != "valid":
-        assert result.error_type == "projection_extraction_incomplete"
-        assert result.metadata["safe_error_code"] == "EXTRACTION_EVIDENCE_UNRESOLVED"
-        assert result.memories == []
-        with pytest.raises(ValueError, match="failed derivation batches have no reusable output"):
-            memory_extraction_output_payload(result)
-    else:
-        assert result.error_type is None
+    assert result.error_type is None
+    if mode == "valid":
+        assert len(client.prompts) == 1 and result.metadata["rejected_fragment_selection_count"] == 0
         restored = memory_extraction_result_from_output_payload(memory_extraction_output_payload(result))
         assert restored.memories[0].resolved_evidence_selection == result.memories[0].resolved_evidence_selection
-        assert not any(key.startswith("selector_correction") for key in result.metadata)
-
-
-@pytest.mark.asyncio
-async def test_selector_correction_groups_failures_and_reuses_artifact_images() -> None:
-    projection = _projection(context_profile=BINARY_PROFILE, context_content="", context_metadata={
-        "source_artifact": {"inference_eligible": True, "sha256": "a" * 64,
-                            "media_type": "image/png", "size_bytes": 128, "filename": "diagram.png"},
-    })
-    catalog = _compile(projection, access_context_hash="access-1")
-    primary = next(f.reference for f in catalog.fragments if f.primary_eligible)
-    artifact = next(f.reference for f in catalog.fragments if f.kind.value == "artifact")
-    candidates = [
-        ProjectionFragmentMemoryCandidate(content="Fixed claim A", memory_type="fact", primary_ref="bad", evidence_displays=evidence_displays("bad", ())),
-        ProjectionFragmentMemoryCandidate(content="Fixed claim B", memory_type="fact", primary_ref=primary,
-                                          required_refs=["unknown-required"], evidence_displays=evidence_displays(primary, ["unknown-required"])),
-    ]
-    images = (StructuredLlmImage(source_observation_id="obs-context", media_type="image/png", body=b"image"),)
-
-    class Client(RevisionClientFixture):
-        calls = 0
-
-        def request_fits(self, prompt, **kwargs):
-            assert kwargs["images"] is images
-            return True
-
-        async def correct_projection_fragment_selectors(self, prompt, **kwargs):
-            self.calls += 1
-            assert kwargs["images"] is images
-            assert all(candidate.content in prompt for candidate in candidates)
-            return ProjectionFragmentSelectorCorrectionResponse.model_validate({"corrections": [
-                {"candidate_index": 0, "primary_ref": primary, "required_refs": [artifact]},
-                {"candidate_index": 1, "primary_ref": primary, "required_refs": ["still-unknown"]},
-            ]})
-
-    client = Client()
-    corrected, metrics = await correct_fragment_selectors_once(
-        candidates, catalog=catalog, client=client, extraction_prompt="supplied catalog",
-        max_tokens=512, model="test-model", images=images,
-    )
-    assert client.calls == 1
-    assert metrics["selector_correction_candidate_count"] == 2
-    assert metrics["selector_correction_recovered_count"] == 1
-    assert corrected[0].required_refs == [artifact]
-    assert corrected[1] is candidates[1]
+        return
+    code = {"unknown": "unknown_ref", "duplicate": "duplicate_ref", "required_only": "ineligible_role"}[mode]
+    # Corrected: the request and its correction. Still unbound: then each of the
+    # two halved ReadingGroups and its own correction.
+    assert len(client.prompts) == (2 if corrected else 6)
+    correction = client.prompts[1].removeprefix(client.prompts[0])
+    assert correction.startswith("\n\n<correction>\nThe previous response selected Evidence this catalog cannot bind:")
+    assert ("- memories[1]: " if mode == "duplicate" else "- memories[1].primary_ref: ") in correction
+    if mode == "required_only":
+        assert f"Allowed Primary refs: {primary}" in correction
+    assert "Return the complete response again, with every Memory" in correction
+    if corrected:
+        # Only the corrected response is bound, with both of its Memories.
+        assert [memory.content for memory in result.memories] == [stable.content, bound_extra.content]
+        assert result.metadata["fragment_selection_rejection_counts"] == {code: 1}
+        assert result.metadata["selection_corrected_request_count"] == 1
+        assert result.metadata["selection_skipped_reading_group_count"] == 0
+    else:
+        # A bound candidate of an unbound response is never kept on its own.
+        counts = result.metadata["fragment_selection_rejection_counts"]
+        assert result.memories == []
+        assert counts[code] >= 2
+        assert sum(counts.values()) == result.metadata["rejected_fragment_selection_count"]
+        assert result.metadata["selection_corrected_request_count"] == 0
+        assert result.metadata["selection_skipped_reading_group_count"] == 2
+        assert result.metadata["skipped_reading_group_count"] == 2
 
 
 def test_compact_catalog_preserves_exact_text_authority_and_internal_provenance():

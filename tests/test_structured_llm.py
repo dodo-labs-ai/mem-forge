@@ -29,7 +29,6 @@ from memforge.llm.structured import (
     MemoryRelationResponse,
     OfflineSemanticJudgeResponse,
     ProjectionFragmentMemoryExtractionResponse,
-    ProjectionFragmentSelectorCorrectionResponse,
     RerankResponse,
     SupportAssessmentWireResponse,
     StructuredLlmCallTelemetry,
@@ -62,28 +61,17 @@ def _png_bytes(*, width: int = 1, height: int = 1) -> bytes:
     return output.getvalue()
 
 
-def test_projection_fragment_schemas_describe_catalog_role_constraints() -> None:
-    schemas = (
-        (
-            ProjectionFragmentMemoryExtractionResponse.model_json_schema(),
-            "ProjectionFragmentMemoryCandidate",
-        ),
-        (
-            ProjectionFragmentSelectorCorrectionResponse.model_json_schema(),
-            "ProjectionFragmentSelectorCorrection",
-        ),
-    )
-
-    for schema, definition_name in schemas:
-        properties = schema["$defs"][definition_name]["properties"]
-        primary_description = properties["primary_ref"]["description"].lower()
-        assert "copied unchanged from primary_candidates" in primary_description
-        assert "never select from required_only_candidates" in primary_description
-        assert "central conclusion" in primary_description
-        required_description = properties["required_refs"]["description"].lower()
-        for rule in ("duplicate-free", "primary_candidates or required_only_candidates",
-                     "do not repeat primary_ref", "additional contribution", "best effort", "[] is valid"):
-            assert rule in required_description
+def test_projection_fragment_schema_describes_catalog_role_constraints() -> None:
+    schema = ProjectionFragmentMemoryExtractionResponse.model_json_schema()
+    properties = schema["$defs"]["ProjectionFragmentMemoryCandidate"]["properties"]
+    primary_description = properties["primary_ref"]["description"].lower()
+    assert "copied unchanged from primary_candidates" in primary_description
+    assert "never select from required_only_candidates" in primary_description
+    assert "central conclusion" in primary_description
+    required_description = properties["required_refs"]["description"].lower()
+    for rule in ("duplicate-free", "primary_candidates or required_only_candidates",
+                 "do not repeat primary_ref", "additional contribution", "best effort", "[] is valid"):
+        assert rule in required_description
 
 
 class ChoiceMessage:
@@ -754,7 +742,6 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "SupportAssessmentWireResponse": '{"results":[]}',
         "ClaimRevisionWireResponse": '{"results":[]}',
         "ProjectionFragmentMemoryExtractionResponse": '{"memories":[]}',
-        "ProjectionFragmentSelectorCorrectionResponse": '{"corrections":[]}',
         "CandidateAdmissionResponse": '{"decisions":[]}',
         "MemoryRelationResponse": '{"decisions":[]}',
         "CrossDocumentRelationResponse": '{"decisions":[]}',
@@ -789,9 +776,6 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "evaluate_revision_work": lambda: client.evaluate_revision_work("prompt", response_format=SupportAssessmentWireResponse, max_tokens=512),
         "assess_claim_revisions": lambda: client.assess_claim_revisions("prompt"),
         "extract_projection_fragment_memories": lambda: client.extract_projection_fragment_memories(
-            "prompt", max_tokens=512,
-        ),
-        "correct_projection_fragment_selectors": lambda: client.correct_projection_fragment_selectors(
             "prompt", max_tokens=512,
         ),
         "admit_candidates": lambda: client.admit_candidates("prompt", max_tokens=512),
