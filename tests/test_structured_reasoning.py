@@ -126,8 +126,6 @@ async def _call(client: LiteLlmStructuredClient, operation: str) -> None:
             "prompt", response_format=CapabilityCheckResponse, max_tokens=256),
         "extract_projection_fragment_memories": lambda: client.extract_projection_fragment_memories(
             "prompt", max_tokens=8192),
-        "correct_projection_fragment_selectors": lambda: client.correct_projection_fragment_selectors(
-            "prompt", max_tokens=2048),
         "assess_claim_revisions": lambda: client.assess_claim_revisions("prompt"),
         "support_assessment": lambda: client.evaluate_revision_work(
             "prompt", response_format=SupportAssessmentWireResponse, max_tokens=4096),
@@ -152,7 +150,6 @@ DIRECT_ANSWER_OPERATIONS = (
 )
 REASONED_OPERATIONS = (
     "extract_projection_fragment_memories",
-    "correct_projection_fragment_selectors",
     "assess_claim_revisions",
     "support_assessment",
     "generate_agent_knowledge_patch",

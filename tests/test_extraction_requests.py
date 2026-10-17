@@ -350,3 +350,117 @@ def _updated_normalized_document(initial, body):
         prior_unit_revision=initial.source_unit_revisions[0],
         prior_observation_revisions={revision.observation_id: revision for revision in initial.observation_revisions},
     )
+
+
+# An incremental Teams window: the base revision holds the earlier message; the
+# target adds a reply that agrees with it.
+EARLIER_MESSAGE = "checkpointer 先不自己实现，等官方支持"
+REPLY_MESSAGE = "嗯，如果不严重的话可以等等"
+
+
+def _teams_reply_window():
+    from tests.test_projection_context import _teams_projection
+
+    initial = _teams_projection((EARLIER_MESSAGE,))
+    target = _teams_projection(
+        (EARLIER_MESSAGE, REPLY_MESSAGE),
+        run_id="run-teams-reply",
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions={revision.observation_id: revision for revision in initial.observation_revisions},
+    )
+    authority = plan_projection_evidence_work(
+        target, committed_base_snapshot=_committed_snapshot(initial), reprocess_all_current_observations=False,
+    )
+    assert isinstance(authority, ExtractionAuthority)
+    return initial, target, authority
+
+
+class _TeamsReplyClient(Client):
+    """Selects the earlier message as Primary; with ``corrects``, its correction selects the reply."""
+
+    def __init__(self, *, corrects):
+        super().__init__(limit=40000)
+        self.corrects = corrects
+        self.extraction_prompts = []
+        self.refs = {}
+
+    async def extract_projection_fragment_memories(self, prompt, **kwargs):
+        self.extraction_prompts.append(prompt)
+        earlier, reply = self.refs["earlier"], self.refs["reply"]
+        primary, required = (reply, earlier) if self.corrects and "<correction>" in prompt else (earlier, reply)
+        return ProjectionFragmentMemoryExtractionResponse.model_validate({"memories": [{
+            "content": "checkpointer 先不自己实现，问题不严重时等官方支持。",
+            "memory_type": "decision",
+            "primary_ref": primary,
+            "required_refs": [required],
+            "evidence_displays": evidence_displays(primary, [required]),
+        }]})
+
+
+async def _extract_teams_reply(client):
+    from memforge.evals.agent_evaluation import QualitySignalCollector, quality_signal_scope
+
+    initial, target, authority = _teams_reply_window()
+    extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=client)
+    extraction = extraction_plan(target, authority, extractor=extractor, base=initial)
+    [request] = extraction.requests
+    [earlier] = [f for f in request.catalog.fragments if EARLIER_MESSAGE in f.presentation_text]
+    [reply] = [f for f in request.catalog.fragments if REPLY_MESSAGE in f.presentation_text]
+    # On the update only the reply may be Primary; the earlier message is Required-only.
+    assert reply.primary_eligible and not earlier.primary_eligible
+    client.refs = {"earlier": earlier.reference, "reply": reply.reference}
+    collector = QualitySignalCollector()
+    with quality_signal_scope(collector):
+        result = await extractor.extract_projection_fragment_memories(
+            request.catalog, source_type="teams", doc_type="teams",
+            revision_context=RevisionAssessmentContext(projection=target, base=initial, access_context_hash="scope"),
+        )
+    return extraction, result, earlier, reply, collector.snapshot()
+
+
+@pytest.mark.asyncio
+async def test_teams_reply_selected_as_required_only_is_corrected_to_primary_on_the_reply():
+    client = _TeamsReplyClient(corrects=True)
+    _extraction, result, earlier, reply, signals = await _extract_teams_reply(client)
+
+    assert "A new reply that agrees with, answers or decides on earlier content" in client.extraction_prompts[0]
+    assert len(client.extraction_prompts) == 2
+    correction = client.extraction_prompts[1].removeprefix(client.extraction_prompts[0])
+    assert (
+        f"- memories[0].primary_ref: Fragment reference is not eligible for primary: {earlier.reference}. "
+        f"Allowed Primary refs: {reply.reference}"
+    ) in correction
+    assert result.error_type is None
+    [memory] = result.memories
+    assert memory.source_observation_id == reply.anchor.observation_id
+    assert memory.required_source_observation_ids == [earlier.anchor.observation_id]
+    assert result.metadata["fragment_selection_rejection_counts"] == {"ineligible_role": 1}
+    assert result.metadata["selection_corrected_request_count"] == 1
+    assert result.metadata["skipped_reading_group_count"] == 0
+    assert [(s.outcome, s.reason_code) for s in signals] == [
+        ("rejected", "ineligible_role"), ("expected", "fragment_selection_resolved"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_teams_reply_still_selected_as_required_only_skips_its_reading_group_and_the_document_commits(caplog):
+    from memforge.source_derivation import assemble_source_derivation_results
+
+    client = _TeamsReplyClient(corrects=False)
+    with caplog.at_level("WARNING", logger="memforge.pipeline.memory_extractor"):
+        extraction, result, _earlier, _reply, signals = await _extract_teams_reply(client)
+
+    assert len(client.extraction_prompts) == 2
+    assert result.error_type is None and result.memories == []
+    assert "safe_error_code" not in result.metadata
+    assert result.metadata["selection_skipped_reading_group_count"] == 1
+    assert result.metadata["skipped_reading_group_count"] == 1
+    assert "extraction_reading_group_unread" in caplog.text
+    assert [(s.outcome, s.reason_code) for s in signals] == [("rejected", "ineligible_role")] * 2
+
+    _initial, target, _authority = _teams_reply_window()
+    unit = assemble_source_derivation_results(projection=target, plan=extraction, results=(result,))
+    assert unit.error_type is None
+    assert unit.metadata["skipped_reading_group_count"] == 1
+    assert unit.metadata["fragment_selection_rejection_counts"] == {"ineligible_role": 2}
+    assert unit.metadata["selection_skipped_reading_group_count"] == 1

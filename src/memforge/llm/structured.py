@@ -377,27 +377,6 @@ class ProjectionFragmentMemoryExtractionResponse(StructuredResponseModel):
     memories: list[ProjectionFragmentMemoryCandidate]
 
 
-class ProjectionFragmentSelectorCorrection(StructuredResponseModel):
-    """Selector-only proposal for one fixed extraction candidate."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    candidate_index: int
-    primary_ref: str = Field(description=_PRIMARY_REF_DESCRIPTION)
-    required_refs: list[str] = Field(
-        default_factory=list,
-        description=_REQUIRED_REFS_DESCRIPTION,
-    )
-
-
-class ProjectionFragmentSelectorCorrectionResponse(StructuredResponseModel):
-    """One optional correction pass; omitted candidates remain rejected."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    corrections: list[ProjectionFragmentSelectorCorrection]
-
-
 CANDIDATE_REF_PATTERN = r"^CND-[0-9]{4}$"
 
 
@@ -1942,18 +1921,6 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt,
             response_format=ProjectionFragmentMemoryExtractionResponse,
-            max_tokens=max_tokens,
-            model=model,
-            images=images,
-        )
-
-    async def correct_projection_fragment_selectors(
-        self, prompt: str, *, max_tokens: int, model: str | None = None,
-        images: StructuredImageInputs = (),
-    ) -> ProjectionFragmentSelectorCorrectionResponse:
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=ProjectionFragmentSelectorCorrectionResponse,
             max_tokens=max_tokens,
             model=model,
             images=images,

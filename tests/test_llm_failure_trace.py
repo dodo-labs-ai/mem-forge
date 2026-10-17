@@ -6,7 +6,6 @@ import json
 import pytest
 import litellm
 
-from memforge.llm.request_budget import RequestBudget
 from memforge.llm.structured import (
     ClaimRevisionWireDecision, LiteLlmStructuredClient, RerankResponse, StructuredLlmConfig,
 )
@@ -218,37 +217,6 @@ async def test_local_timeout_artifact_is_complete_and_marks_missing_output(monke
 
 
 @pytest.mark.asyncio
-async def test_optional_selector_correction_keeps_rejected_extraction_trace(monkeypatch):
-    from memforge.pipeline.fragment_selector_correction import correct_fragment_selectors_once
-    from memforge.pipeline.projection_fragments import FragmentSelectionError, FragmentSelectionErrorCode
-    from memforge.llm.structured import ProjectionFragmentMemoryCandidate
-    sink = Sink()
-    async def complete(**kwargs):
-        return response('{"ranking":[]}')
-    monkeypatch.setattr("litellm.acompletion", complete)
-    source_response = await client(sink)._call_schema(prompt="original extraction", response_format=RerankResponse, max_tokens=100)
-    class Catalog:
-        def resolve_selection(self, **kwargs):
-            raise FragmentSelectionError(FragmentSelectionErrorCode.UNKNOWN_REF, "unknown selector")
-    class CorrectionClient:
-        def request_budget(self, model=None):
-            return RequestBudget("fixture", 200000, 200000, 64000, 0.8, "fixture")
-
-        def request_fits(self, *args, **kwargs):
-            return False
-
-        async def correct_projection_fragment_selectors(self, *args, **kwargs):
-            raise AssertionError("a correction that does not fit is never sent")
-    candidate = ProjectionFragmentMemoryCandidate(content="fixed claim", memory_type="fact", primary_ref="unknown", evidence_displays=evidence_displays("unknown", ()))
-    _, metrics = await correct_fragment_selectors_once([candidate], catalog=Catalog(), client=CorrectionClient(),
-        extraction_prompt="original extraction", max_tokens=100, model=None, images=(), source_response=source_response)
-    assert metrics["selector_correction_outcome"] == "capacity_skipped"
-    record = next(iter(sink.records.values()))
-    assert record["prompt"] == "original extraction"
-    assert record["failures"][-1]["stage"] == "business_validation"
-
-
-@pytest.mark.asyncio
 async def test_actual_executor_traces_a_rejected_row_with_its_location(monkeypatch):
     from memforge.pipeline.revision_work import RevisionWorkExecutor
     from tests.test_revision_work import Client, work_items, payload
@@ -277,35 +245,3 @@ async def test_actual_executor_traces_a_rejected_row_with_its_location(monkeypat
     assert record["outcome"] == "failed"
     assert record["failures"][-1]["location"] == "results[0].support_witness_refs[0]"
     assert "PRM-9999" in record["attempts"][0]["response"]["choices"][0]["message"]["content"]
-
-
-@pytest.mark.asyncio
-async def test_multiple_selector_errors_preserve_original_row_and_field_indices(monkeypatch):
-    from memforge.pipeline.fragment_selector_correction import correct_fragment_selectors_once
-    from memforge.pipeline.projection_fragments import FragmentSelectionError, FragmentSelectionErrorCode
-    from memforge.llm.structured import ProjectionFragmentMemoryCandidate
-    sink = Sink()
-    async def complete(**kwargs):
-        return response('{"ranking":[]}')
-    monkeypatch.setattr("litellm.acompletion", complete)
-    original = await client(sink)._call_schema(prompt="original", response_format=RerankResponse, max_tokens=100)
-    class Catalog:
-        def resolve_selection(self, **kwargs):
-            raise FragmentSelectionError(FragmentSelectionErrorCode.UNKNOWN_REF, "unknown selector",
-                location="required_refs[0]", received=kwargs["required_refs"][0], allowed_refs=["p2"])
-    class CorrectionClient:
-        def request_budget(self, model=None):
-            return RequestBudget("fixture", 200000, 200000, 64000, 0.8, "fixture")
-
-        def request_fits(self, *args, **kwargs):
-            return False
-
-        async def correct_projection_fragment_selectors(self, *args, **kwargs):
-            raise AssertionError("a correction that does not fit is never sent")
-    candidates = [ProjectionFragmentMemoryCandidate(content=f"claim {i}", memory_type="fact", primary_ref="p2",
-        required_refs=["p2", f"unknown-{i}", f"unknown-{i}"], evidence_displays=evidence_displays("p2", ["p2", f"unknown-{i}", f"unknown-{i}"])) for i in range(2)]
-    await correct_fragment_selectors_once(candidates, catalog=Catalog(), client=CorrectionClient(),
-        extraction_prompt="original", max_tokens=100, model=None, images=(), source_response=original)
-    errors = next(iter(sink.records.values()))["failures"]
-    assert [e["location"] for e in errors] == ["memories[0].required_refs[1]", "memories[1].required_refs[1]"]
-    assert [e["context"]["candidate_index"] for e in errors] == [0, 1]

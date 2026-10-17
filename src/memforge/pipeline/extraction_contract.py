@@ -15,7 +15,7 @@ __all__ = [
 
 # Recorded on every Source derivation and hashed into its batch identities.
 # Stored derivations with any other value are superseded, never resumed.
-PROJECTION_EXTRACTION_CONTRACT_VERSION = "projection-extraction-v22"
+PROJECTION_EXTRACTION_CONTRACT_VERSION = "projection-extraction-v23"
 PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION = 11
 CONTRACT_SUPERSEDED = "CONTRACT_SUPERSEDED"
 
@@ -42,10 +42,13 @@ independently changing conclusions. Keep known material qualifications in each
 claim even when a supplementary citation is omitted.
 
 Choose one eligible Primary directly supporting the central conclusion. It need
-not alone prove every supporting detail. A signpost that only introduces an
-assertion elsewhere is insufficient: select the substantive assertion itself.
-Prefer a focused complete source view
-when available; a complete broader view is valid.
+not alone prove every supporting detail. Among refs eligible as Primary, a
+signpost that only introduces an assertion elsewhere is insufficient: select the
+eligible ref that states the assertion itself. Prefer a focused complete source
+view when available; a complete broader view is valid.
+A new reply that agrees with, answers or decides on earlier content states its
+own stance: select the reply as Primary and the earlier content it settles as
+Required. Only a pure repeat that adds no stance yields no Memory.
 Select Required only when it confidently adds support to a specific part of the
 final claim or metadata beyond Primary and source-bound interpretation already
 supplied. Do not repeat included labels, duplicate evidence or merely related

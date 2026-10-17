@@ -54,7 +54,8 @@ type FailureCategory = Literal[
 OUTPUT_INVALID = "output_invalid"
 # Contract: one bounded correction, with the same input and refs.
 _MAX_CORRECTIONS = 1
-# The one correction of a response that cannot be read into rows.
+# The one correction of a response that cannot be read into rows, unless the
+# task names its own; ``{error}`` says why the response was rejected.
 _CORRECTION_BLOCK = (
     "\n\n<correction>\n"
     "The previous response was rejected: {error}\n"
@@ -158,7 +159,9 @@ class ItemTask(Generic[Part, Result]):
     RejectedRow)`` for a row whose meaning is invalid, and raises ``ValueError``
     only when the response cannot be read into rows. A row whose ID the task
     does not know is still yielded, under that ID, so the runner can reject the
-    response. ``label`` names an item as the model sees it.
+    response. ``label`` names an item as the model sees it. ``correction`` is
+    the block appended to a request whose response cannot be read; its
+    ``{error}`` is the decoder's error.
     """
 
     item_ids: Sequence[ItemId]
@@ -170,6 +173,7 @@ class ItemTask(Generic[Part, Result]):
     context: Sequence[Part] = ()
     journal: RequestJournal | None = None
     label: Callable[[ItemId], str] = str
+    correction: str = _CORRECTION_BLOCK
 
 
 @dataclass(frozen=True)
@@ -416,7 +420,7 @@ class LlmBatchRunner:
         else:
             outcome = await self._send(
                 request, item_ids, task.call, lambda response: task.decode(response, item_ids, context),
-                task.journal, task.label,
+                task.journal, task.label, correction=task.correction,
             )
             if not isinstance(outcome, ItemFailure):
                 return await self._with_reask(
@@ -607,6 +611,7 @@ class LlmBatchRunner:
         self, request: LlmRequest, item_ids: tuple[ItemId, ...], call: StructuredCall,
         decode: Callable[[BaseModel], Iterable[tuple[ItemId, Result | RejectedRow]]],
         journal: RequestJournal | None, label: Callable[[ItemId], str], *, correct: bool = True,
+        correction: str = _CORRECTION_BLOCK,
     ) -> dict[ItemId, Result | RejectedRow] | ItemFailure:
         """Send one request, or reuse its journaled response, and read it into one row per item.
 
@@ -624,7 +629,9 @@ class LlmBatchRunner:
                 except ValueError as error:
                     # The stored response no longer reads into rows under this task's rules.
                     return ItemFailure("invalid_response", OUTPUT_INVALID, error)
-        outcome = await self._call_with_correction(request, item_ids, call, decode, work_id, label, correct)
+        outcome = await self._call_with_correction(
+            request, item_ids, call, decode, work_id, label, correct, correction,
+        )
         if isinstance(outcome, ItemFailure):
             if journal is not None:
                 await journal.record(work_id, outcome)
@@ -637,7 +644,7 @@ class LlmBatchRunner:
     async def _call_with_correction(
         self, request: LlmRequest, item_ids: tuple[ItemId, ...], call: StructuredCall,
         decode: Callable[[BaseModel], Iterable[tuple[ItemId, Result | RejectedRow]]], work_id: str | None,
-        label: Callable[[ItemId], str], correct: bool,
+        label: Callable[[ItemId], str], correct: bool, correction: str,
     ) -> tuple[BaseModel, dict[ItemId, Result | RejectedRow]] | ItemFailure:
         """Call once; a response that cannot be read into rows gets one correction of the whole request."""
 
@@ -671,7 +678,7 @@ class LlmBatchRunner:
                     "llm_batch_output_rejected items=%d attempt=%d error_class=%s",
                     len(item_ids), corrections + 1, type(error).__name__,
                 )
-                corrected = replace(request, prompt=request.prompt + _CORRECTION_BLOCK.format(error=error))
+                corrected = replace(request, prompt=request.prompt + correction.format(error=error))
                 if not correct or corrections == _MAX_CORRECTIONS or not self.fits(corrected, correction=True):
                     return ItemFailure("invalid_response", OUTPUT_INVALID, error)
                 corrections += 1
