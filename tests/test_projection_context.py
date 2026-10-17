@@ -146,7 +146,7 @@ def _confluence_projection_with_images(
 
 
 def _teams_projection(
-    message_contents: tuple[str, str] = (
+    message_contents: tuple[str, ...] = (
         "Decision: keep A7",
         "Acknowledged: keep A7",
     ),
@@ -172,15 +172,11 @@ def _teams_projection(
     messages = {
         "messages": [
             {
-                "id": "msg-1",
-                "content": message_contents[0],
-                "time": "2026-07-15T10:00:00Z",
-            },
-            {
-                "id": "msg-2",
-                "content": message_contents[1],
-                "time": "2026-07-15T10:01:00Z",
-            },
+                "id": f"msg-{index + 1}",
+                "content": content,
+                "time": f"2026-07-15T10:{index:02d}:00Z",
+            }
+            for index, content in enumerate(message_contents)
         ]
     }
     return project_source_item(

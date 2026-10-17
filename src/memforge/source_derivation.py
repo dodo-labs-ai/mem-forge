@@ -56,6 +56,7 @@ from memforge.pipeline.projection_context import (
     observation_is_inference_eligible,
     plan_projection_evidence_work,
 )
+from memforge.pipeline.projection_fragments import FragmentSelectionErrorCode
 from memforge.pipeline.revision_assessment import REVISION_INPUT_POLICY
 from memforge.source_artifacts import SOURCE_ARTIFACT_OBSERVATION_TYPE, SourceArtifactSummary
 from memforge.source_projection import (
@@ -85,7 +86,14 @@ SOURCE_DERIVATION_BATCH_RETRYABLE_FAILURE = "retryable_failure"
 
 _SAFE_DERIVATION_DIAGNOSTIC_RE = re.compile(r"^[A-Za-z0-9_.\[\]$-]+$")
 _MAX_SAFE_DERIVATION_ERROR_FIELDS = 32
-_SELECTOR_NORMALIZATION_FINGERPRINT_LIMIT = 32
+# Content-free extraction diagnostics a derivation batch keeps for replay and aggregation.
+_EVIDENCE_TELEMETRY_COUNTS = (
+    "skipped_reading_group_count",
+    "rejected_fragment_selection_count",
+    "selection_corrected_request_count",
+    "selection_skipped_reading_group_count",
+)
+_FRAGMENT_SELECTION_REJECTION_CODES = frozenset(code.value for code in FragmentSelectionErrorCode)
 
 logger = logging.getLogger(__name__)
 
@@ -1447,12 +1455,11 @@ def aggregate_extraction_metrics(
         "artifact_summary_count",
         "discarded_orphan_artifact_summary_count",
         "discarded_invalid_artifact_summary_count",
-        "selector_correction_calls",
-        "selector_correction_candidate_count",
-        "selector_correction_recovered_count",
-        "skipped_reading_group_count",
+        *_EVIDENCE_TELEMETRY_COUNTS,
     )
-    aggregated = {key: sum(int((result.metadata or {}).get(key, 0) or 0) for result in results) for key in keys}
+    aggregated: dict[str, object] = {
+        key: sum(int((result.metadata or {}).get(key, 0) or 0) for result in results) for key in keys
+    }
     aggregated["max_active_multimodal"] = max(
         (
             int(
@@ -1466,40 +1473,12 @@ def aggregate_extraction_metrics(
         ),
         default=0,
     )
-    selector_normalization_present = False
-    selector_normalized_candidate_count = 0
-    selector_normalization_count = 0
-    selector_normalization_fingerprints: list[str] = []
+    rejection_counts: dict[str, int] = {}
     for result in results:
         telemetry = _safe_evidence_telemetry(result.metadata)
-        if "selector_normalization_count" in telemetry:
-            selector_normalization_present = True
-            selector_normalized_candidate_count += int(
-                telemetry.get("selector_normalized_candidate_count", 0)
-            )
-            selector_normalization_count += int(
-                telemetry.get("selector_normalization_count", 0)
-            )
-            for fingerprint in telemetry.get(
-                "selector_normalization_fingerprints", []
-            ):
-                if (
-                    len(selector_normalization_fingerprints)
-                    < _SELECTOR_NORMALIZATION_FINGERPRINT_LIMIT
-                ):
-                    selector_normalization_fingerprints.append(fingerprint)
-    if selector_normalization_present:
-        aggregated.update(
-            {
-                "selector_normalized_candidate_count": (
-                    selector_normalized_candidate_count
-                ),
-                "selector_normalization_count": selector_normalization_count,
-                "selector_normalization_fingerprints": (
-                    selector_normalization_fingerprints
-                ),
-            }
-        )
+        for code, count in telemetry.get("fragment_selection_rejection_counts", {}).items():
+            rejection_counts[code] = rejection_counts.get(code, 0) + count
+    aggregated["fragment_selection_rejection_counts"] = dict(sorted(rejection_counts.items()))
     return aggregated
 
 
@@ -1508,50 +1487,15 @@ def _safe_evidence_telemetry(value: object) -> dict[str, object]:
 
     if not isinstance(value, Mapping):
         return {}
-    raw_normalization_fingerprints = value.get(
-        "selector_normalization_fingerprints"
-    )
-    normalization_fingerprints = [
-        fingerprint
-        for fingerprint in (
-            raw_normalization_fingerprints
-            if isinstance(raw_normalization_fingerprints, list)
-            else []
-        )
-        if isinstance(fingerprint, str)
-        and re.fullmatch(r"[0-9a-f]{64}", fingerprint) is not None
-    ][:_SELECTOR_NORMALIZATION_FINGERPRINT_LIMIT]
     telemetry: dict[str, object] = {}
-    if any(
-        key in value
-        for key in (
-            "selector_normalized_candidate_count",
-            "selector_normalization_count",
-            "selector_normalization_fingerprints",
-        )
-    ):
-        telemetry.update(
-            {
-                "selector_normalized_candidate_count": max(
-                    0,
-                    int(value.get("selector_normalized_candidate_count", 0) or 0),
-                ),
-                "selector_normalization_count": max(
-                    0,
-                    int(value.get("selector_normalization_count", 0) or 0),
-                ),
-                "selector_normalization_fingerprints": normalization_fingerprints,
-            }
-        )
-    for key in (
-        "selector_correction_candidate_count",
-        "selector_correction_recovered_count",
-        "skipped_reading_group_count",
-    ):
+    for key in _EVIDENCE_TELEMETRY_COUNTS:
         if isinstance(value.get(key), int):
             telemetry[key] = max(0, value[key])
-    if value.get("selector_correction_outcome") in {
-        "not_needed", "capacity_skipped", "call_failed", "completed",
-    }:
-        telemetry["selector_correction_outcome"] = value["selector_correction_outcome"]
+    rejection_counts = value.get("fragment_selection_rejection_counts")
+    if isinstance(rejection_counts, Mapping):
+        telemetry["fragment_selection_rejection_counts"] = {
+            code: max(0, count)
+            for code, count in sorted(rejection_counts.items())
+            if code in _FRAGMENT_SELECTION_REJECTION_CODES and isinstance(count, int)
+        }
     return telemetry

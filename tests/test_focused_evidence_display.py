@@ -42,7 +42,7 @@ def test_required_order_is_resolved_by_identity_and_display_does_not_change_auth
     candidate = ProjectionFragmentMemoryCandidate(content="Approval is required.", memory_type="fact",
         primary_ref=primary, required_refs=required[::-1],
         evidence_displays=[{"ref": r, "text": "Readable " + r} for r in [primary, *required]])
-    [raw] = _SelectionResolution().resolve([candidate], catalog=catalog, prompt_hash="0" * 64, returned=1)
+    [raw] = _SelectionResolution().bind([candidate], catalog=catalog, prompt_hash="0" * 64, request_key=("g",))
     bound = raw.resolved_evidence_selection
     by_anchor = {f.anchor: f.reference for f in catalog.fragments}
     assert all(p.display_text == "Readable " + by_anchor[p.anchor] for p in bound.parts)

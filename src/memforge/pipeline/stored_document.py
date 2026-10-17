@@ -407,7 +407,7 @@ async def reprocess_preview(
     into fewer requests), one Candidate admission request, one Relation request
     when the Unit has Supports, and one whole-Unit reading per Support
     (Supports can share a request). It leaves out requests split for capacity,
-    Support readings that take several steps, selector corrections, entity
+    Support readings that take several steps, extraction corrections, entity
     resolution and cross-document relation classification.
     """
 
