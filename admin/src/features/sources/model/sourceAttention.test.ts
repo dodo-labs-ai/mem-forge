@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { makeSource } from "@/test/sourceFixtures";
+import { makeFailedItem, makeSource } from "@/test/sourceFixtures";
 import { OVERDUE_GRACE_MS, sourceAttention } from "./sourceAttention";
 import { sourceSyncActivityFromStatus } from "./sourceSyncActivity";
 
@@ -38,6 +38,33 @@ describe("sourceAttention", () => {
   test("other failures offer a retry", () => {
     const attention = sourceAttention({ source: makeSource(), readiness: null, activity: { state: "failed", error: { message: "boom" } }, now: NOW });
     expect(attention).toMatchObject({ reason: "sync_failed", action: "retry" });
+  });
+
+  test("failed items ask the user to look, and say that syncing retries them", () => {
+    const source = makeSource({
+      failed_items: { count: 3, retrying_after_upgrade: 0, items: [makeFailedItem()] },
+    });
+    const attention = sourceAttention({ source, readiness: null, activity: { state: "success" }, now: NOW });
+
+    expect(attention).toMatchObject({
+      reason: "partially_synced",
+      title: "Some items failed (3)",
+      detail: "3 items could not be synced. Syncing this source retries every failed item.",
+      action: "view_details",
+    });
+  });
+
+  test("failed items wait for the result of the sync that retries them", () => {
+    const source = makeSource({
+      failed_items: { count: 2, retrying_after_upgrade: 2, items: [makeFailedItem({ retrying_after_upgrade: true })] },
+    });
+    expect(sourceAttention({ source, readiness: null, activity: { state: "active" }, now: NOW })).toBeNull();
+    expect(sourceAttention({ source, readiness: null, activity: { state: "queued" }, now: NOW })).toBeNull();
+  });
+
+  test("a partial sync with nothing left in the failure record needs nothing", () => {
+    const source = makeSource({ failed_items: { count: 0, retrying_after_upgrade: 0, items: [] } });
+    expect(sourceAttention({ source, readiness: null, activity: { state: "partial" }, now: NOW })).toBeNull();
   });
 
   test("a scheduled run later than the grace period is overdue", () => {

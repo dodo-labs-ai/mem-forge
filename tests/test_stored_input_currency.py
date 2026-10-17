@@ -11,13 +11,14 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
-from memforge.llm.structured import failure_retryable
+from memforge.llm.structured import StructuredLlmError, failure_retryable
 from memforge.memory.engine import SourceUnitLifecycleExecutionError
 from memforge.models import ContentItem, GeneMetadata, NormalizedContent, RawContent, ScopeListing, ScopeListingKind
 from memforge.source_adapters.jira import changelog_semantic_class as jira_changelog_semantic_class
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
 from memforge.source_activity import SourceActivityConflict
 from memforge.source_derivation import DERIVATION_DETERMINISTIC_FAILURE
+from memforge.source_item_failures import FailedItemRetry
 from memforge.storage.database import Database
 from tests.test_source_reprocess import RawKeepingDocumentStore
 from tests.test_sync_bookkeeping import (
@@ -136,9 +137,10 @@ class Harness:
             memory_engine=self.engine, memory_store=None, max_concurrent=1, retry_sleep=_skip_retry_delay,
         )
 
-    async def sync(self, extractor=None):
+    async def sync(self, extractor=None, *, retry: FailedItemRetry = FailedItemRetry.ALL):
+        """Sync as a person requests it; ``retry=RETRYABLE`` syncs as a schedule does."""
         return await self.orchestrator(extractor).sync_gene(
-            gene=self.provider, source_name="Jira", source_id=SOURCE_ID,
+            gene=self.provider, source_name="Jira", source_id=SOURCE_ID, failed_item_retry=retry,
         )
 
     async def reprocess(self, *issue_keys: str, extractor=None):
@@ -368,42 +370,174 @@ async def test_recovery_ends_a_derivation_that_cannot_commit_before_any_model_ca
     )
 
 
-class _WrappingLifecycleEngine(RecordingMemoryEngine):
-    """Fails the first lifecycle commit as the lifecycle engine reports a failure: wrapped, with its retry rule."""
+class _FailingLifecycleEngine(RecordingMemoryEngine):
+    """Fails the lifecycle of one Document while ``failure`` is set, as the lifecycle engine reports it.
 
-    def __init__(self, cause: Exception) -> None:
+    The failure is wrapped with the classification of its cause and the stage it ended, unless
+    ``wrapped`` is false, as when the failure precedes the lifecycle's own bookkeeping.
+    """
+
+    def __init__(
+        self, store: Database, issue_key: str, failure, *, stage: str = "plan_construction", wrapped: bool = True,
+    ) -> None:
         super().__init__()
-        self.cause = cause
+        self.store = store
+        self.doc_id = doc_id(issue_key)
+        self.failure = failure
+        self.stage = stage
+        self.wrapped = wrapped
+        self.failed_calls = 0
 
     async def prepare_and_commit_projected_lifecycle(self, **kwargs):
-        if self.cause is not None:
-            cause, self.cause = self.cause, None
+        if kwargs["doc_id"] == self.doc_id and self.failure is not None:
+            self.failed_calls += 1
+            cause = self.failure()
+            if not self.wrapped:
+                raise cause
             raise SourceUnitLifecycleExecutionError(
-                "projected lifecycle commit failed", None, retryable=failure_retryable(cause),
+                "projected lifecycle failed", None,
+                retryable=failure_retryable(cause, store=self.store), stage=self.stage,
             ) from cause
         return await super().prepare_and_commit_projected_lifecycle(**kwargs)
 
 
+async def _attempt_status(db: Database, derivation_id: str) -> str:
+    [attempt] = [attempt for attempt in await db.list_source_derivation_attempts(source_id=SOURCE_ID)
+                 if attempt.id == derivation_id]
+    return attempt.status
+
+
+async def _ledger(db: Database) -> dict[str, object]:
+    """The failure ledger of the Source, by issue."""
+    return {
+        failure.document_id.removeprefix("jira-"): failure
+        for failure in await db.list_source_item_failures(source_id=SOURCE_ID)
+    }
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "cause",
+    ("failure", "wrapped"),
     [
-        SourceActivityConflict("source activity fence is not current: sync-run"),
-        sqlite3.OperationalError("database is locked"),
+        (lambda: SourceActivityConflict("source activity fence is not current: sync-run"), True),
+        (lambda: sqlite3.OperationalError("database is locked"), True),
+        (lambda: sqlite3.OperationalError("database is locked"), False),
+        (lambda: StructuredLlmError("provider unavailable", terminal_category="provider_error"), True),
+        (lambda: StructuredLlmError("model call timed out", terminal_category="deadline_exceeded"), True),
     ],
-    ids=["lost_fence", "storage"],
+    ids=["lost_fence", "storage", "raw_storage", "model_provider", "model_deadline"],
 )
-async def test_a_retryable_recovery_failure_stops_the_run_and_keeps_every_derivation_staged(db, cause):
+async def test_a_transient_recovery_failure_stops_the_run_and_keeps_every_derivation_staged(db, failure, wrapped):
     harness = await synced(db)
     staged = await _staged_changes(harness)
-    harness.engine = _WrappingLifecycleEngine(cause)
+    harness.engine = _FailingLifecycleEngine(db, "PAY-1", failure, wrapped=wrapped)
 
     state = await harness.sync()
 
-    assert (state.last_sync_status, state.error_message) == ("failed", "projected lifecycle commit failed")
+    assert state.last_sync_status == "failed"
+    assert state.failure_retryable is True
     statuses = {attempt.id: attempt.status for attempt in await db.list_source_derivation_attempts(source_id=SOURCE_ID)}
-    # PAY-1's extraction completed before its commit failed; PAY-2 was not reached. Both stay staged.
+    # PAY-1's extraction completed before its lifecycle failed; PAY-2 was not reached. Both stay staged.
     assert (statuses[staged["PAY-1"].id], statuses[staged["PAY-2"].id]) == ("completed", "retryable_failure")
+    recorded = (await _ledger(db))["PAY-1"]
+    assert (recorded.retryable, recorded.failures_in_release) == (True, 1)
+
+
+@pytest.mark.asyncio
+async def test_an_undeclared_lifecycle_failure_ends_its_derivation_and_the_run_reads_the_provider(db):
+    harness = await synced(db)
+    staged = await _staged_changes(harness)
+    before = await db.get_sync_state(SOURCE_ID)
+    # A location-only change of PAY-2 that only this run's provider pass can commit.
+    harness.provider.urls["PAY-2"] = "https://jira.example/browse/PAY-2?moved"
+    harness.engine = _FailingLifecycleEngine(db, "PAY-1", lambda: KeyError("obs-carried-member"))
+
+    state = await harness.sync(retry=FailedItemRetry.RETRYABLE)
+
+    assert state.last_sync_status == "partial"
+    assert [failed.doc_id for failed in state.failed_docs] == [doc_id("PAY-1")]
+    assert await _attempt_status(db, staged["PAY-1"].id) == "superseded"
+    [ended] = await db.list_source_derivation_attempts(source_id=SOURCE_ID, statuses=("superseded",))
+    assert ended.terminal_reason_code == DERIVATION_DETERMINISTIC_FAILURE
+    assert await _attempt_status(db, staged["PAY-2"].id) == "applied"
+    moved = await _unit_input(db, SOURCE_ID, doc_id("PAY-2"))
+    assert moved.item.source_url == harness.provider.urls["PAY-2"]
+    recorded = await _ledger(db)
+    assert set(recorded) == {"PAY-1"}
+    assert (recorded["PAY-1"].stage, recorded["PAY-1"].error_class, recorded["PAY-1"].retryable) == (
+        "plan_construction", "builtins.KeyError", False,
+    )
+    # The ledger retries the failed Document, so the run advances the Source's cursor.
+    assert state.last_sync_at > before.last_sync_at
+
+    # A scheduled run leaves the Document alone although the provider returns it again.
+    failed_calls = harness.engine.failed_calls
+    next_state = await harness.sync(retry=FailedItemRetry.RETRYABLE)
+    assert harness.engine.failed_calls == failed_calls
+    assert (next_state.last_sync_status, next_state.failed_docs) == ("success", [])
+    assert next_state.last_sync_at > state.last_sync_at
+    assert await db.list_source_derivation_attempts(
+        source_id=SOURCE_ID, statuses=("pending", "retryable_failure", "completed"),
+    ) == ()
+
+    # A requested sync retries it; with the failure fixed it commits and leaves the ledger.
+    harness.engine.failure = None
+    retried = await harness.sync()
+    assert (retried.last_sync_status, retried.docs_failed) == ("success", 0)
+    assert await _ledger(db) == {}
+
+
+@pytest.mark.asyncio
+async def test_the_same_transient_recovery_failure_in_three_consecutive_runs_ends_the_derivation(db):
+    harness = await synced(db)
+    staged = await _staged_changes(harness)
+    harness.engine = _FailingLifecycleEngine(db, "PAY-1", lambda: sqlite3.OperationalError("database is locked"))
+    locked = ("plan_construction", "sqlite3.OperationalError")
+
+    for runs in (1, 2):
+        assert (await harness.sync(retry=FailedItemRetry.RETRYABLE)).last_sync_status == "failed"
+        assert await _attempt_status(db, staged["PAY-1"].id) == "completed"
+        recorded = (await _ledger(db))["PAY-1"]
+        assert ((recorded.stage, recorded.error_class), recorded.failures_in_release) == (locked, runs)
+
+    state = await harness.sync(retry=FailedItemRetry.RETRYABLE)
+
+    assert await _attempt_status(db, staged["PAY-1"].id) == "superseded"
+    assert state.last_sync_status == "partial"
+    assert [failed.doc_id for failed in state.failed_docs] == [doc_id("PAY-1")]
+    assert await _attempt_status(db, staged["PAY-2"].id) == "applied"
+    recorded = (await _ledger(db))["PAY-1"]
+    assert (recorded.retryable, recorded.failures_in_release, recorded.budget_exhausted) == (True, 3, True)
+
+    # The budget is spent: scheduled runs of this release leave the Document alone.
+    failed_calls = harness.engine.failed_calls
+    assert (await harness.sync(retry=FailedItemRetry.RETRYABLE)).last_sync_status == "success"
+    assert harness.engine.failed_calls == failed_calls
+
+
+@pytest.mark.asyncio
+async def test_a_different_recovery_failure_or_a_success_starts_the_count_again(db):
+    harness = await synced(db)
+    await _staged_changes(harness)
+    engine = harness.engine = _FailingLifecycleEngine(
+        db, "PAY-1", lambda: sqlite3.OperationalError("database is locked"),
+    )
+    for _ in range(2):
+        assert (await harness.sync()).last_sync_status == "failed"
+
+    engine.failure = lambda: StructuredLlmError("provider unavailable", terminal_category="provider_error")
+    assert (await harness.sync()).last_sync_status == "failed"
+    recorded = (await _ledger(db))["PAY-1"]
+    assert (recorded.error_class, recorded.failures_in_release) == ("memforge.llm.structured.StructuredLlmError", 1)
+
+    engine.stage = "reconciliation"
+    assert (await harness.sync()).last_sync_status == "failed"
+    recorded = (await _ledger(db))["PAY-1"]
+    assert (recorded.stage, recorded.failures_in_release) == ("reconciliation", 1)
+
+    engine.failure = None
+    assert (await harness.sync()).last_sync_status == "success"
+    assert await _ledger(db) == {}
 
 
 @pytest.mark.asyncio

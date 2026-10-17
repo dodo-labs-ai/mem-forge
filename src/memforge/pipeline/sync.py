@@ -21,7 +21,7 @@ import math
 import threading
 import uuid
 from collections import defaultdict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -74,7 +74,7 @@ from memforge.memory.lifecycle_plan import (
     AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON,
     ReconciliationScope,
 )
-from memforge.memory.engine import SourceUnitLifecycleDeferred
+from memforge.memory.engine import SourceUnitLifecycleDeferred, SourceUnitLifecycleExecutionError
 from memforge.memory.lifecycle_planner import (
     lifecycle_access_context_hash,
     lifecycle_plan_id,
@@ -98,6 +98,7 @@ from memforge.source_artifacts import (
 from memforge.source_derivation import (
     DERIVATION_DETERMINISTIC_FAILURE,
     DERIVATION_INPUT_SUPERSEDED,
+    DERIVATION_RELEASE_SUPERSEDED,
     SourceDerivationAttempt,
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
@@ -113,7 +114,9 @@ from memforge.pipeline.extraction_contract import (
 from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot
 from memforge.pipeline.stored_document import (
     StoredDocumentUnavailable,
+    StoredDocumentUnavailableReason,
     StoredSourceDocument,
+    document_content_item,
     load_stored_source_document,
     project_stored_input,
     rediscover_source_document,
@@ -122,8 +125,16 @@ from memforge.pipeline.stored_document import (
 from memforge.pipeline.projection_images import (
     load_projection_images,
 )
+from memforge.release import current_release
 from memforge.source_access import memory_visibility_for_source_id
 from memforge.source_activity import SourceActivityLease
+from memforge.source_item_failures import (
+    REMOVAL_STAGE,
+    UNRECORDED_RELEASE,
+    FailedItemRetry,
+    RunItemFailure,
+    SourceItemFailure,
+)
 from memforge.source_projection_config import canonical_projection_scope, source_access_context
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time, reported_source_time
 
@@ -154,13 +165,16 @@ DEFAULT_INCREMENTAL_SYNC_OVERLAP = timedelta(minutes=10)
 class SourceSyncMode(str, Enum):
     """What one Source sync run reads.
 
-    NORMAL discovers and fetches from the provider. REPROCESS processes the
-    Source Units of named Documents with the current adapter and compiler:
-    extraction reads every ReadingGroup and every Support is read over the
-    whole Unit. It reads each Document's current state from the provider when
-    the Source can ask for one Document by id, and its stored input otherwise
-    (see :mod:`memforge.pipeline.stored_document`). It never advances the sync
-    cursor or infers removals.
+    NORMAL discovers and fetches from the provider, and retries the Documents
+    of the Source's failure ledger that its ``FailedItemRetry`` selects.
+    REPROCESS processes the Source Units of named Documents with the current
+    adapter and compiler: extraction reads every ReadingGroup and every
+    Support is read over the whole Unit. It reads each Document's current
+    state from the provider when the Source can ask for one Document by id,
+    and its stored input otherwise (see
+    :mod:`memforge.pipeline.stored_document`). A NORMAL run processes each
+    Document it retries from the ledger the same way. REPROCESS never advances
+    the sync cursor or infers removals.
     """
 
     NORMAL = "normal"
@@ -603,6 +617,7 @@ def _fail_deferred_commits_nothing_can_unblock(
     for unit_id, result in deferred.items():
         if unit_id not in waiting:
             result["terminal_error"] = _retained_document_error(result["deferred_lifecycle"])
+            result["terminal_failure"] = result["deferred_lifecycle"]
             result["deferred_lifecycle"] = None
 
 
@@ -616,6 +631,96 @@ def _retained_document_error(exc: BaseException) -> str:
             if stripped:
                 return stripped
     return f"{type(exc).__name__}: error details omitted"
+
+
+def _failure_stage(exc: BaseException, stage: str) -> str:
+    """The step at which a Document failed: the lifecycle's own stage when it reports one."""
+
+    if isinstance(exc, SourceUnitLifecycleExecutionError) and exc.stage is not None:
+        return exc.stage
+    return stage
+
+
+def _failure_class(exc: BaseException) -> str:
+    """The qualified class of a failure: the class of the failure a lifecycle error wraps."""
+
+    if isinstance(exc, SourceUnitLifecycleExecutionError) and exc.__cause__ is not None:
+        exc = exc.__cause__
+    return f"{type(exc).__module__}.{type(exc).__qualname__}"
+
+
+def _run_item_failure(
+    exc: BaseException,
+    *,
+    document_id: str,
+    title: str | None,
+    stage: str,
+    store: Any,
+    source_unit_id: str | None = None,
+    item: ContentItem | None = None,
+) -> RunItemFailure:
+    """One Document's failure, classified for the failure ledger."""
+
+    error_code = getattr(exc, "error_code", None)
+    return RunItemFailure(
+        document_id=document_id,
+        stage=_failure_stage(exc, stage),
+        error_class=_failure_class(exc),
+        message=_retained_document_error(exc),
+        retryable=retries_failure(exc, store=store),
+        title=title,
+        error_code=error_code if isinstance(error_code, str) else None,
+        source_unit_id=source_unit_id,
+        item=item,
+    )
+
+
+def _derivation_item(context: SourceUnitDerivationContext) -> ContentItem:
+    """The item that asks for a staged derivation's Document again."""
+
+    if context.unit_input is not None:
+        return context.unit_input.item
+    return document_content_item(context.document)
+
+
+def _select_failed_items(
+    ledger: Mapping[str, SourceItemFailure],
+    *,
+    retry: FailedItemRetry,
+    release: str,
+    recovered_doc_ids: set[str],
+    ended: Mapping[str, ContentItem | None],
+) -> tuple[set[str], dict[str, ContentItem | None]]:
+    """The ledger Documents a NORMAL run processes again, and those it leaves alone while the provider keeps them unchanged.
+
+    Recovery has already processed the Documents of the derivations it
+    resumed. Of those, a Document whose staged derivation recovery ended is
+    processed again by a requested sync and left alone by a scheduled one, as
+    a deterministic failure of this release is. A failed removal is retried
+    by the run's own absence check, not by processing the Document. Each
+    Document left alone maps to the item that failed, when one was recorded.
+    """
+
+    retried: set[str] = set()
+    left_alone: dict[str, ContentItem | None] = {}
+    for failure in ledger.values():
+        if failure.stage == REMOVAL_STAGE or failure.document_id in recovered_doc_ids:
+            continue
+        if failure.retried_by(retry, release=release):
+            retried.add(failure.document_id)
+        else:
+            left_alone[failure.document_id] = failure.item
+    if retry is FailedItemRetry.ALL:
+        retried.update(ended)
+    else:
+        left_alone.update(ended)
+    return retried, left_alone
+
+
+def _same_provider_revision(item: ContentItem, failed: ContentItem | None) -> bool:
+    """Whether discovery returned the provider revision that failed: the same version and change time."""
+
+    return failed is not None and (item.version, item.last_modified) == (failed.version, failed.last_modified)
 
 
 def _memory_extraction_error(
@@ -662,6 +767,9 @@ class _SourceUnitExecutionDiagnostics:
     error_class: str | None = None
     # The content-free code of the failure, when the failing step reported one.
     error_code: str | None = None
+    # The step of the Document's work that ran last: ``fetch``, ``normalize``,
+    # ``projection``, ``derivation`` or ``lifecycle``.
+    stage: str = "derivation"
 
     def bind_source_unit(self, source_unit_id: str) -> None:
         if self.source_unit_id is not None and self.source_unit_id != source_unit_id:
@@ -794,6 +902,7 @@ class GeneSyncOrchestrator:
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
         projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         record_terminal_result: bool = True,
+        failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
     ) -> SyncState:
         """Run the full sync pipeline for a gene.
 
@@ -825,6 +934,15 @@ class GeneSyncOrchestrator:
             Persist the terminal SyncState and history here. Durable workers
             disable this so their lease-fenced completion transaction owns the
             complete terminal read model.
+        failed_item_retry:
+            Which rows of the Source's failure ledger a NORMAL run retries:
+            ``ALL`` for a sync a person requested, ``RETRYABLE`` for a
+            scheduled one (see :mod:`memforge.source_item_failures`).
+
+        Every per-Document failure is recorded in the failure ledger, which
+        owns its retry, so a run whose failures are all per-Document ones
+        advances the incremental cursor; its status is ``partial``. A failure
+        of the run itself keeps the cursor.
 
         Returns
         -------
@@ -858,6 +976,11 @@ class GeneSyncOrchestrator:
         docs_failed = 0
         memories_extracted = 0
         failed_docs: list[FailedDoc] = []
+        # The ledger record of each failed Document, and the Documents that
+        # committed or were removed, which leave the ledger.
+        item_failures: dict[str, RunItemFailure] = {}
+        settled_doc_ids: set[str] = set()
+        release = current_release()
         runtime_bundles = []
         error_message: str | None = None
         crawled_doc_ids: set[str] = set()
@@ -883,6 +1006,17 @@ class GeneSyncOrchestrator:
         recovered_completed_results: tuple[dict[str, Any], ...] = ()
         recovered_deferred_results: tuple[dict[str, Any], ...] = ()
         recovered_failed_results: tuple[dict[str, Any], ...] = ()
+        transition_run = scope_transition is not None
+
+        def fail_document(failure: RunItemFailure, *, error: str | None = None) -> None:
+            failed_docs.append(
+                FailedDoc(
+                    doc_id=failure.document_id,
+                    title=failure.title or failure.document_id,
+                    error=error if error is not None else failure.message,
+                )
+            )
+            item_failures[failure.document_id] = failure
 
         try:
             recovered = await self._resume_source_derivations(
@@ -896,35 +1030,56 @@ class GeneSyncOrchestrator:
             recovered_deferred_results = recovered.deferred_results
             recovered_failed_results = recovered.failed_results
 
+            # The failure ledger decides which failed Documents a NORMAL run
+            # processes again, and which a scheduled run leaves alone when
+            # discovery returns them.
+            ledger = {
+                failure.document_id: failure
+                for failure in await self.db.list_source_item_failures(source_id=source_id)
+            }
+            retried_doc_ids: set[str] = set()
+            left_alone: dict[str, ContentItem | None] = {}
+            if not reprocessing and scope_transition is None:
+                retried_doc_ids, left_alone = _select_failed_items(
+                    ledger,
+                    retry=failed_item_retry,
+                    release=release,
+                    recovered_doc_ids={str(result["doc_id"]) for result in recovered.results},
+                    ended={str(result["doc_id"]): result["failure"].item for result in recovered_failed_results},
+                )
+            skipped_doc_ids: set[str] = set()
+            rediscovering = source_rediscovers_documents(
+                configured_source_type,
+                (configured_source or {}).get("config") or {},
+            )
+
             stored_documents: dict[str, StoredSourceDocument] = {}
             if reprocessing:
                 if scope_transition is not None:
                     raise RuntimeError(
                         "reprocess waits for the open Projection Scope transition to complete"
                     )
-                rediscovering = source_rediscovers_documents(
-                    configured_source_type,
-                    (configured_source or {}).get("config") or {},
-                )
                 if rediscovering:
                     await gene.authenticate()
                 items = []
                 for doc_id in sorted(reprocess_doc_ids or ()):
                     try:
-                        if rediscovering:
-                            item = await rediscover_source_document(
-                                self.db, gene, source_id=source_id, document_id=doc_id,
-                            )
-                        else:
-                            stored = await load_stored_source_document(
-                                self.db, self.doc_store, gene, source_id=source_id, document_id=doc_id,
-                            )
-                            stored_documents[doc_id] = stored
-                            item = stored.item
+                        item, stored = await self._document_input(
+                            gene,
+                            source_id=source_id,
+                            document_id=doc_id,
+                            rediscovering=rediscovering,
+                            failure=ledger.get(doc_id),
+                        )
                     except StoredDocumentUnavailable as exc:
                         docs_failed += 1
-                        failed_docs.append(FailedDoc(doc_id=doc_id, title=doc_id, error=str(exc)))
+                        fail_document(
+                            _run_item_failure(exc, document_id=doc_id, title=doc_id, stage="fetch", store=self.db),
+                            error=str(exc),
+                        )
                         continue
+                    if stored is not None:
+                        stored_documents[doc_id] = stored
                     items.append(item)
                 indexed_doc_ids: set[str] = set()
                 last_sync_time = None
@@ -1001,8 +1156,16 @@ class GeneSyncOrchestrator:
                 if callable(begin_discovery):
                     begin_discovery()
                 async for item in gene.discover(since=last_sync_time):
-                    items.append(item)
                     crawled_doc_ids.add(item.item_id)
+                    if item.item_id in left_alone:
+                        if _same_provider_revision(item, left_alone[item.item_id]):
+                            # A deterministic failure of this release waits for
+                            # a requested sync, the next release or a change.
+                            skipped_doc_ids.add(item.item_id)
+                            continue
+                        # The provider changed the Document since it failed.
+                        retried_doc_ids.add(item.item_id)
+                    items.append(item)
                     if progress_callback:
                         progress_callback(
                             {
@@ -1021,18 +1184,61 @@ class GeneSyncOrchestrator:
 
                 logger.info(
                     "Discovered %d content items from %s (since=%s)",
-                    len(items),
+                    len(crawled_doc_ids),
                     source_name,
                     last_sync_time.isoformat() if last_sync_time else "full sync",
                 )
-                discovered_doc_ids = {item.item_id for item in items}
+                if skipped_doc_ids:
+                    logger.info(
+                        "Left %d unchanged discovered Documents of %s alone: each failed deterministically "
+                        "in this release",
+                        len(skipped_doc_ids),
+                        source_id,
+                    )
+                # A failed Document that discovery did not return is read the
+                # way a reprocess reads it. A complete snapshot is the whole
+                # scope: what it did not return is removed, not retried.
+                if not authoritative_snapshot:
+                    for doc_id in sorted(retried_doc_ids - crawled_doc_ids):
+                        try:
+                            item, stored = await self._document_input(
+                                gene,
+                                source_id=source_id,
+                                document_id=doc_id,
+                                rediscovering=rediscovering,
+                                failure=ledger.get(doc_id),
+                            )
+                        except StoredDocumentUnavailable as exc:
+                            if exc.reason is StoredDocumentUnavailableReason.PROVIDER_DOCUMENT_MISSING:
+                                # Nothing is left to retry; a run that proves
+                                # the Document absent removes it.
+                                settled_doc_ids.add(doc_id)
+                                continue
+                            docs_failed += 1
+                            fail_document(
+                                _run_item_failure(
+                                    exc,
+                                    document_id=doc_id,
+                                    title=ledger[doc_id].title,
+                                    stage="fetch",
+                                    store=self.db,
+                                ),
+                                error=str(exc),
+                            )
+                            continue
+                        if stored is not None:
+                            stored_documents[doc_id] = stored
+                        items.append(item)
+                discovered_doc_ids = set(crawled_doc_ids)
                 unexpected_reuse_ids = reusable_projection_doc_ids - discovered_doc_ids
                 if unexpected_reuse_ids and authoritative_snapshot:
                     raise ValueError(
                         "reusable Source Projection membership is outside provider discovery: "
                         f"{sorted(unexpected_reuse_ids)[0]}"
                     )
-                reusable_projection_doc_ids = reusable_projection_doc_ids & discovered_doc_ids
+                reusable_projection_doc_ids = (reusable_projection_doc_ids & discovered_doc_ids) - (
+                    retried_doc_ids | set(left_alone)
+                )
                 total_item_count = len(items)
                 if reusable_projection_doc_ids:
                     items = [item for item in items if item.item_id not in reusable_projection_doc_ids]
@@ -1136,10 +1342,15 @@ class GeneSyncOrchestrator:
                         progress_callback(progress)
 
                 last_error: str | None = None
+                last_failure: RunItemFailure | None = None
+                # A Document retried from the failure ledger is processed as a
+                # reprocess, so it is derived again under a new identity.
+                reprocess_item = reprocessing or item.item_id in retried_doc_ids
                 async with item_semaphore:
                     for attempt in range(1, MAX_RETRIES + 1):
                         attempt_error: str | None = None
                         retry_document = True
+                        diagnostics = _SourceUnitExecutionDiagnostics(stage="fetch")
                         try:
                             item_stats = await self._process_item(
                                 gene=gene,
@@ -1148,9 +1359,10 @@ class GeneSyncOrchestrator:
                                 source_id=source_id,
                                 run_id=run_id,
                                 progress_callback=on_item_progress,
-                                force_reprocess=force_full_sync or reprocessing,
-                                reprocessing=reprocessing,
+                                force_reprocess=force_full_sync or reprocess_item,
+                                reprocessing=reprocess_item,
                                 stored_document=stored_documents.get(item.item_id),
+                                diagnostics=diagnostics,
                                 projection_scope=configured_projection_scope,
                                 scope_transition=(
                                     {
@@ -1201,6 +1413,15 @@ class GeneSyncOrchestrator:
                             retry_document = False
                         except Exception as exc:
                             attempt_error = _retained_document_error(exc)
+                            last_failure = _run_item_failure(
+                                exc,
+                                document_id=item.item_id,
+                                title=item.title,
+                                stage=diagnostics.stage,
+                                store=self.db,
+                                source_unit_id=diagnostics.source_unit_id,
+                                item=item,
+                            )
                             stats["runtime_bundle"] = getattr(exc, "runtime_bundle", None)
                             explicitly_retryable = bool(
                                 getattr(exc, "retryable", True)
@@ -1242,16 +1463,16 @@ class GeneSyncOrchestrator:
                                 attempt_error,
                             )
 
-                if last_error is not None:
+                if last_error is not None and last_failure is not None:
                     stats["failed"] = True
-                    failed_docs.append(
-                        FailedDoc(
-                            doc_id=item.item_id,
-                            title=item.title,
-                            error=last_error,
-                        )
-                    )
+                    fail_document(last_failure, error=last_error)
                 elif stats["processed"]:
+                    if item.item_id in ledger and stats.get("deferred_lifecycle") is None:
+                        # The Document committed; its row leaves the ledger
+                        # at once, so a run that stops before it ends keeps none.
+                        await self.db.delete_source_item_failures(
+                            source_id, (item.item_id,), source_activity=source_activity,
+                        )
                     if stats["updated"]:
                         docs_updated_counter += 1
                     memories_extracted_counter += stats["memories_extracted"]
@@ -1372,13 +1593,21 @@ class GeneSyncOrchestrator:
                     docs_updated += 1
                 if r["failed"]:
                     docs_failed += 1
-                if r.get("error") is not None:
+                elif r["processed"]:
+                    settled_doc_ids.add(str(r["doc_id"]))
+                if r.get("failure") is not None:
                     # A recovery that failed deterministically; retrying the run cannot apply it.
-                    failed_docs.append(FailedDoc(doc_id=str(r["doc_id"]), title=str(r["title"]), error=r["error"]))
+                    fail_document(r["failure"])
                     failure_retryable = False
                 memories_extracted += r["memories_extracted"]
                 if r.get("runtime_bundle") is not None:
                     runtime_bundles.append(r["runtime_bundle"])
+
+            # A complete discovery is the whole scope: a failed Document it did
+            # not return and that holds no Unit has nothing left to retry or
+            # remove.
+            if run_coverage.proves_absence and not reprocessing and scope_transition is None:
+                settled_doc_ids.update(set(ledger) - crawled_doc_ids - indexed_doc_ids)
 
             # ----------------------------------------------------------
             # Step 5: Remove Documents the provider no longer has
@@ -1449,9 +1678,10 @@ class GeneSyncOrchestrator:
                     source_filter_summary=_source_filter_summary(gene, last_sync_time),
                     source_activity=source_activity,
                 )
-                if deletion_failures:
-                    failed_docs.extend(deletion_failures)
-                    docs_failed += len(deletion_failures)
+                for deletion_failure in deletion_failures:
+                    fail_document(deletion_failure)
+                docs_failed += len(deletion_failures)
+                settled_doc_ids.update(absent_doc_ids - {failure.document_id for failure in deletion_failures})
                 if deleted_count > 0:
                     logger.info(
                         "Soft-deleted memories from %d removed documents",
@@ -1473,25 +1703,33 @@ class GeneSyncOrchestrator:
                     effective_results,
                     additional_source_unit_ids=tombstoned_source_unit_ids,
                 )
+            run_items = {item.item_id: item for item in items}
             for result in deferred_results:
                 if result.get("deferred_lifecycle") is not None:
                     result["terminal_error"] = _retained_document_error(result["deferred_lifecycle"])
+                    result["terminal_failure"] = result["deferred_lifecycle"]
                 terminal_error = result.get("terminal_error")
                 if terminal_error is not None:
                     result["failed"] = True
                     failure_retryable = False
                     docs_failed += 1
-                    failed_docs.append(
-                        FailedDoc(
-                            doc_id=str(result["doc_id"]),
+                    fail_document(
+                        _run_item_failure(
+                            result["terminal_failure"],
+                            document_id=str(result["doc_id"]),
                             title=str(result["title"]),
-                            error=str(terminal_error),
-                        )
+                            stage="lifecycle_commit",
+                            store=self.db,
+                            source_unit_id=result.get("source_unit_id"),
+                            item=run_items.get(str(result["doc_id"])),
+                        ),
+                        error=str(terminal_error),
                     )
                     if result.get("runtime_bundle") is not None:
                         runtime_bundles.append(result["runtime_bundle"])
                     continue
                 if result["processed"]:
+                    settled_doc_ids.add(str(result["doc_id"]))
                     docs_processed += 1
                 if result["updated"]:
                     docs_updated += 1
@@ -1531,14 +1769,18 @@ class GeneSyncOrchestrator:
             await self.db.update_source_doc_count(source_id, total_docs)
 
             # ----------------------------------------------------------
-            # Determine final status
+            # Record failed Documents and determine final status
             # ----------------------------------------------------------
-            if docs_failed == 0:
-                status = "success"
-            elif docs_processed > 0 or deleted_count > 0:
-                status = "partial"
-            else:
-                status = "failed"
+            # Every failure left is one Document's: the ledger records it and
+            # retries it, so the run is partial and its cursor advances.
+            await self._record_failed_items(
+                source_id,
+                release=release,
+                failures=item_failures,
+                settled_doc_ids=settled_doc_ids,
+                source_activity=source_activity,
+            )
+            status = "success" if docs_failed == 0 else "partial"
 
         except Exception as e:
             logger.error(
@@ -1550,6 +1792,16 @@ class GeneSyncOrchestrator:
             )
             status = "failed"
             error_message = str(e)
+            try:
+                await self._record_failed_items(
+                    source_id,
+                    release=release,
+                    failures=item_failures,
+                    settled_doc_ids=settled_doc_ids,
+                    source_activity=source_activity,
+                )
+            except Exception:
+                logger.exception("Failed to record the failed Documents of %s", source_id)
             failure_retryable = (
                 not isinstance(e, SourceConfigurationError)
                 and bool(getattr(e, "retryable", True))
@@ -1590,10 +1842,12 @@ class GeneSyncOrchestrator:
         if docs_failed > 0 and error_message is None:
             error_message = summarize_failed_documents(docs_failed, failed_docs)
 
-        # Advance the incremental watermark after a successful sync, including
-        # no-change runs where discovery returns zero items. A reprocess
-        # discovers nothing, so the cursor stays where the last sync left it.
-        if status == "success" and not reprocessing:
+        # Advance the incremental watermark after a sync whose failures, if
+        # any, are all recorded in the failure ledger, including no-change
+        # runs where discovery returns zero items. A Projection Scope
+        # transition advances it only once complete. A reprocess discovers
+        # nothing, so the cursor stays where the last sync left it.
+        if not reprocessing and (status == "success" or (status == "partial" and not transition_run)):
             sync_at = finished_at
         elif existing_state and existing_state.last_sync_at:
             sync_at = existing_state.last_sync_at
@@ -1674,6 +1928,87 @@ class GeneSyncOrchestrator:
 
         return sync_state
 
+    async def _document_input(
+        self,
+        gene: Gene,
+        *,
+        source_id: str,
+        document_id: str,
+        rediscovering: bool,
+        failure: SourceItemFailure | None,
+    ) -> tuple[ContentItem, StoredSourceDocument | None]:
+        """The input of a Document the run processes as a reprocess.
+
+        A Source that can ask its provider for one Document by id reads its
+        current item, asking with the item the Document's failure ledger row
+        kept when the Document never committed a Unit. Any other Source
+        fetches the item that row kept, as discovery returned it: it names
+        the revision that failed, which the Unit's stored input does not
+        hold. A Document without such a row reads the stored input of its
+        Unit's current revision.
+        """
+
+        if not rediscovering:
+            if failure is not None and failure.item is not None:
+                return failure.item, None
+            stored = await load_stored_source_document(
+                self.db, self.doc_store, gene, source_id=source_id, document_id=document_id,
+            )
+            return stored.item, stored
+        try:
+            return (
+                await rediscover_source_document(self.db, gene, source_id=source_id, document_id=document_id),
+                None,
+            )
+        except StoredDocumentUnavailable as exc:
+            if (
+                exc.reason is not StoredDocumentUnavailableReason.SOURCE_UNIT_MISSING
+                or failure is None
+                or failure.item is None
+            ):
+                raise
+        current = await gene.rediscover(failure.item)
+        if current is None or current.item_id != document_id:
+            raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.PROVIDER_DOCUMENT_MISSING, document_id)
+        return current, None
+
+    async def _record_failed_items(
+        self,
+        source_id: str,
+        *,
+        release: str,
+        failures: Mapping[str, RunItemFailure],
+        settled_doc_ids: set[str],
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
+        """Record this run's failed Documents in the failure ledger and drop the settled ones.
+
+        A Document that committed, or that left the Source, leaves the ledger;
+        a failed Document's row records this failure and its release. Each
+        write commits only while the run holds its Source activity lease.
+        """
+
+        ledger = {
+            failure.document_id: failure
+            for failure in await self.db.list_source_item_failures(source_id=source_id)
+        }
+        failed_at = datetime.now(timezone.utc)
+        for document_id, failure in sorted(failures.items()):
+            await self.db.upsert_source_item_failure(
+                SourceItemFailure.recorded(
+                    ledger.get(document_id),
+                    failure,
+                    source_id=source_id,
+                    release=release,
+                    failed_at=failed_at,
+                ),
+                source_activity=source_activity,
+            )
+        settled = (settled_doc_ids - set(failures)) & set(ledger)
+        if settled:
+            await self.db.delete_source_item_failures(source_id, settled, source_activity=source_activity)
+            logger.info("%d failed Document(s) of %s committed or left the Source", len(settled), source_id)
+
     async def _converge_deferred_projected_lifecycle(
         self,
         results: list[dict[str, Any]],
@@ -1742,6 +2077,7 @@ class GeneSyncOrchestrator:
                         attempts += 1
                     result["deferred_lifecycle"] = None
                     result["terminal_error"] = _retained_document_error(exc)
+                    result["terminal_failure"] = exc
                     result["runtime_bundle"] = getattr(
                         exc,
                         "runtime_bundle",
@@ -1773,8 +2109,22 @@ class GeneSyncOrchestrator:
         progress_callback: Callable[[dict], None] | None = None,
         source_activity: SourceActivityLease | None = None,
     ) -> _SourceDerivationRecovery:
-        """Resume durable Source Unit work before reading the provider."""
+        """Resume durable Source Unit work before reading the provider.
 
+        A derivation another release staged is superseded, not resumed: the
+        failure ledger records its Document, so the run derives it again with
+        this release's code. A recovery whose failure is transient stops the
+        run and leaves the derivation staged, until the same failure has
+        repeated in as many consecutive runs as the ledger's retry budget
+        allows; every other failure ends the staged derivation, and recovery
+        continues with the next, so one Unit never blocks the Source.
+        """
+
+        release = current_release()
+        ledger = {
+            failure.document_id: failure
+            for failure in await self.db.list_source_item_failures(source_id=source_id)
+        }
         results: list[dict[str, Any]] = []
         attempts = await self.db.list_source_derivation_attempts(
             source_id=source_id,
@@ -1789,7 +2139,11 @@ class GeneSyncOrchestrator:
             SourceDerivationAttempt,
         ] = {}
         superseded_attempts: list[tuple[SourceDerivationAttempt, str | None]] = []
+        release_superseded: list[SourceDerivationAttempt] = []
         for attempt in attempts:
+            if attempt.release != release:
+                release_superseded.append(attempt)
+                continue
             if attempt.extraction_contract_version != PROJECTION_EXTRACTION_CONTRACT_VERSION:
                 if attempt.status in {"pending", "retryable_failure"}:
                     superseded_attempts.append(
@@ -1809,6 +2163,17 @@ class GeneSyncOrchestrator:
             await self.db.supersede_source_derivation(
                 attempt.id,
                 reason_code=reason_code,
+            )
+        for attempt in release_superseded:
+            await self._supersede_derivation_of_another_release(
+                attempt, ledger=ledger, release=release, source_activity=source_activity,
+            )
+        if release_superseded:
+            logger.info(
+                "Superseded %d Source derivation(s) staged by another release for source %s; "
+                "their Documents are derived again",
+                len(release_superseded),
+                source_id,
             )
         if superseded_attempts:
             logger.info(
@@ -1886,21 +2251,46 @@ class GeneSyncOrchestrator:
                     lifecycle_stats = None
                 except Exception as exc:
                     recovery_error = exc
-                    # A failure that repeats on every attempt ends this staged
-                    # derivation, and recovery continues with the next, so one
-                    # Unit never blocks the Source. Any other failure (a lost
-                    # activity fence, storage, network or provider errors)
-                    # stops the run and leaves the derivation staged.
-                    if retries_failure(exc):
+                    failure = _run_item_failure(
+                        exc,
+                        document_id=doc_id,
+                        title=attempt.context.document.title,
+                        stage=diagnostics.stage,
+                        store=self.db,
+                        source_unit_id=attempt.source_unit_id,
+                        item=_derivation_item(attempt.context),
+                    )
+                    recorded = SourceItemFailure.recorded(
+                        ledger.get(doc_id),
+                        failure,
+                        source_id=source_id,
+                        release=release,
+                        failed_at=datetime.now(timezone.utc),
+                    )
+                    # A failure whose cause proves it transient (a lost activity
+                    # fence, a transient storage or provider error, a model
+                    # timeout) stops the run and leaves the derivation staged,
+                    # until it has failed the same way in as many consecutive
+                    # runs as the ledger's budget allows.
+                    if failure.retryable and not recorded.budget_exhausted:
+                        try:
+                            await self.db.upsert_source_item_failure(recorded, source_activity=source_activity)
+                        except Exception:
+                            logger.warning(
+                                "Failed to record the recovery failure of Source derivation %s",
+                                attempt.id,
+                                exc_info=True,
+                            )
                         raise
                     await self.db.supersede_source_derivation(
                         attempt.id,
                         reason_code=DERIVATION_DETERMINISTIC_FAILURE,
                     )
                     logger.warning(
-                        "Recovery of Source derivation %s for %s failed: %s",
+                        "Recovery of Source derivation %s for %s failed (%d consecutive failure(s) in this release): %s",
                         attempt.id,
                         doc_id,
+                        recorded.failures_in_release,
                         exc,
                     )
                     results.append(
@@ -1909,7 +2299,8 @@ class GeneSyncOrchestrator:
                             "updated": False,
                             "memories_extracted": 0,
                             "failed": True,
-                            "error": _retained_document_error(exc),
+                            "error": failure.message,
+                            "failure": failure,
                             "runtime_bundle": getattr(exc, "runtime_bundle", None),
                             "source_unit_id": attempt.source_unit_id,
                             "target_unit_revision_id": attempt.target_unit_revision_id,
@@ -1960,6 +2351,45 @@ class GeneSyncOrchestrator:
                 }
             )
         return _SourceDerivationRecovery(results=tuple(results))
+
+    async def _supersede_derivation_of_another_release(
+        self,
+        attempt: SourceDerivationAttempt,
+        *,
+        ledger: dict[str, SourceItemFailure],
+        release: str,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
+        """Supersede a derivation another release staged and record its Document in the failure ledger.
+
+        The ledger row carries the staging release, so the next NORMAL run, or
+        the release recovery queued at startup, derives the Document again with
+        this release's code. A Document that already has a row keeps it.
+        """
+
+        await self.db.supersede_source_derivation(attempt.id, reason_code=DERIVATION_RELEASE_SUPERSEDED)
+        doc_id = attempt.context.document.doc_id
+        if doc_id in ledger:
+            return
+        now = datetime.now(timezone.utc)
+        failure = SourceItemFailure(
+            source_id=attempt.source_id,
+            document_id=doc_id,
+            stage="derivation",
+            error_class=DERIVATION_RELEASE_SUPERSEDED,
+            error_code=DERIVATION_RELEASE_SUPERSEDED,
+            message="Another release staged this Document's derivation; this release derives it again.",
+            retryable=True,
+            release=attempt.release or UNRECORDED_RELEASE,
+            failures_in_release=1,
+            first_failed_at=now,
+            last_failed_at=now,
+            title=attempt.context.document.title,
+            source_unit_id=attempt.source_unit_id,
+            item=_derivation_item(attempt.context),
+        )
+        await self.db.upsert_source_item_failure(failure, source_activity=source_activity)
+        ledger[doc_id] = failure
 
     async def _resume_source_derivation_attempt(
         self,
@@ -2035,6 +2465,7 @@ class GeneSyncOrchestrator:
         source_updated_at = (
             datetime.fromisoformat(context.source_updated_at) if context.source_updated_at is not None else None
         )
+        diagnostics.stage = "lifecycle"
         return await self.memory_engine.prepare_and_commit_projected_lifecycle(
             projection=projection,
             doc_id=context.document.doc_id,
@@ -2129,11 +2560,14 @@ class GeneSyncOrchestrator:
         recovered_deferred_targets: frozenset[tuple[str, str]] = frozenset(),
         reprocessing: bool = False,
         stored_document: StoredSourceDocument | None = None,
+        diagnostics: _SourceUnitExecutionDiagnostics | None = None,
     ) -> dict:
+        """Process one Document; ``diagnostics`` records its Source Unit and the step that ran last."""
+
         doc_id = item.item_id
         self._memory_sample("document_wait_start", source_id=source_id, run_id=run_id, doc_id=doc_id)
         lifecycle_error: Exception | None = None
-        diagnostics = _SourceUnitExecutionDiagnostics()
+        diagnostics = diagnostics or _SourceUnitExecutionDiagnostics(stage="fetch")
 
         async with self._document_lifecycle_slot(source_id, doc_id) as document_queue_wait_ms:
             self._memory_sample(
@@ -2171,6 +2605,7 @@ class GeneSyncOrchestrator:
                         source_unit_id_callback=diagnostics.bind_source_unit,
                         reprocessing=reprocessing,
                         stored_document=stored_document,
+                        diagnostics=diagnostics,
                     )
                     if result.get("recovered_deferred_target") is not None:
                         diagnostics.status = "prepared"
@@ -2419,13 +2854,15 @@ class GeneSyncOrchestrator:
         recovered_deferred_targets: frozenset[tuple[str, str]] = frozenset(),
         reprocessing: bool = False,
         stored_document: StoredSourceDocument | None = None,
+        diagnostics: _SourceUnitExecutionDiagnostics | None = None,
     ) -> dict:
         """Process a single content item through the full pipeline.
 
         ``reprocessing`` processes the Unit as an operator reprocess (see
         :class:`SourceSyncMode`). A ``stored_document`` replaces the provider:
         its stored raw content and committed Artifacts are the input, and
-        nothing is fetched or exported.
+        nothing is fetched or exported. ``diagnostics`` records each step as
+        it starts, so a failure names the step it ended.
 
         Steps:
             1. Fetch raw content
@@ -2443,6 +2880,7 @@ class GeneSyncOrchestrator:
             Stats: ``{updated, memories_extracted}``.
         """
         doc_id = item.item_id
+        diagnostics = diagnostics or _SourceUnitExecutionDiagnostics()
         stats = {
             "updated": False,
             "memories_extracted": 0,
@@ -2456,6 +2894,7 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         # 1. Fetch raw content
         # ------------------------------------------------------------------
+        diagnostics.stage = "fetch"
         if stored_document is None:
             previous_input = await self._stored_unit_input(source_id, doc_id)
             item.stored_extra = dict(previous_input.item.extra) if previous_input is not None else {}
@@ -2483,6 +2922,7 @@ class GeneSyncOrchestrator:
         source_metadata = gene.metadata()
         source_type = source_metadata.name
         source_shape = source_metadata.data_shape
+        diagnostics.stage = "normalize"
         if stored_document is not None:
             stored_projection = await project_stored_input(
                 stored_document,
@@ -2497,6 +2937,7 @@ class GeneSyncOrchestrator:
         else:
             normalized = await gene.normalize(raw)
             require_attested_content(raw, normalized)
+            diagnostics.stage = "projection"
             projection_probe, stored_source_artifacts = await self._project_fetched_item(
                 gene=gene,
                 item=item,
@@ -2555,6 +2996,7 @@ class GeneSyncOrchestrator:
             )
 
         projection_run_id = f"{run_id or 'direct'}:{source_unit.id}:{projection_probe.source_unit_revisions[0].id}"
+        diagnostics.stage = "projection"
         async with self._db_lock:
             projection = await self.db.get_source_projection(projection_run_id)
             if projection is None:
@@ -2838,6 +3280,7 @@ class GeneSyncOrchestrator:
             )
 
         if empty_content and not stored_source_artifacts:
+            diagnostics.stage = "lifecycle"
             memory_stats = await self.memory_engine.prepare_and_commit_projected_lifecycle(
                 projection=projection,
                 doc_id=doc_id,
@@ -2916,6 +3359,7 @@ class GeneSyncOrchestrator:
         # Extraction owns the only document-content model call. Historical
         # cross-document/cross-source discovery remains post-commit Relation
         # work; same-source incumbents are loaded by exact lifecycle lineage.
+        diagnostics.stage = "derivation"
         extraction_result = await self._extract_for_document_update(
             projection=projection,
             update_plan=update_plan,
@@ -2957,6 +3401,7 @@ class GeneSyncOrchestrator:
         # 8. Bind claims to revision-pinned evidence and apply one complete,
         # stale-guarded Lifecycle Plan for this Source Unit.
         # ------------------------------------------------------------------
+        diagnostics.stage = "lifecycle"
         memory_stats = await self.memory_engine.prepare_and_commit_projected_lifecycle(
             projection=projection,
             doc_id=doc_id,
@@ -3593,7 +4038,7 @@ class GeneSyncOrchestrator:
         absent_doc_ids: set[str],
         source_filter_summary: str | None,
         source_activity: SourceActivityLease | None = None,
-    ) -> tuple[int, list[FailedDoc], set[str]]:
+    ) -> tuple[int, list[RunItemFailure], set[str]]:
         """Remove the held Documents this run proved the provider no longer has.
 
         For each absent document, persist an explicit Source Unit tombstone,
@@ -3612,7 +4057,7 @@ class GeneSyncOrchestrator:
         )
 
         deleted_count = 0
-        failed_deletions: list[FailedDoc] = []
+        failed_deletions: list[RunItemFailure] = []
         tombstoned_source_unit_ids: set[str] = set()
         for doc_id in sorted(absent_doc_ids):
             title = doc_id
@@ -3734,11 +4179,7 @@ class GeneSyncOrchestrator:
                     e,
                 )
                 failed_deletions.append(
-                    FailedDoc(
-                        doc_id=doc_id,
-                        title=title,
-                        error=str(e),
-                    )
+                    _run_item_failure(e, document_id=doc_id, title=title, stage=REMOVAL_STAGE, store=self.db)
                 )
 
         return deleted_count, failed_deletions, tombstoned_source_unit_ids

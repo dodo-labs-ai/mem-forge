@@ -9,6 +9,8 @@ import pytest
 
 from memforge.memory.health import MemoryIndexHealthChecker
 from memforge.memory.relation_discovery_contract import (
+    RELATION_DISCOVERY_LEASE_EXPIRED,
+    RELATION_DISCOVERY_LEASE_EXPIRED_ERROR,
     RelationDiscoveryRequest,
     RelationDiscoveryWorkSelection,
     RelationDiscoveryWorkState,
@@ -98,6 +100,7 @@ async def test_sqlite_relation_work_records_the_last_failure_and_its_code(db: Da
         error_code="output_invalid",
         next_attempt_at=_RETRY_DUE_AT,
         exhausted=False,
+        release="1.0.0",
     )
     second = await _lease_one(db)
     await db.fail_relation_discovery_work(
@@ -108,6 +111,7 @@ async def test_sqlite_relation_work_records_the_last_failure_and_its_code(db: Da
         error_code="TimeoutError",
         next_attempt_at=_RETRY_DUE_AT,
         exhausted=False,
+        release="1.0.0",
     )
     third = await _lease_one(db)
 
@@ -233,6 +237,144 @@ async def test_sqlite_relation_work_lease_can_be_scoped_to_source(db: Database) 
     assert leased.request.id == "relation-work-source-1"
     assert leased.request.source_id == "src-target"
 
+
+
+async def _work_row(db: Database, work_id: str = "relation-work-1") -> dict:
+    [row] = await db.db.execute_fetchall(
+        """SELECT status, attempts, lease_owner, lease_until, next_attempt_at, error, error_code, release
+             FROM relation_discovery_work WHERE id = ?""",
+        (work_id,),
+    )
+    return dict(row)
+
+
+async def _expire_lease(db: Database, work_id: str = "relation-work-1") -> None:
+    await db.db.execute("UPDATE relation_discovery_work SET lease_until = ? WHERE id = ?", (_RETRY_DUE_AT, work_id))
+    await db.db.commit()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_relation_work_records_the_release_of_its_last_failure(db: Database) -> None:
+    await _enqueue_relation_work(db)
+    first = await _lease_one(db)
+    await db.fail_relation_discovery_work(
+        first.request.id,
+        worker_id="relation-worker",
+        lease_token=first.lease_token,
+        error="TimeoutError: first failure",
+        error_code="TimeoutError",
+        next_attempt_at=_RETRY_DUE_AT,
+        exhausted=False,
+        release="1.0.0",
+    )
+    second = await _lease_one(db)
+    assert second.release == "1.0.0"
+    await db.fail_relation_discovery_work(
+        second.request.id,
+        worker_id="relation-worker",
+        lease_token=second.lease_token,
+        error="MemoryPairClassificationError: rejected request",
+        error_code="request_error",
+        next_attempt_at=None,
+        exhausted=True,
+        release="1.1.0",
+    )
+
+    assert (await _work_row(db))["release"] == "1.1.0"
+
+    rerun = await SqliteRelationalStore(db).rerun_relation_discovery_work(
+        RelationDiscoveryWorkSelection(state=RelationDiscoveryWorkState.EXHAUSTED, max_attempts=3),
+        actor="operator@example.test",
+    )
+
+    assert rerun == 1
+    assert (await _work_row(db))["release"] is None
+
+
+@pytest.mark.asyncio
+async def test_sqlite_relation_work_whose_lease_expires_on_its_last_attempt_is_exhausted(db: Database) -> None:
+    await _enqueue_relation_work(db)
+    store = SqliteRelationalStore(db)
+    await _lease_one(db, max_attempts=2)
+    await _expire_lease(db)
+
+    # With an attempt left, the work is leased again.
+    assert await store.exhaust_expired_relation_discovery_work(max_attempts=2, release="1.0.0") == 0
+    assert await store.has_ready_relation_discovery_work(max_attempts=2) is True
+    last = await _lease_one(db, max_attempts=2)
+    assert last.attempts == 2
+    await _expire_lease(db)
+
+    assert await store.has_ready_relation_discovery_work(max_attempts=2) is True
+    assert await db.lease_relation_discovery_work(
+        worker_id="relation-worker", limit=1, lease_seconds=60, max_attempts=2
+    ) == []
+    assert await store.exhaust_expired_relation_discovery_work(max_attempts=2, release="1.0.0") == 1
+
+    assert await _work_row(db) == {
+        "status": "failed",
+        "attempts": 2,
+        "lease_owner": None,
+        "lease_until": None,
+        "next_attempt_at": None,
+        "error": RELATION_DISCOVERY_LEASE_EXPIRED_ERROR,
+        "error_code": RELATION_DISCOVERY_LEASE_EXPIRED,
+        "release": "1.0.0",
+    }
+    assert await store.has_ready_relation_discovery_work(max_attempts=2) is False
+    assert await store.count_relation_discovery_work(
+        RelationDiscoveryWorkSelection(state=RelationDiscoveryWorkState.EXHAUSTED, max_attempts=2)
+    ) == 1
+    with pytest.raises(ValueError, match="lease was lost"):
+        await db.obsolete_relation_discovery_work(
+            last.request.id,
+            worker_id="relation-worker",
+            lease_token=last.lease_token or "",
+            reason="the expired worker must not finish",
+        )
+
+
+@pytest.mark.asyncio
+async def test_sqlite_relation_work_whose_lease_is_current_on_its_last_attempt_keeps_running(db: Database) -> None:
+    await _enqueue_relation_work(db)
+    await _lease_one(db, max_attempts=1)
+
+    assert await db.exhaust_expired_relation_discovery_work(max_attempts=1, release="1.0.0") == 0
+    assert (await _work_row(db))["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_sqlite_relation_work_selects_failures_another_release_recorded(db: Database) -> None:
+    await _enqueue_relation_work(db)
+    await db.db.executemany(
+        """INSERT INTO relation_discovery_work (
+               id, lifecycle_plan_id, memory_id, expected_content_hash, source_id,
+               source_unit_id, doc_id, status, attempts, error_code, next_attempt_at, release,
+               created_at, updated_at
+           ) SELECT ?, lifecycle_plan_id, memory_id, ?, source_id,
+                    source_unit_id, doc_id, ?, ?, 'TimeoutError', ?, ?, created_at, updated_at
+               FROM relation_discovery_work WHERE id = 'relation-work-1'""",
+        [
+            ("work-exhausted-earlier", "hash-earlier", "failed", 5, None, "1.0.0"),
+            ("work-exhausted-unrecorded", "hash-unrecorded", "failed", 5, None, None),
+            ("work-exhausted-current", "hash-current", "failed", 5, None, "2.0.0"),
+            ("work-retrying-earlier", "hash-retrying", "failed", 1, _RETRY_DUE_AT, "1.0.0"),
+        ],
+    )
+    await db.db.commit()
+
+    def selection(state: RelationDiscoveryWorkState) -> RelationDiscoveryWorkSelection:
+        return RelationDiscoveryWorkSelection(state=state, max_attempts=5, release_other_than="2.0.0")
+
+    exhausted = await db.list_relation_discovery_work(selection(RelationDiscoveryWorkState.EXHAUSTED), limit=10)
+    retrying = await db.list_relation_discovery_work(selection(RelationDiscoveryWorkState.FAILED), limit=10)
+
+    assert sorted(work.request.id for work in exhausted) == ["work-exhausted-earlier", "work-exhausted-unrecorded"]
+    assert [work.request.id for work in retrying] == ["work-retrying-earlier"]
+    with pytest.raises(ValueError, match="records the release"):
+        RelationDiscoveryWorkSelection(
+            state=RelationDiscoveryWorkState.COMPLETED, max_attempts=5, release_other_than="2.0.0"
+        )
 
 def _scope(statuses=("active",)) -> AccessScope:
     return AccessScope(

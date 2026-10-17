@@ -55,6 +55,8 @@ from memforge.pipeline.sync import (
     get_process_extraction_work_pool,
 )
 from memforge.retrieval import vector_index
+from memforge.release import current_release
+from memforge.source_item_failures import REMOVAL_STAGE, FailedItemRetry
 from memforge.source_secrets import decrypt_source_config_for_runtime, source_secret_fields
 from memforge.source_activity import (
     SourceActivityConflict,
@@ -71,6 +73,21 @@ if TYPE_CHECKING:
     from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
+
+# The trigger of the sync a new release queues for a Source with failed
+# Documents of an earlier release and no sync cursor.
+RELEASE_RECOVERY_TRIGGER = "release_recovery"
+
+
+def failed_item_retry_for_run(run: SourceSyncRun) -> FailedItemRetry:
+    """Which rows of the failure ledger a sync run retries.
+
+    A run a person requested, or that a request coalesced into, retries every
+    row; any other run retries only the rows that may pass (see
+    :mod:`memforge.source_item_failures`).
+    """
+
+    return FailedItemRetry.ALL if run.retry_failed_items else FailedItemRetry.RETRYABLE
 
 
 class SyncAlreadyRunningError(RuntimeError):
@@ -116,6 +133,8 @@ class RuntimeHealthReport:
     index_consistency: RuntimeHealthComponent | None = None
     audit_failures: RuntimeHealthComponent | None = None
     genes: dict[str, RuntimeHealthComponent] = field(default_factory=dict)
+    # The Documents of every Source whose processing failed, as the failure ledger records them.
+    failed_items: RuntimeHealthComponent | None = None
 
 
 @dataclass(frozen=True)
@@ -271,6 +290,7 @@ class RuntimeProvider(Protocol):
         projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         record_terminal_result: bool = True,
         source_activity: SourceActivityLease | None = None,
+        failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
     ) -> SyncState: ...
 
 
@@ -416,6 +436,7 @@ class DefaultRuntimeProvider:
         projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         record_terminal_result: bool = True,
         source_activity: SourceActivityLease | None = None,
+        failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
     ) -> SyncState:
         return await run_source_sync(
             db=db,
@@ -433,6 +454,7 @@ class DefaultRuntimeProvider:
             projection_scope_attestations=projection_scope_attestations,
             record_terminal_result=record_terminal_result,
             source_activity=source_activity,
+            failed_item_retry=failed_item_retry,
         )
 
 
@@ -591,6 +613,12 @@ async def check_runtime_health(db: "Database", config: AppConfig) -> RuntimeHeal
     except Exception as exc:
         audit_failures = RuntimeHealthComponent(status="warning", detail=str(exc))
 
+    failed_items: RuntimeHealthComponent | None = None
+    try:
+        failed_items = await failed_item_health(db)
+    except Exception as exc:
+        failed_items = RuntimeHealthComponent(status="warning", detail=str(exc))
+
     genes: dict[str, RuntimeHealthComponent] = {}
     try:
         sources = await db.list_sources()
@@ -615,6 +643,32 @@ async def check_runtime_health(db: "Database", config: AppConfig) -> RuntimeHeal
         index_consistency=index_consistency,
         audit_failures=audit_failures,
         genes=genes,
+        failed_items=failed_items,
+    )
+
+
+async def failed_item_health(store: Any) -> RuntimeHealthComponent:
+    """Count the failed Documents of every Source, and those a new release is retrying.
+
+    A failed Document is per-item work the failure ledger retries, so it never
+    makes the runtime unhealthy; it is a warning while any is left.
+    """
+
+    release = current_release()
+    failures = await store.list_source_item_failures()
+    retrying = sum(failure.recorded_by_another_release(release) for failure in failures)
+    payload = {
+        "failed_items": len(failures),
+        "retrying_after_upgrade": retrying,
+        "sources": len({failure.source_id for failure in failures}),
+        "release": release,
+    }
+    if not failures:
+        return RuntimeHealthComponent(status="ok", detail="No failed items", payload=payload)
+    return RuntimeHealthComponent(
+        status="warning",
+        detail=f"{len(failures)} failed item(s) in {payload['sources']} source(s)",
+        payload=payload,
     )
 
 
@@ -895,6 +949,7 @@ async def run_source_sync(
     projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
     record_terminal_result: bool = True,
     source_activity: SourceActivityLease | None = None,
+    failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
 ) -> SyncState:
     activity_id = source_activity.id if source_activity is not None else None
     owns_activity = False
@@ -953,6 +1008,7 @@ async def run_source_sync(
             "reusable_projection_doc_ids": reusable_projection_doc_ids,
             "projection_scope_attestations": projection_scope_attestations,
             "record_terminal_result": record_terminal_result,
+            "failed_item_retry": failed_item_retry,
         }
         sync_operation = runtime.orchestrator().sync_gene(**sync_kwargs)
         if heartbeat_task is None:
@@ -1456,6 +1512,7 @@ class SourceSyncWorker:
                 projection_scope_attestations=projection_scope_attestations,
                 record_terminal_result=False,
                 source_activity=run.source_activity,
+                failed_item_retry=failed_item_retry_for_run(run),
             )
             if final_state is None:
                 final_state = SyncState(
@@ -1604,7 +1661,14 @@ class SyncService:
         source_config_revision: str | None = None,
         predecessor_activity_id: str | None = None,
         retry_run_id: str | None = None,
+        retry_failed_items: bool = False,
     ) -> SourceSyncRun:
+        """Queue a sync of the Source, or coalesce into its active run.
+
+        A ``manual`` or ``force`` sync, or one with ``retry_failed_items``,
+        retries every failed Document of the Source; a local agent's sync
+        carries that intent from the job a person requested.
+        """
         source = await self._ensure_source_can_sync(source_id)
         current_config_revision = (
             local_agent_source_config_revision(source)
@@ -1623,6 +1687,7 @@ class SyncService:
             source_config_revision=effective_config_revision,
             predecessor_activity_id=predecessor_activity_id,
             retry_run_id=retry_run_id,
+            retry_failed_items=retry_failed_items,
         )
 
     async def enqueue_reprocess(self, source_id: str, document_ids: tuple[str, ...]) -> SourceSyncRun:
@@ -1634,11 +1699,63 @@ class SyncService:
         source = await self._ensure_source_can_sync(source_id)
         if not document_ids:
             raise ValueError("reprocess needs at least one Document")
-        state = await self.db.get_sync_state(source_id)
-        if state is None or state.last_sync_at is None:
+        if not await self._has_sync_cursor(source_id):
             raise SourceSyncBoundaryError(f"Source {source_id} has not completed a sync to reprocess")
+        return await self._enqueue_reprocess_run(source, document_ids)
+
+    async def enqueue_release_recovery(self) -> int:
+        """Queue one run per Source to retry the failed Documents another release recorded.
+
+        Each such Document is retried once with this release's code, without
+        waiting for a scheduled sync, so a Source without a schedule recovers
+        too. A Source with a sync cursor reprocesses those Documents. A Source
+        that has never completed a sync has no cursor for a reprocess to keep,
+        so it syncs: its discovery is complete, and the run retries every
+        failed Document of an earlier release. A Source that is paused,
+        inactive or cannot sync keeps its rows; one whose run is already
+        pending or running retries them in that run. Returns the number of
+        runs queued.
+        """
+        release = current_release()
+        failed_by_source: dict[str, list[str]] = {}
+        for failure in await self.db.list_source_item_failures():
+            if failure.recorded_by_another_release(release) and failure.stage != REMOVAL_STAGE:
+                failed_by_source.setdefault(failure.source_id, []).append(failure.document_id)
+        queued = 0
+        for source_id, document_ids in sorted(failed_by_source.items()):
+            try:
+                source = await self._ensure_source_can_sync(source_id)
+                if await self._has_sync_cursor(source_id):
+                    await self._enqueue_reprocess_run(source, tuple(document_ids))
+                else:
+                    await self.enqueue_source(source_id, trigger=RELEASE_RECOVERY_TRIGGER)
+            except SourceActivityConflict:
+                logger.info(
+                    "Release %s retries %d failed Document(s) of %s in its active sync run",
+                    release,
+                    len(document_ids),
+                    source_id,
+                )
+                continue
+            except (ValueError, SourcePausedError, SourceNotActiveError, SourceSyncUnsupportedError) as exc:
+                logger.info("Release %s cannot retry the failed Documents of %s yet: %s", release, source_id, exc)
+                continue
+            queued += 1
+            logger.info(
+                "Release %s queued a retry of %d failed Document(s) of %s recorded by another release",
+                release,
+                len(document_ids),
+                source_id,
+            )
+        return queued
+
+    async def _has_sync_cursor(self, source_id: str) -> bool:
+        state = await self.db.get_sync_state(source_id)
+        return state is not None and state.last_sync_at is not None
+
+    async def _enqueue_reprocess_run(self, source: dict, document_ids: tuple[str, ...]) -> SourceSyncRun:
         return await self.db.enqueue_source_sync_run(
-            source_id=source_id,
+            source_id=str(source["id"]),
             workspace_id=self.workspace_id,
             trigger="reprocess",
             source_config_revision=(

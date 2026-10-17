@@ -264,7 +264,11 @@ def provider_status_code(exc: BaseException) -> int | None:
     On some routes LiteLLM reports any provider answer as a connection error
     with a status of its own. The answer's status is then the one on the HTTP
     error underneath, so a rejected request is not mistaken for a server fault.
+    A provider client that raises httpx's own status error carries the status
+    on its response.
     """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code
     if isinstance(exc, litellm.APIConnectionError):
         answered = _answered_status_code(exc)
         if answered is not None:
@@ -295,10 +299,14 @@ def is_retryable_provider_error(exc: BaseException) -> bool:
     """Whether a failed provider request may succeed when sent again unchanged.
 
     Timeouts, connection failures, request timeout (408), conflict (409), rate
-    limiting (429) and server errors (5xx) are transient. Every other failure
-    repeats for the same request.
+    limiting (429) and server errors (5xx) are transient, whether LiteLLM or
+    an httpx client reports them. Every other failure repeats for the same
+    request.
     """
-    if isinstance(exc, (TimeoutError, ConnectionError)):
+    if isinstance(
+        exc,
+        (TimeoutError, ConnectionError, httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError),
+    ):
         return True
     status_code = provider_status_code(exc)
     return status_code in _RETRYABLE_STATUS_CODES or bool(

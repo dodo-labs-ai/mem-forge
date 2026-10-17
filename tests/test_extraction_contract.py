@@ -38,6 +38,7 @@ from memforge.pipeline.projection_context import (
     plan_projection_evidence_work,
 )
 from memforge.pipeline.revision_assessment import REVISION_INPUT_POLICY, RevisionAssessmentContext
+from memforge.release import installed_version
 from memforge.storage.database import Database
 from tests.llm_fixture import NoopMemoryExtractor
 
@@ -477,12 +478,11 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
     monkeypatch.setenv("MEMFORGE_DEPLOYMENT_REVISION", "deployment-a")
 
     result = await deriver.derive(request)
-
-    monkeypatch.setenv("MEMFORGE_DEPLOYMENT_REVISION", "deployment-b")
     replay = await deriver.derive(request)
 
     assert extractor_called is False
     assert replay.derivation == result.derivation
+    assert result.derivation.release == f"{installed_version()}+deployment-a"
     assert len(published_events) == 1
     assert published_events[0][0].deployment_revision == "deployment-a"
     assert len(published_assessments) == 1
@@ -545,6 +545,14 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
             "INCREMENTAL_BASE_UNAVAILABLE",
         )
     ]
+
+    # Another deployment is another release: it derives the Unit under its own identity.
+    monkeypatch.setenv("MEMFORGE_DEPLOYMENT_REVISION", "deployment-b")
+    redeployed = await deriver.derive(request)
+
+    assert redeployed.derivation.id != result.derivation.id
+    assert redeployed.derivation.release == f"{installed_version()}+deployment-b"
+    assert len(published_events) == 2
 
 
 def test_planning_failure_error_names_its_code_and_identifiers_but_no_source_text() -> None:

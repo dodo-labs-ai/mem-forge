@@ -24,9 +24,9 @@ export const sourceActionLayout = {
     },
     {
       id: "force-resync",
-      label: "Refresh source",
+      label: "Rebuild memories",
       description:
-        "Look for new, changed, or removed documents. Existing memories are not rebuilt unless source content changed.",
+        "Read every document again and rebuild its memories with the current version, even when its content did not change.",
       tone: "neutral",
     },
     {

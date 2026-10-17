@@ -186,6 +186,8 @@ from memforge.memory.cross_source_review_conversion import (
 )
 from memforge.memory.relation_discovery_contract import (
     RELATION_DISCOVERY_ERROR_MAX_CHARS,
+    RELATION_DISCOVERY_LEASE_EXPIRED,
+    RELATION_DISCOVERY_LEASE_EXPIRED_ERROR,
     RELATION_DISCOVERY_RERUN_EVENT,
     RelationDiscoveryRequest,
     RelationDiscoveryWork,
@@ -248,6 +250,7 @@ from memforge.vector_index_errors import (
 from memforge.retrieval.access_predicate import readable_source_sql, visible_entity_sql, visible_sql
 from memforge.retrieval.metadata_text import metadata_alias_text, metadata_compact_text
 from memforge.source_access import infer_legacy_source_access
+from memforge.source_item_failures import SourceItemFailure
 from memforge.source_derivation import (
     DERIVATION_INPUT_SUPERSEDED,
     SOURCE_DERIVATION_BATCH_COMPLETED,
@@ -821,6 +824,8 @@ def _source_sync_run_from_row(
         rerun_source_config_revision=data.get("rerun_source_config_revision"),
         predecessor_activity_id=data.get("predecessor_activity_id"),
         rerun_predecessor_activity_id=data.get("rerun_predecessor_activity_id"),
+        retry_failed_items=bool(data.get("retry_failed_items")),
+        rerun_retry_failed_items=bool(data.get("rerun_retry_failed_items")),
         reprocess_document_ids=tuple(json.loads(data.get("reprocess_document_ids_json") or "[]")),
         coalesced=coalesced,
         lease_owner=data.get("lease_owner"),
@@ -1527,6 +1532,7 @@ CREATE TABLE IF NOT EXISTS source_derivation_attempts (
     ),
     terminal_reason_code        TEXT,
     authority_plan_identity_json TEXT,
+    release                     TEXT,
     created_at                  TEXT NOT NULL,
     updated_at                  TEXT NOT NULL,
     completed_at                TEXT,
@@ -1534,6 +1540,24 @@ CREATE TABLE IF NOT EXISTS source_derivation_attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_source_derivation_attempts_source_status
     ON source_derivation_attempts(source_id, status, updated_at);
+
+CREATE TABLE IF NOT EXISTS source_item_failures (
+    source_id           TEXT NOT NULL,
+    document_id         TEXT NOT NULL,
+    source_unit_id      TEXT,
+    title               TEXT,
+    stage               TEXT NOT NULL,
+    error_code          TEXT,
+    error_class         TEXT NOT NULL,
+    message             TEXT NOT NULL,
+    retryable           INTEGER NOT NULL CHECK (retryable IN (0, 1)),
+    release             TEXT NOT NULL,
+    failures_in_release INTEGER NOT NULL CHECK (failures_in_release > 0),
+    item_json           TEXT,
+    first_failed_at     TEXT NOT NULL,
+    last_failed_at      TEXT NOT NULL,
+    PRIMARY KEY (source_id, document_id)
+);
 
 CREATE TABLE IF NOT EXISTS source_derivation_batches (
     derivation_id                TEXT NOT NULL
@@ -1710,6 +1734,7 @@ CREATE TABLE IF NOT EXISTS relation_discovery_work (
     error_code               TEXT,
     run_generation           INTEGER NOT NULL DEFAULT 0,
     classifier_version       TEXT,
+    release                  TEXT,
     created_at               TEXT NOT NULL,
     updated_at               TEXT NOT NULL,
     completed_at             TEXT,
@@ -1892,6 +1917,8 @@ CREATE TABLE IF NOT EXISTS source_sync_runs (
     rerun_source_config_revision TEXT,
     predecessor_activity_id TEXT,
     rerun_predecessor_activity_id TEXT,
+    retry_failed_items      INTEGER NOT NULL DEFAULT 0,
+    rerun_retry_failed_items INTEGER NOT NULL DEFAULT 0,
     reprocess_document_ids_json TEXT,
     lease_owner             TEXT,
     lease_expires_at        TEXT,
@@ -4804,6 +4831,49 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         "Rebuild each Memory's FTS5 row from its linked entities",
         [],
     ),
+    (
+        116,
+        "Record failed Source items in a ledger and the release of each Source derivation",
+        # A failed Document is retried from the ledger, once by each later
+        # release. A derivation staged by another release, including every
+        # derivation staged before this migration, is not resumed.
+        [
+            """CREATE TABLE IF NOT EXISTS source_item_failures (
+                source_id           TEXT NOT NULL,
+                document_id         TEXT NOT NULL,
+                source_unit_id      TEXT,
+                title               TEXT,
+                stage               TEXT NOT NULL,
+                error_code          TEXT,
+                error_class         TEXT NOT NULL,
+                message             TEXT NOT NULL,
+                retryable           INTEGER NOT NULL CHECK (retryable IN (0, 1)),
+                release             TEXT NOT NULL,
+                failures_in_release INTEGER NOT NULL CHECK (failures_in_release > 0),
+                item_json           TEXT,
+                first_failed_at     TEXT NOT NULL,
+                last_failed_at      TEXT NOT NULL,
+                PRIMARY KEY (source_id, document_id)
+            )""",
+            "ALTER TABLE source_derivation_attempts ADD COLUMN release TEXT",
+        ],
+    ),
+    (
+        117,
+        "Record the release of each relation discovery work failure",
+        # Failed or exhausted work is re-run once by each later release. Work
+        # that failed before this migration records no release, so the next
+        # start re-runs it.
+        ["ALTER TABLE relation_discovery_work ADD COLUMN release TEXT"],
+    ),
+    (
+        118,
+        "Record whether a Source sync run retries every failed Document",
+        [
+            "ALTER TABLE source_sync_runs ADD COLUMN retry_failed_items INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE source_sync_runs ADD COLUMN rerun_retry_failed_items INTEGER NOT NULL DEFAULT 0",
+        ],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -4857,6 +4927,17 @@ async def _open_aiosqlite_connection(
             await asyncio.to_thread(worker.join)
         await asyncio.sleep(0)
         raise
+
+
+# The triggers of a sync a person requested, which retries every failed
+# Document of its Source.
+_REQUESTED_SYNC_TRIGGERS = frozenset({"manual", "force"})
+
+# Primary result codes of a database another connection holds; the low byte of
+# an extended code is its primary code.
+_TRANSIENT_SQLITE_RESULT_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+# The messages of those results, for an error that carries no result code.
+_TRANSIENT_SQLITE_MESSAGES = ("database is locked", "database table is locked", "database is busy")
 
 
 def _truncate_write_ahead_log(path: str, *, wait_s: float) -> bool:
@@ -6029,6 +6110,21 @@ class Database:
         assert self._db is not None, "Database not connected"
         return self._db
 
+    def is_transient_error(self, error: BaseException) -> bool:
+        """Whether an SQLite error may succeed when the work runs again.
+
+        Only a busy or locked database is transient: another connection held
+        the lock past the busy timeout. Every other SQLite error, a constraint
+        violation or a missing table among them, fails the same way again.
+        """
+
+        if not isinstance(error, sqlite3.OperationalError):
+            return False
+        code = getattr(error, "sqlite_errorcode", None)
+        if code is not None:
+            return (code & 0xFF) in _TRANSIENT_SQLITE_RESULT_CODES
+        return str(error).startswith(_TRANSIENT_SQLITE_MESSAGES)
+
     @asynccontextmanager
     async def _write_transaction(self) -> AsyncIterator[None]:
         """Hold the write lock for one transaction, which the block commits.
@@ -6444,8 +6540,9 @@ class Database:
             existing_payload = json.loads(existing["payload_json"] or "{}")
             if existing["status"] == "queued":
                 replacement = dict(payload)
-                if bool(existing_payload.get("force_full_sync")):
-                    replacement["force_full_sync"] = True
+                for flag in ("force_full_sync", "retry_failed_items"):
+                    if bool(existing_payload.get(flag)):
+                        replacement[flag] = True
                 await self.db.execute(
                     """UPDATE local_agent_jobs SET payload_json = ?, updated_at = ?,
                            next_attempt_at = CASE WHEN ? THEN NULL ELSE next_attempt_at END
@@ -6454,7 +6551,10 @@ class Database:
                 )
                 return str(existing["job_id"]), False
             same_revision = existing_payload.get("source_config_revision") == payload.get("source_config_revision")
-            if same_revision and (not payload.get("force_full_sync") or existing_payload.get("force_full_sync")):
+            if same_revision and all(
+                not payload.get(flag) or existing_payload.get(flag)
+                for flag in ("force_full_sync", "retry_failed_items")
+            ):
                 return str(existing["job_id"]), False
         await self.db.execute(
             """INSERT INTO local_agent_jobs (
@@ -6991,8 +7091,8 @@ class Database:
                             extraction_contract_version, status,
                             created_at, updated_at, completed_at, applied_at,
                             terminal_reason_code,
-                            authority_plan_identity_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
+                            authority_plan_identity_json, release
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)""",
                         (
                             manifest.id,
                             manifest.source_id,
@@ -7012,6 +7112,7 @@ class Database:
                             now if initial_status == SOURCE_DERIVATION_COMPLETED else None,
                             manifest.terminal_reason_code,
                             authority_plan_identity_json,
+                            manifest.release,
                         ),
                     )
                     for batch in manifest.batches:
@@ -7051,6 +7152,7 @@ class Database:
                         "authority_plan_identity_json": (
                             authority_plan_identity_json
                         ),
+                        "release": manifest.release,
                     }
                     mismatched_columns = tuple(
                         column for column, value in immutable_values.items() if existing[column] != value
@@ -7262,6 +7364,136 @@ class Database:
             )
             await self.db.commit()
 
+    # ==================================================================
+    # Source item failures
+    # ==================================================================
+
+    async def upsert_source_item_failure(
+        self,
+        failure: SourceItemFailure,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
+        """Insert the ledger row, or replace the Document's row in its Source, while ``source_activity`` is current."""
+
+        async with self._write_lock:
+            try:
+                await self._assert_source_activity_fence_unlocked(failure.source_id, source_activity)
+                await self._upsert_source_item_failure_unlocked(failure)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def _upsert_source_item_failure_unlocked(self, failure: SourceItemFailure) -> None:
+        await self.db.execute(
+            """INSERT INTO source_item_failures (
+                   source_id, document_id, source_unit_id, title, stage,
+                   error_code, error_class, message, retryable, release,
+                   failures_in_release, item_json, first_failed_at, last_failed_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(source_id, document_id) DO UPDATE SET
+                   source_unit_id = excluded.source_unit_id,
+                   title = excluded.title,
+                   stage = excluded.stage,
+                   error_code = excluded.error_code,
+                   error_class = excluded.error_class,
+                   message = excluded.message,
+                   retryable = excluded.retryable,
+                   release = excluded.release,
+                   failures_in_release = excluded.failures_in_release,
+                   item_json = excluded.item_json,
+                   first_failed_at = excluded.first_failed_at,
+                   last_failed_at = excluded.last_failed_at""",
+            (
+                failure.source_id,
+                failure.document_id,
+                failure.source_unit_id,
+                failure.title,
+                failure.stage,
+                failure.error_code,
+                failure.error_class,
+                failure.message,
+                int(failure.retryable),
+                failure.release,
+                failure.failures_in_release,
+                (
+                    json.dumps(failure.item.to_payload(), sort_keys=True, separators=(",", ":"))
+                    if failure.item is not None
+                    else None
+                ),
+                failure.first_failed_at.isoformat(),
+                failure.last_failed_at.isoformat(),
+            ),
+        )
+
+    async def list_source_item_failures(
+        self,
+        *,
+        source_id: str | None = None,
+    ) -> tuple[SourceItemFailure, ...]:
+        """The ledger rows of one Source, or of every Source, ordered by Source and Document."""
+
+        if source_id is None:
+            rows = await self.db.execute_fetchall(
+                "SELECT * FROM source_item_failures ORDER BY source_id, document_id"
+            )
+        else:
+            rows = await self.db.execute_fetchall(
+                "SELECT * FROM source_item_failures WHERE source_id = ? ORDER BY document_id",
+                (source_id,),
+            )
+        return tuple(
+            SourceItemFailure(
+                source_id=str(row["source_id"]),
+                document_id=str(row["document_id"]),
+                stage=str(row["stage"]),
+                error_class=str(row["error_class"]),
+                message=str(row["message"]),
+                retryable=bool(row["retryable"]),
+                release=str(row["release"]),
+                failures_in_release=int(row["failures_in_release"]),
+                first_failed_at=datetime.fromisoformat(str(row["first_failed_at"])),
+                last_failed_at=datetime.fromisoformat(str(row["last_failed_at"])),
+                title=_non_empty_string(row["title"]),
+                error_code=_non_empty_string(row["error_code"]),
+                source_unit_id=_non_empty_string(row["source_unit_id"]),
+                item=(
+                    ContentItem.from_payload(json.loads(row["item_json"]))
+                    if row["item_json"] is not None
+                    else None
+                ),
+            )
+            for row in rows
+        )
+
+    async def delete_source_item_failures(
+        self,
+        source_id: str,
+        document_ids: Collection[str],
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
+        """Delete the ledger rows of these Documents of the Source while ``source_activity`` is current."""
+
+        document_ids = tuple(dict.fromkeys(document_ids))
+        if not document_ids:
+            return
+        async with self._write_lock:
+            try:
+                await self._assert_source_activity_fence_unlocked(source_id, source_activity)
+                for chunk_start in range(0, len(document_ids), 500):
+                    chunk = document_ids[chunk_start : chunk_start + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    await self.db.execute(
+                        f"DELETE FROM source_item_failures WHERE source_id = ? AND document_id IN ({placeholders})",
+                        (source_id, *chunk),
+                    )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
     async def stage_derivation_work(self, *, derivation_id: str, work: DerivationWork) -> DerivationWork:
         return await self._persist_derivation_work(derivation_id, work, stage=True)
 
@@ -7439,6 +7671,7 @@ class Database:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
             completed_at=(str(row["completed_at"]) if row["completed_at"] is not None else None),
+            release=(str(row["release"]) if row["release"] is not None else None),
         )
 
     def _validate_new_projection_revision_declarations(
@@ -11313,22 +11546,56 @@ class Database:
             await self.db.commit()
 
     async def has_ready_relation_discovery_work(self, *, max_attempts: int) -> bool:
-        """Return whether durable relation work is ready for a lease attempt."""
+        """Return whether durable relation work is ready for a lease attempt or for exhaustion.
+
+        Work whose lease expired is ready either way: with an attempt left it is
+        leased again, and on its last attempt it is recorded as exhausted.
+        """
 
         if max_attempts < 1:
             raise ValueError("relation discovery readiness requires positive max attempts")
         now = _now_iso()
         rows = await self.db.execute_fetchall(
             """SELECT 1 AS ready FROM relation_discovery_work
-               WHERE attempts < ? AND (
-                     status = 'pending'
-                  OR (status = 'failed' AND next_attempt_at <= ?)
-                  OR (status = 'running' AND lease_until < ?)
-               )
+               WHERE (status = 'running' AND lease_until < ?)
+                  OR (attempts < ? AND (
+                         status = 'pending'
+                      OR (status = 'failed' AND next_attempt_at <= ?)
+                  ))
                LIMIT 1""",
-            (max_attempts, now, now),
+            (now, max_attempts, now),
         )
         return bool(rows)
+
+    async def exhaust_expired_relation_discovery_work(self, *, max_attempts: int, release: str) -> int:
+        """Record work whose lease expired on its last attempt as exhausted; returns how many.
+
+        The worker that held such work stopped before it finished, and no
+        attempt is left to lease it again. ``release`` is the release that
+        records the failure.
+        """
+
+        if max_attempts < 1:
+            raise ValueError("relation discovery exhaustion requires positive max attempts")
+        now = _now_iso()
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE relation_discovery_work
+                      SET status = 'failed', lease_owner = NULL, lease_token = NULL,
+                          lease_until = NULL, next_attempt_at = NULL,
+                          error = ?, error_code = ?, release = ?, updated_at = ?
+                    WHERE status = 'running' AND attempts >= ? AND lease_until < ?""",
+                (
+                    RELATION_DISCOVERY_LEASE_EXPIRED_ERROR,
+                    RELATION_DISCOVERY_LEASE_EXPIRED,
+                    release,
+                    now,
+                    max_attempts,
+                    now,
+                ),
+            )
+            await self.db.commit()
+        return int(cursor.rowcount or 0)
 
     async def lease_relation_discovery_work(
         self,
@@ -11444,7 +11711,7 @@ class Database:
                           SET status = 'completed', lease_owner = NULL,
                               lease_token = NULL, lease_until = NULL,
                               next_attempt_at = NULL, error = NULL, error_code = NULL,
-                              classifier_version = ?,
+                              release = NULL, classifier_version = ?,
                               updated_at = ?, completed_at = ?
                         WHERE id = ? AND status = 'running'
                           AND lease_owner = ? AND lease_token = ?""",
@@ -11556,8 +11823,9 @@ class Database:
         error_code: str,
         next_attempt_at: str | None,
         exhausted: bool,
+        release: str,
     ) -> None:
-        """Record a failure; exhausted work is not retried, other work is retried at ``next_attempt_at``."""
+        """Record a failure of ``release``; exhausted work is not retried, other work is retried at ``next_attempt_at``."""
 
         if not exhausted and next_attempt_at is None:
             raise ValueError("retried relation discovery work requires its next attempt time")
@@ -11569,6 +11837,7 @@ class Database:
             message=error,
             error_code=error_code,
             next_attempt_at=None if exhausted else next_attempt_at,
+            release=release,
         )
 
     async def count_relation_discovery_work(self, selection: RelationDiscoveryWorkSelection) -> int:
@@ -11618,6 +11887,7 @@ class Database:
         selection: RelationDiscoveryWorkSelection,
         *,
         actor: str,
+        reason: str | None = None,
     ) -> int:
         """Queue the selected completed or exhausted work again; returns how many."""
 
@@ -11635,7 +11905,7 @@ class Database:
                     rows,
                     actor=actor,
                     operation_id=f"relation-rerun-{uuid.uuid4().hex}",
-                    reason=None,
+                    reason=reason,
                 )
                 await self.db.commit()
             except Exception:
@@ -11683,7 +11953,7 @@ class Database:
                       SET status = 'pending', attempts = 0, run_generation = run_generation + 1,
                           lease_owner = NULL, lease_token = NULL, lease_until = NULL,
                           next_attempt_at = NULL, error = NULL, error_code = NULL,
-                          completed_at = NULL, updated_at = ?
+                          release = NULL, completed_at = NULL, updated_at = ?
                     WHERE id = ? AND status = ? AND attempts = ? AND run_generation = ?""",
                 (now, row["id"], row["status"], row["attempts"], row["run_generation"]),
             )
@@ -11930,6 +12200,7 @@ class Database:
             message=reason,
             error_code=None,
             next_attempt_at=None,
+            release=None,
         )
 
     async def _finish_relation_discovery_work(
@@ -11942,8 +12213,9 @@ class Database:
         message: str,
         error_code: str | None,
         next_attempt_at: str | None,
+        release: str | None,
     ) -> None:
-        """Fence and finish leased work; each failure replaces the recorded error.
+        """Fence and finish leased work; each failure replaces the recorded error and its release.
 
         An obsolete finish records its reason only when no failure is recorded,
         and removes the relations the classifier recorded for the work: work
@@ -11965,6 +12237,7 @@ class Database:
                               lease_until = NULL, next_attempt_at = ?,
                               error = CASE WHEN ? THEN ? ELSE COALESCE(error, ?) END,
                               error_code = CASE WHEN ? THEN ? ELSE error_code END,
+                              release = CASE WHEN ? THEN ? ELSE release END,
                               updated_at = ?,
                               completed_at = CASE WHEN ? = 'obsolete' THEN ? ELSE NULL END
                         WHERE id = ? AND status = 'running'
@@ -11978,6 +12251,8 @@ class Database:
                         message[:RELATION_DISCOVERY_ERROR_MAX_CHARS],
                         failed,
                         error_code,
+                        failed,
+                        release,
                         now,
                         status.value,
                         now,
@@ -12187,6 +12462,7 @@ class Database:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             completed_at=row["completed_at"],
+            release=row["release"],
         )
 
     def _row_to_lifecycle_review(self, row) -> LifecycleReview:
@@ -17927,6 +18203,10 @@ class Database:
                     (source_id,),
                 )
                 await self.db.execute(
+                    "DELETE FROM source_item_failures WHERE source_id = ?",
+                    (source_id,),
+                )
+                await self.db.execute(
                     "DELETE FROM source_subscriptions WHERE source_id = ?",
                     (source_id,),
                 )
@@ -18487,6 +18767,7 @@ class Database:
         predecessor_activity_id: str | None = None,
         retry_run_id: str | None = None,
         reprocess_document_ids: tuple[str, ...] = (),
+        retry_failed_items: bool = False,
     ) -> SourceSyncRun:
         """Queue one sync run, or coalesce into the Source's active run.
 
@@ -18494,6 +18775,12 @@ class Database:
         Documents instead. It never coalesces: it is refused with
         :class:`SourceSyncRunActive` while another run is pending or running.
         A sync requested while a reprocess is active runs after it.
+
+        A sync a person requested (``manual`` or ``force``, or
+        ``retry_failed_items``) retries every failed Document of its Source.
+        The request carries that into the run it coalesces into: a pending
+        run takes it, and a running run that does not retry every failed
+        Document gets a successor that does.
         """
         for _attempt in range(3):
             async with self._write_lock:
@@ -18508,6 +18795,7 @@ class Database:
                         predecessor_activity_id=predecessor_activity_id,
                         retry_run_id=retry_run_id,
                         reprocess_document_ids=reprocess_document_ids,
+                        retry_failed_items=retry_failed_items or trigger in _REQUESTED_SYNC_TRIGGERS,
                     )
                     await self.db.commit()
                     return run
@@ -18531,6 +18819,7 @@ class Database:
         predecessor_activity_id: str | None = None,
         retry_run_id: str | None = None,
         reprocess_document_ids: tuple[str, ...] = (),
+        retry_failed_items: bool = False,
         now: str | None = None,
     ) -> SourceSyncRun:
         now_iso = now or _now_iso()
@@ -18576,7 +18865,7 @@ class Database:
             if target.source_config_revision is not None and target.source_config_revision != local_agent_source_config_revision(dict(source)):
                 raise ValueError("source sync retry target configuration is stale")
             await self.db.execute(
-                """UPDATE source_sync_runs SET next_attempt_at = NULL, updated_at = ?
+                """UPDATE source_sync_runs SET next_attempt_at = NULL, retry_failed_items = 1, updated_at = ?
                    WHERE run_id = ? AND status = 'pending'""", (now_iso, retry_run_id),
             )
             current = await self.get_source_sync_run(retry_run_id)
@@ -18613,6 +18902,7 @@ class Database:
                 """UPDATE source_sync_runs
                    SET rerun_requested = 1,
                        force_full_sync = CASE WHEN ? THEN 1 ELSE force_full_sync END,
+                       rerun_retry_failed_items = CASE WHEN ? THEN 1 ELSE rerun_retry_failed_items END,
                        rerun_input_snapshot_id = COALESCE(?, rerun_input_snapshot_id),
                        rerun_input_generation_watermark = ?,
                        rerun_source_config_revision = COALESCE(?, rerun_source_config_revision),
@@ -18621,6 +18911,7 @@ class Database:
                    WHERE run_id = ? AND status IN ('pending', 'running')""",
                 (
                     int(force_full_sync),
+                    int(retry_failed_items),
                     normalized_snapshot_id,
                     input_generation_watermark,
                     normalized_config_revision,
@@ -18645,14 +18936,24 @@ class Database:
                 pending_snapshot_id,
             }
             force_requires_rerun = force_full_sync and not bool(existing["force_full_sync"])
+            retry_requires_rerun = retry_failed_items and not bool(existing["retry_failed_items"])
             mark_rerun = existing["status"] == "running" and (
                 has_new_snapshot
                 or (trigger == "local_agent" and normalized_snapshot_id is None)
                 or force_requires_rerun
+                or retry_requires_rerun
             )
             cursor = await self.db.execute(
                 """UPDATE source_sync_runs
                    SET force_full_sync = CASE WHEN ? THEN 1 ELSE force_full_sync END,
+                       retry_failed_items = CASE
+                           WHEN status = 'pending' AND ? THEN 1 ELSE retry_failed_items
+                       END,
+                       rerun_retry_failed_items = CASE
+                           WHEN status = 'pending' THEN 0
+                           WHEN status = 'running' AND ? THEN 1
+                           ELSE rerun_retry_failed_items
+                       END,
                        rerun_requested = CASE
                            WHEN status = 'pending' THEN 0
                            WHEN ? THEN 1
@@ -18700,6 +19001,8 @@ class Database:
                    WHERE run_id = ? AND status IN ('pending', 'running')""",
                 (
                     int(force_full_sync),
+                    int(retry_failed_items),
+                    int(retry_requires_rerun),
                     int(mark_rerun),
                     normalized_snapshot_id,
                     normalized_snapshot_id,
@@ -18736,9 +19039,9 @@ class Database:
             """INSERT INTO source_sync_runs (
                 run_id, workspace_id, source_id, trigger, status,
                 force_full_sync, input_snapshot_id, input_generation_watermark,
-                source_config_revision, predecessor_activity_id,
+                source_config_revision, predecessor_activity_id, retry_failed_items,
                 reprocess_document_ids_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id,
                 workspace_id,
@@ -18749,6 +19052,7 @@ class Database:
                 input_generation_watermark,
                 normalized_config_revision,
                 normalized_predecessor_activity_id,
+                int(retry_failed_items),
                 (json.dumps(sorted(set(reprocess_document_ids))) if reprocess_document_ids else None),
                 now_iso,
                 now_iso,
@@ -18788,6 +19092,7 @@ class Database:
                        rerun_input_generation_watermark = NULL,
                        rerun_source_config_revision = NULL,
                        rerun_predecessor_activity_id = NULL,
+                       rerun_retry_failed_items = 0,
                        lease_owner = NULL,
                        lease_expires_at = NULL,
                        next_attempt_at = NULL,
@@ -19295,6 +19600,10 @@ class Database:
                            )
                            ELSE predecessor_activity_id
                        END,
+                       retry_failed_items = CASE
+                           WHEN ? AND rerun_requested = 1 AND rerun_retry_failed_items = 1 THEN 1
+                           ELSE retry_failed_items
+                       END,
                        rerun_requested = CASE WHEN ? THEN 0 ELSE rerun_requested END,
                        rerun_input_snapshot_id = CASE
                            WHEN ? THEN NULL ELSE rerun_input_snapshot_id
@@ -19308,6 +19617,7 @@ class Database:
                        rerun_predecessor_activity_id = CASE
                            WHEN ? THEN NULL ELSE rerun_predecessor_activity_id
                        END,
+                       rerun_retry_failed_items = CASE WHEN ? THEN 0 ELSE rerun_retry_failed_items END,
                        lease_owner = NULL,
                        lease_expires_at = NULL,
                        next_attempt_at = ?,
@@ -19319,15 +19629,7 @@ class Database:
                      AND lease_expires_at > ?""",
                     (
                         status,
-                        int(retryable),
-                        int(retryable),
-                        int(retryable),
-                        int(retryable),
-                        int(retryable),
-                        int(retryable),
-                        int(retryable),
-                        int(retryable),
-                        int(retryable),
+                        *(int(retryable),) * 11,
                         next_attempt_iso,
                         error_message,
                         completed_at,
@@ -19384,9 +19686,9 @@ class Database:
             """INSERT INTO source_sync_runs (
                 run_id, workspace_id, source_id, trigger, status,
                 force_full_sync, input_snapshot_id, input_generation_watermark,
-                source_config_revision, predecessor_activity_id,
+                source_config_revision, predecessor_activity_id, retry_failed_items,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, 'rerun', 'pending', ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, 'rerun', 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 successor_id,
                 completed["workspace_id"],
@@ -19396,6 +19698,7 @@ class Database:
                 completed["rerun_input_generation_watermark"],
                 completed["rerun_source_config_revision"],
                 completed["rerun_predecessor_activity_id"],
+                int(completed["rerun_retry_failed_items"]),
                 now,
                 now,
             ),
