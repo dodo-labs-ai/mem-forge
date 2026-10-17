@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from typing import Any
 
 import pytest
@@ -472,6 +473,27 @@ async def test_a_deadline_that_passes_during_an_attempt_ends_the_call() -> None:
     )
 
     with pytest.raises(EmbeddingDeadlineExceeded, match="after 0.1s"):
+        await runtime.embed_documents(["alpha"])
+
+
+async def test_a_retryable_failure_that_ends_after_the_deadline_ends_the_call_at_the_deadline() -> None:
+    async def fails_after_the_deadline(**_request: Any) -> Any:
+        # Holding the event loop keeps the deadline from interrupting the
+        # attempt, so the attempt itself ends after the deadline.
+        time.sleep(0.1)
+        raise TimeoutError("timed out")
+
+    runtime = EmbeddingRuntime(
+        EmbeddingSettings(
+            invocation=_OLLAMA,
+            timeout_s=0.05,
+            num_retries=3,
+            retry_pauses_s=(0.0,),
+        ),
+        transport=fails_after_the_deadline,
+    )
+
+    with pytest.raises(EmbeddingDeadlineExceeded, match="after 0.05s"):
         await runtime.embed_documents(["alpha"])
 
 

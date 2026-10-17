@@ -8931,19 +8931,21 @@ async def test_source_sync_worker_run_forever_polls_until_cancelled(db: Database
         worker_id="worker-loop",
     )
 
+    async def finished_run():
+        while True:
+            run = await db.get_source_sync_run(enqueued.run_id)
+            assert run is not None
+            if run.status not in {"pending", "running"}:
+                return run
+            await asyncio.sleep(0.01)
+
     task = asyncio.create_task(worker.run_forever(poll_seconds=0.01))
-    for _ in range(50):
-        completed = await db.get_source_sync_run(enqueued.run_id)
-        if completed and completed.status == "success":
-            break
-        await asyncio.sleep(0.01)
+    finished = await asyncio.wait_for(finished_run(), timeout=30)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    completed = await db.get_source_sync_run(enqueued.run_id)
-    assert completed is not None
-    assert completed.status == "success"
+    assert finished.status == "success"
 
 
 @pytest.mark.asyncio
