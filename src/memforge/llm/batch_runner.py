@@ -127,9 +127,10 @@ class ItemFailure:
     after its correction. The caller owns the stage outcome: Support keeps an
     unjudgeable incumbent; Claim Extraction skips the unjudgeable ReadingGroup.
     The rest leave the Source Unit revision
-    uncommitted: ``deadline_exceeded`` and ``provider_error`` are transient and
-    the sync retries them at once, while ``request_error``, a request that failed
-    without a response to validate, is left for the next sync
+    uncommitted: ``deadline_exceeded`` and a ``provider_error`` the provider
+    did not refuse are transient and the sync retries them at once, while a
+    refused request (400, 401, 403, 404, 422) and ``request_error``, a request
+    that failed without a response to validate, are left for the next sync
     (``failure_retryable`` in ``llm.structured`` is the one rule). ``error`` is the exception that ended
     the item; every failure that is not unjudgeable carries one, for the caller to raise. For a chain item, ``part`` is the index of the
     first part it could not read.

@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 
-from memforge.llm.structured import TRANSIENT_TERMINAL_CATEGORIES
+from memforge.llm.structured import terminal_failure_retryable
+from memforge.llm.transport import provider_status_code
 from memforge.memory.cross_document_relation import (
     CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
     CrossDocumentRelationClassification,
@@ -446,12 +447,13 @@ def _repeats_on_every_attempt(error: BaseException) -> bool:
 
     Each work item has its own attempt budget, which bounds a failure that
     declares nothing, so such a failure is attempted again until the budget
-    runs out. A model failure repeats unless its terminal category is transient.
+    runs out. A model failure repeats unless ``terminal_failure_retryable``
+    accepts its terminal category and the status the provider answered with.
     """
 
     category = getattr(error, "terminal_category", None)
     if category is not None:
-        return category not in TRANSIENT_TERMINAL_CATEGORIES
+        return not terminal_failure_retryable(category, provider_status_code(error))
     return not getattr(error, "retryable", True)
 
 

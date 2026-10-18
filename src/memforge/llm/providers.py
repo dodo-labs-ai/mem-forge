@@ -227,6 +227,11 @@ class ProviderDescriptor:
     # The SDK keyword arguments that ask the generation model at a route to
     # answer without reasoning first, as LiteLLM passes them to this provider.
     reasoning_off: Callable[[str], dict[str, Any]] = _sends_nothing
+    # The kinds whose requests go to the provider's OpenAI-compatible API, with
+    # the path of that API after the base URL. They are sent on LiteLLM's
+    # ``openai/`` route, which carries the API key and the timeout of every
+    # request, while the route of the model id still names the model.
+    openai_api_paths: Mapping[ModelKind, str] = field(default_factory=dict)
 
     @property
     def model_is_route(self) -> bool:
@@ -285,6 +290,19 @@ class ProviderDescriptor:
                 )
             return model
         return f"{self.route_prefixes[kind]}/{model}"
+
+    def request_target(self, kind: ModelKind, route: str, endpoint: str | None) -> tuple[str, str | None]:
+        """Return the LiteLLM route and the base URL a request of ``kind`` is sent with.
+
+        ``route`` and ``endpoint`` are the model's own, as ``compile_route`` and
+        ``base_endpoint`` give them. A kind the provider serves through its
+        OpenAI-compatible API is sent there under the same model name.
+        """
+        api_path = self.openai_api_paths.get(kind)
+        base = endpoint or self.default_endpoint
+        if api_path is None or base is None:
+            return route, endpoint
+        return f"openai/{route.partition('/')[2]}", f"{base}{api_path}"
 
 
 PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
@@ -354,6 +372,11 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
             *(f"/v1{path}" for path in _OPENAI_REQUEST_PATHS),
         ),
         reasoning_off=_ollama_thinking_off,
+        # LiteLLM's ``ollama/`` route posts an embedding request with neither
+        # the API key nor the timeout
+        # (https://github.com/BerriAI/litellm/issues/47261), and Ollama's
+        # OpenAI-compatible API takes the same models under the same names.
+        openai_api_paths={"embedding": "/v1"},
     ),
     ProviderDescriptor(
         id="openai_compatible",

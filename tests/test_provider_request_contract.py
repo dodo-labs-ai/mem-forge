@@ -105,18 +105,35 @@ _ANSWER = {"ranking": [3, 1]}
 _JSON_TEXT_INSTRUCTION = "Return ONLY a single JSON object"
 _ELSEWHERE = "elsewhere.example.test"
 
-# The HTTP answers a request can fail with, and whether each may succeed when
-# the same request is sent again. Every row classifies them the same way.
-STATUS_RETRYABLE: Mapping[int, bool] = {
-    400: False,
-    401: False,
-    404: False,
-    408: True,
-    409: True,
-    422: False,
-    429: True,
-    500: True,
-    503: True,
+
+
+@dataclass(frozen=True)
+class StatusClassification:
+    """What a failed answer with one HTTP status leads to."""
+
+    # The call sends the same request again within its retry budget.
+    sent_again: bool
+    # The run that made the call may succeed when it is retried
+    # (``failure_retryable``).
+    run_retryable: bool
+
+
+_TRANSIENT = StatusClassification(sent_again=True, run_retryable=True)
+_REFUSED = StatusClassification(sent_again=False, run_retryable=False)
+
+# The HTTP answers a request can fail with, and what each leads to. Every row
+# classifies them the same way, for both kinds of model.
+STATUS_CLASSIFICATION: Mapping[int, StatusClassification] = {
+    400: _REFUSED,
+    401: _REFUSED,
+    403: _REFUSED,
+    404: _REFUSED,
+    408: _TRANSIENT,
+    409: _TRANSIENT,
+    422: _REFUSED,
+    429: _TRANSIENT,
+    500: _TRANSIENT,
+    503: _TRANSIENT,
 }
 
 # Keyword arguments MemForge gives the SDK that are the SDK's to read, never a
@@ -302,8 +319,8 @@ class Row:
 
 
 _OLLAMA_EMBEDDING_KEY_GAP = (
-    "LiteLLM posts an Ollama embedding with no headers, so the API key of an Ollama "
-    "server behind authentication never reaches it."
+    "LiteLLM's ollama/ embedding route posts with no headers, so the API key of an Ollama "
+    "server behind authentication never reaches it: https://github.com/BerriAI/litellm/issues/47261"
 )
 _SAME_REQUESTS_AS_KEYLESS_OLLAMA = "The keyless ollama row sends the same requests; only the credential differs."
 
@@ -429,13 +446,14 @@ MATRIX: tuple[Row, ...] = (
         ),
         embedding=EmbeddingContract(
             model_id="nomic-embed-text",
-            url="http://localhost:11434/api/embed",
+            url="http://localhost:11434/v1/embeddings",
             model="nomic-embed-text",
-            headers={"authorization": None},
-            reply=_ollama_embed,
-            error=_ollama_error,
+            headers={"authorization": "Bearer no-api-key"},
+            reply=_openai_embeddings,
+            error=_openai_error,
             dimensions_field="dimensions",
-            timeout_error=None,
+            timeout_error=litellm.Timeout,
+            fields={"encoding_format": "float"},
         ),
     ),
     Row(
@@ -459,13 +477,14 @@ MATRIX: tuple[Row, ...] = (
         ),
         embedding=EmbeddingContract(
             model_id="nomic-embed-text",
-            url="https://ollama.example.test/api/embed",
+            url="https://ollama.example.test/v1/embeddings",
             model="nomic-embed-text",
             headers={"authorization": f"Bearer {_KEY}"},
-            reply=_ollama_embed,
-            error=_ollama_error,
+            reply=_openai_embeddings,
+            error=_openai_error,
             dimensions_field="dimensions",
-            timeout_error=None,
+            timeout_error=litellm.Timeout,
+            fields={"encoding_format": "float"},
         ),
         excluded={
             (kind, feature): _SAME_REQUESTS_AS_KEYLESS_OLLAMA
@@ -475,7 +494,6 @@ MATRIX: tuple[Row, ...] = (
             )
             for feature in features
         },
-        known_gaps={("embedding", "credential"): _OLLAMA_EMBEDDING_KEY_GAP},
     ),
     Row(
         id="openai_compatible",
@@ -647,23 +665,9 @@ MATRIX: tuple[Row, ...] = (
 # Route providers the quickstart names for the LiteLLM-route descriptor, with
 # the kind of model it names them for.
 DOCUMENTED_ROUTES: tuple[tuple[str, ModelKind], ...] = (
-    ("bedrock", "generation"),
-    ("vertex_ai", "generation"),
+    ("voyage", "embedding"),
     ("ollama", "embedding"),
 )
-
-# Documented routes no request can reach a provider on from a MemForge install,
-# with a model on each and the reason.
-UNREACHABLE_ROUTES: Mapping[str, tuple[str, str]] = {
-    "bedrock": (
-        "bedrock/anthropic.claude-sonnet-4-6",
-        "LiteLLM signs a Bedrock request with boto3, which MemForge does not install.",
-    ),
-    "vertex_ai": (
-        "vertex_ai/gemini-2.5-flash",
-        "LiteLLM authenticates a Vertex AI request with google-auth, which MemForge does not install.",
-    ),
-}
 
 
 def _route_provider(model_id: str) -> str:
@@ -720,7 +724,7 @@ def test_every_route_a_descriptor_compiles_or_the_docs_name_has_a_litellm_row() 
         if (contract := row.contract(kind)) is not None
     }
 
-    assert claimed - covered - {(route, "generation") for route in UNREACHABLE_ROUTES} == set()
+    assert claimed - covered == set()
 
 
 def test_every_row_covers_each_feature_of_the_kinds_its_descriptor_serves() -> None:
@@ -1109,12 +1113,14 @@ async def test_a_redirect_fails_the_request_and_its_key_and_payload_are_not_sent
 # -- Error classification -----------------------------------------------------------
 
 
-@pytest.mark.parametrize("status", list(STATUS_RETRYABLE))
+@pytest.mark.parametrize("status", list(STATUS_CLASSIFICATION))
 @pytest.mark.parametrize(("row", "kind"), _row_kinds("error_classification"))
-async def test_a_failed_request_is_sent_again_only_when_its_status_is_transient(wire, row, kind, status) -> None:
+async def test_a_failed_request_is_sent_again_and_its_run_retried_only_when_its_status_is_transient(
+    wire, row, kind, status
+) -> None:
     """One retry is allowed; the provider's own error format reports the status the same way for every row."""
     contract = row.contract(kind)
-    retryable = STATUS_RETRYABLE[status]
+    expected = STATUS_CLASSIFICATION[status]
     wire.respond = lambda _request: httpx.Response(status, json=contract.error(status))
 
     if kind == "generation":
@@ -1124,40 +1130,14 @@ async def test_a_failed_request_is_sent_again_only_when_its_status_is_transient(
         first = wire.requests[0].content
         # A rejected schema request may be followed by its JSON-text form,
         # which is another request, not the same one again.
-        assert sum(request.content == first for request in wire.requests) == (2 if retryable else 1)
+        sent = sum(request.content == first for request in wire.requests)
     else:
         runtime = _embedding_runtime(_invocation(row, kind), num_retries=1, retry_pauses_s=(0.0,))
         with pytest.raises(EmbeddingProviderError) as raised:
             await runtime.embed_query("alpha")
-        assert len(wire.requests) == (2 if retryable else 1)
-        assert failure_retryable(raised.value) is retryable
+        sent = len(wire.requests)
 
+    assert sent == (2 if expected.sent_again else 1)
+    assert failure_retryable(raised.value) is expected.run_retryable
     assert raised.value.status_code == status
     assert {request.url.host for request in wire.requests} == {httpx.URL(contract.url).host}
-
-
-# -- Documented routes no request leaves for ----------------------------------------
-
-
-@pytest.mark.parametrize(
-    "route",
-    [
-        pytest.param(route, id=provider, marks=pytest.mark.xfail(strict=True, reason=reason))
-        for provider, (route, reason) in UNREACHABLE_ROUTES.items()
-    ],
-)
-async def test_a_route_the_docs_name_sends_its_request(wire, route) -> None:
-    binding = build_binding(
-        kind="generation",
-        provider="litellm",
-        model_id=route,
-        auth_strategy="api_key",
-        secret_ref=_SECRET_REF,
-        config_source="settings",
-    )
-    client = _structured_client(compile_binding(binding, _KEY), num_retries=0)
-
-    with contextlib.suppress(StructuredLlmError):
-        await client.answer_schema(_PROMPT, response_format=_Ranking, max_tokens=_MAX_TOKENS)
-
-    assert wire.requests
