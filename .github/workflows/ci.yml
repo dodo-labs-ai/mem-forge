@@ -66,7 +66,7 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
 
-  # Deprecated (admin-ui-v1): remove this job with the V1 admin UI (ADR 0044).
+  # Deprecated (admin-ui-v1): remove this job with the V1 admin UI.
   admin-ui:
     runs-on: ubuntu-latest
     defaults:

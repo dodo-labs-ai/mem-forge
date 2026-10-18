@@ -1,6 +1,6 @@
 """Read a workspace's Cross-Source Conflict Reviews.
 
-Cross-document discovery records relations and creates no Review (ADR 0037).
+Cross-document discovery records relations and creates no Review.
 The Cross-Source Conflict Reviews a workspace still holds are people's decisions
 on Memory pairs: they seed the relation evaluation set and are converted once
 into relations and Relation Dismissals.

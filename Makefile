@@ -19,7 +19,7 @@ test:
 	uv run pytest -q
 
 # Deprecated (admin-ui-v1): each ui-* target also runs the V1 admin UI until
-# it is removed (ADR 0044).
+# it is removed.
 ui-install:
 	cd admin && npm ci
 	cd admin-ui && npm ci

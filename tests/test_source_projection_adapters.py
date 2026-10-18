@@ -1811,7 +1811,7 @@ def test_teams_legacy_history_and_partition_fields_cannot_authorize_removal() ->
         (False, True, True, ProjectionCoverage.COMPLETE_SNAPSHOT),
         (False, True, False, ProjectionCoverage.PARTIAL_PROJECTION),
         # A complete discovery of an unchanged scope, first or force-full, is a
-        # query result; absence comes from the scope listing (ADR 0045).
+        # query result; absence comes from the scope listing.
         (False, False, True, ProjectionCoverage.PARTIAL_PROJECTION),
         (False, False, False, ProjectionCoverage.PARTIAL_PROJECTION),
     ],

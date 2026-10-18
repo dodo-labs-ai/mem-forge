@@ -1,4 +1,4 @@
-"""ADR 0041: stored input belongs to the Source Unit revision, not to the shared Document row."""
+"""Stored input belongs to the Source Unit revision, not to the shared Document row."""
 
 from __future__ import annotations
 

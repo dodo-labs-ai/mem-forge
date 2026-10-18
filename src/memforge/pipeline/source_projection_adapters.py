@@ -74,10 +74,10 @@ def source_run_projection_coverage(
 
     A submitted authoritative snapshot is the whole Source. A complete discovery
     of a newly configured scope is the whole new scope: the user changed the
-    scope, so a Unit outside it is removed (ADR 0005). Any other discovery is
+    scope, so a Unit outside it is removed. Any other discovery is
     partial, whether or not ``since`` narrowed it, because a query result is
     not proof that the provider no longer has an item; such a run removes only
-    what its scope listing proves absent (ADR 0045).
+    what its scope listing proves absent.
     """
 
     if authoritative_snapshot:

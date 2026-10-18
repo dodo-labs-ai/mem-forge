@@ -1,7 +1,7 @@
 """Convert a workspace's Cross-Source Conflict Reviews into cross-document relations.
 
 Cross-document discovery records relations and creates no Review, so the Reviews
-it created before are converted once per workspace (ADR 0037). A decided Review
+it created before are converted once per workspace. A decided Review
 converts by its relation label: ``contradicts`` when confirmed and ``none`` when
 dismissed, unless the report and apply requests relabel it by Review id.
 

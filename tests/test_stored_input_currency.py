@@ -1,4 +1,4 @@
-"""ADR 0040: stored input is current, reprocess reads the provider, revisions are content-addressed,
+"""Stored input is current, reprocess reads the provider, revisions are content-addressed,
 and recovery isolates Source Units."""
 
 from __future__ import annotations
