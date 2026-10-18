@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from pathlib import Path
 
@@ -15,6 +17,7 @@ from memforge.llm.bindings import (
     binding_from_settings,
     binding_record,
     build_binding,
+    compile_binding,
     environment_binding,
     key_last4,
     new_stored_secret,
@@ -523,6 +526,109 @@ def test_a_token_limit_a_binding_cannot_state_is_refused(kind, token_limits, err
         )
 
     assert refusal.value.code == error_code
+
+
+def test_a_generation_binding_carries_the_response_schema_support_its_listing_declared() -> None:
+    settings = {"kind": "generation", "provider": "openrouter", "model_id": "openai/gpt-5-mini", "config_source": "settings"}
+
+    undeclared = build_binding(**settings)
+    declared = build_binding(**settings, native_schema=True)
+    declined = build_binding(**settings, native_schema=False)
+
+    assert (undeclared.native_schema, declared.native_schema, declined.native_schema) == (None, True, False)
+    assert len({undeclared.digest, declared.digest, declined.digest}) == 3
+
+
+def test_a_binding_that_declares_no_response_schema_support_keeps_the_digest_it_was_checked_with() -> None:
+    """A binding stored before response schema support was recorded stays ready as it is."""
+    binding = build_binding(kind="generation", provider="ollama", model_id="qwen3:0.6b", config_source="settings")
+    material = {
+        "provider": "ollama",
+        "endpoint": "http://localhost:11434",
+        "origin": "http://localhost:11434",
+        "route": "ollama_chat/qwen3:0.6b",
+        "auth_strategy": "none",
+        "model_id": "qwen3:0.6b",
+        "dimensions": None,
+        "token_limits": {},
+        "secret_ref": None,
+        "litellm": bindings.installed_litellm_version(),
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
+
+    assert binding.digest == hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("kind", "native_schema", "error_code"),
+    [
+        ("embedding", True, "native_schema_not_supported"),
+        ("generation", "yes", "native_schema_invalid"),
+    ],
+)
+def test_response_schema_support_a_binding_cannot_declare_is_refused(kind, native_schema, error_code) -> None:
+    with pytest.raises(ModelConfigError) as refusal:
+        build_binding(
+            kind=kind,
+            provider="openrouter",
+            model_id="openai/gpt-5-mini",
+            native_schema=native_schema,
+            config_source="settings",
+        )
+
+    assert refusal.value.code == error_code
+
+
+@pytest.mark.parametrize(
+    ("provider", "model_id", "declared", "expected"),
+    [
+        ("ollama", "qwen3:0.6b", None, True),
+        ("openrouter", "openai/gpt-5-mini", True, True),
+        ("openrouter", "meituan/longcat-2.0", False, False),
+        ("openrouter", "openai/gpt-5-mini", None, None),
+        ("openai", "gpt-5-mini", None, None),
+        ("openai_compatible", "qwen3", None, None),
+        ("litellm", "ollama_chat/qwen3", None, None),
+    ],
+)
+def test_an_invocation_takes_what_the_listing_or_else_the_provider_declares_about_response_schemas(
+    provider, model_id, declared, expected
+) -> None:
+    binding = build_binding(
+        kind="generation",
+        provider=provider,
+        model_id=model_id,
+        endpoint="https://models.example.test/v1" if provider == "openai_compatible" else None,
+        auth_strategy="none" if provider in {"ollama", "openai_compatible"} else "environment",
+        native_schema=declared,
+        config_source="settings",
+    )
+
+    assert compile_binding(binding, None).native_schema is expected
+
+
+def test_an_embedding_invocation_declares_no_response_schema_support() -> None:
+    binding = build_binding(kind="embedding", provider="ollama", model_id="nomic-embed-text", config_source="settings")
+
+    assert compile_binding(binding, None).native_schema is None
+
+
+@pytest.mark.parametrize("declared", [True, False, None])
+async def test_the_declared_native_schema_support_is_stored_with_the_binding(db, declared) -> None:
+    binding = build_binding(
+        kind="generation",
+        provider="openrouter",
+        model_id="openai/gpt-5-mini",
+        auth_strategy="environment",
+        native_schema=declared,
+        config_source="settings",
+    )
+
+    await db.put_model_binding("generation", "candidate", binding_record(binding))
+    stored = binding_from_record(await db.get_model_binding("generation", "candidate"))
+
+    assert stored.native_schema is declared
+    assert stored.digest == binding.digest
 
 
 async def test_a_ready_binding_needs_revalidation_once_the_installed_litellm_changes(db, monkeypatch) -> None:

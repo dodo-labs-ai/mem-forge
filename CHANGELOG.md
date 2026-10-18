@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Local Ollama models now answer in the exact JSON shape MemForge asks for.
+  MemForge sends the schema as Ollama's own `format`, so Ollama holds the
+  answer to it, instead of writing the schema into the prompt, which small
+  models such as `qwen3:0.6b` tended to echo back instead of answering.
+  - OpenRouter models that support structured outputs get the same: when you
+    pick a model with Load models in Settings, MemForge keeps what OpenRouter's
+    model list says (`structured_outputs`) and asks that model for a
+    `json_schema` response format. Other OpenRouter models keep the schema in
+    the prompt.
+  - Whether a provider natively supports a schema is now decided by what the
+    provider says, not by LiteLLM's built-in model list, which does not know
+    local Ollama models or most OpenRouter models. OpenAI, Anthropic,
+    OpenAI-compatible endpoints and models typed as a LiteLLM route (such as
+    `ollama_chat/...`) work as before.
+  - A provider that rejects the schema request still gets the request again
+    with the schema in the prompt, so nothing that works today stops working.
+  - Existing installs keep their validated models; nothing needs to be checked
+    again. An existing OpenRouter model gets structured outputs once you pick it
+    again from Load models and save it, which validates it again.
+  - The admin API's model listing, candidate and binding responses gain a
+    `native_schema` field, and the model bindings table a `native_schema`
+    column (migration 119).
+  - Cloud: nothing to change. Cloud's a hosted LiteLLM gateway models use the generic
+    LiteLLM route provider, whose requests are unchanged, and the
+    `native_schema_transport` Cloud sets is still honoured.
+
 - Contributors: `scripts/provider_smoke.py` checks that real providers
   (OpenRouter, OpenAI, Anthropic, a local Ollama, or any LiteLLM route) accept
   what MemForge sends, through the same model listing and capability check as

@@ -4550,6 +4550,11 @@ export interface components {
             kind: "generation" | "embedding";
             /** Model Id */
             model_id: string;
+            /**
+             * Native Schema
+             * @description Whether the generation model answers in the JSON schema a request gives, as the provider's model listing declared it; null when the listing declared nothing.
+             */
+            native_schema?: boolean | null;
             /** Options */
             options: {
                 [key: string]: unknown;
@@ -4614,6 +4619,11 @@ export interface components {
              * @default
              */
             model_id: string;
+            /**
+             * Native Schema
+             * @description For a generation model chosen from a model listing: whether the listing declares that it answers in the JSON schema a request gives (native_schema of the listed model). Leave it out when the listing declares nothing.
+             */
+            native_schema?: boolean | null;
             /** Options */
             options?: {
                 [key: string]: unknown;
@@ -4728,6 +4738,11 @@ export interface components {
              * @description The largest output the listing gives for the model, in tokens; null when it gives none.
              */
             max_output_tokens?: number | null;
+            /**
+             * Native Schema
+             * @description Whether the listing declares that the model answers in the JSON schema a request gives; null when it declares nothing about it.
+             */
+            native_schema?: boolean | null;
         };
         /** ModelProviderListResponse */
         ModelProviderListResponse: {

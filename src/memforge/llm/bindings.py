@@ -170,6 +170,10 @@ class ModelBinding:
     # The context window and the largest output of the model, in tokens, for a
     # model whose limits LiteLLM does not know.
     token_limits: Mapping[str, int] = field(default_factory=dict)
+    # Whether the generation model answers in the JSON schema a request gives,
+    # as the provider's model listing declared it when the model was chosen;
+    # ``None`` when the listing declared nothing.
+    native_schema: bool | None = None
 
     @property
     def digest(self) -> str:
@@ -177,8 +181,11 @@ class ModelBinding:
 
         A check that passed for one digest says nothing about a binding with
         another: the endpoint, provider, route, auth strategy, model, requested
-        dimensions, token limits, the key the binding refers to or the
-        installed LiteLLM version has changed.
+        dimensions, token limits, the declared response schema support, the key
+        the binding refers to or the installed LiteLLM version has changed.
+        Response schema support enters the digest only when the listing
+        declared it, so a binding the listing declared nothing for is
+        identified by its other settings alone.
         """
         material = {
             "provider": self.provider,
@@ -192,6 +199,8 @@ class ModelBinding:
             "secret_ref": self.secret_ref,
             "litellm": installed_litellm_version(),
         }
+        if self.native_schema is not None:
+            material["native_schema"] = self.native_schema
         encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -268,6 +277,7 @@ def build_binding(
     options: Mapping[str, Any] | None = None,
     parameters: Mapping[str, Any] | None = None,
     token_limits: Mapping[str, Any] | None = None,
+    native_schema: bool | None = None,
     secret_ref: str | None = None,
 ) -> ModelBinding:
     """Build a binding of ``kind`` from settings, or say which setting is unusable."""
@@ -293,6 +303,7 @@ def build_binding(
         secret_ref=secret_ref if strategy == "api_key" else None,
         config_source=config_source,
         token_limits=_validated_token_limits(kind, token_limits),
+        native_schema=_validated_native_schema(kind, native_schema),
     )
 
 
@@ -300,7 +311,9 @@ def compile_binding(binding: ModelBinding, credential: str | None) -> ResolvedIn
     """Compile a binding and its resolved credential into what the SDK is given.
 
     The binding's route and endpoint name the model; its descriptor says which
-    route and base URL its requests are sent with.
+    route and base URL its requests are sent with. Response schema support is
+    what the model listing declared for the model, or else what the descriptor
+    declares for every model of its provider.
     """
     if binding.auth_strategy == "api_key":
         if not credential:
@@ -313,15 +326,18 @@ def compile_binding(binding: ModelBinding, credential: str | None) -> ResolvedIn
         api_key = KEYLESS_API_KEY
     else:
         api_key = None
-    route, api_base = provider_descriptor(binding.provider).request_target(
-        binding.kind, binding.route, binding.endpoint
-    )
+    descriptor = provider_descriptor(binding.provider)
+    route, api_base = descriptor.request_target(binding.kind, binding.route, binding.endpoint)
+    native_schema = binding.native_schema
+    if native_schema is None and binding.kind == "generation" and descriptor.enforces_response_schema:
+        native_schema = True
     return ResolvedInvocation(
         route=route,
         api_base=api_base,
         api_key=api_key,
         extra_params={**binding.options, **binding.parameters},
         provider=binding.provider,
+        native_schema=native_schema,
     )
 
 
@@ -518,6 +534,7 @@ def binding_record(binding: ModelBinding) -> dict[str, Any]:
         "route": binding.route,
         "parameters": dict(binding.parameters),
         "token_limits": dict(binding.token_limits),
+        "native_schema": binding.native_schema,
         "config_source": binding.config_source,
         "state": binding.state,
         "validation": None if validation is None else validation_record(validation),
@@ -563,6 +580,7 @@ def binding_from_record(record: Mapping[str, Any]) -> ModelBinding:
         validation=validation,
         saved_at=record.get("updated_at"),
         token_limits=MappingProxyType(dict(record.get("token_limits") or {})),
+        native_schema=record.get("native_schema"),
     )
     if validation is None:
         return binding
@@ -825,3 +843,16 @@ def _validated_token_limits(
             )
         validated[name] = value
     return MappingProxyType(validated)
+
+
+def _validated_native_schema(kind: ModelKind, native_schema: bool | None) -> bool | None:
+    if native_schema is None:
+        return None
+    if kind != "generation":
+        raise ModelConfigError(
+            "native_schema_not_supported",
+            f"Only a generation model declares response schema support, not a {kind} model.",
+        )
+    if not isinstance(native_schema, bool):
+        raise ModelConfigError("native_schema_invalid", "Response schema support must be true or false.")
+    return native_schema

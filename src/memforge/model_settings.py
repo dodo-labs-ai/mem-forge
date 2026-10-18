@@ -125,6 +125,9 @@ class CandidateDraft:
     options: Mapping[str, Any] = field(default_factory=dict)
     parameters: Mapping[str, Any] = field(default_factory=dict)
     token_limits: Mapping[str, Any] = field(default_factory=dict)
+    # Whether the model answers in a response schema, as the model listing
+    # declared it; ``None`` when it declared nothing.
+    native_schema: bool | None = None
     # A new API key. ``None`` keeps the key already saved for the endpoint.
     api_key: str | None = field(default=None, repr=False)
 
@@ -344,6 +347,7 @@ class ModelSettings:
             options=draft.options,
             parameters=draft.parameters,
             token_limits=draft.token_limits,
+            native_schema=draft.native_schema,
             config_source="settings",
         )
         _require_provider_endpoint_for_environment_credentials(binding)
