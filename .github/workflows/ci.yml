@@ -1,25 +1,9 @@
 name: CI
 
-# A change confined to these files leaves every job's inputs untouched. Only the
-# top level of docs/ is listed, so a file added in a docs/ subdirectory still
-# runs the documentation boundary test.
 on:
   pull_request:
-    paths-ignore: &unchecked_paths
-      - "docs/*.md"
-      - "README.md"
-      - "CHANGELOG.md"
-      - "AGENTS.md"
-      - "CLAUDE.md"
-      - "CONTRIBUTING.md"
-      - "CODE_OF_CONDUCT.md"
-      - "SECURITY.md"
-      - ".github/assets/**"
-      - ".github/ISSUE_TEMPLATE/**"
-      - ".github/PULL_REQUEST_TEMPLATE.md"
   push:
     branches: [main]
-    paths-ignore: *unchecked_paths
 
 # A newer push to a pull request replaces the run for the older commit. Runs on
 # main are never cancelled.
@@ -28,7 +12,37 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # A change confined to documentation leaves every other job's inputs
+  # untouched, so those jobs are skipped; a skipped job still satisfies a
+  # required check. Only the top level of docs/ counts as documentation, so a
+  # file added in a docs/ subdirectory still runs the documentation boundary
+  # test.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: classify
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          documentation='^(docs/[^/]+\.md|README\.md|CHANGELOG\.md|AGENTS\.md|CLAUDE\.md|CONTRIBUTING\.md|CODE_OF_CONDUCT\.md|SECURITY\.md|\.github/assets/.+|\.github/ISSUE_TEMPLATE/.+|\.github/PULL_REQUEST_TEMPLATE\.md)$'
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+            || ! changed=$(git diff --name-only "$BASE...$HEAD"); then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          elif printf '%s\n' "$changed" | grep -Eqv "$documentation"; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   python:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -47,6 +61,8 @@ jobs:
       - run: uv run pytest -q -n 4 --dist worksteal --durations=25 --durations-min=0.2
 
   admin:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -68,6 +84,8 @@ jobs:
 
   # Deprecated (admin-ui-v1): remove this job with the V1 admin UI.
   admin-ui:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
