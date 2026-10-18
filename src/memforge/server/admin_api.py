@@ -1872,6 +1872,14 @@ class SourceConnectionStatusResponse(BaseModel):
     reason: SourceConnectionReason | None = None
 
 
+class UnrecognizedSessionLinesResponse(BaseModel):
+    """Transcript lines the agent client's plugin could not recognize in recent uploads."""
+
+    count: int
+    plugin_version: str | None
+    last_seen_at: str | None
+
+
 class SourceResponse(BaseModel):
     """One Source as the viewer sees it in the Source List."""
 
@@ -1905,6 +1913,13 @@ class SourceResponse(BaseModel):
     connection_status: SourceConnectionStatusResponse | None = Field(
         default=None,
         description="Readiness of a browser-session connection; present only for Sources that use one.",
+    )
+    unrecognized_session_lines: UnrecognizedSessionLinesResponse | None = Field(
+        default=None,
+        description=(
+            "Transcript lines the current plugin version could not recognize in recent uploads; "
+            "present only for agent-session Sources, null when every line was recognized."
+        ),
     )
     ownership: SourceOwnershipResponse
     capabilities: SourceCapabilitiesResponse
@@ -6346,7 +6361,7 @@ def create_admin_app(
         )
 
         # Attach memory_count and sync status to each source
-        from memforge.agent_sessions import AGENT_SESSION_SOURCE_TYPE
+        from memforge.agent_sessions import AGENT_SESSION_SOURCE_TYPE, recent_unrecognized_session_lines
 
         jira_auth_service = JiraAuthSessionService(db)
         for s in sources:
@@ -6365,6 +6380,7 @@ def create_admin_app(
             # can pick a per-client brand mark without decoding opaque source ids.
             if s["type"] == AGENT_SESSION_SOURCE_TYPE:
                 s["client"] = original_config.get("client")
+                s["unrecognized_session_lines"] = await recent_unrecognized_session_lines(db, s["id"])
             else:
                 s["client"] = None
             if (
@@ -8853,6 +8869,7 @@ def create_admin_app(
                 branch=req.branch,
                 commit_sha=req.commit_sha,
                 receipt=req.receipt,
+                plugin_version=req.plugin_version,
                 retention=req.retention,
                 submitted_at=req.submitted_at,
                 source_updated_at=req.source_updated_at,

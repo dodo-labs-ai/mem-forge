@@ -1698,6 +1698,59 @@ def test_agent_session_window_api_records_no_output_receipt(tmp_path):
         asyncio.run(database.close())
 
 
+def test_source_list_reports_unrecognized_session_lines_from_the_current_plugin_version(tmp_path):
+    """Lines the plugin could not recognize surface on the Source until a newer plugin uploads cleanly."""
+    from memforge.server.admin_api import create_admin_app
+
+    class PatchClient(_AuthorizesAllCandidateUserEvidence):
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(claim_text="Session windows report lines the plugin could not recognize.")
+
+    def window(index: int, plugin_version: str, unrecognized: int) -> dict:
+        omissions = {"metadata_or_context": 1, **({"unrecognized_line": unrecognized} if unrecognized else {})}
+        return {
+            "plugin_version": plugin_version,
+            "client": "claude-code",
+            "session_id": "sess-format-drift",
+            "trigger": "Stop",
+            "workspace": "/workspace/mem-forge",
+            "history_window": {"kind": "transcript_window", "start": str(index * 10), "end": str(index * 10 + 10)},
+            "events": _authorized_events({"role": "assistant", "text": f"Window {index} summary."}),
+            "receipt": {"metadata": {"omissions": omissions}},
+            "submitted_at": f"2026-06-23T22:0{index}:00+00:00",
+        }
+
+    def unrecognized_lines(client: TestClient):
+        response = client.get("/api/v1/sources")
+        assert response.status_code == 200, response.text
+        (source,) = [row for row in response.json()["data"] if row["type"] == "agent_session"]
+        return source["unrecognized_session_lines"]
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+    import asyncio
+
+    asyncio.run(database.connect())
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        app.state.agent_session_window_client = PatchClient()
+        with TestClient(app) as client:
+            for index, unrecognized in enumerate((3, 0, 2)):
+                response = client.post("/api/v1/agent-sessions/windows", json=window(index, "0.2.0", unrecognized))
+                assert response.status_code == 200, response.text
+            assert unrecognized_lines(client) == {
+                "count": 5,
+                "plugin_version": "0.2.0",
+                "last_seen_at": "2026-06-23T22:02:00+00:00",
+            }
+
+            response = client.post("/api/v1/agent-sessions/windows", json=window(3, "0.2.1", 0))
+            assert response.status_code == 200, response.text
+            assert unrecognized_lines(client) is None
+    finally:
+        asyncio.run(database.close())
+
+
 @pytest.mark.parametrize("client_name", ["codex", "claude-code"])
 def test_agent_session_window_requires_primary_user_anchor_for_both_clients(tmp_path, client_name):
     """Assistant-only windows cannot create durable memories for any agent client."""

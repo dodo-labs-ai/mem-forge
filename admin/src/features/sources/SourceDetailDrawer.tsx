@@ -1,8 +1,9 @@
-import { Info, RefreshCw } from "lucide-react";
+import { CircleAlert, Info, RefreshCw } from "lucide-react";
 import { useSharedWorkspace } from "@/api";
-import { formatCount, formatDateTime, formatInterval, formatRelative, formatUntil } from "@/lib/format";
+import { formatCount, formatDateTime, formatInterval, formatRelative, formatUntil, pluralize } from "@/lib/format";
 import { ActionCard, DetailDrawer, DrawerSection, Notice, PropertyList, StatusBadge } from "@/patterns";
 import { Button } from "@/ui/button";
+import { BRAND_MARKS, sourceBrandKeysFor } from "./model/sourceBrand";
 import { failedItemsTitle, retryingAfterUpgradeTitle } from "./model/sourceFailedItems";
 import { presentSourceSyncActivity } from "./model/sourceSyncActivity";
 import type { SourceRow } from "./model/sourceRows";
@@ -18,6 +19,12 @@ interface SourceDetailDrawerProps {
   onOpenChange: (open: boolean) => void;
 }
 
+function unrecognizedSessionLinesTitle(count: number, type: string, client: string | null | undefined): string {
+  const brandKey = sourceBrandKeysFor(type, client)?.[0];
+  const clientLabel = brandKey ? BRAND_MARKS[brandKey].label : "this client";
+  return `${pluralize(count, "session line")} from ${clientLabel} ${count === 1 ? "was" : "were"} not recognized`;
+}
+
 export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpenChange }: SourceDetailDrawerProps) {
   const sharedWorkspace = useSharedWorkspace();
   if (row === null) return <DetailDrawer open={false} onOpenChange={onOpenChange} title="" children={null} />;
@@ -25,6 +32,7 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpe
   const presentation = activity ? presentSourceSyncActivity(activity, source.name, "items") : null;
   const schedule = source.sync_schedule;
   const { failedItems } = row;
+  const unrecognizedLines = source.unrecognized_session_lines;
   const sync = actions.syncControl(source, activity);
 
   return (
@@ -70,6 +78,16 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpe
             )
           }
         />
+      ) : null}
+
+      {unrecognizedLines ? (
+        <Notice
+          tone="warn"
+          icon={CircleAlert}
+          title={unrecognizedSessionLinesTitle(unrecognizedLines.count, source.type, source.client)}
+        >
+          Update the MemForge plugin so new sessions are read in full.
+        </Notice>
       ) : null}
 
       <DrawerSection title="Sync">

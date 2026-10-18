@@ -247,6 +247,8 @@ CODEX_TOOL_RESULT_TYPES = {
     "tool_search_output",
     "custom_tool_call_output",
 }
+CODEX_MESSAGE_ROLES = {"user", "assistant", "developer", "system"}
+CLAUDE_MESSAGE_ROLES = {"user", "assistant"}
 
 # Capture policies. Each client hook maps onto one of these.
 REQUIRED_CAPTURE_TRIGGER = "REQUIRED_CAPTURE"  # context about to be lost: always capture
@@ -1481,7 +1483,9 @@ def _bounded_transcript_evidence_window(
     The cursor still advances by native transcript lines, but upload budgeting is
     applied after client-format parsing and memory-relevance filtering. Lines
     that only contain bootstrap/context metadata are represented in the omission
-    counters instead of being sent as raw LLM input.
+    counters instead of being sent as raw LLM input. Lines the parsers cannot
+    read are counted as ``unrecognized_line`` so the service can report a
+    transcript format this adapter does not understand.
     """
     selected: list[dict[str, Any]] = []
     omissions: Counter[str] = Counter()
@@ -1504,7 +1508,10 @@ def _bounded_transcript_evidence_window(
 
             events = _parse_transcript_events_from_line(line.rstrip("\n"))
             if not events:
-                omissions["metadata_or_context"] += 1
+                if _is_unrecognized_transcript_line(line):
+                    omissions["unrecognized_line"] += 1
+                else:
+                    omissions["metadata_or_context"] += 1
                 effective_to = index + 1
                 continue
 
@@ -1747,6 +1754,40 @@ def _parse_codex_events(data: dict[str, Any], payload: dict[str, Any]) -> list[d
             )
         ]
     return []
+
+
+def _is_unrecognized_transcript_line(line: str) -> bool:
+    """Return whether a line that produced no evidence is one the parsers cannot read.
+
+    Malformed JSON and conversation records whose shape the parsers do not
+    understand are unrecognized. Records the parsers drop on purpose, such as
+    session metadata, reasoning, injected context and metadata record types the
+    adapter has no use for, are not.
+    """
+    if not line.strip():
+        return False
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return True
+    if not isinstance(data, dict):
+        return True
+    if data.get("type") in ("response_item", "event_msg"):
+        payload = data.get("payload")
+        if not isinstance(payload, dict) or not _first_string(payload, "type", "item_type", "role"):
+            return True
+        return payload.get("type") == "message" and payload.get("role") not in CODEX_MESSAGE_ROLES
+    if _looks_like_claude_record(data):
+        message = data.get("message") if isinstance(data.get("message"), dict) else {}
+        role = data.get("type") if data.get("type") in CLAUDE_MESSAGE_ROLES else message.get("role")
+        content = message.get("content") if message else data.get("content") or data.get("text")
+        parts = [content] if isinstance(content, str) else content
+        return (
+            role not in CLAUDE_MESSAGE_ROLES
+            or not isinstance(parts, list)
+            or not all(isinstance(part, str) or (isinstance(part, dict) and _first_string(part, "type")) for part in parts)
+        )
+    return False
 
 
 def _looks_like_claude_record(data: dict[str, Any]) -> bool:
