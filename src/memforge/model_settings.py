@@ -63,6 +63,7 @@ from memforge.llm.providers import (
     AuthStrategy,
     ModelConfigError,
     ModelKind,
+    ResolvedInvocation,
     provider_descriptor,
 )
 from memforge.llm.embedding_profile import EmbeddingProfile
@@ -95,6 +96,7 @@ __all__ = [
     "ValidationOutcome",
     "VectorIndexStatus",
     "VectorIndexView",
+    "check_binding",
 ]
 
 # ``ready``: the embedding model in use is the one the index was built with.
@@ -772,22 +774,7 @@ class ModelSettings:
             invocation = await resolve_invocation(db, self._config, binding)
         except ModelConfigError as exc:
             return CapabilityCheck(error_code=exc.code)
-        if binding.kind == "embedding":
-            return await check_embedding(invocation)
-        llm = self._config.llm
-        client = self._runtime_provider.build_structured_llm_client(
-            ResolvedModels(
-                generation=invocation,
-                embedding=None,
-                request_timeout_s=min(llm.request_timeout_s, GENERATION_CHECK_TIMEOUT_S),
-                **generation_token_limits(llm, binding.token_limits),
-                input_budget_fraction=llm.input_budget_fraction,
-            ),
-            max_concurrent=llm.enrichment_max_concurrent,
-        )
-        if client is None:
-            return CapabilityCheck(error_code="not_configured")
-        return await check_generation(client)
+        return await check_binding(self._config, self._runtime_provider, binding, invocation)
 
     async def _binding_view(
         self,
@@ -817,6 +804,37 @@ class ModelSettings:
         except ModelConfigError:
             return KeyView(source=source)
         return KeyView(source=source, is_set=True, last4=key_last4(value or "") or None)
+
+
+async def check_binding(
+    config: AppConfig,
+    runtime_provider: RuntimeProvider,
+    binding: ModelBinding,
+    invocation: ResolvedInvocation,
+) -> CapabilityCheck:
+    """Make the capability check a binding is validated with.
+
+    ``invocation`` is ``binding`` compiled with its credential. An embedding
+    model is checked through an Embedding Runtime; a generation model through
+    the structured client the runtime builds for it, with the runtime's token
+    limits and a request timeout no longer than the check's.
+    """
+    if binding.kind == "embedding":
+        return await check_embedding(invocation)
+    llm = config.llm
+    client = runtime_provider.build_structured_llm_client(
+        ResolvedModels(
+            generation=invocation,
+            embedding=None,
+            request_timeout_s=min(llm.request_timeout_s, GENERATION_CHECK_TIMEOUT_S),
+            **generation_token_limits(llm, binding.token_limits),
+            input_budget_fraction=llm.input_budget_fraction,
+        ),
+        max_concurrent=llm.enrichment_max_concurrent,
+    )
+    if client is None:
+        return CapabilityCheck(error_code="not_configured")
+    return await check_generation(client)
 
 
 def _check_subject(db: "Database", slot: BindingSlot, binding: ModelBinding) -> _CheckSubject:
