@@ -329,6 +329,45 @@ async def test_a_reindex_builds_verifies_switches_and_deletes_the_previous_index
         assert raw.execute("SELECT state FROM vector_indexes").fetchall() == [("active",)]
 
 
+@pytest.mark.parametrize("read", ["get_latest_vector_reindex", "vector_reindex_running", "get_active_vector_index"])
+async def test_a_rebuild_that_ends_while_the_view_is_read_is_reported_as_running_or_as_ended(
+    db, config, settings, models, monkeypatch, read
+) -> None:
+    await _installation(db, config, settings)
+    await _candidate_b(db, settings)
+    app = create_admin_app(db=db, config=config)
+    may_switch = asyncio.Event()
+    activate = db.activate_vector_index
+
+    async def held_activation(*args, **kwargs):
+        await may_switch.wait()
+        return await activate(*args, **kwargs)
+
+    monkeypatch.setattr(db, "activate_vector_index", held_activation)
+    original = getattr(db, read)
+    ended = False
+
+    async def read_then_end_the_rebuild(*args, **kwargs):
+        nonlocal ended
+        result = await original(*args, **kwargs)
+        if not ended and asyncio.current_task() not in app.state.model_settings._reindex_tasks:
+            ended = True
+            may_switch.set()
+            await _rebuild_task_done(app)
+        return result
+
+    async with _client(app) as client:
+        started = await client.post(f"{API}/vector-index/reindex")
+        assert started.status_code == 202, started.text
+        monkeypatch.setattr(db, read, read_then_end_the_rebuild)
+        view = (await client.get(f"{API}/vector-index")).json()
+        may_switch.set()
+        await _rebuild_task_done(app)
+
+    assert view["reindex"] is not None
+    assert (view["status"] == "reindexing") == (view["reindex"]["state"] == "running")
+
+
 async def test_a_switch_stands_when_the_previous_index_cannot_be_deleted(
     db, config, settings, models, monkeypatch
 ) -> None:
