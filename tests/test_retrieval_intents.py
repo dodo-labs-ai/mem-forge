@@ -155,7 +155,7 @@ def test_query_made_only_of_names_is_a_known_item(query) -> None:
         "core/Cargo.toml",
         "read ~/notes.md",
         "contents of /etc/hosts",
-        "see https://github.com/shno-labs/mem-forge for details",
+        "see https://github.com/dodo-labs-ai/mem-forge for details",
     ],
 )
 def test_self_identifying_identifier_anywhere_is_a_known_item(query) -> None:

@@ -12,7 +12,7 @@ Requirements:
   default) and, for vector search, an embedding endpoint (OpenAI by default)
 
 ```bash
-git clone https://github.com/shno-labs/mem-forge.git
+git clone https://github.com/dodo-labs-ai/mem-forge.git
 cd mem-forge
 cp .env.example .env
 ```
@@ -321,13 +321,13 @@ is required; the marketplace is fetched from GitHub.
 
 ```bash
 # Codex
-codex plugin marketplace add shno-labs/mem-forge
+codex plugin marketplace add dodo-labs-ai/mem-forge
 codex plugin add memory@memforge
 ```
 
 ```text
 # Claude Code (run inside an active Claude Code session)
-/plugin marketplace add shno-labs/mem-forge
+/plugin marketplace add dodo-labs-ai/mem-forge
 /plugin install memory@memforge
 ```
 

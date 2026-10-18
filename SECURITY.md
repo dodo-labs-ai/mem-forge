@@ -13,7 +13,7 @@ branch until versioned releases are introduced.
 
 Please do not open a public issue for suspected credential exposure,
 authentication bypass, or data leakage. Report privately through GitHub security
-advisories for `shno-labs/mem-forge`.
+advisories for `dodo-labs-ai/mem-forge`.
 
 Include:
 

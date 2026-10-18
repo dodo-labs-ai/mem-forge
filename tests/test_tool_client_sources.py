@@ -653,7 +653,7 @@ def test_tool_client_create_memory_posts_user_memory_payload():
         provenance="User asked to remember this after reviewing the MemForge MCP UX.",
         memory_type="convention",
         client="codex",
-        repo_identifier="github.com/shno-labs/mem-forge",
+        repo_identifier="github.com/dodo-labs-ai/mem-forge",
     )
 
     assert result["memory_id"] == "mem-new"
@@ -666,7 +666,7 @@ def test_tool_client_create_memory_posts_user_memory_payload():
                 "provenance": "User asked to remember this after reviewing the MemForge MCP UX.",
                 "memory_type": "convention",
                 "client": "codex",
-                "repo_identifier": "github.com/shno-labs/mem-forge",
+                "repo_identifier": "github.com/dodo-labs-ai/mem-forge",
             },
         )
     ]
