@@ -120,7 +120,11 @@ and fill in what it asks for:
 | OpenRouter | Any model OpenRouter offers | API key, model |
 | Ollama | Models running on your machine | Model; the address if it is not `http://localhost:11434` |
 | OpenAI-compatible endpoint | A proxy or local server that speaks the OpenAI API, such as LM Studio, vLLM or a LiteLLM Proxy | Base URL, model, and an API key if the server wants one |
-| Other provider (LiteLLM route) | Any other provider LiteLLM supports, such as Bedrock or Vertex AI | The model as a LiteLLM route such as `bedrock/...`, and an API key or the provider's own environment variables |
+| Other provider (LiteLLM route) | Another provider LiteLLM reaches with an API key, such as Voyage AI for embeddings | The model as a LiteLLM route such as `voyage/voyage-3`, and an API key or the provider's own environment variables |
+
+Providers that need extra Python packages, for example AWS Bedrock or Google
+Vertex AI, are not included: MemForge does not ship those packages, so their
+LiteLLM routes do not work.
 
 Fields you can leave blank are marked *(optional)*; the others are required,
 except that an API key already saved can be left blank to keep it. A provider

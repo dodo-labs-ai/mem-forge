@@ -648,23 +648,9 @@ MATRIX: tuple[Row, ...] = (
 # Route providers the quickstart names for the LiteLLM-route descriptor, with
 # the kind of model it names them for.
 DOCUMENTED_ROUTES: tuple[tuple[str, ModelKind], ...] = (
-    ("bedrock", "generation"),
-    ("vertex_ai", "generation"),
+    ("voyage", "embedding"),
     ("ollama", "embedding"),
 )
-
-# Documented routes no request can reach a provider on from a MemForge install,
-# with a model on each and the reason.
-UNREACHABLE_ROUTES: Mapping[str, tuple[str, str]] = {
-    "bedrock": (
-        "bedrock/anthropic.claude-sonnet-4-6",
-        "LiteLLM signs a Bedrock request with boto3, which MemForge does not install.",
-    ),
-    "vertex_ai": (
-        "vertex_ai/gemini-2.5-flash",
-        "LiteLLM authenticates a Vertex AI request with google-auth, which MemForge does not install.",
-    ),
-}
 
 
 def _route_provider(model_id: str) -> str:
@@ -721,7 +707,7 @@ def test_every_route_a_descriptor_compiles_or_the_docs_name_has_a_litellm_row() 
         if (contract := row.contract(kind)) is not None
     }
 
-    assert claimed - covered - {(route, "generation") for route in UNREACHABLE_ROUTES} == set()
+    assert claimed - covered == set()
 
 
 def test_every_row_covers_each_feature_of_the_kinds_its_descriptor_serves() -> None:
@@ -1135,30 +1121,3 @@ async def test_a_failed_request_is_sent_again_only_when_its_status_is_transient(
 
     assert raised.value.status_code == status
     assert {request.url.host for request in wire.requests} == {httpx.URL(contract.url).host}
-
-
-# -- Documented routes no request leaves for ----------------------------------------
-
-
-@pytest.mark.parametrize(
-    "route",
-    [
-        pytest.param(route, id=provider, marks=pytest.mark.xfail(strict=True, reason=reason))
-        for provider, (route, reason) in UNREACHABLE_ROUTES.items()
-    ],
-)
-async def test_a_route_the_docs_name_sends_its_request(wire, route) -> None:
-    binding = build_binding(
-        kind="generation",
-        provider="litellm",
-        model_id=route,
-        auth_strategy="api_key",
-        secret_ref=_SECRET_REF,
-        config_source="settings",
-    )
-    client = _structured_client(compile_binding(binding, _KEY), num_retries=0)
-
-    with contextlib.suppress(StructuredLlmError):
-        await client.answer_schema(_PROMPT, response_format=_Ranking, max_tokens=_MAX_TOKENS)
-
-    assert wire.requests
