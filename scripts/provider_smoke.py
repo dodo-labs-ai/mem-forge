@@ -23,8 +23,10 @@ only, and never written anywhere.
 Every check takes the path "Save and validate" in Settings takes. The model is
 bound through its provider descriptor; when the descriptor's endpoint lists its
 models, the listing is asked once per kind whether it holds the model (a model
-it does not hold is reported, not failed); a generation model then answers the
-structured capability check, directly and without reasoning; an embedding model
+it does not hold is reported, not failed); a generation model is then bound
+with the token limits and the response schema support the listing gives for it,
+as Settings binds a model chosen from the list, and answers the structured
+capability check, directly and without reasoning; an embedding model
 embeds two short texts, twice, and has to answer one vector per text in one
 dimension. Each check ends at ``--timeout`` seconds.
 
@@ -311,7 +313,7 @@ async def _check_model(
         return [row(capability, "fail", detail=exc.code)]
 
     rows: list[Row] = []
-    token_limits: dict[str, int] = {}
+    listed: ModelOption | None = None
     if provider_descriptor(target.descriptor).lists_models:
         try:
             listing, latency_ms = await _within(timeout_s, lambda: checks.listing(binding, api_key))
@@ -322,11 +324,11 @@ async def _check_model(
         else:
             result, detail = _listing_result(target, model, listing)
             rows.append(row("model listing", result, latency_ms, detail))
-            if kind == "generation":
-                token_limits = _listed_token_limits(target, model, listing)
+            if kind == "generation" and listing.ok:
+                listed = _listed(target, model, listing)
 
     try:
-        checked = _binding(target, kind, model, token_limits=token_limits)
+        checked = _binding(target, kind, model, listed=listed)
         invocation = compile_binding(checked, api_key)
         outcome, latency_ms = await _within(timeout_s, lambda: checks.capability(checked, invocation))
     except ModelConfigError as exc:
@@ -346,9 +348,20 @@ def _binding(
     kind: ModelKind,
     model: str,
     *,
-    token_limits: Mapping[str, int] | None = None,
+    listed: ModelOption | None = None,
 ) -> ModelBinding:
-    """Bind the model as Settings saves it."""
+    """Bind the model as Settings saves it, with what the listing gives for a generation model.
+
+    Settings takes the token limits and the response schema support the model
+    listing gives for the model chosen from it.
+    """
+    token_limits: dict[str, int] = {}
+    if listed is not None:
+        limits = {
+            "context_window_tokens": listed.context_window_tokens,
+            "max_output_tokens": listed.max_output_tokens,
+        }
+        token_limits = {name: value for name, value in limits.items() if value is not None}
     return build_binding(
         kind=kind,
         provider=target.descriptor,
@@ -356,6 +369,7 @@ def _binding(
         endpoint=target.endpoint,
         auth_strategy=target.auth_strategy,
         token_limits=token_limits,
+        native_schema=None if listed is None else listed.native_schema,
         config_source="settings",
     )
 
@@ -376,18 +390,6 @@ def _listing_result(target: Target, model: str, listing: ModelDiscoveryResponse)
     if _listed(target, model, listing) is None:
         return "pass", f"not among the {len(listing.models)} listed models"
     return "pass", ""
-
-
-def _listed_token_limits(target: Target, model: str, listing: ModelDiscoveryResponse) -> dict[str, int]:
-    """The token limits the listing gives for the model, which Settings takes into its binding."""
-    option = _listed(target, model, listing) if listing.ok else None
-    if option is None:
-        return {}
-    limits = {
-        "context_window_tokens": option.context_window_tokens,
-        "max_output_tokens": option.max_output_tokens,
-    }
-    return {name: value for name, value in limits.items() if value is not None}
 
 
 def _capability_result(outcome: CapabilityCheck) -> tuple[Result, str]:

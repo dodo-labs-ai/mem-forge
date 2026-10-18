@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Local Ollama models now answer in the exact JSON shape MemForge asks for.
+  MemForge sends the schema as Ollama's own `format`, so Ollama holds the
+  answer to it, instead of writing the schema into the prompt, which small
+  models such as `qwen3:0.6b` tended to echo back instead of answering.
+  - OpenRouter models that support structured outputs get the same: MemForge
+    reads what OpenRouter's model list says about the model
+    (`structured_outputs`) and asks it for a `json_schema` response format.
+    Other OpenRouter models keep the schema in the prompt. OpenRouter can add or
+    drop support for a model, so MemForge reads the list again whenever it
+    checks the model: at Save and validate, at Check again and when the server
+    starts. When the list cannot be reached, it keeps what it read last.
+  - The same holds for an Ollama model typed as a LiteLLM route
+    (`ollama_chat/...` or `ollama/...`, with the Other provider option or
+    `MEMFORGE_ENRICHMENT_MODEL`).
+  - Whether a provider natively supports a schema is now decided by what the
+    provider says, not by LiteLLM's built-in model list, which does not know
+    local Ollama models or most OpenRouter models. OpenAI, Anthropic,
+    OpenAI-compatible endpoints and other LiteLLM routes work as before.
+  - A provider that rejects the schema request still gets the request again
+    with the schema in the prompt, so nothing that works today stops working.
+  - Existing installs keep their validated models; nothing needs to be checked
+    again, and what the model list says never makes a model need a new check.
+    An OpenRouter model saved before picks up structured outputs the next time
+    the server starts.
+  - The admin API's model listing, candidate and binding responses gain a
+    `native_schema` field, and the model bindings table a `native_schema`
+    column (migration 119).
+  - Cloud: nothing to change. Cloud's SAP AI Core models use the generic
+    LiteLLM route provider, whose requests are unchanged, and the
+    `native_schema_transport` Cloud sets is still honoured.
+
 - Contributors: `scripts/provider_smoke.py` checks that real providers
   (OpenRouter, OpenAI, Anthropic, a local Ollama, or any LiteLLM route) accept
   what MemForge sends, through the same model listing and capability check as

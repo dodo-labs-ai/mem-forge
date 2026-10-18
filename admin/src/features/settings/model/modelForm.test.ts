@@ -25,6 +25,7 @@ import {
   isChanged,
   listedLimitsGap,
   listedTokenLimits,
+  nativeSchemaForTypedModel,
   offersTokenLimits,
   savedValues,
   tokenLimitsForChoice,
@@ -60,7 +61,13 @@ describe("savedValues", () => {
       options: {},
       parameters: {},
       tokenLimits: {},
+      nativeSchema: null,
     });
+  });
+
+  test("keeps what the model listing declared about the model answering in a JSON schema", () => {
+    expect(savedValues(makeBinding({ native_schema: true }), "generation", PROVIDERS).nativeSchema).toBe(true);
+    expect(savedValues(makeBinding({ native_schema: false }), "generation", PROVIDERS).nativeSchema).toBe(false);
   });
 
   test("shows extra settings and token limits as the text of their fields", () => {
@@ -155,6 +162,13 @@ describe("candidateRequest", () => {
     });
     expect(candidateRequest(values, OPENAI, "generation").parameters).toEqual({});
     expect(candidateRequest(edited({ ...values, provider: "ollama" }), OLLAMA, "embedding").options).toEqual({});
+  });
+
+  test("sends what the listing declared about a generation model answering in a JSON schema, and nothing undeclared", () => {
+    expect(candidateRequest(edited({ nativeSchema: true }), OPENAI, "generation").native_schema).toBe(true);
+    expect(candidateRequest(edited({ nativeSchema: false }), OPENAI, "generation").native_schema).toBe(false);
+    expect(candidateRequest(SAVED, OPENAI, "generation")).not.toHaveProperty("native_schema");
+    expect(candidateRequest(edited({ nativeSchema: true }), OPENAI, "embedding")).not.toHaveProperty("native_schema");
   });
 
   test("sends the token limits that are filled in as numbers, for a generation model only", () => {
@@ -407,5 +421,20 @@ describe("fieldProblems", () => {
     expect(fieldProblems(SAVED, { provider: undefined, kind: "generation", savedKey: KEPT })).toEqual([
       { path: ["provider"], message: "Choose a provider." },
     ]);
+  });
+});
+
+describe("what the listing declares about a model answering in a JSON schema", () => {
+  const DECLARED = edited({ nativeSchema: true });
+
+  test("is a change to save, so the model is checked with it", () => {
+    expect(isChanged(SAVED, DECLARED, OPENAI, "generation")).toBe(true);
+    expect(isChanged(DECLARED, DECLARED, OPENAI, "generation")).toBe(false);
+  });
+
+  test("stays with the saved model while the field names it, and is dropped for any other model", () => {
+    expect(nativeSchemaForTypedModel(DECLARED, "openai", " gpt-5.4 ")).toBe(true);
+    expect(nativeSchemaForTypedModel(DECLARED, "openai", "gpt-5.4-mini")).toBeNull();
+    expect(nativeSchemaForTypedModel(DECLARED, "openrouter", "gpt-5.4")).toBeNull();
   });
 });

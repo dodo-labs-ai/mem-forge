@@ -25,6 +25,7 @@ from memforge.llm.failure_trace import (
 )
 from memforge.llm.providers import (
     ModelConfigError, ResolvedInvocation, litellm_optional_kwargs, provider_descriptor,
+    route_enforces_response_schema,
 )
 from memforge.llm.structured_images import (
     StructuredLlmImage,
@@ -651,10 +652,16 @@ class StructuredLlmConfig:
     # Every client in the worker event loop shares this logical-call admission.
     # Callers that do not opt in remain conservatively serial.
     max_concurrent: int = 1
-    # ``auto`` follows LiteLLM's provider capability registry. Integrations may
-    # instead select an explicit standard wire contract when the registry lags
-    # a deployed model, without teaching this provider-neutral client a gateway
-    # or model alias.
+    # Whether the provider holds the main model's reply to the JSON schema a
+    # request gives, as the provider declares it. ``True`` asks for the schema
+    # natively and ``False`` writes it into the prompt. ``None`` leaves it to
+    # the wire contract below: an explicit one is taken as native support, and
+    # ``auto`` to LiteLLM's model map.
+    native_schema: bool | None = None
+    # ``auto`` lets LiteLLM write the response schema in the provider's own
+    # form. Integrations may instead select an explicit standard wire contract
+    # when the registry lags a deployed model, without teaching this
+    # provider-neutral client a gateway or model alias.
     native_schema_transport: NativeSchemaTransport = "auto"
     # Some LiteLLM gateways interpret message text as a prompt template. When
     # configured by the deployment adapter, carry the complete prompt as one
@@ -670,6 +677,7 @@ class StructuredLlmConfig:
     # ``memforge.llm.decision_model``. It shares this client's gateway,
     # credentials and capacity caps, and has its own schema wire contract.
     decision_model: str | None = None
+    decision_native_schema: bool | None = None
     decision_native_schema_transport: NativeSchemaTransport = "auto"
     # The extra request parameters of the resolved invocation.
     extra_params: Mapping[str, Any] = dataclass_field(default_factory=dict)
@@ -679,7 +687,19 @@ class StructuredLlmConfig:
 
     @classmethod
     def for_invocation(cls, invocation: ResolvedInvocation, **settings: Any) -> StructuredLlmConfig:
-        """Build the configuration of a client that calls one resolved invocation."""
+        """Build the configuration of a client that calls one resolved invocation.
+
+        The main model takes the response schema support the invocation
+        declares. The decision model is another model of the same provider, so
+        it takes only what the provider declares for every model it serves,
+        through the descriptor or the decision model's route.
+        """
+        settings.setdefault("native_schema", invocation.native_schema)
+        decision_model = settings.get("decision_model")
+        if (
+            invocation.provider is not None and provider_descriptor(invocation.provider).enforces_response_schema
+        ) or route_enforces_response_schema(decision_model):
+            settings.setdefault("decision_native_schema", True)
         return cls(
             model=invocation.route,
             base_url=invocation.api_base,
@@ -2196,13 +2216,10 @@ class LiteLlmStructuredClient:
         images: StructuredImageInputs,
     ):
         native_schema_transport = self._native_schema_transport(model_name)
-        if (
-            native_schema_transport == "auto"
-            and not _supports_native_response_schema(model_name)
-        ):
+        if not self._takes_native_schema(model_name, native_schema_transport):
             state.final_mode = "json_text"
             logger.debug(
-                "Structured LLM model %s does not advertise native response_schema support; "
+                "Structured LLM model %s is not known to take a native response schema; "
                 "using JSON-text schema for %s",
                 model_name,
                 response_format.__name__,
@@ -2585,10 +2602,29 @@ class LiteLlmStructuredClient:
             return response, attempt_index
 
     def _native_schema_transport(self, model_name: str) -> NativeSchemaTransport:
-        decision_model = self.config.decision_model
-        if decision_model and model_name == litellm_model_name(decision_model):
+        if self._is_decision_model(model_name):
             return self.config.decision_native_schema_transport
         return self.config.native_schema_transport
+
+    def _takes_native_schema(self, model_name: str, transport: NativeSchemaTransport) -> bool:
+        """Whether a structured request to ``model_name`` asks the provider for its schema first.
+
+        What the provider declares decides. A model it declares nothing for
+        takes one when the client is configured with an explicit wire
+        contract, or else when LiteLLM's model map says it does.
+        """
+        declared = (
+            self.config.decision_native_schema
+            if self._is_decision_model(model_name)
+            else self.config.native_schema
+        )
+        if declared is not None:
+            return declared
+        return transport != "auto" or _supports_native_response_schema(model_name)
+
+    def _is_decision_model(self, model_name: str) -> bool:
+        decision_model = self.config.decision_model
+        return bool(decision_model) and model_name == litellm_model_name(decision_model)
 
     def _emit_telemetry(self, telemetry: StructuredLlmCallTelemetry) -> None:
         try:
