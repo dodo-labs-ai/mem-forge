@@ -53,9 +53,11 @@ from memforge.model_settings import (
 )
 
 __all__ = [
+    "ModelDiscoveryResponse",
     "ModelHealthResponse",
     "ModelKindHealthResponse",
     "build_model_settings_router",
+    "list_endpoint_models",
     "model_health_response",
 ]
 
@@ -651,7 +653,7 @@ def build_model_settings_router(
                         "Enter the API key for this endpoint, then try again."
                     ),
                 )
-        return await _discover_models(
+        return await list_endpoint_models(
             descriptor,
             listing,
             kind,
@@ -1073,7 +1075,7 @@ def _refused_listing(
     return "api_key_required", "Add an API key, then try again."
 
 
-async def _discover_models(
+async def list_endpoint_models(
     descriptor: ProviderDescriptor,
     listing: ModelListing,
     kind: ModelKind,
