@@ -35,6 +35,7 @@ from memforge.llm.structured_image_delivery import ArtifactImageDelivery
 from memforge.llm.transport import (
     is_connection_failure,
     is_retryable_provider_error,
+    is_retryable_status,
     provider_status_code,
 )
 
@@ -43,7 +44,8 @@ type StructuredImageInputs = tuple[StructuredLlmImage, ...] | ArtifactImageDeliv
 logger = logging.getLogger(__name__)
 
 # ``invalid_response``: a model response was received and failed validation.
-# ``provider_error``: a transient, authorization or capacity failure the provider reported.
+# ``provider_error``: a transient, authorization, model or capacity failure the provider
+# reported, which another request form cannot get past.
 # ``request_error``: the call failed without a response to validate for any other reason,
 # such as a provider rejection of the request (400) or an unexpected exception.
 type StructuredLlmTerminalCategory = Literal[
@@ -58,8 +60,21 @@ type NativeSchemaTransport = Literal[
     "auto",
     "json_schema_response_format",
 ]
-# A model call that ended in one of these may succeed when it is sent again.
-TRANSIENT_TERMINAL_CATEGORIES: frozenset[str] = frozenset({"provider_error", "deadline_exceeded"})
+
+
+def terminal_failure_retryable(terminal_category: str, status_code: int | None) -> bool:
+    """Whether a model call that ended in ``terminal_category`` may succeed when it is made again.
+
+    A call that overran its deadline may. A provider error may when the
+    provider never answered, through a timeout or a connection failure, or
+    answered with a transient status: 408, 409, 429 or 5xx. A provider that
+    refused the request, its credential or its model, as with 400, 401, 403,
+    404 or 422, refuses it again. Every other category fails the same way
+    again.
+    """
+    if terminal_category == "deadline_exceeded":
+        return True
+    return terminal_category == "provider_error" and (status_code is None or is_retryable_status(status_code))
 
 
 class TransientErrorClassifier(Protocol):
@@ -79,18 +94,20 @@ def failure_retryable(error: BaseException, *, store: TransientErrorClassifier |
 
     A failure is retryable only when its cause proves it transient:
 
-    - a failed model call whose terminal category is transient (a provider
-      error, rate limit and 5xx included, or a deadline overrun), an embedding
-      call that overran its deadline or never reached the provider, or a raw
-      provider error that ``is_retryable_provider_error`` accepts, such as a
-      Gene's httpx timeout, connection failure, 429 or 5xx;
-    - a storage error that ``store`` classifies as transient (a store that
-      names no transient errors classifies none);
     - an exception that declares itself retryable through its ``retryable``
-      attribute, such as the loss of the Source activity fence.
+      attribute, such as the loss of the Source activity fence;
+    - a failed model call that ``terminal_failure_retryable`` accepts: a
+      deadline overrun, or a provider error the provider never answered or
+      answered with 408, 409, 429 or 5xx;
+    - an embedding call that overran its deadline or never reached the
+      provider, or a raw provider error that ``is_retryable_provider_error``
+      accepts, such as a Gene's httpx timeout, connection failure, 429 or 5xx;
+    - a storage error that ``store`` classifies as transient (a store that
+      names no transient errors classifies none).
 
-    Every other failure fails the same way again: a request error, an invalid
-    model response, and any exception that declares nothing. Such a failure is
+    Every other failure fails the same way again: a provider that refused the
+    request, its credential or its model (400, 401, 403, 404, 422), a request
+    error, an invalid model response, and any exception that declares nothing. Such a failure is
     not retried within the run and the revision stays uncommitted; recovery of a
     staged derivation ends that derivation and continues with the next. The Unit
     is derived again when a later run projects it again: the provider changes
@@ -98,12 +115,12 @@ def failure_retryable(error: BaseException, *, store: TransientErrorClassifier |
     it.
     """
 
-    category = getattr(error, "terminal_category", None)
-    if category is not None:
-        return category in TRANSIENT_TERMINAL_CATEGORIES
     declared = getattr(error, "retryable", None)
     if declared is not None:
         return bool(declared)
+    category = getattr(error, "terminal_category", None)
+    if category is not None:
+        return terminal_failure_retryable(category, provider_status_code(error))
     if isinstance(error, EmbeddingDeadlineExceeded):
         return True
     if isinstance(error, EmbeddingProviderError) and error.unreachable:
