@@ -1521,7 +1521,7 @@ function AddSourceDialog({
   );
 }
 
-const MEMFORGE_MARKETPLACE_REPO = "shno-labs/mem-forge";
+const MEMFORGE_MARKETPLACE_REPO = "dodo-labs-ai/mem-forge";
 const MEMFORGE_PLUGIN_NAME = "memory@memforge";
 
 const CODEX_PLUGIN_COMMANDS = [

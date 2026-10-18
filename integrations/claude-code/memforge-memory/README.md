@@ -59,7 +59,7 @@ another workspace.
 Install from GitHub (run inside an active Claude Code session):
 
 ```text
-/plugin marketplace add shno-labs/mem-forge
+/plugin marketplace add dodo-labs-ai/mem-forge
 /plugin install memory@memforge
 ```
 
