@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The vector index status in Settings no longer reports "reindexing" next to
+  a rebuild that has already ended. Both now come from one read of the latest
+  rebuild, so a rebuild that ends while the status is read shows as running or
+  as ended, never both.
+  - Cloud: nothing to do; the Cloud admin reads the same view.
+
 - Local Ollama models now answer in the exact JSON shape MemForge asks for.
   MemForge sends the schema as Ollama's own `format`, so Ollama holds the
   answer to it, instead of writing the schema into the prompt, which small
