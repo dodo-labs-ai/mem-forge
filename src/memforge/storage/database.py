@@ -22782,6 +22782,27 @@ class Database:
             await self.db.commit()
             return cursor.rowcount == 1
 
+    async def record_model_binding_native_schema(
+        self,
+        kind: str,
+        slot: str,
+        *,
+        updated_at: str,
+        native_schema: bool,
+    ) -> bool:
+        """Record the response schema support a listing declares for the binding saved at ``updated_at``.
+
+        The binding keeps its state, its latest check and when it was saved.
+        Returns False, recording nothing, when it has been saved again since.
+        """
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                "UPDATE model_bindings SET native_schema = ? WHERE kind = ? AND slot = ? AND updated_at = ?",
+                (int(native_schema), kind, slot, updated_at),
+            )
+            await self.db.commit()
+            return cursor.rowcount == 1
+
     async def promote_model_candidate(
         self,
         kind: str,

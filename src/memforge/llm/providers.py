@@ -16,10 +16,11 @@ first. Closed-choice calls size their output for the answer alone, and a model
 that reasons by default would spend that output before it answers.
 
 Whether a structured request asks the provider to hold the reply to its JSON
-schema is decided by what the provider declares: a descriptor whose provider
-enforces a schema for every model it serves says so, and a model listing that
-declares it for each model says so for the model chosen from it. A model that
-nothing declares anything for is left to LiteLLM's model map.
+schema is decided by what the provider declares: a provider that enforces a
+schema for every model it serves says so through its descriptor, and through
+the LiteLLM routes that reach it; a model listing that declares it for each
+model says so for the model chosen from it. A model that nothing declares
+anything for is left to LiteLLM's model map.
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ __all__ = [
     "names_litellm_route",
     "origin_label",
     "provider_descriptor",
+    "route_enforces_response_schema",
 ]
 
 ModelKind = Literal["generation", "embedding"]
@@ -65,6 +67,14 @@ AUTH_STRATEGIES: tuple[AuthStrategy, ...] = get_args(AuthStrategy)
 KEYLESS_API_KEY = "no-api-key"
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+# The LiteLLM providers whose server holds every generation reply to the JSON
+# schema a request gives. Ollama takes the schema as the ``format`` of a chat
+# or a generate request for every model
+# (https://docs.ollama.com/capabilities/structured-outputs), and LiteLLM's
+# ``ollama_chat/`` and ``ollama/`` routes write a ``json_schema`` response
+# format there.
+_SCHEMA_ENFORCING_ROUTE_PROVIDERS = frozenset({"ollama_chat", "ollama"})
 
 # The request paths of an OpenAI-style API, written after its base URL.
 _OPENAI_REQUEST_PATHS = (
@@ -442,6 +452,12 @@ def provider_descriptor(provider_id: str) -> ProviderDescriptor:
     if descriptor is None:
         raise ModelConfigError("unknown_provider", f"{provider_id!r} is not a known provider.")
     return descriptor
+
+
+def route_enforces_response_schema(route: str | None) -> bool:
+    """Whether the provider a LiteLLM ``provider/model`` route reaches holds every reply to the request's schema."""
+    provider, separator, _model = (route or "").strip().partition("/")
+    return bool(separator) and provider in _SCHEMA_ENFORCING_ROUTE_PROVIDERS
 
 
 def names_litellm_route(model: str | None) -> bool:

@@ -528,7 +528,7 @@ def test_a_token_limit_a_binding_cannot_state_is_refused(kind, token_limits, err
     assert refusal.value.code == error_code
 
 
-def test_a_generation_binding_carries_the_response_schema_support_its_listing_declared() -> None:
+def test_a_generation_binding_carries_the_response_schema_support_its_listing_declares() -> None:
     settings = {"kind": "generation", "provider": "openrouter", "model_id": "openai/gpt-5-mini", "config_source": "settings"}
 
     undeclared = build_binding(**settings)
@@ -536,12 +536,19 @@ def test_a_generation_binding_carries_the_response_schema_support_its_listing_de
     declined = build_binding(**settings, native_schema=False)
 
     assert (undeclared.native_schema, declared.native_schema, declined.native_schema) == (None, True, False)
-    assert len({undeclared.digest, declared.digest, declined.digest}) == 3
+    assert undeclared.digest == declared.digest == declined.digest
 
 
-def test_a_binding_that_declares_no_response_schema_support_keeps_the_digest_it_was_checked_with() -> None:
-    """A binding stored before response schema support was recorded stays ready as it is."""
-    binding = build_binding(kind="generation", provider="ollama", model_id="qwen3:0.6b", config_source="settings")
+@pytest.mark.parametrize("native_schema", [None, True, False])
+def test_the_digest_leaves_out_response_schema_support(native_schema) -> None:
+    """A check stays on record whatever the provider declares, so stored digests stay what they were."""
+    binding = build_binding(
+        kind="generation",
+        provider="ollama",
+        model_id="qwen3:0.6b",
+        native_schema=native_schema,
+        config_source="settings",
+    )
     material = {
         "provider": "ollama",
         "endpoint": "http://localhost:11434",
@@ -588,7 +595,10 @@ def test_response_schema_support_a_binding_cannot_declare_is_refused(kind, nativ
         ("openrouter", "openai/gpt-5-mini", None, None),
         ("openai", "gpt-5-mini", None, None),
         ("openai_compatible", "qwen3", None, None),
-        ("litellm", "ollama_chat/qwen3", None, None),
+        ("litellm", "ollama_chat/qwen3", None, True),
+        ("litellm", "ollama/qwen3", None, True),
+        ("litellm", "openrouter/openai/gpt-5-mini", None, None),
+        ("litellm", "ollama-like/qwen3", None, None),
     ],
 )
 def test_an_invocation_takes_what_the_listing_or_else_the_provider_declares_about_response_schemas(

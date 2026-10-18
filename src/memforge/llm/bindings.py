@@ -43,6 +43,7 @@ from memforge.llm.providers import (
     names_litellm_route,
     origin_label,
     provider_descriptor,
+    route_enforces_response_schema,
 )
 from memforge.source_secrets import SecretConfigurationError, decrypt_secret, encrypt_secret
 
@@ -171,8 +172,9 @@ class ModelBinding:
     # model whose limits LiteLLM does not know.
     token_limits: Mapping[str, int] = field(default_factory=dict)
     # Whether the generation model answers in the JSON schema a request gives,
-    # as the provider's model listing declared it when the model was chosen;
-    # ``None`` when the listing declared nothing.
+    # as the provider's model listing declares it; ``None`` when it declares
+    # nothing. It is what the provider observes, refreshed at each check, so it
+    # is not part of the digest.
     native_schema: bool | None = None
 
     @property
@@ -181,11 +183,11 @@ class ModelBinding:
 
         A check that passed for one digest says nothing about a binding with
         another: the endpoint, provider, route, auth strategy, model, requested
-        dimensions, token limits, the declared response schema support, the key
-        the binding refers to or the installed LiteLLM version has changed.
-        Response schema support enters the digest only when the listing
-        declared it, so a binding the listing declared nothing for is
-        identified by its other settings alone.
+        dimensions, token limits, the key the binding refers to or the
+        installed LiteLLM version has changed. Response schema support is not
+        among them: a request that asks for the schema natively is validated
+        as before and falls back to the schema in the prompt when the provider
+        rejects it.
         """
         material = {
             "provider": self.provider,
@@ -199,8 +201,6 @@ class ModelBinding:
             "secret_ref": self.secret_ref,
             "litellm": installed_litellm_version(),
         }
-        if self.native_schema is not None:
-            material["native_schema"] = self.native_schema
         encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -313,7 +313,7 @@ def compile_binding(binding: ModelBinding, credential: str | None) -> ResolvedIn
     The binding's route and endpoint name the model; its descriptor says which
     route and base URL its requests are sent with. Response schema support is
     what the model listing declared for the model, or else what the descriptor
-    declares for every model of its provider.
+    or the route declares for every model of its provider.
     """
     if binding.auth_strategy == "api_key":
         if not credential:
@@ -329,7 +329,9 @@ def compile_binding(binding: ModelBinding, credential: str | None) -> ResolvedIn
     descriptor = provider_descriptor(binding.provider)
     route, api_base = descriptor.request_target(binding.kind, binding.route, binding.endpoint)
     native_schema = binding.native_schema
-    if native_schema is None and binding.kind == "generation" and descriptor.enforces_response_schema:
+    if native_schema is None and binding.kind == "generation" and (
+        descriptor.enforces_response_schema or route_enforces_response_schema(binding.route)
+    ):
         native_schema = True
     return ResolvedInvocation(
         route=route,

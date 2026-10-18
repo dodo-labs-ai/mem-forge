@@ -25,6 +25,7 @@ from memforge.llm.failure_trace import (
 )
 from memforge.llm.providers import (
     ModelConfigError, ResolvedInvocation, litellm_optional_kwargs, provider_descriptor,
+    route_enforces_response_schema,
 )
 from memforge.llm.structured_images import (
     StructuredLlmImage,
@@ -690,10 +691,14 @@ class StructuredLlmConfig:
 
         The main model takes the response schema support the invocation
         declares. The decision model is another model of the same provider, so
-        it takes only what the provider declares for every model it serves.
+        it takes only what the provider declares for every model it serves,
+        through the descriptor or the decision model's route.
         """
         settings.setdefault("native_schema", invocation.native_schema)
-        if invocation.provider is not None and provider_descriptor(invocation.provider).enforces_response_schema:
+        decision_model = settings.get("decision_model")
+        if (
+            invocation.provider is not None and provider_descriptor(invocation.provider).enforces_response_schema
+        ) or route_enforces_response_schema(decision_model):
             settings.setdefault("decision_native_schema", True)
         return cls(
             model=invocation.route,

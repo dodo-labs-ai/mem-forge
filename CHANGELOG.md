@@ -6,21 +6,26 @@
   MemForge sends the schema as Ollama's own `format`, so Ollama holds the
   answer to it, instead of writing the schema into the prompt, which small
   models such as `qwen3:0.6b` tended to echo back instead of answering.
-  - OpenRouter models that support structured outputs get the same: when you
-    pick a model with Load models in Settings, MemForge keeps what OpenRouter's
-    model list says (`structured_outputs`) and asks that model for a
-    `json_schema` response format. Other OpenRouter models keep the schema in
-    the prompt.
+  - OpenRouter models that support structured outputs get the same: MemForge
+    reads what OpenRouter's model list says about the model
+    (`structured_outputs`) and asks it for a `json_schema` response format.
+    Other OpenRouter models keep the schema in the prompt. OpenRouter can add or
+    drop support for a model, so MemForge reads the list again whenever it
+    checks the model: at Save and validate, at Check again and when the server
+    starts. When the list cannot be reached, it keeps what it read last.
+  - The same holds for an Ollama model typed as a LiteLLM route
+    (`ollama_chat/...` or `ollama/...`, with the Other provider option or
+    `MEMFORGE_ENRICHMENT_MODEL`).
   - Whether a provider natively supports a schema is now decided by what the
     provider says, not by LiteLLM's built-in model list, which does not know
     local Ollama models or most OpenRouter models. OpenAI, Anthropic,
-    OpenAI-compatible endpoints and models typed as a LiteLLM route (such as
-    `ollama_chat/...`) work as before.
+    OpenAI-compatible endpoints and other LiteLLM routes work as before.
   - A provider that rejects the schema request still gets the request again
     with the schema in the prompt, so nothing that works today stops working.
   - Existing installs keep their validated models; nothing needs to be checked
-    again. An existing OpenRouter model gets structured outputs once you pick it
-    again from Load models and save it, which validates it again.
+    again, and what the model list says never makes a model need a new check.
+    An OpenRouter model saved before picks up structured outputs the next time
+    the server starts.
   - The admin API's model listing, candidate and binding responses gain a
     `native_schema` field, and the model bindings table a `native_schema`
     column (migration 119).
