@@ -202,6 +202,10 @@ AGENT_SESSION_AUTHORITY_MIN_OUTPUT_TOKENS = 1024
 AGENT_SESSION_AUTHORITY_TASK = DecisionTask("agent_session_authority", AGENT_SESSION_AUTHORITY_CONTRACT)
 
 
+# Recent window receipts read when reporting lines a client plugin could not recognize.
+UNRECOGNIZED_LINES_RECEIPT_LIMIT = 50
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -724,6 +728,7 @@ async def _record_window_outcome(
     source_updated_at: str | None,
     window_hash: str,
     receipt: dict[str, Any] | None,
+    plugin_version: str | None,
     outcome: str,
     reason: str,
     metadata: dict[str, Any] | None = None,
@@ -752,6 +757,7 @@ async def _record_window_outcome(
         "window_hash": f"sha256:{window_hash}",
         "window_retention": "none",
         "receipt": receipt or {},
+        "plugin_version": plugin_version,
         "user_id": owner_user_id,
         "judgment_contracts": {
             "authority": AGENT_SESSION_AUTHORITY_CONTRACT,
@@ -781,6 +787,42 @@ async def _record_window_outcome(
     )
     await db.upsert_agent_session_receipt(receipt_record)
     return doc_id
+
+
+async def recent_unrecognized_session_lines(db: Database, source_id: str) -> dict[str, Any] | None:
+    """Report transcript lines the Source's current client plugin could not recognize.
+
+    Reads the Source's most recent window receipts and sums the
+    ``unrecognized_line`` omissions reported by windows from the plugin version
+    that uploaded the latest window, so updating the plugin clears the report.
+    Returns None when those windows recognized every line.
+    """
+    receipts = await db.list_agent_session_receipts(source_id=source_id, limit=UNRECOGNIZED_LINES_RECEIPT_LIMIT)
+    windows = [receipt for receipt in receipts if receipt.get("source_kind") == AGENT_SESSION_WINDOW_SOURCE_KIND]
+    if not windows:
+        return None
+    plugin_version = windows[0]["metadata"].get("plugin_version")
+    count = 0
+    last_seen_at: str | None = None
+    for window in windows:
+        metadata = window["metadata"]
+        if metadata.get("plugin_version") != plugin_version:
+            continue
+        lines = _unrecognized_line_count(metadata.get("receipt"))
+        if lines:
+            count += lines
+            last_seen_at = last_seen_at or window.get("submitted_at")
+    if not count:
+        return None
+    return {"count": count, "plugin_version": plugin_version, "last_seen_at": last_seen_at}
+
+
+def _unrecognized_line_count(receipt: Any) -> int:
+    """Return the transcript lines one window's plugin reported as unrecognized."""
+    metadata = receipt.get("metadata") if isinstance(receipt, dict) else None
+    omissions = metadata.get("omissions") if isinstance(metadata, dict) else None
+    value = omissions.get("unrecognized_line") if isinstance(omissions, dict) else None
+    return value if isinstance(value, int) and value > 0 else 0
 
 
 async def _existing_window_result(
@@ -855,6 +897,7 @@ async def submit_agent_session_window(
     branch: str | None = None,
     commit_sha: str | None = None,
     receipt: dict[str, Any] | None = None,
+    plugin_version: str | None = None,
     retention: str = "none",
     submitted_at: str | None = None,
     source_updated_at: str | None = None,
@@ -913,6 +956,7 @@ async def submit_agent_session_window(
         "source_updated_at": normalized_source_updated_at,
         "window_hash": window_hash,
         "receipt": receipt,
+        "plugin_version": plugin_version,
     }
     existing_result = await _existing_window_result(
         db=db,
