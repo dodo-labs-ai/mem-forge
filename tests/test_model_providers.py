@@ -369,36 +369,12 @@ def test_a_route_without_an_endpoint_is_bound_to_the_provider_of_its_route() -> 
     assert _binding("litellm", model_id="voyage/voyage-3", kind="embedding").origin == "provider:voyage"
 
 
-@pytest.mark.parametrize(
-    ("provider", "model_id", "parameters"),
-    [
-        ("openrouter", "anthropic/claude-haiku-5.5", {"extra_body": {"reasoning": {"enabled": False}}}),
-        ("openrouter", "openai/gpt-5-mini", {"extra_body": {"reasoning": {"enabled": False}}}),
-        ("anthropic", "claude-haiku-4-5", {}),
-        ("openai", "gpt-5.1", {"reasoning_effort": "none"}),
-        ("openai", "gpt-5-mini", {"reasoning_effort": "minimal"}),
-        ("openai", "o4-mini", {"reasoning_effort": "low"}),
-        ("openai", "gpt-4o-mini", {}),
-        ("openai", "gpt-5-chat-latest", {}),
-        ("openai", "a-model-litellm-does-not-know", {}),
-        ("ollama", "qwen3", {"think": False}),
-        ("ollama", "gpt-oss:20b", {"think": "low"}),
-        ("openai_compatible", "gpt-5-mini", {}),
-        ("openai_compatible", "qwen3", {}),
-        ("litellm", "sap/anthropic--claude-4.6-sonnet", {}),
-        ("litellm", "sap/gpt-5-mini", {}),
-        ("litellm", "openrouter/anthropic/claude-haiku-5.5", {}),
-        ("litellm", "openai/gpt-5-mini", {}),
-        ("litellm", "ollama_chat/qwen3", {}),
-    ],
-)
-def test_each_descriptor_says_how_its_generation_model_answers_without_reasoning(
-    provider, model_id, parameters
-) -> None:
-    descriptor = provider_descriptor(provider)
-    route = descriptor.compile_route("generation", model_id)
+@pytest.mark.parametrize("model_id", ["sap/anthropic--claude-4.6-sonnet", "sap/gpt-5-mini"])
+def test_a_litellm_route_through_a_gateway_is_asked_for_nothing_about_reasoning(model_id) -> None:
+    """A gateway may pass a request on to any provider, so no reasoning parameter is safe to send it."""
+    descriptor = provider_descriptor("litellm")
 
-    assert descriptor.reasoning_off(route) == parameters
+    assert descriptor.reasoning_off(descriptor.compile_route("generation", model_id)) == {}
 
 
 def test_reasoning_off_parameters_are_a_fresh_value_for_every_request() -> None:
