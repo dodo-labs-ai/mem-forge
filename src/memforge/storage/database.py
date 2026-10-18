@@ -4707,7 +4707,7 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         105,
         "Remove the Source activity epoch",
         # Source activity leases, local-agent job leases, and derivation
-        # identities fence Source writes (ADR 0042). An unapplied derivation
+        # identities fence Source writes. An unapplied derivation
         # whose context carries the epoch no longer matches its identity and is
         # superseded; the columns are dropped where a database created before
         # this version still has them (see _remove_source_activity_epoch_unlocked).
@@ -4716,16 +4716,16 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
     (
         106,
         "Record cross-document relations by label only",
-        # The relation classifier returns only a label (ADR 0043). The column is
+        # The relation classifier returns only a label. The column is
         # dropped where a database created before this version still has it.
         [],
     ),
     (
         107,
         "Remove Memory and agent claim confidence",
-        # No lifecycle, ranking, filtering or hook decision reads a confidence
-        # (ADR 0043). The columns are dropped where a database created before
-        # this version still has them.
+        # No lifecycle, ranking, filtering or hook decision reads a confidence.
+        # The columns are dropped where a database created before this version
+        # still has them.
         [],
     ),
     (
@@ -4752,7 +4752,7 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         112,
         "Record why a sync run skipped its absence check",
         # A run whose scope listing did not complete removes nothing and says
-        # why in its sync history (ADR 0045).
+        # why in its sync history.
         ["ALTER TABLE sync_history ADD COLUMN absence_check_skipped_reason TEXT"],
     ),
     (

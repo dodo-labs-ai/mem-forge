@@ -5,7 +5,7 @@ import reactRefresh from "eslint-plugin-react-refresh";
 import tseslint from "typescript-eslint";
 import { defineConfig, globalIgnores } from "eslint/config";
 
-/** Layers a module may not import, keyed by its own layer (ADR 0044). */
+/** Layers a module may not import, keyed by its own layer. */
 const LAYER_RULES = [
   { files: ["src/lib/**"], forbidden: ["@/api", "@/ui", "@/patterns", "@/features", "@/app"] },
   { files: ["src/api/**"], forbidden: ["@/ui", "@/patterns", "@/features", "@/app"] },
@@ -16,7 +16,7 @@ const LAYER_RULES = [
 
 const V1_IMPORT = {
   group: ["**/admin-ui/**"],
-  message: "The V1 admin UI is removed after the parallel run; copy what you need (ADR 0044).",
+  message: "The V1 admin UI is removed after the parallel run; copy what you need.",
 };
 const FEATURE_INTERNALS = {
   group: ["@/features/*/**"],
@@ -33,7 +33,7 @@ function layerRule(forbidden, extraPatterns = []) {
           ...extraPatterns,
           ...forbidden.map((layer) => ({
             group: [layer, `${layer}/**`],
-            message: "This layer may only import from the layers below it (ADR 0044).",
+            message: "This layer may only import from the layers below it.",
           })),
         ],
       },

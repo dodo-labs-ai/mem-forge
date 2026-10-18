@@ -37,7 +37,7 @@ export function MemoryDetailPage() {
   });
 
   // Deprecated (admin-ui-v1): PUT /memories/{id} retires without a reason,
-  // content hash or visibility check; the admin UI uses POST /memories/{id}/retire (ADR 0044).
+  // content hash or visibility check; the admin UI uses POST /memories/{id}/retire.
   const updateStatus = useMutation({
     mutationFn: (status: string) => resourceClient.put(`/memories/${id}`, { status }),
     onSuccess: () => {

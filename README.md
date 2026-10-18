@@ -196,7 +196,7 @@ how to scope it. Need one that is missing?
 
 - [Quickstart](https://github.com/shno-labs/mem-forge/blob/main/docs/quickstart.md): setup, models, plugins, sources, CLI,
   development from source
-- [Docs index](https://github.com/shno-labs/mem-forge/blob/main/docs/README.md): architecture, API, design notes and ADRs
+- [Docs index](https://github.com/shno-labs/mem-forge/blob/main/docs/README.md): quickstart, architecture, API and release guides
 - [Contributing](https://github.com/shno-labs/mem-forge/blob/main/CONTRIBUTING.md)
 
 ## License
