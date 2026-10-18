@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Memories you write by hand, and corrections you make, now appear in the
+  recent-memories listing (`list_recent_memories` and
+  `POST /api/v1/memories/recent`) and in searches filtered only by date. They
+  were left out because they have no configured Source.
+  - Search without an explicit access scope now runs as the local owner and
+    includes the owner's private Memories, such as agent-session and hand-made
+    ones. Other users' private Memories are still never returned.
+  - A new test checks every OSS read surface (search and recent APIs, the
+    Memory list, ToolClient, both CLI search commands, the MCP search and
+    recent tools, hook context, and the search engine called directly) returns
+    all of the owner's Memories and no one else's private ones.
+  - Cloud: the search default does not affect Cloud, which always passes its
+    own access scope. If Cloud's HANA store mirrors the SQLite
+    `list_recent_memory_ids` and `list_ids_by_source_and_time` queries, it
+    needs the same change: a support row from `user_memory` or
+    `user_correction` counts as current even though no Source row exists for
+    it.
+
 - The Sources page warns when the Codex or Claude Code plugin cannot read
   lines of its session transcripts, for example after the client changes its
   transcript format, so a plugin update is not missed.
