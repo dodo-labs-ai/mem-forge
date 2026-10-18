@@ -178,22 +178,29 @@ async def test_a_reply_that_never_matches_the_schema_fails(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("failure", "error_code"),
+    ("failure", "error_code", "status_code"),
     [
-        (litellm.AuthenticationError("invalid x-api-key", "openai", "check-model"), "authentication_failed"),
-        (litellm.NotFoundError("model not found", "check-model", "openai"), "model_not_found"),
-        (litellm.APIConnectionError("nodename nor servname provided", "openai", "check-model"), "provider_unreachable"),
-        (_refused_connection(), "provider_unreachable"),
-        (litellm.InternalServerError("upstream failed", "openai", "check-model"), "provider_error"),
+        (litellm.AuthenticationError("invalid x-api-key", "openai", "check-model"), "authentication_failed", 401),
+        (litellm.NotFoundError("model not found", "check-model", "openai"), "model_not_found", 404),
+        (
+            litellm.APIConnectionError("nodename nor servname provided", "openai", "check-model"),
+            "provider_unreachable",
+            None,
+        ),
+        (_refused_connection(), "provider_unreachable", None),
+        (litellm.InternalServerError("upstream failed", "openai", "check-model"), "provider_error", 500),
     ],
     ids=["rejected_key", "unknown_model", "unresolved_host", "refused_connection", "server_fault"],
 )
-async def test_a_provider_failure_is_reported_by_code(monkeypatch, failure, error_code) -> None:
+async def test_a_provider_failure_is_reported_by_code_and_the_status_it_was_answered_with(
+    monkeypatch, failure, error_code, status_code
+) -> None:
     Provider(monkeypatch, failure, failure, failure, failure)
 
     check = await check_generation(_client(num_retries=0))
 
     assert check.error_code == error_code
+    assert check.facts.get("status_code") == status_code
     assert check.facts["latency_ms"] >= 0
 
 
@@ -383,10 +390,11 @@ async def test_a_requested_dimension_is_sent_and_has_to_be_the_one_observed() ->
         (418, "provider_error"),
     ],
 )
-async def test_an_embedding_provider_rejection_is_reported_by_code(status_code, error_code) -> None:
+async def test_an_embedding_provider_rejection_is_reported_by_code_and_status(status_code, error_code) -> None:
     check = await check_embedding(EMBEDDING, transport=EmbeddingProvider(Rejection(status_code)))
 
     assert check.error_code == error_code
+    assert check.facts["status_code"] == status_code
     assert "dimension" not in check.facts
 
 
@@ -415,6 +423,7 @@ async def test_an_unreachable_embedding_endpoint_is_reported_as_unreachable(monk
     check = await check_embedding(EMBEDDING, transport=provider)
 
     assert check.error_code == "provider_unreachable"
+    assert "status_code" not in check.facts
     assert len(provider.requests) == 2
 
 
