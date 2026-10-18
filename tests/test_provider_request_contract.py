@@ -302,8 +302,8 @@ class Row:
 
 
 _OLLAMA_EMBEDDING_KEY_GAP = (
-    "LiteLLM posts an Ollama embedding with no headers, so the API key of an Ollama "
-    "server behind authentication never reaches it."
+    "LiteLLM's ollama/ embedding route posts with no headers, so the API key of an Ollama "
+    "server behind authentication never reaches it: https://github.com/BerriAI/litellm/issues/47261"
 )
 _SAME_REQUESTS_AS_KEYLESS_OLLAMA = "The keyless ollama row sends the same requests; only the credential differs."
 
@@ -429,13 +429,14 @@ MATRIX: tuple[Row, ...] = (
         ),
         embedding=EmbeddingContract(
             model_id="nomic-embed-text",
-            url="http://localhost:11434/api/embed",
+            url="http://localhost:11434/v1/embeddings",
             model="nomic-embed-text",
-            headers={"authorization": None},
-            reply=_ollama_embed,
-            error=_ollama_error,
+            headers={"authorization": "Bearer no-api-key"},
+            reply=_openai_embeddings,
+            error=_openai_error,
             dimensions_field="dimensions",
-            timeout_error=None,
+            timeout_error=litellm.Timeout,
+            fields={"encoding_format": "float"},
         ),
     ),
     Row(
@@ -459,13 +460,14 @@ MATRIX: tuple[Row, ...] = (
         ),
         embedding=EmbeddingContract(
             model_id="nomic-embed-text",
-            url="https://ollama.example.test/api/embed",
+            url="https://ollama.example.test/v1/embeddings",
             model="nomic-embed-text",
             headers={"authorization": f"Bearer {_KEY}"},
-            reply=_ollama_embed,
-            error=_ollama_error,
+            reply=_openai_embeddings,
+            error=_openai_error,
             dimensions_field="dimensions",
-            timeout_error=None,
+            timeout_error=litellm.Timeout,
+            fields={"encoding_format": "float"},
         ),
         excluded={
             (kind, feature): _SAME_REQUESTS_AS_KEYLESS_OLLAMA
@@ -475,7 +477,6 @@ MATRIX: tuple[Row, ...] = (
             )
             for feature in features
         },
-        known_gaps={("embedding", "credential"): _OLLAMA_EMBEDDING_KEY_GAP},
     ),
     Row(
         id="openai_compatible",
