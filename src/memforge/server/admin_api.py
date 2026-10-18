@@ -203,6 +203,7 @@ from memforge.scheduler import SyncScheduler
 from memforge.server.model_settings_api import (
     ModelHealthResponse,
     build_model_settings_router,
+    listed_native_schema,
     model_health_response,
 )
 from memforge.source_secrets import (
@@ -4511,7 +4512,7 @@ def create_admin_app(
     app.state.workspace_id = workspace_id
     app.state.document_store = document_store or LocalDocumentStore(config.storage.docs_path)
     app.state.runtime_provider = runtime_provider
-    app.state.model_settings = ModelSettings(config, runtime_provider)
+    app.state.model_settings = ModelSettings(config, runtime_provider, listed_native_schema=listed_native_schema)
     app.state.principal_resolver = principal_resolver
     app.state.workspace_role_resolver = workspace_role_resolver
     app.state.maintenance_operator_resolver = maintenance_operator_resolver

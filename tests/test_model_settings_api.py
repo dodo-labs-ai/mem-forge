@@ -1657,9 +1657,10 @@ async def test_a_model_chosen_from_the_listing_is_asked_for_its_schema_as_the_li
     assert models.generation.native_schema is declared
 
 
-def test_the_declared_response_schema_support_is_saved_shown_and_checked_again_when_it_changes(
-    db, tmp_path, providers
+def test_the_declared_response_schema_support_is_saved_and_shown_for_a_generation_model_only(
+    db, tmp_path, providers, monkeypatch
 ) -> None:
+    Endpoint(monkeypatch, lambda url, request: httpx.Response(503, json={}, request=request))
     client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
     client.put(f"{API}/generation/candidate", json={**OPENROUTER_GENERATION, "api_key": GENERATION_KEY})
     client.post(f"{API}/generation/candidate/validate")
@@ -1699,6 +1700,168 @@ def test_a_pasted_listing_path_is_read_as_the_base_url_it_follows(db, tmp_path, 
     assert [url for url, _headers in endpoint.requests] == ["https://openrouter.ai/api/v1/embeddings/models"]
     assert saved.status_code == 200, saved.text
     assert saved.json()["candidate"]["endpoint"] == "https://openrouter.ai/api/v1"
+
+
+class Listing:
+    """Stand in for what the model listing declares, and record the bindings and keys it was asked about."""
+
+    def __init__(self, declared: bool | None = None, failure: Exception | None = None) -> None:
+        self.declared = declared
+        self.failure = failure
+        self.asked: list[tuple[str, str | None]] = []
+
+    async def __call__(self, binding, api_key):
+        self.asked.append((binding.model_id, api_key))
+        if self.failure is not None:
+            raise self.failure
+        return self.declared
+
+
+def _listing_settings(config: AppConfig, listing: Listing) -> ModelSettings:
+    return ModelSettings(config, DefaultRuntimeProvider(), listed_native_schema=listing)
+
+
+async def _active_openrouter_model(db, settings: ModelSettings, native_schema: bool | None = None) -> None:
+    await settings.save_candidate(
+        db, "generation", CandidateDraft(**OPENROUTER_GENERATION, api_key=GENERATION_KEY, native_schema=native_schema)
+    )
+    assert (await settings.validate_candidate(db, "generation")).promoted is True
+
+
+@pytest.mark.parametrize(
+    ("saved", "listed", "native"),
+    [(None, True, True), (True, False, False), (False, True, True)],
+    ids=["undeclared-now-declared", "declared-now-dropped", "declined-now-added"],
+)
+async def test_save_and_validate_checks_the_model_with_what_the_listing_declares_now(
+    db, tmp_path, providers, saved, listed, native
+) -> None:
+    config = _config(tmp_path)
+    listing = Listing(listed)
+
+    await _active_openrouter_model(db, _listing_settings(config, listing), saved)
+    active = bindings.binding_from_record(await db.get_model_binding("generation", "active"))
+
+    assert listing.asked == [("anthropic/claude-haiku-5.5", GENERATION_KEY)]
+    assert ("response_format" in providers.generation_requests[0]) is native
+    assert (active.native_schema, active.state) == (listed, "ready")
+    assert (await resolve_models(db, config)).generation.native_schema is listed
+
+
+@pytest.mark.parametrize("listed", [True, False])
+async def test_a_starting_server_refreshes_a_ready_model_from_the_listing_without_checking_it_again(
+    db, tmp_path, providers, listed
+) -> None:
+    config = _config(tmp_path)
+    await _active_openrouter_model(db, _settings(config), not listed)
+    before = bindings.binding_from_record(await db.get_model_binding("generation", "active"))
+    listing = Listing(listed)
+
+    await _listing_settings(config, listing).validate_unready_active_bindings(db)
+    after = bindings.binding_from_record(await db.get_model_binding("generation", "active"))
+
+    assert listing.asked == [("anthropic/claude-haiku-5.5", GENERATION_KEY)]
+    assert (after.native_schema, after.state, after.saved_at) == (listed, "ready", before.saved_at)
+    assert (after.digest, after.validation) == (before.digest, before.validation)
+    assert len(providers.generation_requests) == 1
+
+
+async def test_checking_the_model_in_use_again_refreshes_it_from_the_listing(db, tmp_path, providers) -> None:
+    config = _config(tmp_path)
+    await _active_openrouter_model(db, _settings(config))
+
+    await _listing_settings(config, Listing(True)).validate_active(db, "generation")
+
+    assert bindings.binding_from_record(await db.get_model_binding("generation", "active")).native_schema is True
+    assert "response_format" in providers.generation_requests[-1]
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [Listing(None), Listing(failure=httpx.ConnectError("offline"))],
+    ids=["declares-nothing", "unreachable"],
+)
+async def test_a_listing_that_says_nothing_keeps_the_stored_support(db, tmp_path, providers, listing) -> None:
+    config = _config(tmp_path)
+    await _active_openrouter_model(db, _settings(config), True)
+
+    await _listing_settings(config, listing).validate_unready_active_bindings(db)
+    await _listing_settings(config, listing).validate_active(db, "generation")
+    after = bindings.binding_from_record(await db.get_model_binding("generation", "active"))
+
+    assert len(listing.asked) == 2
+    assert (after.native_schema, after.state) == (True, "ready")
+    assert "response_format" in providers.generation_requests[-1]
+
+
+async def test_only_a_model_whose_listing_declares_response_schema_support_is_refreshed(
+    db, tmp_path, providers
+) -> None:
+    config = _config(tmp_path)
+    listing = Listing(True)
+    settings = _listing_settings(config, listing)
+    await settings.save_candidate(db, "generation", CandidateDraft(**OPENAI_GENERATION, api_key=GENERATION_KEY))
+    await settings.validate_candidate(db, "generation")
+    await settings.validate_unready_active_bindings(db)
+    await settings.validate_active(db, "generation")
+
+    assert listing.asked == []
+    assert bindings.binding_from_record(await db.get_model_binding("generation", "active")).native_schema is None
+
+
+async def test_a_starting_server_refreshes_the_stored_model_from_the_provider_listing(
+    db, tmp_path, providers, monkeypatch, model_checks_at_server_start
+) -> None:
+    config = _config(tmp_path)
+    await _active_openrouter_model(db, _settings(config))
+    Endpoint(monkeypatch, _openrouter)
+
+    with TestClient(create_admin_app(db=db, config=config)) as client:
+        deadline = time.monotonic() + 5
+        while client.get(API).json()["generation"]["active"]["native_schema"] is None:
+            assert time.monotonic() < deadline, "the starting server did not refresh the listed support"
+            time.sleep(0.01)
+
+    stored = bindings.binding_from_record(await db.get_model_binding("generation", "active"))
+    assert (stored.native_schema, stored.state) == (True, "ready")
+    assert len(providers.generation_requests) == 1
+
+
+async def test_the_listing_is_asked_what_it_declares_about_the_stored_model(db, tmp_path, monkeypatch) -> None:
+    endpoint = Endpoint(monkeypatch, _openrouter)
+    listed = {
+        model_id: bindings.build_binding(
+            kind="generation",
+            provider="openrouter",
+            model_id=model_id,
+            auth_strategy="environment",
+            config_source="settings",
+        )
+        for model_id in ("anthropic/claude-haiku-5.5", "openai/gpt-5-mini", "meituan/longcat-2.0", "unlisted/model")
+    }
+
+    declared = {model_id: await model_settings_api.listed_native_schema(binding, None) for model_id, binding in listed.items()}
+
+    assert declared == {
+        "anthropic/claude-haiku-5.5": True,
+        "openai/gpt-5-mini": False,
+        "meituan/longcat-2.0": None,
+        "unlisted/model": None,
+    }
+    assert {url for url, _headers in endpoint.requests} == {"https://openrouter.ai/api/v1/models"}
+
+
+async def test_a_listing_that_fails_declares_nothing(db, tmp_path, monkeypatch) -> None:
+    Endpoint(monkeypatch, lambda url, request: httpx.Response(503, json={}, request=request))
+    binding = bindings.build_binding(
+        kind="generation",
+        provider="openrouter",
+        model_id="anthropic/claude-haiku-5.5",
+        auth_strategy="environment",
+        config_source="settings",
+    )
+
+    assert await model_settings_api.listed_native_schema(binding, None) is None
 
 
 OPENAI_MODELS = {

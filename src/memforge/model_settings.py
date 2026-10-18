@@ -91,6 +91,7 @@ __all__ = [
     "CandidateDraft",
     "KeyView",
     "KindView",
+    "ListedNativeSchema",
     "ModelHealth",
     "ModelSettings",
     "ValidationOutcome",
@@ -98,6 +99,11 @@ __all__ = [
     "VectorIndexView",
     "check_binding",
 ]
+
+# What the model listing of a binding's provider declares about the binding's
+# model answering in a JSON schema, given the binding and its API key; ``None``
+# when the listing does not answer, does not hold the model or declares nothing.
+type ListedNativeSchema = Callable[[ModelBinding, str | None], Awaitable[bool | None]]
 
 # ``ready``: the embedding model in use is the one the index was built with.
 # ``reindex_required``: it is another one, or the stored vectors cannot be
@@ -126,7 +132,7 @@ class CandidateDraft:
     parameters: Mapping[str, Any] = field(default_factory=dict)
     token_limits: Mapping[str, Any] = field(default_factory=dict)
     # Whether the model answers in a response schema, as the model listing
-    # declared it; ``None`` when it declared nothing.
+    # declares it; ``None`` when it declares nothing.
     native_schema: bool | None = None
     # A new API key. ``None`` keeps the key already saved for the endpoint.
     api_key: str | None = field(default=None, repr=False)
@@ -226,9 +232,18 @@ class _CheckQueue:
 class ModelSettings:
     """The model bindings of one server, for whichever of its databases a call names."""
 
-    def __init__(self, config: AppConfig, runtime_provider: RuntimeProvider) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        runtime_provider: RuntimeProvider,
+        *,
+        listed_native_schema: ListedNativeSchema | None = None,
+    ) -> None:
         self._config = config
         self._runtime_provider = runtime_provider
+        # Asks a provider's model listing what it declares about a model
+        # answering in a JSON schema; ``None`` refreshes nothing.
+        self._listed_native_schema = listed_native_schema
         # The state and latest check of each active binding that is not stored.
         self._unstored_checks: dict[ModelKind, tuple[BindingState, ValidationResult]] = {}
         self._check_queues: dict[tuple[ModelKind, BindingSlot], _CheckQueue] = {
@@ -379,6 +394,9 @@ class ModelSettings:
         on it. The outcome applies only to the candidate that was checked: one
         saved again while its check ran is neither promoted nor marked.
 
+        A generation candidate is checked with the response schema support
+        its provider's listing declares now (``_refresh_native_schema``).
+
         An embedding candidate that passes becomes active at once only when
         its vectors belong in the index in use, or when the installation has
         no index yet and can start one for it. Otherwise it stays the
@@ -394,6 +412,7 @@ class ModelSettings:
             return binding
 
         async def check(binding: ModelBinding) -> ValidationOutcome:
+            binding = await self._refresh_native_schema(db, "candidate", binding)
             validation = await self._validation(db, binding)
             state = state_after_check(binding.state, passed=validation.passed)
             assert binding.saved_at is not None
@@ -438,7 +457,9 @@ class ModelSettings:
     async def validate_active(self, db: "Database", kind: ModelKind) -> ValidationOutcome | None:
         """Check the active binding of ``kind`` again and record the outcome.
 
-        The binding stays in use whatever the outcome. Returns ``None`` when the
+        The binding stays in use whatever the outcome. A generation binding is
+        checked with the response schema support its provider's listing
+        declares now (``_refresh_native_schema``). Returns ``None`` when the
         kind has no active binding.
         """
 
@@ -446,6 +467,7 @@ class ModelSettings:
             return await self._active(db, kind)
 
         async def check(binding: ModelBinding) -> ValidationOutcome:
+            binding = await self._refresh_native_schema(db, "active", binding)
             validation = await self._validation(db, binding)
             state = state_after_check(binding.state, passed=validation.passed)
             if binding.saved_at is None:
@@ -498,18 +520,60 @@ class ModelSettings:
             queue.outcome = outcome
             return outcome
 
+    async def _refresh_native_schema(self, db: "Database", slot: BindingSlot, binding: ModelBinding) -> ModelBinding:
+        """Return ``binding`` with the response schema support its provider's listing declares now.
+
+        Support is what the provider observes about the model, and a provider
+        may add it or drop it, so every check of a stored generation binding
+        whose listing declares it asks the listing again and stores the
+        answer. It is not part of what a check vouches for: a request that
+        asks for the schema natively is validated as before and falls back to
+        the schema in the prompt when the provider rejects it. A listing that
+        does not answer, does not hold the model or declares nothing leaves
+        the stored support as it is.
+        """
+        listed = self._listed_native_schema
+        if listed is None or binding.kind != "generation" or binding.saved_at is None:
+            return binding
+        listing = provider_descriptor(binding.provider).listing
+        if listing is None or not listing.gives_native_schema:
+            return binding
+        try:
+            declared = await listed(binding, await resolve_credential(db, self._config, binding))
+            if declared is None or declared == binding.native_schema:
+                return binding
+            recorded = await db.record_model_binding_native_schema(
+                binding.kind, slot, updated_at=binding.saved_at, native_schema=declared
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not read the response schema support of the %s generation model (%s)",
+                slot,
+                getattr(exc, "code", type(exc).__name__),
+            )
+            return binding
+        if not recorded:
+            return binding
+        logger.info("The listing declares response schema support of the %s generation model: %s", slot, declared)
+        return replace(binding, native_schema=declared)
+
     async def validate_unready_active_bindings(self, db: "Database") -> None:
         """Check every active binding whose latest check is missing or out of date.
 
         This is what a server does once it is up: settings carried over from an
         earlier version, bindings read from the environment and bindings last
         checked under another LiteLLM version have not passed a check as they
-        stand. A failure of one kind does not stop the check of the other.
+        stand. A ready generation binding is not checked again, but takes the
+        response schema support its provider's listing declares now, as a
+        check would. A failure of one kind does not stop the check of the other.
         """
         for kind in MODEL_KINDS:
             try:
                 active = await self._active(db, kind)
-                if active is None or active.state == "ready":
+                if active is None:
+                    continue
+                if active.state == "ready":
+                    await self._refresh_native_schema(db, "active", active)
                     continue
                 outcome = await self.validate_active(db, kind)
             except Exception as exc:

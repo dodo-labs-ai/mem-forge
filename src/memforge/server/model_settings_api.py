@@ -58,6 +58,7 @@ __all__ = [
     "ModelKindHealthResponse",
     "build_model_settings_router",
     "list_endpoint_models",
+    "listed_native_schema",
     "model_health_response",
 ]
 
@@ -224,7 +225,7 @@ class ModelBindingResponse(BaseModel):
         default=None,
         description=(
             "Whether the generation model answers in the JSON schema a request gives, as the "
-            "provider's model listing declared it; null when the listing declared nothing."
+            "provider's model listing declares it at each check; null when it declares nothing."
         ),
     )
     config_source: ConfigSource
@@ -1110,6 +1111,28 @@ def _refused_listing(
             "server environment are not sent with this request. Enter the model yourself.",
         )
     return "api_key_required", "Add an API key, then try again."
+
+
+async def listed_native_schema(binding: ModelBinding, api_key: str | None) -> bool | None:
+    """What the model listing of ``binding``'s provider declares about the model answering in a JSON schema.
+
+    ``None`` when the provider has no listing of the binding's kind, the
+    listing does not answer, it does not hold the model or it declares nothing.
+    """
+    descriptor = provider_descriptor(binding.provider)
+    listing = descriptor.listing
+    if listing is None or binding.kind not in listing.paths:
+        return None
+    listed = await list_endpoint_models(
+        descriptor,
+        listing,
+        binding.kind,
+        endpoint=binding.endpoint or descriptor.default_endpoint or "",
+        api_key=api_key,
+        strategy=binding.auth_strategy,
+    )
+    option = next((model for model in listed.models if model.id == binding.model_id), None)
+    return None if option is None else option.native_schema
 
 
 async def list_endpoint_models(

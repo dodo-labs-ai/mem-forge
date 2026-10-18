@@ -750,6 +750,18 @@ def test_the_decision_model_takes_only_what_the_provider_declares_for_every_mode
     assert (config.native_schema, config.decision_native_schema) == (main, decision)
 
 
+@pytest.mark.parametrize(
+    ("decision_route", "decision"),
+    [("ollama_chat/qwen3:0.6b", True), ("ollama/qwen3:0.6b", True), ("openrouter/openai/gpt-5-mini", None)],
+)
+def test_a_decision_model_on_a_route_to_ollama_takes_its_schema_natively(decision_route, decision):
+    invocation = ResolvedInvocation(route="ollama_chat/qwen3:8b", provider="litellm", native_schema=True)
+
+    config = StructuredLlmConfig.for_invocation(invocation, timeout_s=30.0, decision_model=decision_route)
+
+    assert config.decision_native_schema is decision
+
+
 def test_a_client_configured_with_its_own_declaration_keeps_it():
     invocation = ResolvedInvocation(route="ollama_chat/qwen3:0.6b", provider="ollama", native_schema=True)
 

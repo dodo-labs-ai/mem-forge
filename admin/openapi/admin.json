@@ -6140,7 +6140,7 @@
                 "type": "null"
               }
             ],
-            "description": "Whether the generation model answers in the JSON schema a request gives, as the provider's model listing declared it; null when the listing declared nothing.",
+            "description": "Whether the generation model answers in the JSON schema a request gives, as the provider's model listing declares it at each check; null when it declares nothing.",
             "title": "Native Schema"
           },
           "options": {
