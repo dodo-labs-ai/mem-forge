@@ -774,6 +774,46 @@ class RelationalStoreContract:
 
         assert matched == set()
 
+    async def test_source_date_listings_admit_direct_user_support(self, adapters: ContractAdapters) -> None:
+        """Direct user support has no configured Source row and still lists by its source date."""
+        store = adapters.relational
+        for memory_id, doc_id, source in (
+            ("m-synced", "doc-synced", "src-alpha"),
+            ("m-remembered", "doc-remembered", "user_memory"),
+            ("m-corrected", "doc-corrected", "user_correction"),
+        ):
+            await store.insert_memory(make_memory(memory_id, updated_at=datetime(2026, 6, 1, tzinfo=timezone.utc)))
+            await store.upsert_document(make_document(doc_id, source=source))
+            await store.add_memory_source(
+                memory_id,
+                doc_id,
+                source,
+                None,
+                source_updated_at=datetime(2026, 6, 24, 9, 0, tzinfo=timezone.utc),
+            )
+        window = MemoryTimeRange(
+            after=datetime(2026, 6, 20, tzinfo=timezone.utc),
+            before=datetime(2026, 6, 27, tzinfo=timezone.utc),
+            date_type="source_updated_at",
+        )
+
+        listed, total = await store.list_ids_by_source_and_time(None, window, make_scope(), limit=10, offset=0)
+        recent = await store.list_recent_memory_ids(
+            MemorySourceFilter(),
+            window,
+            make_scope(),
+            memory_types=(),
+            listing_watermark=datetime(2026, 6, 30, tzinfo=timezone.utc),
+            after=None,
+            limit=10,
+        )
+
+        expected = {"m-synced", "m-remembered", "m-corrected"}
+        assert set(listed) == expected
+        assert total == 3
+        assert {item.memory_id for item in recent.items} == expected
+        assert recent.total_count == 3
+
     # -- Project lifecycle --------------------------------------------------
 
     async def test_project_create_and_get_round_trips(self, adapters: ContractAdapters) -> None:
