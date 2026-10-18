@@ -510,7 +510,7 @@ async def test_cloud_pull_uses_optional_pat_as_bearer_header(monkeypatch):
     gene = GitHubRepoGene(
         config={
             "connection_mode": "cloud_pull",
-            "repo_url": "https://github.com/shno-labs/mem-forge",
+            "repo_url": "https://github.com/dodo-labs-ai/mem-forge",
             "pat": "secret-token",
         },
         source_id="src-github-repo",

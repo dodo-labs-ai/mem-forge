@@ -17,7 +17,7 @@ in the repository. Configure one PyPI pending publisher with these exact values:
 | Field | Value |
 | --- | --- |
 | PyPI project | `memforge-ai` |
-| GitHub owner | `shno-labs` |
+| GitHub owner | `dodo-labs-ai` |
 | GitHub repository | `mem-forge` |
 | Workflow | `publish-pypi.yml` |
 | Environment | `pypi` |

@@ -2430,7 +2430,7 @@ def test_mcp_proxy_explicit_repository_context_selects_one_repo_from_multiple_ro
     active_root.mkdir()
     other_root.mkdir()
     _init_git_repo_with_origin(active_root, "https://github.com/dodoman-sun/memforge-cloud.git")
-    _init_git_repo_with_origin(other_root, "https://github.com/shno-labs/mem-forge.git")
+    _init_git_repo_with_origin(other_root, "https://github.com/dodo-labs-ai/mem-forge.git")
     _provide_mcp_roots(proxy, active_root, other_root)
 
     class FakeResponse:
@@ -2666,7 +2666,7 @@ def test_mcp_proxy_rejects_current_repo_filter_when_roots_have_multiple_git_remo
     first_root.mkdir()
     second_root.mkdir()
     _init_git_repo_with_origin(first_root, "https://github.com/dodoman-sun/memforge-cloud.git")
-    _init_git_repo_with_origin(second_root, "https://github.com/shno-labs/mem-forge.git")
+    _init_git_repo_with_origin(second_root, "https://github.com/dodo-labs-ai/mem-forge.git")
     _provide_mcp_roots(proxy, first_root, second_root)
 
     class FakeOpener:
@@ -3205,7 +3205,7 @@ def test_mcp_proxy_forwards_create_memory_with_plugin_client_context(monkeypatch
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "team_alpha")
     monkeypatch.setenv("MEMFORGE_MCP_CLIENT", "claude-code")
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
-    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: "github.com/shno-labs/mem-forge")
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: "github.com/dodo-labs-ai/mem-forge")
 
     result = proxy._call_tool(
         "create_memory",
@@ -3224,7 +3224,7 @@ def test_mcp_proxy_forwards_create_memory_with_plugin_client_context(monkeypatch
         "provenance": "User asked to remember this after reviewing the MemForge MCP UX.",
         "memory_type": "convention",
         "client": "claude-code",
-        "repo_identifier": "github.com/shno-labs/mem-forge",
+        "repo_identifier": "github.com/dodo-labs-ai/mem-forge",
     }
 
 
@@ -3233,7 +3233,7 @@ def test_mcp_proxy_create_memory_uses_explicit_repository_context(monkeypatch, t
     captured = {}
     repo_root = tmp_path / "mem-forge"
     repo_root.mkdir()
-    _init_git_repo_with_origin(repo_root, "https://github.com/shno-labs/mem-forge.git")
+    _init_git_repo_with_origin(repo_root, "https://github.com/dodo-labs-ai/mem-forge.git")
     plugin_root = tmp_path / "plugin-cache"
     plugin_root.mkdir()
     monkeypatch.chdir(plugin_root)
@@ -3275,7 +3275,7 @@ def test_mcp_proxy_create_memory_uses_explicit_repository_context(monkeypatch, t
         "provenance": "User confirmed this convention after reviewing the MemForge MCP UX.",
         "memory_type": "convention",
         "client": "codex",
-        "repo_identifier": "github.com/shno-labs/mem-forge",
+        "repo_identifier": "github.com/dodo-labs-ai/mem-forge",
     }
 
 
@@ -3356,7 +3356,7 @@ def test_packaged_mcp_proxy_resolves_explicit_repository_context_locally(monkeyp
     captured = {}
     repo_root = tmp_path / "mem-forge"
     repo_root.mkdir()
-    _init_git_repo_with_origin(repo_root, "https://github.com/shno-labs/mem-forge.git")
+    _init_git_repo_with_origin(repo_root, "https://github.com/dodo-labs-ai/mem-forge.git")
 
     class FakeResponse:
         headers = {"content-type": "application/json"}
@@ -3406,7 +3406,7 @@ def test_packaged_mcp_proxy_resolves_explicit_repository_context_locally(monkeyp
         "provenance": "User confirmed the cross-client MCP design.",
         "memory_type": "decision",
         "client": client,
-        "repo_identifier": "github.com/shno-labs/mem-forge",
+        "repo_identifier": "github.com/dodo-labs-ai/mem-forge",
     }
 
 
@@ -3484,7 +3484,7 @@ def test_mcp_proxy_rejects_create_memory_without_provenance(monkeypatch):
             raise AssertionError("create_memory should fail before posting without provenance")
 
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FailOpener())
-    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: "github.com/shno-labs/mem-forge")
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: "github.com/dodo-labs-ai/mem-forge")
 
     result = proxy._call_tool(
         "create_memory",
@@ -4991,7 +4991,7 @@ def test_session_window_payload_redacts_before_network_and_versions_contract(tmp
 def test_session_window_payload_sends_canonical_remote_repo_for_codex(tmp_path):
     from memforge import hook_adapter
 
-    _init_git_repo_with_origin(tmp_path, "https://github.com/shno-labs/mem-forge.git")
+    _init_git_repo_with_origin(tmp_path, "https://github.com/dodo-labs-ai/mem-forge.git")
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text('{"type":"tool","name":"apply_patch","input":"edit"}\n', encoding="utf-8")
 
@@ -5005,7 +5005,7 @@ def test_session_window_payload_sends_canonical_remote_repo_for_codex(tmp_path):
         trigger="REQUIRED_CAPTURE",
     )
 
-    assert payload["repo"] == "github.com/shno-labs/mem-forge"
+    assert payload["repo"] == "github.com/dodo-labs-ai/mem-forge"
 
 
 def test_bounded_transcript_slice_never_advances_past_lines_read(tmp_path):

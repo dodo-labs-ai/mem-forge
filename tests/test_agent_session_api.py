@@ -225,7 +225,7 @@ def test_agent_session_authority_classification_packs_candidates_with_full_conte
             session_id="session",
             trigger="Stop",
             workspace="/workspace/mem-forge",
-            repo_identifier="github.com/shno-labs/mem-forge",
+            repo_identifier="github.com/dodo-labs-ai/mem-forge",
             branch="main",
             events=events,
         )
@@ -2033,7 +2033,7 @@ def test_agent_session_window_treats_operational_context_as_untrusted_data(
             "session_id": "sess-authority-metadata-injection",
             "trigger": "Stop",
             "workspace": "/workspace/mem-forge",
-            "repo": "github.com/shno-labs/mem-forge",
+            "repo": "github.com/dodo-labs-ai/mem-forge",
             "branch": "main",
             "events": [{"role": "user", "text": "continue"}],
             "submitted_at": "2026-06-25T10:09:00+00:00",

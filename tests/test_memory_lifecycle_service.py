@@ -291,7 +291,7 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
         memory_type="fact",
         owner_user_id="owner@example.com",
         client="codex",
-        repo_identifier="github.com/shno-labs/mem-forge",
+        repo_identifier="github.com/dodo-labs-ai/mem-forge",
     )
 
     stored = await db.get_memory(result.memory_id)
@@ -306,7 +306,7 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
     assert stored.visibility == Visibility.PRIVATE.value
     assert stored.owner_user_id == "owner@example.com"
     assert stored.project_key == "UNSORTED"
-    assert stored.repo_identifier == "github.com/shno-labs/mem-forge"
+    assert stored.repo_identifier == "github.com/dodo-labs-ai/mem-forge"
     assert [(source.doc_id, source.source_type) for source in sources] == [
         (f"user-memory-{result.memory_id}", "user_memory")
     ]
@@ -787,7 +787,7 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
         client="codex",
         session_id="session-initial",
         workspace="/workspace",
-        repo_identifier="github.com/shno-labs/mem-forge",
+        repo_identifier="github.com/dodo-labs-ai/mem-forge",
         project_key="UNSORTED",
         submitted_at=observed_at,
         source_updated_at=observed_at,
@@ -889,7 +889,7 @@ async def _legacy_limited_managed_agent_claim(
         client="claude-code",
         session_id=f"session-{suffix}",
         workspace="/workspace",
-        repo_identifier="github.com/shno-labs/mem-forge",
+        repo_identifier="github.com/dodo-labs-ai/mem-forge",
         project_key="UNSORTED",
         submitted_at=observed_at,
         source_updated_at=observed_at,

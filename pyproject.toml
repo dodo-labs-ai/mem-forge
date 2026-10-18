@@ -64,9 +64,9 @@ dev = [
 memforge = "memforge.main:cli"
 
 [project.urls]
-Homepage = "https://github.com/shno-labs/mem-forge"
-Repository = "https://github.com/shno-labs/mem-forge"
-Issues = "https://github.com/shno-labs/mem-forge/issues"
+Homepage = "https://github.com/dodo-labs-ai/mem-forge"
+Repository = "https://github.com/dodo-labs-ai/mem-forge"
+Issues = "https://github.com/dodo-labs-ai/mem-forge/issues"
 
 [tool.hatch.build.targets.sdist]
 exclude = ["/.github/assets"]
