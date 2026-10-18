@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -298,13 +299,17 @@ class ModelSettings:
         indexes = self._indexes(db)
         if indexes is None:
             return VectorIndexView(status="not_managed", serves_search=True)
+        # The latest rebuild is read first, and whether it runs is read from
+        # that same record: a rebuild that ends while the view is read is
+        # reported as running, or as ended together with the index it switched in.
+        reindex = await db.get_latest_vector_reindex()
+        running = _rebuild_running(reindex)
         active = await self._active(db, "embedding")
         candidate = await self._candidate(db, "embedding")
         profile = embedding_profile(active)
         in_use = await db.get_active_vector_index()
         if in_use is None and profile is not None:
             in_use = await indexes.settle(profile)
-        running = await db.vector_reindex_running()
         serves_search = (
             active is not None
             and in_use is not None
@@ -338,7 +343,7 @@ class ModelSettings:
             reindex_target=reindex_target,
             in_use=in_use,
             vector_count=vector_count,
-            reindex=await db.get_latest_vector_reindex(),
+            reindex=reindex,
             reindex_running=running,
         )
 
@@ -964,6 +969,15 @@ def _fingerprint_in_use(active: ModelBinding, in_use: Mapping[str, Any]) -> str:
     """
     profile = embedding_profile(active) or embedding_identity(active).profile(int(in_use["dimension"]))
     return profile.fingerprint
+
+
+def _rebuild_running(reindex: Mapping[str, Any] | None) -> bool:
+    """Whether the rebuild ``reindex`` records is building and holds a current lease."""
+    return (
+        reindex is not None
+        and reindex["state"] == "building"
+        and (reindex["lease_expires_epoch"] or 0) > int(time.time())
+    )
 
 
 def _waits_for_reindex(candidate: ModelBinding, in_use: Mapping[str, Any] | None) -> bool:
