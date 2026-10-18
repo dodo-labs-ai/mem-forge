@@ -8,7 +8,7 @@ const DEV_PORT = 5175;
 const DEV_API_TARGET = "http://localhost:8765";
 // Deprecated (admin-ui-v1): in development, every path outside /v2/ and /api/
 // opens the V1 dev server (`npm run dev` in admin-ui), as the image serves V1
-// beside V2. Source setup still links there. Remove with V1 (ADR 0044).
+// beside V2. Source setup still links there. Remove with V1.
 const V1_DEV_TARGET = "http://localhost:5174";
 const V1_DEV_PATHS = "^/(?!v2(/|$)|api/)";
 

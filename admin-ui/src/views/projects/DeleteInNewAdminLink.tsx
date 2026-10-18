@@ -7,7 +7,7 @@ const NEW_ADMIN_BASE_PATH = "/v2/";
 /**
  * @deprecated admin-ui-v1: projects are deleted in the new admin UI, which
  * states which memories move and which sources stop writing to the project,
- * then asks for the project code (ADR 0044). This link opens the project
+ * then asks for the project code. This link opens the project
  * there instead of deleting it here.
  */
 export function DeleteInNewAdminLink({ project }: { project: Pick<Project, "key" | "name"> }) {

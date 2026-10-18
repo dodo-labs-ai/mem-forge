@@ -15,7 +15,7 @@ const EXIT_LABEL_PICK = "Pick a project";
  * the user is not in cross-project mode, so callers can mount it
  * unconditionally.
  */
-/** @deprecated admin-ui-v1: part of the active-project state, which changes no ranking (ADR 0044). */
+/** @deprecated admin-ui-v1: part of the active-project state, which changes no ranking. */
 export function CrossProjectBanner() {
   const { crossProjectMode, lastActiveProjectKey, setActiveProjectKey } =
     useActiveProject();

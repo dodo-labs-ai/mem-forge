@@ -1,4 +1,4 @@
-"""Reading, ordering and dismissing Cross-Document Relations (ADR 0037)."""
+"""Reading, ordering and dismissing Cross-Document Relations."""
 
 from __future__ import annotations
 

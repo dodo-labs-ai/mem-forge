@@ -525,7 +525,7 @@ export interface SourceProjectsResponse {
  */
 /**
  * @deprecated admin-ui-v1: a label only; ranking reads the reserved SHARED key.
- * Removed from the API with the V1 admin UI (ADR 0044).
+ * Removed from the API with the V1 admin UI.
  */
 export type ProjectKind = "normal" | "shared";
 
