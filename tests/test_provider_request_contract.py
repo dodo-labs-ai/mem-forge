@@ -105,18 +105,35 @@ _ANSWER = {"ranking": [3, 1]}
 _JSON_TEXT_INSTRUCTION = "Return ONLY a single JSON object"
 _ELSEWHERE = "elsewhere.example.test"
 
-# The HTTP answers a request can fail with, and whether each may succeed when
-# the same request is sent again. Every row classifies them the same way.
-STATUS_RETRYABLE: Mapping[int, bool] = {
-    400: False,
-    401: False,
-    404: False,
-    408: True,
-    409: True,
-    422: False,
-    429: True,
-    500: True,
-    503: True,
+
+
+@dataclass(frozen=True)
+class StatusClassification:
+    """What a failed answer with one HTTP status leads to."""
+
+    # The call sends the same request again within its retry budget.
+    sent_again: bool
+    # The run that made the call may succeed when it is retried
+    # (``failure_retryable``).
+    run_retryable: bool
+
+
+_TRANSIENT = StatusClassification(sent_again=True, run_retryable=True)
+_REFUSED = StatusClassification(sent_again=False, run_retryable=False)
+
+# The HTTP answers a request can fail with, and what each leads to. Every row
+# classifies them the same way, for both kinds of model.
+STATUS_CLASSIFICATION: Mapping[int, StatusClassification] = {
+    400: _REFUSED,
+    401: _REFUSED,
+    403: _REFUSED,
+    404: _REFUSED,
+    408: _TRANSIENT,
+    409: _TRANSIENT,
+    422: _REFUSED,
+    429: _TRANSIENT,
+    500: _TRANSIENT,
+    503: _TRANSIENT,
 }
 
 # Keyword arguments MemForge gives the SDK that are the SDK's to read, never a
@@ -1096,12 +1113,14 @@ async def test_a_redirect_fails_the_request_and_its_key_and_payload_are_not_sent
 # -- Error classification -----------------------------------------------------------
 
 
-@pytest.mark.parametrize("status", list(STATUS_RETRYABLE))
+@pytest.mark.parametrize("status", list(STATUS_CLASSIFICATION))
 @pytest.mark.parametrize(("row", "kind"), _row_kinds("error_classification"))
-async def test_a_failed_request_is_sent_again_only_when_its_status_is_transient(wire, row, kind, status) -> None:
+async def test_a_failed_request_is_sent_again_and_its_run_retried_only_when_its_status_is_transient(
+    wire, row, kind, status
+) -> None:
     """One retry is allowed; the provider's own error format reports the status the same way for every row."""
     contract = row.contract(kind)
-    retryable = STATUS_RETRYABLE[status]
+    expected = STATUS_CLASSIFICATION[status]
     wire.respond = lambda _request: httpx.Response(status, json=contract.error(status))
 
     if kind == "generation":
@@ -1111,13 +1130,14 @@ async def test_a_failed_request_is_sent_again_only_when_its_status_is_transient(
         first = wire.requests[0].content
         # A rejected schema request may be followed by its JSON-text form,
         # which is another request, not the same one again.
-        assert sum(request.content == first for request in wire.requests) == (2 if retryable else 1)
+        sent = sum(request.content == first for request in wire.requests)
     else:
         runtime = _embedding_runtime(_invocation(row, kind), num_retries=1, retry_pauses_s=(0.0,))
         with pytest.raises(EmbeddingProviderError) as raised:
             await runtime.embed_query("alpha")
-        assert len(wire.requests) == (2 if retryable else 1)
-        assert failure_retryable(raised.value) is retryable
+        sent = len(wire.requests)
 
+    assert sent == (2 if expected.sent_again else 1)
+    assert failure_retryable(raised.value) is expected.run_retryable
     assert raised.value.status_code == status
     assert {request.url.host for request in wire.requests} == {httpx.URL(contract.url).host}

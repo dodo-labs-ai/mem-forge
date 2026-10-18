@@ -31,6 +31,7 @@ class MemoryPairClassificationError(RuntimeError):
         prompt_chars: int = 0,
         terminal_category: str | None = None,
         error_code: str | None = None,
+        status_code: int | None = None,
     ) -> None:
         super().__init__(message)
         self.pair_count = pair_count
@@ -38,6 +39,8 @@ class MemoryPairClassificationError(RuntimeError):
         self.prompt_chars = prompt_chars
         self.terminal_category = terminal_category
         self.error_code = error_code
+        # The HTTP status the provider answered the failed model call with, when it answered.
+        self.status_code = status_code
 
 
 class MemoryRelationType(str, Enum):
@@ -215,6 +218,7 @@ def _classification_error(
         prompt_chars=stats.prompt_chars,
         terminal_category=provider.terminal_category if provider else None,
         error_code=failure.error_code,
+        status_code=provider.status_code if provider else None,
     )
 
 

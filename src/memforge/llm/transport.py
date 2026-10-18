@@ -56,6 +56,7 @@ __all__ = [
     "install_no_redirect_http_client",
     "is_connection_failure",
     "is_retryable_provider_error",
+    "is_retryable_status",
     "keep_ollama_model_lookups_off_request_endpoints",
     "provider_retry_after_seconds",
     "provider_status_code",
@@ -309,9 +310,17 @@ def is_retryable_provider_error(exc: BaseException) -> bool:
     ):
         return True
     status_code = provider_status_code(exc)
-    return status_code in _RETRYABLE_STATUS_CODES or bool(
-        status_code is not None and status_code >= 500
-    )
+    return status_code is not None and is_retryable_status(status_code)
+
+
+def is_retryable_status(status_code: int) -> bool:
+    """Whether a provider answer with ``status_code`` may differ when the request is sent again.
+
+    Request timeout (408), conflict (409), rate limiting (429) and server
+    errors (5xx) may. Any other status, a rejected request, credential or
+    model among them, is the answer the same request gets again.
+    """
+    return status_code in _RETRYABLE_STATUS_CODES or status_code >= 500
 
 
 def is_connection_failure(exc: BaseException) -> bool:
