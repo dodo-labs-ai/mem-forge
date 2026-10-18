@@ -1,4 +1,4 @@
-import { fireEvent, screen, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Link, Outlet } from "react-router-dom";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -735,6 +735,45 @@ describe("Load models", () => {
 
     expect(within(generation).queryByRole("group", { name: "Token limits" })).not.toBeInTheDocument();
     expect(within(generation).queryByText(/Filled in from the OpenRouter model list/)).not.toBeInTheDocument();
+  });
+
+  test("saving a picked model sends what the listing declares about it answering in a JSON schema", async () => {
+    const { calls } = renderPage(makeModelSettings(), {
+      [`POST ${SETTINGS_ROUTE}/generation/discover-models`]: () => ({
+        ok: true,
+        models_supported: true,
+        kind_filtered: true,
+        models: [
+          { id: "anthropic/claude-haiku-5.5", native_schema: true },
+          { id: "meituan/longcat-2.0", native_schema: false },
+        ],
+        message: "Connected. Found 2 generation models.",
+      }),
+      [`PUT ${SETTINGS_ROUTE}/generation/candidate`]: () => errorResponse(HTTP_UNPROCESSABLE, { error: "x", message: "Stop here." }),
+    });
+    const generation = await card("Generation model");
+    await userEvent.click(within(generation).getByRole("combobox", { name: "Provider" }));
+    await userEvent.click(await screen.findByRole("option", { name: "OpenRouter" }));
+    await userEvent.type(within(generation).getByLabelText("API key"), "sk-or-key");
+    const modelField = within(generation).getByLabelText("Model");
+    await userEvent.clear(modelField);
+    await userEvent.click(within(generation).getByRole("button", { name: "Load models" }));
+    const suggestions = await within(generation).findByRole("group", { name: "Suggested models" });
+    const puts = () =>
+      calls.filter((call) => call.method === "PUT" && new URL(call.url).pathname === `${SETTINGS_ROUTE}/generation/candidate`);
+    const save = async () => {
+      const sent = puts().length;
+      await userEvent.click(within(generation).getByRole("button", { name: "Save and validate" }));
+      await waitFor(() => expect(puts()).toHaveLength(sent + 1));
+      return puts()[sent]!.clone().json();
+    };
+
+    await userEvent.click(within(suggestions).getByRole("button", { name: "anthropic/claude-haiku-5.5" }));
+    expect(await save()).toMatchObject({ model_id: "anthropic/claude-haiku-5.5", native_schema: true });
+
+    await userEvent.clear(modelField);
+    await userEvent.type(modelField, "mistral/my-own-model");
+    expect(await save()).not.toHaveProperty("native_schema");
   });
 
   describe("a model field that names a listed model counts as picking it", () => {

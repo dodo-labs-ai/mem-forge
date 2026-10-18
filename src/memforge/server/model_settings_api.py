@@ -58,6 +58,7 @@ __all__ = [
     "ModelKindHealthResponse",
     "build_model_settings_router",
     "list_endpoint_models",
+    "listed_native_schema",
     "model_health_response",
 ]
 
@@ -220,6 +221,13 @@ class ModelBindingResponse(BaseModel):
             "max_output_tokens. Empty when it states none."
         ),
     )
+    native_schema: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the generation model answers in the JSON schema a request gives, as the "
+            "provider's model listing declares it at each check; null when it declares nothing."
+        ),
+    )
     config_source: ConfigSource
     state: BindingState
     validation: ModelValidationResult | None
@@ -360,6 +368,14 @@ class ModelCandidateRequest(BaseModel):
             "max_output_tokens, whole numbers of tokens."
         ),
     )
+    native_schema: bool | None = Field(
+        default=None,
+        description=(
+            "For a generation model chosen from a model listing: whether the listing declares "
+            "that it answers in the JSON schema a request gives (native_schema of the listed "
+            "model). Leave it out when the listing declares nothing."
+        ),
+    )
     api_key: str | None = Field(
         default=None,
         description="A new API key. Leave it out to keep the key saved for this endpoint.",
@@ -391,6 +407,13 @@ class ModelOption(BaseModel):
     max_output_tokens: int | None = Field(
         default=None,
         description="The largest output the listing gives for the model, in tokens; null when it gives none.",
+    )
+    native_schema: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the listing declares that the model answers in the JSON schema a request "
+            "gives; null when it declares nothing about it."
+        ),
     )
 
 
@@ -548,6 +571,7 @@ def build_model_settings_router(
                     options=req.options,
                     parameters=req.parameters,
                     token_limits=req.token_limits,
+                    native_schema=req.native_schema,
                     api_key=req.api_key,
                 ),
             )
@@ -709,6 +733,7 @@ def _binding_response(view: BindingView) -> ModelBindingResponse:
         options=dict(binding.options),
         parameters=dict(binding.parameters),
         token_limits=dict(binding.token_limits),
+        native_schema=binding.native_schema,
         config_source=binding.config_source,
         state=binding.state,
         validation=(
@@ -916,13 +941,15 @@ def _first_token_count(*values: Any) -> int | None:
     return None
 
 
-def _model_option(item: Any) -> ModelOption | None:
-    """Read one listed model, with the token limits its entry gives.
+def _model_option(item: Any, listing: ModelListing, kind: ModelKind) -> ModelOption | None:
+    """Read one listed model of ``kind``, with the token limits and response schema support its entry gives.
 
     The context window is read from ``context_length`` (OpenRouter and others),
     ``context_window`` or ``max_model_len`` (vLLM); the largest output from
     ``top_provider.max_completion_tokens`` (OpenRouter) or
-    ``max_completion_tokens``.
+    ``max_completion_tokens``. A listing that declares response schema support
+    declares it for a generation model by ``structured_outputs`` among the
+    entry's ``supported_parameters`` (OpenRouter).
     """
     if isinstance(item, str):
         return ModelOption(id=item) if item else None
@@ -948,7 +975,18 @@ def _model_option(item: Any) -> ModelOption | None:
             top_provider.get("max_completion_tokens"),
             item.get("max_completion_tokens"),
         ),
+        native_schema=(
+            _declared_native_schema(item) if listing.gives_native_schema and kind == "generation" else None
+        ),
     )
+
+
+def _declared_native_schema(item: dict[str, Any]) -> bool | None:
+    """Whether an entry's ``supported_parameters`` name ``structured_outputs``; ``None`` without that list."""
+    supported = item.get("supported_parameters")
+    if not isinstance(supported, list):
+        return None
+    return "structured_outputs" in supported
 
 
 def _declared_kinds(item: Any) -> frozenset[ModelKind] | None:
@@ -1003,7 +1041,7 @@ def _extract_model_options(payload: Any, listing: ModelListing, kind: ModelKind)
     listed = 0
     models: list[ModelOption] = []
     for item in _listed_entries(payload):
-        option = _model_option(item)
+        option = _model_option(item, listing, kind)
         if option is None or option.id in seen:
             continue
         seen.add(option.id)
@@ -1073,6 +1111,28 @@ def _refused_listing(
             "server environment are not sent with this request. Enter the model yourself.",
         )
     return "api_key_required", "Add an API key, then try again."
+
+
+async def listed_native_schema(binding: ModelBinding, api_key: str | None) -> bool | None:
+    """What the model listing of ``binding``'s provider declares about the model answering in a JSON schema.
+
+    ``None`` when the provider has no listing of the binding's kind, the
+    listing does not answer, it does not hold the model or it declares nothing.
+    """
+    descriptor = provider_descriptor(binding.provider)
+    listing = descriptor.listing
+    if listing is None or binding.kind not in listing.paths:
+        return None
+    listed = await list_endpoint_models(
+        descriptor,
+        listing,
+        binding.kind,
+        endpoint=binding.endpoint or descriptor.default_endpoint or "",
+        api_key=api_key,
+        strategy=binding.auth_strategy,
+    )
+    option = next((model for model in listed.models if model.id == binding.model_id), None)
+    return None if option is None else option.native_schema
 
 
 async def list_endpoint_models(

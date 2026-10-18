@@ -6131,6 +6131,18 @@
             "title": "Model Id",
             "type": "string"
           },
+          "native_schema": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the generation model answers in the JSON schema a request gives, as the provider's model listing declares it at each check; null when it declares nothing.",
+            "title": "Native Schema"
+          },
           "options": {
             "additionalProperties": true,
             "title": "Options",
@@ -6278,6 +6290,18 @@
             "description": "The model, as the provider descriptor reads it.",
             "title": "Model Id",
             "type": "string"
+          },
+          "native_schema": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For a generation model chosen from a model listing: whether the listing declares that it answers in the JSON schema a request gives (native_schema of the listed model). Leave it out when the listing declares nothing.",
+            "title": "Native Schema"
           },
           "options": {
             "additionalProperties": true,
@@ -6575,6 +6599,18 @@
             ],
             "description": "The largest output the listing gives for the model, in tokens; null when it gives none.",
             "title": "Max Output Tokens"
+          },
+          "native_schema": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the listing declares that the model answers in the JSON schema a request gives; null when it declares nothing about it.",
+            "title": "Native Schema"
           }
         },
         "required": [

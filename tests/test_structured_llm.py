@@ -19,6 +19,7 @@ from pydantic import ConfigDict, ValidationError
 
 from memforge.evals.agent_evaluation import QualitySignalCollector, quality_signal_scope
 from memforge.llm.capability import CapabilityCheckResponse
+from memforge.llm.providers import ResolvedInvocation
 from memforge.llm.structured import (
     AgentSessionAuthorityResponse,
     CandidateAdmissionDecision,
@@ -649,10 +650,126 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
     assert "tools" not in calls[0]
     assert "tool_choice" not in calls[0]
     [fallback_log] = [
-        record for record in caplog.records if "does not advertise native response_schema support" in record.message
+        record for record in caplog.records if "is not known to take a native response schema" in record.message
     ]
     assert fallback_log.levelno == logging.DEBUG
     assert "anthropic/anthropic--claude-sonnet-latest" in fallback_log.message
+
+
+_RERANK_ANSWER = '{"ranking":[]}'
+
+
+@pytest.mark.parametrize(
+    ("declared", "model_map", "transport", "native"),
+    [
+        (True, False, "auto", True),
+        (False, True, "auto", False),
+        (False, False, "json_schema_response_format", False),
+        (None, True, "auto", True),
+        (None, False, "auto", False),
+        (None, False, "json_schema_response_format", True),
+    ],
+    ids=[
+        "declared-over-the-map",
+        "declined-over-the-map",
+        "declined-over-an-explicit-contract",
+        "undeclared-the-map-takes-one",
+        "undeclared-the-map-takes-none",
+        "undeclared-an-explicit-contract",
+    ],
+)
+@pytest.mark.asyncio
+async def test_what_the_provider_declares_decides_whether_the_schema_is_asked_for_natively(
+    monkeypatch, declared, model_map, transport, native
+):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse(_RERANK_ANSWER)
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, model_map)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="ollama_chat/qwen3:0.6b",
+            base_url=None,
+            api_key=None,
+            timeout_s=30.0,
+            native_schema=declared,
+            native_schema_transport=transport,
+        )
+    )
+
+    await client.answer_schema("rank", response_format=RerankResponse, max_tokens=256)
+
+    [call] = calls
+    assert ("response_format" in call) is native
+    assert call["messages"][0]["content"].startswith("rank\n\nReturn ONLY") is not native
+
+
+@pytest.mark.asyncio
+async def test_a_declared_schema_the_provider_rejects_is_asked_for_again_as_json_text(monkeypatch):
+    calls = []
+
+    class Rejected(Exception):
+        status_code = 400
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise Rejected("format is not supported")
+        return CompletionResponse(_RERANK_ANSWER)
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(model="ollama_chat/qwen3:0.6b", base_url=None, api_key=None, timeout_s=30.0, native_schema=True)
+    )
+
+    assert await client.answer_schema("rank", response_format=RerankResponse, max_tokens=256) == RerankResponse()
+    assert calls[0]["response_format"] is RerankResponse
+    assert "response_format" not in calls[1]
+    assert calls[1]["messages"][0]["content"].startswith("rank\n\nReturn ONLY")
+
+
+@pytest.mark.parametrize(
+    ("invocation", "main", "decision"),
+    [
+        (ResolvedInvocation(route="ollama_chat/qwen3:0.6b", provider="ollama", native_schema=True), True, True),
+        (ResolvedInvocation(route="openrouter/openai/gpt-5-mini", provider="openrouter", native_schema=True), True, None),
+        (ResolvedInvocation(route="openrouter/meituan/longcat-2.0", provider="openrouter", native_schema=False), False, None),
+        (ResolvedInvocation(route="litellm_proxy/gpt-5-mini", provider="litellm"), None, None),
+        (ResolvedInvocation(route="openai/gpt-5-mini"), None, None),
+    ],
+    ids=["ollama", "openrouter-declared", "openrouter-declined", "litellm-route", "no-descriptor"],
+)
+def test_the_decision_model_takes_only_what_the_provider_declares_for_every_model(invocation, main, decision):
+    config = StructuredLlmConfig.for_invocation(invocation, timeout_s=30.0, decision_model="other-model")
+
+    assert (config.native_schema, config.decision_native_schema) == (main, decision)
+
+
+@pytest.mark.parametrize(
+    ("decision_route", "decision"),
+    [("ollama_chat/qwen3:0.6b", True), ("ollama/qwen3:0.6b", True), ("openrouter/openai/gpt-5-mini", None)],
+)
+def test_a_decision_model_on_a_route_to_ollama_takes_its_schema_natively(decision_route, decision):
+    invocation = ResolvedInvocation(route="ollama_chat/qwen3:8b", provider="litellm", native_schema=True)
+
+    config = StructuredLlmConfig.for_invocation(invocation, timeout_s=30.0, decision_model=decision_route)
+
+    assert config.decision_native_schema is decision
+
+
+def test_a_client_configured_with_its_own_declaration_keeps_it():
+    invocation = ResolvedInvocation(route="ollama_chat/qwen3:0.6b", provider="ollama", native_schema=True)
+
+    config = StructuredLlmConfig.for_invocation(
+        invocation, timeout_s=30.0, native_schema=False, decision_native_schema=False
+    )
+
+    assert (config.native_schema, config.decision_native_schema) == (False, False)
 
 
 @pytest.mark.asyncio

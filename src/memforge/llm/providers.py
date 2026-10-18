@@ -14,6 +14,13 @@ built from one and pass the SDK nothing else about where a request goes.
 A descriptor also says how a request asks its model to answer without reasoning
 first. Closed-choice calls size their output for the answer alone, and a model
 that reasons by default would spend that output before it answers.
+
+Whether a structured request asks the provider to hold the reply to its JSON
+schema is decided by what the provider declares: a provider that enforces a
+schema for every model it serves says so through its descriptor, and through
+the LiteLLM routes that reach it; a model listing that declares it for each
+model says so for the model chosen from it. A model that nothing declares
+anything for is left to LiteLLM's model map.
 """
 
 from __future__ import annotations
@@ -44,6 +51,7 @@ __all__ = [
     "names_litellm_route",
     "origin_label",
     "provider_descriptor",
+    "route_enforces_response_schema",
 ]
 
 ModelKind = Literal["generation", "embedding"]
@@ -59,6 +67,14 @@ AUTH_STRATEGIES: tuple[AuthStrategy, ...] = get_args(AuthStrategy)
 KEYLESS_API_KEY = "no-api-key"
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+# The LiteLLM providers whose server holds every generation reply to the JSON
+# schema a request gives. Ollama takes the schema as the ``format`` of a chat
+# or a generate request for every model
+# (https://docs.ollama.com/capabilities/structured-outputs), and LiteLLM's
+# ``ollama_chat/`` and ``ollama/`` routes write a ``json_schema`` response
+# format there.
+_SCHEMA_ENFORCING_ROUTE_PROVIDERS = frozenset({"ollama_chat", "ollama"})
 
 # The request paths of an OpenAI-style API, written after its base URL.
 _OPENAI_REQUEST_PATHS = (
@@ -146,6 +162,10 @@ class ResolvedInvocation:
     # The descriptor the invocation was compiled from. An invocation named by
     # its route alone has none, and its requests carry nothing provider-specific.
     provider: str | None = None
+    # Whether the provider holds the model's reply to the JSON schema a
+    # structured request gives, as the provider declares it; ``None`` when it
+    # declares nothing, and LiteLLM's model map decides.
+    native_schema: bool | None = None
 
     def __post_init__(self) -> None:
         for name, value in self.extra_params.items():
@@ -198,6 +218,9 @@ class ModelListing:
     # Whether an entry can give the token limits of its model: the context
     # window and the largest output.
     gives_token_limits: bool = False
+    # Whether an entry declares if its model answers in a JSON schema the
+    # request gives.
+    gives_native_schema: bool = False
 
 
 @dataclass(frozen=True)
@@ -232,6 +255,9 @@ class ProviderDescriptor:
     # ``openai/`` route, which carries the API key and the timeout of every
     # request, while the route of the model id still names the model.
     openai_api_paths: Mapping[ModelKind, str] = field(default_factory=dict)
+    # Whether the provider holds the reply of every generation model it serves
+    # to the JSON schema a request gives.
+    enforces_response_schema: bool = False
 
     @property
     def model_is_route(self) -> bool:
@@ -343,6 +369,10 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
             paths={"generation": "/models", "embedding": "/embeddings/models"},
             kind_signal="listing",
             gives_token_limits=True,
+            # A model whose ``supported_parameters`` name ``structured_outputs``
+            # takes a ``json_schema`` response format
+            # (https://openrouter.ai/docs/guides/features/structured-outputs).
+            gives_native_schema=True,
         ),
         request_paths=_OPENAI_REQUEST_PATHS,
         reasoning_off=_openrouter_reasoning_off,
@@ -377,6 +407,10 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         # (https://github.com/BerriAI/litellm/issues/47261), and Ollama's
         # OpenAI-compatible API takes the same models under the same names.
         openai_api_paths={"embedding": "/v1"},
+        # Ollama holds a chat reply to the JSON schema given as its ``format``
+        # for every model (https://docs.ollama.com/capabilities/structured-outputs),
+        # and LiteLLM writes a ``json_schema`` response format there.
+        enforces_response_schema=True,
     ),
     ProviderDescriptor(
         id="openai_compatible",
@@ -418,6 +452,12 @@ def provider_descriptor(provider_id: str) -> ProviderDescriptor:
     if descriptor is None:
         raise ModelConfigError("unknown_provider", f"{provider_id!r} is not a known provider.")
     return descriptor
+
+
+def route_enforces_response_schema(route: str | None) -> bool:
+    """Whether the provider a LiteLLM ``provider/model`` route reaches holds every reply to the request's schema."""
+    provider, separator, _model = (route or "").strip().partition("/")
+    return bool(separator) and provider in _SCHEMA_ENFORCING_ROUTE_PROVIDERS
 
 
 def names_litellm_route(model: str | None) -> bool:

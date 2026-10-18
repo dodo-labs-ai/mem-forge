@@ -26,6 +26,7 @@ import {
   listedLimitsGap,
   listedTokenLimits,
   modelFormSchema,
+  nativeSchemaForTypedModel,
   offersTokenLimits,
   savedValues,
   tokenLimitsForChoice,
@@ -75,7 +76,8 @@ interface ModelFormProps {
  *
  * Load models offers the provider's models of the kind. A model field that
  * names one of them, picked from the list or typed, fills the empty token
- * limit fields with the limits the listing gives for it. When validation finds
+ * limit fields with the limits the listing gives for it, and saves what the
+ * listing declares about the model answering in a JSON schema. When validation finds
  * that only the token limits are missing and the provider's listing can give
  * them, the step offers to fill them in from the listing.
  *
@@ -103,11 +105,21 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
     ),
   });
   const { register, setValue, getValues, trigger, reset, control, formState } = form;
-  const [providerId, endpoint, authStrategy, apiKey, model, options, parameters, tokenLimits] = useWatch({
+  const [providerId, endpoint, authStrategy, apiKey, model, options, parameters, tokenLimits, nativeSchema] = useWatch({
     control,
-    name: ["provider", "endpoint", "authStrategy", "apiKey", "model", "options", "parameters", "tokenLimits"],
+    name: ["provider", "endpoint", "authStrategy", "apiKey", "model", "options", "parameters", "tokenLimits", "nativeSchema"],
   });
-  const values: ModelFormValues = { provider: providerId, endpoint, authStrategy, apiKey, model, options, parameters, tokenLimits };
+  const values: ModelFormValues = {
+    provider: providerId,
+    endpoint,
+    authStrategy,
+    apiKey,
+    model,
+    options,
+    parameters,
+    tokenLimits,
+    nativeSchema,
+  };
   /** The token limits the form filled in from the model list, while it is the source of what the fields hold. */
   const [listedLimits, setListedLimits] = useState<ListedLimits | null>(null);
   /** The model whose token limits were last looked up in the model list from the token limits step. */
@@ -215,9 +227,13 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
     applyListedModel(choice);
   }
 
-  /** Fills the token limit fields from what the listing gives for `choice`, as far as they are empty or listed. */
+  /**
+   * Takes what the listing declares about `choice` answering in a JSON schema, and fills the
+   * token limit fields from what it gives for `choice`, as far as they are empty or listed.
+   */
   function applyListedModel(choice: ModelOption) {
     if (!provider) return;
+    setValue("nativeSchema", choice.native_schema ?? null);
     const names = tokenLimitNames(provider, kind);
     const listed = listedTokenLimits(choice, names);
     const next = tokenLimitsForChoice(getValues("tokenLimits"), names, listedLimits?.limits ?? null, listed);
@@ -241,8 +257,12 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
    */
   function followModelField(typed: string) {
     const named = namedListedModel(outcome, typed);
-    if (named) applyListedModel(named);
-    else followTypedModel(typed);
+    if (named) {
+      applyListedModel(named);
+      return;
+    }
+    setValue("nativeSchema", nativeSchemaForTypedModel(saved, providerId, typed));
+    followTypedModel(typed);
   }
 
   async function loadModels() {

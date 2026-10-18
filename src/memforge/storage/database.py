@@ -672,6 +672,7 @@ def _model_binding_from_row(row: Any) -> dict[str, Any]:
         "route": stored["route"],
         "parameters": json.loads(stored["parameters_json"] or "{}"),
         "token_limits": json.loads(stored["token_limits_json"] or "{}"),
+        "native_schema": None if stored["native_schema"] is None else bool(stored["native_schema"]),
         "config_source": stored["config_source"],
         "state": stored["state"],
         "validation": validation,
@@ -2056,6 +2057,7 @@ CREATE TABLE IF NOT EXISTS model_bindings (
     validation_error_code    TEXT,
     updated_at       TEXT NOT NULL,
     token_limits_json TEXT NOT NULL DEFAULT '{}',
+    native_schema  INTEGER CHECK (native_schema IN (0, 1)),
     PRIMARY KEY (kind, slot)
 );
 CREATE TABLE IF NOT EXISTS model_secrets (
@@ -4872,6 +4874,16 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         [
             "ALTER TABLE source_sync_runs ADD COLUMN retry_failed_items INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE source_sync_runs ADD COLUMN rerun_retry_failed_items INTEGER NOT NULL DEFAULT 0",
+        ],
+    ),
+    (
+        119,
+        "Record whether a generation model answers in a response schema, as its provider's listing declares",
+        # A binding stored before this migration declares nothing, and LiteLLM's
+        # model map keeps deciding for it.
+        [
+            "ALTER TABLE model_bindings ADD COLUMN native_schema INTEGER "
+            "CHECK (native_schema IN (0, 1))",
         ],
     ),
 ]
@@ -22770,6 +22782,27 @@ class Database:
             await self.db.commit()
             return cursor.rowcount == 1
 
+    async def record_model_binding_native_schema(
+        self,
+        kind: str,
+        slot: str,
+        *,
+        updated_at: str,
+        native_schema: bool,
+    ) -> bool:
+        """Record the response schema support a listing declares for the binding saved at ``updated_at``.
+
+        The binding keeps its state, its latest check and when it was saved.
+        Returns False, recording nothing, when it has been saved again since.
+        """
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                "UPDATE model_bindings SET native_schema = ? WHERE kind = ? AND slot = ? AND updated_at = ?",
+                (int(native_schema), kind, slot, updated_at),
+            )
+            await self.db.commit()
+            return cursor.rowcount == 1
+
     async def promote_model_candidate(
         self,
         kind: str,
@@ -22855,9 +22888,9 @@ class Database:
             """INSERT INTO model_bindings (
                    kind, slot, provider, endpoint, origin, auth_strategy, options_json,
                    secret_ref, model_id, route, parameters_json, token_limits_json,
-                   config_source, state, validated_at, validation_digest,
+                   native_schema, config_source, state, validated_at, validation_digest,
                    validation_facts_json, validation_error_code, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(kind, slot) DO UPDATE SET
                    provider = excluded.provider,
                    endpoint = excluded.endpoint,
@@ -22869,6 +22902,7 @@ class Database:
                    route = excluded.route,
                    parameters_json = excluded.parameters_json,
                    token_limits_json = excluded.token_limits_json,
+                   native_schema = excluded.native_schema,
                    config_source = excluded.config_source,
                    state = excluded.state,
                    validated_at = excluded.validated_at,
@@ -22889,6 +22923,7 @@ class Database:
                 record["route"],
                 json.dumps(record.get("parameters") or {}, sort_keys=True),
                 json.dumps(record.get("token_limits") or {}, sort_keys=True),
+                None if record.get("native_schema") is None else int(record["native_schema"]),
                 record["config_source"],
                 record["state"],
                 *(_model_validation_columns(validation) if validation else (None, None, None, None)),

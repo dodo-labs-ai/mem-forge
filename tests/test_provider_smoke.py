@@ -324,7 +324,7 @@ async def test_a_running_ollama_passes_every_check_through_the_product_path(prov
     assert ollama == [
         ("generation", "model listing", "qwen3:0.6b", "pass", ""),
         # LiteLLM asks the Ollama server for the model's limits, and none answers here.
-        ("generation", "structured answer", "qwen3:0.6b", "pass", "json_text; token limits unknown to LiteLLM"),
+        ("generation", "structured answer", "qwen3:0.6b", "pass", "native_schema; token limits unknown to LiteLLM"),
         ("embedding", "model listing", "nomic-embed-text", "pass", ""),
         ("embedding", "embedding", "nomic-embed-text", "pass", "dimension 2"),
     ]
@@ -336,6 +336,7 @@ async def test_a_running_ollama_passes_every_check_through_the_product_path(prov
     }
     chat = next(json.loads(request.content) for request in provider.requests if request.url.path == "/api/chat")
     assert chat["think"] is False
+    assert set(chat["format"]["properties"]) == {"probe"}
 
 
 def _openrouter(request: httpx.Request) -> httpx.Response:
@@ -349,6 +350,7 @@ def _openrouter(request: httpx.Request) -> httpx.Response:
                         "id": "anthropic/claude-haiku-4.5",
                         "context_length": 200000,
                         "top_provider": {"max_completion_tokens": 64000},
+                        "supported_parameters": ["max_tokens", "response_format", "structured_outputs"],
                     }
                 ]
             },
@@ -378,7 +380,7 @@ def _openrouter(request: httpx.Request) -> httpx.Response:
 
 
 async def test_a_model_the_listing_gives_limits_for_passes_and_one_it_does_not_list_is_noted(provider) -> None:
-    """Settings takes the token limits a listing gives, so LiteLLM need not know the model."""
+    """Settings takes the token limits and the response schema support a listing gives, so LiteLLM need not know the model."""
     provider.respond = _openrouter
 
     report = await smoke.run(
@@ -390,13 +392,14 @@ async def test_a_model_the_listing_gives_limits_for_passes_and_one_it_does_not_l
     openrouter = [(row.kind, row.check, row.result, row.detail) for row in report.rows if row.provider == "openrouter"]
     assert openrouter == [
         ("generation", "model listing", "pass", ""),
-        ("generation", "structured answer", "pass", "json_text"),
+        ("generation", "structured answer", "pass", "native_schema"),
         ("embedding", "model listing", "pass", "not among the 1 listed models"),
         ("embedding", "embedding", "pass", "dimension 2"),
     ]
     assert smoke.exit_code(report) == 0
     chat = next(json.loads(r.content) for r in provider.requests if r.url.path == "/api/v1/chat/completions")
     assert chat["reasoning"] == {"enabled": False}
+    assert chat["response_format"]["type"] == "json_schema"
     assert {request.headers.get("authorization") for request in provider.requests} == {f"Bearer {SECRET}"}
 
 
