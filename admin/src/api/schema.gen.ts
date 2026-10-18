@@ -5517,6 +5517,8 @@ export interface components {
             sync_schedule?: components["schemas"]["SourceSyncScheduleResponse"] | null;
             /** Type */
             type: string;
+            /** @description Transcript lines the current plugin version could not recognize in recent uploads; present only for agent-session Sources, null when every line was recognized. */
+            unrecognized_session_lines?: components["schemas"]["UnrecognizedSessionLinesResponse"] | null;
         };
         /** SourceSubscriptionRequest */
         SourceSubscriptionRequest: {
@@ -5740,6 +5742,18 @@ export interface components {
             total_memories: number;
             /** Total Sources */
             total_sources: number;
+        };
+        /**
+         * UnrecognizedSessionLinesResponse
+         * @description Transcript lines the agent client's plugin could not recognize in recent uploads.
+         */
+        UnrecognizedSessionLinesResponse: {
+            /** Count */
+            count: number;
+            /** Last Seen At */
+            last_seen_at: string | null;
+            /** Plugin Version */
+            plugin_version: string | null;
         };
         /** UpdateSourceRequest */
         UpdateSourceRequest: {

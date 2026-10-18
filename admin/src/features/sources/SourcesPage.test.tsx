@@ -78,6 +78,32 @@ test("a shared workspace shows who can use each source", async () => {
   expect(within(drawer).getByText("Only me")).toBeInTheDocument();
 });
 
+test.each([
+  [{ count: 3, plugin_version: "0.2.0", last_seen_at: "2026-09-29T11:00:00Z" }, true],
+  [null, false],
+])("an agent-session source warns about session lines its plugin did not recognize (%o)", async (lines, warns) => {
+  const source = makeSource({
+    id: "src-claude",
+    type: "agent_session",
+    client: "claude-code",
+    name: "Claude Code Session",
+    unrecognized_session_lines: lines,
+  });
+  renderPage([source]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await userEvent.click(await within(table).findByText("Claude Code Session"));
+  const drawer = await screen.findByRole("dialog", { name: "Claude Code Session" });
+  const warning = within(drawer).queryByText("3 session lines from Claude Code were not recognized");
+  if (warns) {
+    expect(warning).toBeInTheDocument();
+    expect(within(drawer).getByText("Update the MemForge plugin so new sessions are read in full.")).toBeInTheDocument();
+  } else {
+    expect(warning).not.toBeInTheDocument();
+    expect(within(drawer).queryByText(/not recognized/)).not.toBeInTheDocument();
+  }
+});
+
 test("Sync now starts a sync for that source", async () => {
   const { calls } = renderPage([makeSource()]);
   const table = await screen.findByRole("table", { name: "Sources" });

@@ -5256,6 +5256,52 @@ def test_session_window_payload_filters_codex_bootstrap_before_budgeting(tmp_pat
     assert payload["receipt"]["metadata"]["omissions"]["metadata_or_context"] == 5
 
 
+def test_session_window_payload_counts_unrecognized_lines_apart_from_ignored_records(tmp_path):
+    from memforge import hook_adapter
+
+    transcript = tmp_path / "claude-format-drift.jsonl"
+    lines = [
+        json.dumps({"type": "user", "message": {"role": "user", "content": "Keep the cache warm."}}),
+        json.dumps({"type": "file-history-snapshot", "snapshot": {"files": []}}),
+        json.dumps({"type": "system", "subtype": "local_command", "content": "ran /status"}),
+        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "..."}]}}),
+        json.dumps({"type": "user", "message": {"role": "user", "body": {"parts": ["Use the new format."]}}}),
+        '{"type": "assistant", "message": {"role": "assistant", "content": [',
+        "",
+        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Done."}]}}),
+    ]
+    transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    payload = hook_adapter._session_window_payload(
+        client="claude-code",
+        session_id="sess-format-drift",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        from_line=0,
+        to_line=len(lines),
+        trigger="REQUIRED_CAPTURE",
+    )
+
+    assert [event["kind"] for event in payload["events"]] == ["user_message", "assistant_message"]
+    assert payload["history_window"]["end"] == str(len(lines))
+    assert payload["receipt"]["metadata"]["omissions"] == {"metadata_or_context": 4, "unrecognized_line": 2}
+
+
+def test_unrecognized_codex_records_are_counted_but_ignored_record_types_are_not():
+    from memforge import hook_adapter
+
+    def record(payload):
+        return json.dumps({"type": "response_item", "payload": payload})
+
+    assert hook_adapter._is_unrecognized_transcript_line(record({"role": "user", "content": "hi"})) is False
+    assert hook_adapter._is_unrecognized_transcript_line(record({"type": "message", "author": "user"})) is True
+    assert hook_adapter._is_unrecognized_transcript_line(json.dumps({"type": "event_msg", "payload": "text"})) is True
+    assert hook_adapter._is_unrecognized_transcript_line(record({"type": "message", "role": "developer"})) is False
+    assert hook_adapter._is_unrecognized_transcript_line(record({"type": "reasoning", "summary": []})) is False
+    assert hook_adapter._is_unrecognized_transcript_line(json.dumps({"type": "world_state", "state": {}})) is False
+    assert hook_adapter._is_unrecognized_transcript_line(json.dumps(["not", "a", "record"])) is True
+
+
 def test_session_window_payload_uses_earliest_offset_aware_event_timestamp(tmp_path):
     from memforge import hook_adapter
 
