@@ -55,7 +55,7 @@ reading another workspace.
 Install from GitHub (no checkout required):
 
 ```bash
-codex plugin marketplace add shno-labs/mem-forge
+codex plugin marketplace add dodo-labs-ai/mem-forge
 codex plugin add memory@memforge
 ```
 

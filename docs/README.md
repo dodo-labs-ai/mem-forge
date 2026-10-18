@@ -14,5 +14,5 @@ Start here if you are new to the repository:
 - [Python distribution release](releasing-python-distribution.md): package
   naming, Trusted Publisher configuration, release tags, and install smoke.
 
-Use the [issue tracker](https://github.com/shno-labs/mem-forge/issues) for
+Use the [issue tracker](https://github.com/dodo-labs-ai/mem-forge/issues) for
 execution status and feature requests.

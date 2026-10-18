@@ -367,7 +367,7 @@ async def test_agent_session_authority_runs_on_the_model_its_registration_select
         session_id="session",
         trigger="Stop",
         workspace="/workspace/mem-forge",
-        repo_identifier="github.com/shno-labs/mem-forge",
+        repo_identifier="github.com/dodo-labs-ai/mem-forge",
         branch="main",
         events=canonicalize_agent_session_events(_authorized_events()),
     )
