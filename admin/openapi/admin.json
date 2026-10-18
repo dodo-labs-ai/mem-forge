@@ -8586,6 +8586,17 @@
           "type": {
             "title": "Type",
             "type": "string"
+          },
+          "unrecognized_session_lines": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UnrecognizedSessionLinesResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Transcript lines the current plugin version could not recognize in recent uploads; present only for agent-session Sources, null when every line was recognized."
           }
         },
         "required": [
@@ -9330,6 +9341,44 @@
           "total_sources"
         ],
         "title": "StatsResponse",
+        "type": "object"
+      },
+      "UnrecognizedSessionLinesResponse": {
+        "description": "Transcript lines the agent client's plugin could not recognize in recent uploads.",
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "last_seen_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Seen At"
+          },
+          "plugin_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plugin Version"
+          }
+        },
+        "required": [
+          "count",
+          "plugin_version",
+          "last_seen_at"
+        ],
+        "title": "UnrecognizedSessionLinesResponse",
         "type": "object"
       },
       "UpdateSourceRequest": {

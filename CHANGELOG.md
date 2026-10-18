@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- The Sources page warns when the Codex or Claude Code plugin cannot read
+  lines of its session transcripts, for example after the client changes its
+  transcript format, so a plugin update is not missed.
+  - The hook adapter counts the transcript lines it cannot recognize in each
+    uploaded window and reports them as the `unrecognized_line` omission in the
+    window receipt. Malformed JSON and conversation records whose shape it does
+    not understand count; records it skips on purpose, such as session
+    metadata, reasoning and injected context, do not. Unrecognized lines are
+    still skipped and are not uploaded again.
+  - Each window receipt records the uploading `plugin_version`. The Source List
+    reports `unrecognized_session_lines` (count, plugin version and when last
+    seen) for an agent-session Source, summed over its 50 most recent windows
+    from the plugin version that uploaded the latest one, so a window from an
+    updated plugin clears it.
+  - The Source drawer shows the warning, for example "3 session lines from
+    Claude Code were not recognized", with a prompt to update the MemForge
+    plugin. Nothing is shown when every line was recognized.
+  - Cloud: no HANA schema or configuration change; the count and plugin version
+    live in the existing agent-session receipt metadata. The Source List reads
+    them through `list_agent_session_receipts(source_id=..., limit=...)`, which
+    Cloud's HANA store must serve with parsed `metadata`, `source_kind` and
+    `submitted_at`, newest first.
+
 - Claim Extraction no longer fails a Document when the model cites Evidence its
   request cannot bind. On an incremental update only the changed content may be
   a Memory's Primary Evidence, and earlier content may only be Required; a model
