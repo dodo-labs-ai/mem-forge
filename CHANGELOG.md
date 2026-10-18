@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Contributors: `scripts/compose_smoke.sh` checks a fresh Docker Compose install
+  end to end in an isolated project and prints a Markdown table for the PR or
+  release notes.
+
 - The vector index status in Settings no longer reports "reindexing" next to
   a rebuild that has already ended. Both now come from one read of the latest
   rebuild, so a rebuild that ends while the status is read shows as running or
