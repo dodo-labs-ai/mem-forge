@@ -48,6 +48,7 @@ from memforge.models import (
     MemorySourceRef,
     Project,
     SourceUnitInput,
+    VIRTUAL_DOCUMENT_SOURCE_IDS,
     Visibility,
     canonicalize_entity_name,
 )
@@ -246,6 +247,8 @@ def _enabled_source_visibility_condition(
 def _current_source_visibility_condition(
     disabled_source_ids: list[str],
 ) -> tuple[str, list[str]]:
+    """Admit a Memory with no support, direct user support, or an enabled active Source."""
+    virtual_placeholders = ", ".join("?" for _ in VIRTUAL_DOCUMENT_SOURCE_IDS)
     disabled_clause = ""
     if disabled_source_ids:
         placeholders = ", ".join("?" for _ in disabled_source_ids)
@@ -259,6 +262,12 @@ def _current_source_visibility_condition(
             )
             OR EXISTS (
                 SELECT 1
+                FROM memory_sources ms_virtual
+                WHERE ms_virtual.memory_id = m.id
+                  AND ms_virtual.source_id IN ({virtual_placeholders})
+            )
+            OR EXISTS (
+                SELECT 1
                 FROM memory_sources ms_enabled
                 JOIN sources s_enabled
                   ON s_enabled.id = ms_enabled.source_id
@@ -267,8 +276,20 @@ def _current_source_visibility_condition(
                   {disabled_clause}
             )
         )""",
-        list(disabled_source_ids),
+        [*sorted(VIRTUAL_DOCUMENT_SOURCE_IDS), *disabled_source_ids],
     )
+
+
+def _append_current_support_row_predicate(*, joins: list[str], clauses: list[str], params: list[Any]) -> None:
+    """Keep a joined support row only when its Source is active or it is direct user support.
+
+    Direct user support (``user_memory``, ``user_correction``) has no configured
+    Source row, so the Source join is outer and the virtual ids pass on their own.
+    """
+    virtual_placeholders = ", ".join("?" for _ in VIRTUAL_DOCUMENT_SOURCE_IDS)
+    joins.append("LEFT JOIN sources s ON s.id = ms.source_id")
+    clauses.append(f"(ms.source_id IN ({virtual_placeholders}) OR s.status = 'active')")
+    params.extend(sorted(VIRTUAL_DOCUMENT_SOURCE_IDS))
 
 
 def _append_source_time_predicates(
@@ -1268,7 +1289,7 @@ class SqliteRelationalStore:
             params=params,
         )
         if has_source_row_join:
-            joins.append("JOIN sources s ON s.id = ms.source_id AND s.status = 'active'")
+            _append_current_support_row_predicate(joins=joins, clauses=clauses, params=params)
         if memory_types:
             placeholders = ", ".join("?" for _ in memory_types)
             clauses.append(f"m.memory_type IN ({placeholders})")
@@ -1326,7 +1347,7 @@ class SqliteRelationalStore:
             params=params,
         )
         if has_source_row_join:
-            joins.append("JOIN sources s ON s.id = ms.source_id AND s.status = 'active'")
+            _append_current_support_row_predicate(joins=joins, clauses=clauses, params=params)
         if memory_types:
             placeholders = ", ".join("?" for _ in memory_types)
             clauses.append(f"m.memory_type IN ({placeholders})")

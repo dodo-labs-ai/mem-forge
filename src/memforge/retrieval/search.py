@@ -343,11 +343,15 @@ def _entity_link_candidate_payload(candidate: EntityLinkCandidate) -> dict[str, 
 
 
 def _default_access_scope(include_superseded: bool) -> AccessScope:
-    """The permissive single-datastore scope: real lifecycle filtering, no
-    access narrowing. Carries only the status set the request asked for."""
+    """The single-owner scope used when a caller passes no request scope.
+
+    The local owner sees workspace Memories and its own private ones; other
+    users' private Memories stay hidden. Lifecycle filtering still applies,
+    with only the status set the request asked for.
+    """
     return AccessScope(
         user_id=LOCAL_DEV_USER_ID,
-        include_private=False,
+        include_private=True,
         allowed_statuses=allowed_search_statuses(include_superseded),
         active_project=None,
         scope_mode="project-first",
@@ -523,9 +527,9 @@ class SearchEngine:
 
         The keyword-only ``request_scope`` carries the per-request access
         predicate (caller identity, scope mode, and the private-branch
-        toggle). Existing positional callers see the permissive single-
-        datastore default; surfaces that build a real scope (the admin API,
-        the agent-hook channel) opt in by passing one.
+        toggle). Without one the search runs as the local owner and returns
+        its private Memories alongside workspace ones; surfaces that resolve
+        a principal (the admin API, the agent-hook channel) pass their own.
 
         Returns
         -------
