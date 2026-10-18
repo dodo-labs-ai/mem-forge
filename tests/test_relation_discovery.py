@@ -262,10 +262,16 @@ class _CompletionFailingStore(_FailingStore):
 
 
 class _UsageReportingFailureClassifier(_Classifier):
-    def __init__(self, error_code: str | None = "output_invalid", terminal_category: str | None = None) -> None:
+    def __init__(
+        self,
+        error_code: str | None = "output_invalid",
+        terminal_category: str | None = None,
+        status_code: int | None = None,
+    ) -> None:
         super().__init__()
         self.error_code = error_code
         self.terminal_category = terminal_category
+        self.status_code = status_code
 
     async def classify(self, pairs):
         raise MemoryPairClassificationError(
@@ -275,6 +281,7 @@ class _UsageReportingFailureClassifier(_Classifier):
             prompt_chars=321,
             terminal_category=self.terminal_category,
             error_code=self.error_code,
+            status_code=self.status_code,
         )
 
 
@@ -526,16 +533,27 @@ async def test_failed_classification_usage_counts_against_slice_budget(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("terminal_category", "exhausted"),
-    [("request_error", True), ("invalid_response", True), ("provider_error", False), ("deadline_exceeded", False)],
+    ("terminal_category", "status_code", "exhausted"),
+    [
+        ("request_error", None, True),
+        ("invalid_response", None, True),
+        ("provider_error", None, False),
+        ("provider_error", 429, False),
+        ("provider_error", 503, False),
+        ("provider_error", 401, True),
+        ("provider_error", 404, True),
+        ("deadline_exceeded", None, False),
+    ],
 )
 async def test_failure_that_repeats_on_every_attempt_finishes_the_work_on_its_first_attempt(
-    terminal_category: str, exhausted: bool
+    terminal_category: str, status_code: int | None, exhausted: bool
 ) -> None:
     challenger = _memory("challenger", "Current claim")
     candidate = _memory("candidate", "Other claim")
     store = _FailingStore(challenger, (candidate,))
-    classifier = _UsageReportingFailureClassifier(terminal_category, terminal_category=terminal_category)
+    classifier = _UsageReportingFailureClassifier(
+        terminal_category, terminal_category=terminal_category, status_code=status_code
+    )
 
     await _discovery(store, (candidate,), classifier).process_slice(worker_id="worker-1")
 

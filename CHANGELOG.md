@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- Ollama embedding models now work with an Ollama server that requires an API
+  key, and a stalled embedding request ends at its timeout. MemForge sends
+  embedding requests for the Ollama provider to the server's OpenAI-compatible
+  API (`<address>/v1/embeddings`) with the saved key as a Bearer token; LiteLLM's
+  own Ollama embedding route sends neither the key nor the timeout
+  (https://github.com/BerriAI/litellm/issues/47261).
+  - A keyless Ollama server keeps working, and a set embedding dimension is
+    still sent. The Ollama server must serve the OpenAI-compatible API, which
+    current Ollama releases do.
+  - The model, its address and its vector space are unchanged, so an existing
+    install keeps its vector index, needs no reindex and keeps its validated
+    model. Generation with Ollama and Load models are unchanged.
+  - A model typed as a LiteLLM route such as `ollama/nomic-embed-text` (the
+    Other provider option, or `MEMFORGE_EMBEDDING_MODEL`) is still sent the way
+    LiteLLM sends it, without the key; choose the Ollama provider for a server
+    behind authentication.
+  - Cloud: nothing to change. Only bindings with the Ollama provider send
+    embeddings differently; Cloud's a hosted LiteLLM gateway models use the generic LiteLLM
+    route provider, whose requests are unchanged.
+
+- The quickstart no longer offers AWS Bedrock or Google Vertex AI as LiteLLM
+  route examples. Their routes need Python packages MemForge does not ship
+  (`boto3`, `google-auth`), so they fail before any request is sent.
+  - Cloud: nothing to change.
+
+- A generation call the provider refuses is no longer retried as if the
+  provider were down. When a generation model answers 400, 401, 403, 404 or
+  422, for example after its key is revoked or the model is removed, the
+  failed Source Unit is recorded as not retryable, the sync is not retried
+  automatically, and relation discovery stops retrying the work, as already
+  happened for an embedding model. Timeouts, connection failures, 408, 409,
+  429 and 5xx are still retried. After fixing the key or the model, reprocess
+  the affected Documents or wait for them to change.
+  - Cloud: no code or configuration change. Cloud's a hosted LiteLLM gateway generation
+    calls go through the same classification, so one a hosted LiteLLM gateway refuses (for
+    example an expired credential or an undeployed model) is no longer retried
+    at the run level.
+
 - Memories you write by hand, and corrections you make, now appear in the
   recent-memories listing (`list_recent_memories` and
   `POST /api/v1/memories/recent`) and in searches filtered only by date. They

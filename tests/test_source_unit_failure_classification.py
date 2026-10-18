@@ -10,7 +10,9 @@ import pytest
 
 from memforge.llm.embedding import EmbeddingDeadlineExceeded, EmbeddingProviderError
 from memforge.llm.structured import StructuredLlmError, failure_retryable
+from memforge.memory.candidate_admission import CandidateAdmissionError
 from memforge.memory.engine import SourceUnitLifecycleExecutionError
+from memforge.memory.relation_classifier import MemoryPairClassificationError
 from memforge.models import RawMemory
 from memforge.pipeline.projection_images import ProjectionImageLoadError
 from memforge.pipeline.sync import MAX_RETRIES
@@ -70,7 +72,19 @@ class _ProviderAnswer(Exception):
         (KeyError("obs-carried-member"), False),
         (ValueError("invalid lifecycle plan"), False),
         (RuntimeError("lifecycle apply failed"), False),
-        (StructuredLlmError("rate limited", terminal_category="provider_error"), True),
+        (StructuredLlmError("unavailable", terminal_category="provider_error"), True),
+        (StructuredLlmError("rate limited", terminal_category="provider_error", status_code=429), True),
+        (StructuredLlmError("overloaded", terminal_category="provider_error", status_code=503), True),
+        (StructuredLlmError("unauthorized", terminal_category="provider_error", status_code=401), False),
+        (StructuredLlmError("forbidden", terminal_category="provider_error", status_code=403), False),
+        (StructuredLlmError("no such model", terminal_category="provider_error", status_code=404), False),
+        (StructuredLlmError("too long", terminal_category="provider_error", status_code=400), False),
+        (CandidateAdmissionError(
+            "admission_failed", "failed",
+            cause=StructuredLlmError("unauthorized", terminal_category="provider_error", status_code=401),
+        ), False),
+        (MemoryPairClassificationError("failed", terminal_category="provider_error", status_code=401), False),
+        (MemoryPairClassificationError("failed", terminal_category="provider_error", status_code=503), True),
         (StructuredLlmError("timed out", terminal_category="deadline_exceeded"), True),
         (StructuredLlmError("rejected", terminal_category="request_error"), False),
         (StructuredLlmError("unreadable", terminal_category="invalid_response"), False),

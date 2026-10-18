@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from memforge.llm.bindings import build_binding, compile_binding
+from memforge.llm.bindings import build_binding, compile_binding, embedding_identity
+from memforge.llm.embedding_profile import EmbeddingIdentity
 from memforge.llm.providers import (
     KEYLESS_API_KEY,
     PROVIDER_DESCRIPTORS,
@@ -221,9 +222,56 @@ def test_the_none_strategy_sends_an_explicit_keyless_value_and_ignores_any_crede
     assert binding.auth_strategy == "none"
     assert invocation.api_key == KEYLESS_API_KEY
     assert invocation.request_kwargs() == {
-        "api_base": "http://localhost:11434",
+        "api_base": "http://localhost:11434/v1",
         "api_key": KEYLESS_API_KEY,
     }
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "api_base"),
+    [
+        (None, "http://localhost:11434/v1"),
+        ("https://ollama.example.test/v1/embeddings", "https://ollama.example.test/v1"),
+        ("https://gateway.example.test/ollama/", "https://gateway.example.test/ollama/v1"),
+    ],
+)
+def test_an_ollama_embedding_is_sent_to_its_openai_compatible_api_under_the_route_that_names_it(
+    endpoint, api_base
+) -> None:
+    binding = _binding(
+        "ollama",
+        kind="embedding",
+        model_id="nomic-embed-text",
+        endpoint=endpoint,
+        auth_strategy="api_key",
+        secret_ref="secret:one",
+        parameters={"dimensions": 256},
+    )
+
+    invocation = compile_binding(binding, "ollama-key")
+
+    # The model, and the vector space its Embedding Profile names, are the binding's.
+    assert embedding_identity(binding) == EmbeddingIdentity(
+        provider="ollama",
+        route="ollama/nomic-embed-text",
+        endpoint=api_base.removesuffix("/v1"),
+        model_id="nomic-embed-text",
+        requested_dimensions=256,
+    )
+    assert invocation == ResolvedInvocation(
+        route="openai/nomic-embed-text",
+        api_base=api_base,
+        api_key="ollama-key",
+        extra_params={"dimensions": 256},
+        provider="ollama",
+    )
+    assert invocation.request_kwargs()["allowed_openai_params"] == ["dimensions"]
+
+
+def test_an_ollama_generation_model_is_sent_on_its_own_route() -> None:
+    invocation = compile_binding(_binding("ollama", model_id="qwen3"), None)
+
+    assert (invocation.route, invocation.api_base) == ("ollama_chat/qwen3", "http://localhost:11434")
 
 
 def test_the_environment_strategy_passes_no_key_so_the_sdk_resolves_it() -> None:

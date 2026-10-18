@@ -245,8 +245,8 @@ async def test_each_kind_resolves_on_its_own(db, tmp_path) -> None:
 
     assert models.generation_route == "anthropic/claude-sonnet-4"
     assert models.embedding == ResolvedInvocation(
-        route="ollama/nomic-embed-text",
-        api_base="http://localhost:11434",
+        route="openai/nomic-embed-text",
+        api_base="http://localhost:11434/v1",
         api_key="no-api-key",
         provider="ollama",
     )
@@ -270,7 +270,7 @@ async def test_two_databases_resolve_their_own_bindings(tmp_path) -> None:
         await first.close()
         await second.close()
 
-    assert routes == ["ollama/first-model", "ollama/second-model", "ollama/first-model"]
+    assert routes == ["openai/first-model", "openai/second-model", "openai/first-model"]
 
 
 async def test_a_deployment_managed_installation_compiles_from_the_environment_and_stores_nothing(

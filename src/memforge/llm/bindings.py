@@ -148,13 +148,15 @@ class ModelBinding:
 
     kind: ModelKind
     provider: str
-    # The base URL requests are sent to; ``None`` leaves it to the route.
+    # The base URL of the provider's API; ``None`` leaves it to the route.
     endpoint: str | None
     # The normalized origin of the endpoint, which a saved key is bound to.
     origin: str
     auth_strategy: AuthStrategy
     model_id: str
-    # The LiteLLM route the model id compiles to.
+    # The LiteLLM route the model id compiles to. With the endpoint it names
+    # the model; ``compile_binding`` gives the route and base URL its requests
+    # are sent with.
     route: str
     options: Mapping[str, Any]
     parameters: Mapping[str, Any]
@@ -295,7 +297,11 @@ def build_binding(
 
 
 def compile_binding(binding: ModelBinding, credential: str | None) -> ResolvedInvocation:
-    """Compile a binding and its resolved credential into what the SDK is given."""
+    """Compile a binding and its resolved credential into what the SDK is given.
+
+    The binding's route and endpoint name the model; its descriptor says which
+    route and base URL its requests are sent with.
+    """
     if binding.auth_strategy == "api_key":
         if not credential:
             raise ModelConfigError(
@@ -307,9 +313,12 @@ def compile_binding(binding: ModelBinding, credential: str | None) -> ResolvedIn
         api_key = KEYLESS_API_KEY
     else:
         api_key = None
+    route, api_base = provider_descriptor(binding.provider).request_target(
+        binding.kind, binding.route, binding.endpoint
+    )
     return ResolvedInvocation(
-        route=binding.route,
-        api_base=binding.endpoint,
+        route=route,
+        api_base=api_base,
         api_key=api_key,
         extra_params={**binding.options, **binding.parameters},
         provider=binding.provider,
