@@ -585,26 +585,27 @@ class MemoryStore:
         Returns "inserted", "corroborated", or "skipped".
         """
         context = self._operation_context(doc_id=doc_id)
-        # Embed the candidate memory
-        embedding_text = _memory_embedding_text(memory)
-        embedding = await self._embed(embedding_text)
-
-        # Query the vector channel for near-duplicates.
-        try:
-            dedup_scope = scope or _writer_access_scope(memory)
-            candidates = await self.vector.query(embedding, dedup_scope, None, DEDUP_CANDIDATE_LIMIT)
-        except Exception as e:
-            await self._emit(
-                "index_operation_failed",
-                "failed",
-                context=context,
-                memory_id=memory.id,
-                doc_id=doc_id,
-                error=str(e),
-                payload={"index": "chroma", "operation": "dedup_query"},
-            )
-            logger.error("Vector dedup query failed for %s: %s", memory.id, e)
-            raise
+        # Near-duplicates are found through the vector channel, which an
+        # installation that keeps Memories without vectors does not have.
+        candidates: list[tuple[str, float]] = []
+        if not await self.keeps_memories_without_vectors():
+            embedding_text = _memory_embedding_text(memory)
+            embedding = await self._embed(embedding_text)
+            try:
+                dedup_scope = scope or _writer_access_scope(memory)
+                candidates = await self.vector.query(embedding, dedup_scope, None, DEDUP_CANDIDATE_LIMIT)
+            except Exception as e:
+                await self._emit(
+                    "index_operation_failed",
+                    "failed",
+                    context=context,
+                    memory_id=memory.id,
+                    doc_id=doc_id,
+                    error=str(e),
+                    payload={"index": "chroma", "operation": "dedup_query"},
+                )
+                logger.error("Vector dedup query failed for %s: %s", memory.id, e)
+                raise
 
         # vector.query returns (id, score); the vector store owns the distance
         # math, so it decides whether a candidate is within the dedup threshold.
@@ -983,12 +984,18 @@ class MemoryStore:
         related_review_id: str | None = None,
         related_review_reason: str | None = None,
     ) -> None:
-        """Insert memory into SQLite + FTS5 + ChromaDB + link entities and sources."""
+        """Insert memory into SQLite + FTS5 + ChromaDB + link entities and sources.
+
+        An installation that keeps Memories without vectors stores the Memory
+        in SQLite and FTS5 only; its first vector index is built from them.
+        """
         inserted = False
         chroma_upsert_started = False
         try:
             indexed_text = await self._canonical_memory_embedding_text(memory)
-            indexed_embedding = await self._embed(indexed_text)
+            indexed_embedding = (
+                None if await self.keeps_memories_without_vectors() else await self._embed(indexed_text)
+            )
             await self.db.insert_memory_with_source_and_relation(
                 memory,
                 doc_id=doc_id,
@@ -1011,34 +1018,35 @@ class MemoryStore:
                 payload={"operation": "memory_insert"},
             )
 
-            await self._emit(
-                "chroma_upsert_attempted",
-                "attempted",
-                context=context,
-                memory_id=memory.id,
-                doc_id=doc_id,
-                payload={"operation": "memory_insert"},
-            )
-            chroma_upsert_started = True
-            await self.vector.upsert(
-                ids=[memory.id],
-                embeddings=[indexed_embedding],
-                metadatas=[
-                    _memory_metadata(
-                        memory,
-                        embedding_text_hash=embedding_text_hash(indexed_text),
-                        extra={"source_doc_id": doc_id},
-                    )
-                ],
-            )
-            await self._emit(
-                "chroma_upsert_committed",
-                "committed",
-                context=context,
-                memory_id=memory.id,
-                doc_id=doc_id,
-                payload={"operation": "memory_insert"},
-            )
+            if indexed_embedding is not None:
+                await self._emit(
+                    "chroma_upsert_attempted",
+                    "attempted",
+                    context=context,
+                    memory_id=memory.id,
+                    doc_id=doc_id,
+                    payload={"operation": "memory_insert"},
+                )
+                chroma_upsert_started = True
+                await self.vector.upsert(
+                    ids=[memory.id],
+                    embeddings=[indexed_embedding],
+                    metadatas=[
+                        _memory_metadata(
+                            memory,
+                            embedding_text_hash=embedding_text_hash(indexed_text),
+                            extra={"source_doc_id": doc_id},
+                        )
+                    ],
+                )
+                await self._emit(
+                    "chroma_upsert_committed",
+                    "committed",
+                    context=context,
+                    memory_id=memory.id,
+                    doc_id=doc_id,
+                    payload={"operation": "memory_insert"},
+                )
         except Exception as e:
             await self._emit(
                 "index_operation_failed",
@@ -2467,6 +2475,14 @@ class MemoryStore:
     # -------------------------------------------------------------------
     # Embedding helper
     # -------------------------------------------------------------------
+
+    async def keeps_memories_without_vectors(self) -> bool:
+        """Whether Memories are kept without vectors: no embedding model is configured and no index is in use.
+
+        The first embedding model then waits for a rebuild of the vector index,
+        which embeds every searchable Memory from its relational row.
+        """
+        return not self.embedding.configured and await self.vector.index_fingerprint() is None
 
     async def _embed(self, text: str) -> list[float]:
         """Return the vector for one Memory embedding text, as a vector of the index in use."""

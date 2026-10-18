@@ -14,13 +14,22 @@ from memforge.config import AppConfig
 from memforge.models import (
     ContentItem,
     Memory,
+    MemoryExtractionResult,
     NormalizedContent,
     RawContent,
     SyncState,
     content_hash,
 )
 from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.storage.database import Database
+from tests.test_sync_bookkeeping import (
+    ProjectionFragmentRecordingExtractor,
+    StubDocumentStore,
+    _IssueGene,
+    _OrderRecordingMemoryEngine,
+    _skip_retry_delay,
+)
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -526,6 +535,64 @@ def test_source_list_returns_why_the_latest_sync_skipped_its_absence_check(tmp_p
         source = next(row for row in listed.json()["data"] if row["id"] == source_id)
         assert source["sync"]["status"] == "success"
         assert source["sync"]["absence_check_skipped_reason"] == reported
+    finally:
+        asyncio.run(database.close())
+
+
+class _UnreadPartsExtractor(ProjectionFragmentRecordingExtractor):
+    """Reports every ReadingGroup it is given as one the model could not read."""
+
+    async def extract_projection_fragment_memories(self, catalog, **kwargs):
+        del kwargs
+        self.fragment_calls.append(catalog)
+        return MemoryExtractionResult(memories=[], metadata={"skipped_reading_group_count": 1})
+
+
+@pytest.mark.parametrize("defer", [False, True], ids=["committed", "deferred-by-this-run"])
+def test_source_list_returns_the_document_parts_the_latest_sync_left_unread(tmp_path, defer):
+    database = _connect_database(tmp_path)
+    source_id = "src-unread-parts"
+    owner_headers = {"x-test-user": "owner-user", "x-test-workspace-role": "member"}
+    extractor = _UnreadPartsExtractor()
+    engine = _OrderRecordingMemoryEngine(defer=defer)
+    engine.db = database
+    try:
+        asyncio.run(
+            database.upsert_source(
+                id=source_id,
+                type="jira",
+                name="Jira",
+                config_json="{}",
+                access_policy="workspace",
+                owner_user_id="owner-user",
+            )
+        )
+        state = asyncio.run(
+            GeneSyncOrchestrator(
+                db=database,
+                doc_store=StubDocumentStore(),
+                memory_extractor=extractor,
+                memory_engine=engine,
+                memory_store=None,
+                max_concurrent=1,
+                retry_sleep=_skip_retry_delay,
+            ).sync_gene(gene=_IssueGene(0, 1), source_name="Jira", source_id=source_id, force_full_sync=True)
+        )
+
+        assert len(engine.commit_only_attempts) == int(defer)
+        unread = len(extractor.fragment_calls)
+        assert unread >= 2
+        assert (state.last_sync_status, state.memories_extracted) == ("success", 0)
+        assert state.skipped_reading_group_count == unread
+        [latest] = asyncio.run(database.get_sync_history(source=source_id, limit=1))
+        assert latest["skipped_reading_group_count"] == unread
+        with TestClient(_app(tmp_path, database)) as client:
+            listed = client.get("/api/v1/sources", headers=owner_headers)
+
+        assert listed.status_code == 200, listed.text
+        source = next(row for row in listed.json()["data"] if row["id"] == source_id)
+        assert source["sync"]["status"] == "success"
+        assert source["sync"]["skipped_reading_group_count"] == unread
     finally:
         asyncio.run(database.close())
 

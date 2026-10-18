@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Creating a memory by hand (MCP `create_memory` or the admin API) works before
+  an embedding model is configured, instead of failing with a server error.
+  The memory is kept and found by keyword search; near-duplicates are not
+  checked until there is an embedding model. When the first embedding model is
+  then saved, Settings asks for one rebuild of the vector index, which gives
+  those memories their vectors.
+  - A `create_memory` request repeated with the same `idempotency_key` answers
+    with the memory it created, whether or not an embedding model is configured.
+  - Cloud: nothing to do; Cloud always has its embedding model.
+
+- A sync that finishes while some parts of its documents went unread by the
+  generation model now says so. A part is unread when the model's answer for it
+  is rejected even on its own, or when the part does not fit the model; such a
+  part yields no memories, and before, the run still showed as fully synced.
+  The admin UI Source drawer notes "N parts of the synced documents could not
+  be read by the generation model, so no memories were taken from them", the
+  old admin UI lists the count in Last sync details, and `memforge sync` adds
+  it to its Done line. A run that reads everything and finds nothing worth
+  remembering shows no notice.
+  - The count is `SyncState.skipped_reading_group_count`, stored in the new
+    `sync_history.skipped_reading_group_count` column (SQLite migration 120,
+    default 0) and returned as `sync.skipped_reading_group_count` on each
+    Source in `GET /api/v1/sources`. It includes derivations a run resumes from
+    an earlier run.
+  - Cloud: the HANA workspace store needs the same `SYNC_HISTORY` column,
+    written with every sync history row and returned from `get_sync_history`,
+    and its completed derivation batch reads must keep each batch's stored
+    evidence counts, as the SQLite store does. Existing rows read as 0.
+
 - Contributors: `scripts/compose_smoke.sh` checks a fresh Docker Compose install
   end to end in an isolated project and prints a Markdown table for the PR or
   release notes.

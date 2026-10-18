@@ -21,6 +21,7 @@ from memforge.llm import bindings
 from memforge.llm.bindings import resolve_active_binding
 from memforge.llm.providers import ModelConfigError, ResolvedInvocation
 from memforge.model_settings import CandidateDraft, ModelSettings
+from memforge.models import Memory, content_hash
 from memforge.runtime import DefaultRuntimeProvider, SourceSyncWorker, resolve_models
 from memforge.server import model_settings_api
 from memforge.server.admin_api import create_admin_app
@@ -778,6 +779,27 @@ async def test_promotion_makes_the_sync_worker_embed_with_the_binding_now_active
         "https://embed.example.test/v1",
         OTHER_KEY,
     )
+
+
+async def test_a_first_embedding_model_waits_for_a_rebuild_that_embeds_the_memories_kept_without_vectors(
+    db, tmp_path, providers
+) -> None:
+    config = _config(tmp_path)
+    config.llm.embedding_model = ""
+    content = "Deploy through the release pipeline."
+    await db.insert_memory(Memory(id="mem-kept", memory_type="fact", content=content, content_hash=content_hash(content)))
+    settings = _settings(config)
+    await settings.save_candidate(db, "embedding", CandidateDraft(**COMPATIBLE_EMBEDDING, api_key=EMBEDDING_KEY))
+
+    outcome = await settings.validate_candidate(db, "embedding")
+    waiting = await settings.vector_index(db)
+    finished = await settings.run_reindex(db)
+    view = await settings.view(db, "embedding")
+
+    assert (outcome.promoted, outcome.reindex_required) == (False, True)
+    assert (waiting.status, waiting.reindex_target) == ("not_configured", "candidate")
+    assert (finished["state"], finished["vector_count"]) == ("active", 1)
+    assert (view.active is not None, view.candidate) == (True, None)
 
 
 async def test_a_failed_validation_leaves_the_sync_workers_runtimes_in_place(db, tmp_path, providers) -> None:

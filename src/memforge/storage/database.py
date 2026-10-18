@@ -1898,6 +1898,7 @@ CREATE TABLE IF NOT EXISTS sync_history (
     error_message       TEXT,
     failed_docs         TEXT,                -- JSON array
     absence_check_skipped_reason TEXT,
+    skipped_reading_group_count INTEGER NOT NULL DEFAULT 0,
     started_at          TEXT NOT NULL,
     finished_at         TEXT NOT NULL,
     run_id              TEXT
@@ -4886,6 +4887,14 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "CHECK (native_schema IN (0, 1))",
         ],
     ),
+    (
+        120,
+        "Record how many document parts a sync run left unread by the generation model",
+        # A run can succeed although some parts of its Documents produced no
+        # usable model answer or did not fit the model; its sync history
+        # counts them.
+        ["ALTER TABLE sync_history ADD COLUMN skipped_reading_group_count INTEGER NOT NULL DEFAULT 0"],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -7579,6 +7588,7 @@ class Database:
                 raise ValueError("Source derivation output payload hash mismatch")
             result = memory_extraction_result_from_output_payload(payload)
             result.metadata = {
+                **result.metadata,
                 "structured_llm_calls": 0,
                 "reused_derivation_batch_count": 1,
             }
@@ -19519,8 +19529,9 @@ class Database:
             """INSERT INTO sync_history (
                 source, status, docs_processed, docs_updated, docs_failed,
                 memories_extracted, error_message, failed_docs,
-                absence_check_skipped_reason, started_at, finished_at, run_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                absence_check_skipped_reason, skipped_reading_group_count,
+                started_at, finished_at, run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 state.source,
                 state.last_sync_status,
@@ -19531,6 +19542,7 @@ class Database:
                 state.error_message,
                 json.dumps(failed_docs) if failed_docs else None,
                 state.absence_check_skipped_reason,
+                state.skipped_reading_group_count,
                 started_at,
                 finished_at,
                 run_id,
@@ -23177,6 +23189,30 @@ class Database:
         placeholders = ", ".join("?" for _ in statuses)
         async with self.db.execute(
             f"SELECT COUNT(*) FROM memories WHERE status IN ({placeholders})",
+            statuses,
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0])
+
+    async def count_memories_kept_without_vectors(self) -> int:
+        """Count the searchable Memories that no pending vector work will give a vector.
+
+        These are the Memories kept while the installation had no embedding
+        model: only a rebuild of the vector index embeds them.
+        """
+        statuses = allowed_search_statuses()
+        placeholders = ", ".join("?" for _ in statuses)
+        async with self.db.execute(
+            f"""SELECT COUNT(*) FROM memories m
+                 WHERE m.status IN ({placeholders})
+                   AND NOT EXISTS (
+                       SELECT 1 FROM lifecycle_vector_outbox o
+                        WHERE o.memory_id = m.id AND o.operation = 'upsert' AND o.status = 'pending'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM review_vector_outbox o
+                        WHERE o.memory_id = m.id AND o.operation = 'upsert' AND o.status = 'pending'
+                   )""",
             statuses,
         ) as cursor:
             row = await cursor.fetchone()

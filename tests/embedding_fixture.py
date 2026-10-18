@@ -51,6 +51,15 @@ def unconfigured_embedding() -> EmbeddingRuntime:
     return EmbeddingRuntime(EmbeddingSettings(invocation=None))
 
 
+def stand_in_embedding() -> EmbeddingRuntime:
+    """A configured runtime for tests that stand in for ``MemoryStore._embed``; it never reaches a provider."""
+
+    async def unreachable(**_request: Any) -> dict[str, Any]:
+        raise AssertionError("the test stands in for every vector")
+
+    return EmbeddingRuntime(EmbeddingSettings(invocation=embedding_invocation()), transport=unreachable)
+
+
 def embedding_from_texts(
     embed: Callable[[list[str]], Sequence[Sequence[float]]],
 ) -> EmbeddingRuntime:

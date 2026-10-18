@@ -34,6 +34,8 @@ export interface SourceSyncActivity {
   retryTarget?: SourceSyncRetryTarget;
   /** Why a finished run removed nothing although it was due to check for deleted items. */
   absenceCheckSkippedReason?: AbsenceCheckSkippedReason | null;
+  /** Parts of a finished run's documents the generation model could not read. */
+  skippedReadingGroupCount?: number | null;
 }
 
 export interface SourceSyncPresentation {
@@ -91,6 +93,7 @@ export function sourceSyncActivityFromStatus(sync: SyncStatus): SourceSyncActivi
     retryTarget: sync.status === "pending" && sync.run_id
       ? { execution_kind: "source_sync_run", execution_id: sync.run_id } : undefined,
     absenceCheckSkippedReason: sync.absence_check_skipped_reason,
+    skippedReadingGroupCount: sync.skipped_reading_group_count,
   };
 }
 
@@ -234,12 +237,13 @@ export function presentSourceSyncActivity(
       fallbackItems,
     );
     const reason = activity.absenceCheckSkippedReason;
-    return reason
-      ? {
-          ...presentation,
-          notice: `Deletion check skipped: ${ABSENCE_CHECK_SKIPPED_NOTICES[reason]}. Nothing was removed; the next sync checks again.`,
-        }
-      : presentation;
+    const notices = [
+      reason
+        ? `Deletion check skipped: ${ABSENCE_CHECK_SKIPPED_NOTICES[reason]}. Nothing was removed; the next sync checks again.`
+        : "",
+      unreadPartsNotice(activity.skippedReadingGroupCount ?? 0),
+    ].filter(Boolean);
+    return notices.length > 0 ? { ...presentation, notice: notices.join(" ") } : presentation;
   }
 
   const snapshot = activity.progress;
@@ -277,6 +281,13 @@ export function presentSourceSyncActivity(
     case "reconciling":
       return withProgress(`Checking removed ${label}`, snapshot, fallbackItems);
   }
+}
+
+function unreadPartsNotice(count: number): string {
+  if (count <= 0) return "";
+  return count === 1
+    ? "1 part of the synced documents could not be read by the generation model, so no memories were taken from it."
+    : `${count} parts of the synced documents could not be read by the generation model, so no memories were taken from them.`;
 }
 
 function withProgress(

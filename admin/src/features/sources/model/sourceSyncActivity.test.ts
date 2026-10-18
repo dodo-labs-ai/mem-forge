@@ -386,3 +386,48 @@ test("notes a finished sync that skipped its deletion check", () => {
     undefined,
   );
 });
+
+test("notes the document parts a finished sync could not read", () => {
+  const finishedSync: SyncStatus = {
+    status: "success",
+    run_id: "ssr-3",
+    started_at: "2026-07-08T10:00:00Z",
+    finished_at: "2026-07-08T10:01:00Z",
+    error_message: null,
+    progress: { schema_version: 1, phase: "processing", progress: { completed: 3, unit: "page" } },
+    skipped_reading_group_count: 2,
+  };
+  assert.deepEqual(presentSourceSyncActivity(sourceSyncActivityFromStatus(finishedSync), "Confluence", "pages"), {
+    message: "Up to date",
+    detail: "3 pages",
+    notice:
+      "2 parts of the synced documents could not be read by the generation model, so no memories were taken from them.",
+  });
+  assert.equal(
+    presentSourceSyncActivity(
+      sourceSyncActivityFromStatus({ ...finishedSync, status: "partial", skipped_reading_group_count: 1 }),
+      "Confluence",
+      "pages",
+    ).notice,
+    "1 part of the synced documents could not be read by the generation model, so no memories were taken from it.",
+  );
+  assert.equal(
+    presentSourceSyncActivity(
+      sourceSyncActivityFromStatus({ ...finishedSync, absence_check_skipped_reason: "scope_listing_failed" }),
+      "Confluence",
+      "pages",
+    ).notice,
+    "Deletion check skipped: the list of items in scope could not be read in full. Nothing was removed; the next sync checks again. "
+      + "2 parts of the synced documents could not be read by the generation model, so no memories were taken from them.",
+  );
+  for (const skipped of [0, null, undefined]) {
+    assert.equal(
+      presentSourceSyncActivity(
+        sourceSyncActivityFromStatus({ ...finishedSync, skipped_reading_group_count: skipped }),
+        "Confluence",
+        "pages",
+      ).notice,
+      undefined,
+    );
+  }
+});
