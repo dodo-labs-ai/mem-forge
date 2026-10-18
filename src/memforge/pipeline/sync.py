@@ -738,6 +738,12 @@ def _memory_extraction_error(
     return MemoryExtractionFailure(message, error_code=error_code)
 
 
+def _skipped_reading_group_count(extraction: MemoryExtractionResult) -> int:
+    """The ReadingGroups a successful extraction left unread."""
+
+    return int((extraction.metadata or {}).get("skipped_reading_group_count", 0) or 0)
+
+
 def _source_filter_summary(gene: Gene, since: datetime | None) -> str | None:
     config = getattr(gene, "config", None)
     parts: list[str] = []
@@ -770,6 +776,9 @@ class _SourceUnitExecutionDiagnostics:
     # The step of the Document's work that ran last: ``fetch``, ``normalize``,
     # ``projection``, ``derivation`` or ``lifecycle``.
     stage: str = "derivation"
+    # The ReadingGroups the derivation left unread: the model's answer for the
+    # group was rejected, or the group does not fit the model.
+    skipped_reading_group_count: int = 0
 
     def bind_source_unit(self, source_unit_id: str) -> None:
         if self.source_unit_id is not None and self.source_unit_id != source_unit_id:
@@ -975,6 +984,7 @@ class GeneSyncOrchestrator:
         docs_updated = 0
         docs_failed = 0
         memories_extracted = 0
+        skipped_reading_group_count = 0
         failed_docs: list[FailedDoc] = []
         # The ledger record of each failed Document, and the Documents that
         # committed or were removed, which leave the ledger.
@@ -1299,6 +1309,7 @@ class GeneSyncOrchestrator:
                     "processed": False,
                     "updated": False,
                     "memories_extracted": 0,
+                    "skipped_reading_group_count": 0,
                     "failed": False,
                     "runtime_bundle": None,
                     "source_unit_id": None,
@@ -1396,6 +1407,9 @@ class GeneSyncOrchestrator:
                                 "memories_extracted",
                                 0,
                             )
+                            stats["skipped_reading_group_count"] = (
+                                diagnostics.skipped_reading_group_count
+                            )
                             stats["source_unit_id"] = item_stats.get(
                                 "source_unit_id"
                             )
@@ -1405,6 +1419,9 @@ class GeneSyncOrchestrator:
                             last_error = None
                         except SourceUnitLifecycleDeferred as exc:
                             stats["deferred_lifecycle"] = exc
+                            stats["skipped_reading_group_count"] = (
+                                diagnostics.skipped_reading_group_count
+                            )
                             stats["source_unit_id"] = (
                                 exc.handle.source_unit_id
                             )
@@ -1600,6 +1617,7 @@ class GeneSyncOrchestrator:
                     fail_document(r["failure"])
                     failure_retryable = False
                 memories_extracted += r["memories_extracted"]
+                skipped_reading_group_count += r["skipped_reading_group_count"]
                 if r.get("runtime_bundle") is not None:
                     runtime_bundles.append(r["runtime_bundle"])
 
@@ -1734,6 +1752,7 @@ class GeneSyncOrchestrator:
                 if result["updated"]:
                     docs_updated += 1
                 memories_extracted += result["memories_extracted"]
+                skipped_reading_group_count += result["skipped_reading_group_count"]
 
             if scope_transition is not None:
                 scoped_reconciliation_coverage = None
@@ -1862,6 +1881,7 @@ class GeneSyncOrchestrator:
             docs_updated=docs_updated,
             docs_failed=docs_failed,
             memories_extracted=memories_extracted,
+            skipped_reading_group_count=skipped_reading_group_count,
             error_message=error_message,
             failed_docs=failed_docs,
             failure_retryable=failure_retryable,
@@ -1916,13 +1936,14 @@ class GeneSyncOrchestrator:
         logger.info(
             "Sync complete for %s (run_id=%s): "
             "%d processed, %d updated, %d failed, "
-            "%d memories extracted, status=%s",
+            "%d memories extracted, %d document parts unread, status=%s",
             source_name,
             run_id,
             docs_processed,
             docs_updated,
             docs_failed,
             memories_extracted,
+            skipped_reading_group_count,
             status,
         )
 
@@ -2236,6 +2257,9 @@ class GeneSyncOrchestrator:
                             "processed": False,
                             "updated": False,
                             "memories_extracted": 0,
+                            "skipped_reading_group_count": (
+                                diagnostics.skipped_reading_group_count
+                            ),
                             "failed": False,
                             "runtime_bundle": exc.runtime_bundle,
                             "source_unit_id": exc.handle.source_unit_id,
@@ -2298,6 +2322,7 @@ class GeneSyncOrchestrator:
                             "processed": False,
                             "updated": False,
                             "memories_extracted": 0,
+                            "skipped_reading_group_count": 0,
                             "failed": True,
                             "error": failure.message,
                             "failure": failure,
@@ -2337,6 +2362,9 @@ class GeneSyncOrchestrator:
                     "updated": True,
                     "memories_extracted": int(
                         lifecycle_stats.get("added", 0)
+                    ),
+                    "skipped_reading_group_count": (
+                        diagnostics.skipped_reading_group_count
                     ),
                     "failed": False,
                     "runtime_bundle": None,
@@ -2449,6 +2477,7 @@ class GeneSyncOrchestrator:
                 extraction.error,
             )
             return None
+        diagnostics.skipped_reading_group_count = _skipped_reading_group_count(extraction)
         recovery_commit = plan_source_derivation_recovery_commit(
             stored_derivation_id=attempt.id,
             produced_derivation_id=extraction.derivation_id,
@@ -3375,6 +3404,7 @@ class GeneSyncOrchestrator:
         raw_memories = extraction_result.memories
         if extraction_result.error_type:
             raise _memory_extraction_error(doc_id=doc_id, extraction=extraction_result)
+        diagnostics.skipped_reading_group_count = _skipped_reading_group_count(extraction_result)
         projection = with_source_artifact_summaries(
             projection,
             extraction_result.artifact_summaries,

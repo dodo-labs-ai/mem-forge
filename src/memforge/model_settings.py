@@ -1005,7 +1005,8 @@ def _reindex_slot(
     its settings, as ``_fingerprint_in_use`` reads them. With no index in use
     there is a rebuild for it only when ``stored_vectors`` says the
     installation holds vectors: without any, its first answer gives the
-    installation an empty index that needs no rebuild.
+    installation its first index, or, when Memories were kept without vectors,
+    a profile to rebuild one for.
     """
     if candidate is not None and _waits_for_reindex(candidate, in_use):
         return "candidate"

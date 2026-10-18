@@ -1791,10 +1791,11 @@ class SourceSyncStatusResponse(BaseModel):
     ``recovery_count``, ``progress_revision``, ``progress_updated_at``). A
     sync running in this process carries its live counters (``phase``,
     ``docs_*``, ``memories_*``, ``current_title``). The last recorded sync
-    carries its totals, ``run_id``, ``failed_docs`` and
+    carries its totals, ``run_id``, ``failed_docs``,
     ``absence_check_skipped_reason``, which names the step that kept that run
-    from removing anything although its scope listing was due. Fields outside
-    the chosen shape are absent.
+    from removing anything although its scope listing was due, and
+    ``skipped_reading_group_count``, the parts of its Documents the generation
+    model could not read. Fields outside the chosen shape are absent.
     """
 
     status: SourceSyncStatus
@@ -1821,6 +1822,7 @@ class SourceSyncStatusResponse(BaseModel):
     memories_stored: int | None = None
     failed_docs: list[SourceSyncFailedDocResponse] | None = None
     absence_check_skipped_reason: AbsenceCheckSkippedReason | None = None
+    skipped_reading_group_count: int | None = None
 
 
 class SourceAccessTransitionResponse(BaseModel):

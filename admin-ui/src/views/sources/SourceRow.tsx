@@ -509,6 +509,7 @@ function LastSyncDetails({
       ? formatDuration(sync.started_at, sync.finished_at)
       : null;
   const failedCount = sync.docs_failed ?? 0;
+  const unreadPartCount = sync.skipped_reading_group_count ?? 0;
   const failedItemCount = source.failed_items?.count ?? 0;
   const isProblemStatus = sync.status === "partial" || sync.status === "failed";
 
@@ -552,6 +553,12 @@ function LastSyncDetails({
                   <>
                     <dt className="text-muted-foreground">Failed</dt>
                     <dd className="font-medium text-destructive">{failedCount}</dd>
+                  </>
+                )}
+                {unreadPartCount > 0 && (
+                  <>
+                    <dt className="text-muted-foreground">Parts unread by the model</dt>
+                    <dd className="font-medium text-foreground">{unreadPartCount}</dd>
                   </>
                 )}
                 {duration && (
