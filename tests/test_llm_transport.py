@@ -4,32 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 
 import httpx
 import litellm
 import pytest
 from litellm.caching.llm_caching_handler import LLMClientCache
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
-from pydantic import ConfigDict
 
 from memforge.llm.bindings import build_binding, compile_binding
-from memforge.llm.embedding import (
-    EmbeddingDeadlineExceeded,
-    EmbeddingProviderError,
-    EmbeddingRuntime,
-    EmbeddingSettings,
-)
-from memforge.llm.providers import ResolvedInvocation
-from memforge.llm.structured import (
-    LiteLlmStructuredClient,
-    StructuredLlmConfig,
-    StructuredLlmError,
-    StructuredResponseModel,
-    failure_retryable,
-)
+from memforge.llm.embedding import EmbeddingRuntime, EmbeddingSettings
+from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
 from memforge.llm.transport import (
-    NoRedirectAsyncClient,
     end_provider_client_exchanges_at_their_timeout,
     install_no_redirect_http_client,
     is_retryable_provider_error,
@@ -39,7 +24,7 @@ from memforge.llm.transport import (
     refuse_redirects_in_provider_clients,
     send_within_timeout,
 )
-from tests.stalling_endpoint_fixture import GIVES_UP_AFTER_S, STALL_MODES, stalling_endpoint
+from tests.model_endpoint_fixture import InMemorySharedClient, OllamaLookups
 
 # The time a call that is not about its deadline is given. The first request a
 # process sends through a provider's SDK also imports that SDK's modules, which
@@ -62,30 +47,12 @@ def test_importing_a_model_client_installs_a_client_that_refuses_redirects() -> 
     assert session.follow_redirects is False
 
 
-class _InMemoryClient(NoRedirectAsyncClient):
-    """The shared client with each connection pool replaced by an in-memory server."""
-
-    def __init__(self, respond) -> None:
-        super().__init__()
-        self.respond = respond
-        self.requests: list[httpx.Request] = []
-        self.pools_opened = 0
-
-    def _handle(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
-        return self.respond(request)
-
-    def _new_pool(self) -> httpx.AsyncClient:
-        self.pools_opened += 1
-        return httpx.AsyncClient(transport=httpx.MockTransport(self._handle), follow_redirects=False)
-
-
 def _redirect_elsewhere(_request: httpx.Request) -> httpx.Response:
     return httpx.Response(307, headers={"location": "https://elsewhere.example.test/v1/embeddings"})
 
 
 async def test_the_shared_client_returns_a_redirect_even_when_asked_to_follow_it() -> None:
-    client = _InMemoryClient(_redirect_elsewhere)
+    client = InMemorySharedClient(_redirect_elsewhere)
 
     response = await client.post(
         "https://models.example.test/v1/embeddings",
@@ -99,7 +66,7 @@ async def test_the_shared_client_returns_a_redirect_even_when_asked_to_follow_it
 
 
 def test_the_shared_client_keeps_one_connection_pool_per_event_loop() -> None:
-    client = _InMemoryClient(lambda _request: httpx.Response(200, json={"ok": True}))
+    client = InMemorySharedClient(lambda _request: httpx.Response(200, json={"ok": True}))
 
     async def twice() -> list[int]:
         first = await client.get("https://models.example.test/v1/models")
@@ -278,22 +245,12 @@ async def endpoint(monkeypatch):
     """An in-memory OpenAI-compatible embeddings endpoint behind LiteLLM's HTTP client."""
     from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
-    client = _InMemoryClient(_embeddings)
+    client = InMemorySharedClient(_embeddings)
     monkeypatch.setattr(litellm, "aclient_session", client)
     yield client
     # LiteLLM records each call on a queue bound to this test's event loop.
     await GLOBAL_LOGGING_WORKER.flush()
     await client.aclose()
-
-
-async def test_an_openai_compatible_model_reaches_the_configured_endpoint_through_litellm(endpoint) -> None:
-    vectors = await _endpoint_runtime("https://embed-ok.example.test/v1").embed_documents(["alpha", "be"])
-
-    assert vectors == [[5.0, 0.5], [2.0, 0.5]]
-    assert [str(request.url) for request in endpoint.requests] == [
-        "https://embed-ok.example.test/v1/embeddings"
-    ]
-    assert endpoint.requests[0].headers["authorization"] == "Bearer endpoint-key"
 
 
 async def test_a_keyless_endpoint_is_never_sent_a_key_from_the_environment(monkeypatch, endpoint) -> None:
@@ -302,72 +259,6 @@ async def test_a_keyless_endpoint_is_never_sent_a_key_from_the_environment(monke
     await _endpoint_runtime("https://embed-keyless.example.test/v1", api_key=None).embed_query("alpha")
 
     assert endpoint.requests[0].headers["authorization"] == "Bearer no-api-key"
-
-
-async def test_a_set_dimension_reaches_an_openai_compatible_endpoint_whatever_the_model_is_called(
-    endpoint,
-) -> None:
-    binding = build_binding(
-        kind="embedding",
-        provider="openai_compatible",
-        model_id="BAAI/bge-m3",
-        endpoint="https://embed-sized.example.test/v1",
-        parameters={"dimensions": 2},
-        secret_ref="secret:test",
-        config_source="settings",
-    )
-    runtime = EmbeddingRuntime(
-        EmbeddingSettings(invocation=compile_binding(binding, "endpoint-key"), num_retries=0)
-    )
-
-    await runtime.embed_query("alpha")
-
-    sent = json.loads(endpoint.requests[0].content)
-    assert (sent["model"], sent["dimensions"]) == ("BAAI/bge-m3", 2)
-    assert "allowed_openai_params" not in sent
-
-
-async def test_one_attempt_is_one_request_because_the_sdk_does_not_retry(endpoint) -> None:
-    endpoint.respond = lambda _request: httpx.Response(503, json={"error": {"message": "busy"}})
-
-    with pytest.raises(EmbeddingProviderError) as raised:
-        await _endpoint_runtime("https://embed-busy.example.test/v1").embed_query("alpha")
-
-    assert raised.value.status_code == 503
-    assert len(endpoint.requests) == 1
-
-
-async def test_a_redirecting_endpoint_fails_and_the_request_is_not_sent_on(endpoint) -> None:
-    endpoint.respond = _redirect_elsewhere
-
-    with pytest.raises(EmbeddingProviderError):
-        await _endpoint_runtime("https://embed-moved.example.test/v1").embed_query("alpha")
-
-    assert [request.url.host for request in endpoint.requests] == ["embed-moved.example.test"]
-
-
-@pytest.fixture
-async def provider_endpoint(monkeypatch):
-    """An in-memory endpoint behind the HTTP clients LiteLLM builds for a provider."""
-    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
-
-    requests: list[httpx.Request] = []
-
-    def redirect(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(
-            307,
-            headers={"location": f"https://elsewhere.example.test{request.url.path}"},
-        )
-
-    monkeypatch.setattr(
-        AsyncHTTPHandler,
-        "_create_async_transport",
-        staticmethod(lambda **_options: httpx.MockTransport(redirect)),
-    )
-    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
-    yield requests
-    await GLOBAL_LOGGING_WORKER.flush()
 
 
 def test_a_client_litellm_builds_for_a_provider_refuses_redirects() -> None:
@@ -383,65 +274,6 @@ def test_refusing_redirects_in_provider_clients_wraps_the_builder_once() -> None
     refuse_redirects_in_provider_clients()
 
     assert AsyncHTTPHandler.create_client is builder
-
-
-async def test_a_bare_generation_model_does_not_send_its_key_and_prompt_on_to_a_redirect_target(
-    provider_endpoint,
-) -> None:
-    client = LiteLlmStructuredClient(
-        StructuredLlmConfig(
-            model="claude-sonnet-4-20250514",
-            base_url="https://generate-moved.example.test",
-            api_key="endpoint-key",
-            timeout_s=_UNHURRIED_CALL_S,
-        )
-    )
-
-    with pytest.raises(StructuredLlmError):
-        await client.rerank_memories("Rank the matching memories")
-
-    assert provider_endpoint
-    assert {request.url.host for request in provider_endpoint} == {"generate-moved.example.test"}
-    assert provider_endpoint[0].headers["x-api-key"] == "endpoint-key"
-
-
-@pytest.mark.parametrize(
-    ("model", "base_url"),
-    [
-        ("ollama/nomic-embed-text", "https://embed-moved.example.test"),
-        ("voyage/voyage-3", "https://embed-moved.example.test/v1"),
-        ("openrouter/openai/text-embedding-3-small", "https://embed-moved.example.test/v1"),
-    ],
-)
-async def test_a_provider_route_embedding_is_not_sent_on_to_a_redirect_target(
-    provider_endpoint, model, base_url
-) -> None:
-    runtime = EmbeddingRuntime(
-        EmbeddingSettings(
-            invocation=ResolvedInvocation(route=model, api_base=base_url, api_key="endpoint-key"),
-            num_retries=3,
-        )
-    )
-
-    with pytest.raises(EmbeddingProviderError) as raised:
-        await runtime.embed_query("alpha")
-
-    assert raised.value.status_code == 307
-    assert [request.url.host for request in provider_endpoint] == ["embed-moved.example.test"]
-
-
-class _OllamaLookups:
-    """Stand in for the client LiteLLM asks an Ollama server about a model with.
-
-    It records each question and answers none, as when no server is listening.
-    """
-
-    def __init__(self) -> None:
-        self.requests: list[tuple[str, dict[str, str]]] = []
-
-    def post(self, url: str, json=None, headers=None, **_options) -> httpx.Response:
-        self.requests.append((url, dict(headers or {})))
-        raise httpx.ConnectError("connection refused")
 
 
 @pytest.fixture
@@ -465,7 +297,7 @@ async def ollama_endpoint(monkeypatch):
             },
         )
 
-    lookups = _OllamaLookups()
+    lookups = OllamaLookups()
     monkeypatch.setattr(
         AsyncHTTPHandler,
         "_create_async_transport",
@@ -517,7 +349,7 @@ async def test_a_keyless_ollama_endpoint_is_never_sent_the_ollama_key_of_the_env
 
 
 def test_an_ollama_lookup_at_a_request_endpoint_reports_a_model_with_no_known_limits(monkeypatch) -> None:
-    lookups = _OllamaLookups()
+    lookups = OllamaLookups()
     monkeypatch.setattr(litellm, "module_level_client", lookups)
     monkeypatch.setenv("OLLAMA_API_KEY", "environment-ollama-key")
 
@@ -541,180 +373,7 @@ def test_keeping_ollama_lookups_off_request_endpoints_wraps_the_lookup_once() ->
     assert litellm.OllamaConfig.get_model_info is lookup
 
 
-class _RankingAnswer(StructuredResponseModel):
-    """An answer the model may reason toward: a schema that is not a direct answer."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    ranking: list[int] = []
-
-
-def _chat_reply(request: httpx.Request) -> httpx.Response:
-    """Answer a chat request in the wire shape of the provider it was sent to."""
-    answer = json.dumps({"ranking": []})
-    if request.url.path.endswith("/v1/messages"):
-        return httpx.Response(200, json={
-            "id": "msg-1", "type": "message", "role": "assistant", "model": "chat-model",
-            "content": [{"type": "text", "text": answer}], "stop_reason": "end_turn",
-            "usage": {"input_tokens": 1, "output_tokens": 1},
-        })
-    if request.url.path.endswith("/api/chat"):
-        return httpx.Response(200, json={
-            "model": "chat-model", "message": {"role": "assistant", "content": answer},
-            "done": True, "done_reason": "stop", "prompt_eval_count": 1, "eval_count": 1,
-        })
-    return httpx.Response(200, json={
-        "id": "chat-1", "object": "chat.completion", "created": 1, "model": "chat-model",
-        "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": answer}}],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-    })
-
-
-@pytest.fixture
-async def chat_endpoint(monkeypatch):
-    """An in-memory chat endpoint behind every HTTP client LiteLLM sends generation requests through."""
-    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
-
-    requests: list[httpx.Request] = []
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return _chat_reply(request)
-
-    shared = _InMemoryClient(respond)
-    monkeypatch.setattr(litellm, "aclient_session", shared)
-    monkeypatch.setattr(
-        AsyncHTTPHandler,
-        "_create_async_transport",
-        staticmethod(lambda **_options: httpx.MockTransport(respond)),
-    )
-    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
-    monkeypatch.setattr(litellm, "module_level_client", _OllamaLookups())
-    yield requests
-    await GLOBAL_LOGGING_WORKER.flush()
-    await shared.aclose()
-
-
-@pytest.mark.parametrize(
-    ("provider", "model_id", "endpoint_url", "reasoning_off"),
-    [
-        ("openrouter", "anthropic/claude-haiku-5.5", "https://router.example.test/api/v1",
-         {"reasoning": {"enabled": False}}),
-        ("ollama", "qwen3", "https://ollama-chat.example.test", {"think": False}),
-        ("openai", "gpt-5-mini", "https://openai-chat.example.test/v1", {"reasoning_effort": "minimal"}),
-        ("anthropic", "claude-haiku-4-5", "https://anthropic-chat.example.test", {}),
-    ],
-)
-async def test_only_a_direct_answer_asks_the_provider_to_answer_without_reasoning(
-    chat_endpoint, provider, model_id, endpoint_url, reasoning_off
-) -> None:
-    """LiteLLM writes the descriptor's reasoning-off parameters into the provider's request body."""
-    keyless = provider == "ollama"
-    binding = build_binding(
-        kind="generation",
-        provider=provider,
-        model_id=model_id,
-        endpoint=endpoint_url,
-        auth_strategy="none" if keyless else "api_key",
-        secret_ref=None if keyless else "secret:test",
-        config_source="settings",
-    )
-    client = LiteLlmStructuredClient(
-        StructuredLlmConfig.for_invocation(
-            compile_binding(binding, None if keyless else "endpoint-key"), timeout_s=_UNHURRIED_CALL_S
-        )
-    )
-
-    await client.rerank_memories("Rank the matching memories")
-    await client.answer_schema("Rank the matching memories", response_format=_RankingAnswer, max_tokens=256)
-
-    direct, reasoned = (json.loads(request.content) for request in chat_endpoint)
-    assert {name: direct[name] for name in set(direct) - set(reasoned)} == reasoning_off
-    assert set(reasoned) <= set(direct)
-
-
 # -- Request timeouts ---------------------------------------------------------------
-
-_REQUEST_TIMEOUT_S = 0.5
-# A request ended at its timeout ends well before the stalling endpoint gives up.
-_ENDED_AT_ITS_TIMEOUT_S = GIVES_UP_AFTER_S / 2
-_MESSAGES = [{"role": "user", "content": "Rank the matching memories"}]
-
-
-@pytest.fixture
-async def fresh_provider_clients(monkeypatch):
-    """Provider clients built for this test, under the policy the runtime installs.
-
-    LiteLLM keeps one module-level client for Ollama requests. This test gets
-    its own, so it never sends through one built under another test's stand-in.
-    """
-    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
-    from litellm.llms.custom_httpx.async_client_cleanup import close_litellm_async_clients
-
-    assert isinstance(litellm.aclient_session, NoRedirectAsyncClient)
-    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
-    module_client = AsyncHTTPHandler(timeout=litellm.request_timeout)
-    monkeypatch.setattr(litellm, "module_level_aclient", module_client)
-    yield
-    await GLOBAL_LOGGING_WORKER.flush()
-    await close_litellm_async_clients()
-    await module_client.close()
-
-
-def _completion(route: str, *, path: str = "/v1", **request):
-    async def call(base_url: str):
-        return await litellm.acompletion(
-            model=route,
-            messages=_MESSAGES,
-            api_base=f"{base_url}{path}",
-            api_key="endpoint-key",
-            timeout=_REQUEST_TIMEOUT_S,
-            num_retries=0,
-            **request,
-        )
-
-    return call
-
-
-def _embedding(route: str, *, path: str = "/v1"):
-    async def call(base_url: str):
-        return await litellm.aembedding(
-            model=route,
-            input=["alpha"],
-            api_base=f"{base_url}{path}",
-            api_key="endpoint-key",
-            timeout=_REQUEST_TIMEOUT_S,
-            max_retries=0,
-        )
-
-    return call
-
-
-_SDK_REQUESTS = {
-    "openrouter completion": _completion(
-        "openrouter/anthropic/claude-haiku-test", extra_body={"reasoning": {"effort": "none"}}
-    ),
-    "openai completion": _completion("openai/chat-test"),
-    "anthropic completion": _completion("anthropic/claude-test", path=""),
-    "openai embedding": _embedding("openai/text-embedding-test"),
-    "openrouter embedding": _embedding("openrouter/openai/text-embedding-test"),
-}
-
-
-@pytest.mark.parametrize("mode", STALL_MODES)
-@pytest.mark.parametrize("request_name", list(_SDK_REQUESTS))
-async def test_a_model_request_ends_at_its_timeout_however_the_endpoint_stalls(
-    fresh_provider_clients, mode, request_name
-) -> None:
-    """A provider that keeps the connection busy cannot hold a request past its timeout."""
-    with stalling_endpoint(mode) as base_url:
-        started = time.monotonic()
-        with pytest.raises(litellm.Timeout) as raised:
-            await _SDK_REQUESTS[request_name](base_url)
-        elapsed_s = time.monotonic() - started
-
-    assert elapsed_s < _ENDED_AT_ITS_TIMEOUT_S
-    assert is_retryable_provider_error(raised.value) is True
 
 
 async def test_an_exchange_that_outlasts_its_timeout_fails_as_a_read_timeout() -> None:
@@ -761,60 +420,3 @@ def test_ending_provider_client_exchanges_at_their_timeout_wraps_the_builder_onc
     end_provider_client_exchanges_at_their_timeout()
 
     assert AsyncHTTPHandler.create_client is builder
-
-
-@pytest.mark.parametrize(
-    "route", ["openrouter/anthropic/claude-haiku-test", "openai/chat-test", "anthropic/claude-test"]
-)
-async def test_a_structured_call_to_a_trickling_endpoint_ends_at_its_deadline_as_a_transient_failure(
-    fresh_provider_clients, route
-) -> None:
-    with stalling_endpoint("trickle") as base_url:
-        client = LiteLlmStructuredClient(
-            StructuredLlmConfig(
-                model=route,
-                base_url=base_url if route.startswith("anthropic/") else f"{base_url}/v1",
-                api_key="endpoint-key",
-                timeout_s=_REQUEST_TIMEOUT_S,
-            )
-        )
-        started = time.monotonic()
-        with pytest.raises(StructuredLlmError) as raised:
-            await client.rerank_memories("Rank the matching memories")
-        elapsed_s = time.monotonic() - started
-
-    assert elapsed_s < _ENDED_AT_ITS_TIMEOUT_S
-    assert raised.value.terminal_category == "deadline_exceeded"
-    assert failure_retryable(raised.value) is True
-
-
-@pytest.mark.parametrize(
-    ("route", "path"),
-    [
-        ("openai/text-embedding-test", "/v1"),
-        ("openrouter/openai/text-embedding-test", "/v1"),
-        # LiteLLM sends an Ollama embedding without the caller's timeout; the
-        # runtime's own deadline ends it.
-        ("ollama/nomic-embed-text", ""),
-    ],
-)
-async def test_an_embedding_from_a_trickling_endpoint_ends_at_its_deadline_as_a_transient_failure(
-    fresh_provider_clients, route, path
-) -> None:
-    with stalling_endpoint("trickle") as base_url:
-        runtime = EmbeddingRuntime(
-            EmbeddingSettings(
-                invocation=ResolvedInvocation(
-                    route=route, api_base=f"{base_url}{path}", api_key="endpoint-key"
-                ),
-                timeout_s=_REQUEST_TIMEOUT_S,
-                cache_size=0,
-            )
-        )
-        started = time.monotonic()
-        with pytest.raises(EmbeddingDeadlineExceeded) as raised:
-            await runtime.embed_query("alpha")
-        elapsed_s = time.monotonic() - started
-
-    assert elapsed_s < _ENDED_AT_ITS_TIMEOUT_S
-    assert failure_retryable(raised.value) is True
