@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Contributors: `scripts/provider_smoke.py` checks that real providers
+  (OpenRouter, OpenAI, Anthropic, a local Ollama, or any LiteLLM route) accept
+  what MemForge sends, through the same model listing and capability check as
+  "Save and validate", and prints a Markdown table for the PR or release notes.
+  It replaces `scripts/smoke_litellm_source_support.py`. A failed model check
+  now also records the HTTP status the provider answered with (`status_code`
+  in the validation facts).
+
 - Ollama embedding models now work with an Ollama server that requires an API
   key, and a stalled embedding request ends at its timeout. MemForge sends
   embedding requests for the Ollama provider to the server's OpenAI-compatible

@@ -12,8 +12,8 @@ model registry, from the binding or from the ``MEMFORGE_LLM_*`` limits.
 
 A check reports what it observed (latency, the vector dimension, the model id
 the provider reported, how the structured reply was obtained, whether the
-model's token limits are known) or one stable error code. It keeps no prompt
-and no response.
+model's token limits are known, the HTTP status a provider refused a request
+with) or one stable error code. It keeps no prompt and no response.
 """
 
 from __future__ import annotations
@@ -126,6 +126,7 @@ async def check_generation(client: LiteLlmStructuredClient) -> CapabilityCheck:
     collector = StructuredLlmMetricsCollector()
     started = perf_counter()
     error_code: str | None = None
+    status_code: int | None = None
     try:
         with client.metrics_scope(collector):
             async with asyncio.timeout(GENERATION_CHECK_TIMEOUT_S):
@@ -140,6 +141,8 @@ async def check_generation(client: LiteLlmStructuredClient) -> CapabilityCheck:
         error_code = "timeout"
     except StructuredLlmError as exc:
         error_code = _generation_error_code(exc)
+        if error_code != "provider_unreachable":
+            status_code = exc.status_code
     except Exception as exc:
         logger.warning("Generation capability check failed (%s)", type(exc).__name__)
         error_code = "provider_error"
@@ -148,6 +151,8 @@ async def check_generation(client: LiteLlmStructuredClient) -> CapabilityCheck:
         "latency_ms": _elapsed_ms(started),
         "token_limits_known": _token_limits_known(client),
     }
+    if status_code is not None:
+        facts["status_code"] = status_code
     if error_code is None and not facts["token_limits_known"]:
         error_code = "token_limits_required"
     calls = collector.calls()
@@ -188,6 +193,8 @@ async def check_embedding(
             error_code = "embedding_dimension_unstable"
     except EmbeddingError as exc:
         error_code = embedding_error_code(exc)
+        if isinstance(exc, EmbeddingProviderError) and not exc.unreachable and exc.status_code is not None:
+            facts["status_code"] = exc.status_code
     except Exception as exc:
         logger.warning("Embedding capability check failed (%s)", type(exc).__name__)
         error_code = "provider_error"
