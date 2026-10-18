@@ -84,9 +84,10 @@ FEATURES: Mapping[ModelKind, tuple[Feature, ...]] = {
 
 # How a structured request asks for its schema. ``json_schema``: an OpenAI
 # ``response_format`` of type ``json_schema``. ``json_tool_call``: one tool the
-# model is made to call, whose input is the answer. ``json_text``: the schema
-# written into the prompt, for a model LiteLLM does not know to take one.
-SchemaShape = Literal["json_schema", "json_tool_call", "json_text"]
+# model is made to call, whose input is the answer. ``format``: the schema as
+# Ollama's ``format``. ``json_text``: the schema written into the prompt, for a
+# model nothing declares to take one.
+SchemaShape = Literal["json_schema", "json_tool_call", "format", "json_text"]
 
 # The credential an API-key row is configured with.
 _KEY = "row-key"
@@ -277,6 +278,10 @@ class GenerationContract:
     timeout_error: type[Exception]
     # Other fields the request body carries.
     fields: Mapping[str, Any] = field(default_factory=dict)
+    # Whether the model listing declares that the model answers in a response
+    # schema, as Settings binds a model chosen from the listing; ``None`` for a
+    # model the listing declares nothing for.
+    native_schema: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -323,6 +328,10 @@ _OLLAMA_EMBEDDING_KEY_GAP = (
     "server behind authentication never reaches it: https://github.com/BerriAI/litellm/issues/47261"
 )
 _SAME_REQUESTS_AS_KEYLESS_OLLAMA = "The keyless ollama row sends the same requests; only the credential differs."
+_SAME_REQUESTS_AS_OPENROUTER = (
+    "The openrouter row sends the same requests; only the structured request differs, for a "
+    "model the listing declares no response schema support for."
+)
 
 MATRIX: tuple[Row, ...] = (
     Row(
@@ -392,7 +401,7 @@ MATRIX: tuple[Row, ...] = (
             url="https://openrouter.ai/api/v1/chat/completions",
             model="anthropic/claude-haiku-5.5",
             headers={"authorization": f"Bearer {_KEY}"},
-            schema="json_text",
+            schema="json_schema",
             output_limit=("max_tokens",),
             reply=_openai_chat,
             error=_openai_error,
@@ -410,6 +419,7 @@ MATRIX: tuple[Row, ...] = (
             ),
             timeout_error=litellm.Timeout,
             fields={"usage": {"include": True}},
+            native_schema=True,
         ),
         embedding=EmbeddingContract(
             model_id="openai/text-embedding-3-small",
@@ -423,6 +433,34 @@ MATRIX: tuple[Row, ...] = (
         ),
     ),
     Row(
+        id="openrouter-without-response-schema",
+        descriptor="openrouter",
+        auth_strategy="api_key",
+        endpoint=None,
+        api_path="/api/v1",
+        generation=GenerationContract(
+            model_id="meituan/longcat-2.0",
+            url="https://openrouter.ai/api/v1/chat/completions",
+            model="meituan/longcat-2.0",
+            headers={"authorization": f"Bearer {_KEY}"},
+            schema="json_text",
+            output_limit=("max_tokens",),
+            reply=_openai_chat,
+            error=_openai_error,
+            reasoning_off=(),
+            timeout_error=litellm.Timeout,
+            fields={"usage": {"include": True}},
+            native_schema=False,
+        ),
+        excluded={
+            **{
+                ("generation", feature): _SAME_REQUESTS_AS_OPENROUTER
+                for feature in ("credential", "reasoning_off", "timeout", "redirect", "error_classification")
+            },
+            **{("embedding", feature): _SAME_REQUESTS_AS_OPENROUTER for feature in FEATURES["embedding"]},
+        },
+    ),
+    Row(
         id="ollama",
         descriptor="ollama",
         auth_strategy="none",
@@ -433,7 +471,7 @@ MATRIX: tuple[Row, ...] = (
             url="http://localhost:11434/api/chat",
             model="qwen3",
             headers={"authorization": "Bearer no-api-key"},
-            schema="json_text",
+            schema="format",
             output_limit=("options", "num_predict"),
             reply=_ollama_chat,
             error=_ollama_error,
@@ -467,7 +505,7 @@ MATRIX: tuple[Row, ...] = (
             url="https://ollama.example.test/api/chat",
             model="qwen3",
             headers={"authorization": f"Bearer {_KEY}"},
-            schema="json_text",
+            schema="format",
             output_limit=("options", "num_predict"),
             reply=_ollama_chat,
             error=_ollama_error,
@@ -851,6 +889,7 @@ def _invocation(
         endpoint=row.endpoint if endpoint is _DEFAULT_ENDPOINT else endpoint,
         auth_strategy=row.auth_strategy,
         parameters=parameters,
+        native_schema=contract.native_schema if kind == "generation" else None,
         secret_ref=_SECRET_REF if row.auth_strategy == "api_key" else None,
         config_source="settings",
     )
@@ -954,6 +993,10 @@ async def test_a_structured_request_reaches_the_provider_as_its_api_takes_it_and
         assert [tool["name"] for tool in body["tools"]] == ["json_tool_call"]
         assert set(body["tools"][0]["input_schema"]["properties"]) == {"ranking"}
         assert "response_format" not in body
+    elif contract.schema == "format":
+        assert set(body["format"]["properties"]) == {"ranking"}
+        assert [name for name in ("response_format", "tools") if name in body] == []
+        assert _JSON_TEXT_INSTRUCTION not in _prompt_text(body)
     else:
         assert [name for name in ("response_format", "tools", "format") if name in body] == []
         assert _JSON_TEXT_INSTRUCTION in _prompt_text(body)

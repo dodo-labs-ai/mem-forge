@@ -24,6 +24,8 @@ export const WHOLE_NUMBER_MESSAGE = "Enter a whole number greater than zero.";
  * One model as the user edits it. `apiKey` holds only a key the user typed;
  * a saved key never leaves the server. Extra settings and token limits are
  * kept as the text in their fields, by the name the server gives them.
+ * `nativeSchema` is what the model listing declares about the model answering
+ * in a JSON schema, `null` when it declares nothing; it has no field of its own.
  */
 export interface ModelFormValues {
   provider: string;
@@ -34,6 +36,7 @@ export interface ModelFormValues {
   options: Record<string, string>;
   parameters: Record<string, string>;
   tokenLimits: Record<string, string>;
+  nativeSchema: boolean | null;
 }
 
 function fieldText(values: Record<string, unknown>): Record<string, string> {
@@ -55,6 +58,7 @@ export function blankValues(provider: ModelProvider | undefined): ModelFormValue
     options: {},
     parameters: {},
     tokenLimits: {},
+    nativeSchema: null,
   };
 }
 
@@ -74,6 +78,7 @@ export function savedValues(
     options: fieldText(binding.options),
     parameters: fieldText(binding.parameters),
     tokenLimits: fieldText(binding.token_limits),
+    nativeSchema: binding.native_schema ?? null,
   };
 }
 
@@ -125,6 +130,15 @@ export function tokenLimitsForChoice(
   const next: Record<string, string> = { ...current };
   for (const name of names) next[name] = listed[name] ?? "";
   return sameFields(next, current, names) ? null : next;
+}
+
+/**
+ * What the form declares about the model answering in a JSON schema once the
+ * Model field names `typed` and no listed model: what was saved for that
+ * model, or nothing for any other model.
+ */
+export function nativeSchemaForTypedModel(saved: ModelFormValues, provider: string, typed: string): boolean | null {
+  return provider === saved.provider && typed.trim() === saved.model ? saved.nativeSchema : null;
 }
 
 /** The token limits the form filled in from the model list, and the model they belong to. */
@@ -253,6 +267,7 @@ function storedShape(values: ModelFormValues, provider: ModelProvider, kind: Mod
     trimmedFields(values.options, provider.options),
     trimmedFields(values.parameters, parameterNames(provider, kind)),
     trimmedFields(values.tokenLimits, tokenLimitNames(provider, kind)),
+    values.nativeSchema,
   ]);
 }
 
@@ -283,6 +298,7 @@ export function candidateRequest(values: ModelFormValues, provider: ModelProvide
     parameters: numberFields(values.parameters, parameterNames(provider, kind)),
     token_limits: numberFields(values.tokenLimits, tokenLimitNames(provider, kind)),
   };
+  if (kind === "generation" && values.nativeSchema !== null) request.native_schema = values.nativeSchema;
   const key = typedKey(values);
   if (key !== "") request.api_key = key;
   return request;
@@ -367,6 +383,7 @@ const valuesSchema = z.object({
   options: z.record(z.string(), z.string()),
   parameters: z.record(z.string(), z.string()),
   tokenLimits: z.record(z.string(), z.string()),
+  nativeSchema: z.boolean().nullable(),
 });
 
 /** The form schema: every problem `problemsOf` finds is reported on its field. */

@@ -228,6 +228,7 @@ def test_environment_values_read_as_the_active_binding_without_the_key(db, tmp_p
         "options": {},
         "parameters": {},
         "token_limits": {},
+        "native_schema": None,
         "config_source": "environment",
         "state": "not_validated",
         "validation": None,
@@ -1497,8 +1498,8 @@ def test_discovery_lists_the_models_of_an_endpoint(db, tmp_path, monkeypatch) ->
     assert payload["ok"] is True
     assert payload["models_supported"] is True
     assert payload["models"] == [
-        {"id": "model-a", "label": None, "context_window_tokens": None, "max_output_tokens": None},
-        {"id": "model-b", "label": "Model B", "context_window_tokens": None, "max_output_tokens": None},
+        {"id": "model-a", "label": None, "context_window_tokens": None, "max_output_tokens": None, "native_schema": None},
+        {"id": "model-b", "label": "Model B", "context_window_tokens": None, "max_output_tokens": None, "native_schema": None},
     ]
     assert payload["kind_filtered"] is False
     assert payload["message"] == "Connected. Found 2 models; the endpoint does not say which are embedding models."
@@ -1519,13 +1520,25 @@ OPENROUTER_CHAT_MODELS = {
             "name": "Anthropic: Claude Haiku 5.5",
             "context_length": 1_000_000,
             "top_provider": {"context_length": 1_000_000, "max_completion_tokens": 128_000},
+            "supported_parameters": ["max_tokens", "response_format", "structured_outputs", "tools"],
         },
-        {"id": "openai/gpt-5-mini", "name": "OpenAI: GPT-5 Mini", "top_provider": {"max_completion_tokens": None}},
+        {
+            "id": "openai/gpt-5-mini",
+            "name": "OpenAI: GPT-5 Mini",
+            "top_provider": {"max_completion_tokens": None},
+            "supported_parameters": ["max_tokens", "response_format"],
+        },
+        {"id": "meituan/longcat-2.0", "name": "Meituan: LongCat 2.0"},
     ]
 }
 OPENROUTER_EMBEDDING_MODELS = {
     "data": [
-        {"id": "openai/text-embedding-3-small", "name": "OpenAI: Text Embedding 3 Small", "context_length": 8_192},
+        {
+            "id": "openai/text-embedding-3-small",
+            "name": "OpenAI: Text Embedding 3 Small",
+            "context_length": 8_192,
+            "supported_parameters": ["dimensions"],
+        },
         {"id": "qwen/qwen3-embedding-8b", "name": "Qwen: Qwen3 Embedding 8B"},
     ]
 }
@@ -1551,12 +1564,20 @@ def test_openrouter_lists_each_kind_from_its_own_listing(db, tmp_path, monkeypat
         "https://openrouter.ai/api/v1/models",
     ]
     assert [model["id"] for model in embedding["models"]] == ["openai/text-embedding-3-small", "qwen/qwen3-embedding-8b"]
+    assert [model["native_schema"] for model in embedding["models"]] == [None, None]
     assert (embedding["kind_filtered"], embedding["message"]) == (True, "Connected. Found 2 embedding models.")
-    assert [model["id"] for model in generation["models"]] == ["anthropic/claude-haiku-5.5", "openai/gpt-5-mini"]
-    assert generation["message"] == "Connected. Found 2 generation models."
+    assert [model["id"] for model in generation["models"]] == [
+        "anthropic/claude-haiku-5.5",
+        "openai/gpt-5-mini",
+        "meituan/longcat-2.0",
+    ]
+    assert generation["message"] == "Connected. Found 3 generation models."
 
 
-def test_discovery_carries_the_token_limits_a_listing_gives(db, tmp_path, monkeypatch) -> None:
+def test_discovery_carries_the_token_limits_and_the_response_schema_support_a_listing_gives(
+    db, tmp_path, monkeypatch
+) -> None:
+    """OpenRouter declares a model's response schema support by ``structured_outputs``; JSON mode alone is not it."""
     Endpoint(monkeypatch, _openrouter)
     client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
 
@@ -1568,14 +1589,89 @@ def test_discovery_carries_the_token_limits_a_listing_gives(db, tmp_path, monkey
             "label": "Anthropic: Claude Haiku 5.5",
             "context_window_tokens": 1_000_000,
             "max_output_tokens": 128_000,
+            "native_schema": True,
         },
         {
             "id": "openai/gpt-5-mini",
             "label": "OpenAI: GPT-5 Mini",
             "context_window_tokens": None,
             "max_output_tokens": None,
+            "native_schema": False,
+        },
+        {
+            "id": "meituan/longcat-2.0",
+            "label": "Meituan: LongCat 2.0",
+            "context_window_tokens": None,
+            "max_output_tokens": None,
+            "native_schema": None,
         },
     ]
+
+
+def test_a_listing_that_declares_no_response_schema_support_gives_none(db, tmp_path, monkeypatch) -> None:
+    """Only a listing known to declare it is read for it, whatever other entries carry."""
+
+    def respond(url, request):
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "served-model", "supported_parameters": ["structured_outputs"]}]},
+            request=request,
+        )
+
+    Endpoint(monkeypatch, respond)
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+
+    generation = _discover(
+        client, "generation", provider="openai_compatible", endpoint="https://models.example.test/v1"
+    )
+
+    assert [(model["id"], model["native_schema"]) for model in generation["models"]] == [("served-model", None)]
+
+
+OPENROUTER_GENERATION = {"provider": "openrouter", "model_id": "anthropic/claude-haiku-5.5"}
+
+
+@pytest.mark.parametrize(
+    ("declared", "native"),
+    [(True, True), (False, False), (None, True)],
+    ids=["declared", "declined", "undeclared-the-model-map-decides"],
+)
+async def test_a_model_chosen_from_the_listing_is_asked_for_its_schema_as_the_listing_declares(
+    db, tmp_path, providers, declared, native
+) -> None:
+    """The fixture's LiteLLM model map takes a schema for every model; a declaration overrides it."""
+    config = _config(tmp_path)
+    settings = _settings(config)
+    await settings.save_candidate(
+        db,
+        "generation",
+        CandidateDraft(**OPENROUTER_GENERATION, api_key=GENERATION_KEY, native_schema=declared),
+    )
+
+    outcome = await settings.validate_candidate(db, "generation")
+    models = await resolve_models(db, config)
+
+    assert outcome.promoted is True
+    assert outcome.validation.facts["structured_output_mode"] == ("native_schema" if native else "json_text")
+    assert ("response_format" in providers.generation_requests[0]) is native
+    assert models.generation.native_schema is declared
+
+
+def test_the_declared_response_schema_support_is_saved_shown_and_checked_again_when_it_changes(
+    db, tmp_path, providers
+) -> None:
+    client = TestClient(create_admin_app(db=db, config=_config(tmp_path)))
+    client.put(f"{API}/generation/candidate", json={**OPENROUTER_GENERATION, "api_key": GENERATION_KEY})
+    client.post(f"{API}/generation/candidate/validate")
+
+    saved = client.put(f"{API}/generation/candidate", json={**OPENROUTER_GENERATION, "native_schema": True})
+    refused = client.put(f"{API}/embedding/candidate", json={**COMPATIBLE_EMBEDDING, "native_schema": True})
+
+    assert saved.status_code == 200, saved.text
+    assert (saved.json()["active"]["native_schema"], saved.json()["active"]["state"]) == (None, "ready")
+    assert (saved.json()["candidate"]["native_schema"], saved.json()["candidate"]["state"]) == (True, "not_validated")
+    assert refused.status_code == 422
+    assert refused.json()["detail"]["error"] == "native_schema_not_supported"
 
 
 def test_a_pasted_listing_path_is_read_as_the_base_url_it_follows(db, tmp_path, monkeypatch) -> None:
