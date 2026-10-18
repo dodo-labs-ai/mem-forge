@@ -66,7 +66,7 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
         paused ? "Could not pause the source" : "Could not resume the source",
       );
     },
-    /** @deprecated admin-ui-v1: V2's own source setup dialogs replace this (ADR 0044). */
+    /** @deprecated admin-ui-v1: V2's own source setup dialogs replace this. */
     openInV1() {
       window.location.assign(V1_SOURCES_PATH);
     },

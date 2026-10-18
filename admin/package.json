@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "MemForge admin UI. Runs at /v2/ beside the V1 admin-ui package until V1 is removed (ADR 0044).",
+  "description": "MemForge admin UI. Runs at /v2/ beside the V1 admin-ui package until V1 is removed.",
   "exports": {
     "./app": "./src/app/render.tsx",
     "./ui": "./src/ui/index.ts",

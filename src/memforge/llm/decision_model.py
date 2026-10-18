@@ -1,7 +1,7 @@
 """Which model answers a Decision task.
 
 A Decision task answers one fixed question about one item the program supplied
-in full, with closed options (ADR 0043). It moves to the decision model only
+in full, with closed options. It moves to the decision model only
 after its contract version passes its evaluation: on held-out labeled cases,
 against the main model, its safe-answer recall and its precision on every other
 option are no lower. Passed tasks are registered here with that contract

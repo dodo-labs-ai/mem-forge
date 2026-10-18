@@ -87,7 +87,7 @@ class Gene(ABC):
     - ``rediscovers_documents()`` and ``rediscover()`` -- read one stored
       Document's current state from the provider by its id
     - ``list_scope()`` and ``confirm_absent()`` -- list the configured scope
-      by identifier so a run can prove which Documents are gone (ADR 0045)
+      by identifier so a run can prove which Documents are gone
     """
 
     # ------------------------------------------------------------------

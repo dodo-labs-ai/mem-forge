@@ -1985,7 +1985,7 @@ class ResolvedProjectsResponse(BaseModel):
 # (storage to wire) and inline in the create/update handlers (wire to storage).
 # Deprecated (admin-ui-v1): ranking and access read only the reserved SHARED
 # key, so `kind` changes a label and nothing else. It is removed with the V1
-# admin UI, together with `is_shared` in storage (ADR 0044).
+# admin UI, together with `is_shared` in storage.
 # The schema flag marks the field in OpenAPI without a runtime warning on V1 calls.
 PROJECT_KIND_SCHEMA = {"deprecated": True}
 
@@ -5504,7 +5504,7 @@ def create_admin_app(
     # Deprecated (admin-ui-v1): the V1 memory detail page retires through this
     # route with a fixed reason and no content hash, visibility check or actor.
     # The admin UI uses POST /memories/{id}/retire; this route is removed with
-    # the V1 admin UI (ADR 0044).
+    # the V1 admin UI.
     @memory_router.put(
         "/{memory_id}",
         deprecated=True,

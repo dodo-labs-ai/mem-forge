@@ -122,7 +122,7 @@ class Project:
     key: str
     name: str
     # Deprecated (admin-ui-v1): a display label with no effect on ranking or
-    # access. Removed with the V1 admin UI (ADR 0044).
+    # access. Removed with the V1 admin UI.
     is_shared: bool = False
     created_at: datetime | None = None
 
@@ -506,7 +506,7 @@ class NormalizedContent:
 
 
 class ScopeListingKind(str, Enum):
-    """What a Source's scope listing proves about an item it does not list (ADR 0045)."""
+    """What a Source's scope listing proves about an item it does not list."""
 
     # The listing enumerates everything the provider holds at the configured
     # location, such as a repository tree at a ref: an unlisted item is absent.

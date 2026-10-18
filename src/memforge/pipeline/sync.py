@@ -1617,7 +1617,7 @@ class GeneSyncOrchestrator:
             # or a complete discovery of a newly configured scope, is the whole
             # scope: what it did not return is removed. Every other run lists
             # the configured scope by identifier and removes only what that
-            # listing proves absent (ADR 0045).
+            # listing proves absent.
             #
             # Absence is proven only after every Unit of this run has committed,
             # so deferred commits blocked only by this run's Units converge

@@ -1,4 +1,4 @@
-"""A document Source removes a Unit only when its scope listing proves the provider no longer has it (ADR 0045)."""
+"""A document Source removes a Unit only when its scope listing proves the provider no longer has it."""
 
 from __future__ import annotations
 
