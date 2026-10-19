@@ -174,6 +174,9 @@ class ResolvedInvocation:
     # structured request gives, as the provider declares it; ``None`` when it
     # declares nothing, and LiteLLM's model map decides.
     native_schema: bool | None = None
+    # Whether the model reads images, as its latest capability check observed;
+    # ``None`` when no check has told.
+    image_input: bool | None = None
 
     def __post_init__(self) -> None:
         for name, value in self.extra_params.items():

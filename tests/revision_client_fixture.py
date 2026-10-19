@@ -130,6 +130,7 @@ def sparse_response(prompt, decisions):
 
 class RevisionClientFixture:
     input_policy_identity = "test-input-policy"
+    reads_images = True
 
     def request_budget(self, model=None):
         from memforge.llm.request_budget import RequestBudget

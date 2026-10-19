@@ -72,7 +72,7 @@ from memforge.pipeline.projection_fragments import (
     SupportRevalidationLimitation,
     SupportRevalidationLimitationCode,
 )
-from memforge.pipeline.revision_assessment import RevisionAssessmentContext, SupportAssessment
+from memforge.pipeline.revision_assessment import RevisionAssessmentContext, SupportAssessment, client_reads_images
 from memforge.pipeline.revision_work import CHANGE_IMPACT_TASK
 from memforge.pipeline.support_relation_coordinator import (
     MemorySupport,
@@ -115,6 +115,17 @@ logger = logging.getLogger(__name__)
 _First = TypeVar("_First")
 _Second = TypeVar("_Second")
 _EMPTY_OBSERVATION_REASON = "source observation is explicitly empty"
+_NOT_INFERENCE_ELIGIBLE_REASON = "current Source Artifact revision is not inference eligible"
+# A model that reads text alone cannot read the images the Evidence may cite,
+# however readable they are, so the Review says so.
+_TEXT_ONLY_MODEL_REASON = (
+    "the generation model reads text only, so the images of the current Source Artifact revision were not read"
+)
+
+
+def _protected_reason(reads_images: bool) -> str:
+    """Why the Review proposes removing a Memory whose current Support could not be re-derived."""
+    return _NOT_INFERENCE_ELIGIBLE_REASON if reads_images else _TEXT_ONLY_MODEL_REASON
 
 __all__ = [
     "DeferredProjectedLifecycleHandle",
@@ -1007,7 +1018,10 @@ class MemoryEngine:
         structured_llm_elapsed_ms = 0
         bounded_reconciliation_elapsed_ms = 0
         from memforge.pipeline.projection_images import projection_inference_image_observation_ids
-        if not document_content.strip() and not filtered_memories and not projection_inference_image_observation_ids(projection):
+        reads_images = client_reads_images(self.structured_llm_client)
+        if not document_content.strip() and not filtered_memories and not (
+            reads_images and projection_inference_image_observation_ids(projection)
+        ):
             # Nothing is left to read or relate. Whether each claim's Evidence is gone
             # is a coverage fact, which DestructiveValidation checks before any removal.
             evidence_by_memory = await self.db.get_active_memory_support_evidence_many(
@@ -1026,7 +1040,7 @@ class MemoryEngine:
                     action=ReconcileAction.DELETE,
                     memory_id=memory.id,
                     reason=(
-                        "current Source Artifact revision is not inference eligible"
+                        _protected_reason(reads_images)
                         if memory.id in derivation_protected_ids
                         else _EMPTY_OBSERVATION_REASON
                     ),
@@ -1068,6 +1082,7 @@ class MemoryEngine:
                 assessment_context = RevisionAssessmentContext(
                     projection=projection, base=base, access_context_hash=access_context_hash,
                     image_loader=evidence_image_loader, evidence_revisions=evidence_revisions,
+                    reads_images=reads_images,
                 )
 
                 def assessment_context_for(baseline):
@@ -1080,6 +1095,7 @@ class MemoryEngine:
                         image_loader=evidence_image_loader, indexes=assessment_context.indexes,
                         known_observations=base.observations if base is not None else (),
                         evidence_revisions=tuple(assessment_context.revisions.values()),
+                        reads_images=reads_images,
                     )
                 contexts_by_revision = {base.source_unit_revisions[0].id: assessment_context} if base else {}
                 for memory in model_incumbents:
@@ -1339,7 +1355,7 @@ class MemoryEngine:
                 ReconcileOperation(
                     action=ReconcileAction.DELETE,
                     memory_id=memory_id,
-                    reason=("current Source Artifact revision is not inference eligible"),
+                    reason=_protected_reason(reads_images),
                     flag_for_review=True,
                 )
                 for memory_id in sorted(derivation_protected_ids)

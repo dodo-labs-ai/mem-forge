@@ -73,7 +73,9 @@ __all__ = [
     "key_last4",
     "key_source",
     "new_stored_secret",
+    "observed_image_input",
     "parameters_for_kind",
+    "record_unstored_check",
     "resolve_active_binding",
     "resolve_active_invocation",
     "resolve_credential",
@@ -340,7 +342,23 @@ def compile_binding(binding: ModelBinding, credential: str | None) -> ResolvedIn
         extra_params={**binding.options, **binding.parameters},
         provider=binding.provider,
         native_schema=native_schema,
+        image_input=observed_image_input(binding),
     )
+
+
+def observed_image_input(binding: ModelBinding) -> bool | None:
+    """Whether the generation model reads images, as the check on record for the binding observed.
+
+    A check observes it only when it passed for the binding as it stands, so a
+    binding changed since, or one that has not passed, tells nothing.
+    """
+    validation = binding.validation
+    if binding.kind != "generation" or validation is None or not validation.passed:
+        return None
+    if validation.digest != binding.digest:
+        return None
+    observed = validation.facts.get("image_input")
+    return observed if isinstance(observed, bool) else None
 
 
 def binding_from_settings(
@@ -611,11 +629,36 @@ async def resolve_active_binding(
 ) -> ModelBinding | None:
     """Return the binding the runtime uses for ``kind`` with this database."""
     if not config.server.llm_config_writable:
-        return environment_binding(config, kind, config_source="deployment")
+        return _with_unstored_check(environment_binding(config, kind, config_source="deployment"))
     stored = await db.get_model_binding(kind, "active")
     if stored is not None:
         return binding_from_record(stored)
-    return environment_binding(config, kind, config_source="environment")
+    return _with_unstored_check(environment_binding(config, kind, config_source="environment"))
+
+
+# The state and latest check this process recorded of each active binding that
+# is not stored. Such a binding is read from the environment as the process
+# starts, so its check is kept for as long as the process runs.
+_unstored_checks: dict[ModelKind, tuple[BindingState, ValidationResult]] = {}
+
+
+def record_unstored_check(binding: ModelBinding, state: BindingState, validation: ValidationResult) -> None:
+    """Keep the outcome of a check of an active binding that is not stored, for the runtime to read."""
+    _unstored_checks[binding.kind] = (state, validation)
+
+
+def _with_unstored_check(binding: ModelBinding | None) -> ModelBinding | None:
+    if binding is None:
+        return None
+    recorded = _unstored_checks.get(binding.kind)
+    if recorded is None:
+        return binding
+    state, validation = recorded
+    return replace(
+        binding,
+        state=state_after_change(state, previous_digest=validation.digest, digest=binding.digest),
+        validation=validation,
+    )
 
 
 async def resolve_credential(

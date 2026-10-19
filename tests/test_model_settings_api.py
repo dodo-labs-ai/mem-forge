@@ -7,6 +7,7 @@ import json
 import sqlite3
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -37,6 +38,8 @@ OTHER_KEY = "replacement-secret-key-4444"
 ALL_KEYS = (GENERATION_KEY, EMBEDDING_KEY, ENVIRONMENT_KEY, OTHER_KEY)
 API = "/api/v1/model-settings"
 EXPECTED_REPLY = {"probe": {"label": "memforge", "confirmed": True, "items": ["alpha", "beta", "gamma"]}}
+# The number the image of every capability check shows here.
+IMAGE_DIGITS = "7319"
 
 OPENAI_GENERATION = {"provider": "openai", "model_id": "gpt-5-mini"}
 COMPATIBLE_EMBEDDING = {
@@ -83,7 +86,8 @@ class Providers:
     """Stand in for the model providers behind LiteLLM.
 
     Every generation and embedding request is recorded. A failure set on a kind
-    is raised for each of its requests until it is cleared.
+    is raised for each of its requests until it is cleared. The generation model
+    reads images: it names the number of a check's image.
     """
 
     def __init__(self, monkeypatch) -> None:
@@ -93,8 +97,10 @@ class Providers:
         self.embedding_failure: Exception | None = None
         self.generation_gate: threading.Event | None = None
         self.dimension = 3
+        self.image_reply: dict[str, Any] = {"digits": IMAGE_DIGITS}
         monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", self.complete)
         monkeypatch.setattr("memforge.llm.structured.litellm.supports_response_schema", lambda **_kwargs: True)
+        monkeypatch.setattr("memforge.llm.capability._new_probe_digits", lambda: IMAGE_DIGITS)
         monkeypatch.setattr("litellm.aembedding", self.embed)
 
     async def complete(self, **request: Any) -> Any:
@@ -105,11 +111,12 @@ class Providers:
             await asyncio.sleep(0.005)
         if self.generation_failure is not None:
             raise self.generation_failure
+        reply = self.image_reply if _carries_image(request) else EXPECTED_REPLY
         return SimpleNamespace(
             model="reported-generation-model",
             choices=[
                 SimpleNamespace(
-                    message=SimpleNamespace(content=json.dumps(EXPECTED_REPLY)),
+                    message=SimpleNamespace(content=json.dumps(reply)),
                     finish_reason="stop",
                 )
             ],
@@ -126,6 +133,19 @@ class Providers:
                 for index, text in enumerate(request["input"])
             ],
         }
+
+
+def _carries_image(request: dict[str, Any]) -> bool:
+    return any(
+        isinstance(message.get("content"), list)
+        and any(block.get("type") == "image_url" for block in message["content"])
+        for message in request.get("messages", ())
+    )
+
+
+def text_requests(providers: "Providers") -> list[dict[str, Any]]:
+    """The generation requests that are not the image of a check."""
+    return [request for request in providers.generation_requests if not _carries_image(request)]
 
 
 class Rejection(Exception):
@@ -634,6 +654,7 @@ def test_a_candidate_becomes_active_only_after_its_check_passes(db, tmp_path, pr
         "structured_output_mode": "native_schema",
         "schema_fallback": False,
         "provider_model": "reported-generation-model",
+        "image_input": True,
     }
     assert _stored_rows(db) == [("generation", "active")]
     for response in (failed, passed):
@@ -669,6 +690,7 @@ async def test_the_runtime_uses_a_promoted_binding(db, tmp_path, providers) -> N
         api_base="https://api.openai.com/v1",
         api_key=GENERATION_KEY,
         provider="openai",
+        image_input=True,
     )
 
 
@@ -852,7 +874,7 @@ async def test_simultaneous_checks_of_the_active_binding_make_one_model_request(
     providers.generation_gate.set()
     outcomes = await asyncio.gather(*checks)
 
-    assert len(providers.generation_requests) == 1
+    assert len(text_requests(providers)) == 1
     assert {outcome.state for outcome in outcomes} == {"ready"}
     assert len({outcome.validation.checked_at for outcome in outcomes}) == 1
     assert (await settings.health(db))["generation"].state == "ready"
@@ -866,7 +888,7 @@ async def test_a_check_requested_after_one_finished_is_made_again(db, tmp_path, 
     await settings.validate_active(db, "generation")
     await settings.validate_active(db, "generation")
 
-    assert len(providers.generation_requests) == 2
+    assert len(text_requests(providers)) == 2
 
 
 async def test_a_check_that_started_first_is_the_one_whose_outcome_is_stored(db, tmp_path, providers) -> None:
@@ -887,7 +909,7 @@ async def test_a_check_that_started_first_is_the_one_whose_outcome_is_stored(db,
     outcomes = await asyncio.gather(first, second)
 
     view = await settings.view(db, "generation")
-    assert len(providers.generation_requests) == 1
+    assert len(text_requests(providers)) == 1
     assert [outcome.state for outcome in outcomes] == ["needs_revalidation", "needs_revalidation"]
     assert view.active.binding.state == "needs_revalidation"
     assert view.active.binding.validation.error_code == "authentication_failed"
@@ -906,7 +928,7 @@ async def test_simultaneous_validations_of_a_candidate_promote_it_once(db, tmp_p
     outcomes = await asyncio.gather(*checks)
 
     view = await settings.view(db, "generation")
-    assert len(providers.generation_requests) == 1
+    assert len(text_requests(providers)) == 1
     assert [outcome.promoted for outcome in outcomes] == [True, True, True]
     assert (view.active.binding.state, view.candidate) == ("ready", None)
 
@@ -923,7 +945,7 @@ async def test_a_binding_that_replaced_the_checked_one_gets_a_check_of_its_own(d
         await asyncio.sleep(0.005)
     await settings.save_candidate(db, "generation", CandidateDraft(provider="openai", model_id="gpt-5"))
     promotion = asyncio.create_task(settings.validate_candidate(db, "generation"))
-    while len(providers.generation_requests) < 2:
+    while len(text_requests(providers)) < 2:
         await asyncio.sleep(0.005)
     providers.generation_gate.set()
     await asyncio.gather(first, promotion)
@@ -931,7 +953,7 @@ async def test_a_binding_that_replaced_the_checked_one_gets_a_check_of_its_own(d
     await settings.validate_active(db, "generation")
 
     view = await settings.view(db, "generation")
-    assert [request["model"] for request in providers.generation_requests] == ["openai/gpt-5"]
+    assert [request["model"] for request in text_requests(providers)] == ["openai/gpt-5"]
     assert (view.active.binding.model_id, view.active.binding.state) == ("gpt-5", "ready")
 
 
@@ -964,6 +986,97 @@ async def test_a_candidate_saved_again_while_it_is_checked_is_not_promoted(
 async def _ready_generation(db: Database, settings: ModelSettings) -> None:
     await settings.save_candidate(db, "generation", CandidateDraft(**OPENAI_GENERATION, api_key=GENERATION_KEY))
     assert (await settings.validate_candidate(db, "generation")).promoted is True
+
+
+async def test_a_model_its_check_finds_reading_text_alone_gets_no_image_at_runtime(db, tmp_path, providers) -> None:
+    config = _config(tmp_path)
+    providers.image_reply = {"digits": ""}
+    await _ready_generation(db, _settings(config))
+
+    stored = bindings.binding_from_record(await db.get_model_binding("generation", "active"))
+    models = await resolve_models(db, config)
+
+    assert stored.validation.facts["image_input"] is False
+    assert models.generation.image_input is False
+    assert DefaultRuntimeProvider().build_structured_llm_client(models, max_concurrent=1).reads_images is False
+
+
+@pytest.mark.parametrize("config_source", ["environment", "deployment"])
+async def test_a_model_the_environment_names_gets_no_image_once_its_check_finds_it_reads_text_alone(
+    db, tmp_path, providers, config_source
+) -> None:
+    if config_source == "deployment":
+        config = _deployment_config(tmp_path)
+    else:
+        config = _config(tmp_path)
+        config.llm.enrichment_api_key = GENERATION_KEY
+    providers.image_reply = {"digits": ""}
+
+    await _settings(config).validate_unready_active_bindings(db)
+    models = await resolve_models(db, config)
+
+    assert await db.get_model_binding("generation", "active") is None
+    assert models.generation.image_input is False
+
+
+async def _ready_generation_never_asked_about_images(
+    db: Database, settings: ModelSettings, providers: Providers
+) -> bindings.ValidationResult:
+    await _ready_generation(db, settings)
+    record = await db.get_model_binding("generation", "active")
+    checked = bindings.binding_from_record(record).validation
+    unasked = {key: value for key, value in checked.facts.items() if key != "image_input"}
+    record["validation"] = {**record["validation"], "facts": unasked}
+    await db.put_model_binding("generation", "active", record)
+    providers.generation_requests.clear()
+    return replace(checked, facts=unasked)
+
+
+async def test_a_starting_server_asks_a_ready_model_once_whether_it_reads_images(db, tmp_path, providers) -> None:
+    settings = _settings(_config(tmp_path))
+    unasked = await _ready_generation_never_asked_about_images(db, settings, providers)
+
+    await settings.validate_unready_active_bindings(db)
+    asked = bindings.binding_from_record(await db.get_model_binding("generation", "active"))
+    await settings.validate_unready_active_bindings(db)
+
+    assert asked.state == "ready"
+    assert asked.validation == replace(unasked, facts={**unasked.facts, "image_input": True})
+    assert len(providers.generation_requests) == 1
+    assert text_requests(providers) == []
+
+
+async def test_a_check_requested_while_a_starting_server_asks_about_images_is_made(
+    db, tmp_path, providers
+) -> None:
+    settings = _settings(_config(tmp_path))
+    await _ready_generation_never_asked_about_images(db, settings, providers)
+    providers.generation_gate = threading.Event()
+
+    asking = asyncio.create_task(settings.validate_unready_active_bindings(db))
+    while not providers.generation_requests:
+        await asyncio.sleep(0.005)
+    check = asyncio.create_task(settings.validate_active(db, "generation"))
+    await asyncio.sleep(0.05)
+    providers.generation_gate.set()
+    await asking
+    outcome = await check
+
+    assert len(text_requests(providers)) == 1
+    assert outcome.validation.facts["image_input"] is True
+    assert outcome.state == "ready"
+
+
+async def test_a_provider_down_at_start_leaves_a_ready_model_ready(db, tmp_path, providers) -> None:
+    settings = _settings(_config(tmp_path))
+    unasked = await _ready_generation_never_asked_about_images(db, settings, providers)
+    providers.generation_failure = litellm.ServiceUnavailableError("no upstream available", "openai", "gpt-5-mini")
+
+    await settings.validate_unready_active_bindings(db)
+    asked = bindings.binding_from_record(await db.get_model_binding("generation", "active"))
+
+    assert asked.state == "ready"
+    assert asked.validation == replace(unasked, facts={**unasked.facts, "image_input": None})
 
 
 async def test_a_failed_check_moves_a_ready_binding_to_needs_revalidation_and_it_stays_in_use(
@@ -1102,7 +1215,7 @@ async def test_a_starting_server_checks_carried_over_bindings_without_waiting_fo
 
     assert while_checking["generation"] == {"configured": True, "state": "not_validated"}
     assert checked["generation"] == {"configured": True, "state": "ready"}
-    assert len(providers.generation_requests) == 1
+    assert len(text_requests(providers)) == 1
     stored = bindings.binding_from_record(await db.get_model_binding("generation", "active"))
     assert stored.state == "ready"
     assert stored.validation.facts["structured_output_mode"] == "native_schema"
@@ -1138,7 +1251,7 @@ async def test_a_starting_server_checks_again_a_binding_validated_under_another_
     assert (await settings.health(db))["generation"].state == "needs_revalidation"
     await settings.validate_unready_active_bindings(db)
 
-    assert len(providers.generation_requests) == 1
+    assert len(text_requests(providers)) == 1
     assert (await settings.health(db))["generation"].state == "ready"
 
 
@@ -1382,7 +1495,7 @@ def test_a_model_litellm_has_no_limits_for_fails_its_check_until_the_limits_are_
     assert (with_limits["passed"], with_limits["promoted"], with_limits["error_code"]) == (True, True, None)
     assert with_limits["validation"]["facts"]["token_limits_known"] is True
     assert with_limits["settings"]["active"]["token_limits"] == TOKEN_LIMITS
-    assert len(providers.generation_requests) == 2
+    assert len(text_requests(providers)) == 2
 
 
 async def test_the_runtime_sizes_its_requests_with_the_limits_of_the_binding(db, tmp_path, providers) -> None:
@@ -1786,7 +1899,7 @@ async def test_a_starting_server_refreshes_a_ready_model_from_the_listing_withou
     assert listing.asked == [("anthropic/claude-haiku-5.5", GENERATION_KEY)]
     assert (after.native_schema, after.state, after.saved_at) == (listed, "ready", before.saved_at)
     assert (after.digest, after.validation) == (before.digest, before.validation)
-    assert len(providers.generation_requests) == 1
+    assert len(text_requests(providers)) == 1
 
 
 async def test_checking_the_model_in_use_again_refreshes_it_from_the_listing(db, tmp_path, providers) -> None:
@@ -1847,7 +1960,7 @@ async def test_a_starting_server_refreshes_the_stored_model_from_the_provider_li
 
     stored = bindings.binding_from_record(await db.get_model_binding("generation", "active"))
     assert (stored.native_schema, stored.state) == (True, "ready")
-    assert len(providers.generation_requests) == 1
+    assert len(text_requests(providers)) == 1
 
 
 async def test_the_listing_is_asked_what_it_declares_about_the_stored_model(db, tmp_path, monkeypatch) -> None:

@@ -13,6 +13,7 @@ import pytest
 
 from memforge.llm.capability import (
     CapabilityCheckResponse,
+    ImageReadingResponse,
     check_embedding,
     check_generation,
 )
@@ -30,6 +31,8 @@ EMBEDDING = ResolvedInvocation(
     api_key="embedding-secret-key",
 )
 EXPECTED_REPLY = {"probe": {"label": "memforge", "confirmed": True, "items": ["alpha", "beta", "gamma"]}}
+# The number the image of every check shows here.
+IMAGE_DIGITS = "4821"
 
 
 def _completion(content: Any, *, model: str | None = "check-model-2026-10") -> SimpleNamespace:
@@ -41,23 +44,47 @@ def _completion(content: Any, *, model: str | None = "check-model-2026-10") -> S
 
 
 class Provider:
-    """Stand in for the generation provider behind LiteLLM and record every request."""
+    """Stand in for the generation provider behind LiteLLM and record every request.
 
-    def __init__(self, monkeypatch, *steps: Any, native_schema: bool = True) -> None:
+    Each request takes the next step. Without one, the model answers the text
+    probe and names the number of the check's image. ``images``, when given,
+    answers every request that carries an image instead.
+    """
+
+    def __init__(self, monkeypatch, *steps: Any, native_schema: bool = True, images: Any = None) -> None:
         self._steps = list(steps)
+        self._images = images
         self.requests: list[dict[str, Any]] = []
         monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", self)
         monkeypatch.setattr(
             "memforge.llm.structured.litellm.supports_response_schema",
             lambda **_kwargs: native_schema,
         )
+        monkeypatch.setattr("memforge.llm.capability._new_probe_digits", lambda: IMAGE_DIGITS)
 
     async def __call__(self, **request: Any) -> Any:
         self.requests.append(request)
-        step = self._steps.pop(0) if self._steps else _completion(EXPECTED_REPLY)
+        if self._images is not None and _carries_image(request):
+            step = self._images
+        elif self._steps:
+            step = self._steps.pop(0)
+        else:
+            step = _completion({"digits": IMAGE_DIGITS} if _carries_image(request) else EXPECTED_REPLY)
         if isinstance(step, BaseException):
             raise step
         return step
+
+    @property
+    def image_requests(self) -> list[dict[str, Any]]:
+        return [request for request in self.requests if _carries_image(request)]
+
+
+def _carries_image(request: dict[str, Any]) -> bool:
+    return any(
+        isinstance(message.get("content"), list)
+        and any(block.get("type") == "image_url" for block in message["content"])
+        for message in request.get("messages", ())
+    )
 
 
 def _refused_connection() -> Exception:
@@ -108,6 +135,7 @@ async def test_a_generation_model_that_returns_the_object_passes(monkeypatch) ->
         "structured_output_mode": "native_schema",
         "schema_fallback": False,
         "provider_model": "check-model-2026-10",
+        "image_input": True,
     }
     request = provider.requests[0]
     assert request["model"] == "openai/check-model"
@@ -140,8 +168,8 @@ async def test_a_model_without_native_schema_support_is_checked_with_the_schema_
     assert check.passed is True
     assert check.facts["structured_output_mode"] == "json_text"
     assert check.facts["schema_fallback"] is False
-    assert len(provider.requests) == 1
-    assert "response_format" not in provider.requests[0]
+    assert len(provider.requests) == 2
+    assert all("response_format" not in request for request in provider.requests)
 
 
 @pytest.mark.parametrize(
@@ -216,7 +244,9 @@ async def test_a_model_whose_token_limits_nobody_knows_fails_after_it_has_answer
     assert unknown.facts["structured_output_mode"] == "native_schema"
     assert configured.passed is True
     assert configured.facts["token_limits_known"] is True
-    assert len(provider.requests) == 2
+    assert "image_input" not in unknown.facts
+    assert len(provider.requests) == 3
+    assert len(provider.image_requests) == 1
 
 
 async def test_a_failed_request_is_reported_before_missing_token_limits(monkeypatch) -> None:
@@ -253,9 +283,107 @@ async def test_a_generation_check_keeps_neither_the_prompt_nor_the_reply(monkeyp
         "structured_output_mode",
         "schema_fallback",
         "provider_model",
+        "image_input",
     }
     assert "generation-secret-key" not in caplog.text
     assert "alpha" not in repr(check)
+
+
+# -- Image input -------------------------------------------------------------------
+
+
+def _refusal(status_code: int) -> Exception:
+    """A provider that answered the request with ``status_code`` and turned it down."""
+    if status_code == 404:
+        return litellm.NotFoundError("No endpoints found that support image input", "openrouter", "check-model")
+    if status_code == 429:
+        return litellm.RateLimitError("rate limited", "openai", "check-model")
+    if status_code == 500:
+        return litellm.InternalServerError("model does not support multimodal", "ollama_chat", "check-model")
+    if status_code == 502:
+        return litellm.BadGatewayError("upstream unavailable", "openrouter", "check-model")
+    if status_code == 503:
+        return litellm.ServiceUnavailableError("no upstream available", "openrouter", "check-model")
+    if status_code == 529:
+        return litellm.APIError(529, "overloaded", "anthropic", "check-model")
+    return litellm.BadRequestError("model does not support multimodal requests", "ollama_chat", "check-model")
+
+
+async def test_a_model_that_names_the_number_in_the_image_reads_images(monkeypatch) -> None:
+    provider = Provider(monkeypatch)
+
+    check = await check_generation(_client())
+
+    assert check.facts["image_input"] is True
+    [request] = provider.image_requests
+    assert request["response_format"] is ImageReadingResponse
+    assert IMAGE_DIGITS not in json.dumps(
+        [block for block in request["messages"][0]["content"] if block["type"] == "text"]
+    )
+
+
+@pytest.mark.parametrize("digits", ["", "1234", "none"])
+async def test_a_model_that_answers_without_the_number_reads_text_alone(monkeypatch, digits) -> None:
+    Provider(monkeypatch, images=_completion({"digits": digits}))
+
+    check = await check_generation(_client())
+
+    assert check.passed is True
+    assert check.facts["image_input"] is False
+
+
+async def test_digits_written_apart_still_name_the_number(monkeypatch) -> None:
+    Provider(monkeypatch, images=_completion({"digits": " ".join(IMAGE_DIGITS)}))
+
+    check = await check_generation(_client())
+
+    assert check.facts["image_input"] is True
+
+
+@pytest.mark.parametrize("status_code", [400, 404, 500])
+async def test_a_refused_image_while_the_text_is_answered_again_means_text_alone(monkeypatch, status_code) -> None:
+    provider = Provider(monkeypatch, images=_refusal(status_code))
+
+    check = await check_generation(_client())
+
+    assert check.passed is True
+    assert check.facts["image_input"] is False
+    assert not _carries_image(provider.requests[-1])
+
+
+async def test_a_refused_image_tells_nothing_when_the_text_fails_too(monkeypatch) -> None:
+    # The text probe passes, then the provider turns down everything.
+    Provider(monkeypatch, _completion(EXPECTED_REPLY), *[_refusal(404)] * 4, images=_refusal(404))
+
+    check = await check_generation(_client())
+
+    assert check.passed is True
+    assert check.facts["image_input"] is None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [_refusal(429), _refusal(502), _refusal(503), _refusal(529), _refused_connection()],
+    ids=["rate_limited", "bad_gateway", "unavailable", "overloaded", "unreachable"],
+)
+async def test_an_unanswered_image_request_tells_nothing_and_asks_no_more(monkeypatch, failure) -> None:
+    provider = Provider(monkeypatch, images=failure)
+
+    check = await check_generation(_client())
+
+    assert check.passed is True
+    assert check.facts["image_input"] is None
+    assert _carries_image(provider.requests[-1])
+
+
+async def test_a_model_that_fails_the_text_probe_is_not_asked_about_images(monkeypatch) -> None:
+    provider = Provider(monkeypatch, litellm.AuthenticationError("invalid api key", "openai", "check-model"))
+
+    check = await check_generation(_client())
+
+    assert check.error_code == "authentication_failed"
+    assert "image_input" not in check.facts
+    assert provider.image_requests == []
 
 
 # -- Embedding ----------------------------------------------------------------------

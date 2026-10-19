@@ -61,11 +61,17 @@ def reading_group_label(fragments) -> str:
     return f"{first.observation_id}:{first.range_start}-{last.range_end}"
 
 
+def client_reads_images(client) -> bool:
+    """Whether the model a structured client calls sees images; a client that does not say does."""
+    return getattr(client, "reads_images", True) is not False
+
+
 def revision_inference_capability_hash(client, *, extraction_model=None, extraction_max_tokens=None) -> str:
     from memforge.pipeline.projection_images import projection_inference_capability_hash
 
     payload = {
-        "images": projection_inference_capability_hash(),
+        # A model that sees no images reads under no image contract.
+        "images": projection_inference_capability_hash() if client_reads_images(client) else None,
         "revision_input_policy": REVISION_INPUT_POLICY,
         "revision_input": client.input_policy_identity_for(extraction_model) if client is not None else None,
         "extraction_model": extraction_model,
@@ -130,6 +136,7 @@ class RevisionAssessmentContext:
         indexes: dict | None = None,
         known_observations: tuple = (),
         evidence_revisions: tuple = (),
+        reads_images: bool = True,
     ):
         """``known_observations`` describe carried Observations that neither the target
         nor the baseline returns, such as those of the committed Source Unit revision.
@@ -143,6 +150,9 @@ class RevisionAssessmentContext:
         still shows the retired revision's content (``reading_context_revisions``),
         that Evidence leaves its Support; on any other retired revision it keeps
         the Support unresolved.
+
+        ``reads_images`` is whether the model reading this Unit sees images. When
+        it does not, no image Artifact is current to it.
         """
         self.projection = projection
         self.base = base
@@ -188,7 +198,9 @@ class RevisionAssessmentContext:
             key: r
             for key, r in self.current.items()
             if key not in self.tombstoned
-            and observation_is_inference_eligible(observations[key].observation_type, r.metadata)
+            and observation_is_inference_eligible(
+                observations[key].observation_type, r.metadata, reads_images=reads_images
+            )
         }
         self.previous = {r.observation_id: r for r in baseline if r.id not in self.retired}
         self._delta = None
