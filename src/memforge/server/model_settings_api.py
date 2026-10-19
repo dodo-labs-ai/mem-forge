@@ -677,7 +677,6 @@ def build_model_settings_router(
                     ),
                 )
         return await list_endpoint_models(
-            descriptor,
             listing,
             kind,
             endpoint=endpoint,
@@ -880,27 +879,6 @@ def _suggest_host_endpoint(endpoint: str) -> str | None:
     return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
-def _model_list_urls(endpoint: str, listing: ModelListing, kind: ModelKind) -> list[str]:
-    root = endpoint.strip().rstrip("/")
-    path = listing.paths[kind]
-    urls = [f"{root}{path}"]
-    if listing.tries_v1 and not urlsplit(root).path.rstrip("/").endswith("/v1"):
-        urls.append(f"{root}/v1{path}")
-    return list(dict.fromkeys(urls))
-
-
-def _model_list_headers(descriptor: ProviderDescriptor, api_key: str | None) -> dict[str, str]:
-    headers = {"Accept": "application/json"}
-    if not api_key:
-        return headers
-    if descriptor.key_header == "x-api-key":
-        headers["x-api-key"] = api_key
-        headers["anthropic-version"] = "2023-06-01"
-    else:
-        headers["Authorization"] = f"Bearer {api_key}"
-    return headers
-
-
 # How long one model listing request may take, from sending it to the last
 # byte of the answer. The HTTP client's own timeout bounds each wait on its
 # own, which an endpoint that sends a byte now and then never runs out of.
@@ -990,7 +968,6 @@ async def listed_native_schema(binding: ModelBinding, api_key: str | None) -> bo
     if listing is None or binding.kind not in listing.paths:
         return None
     listed = await list_endpoint_models(
-        descriptor,
         listing,
         binding.kind,
         endpoint=binding.endpoint or descriptor.default_endpoint or "",
@@ -1002,7 +979,6 @@ async def listed_native_schema(binding: ModelBinding, api_key: str | None) -> bo
 
 
 async def list_endpoint_models(
-    descriptor: ProviderDescriptor,
     listing: ModelListing,
     kind: ModelKind,
     *,
@@ -1020,13 +996,13 @@ async def list_endpoint_models(
     """
     value = endpoint.strip()
     host = urlsplit(value).hostname or "the endpoint"
-    headers = _model_list_headers(descriptor, api_key)
+    headers = listing.request_headers(api_key)
     unsupported: tuple[int, int] | None = None
     redirected: tuple[int, int] | None = None
     non_json_latency_ms: int | None = None
 
     async with httpx.AsyncClient(timeout=_LISTING_TIMEOUT_S, follow_redirects=False) as client:
-        for url in _model_list_urls(value, listing, kind):
+        for url in listing.request_urls(value, kind):
             started = time.perf_counter()
             try:
                 async with asyncio.timeout(_LISTING_TIMEOUT_S):
