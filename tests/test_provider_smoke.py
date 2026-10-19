@@ -72,7 +72,7 @@ def test_a_provider_whose_key_is_set_is_tried_and_every_other_one_is_reported_sk
         ("openrouter", "api_key", "OPENROUTER_API_KEY")
     ]
     assert targets[0].models == {
-        "generation": "anthropic/claude-haiku-4.5",
+        "generation": "anthropic/claude-haiku-5.5",
         "embedding": "openai/text-embedding-3-small",
     }
     assert [(row.provider, row.result, row.detail) for row in skipped] == [
@@ -87,7 +87,7 @@ def test_anthropic_is_tried_for_generation_only() -> None:
     targets, _skipped = smoke.plan_targets(smoke.parse_args([]), {"ANTHROPIC_API_KEY": SECRET}, ollama_answers=False)
 
     assert [(target.descriptor, dict(target.models)) for target in targets] == [
-        ("anthropic", {"generation": "claude-haiku-4-5"})
+        ("anthropic", {"generation": "claude-haiku-5-5"})
     ]
 
 
@@ -347,9 +347,9 @@ def _openrouter(request: httpx.Request) -> httpx.Response:
             json={
                 "data": [
                     {
-                        "id": "anthropic/claude-haiku-4.5",
-                        "context_length": 200000,
-                        "top_provider": {"max_completion_tokens": 64000},
+                        "id": "anthropic/claude-haiku-5.5",
+                        "context_length": 1000000,
+                        "top_provider": {"max_completion_tokens": 128000},
                         "supported_parameters": ["max_tokens", "response_format", "structured_outputs"],
                     }
                 ]

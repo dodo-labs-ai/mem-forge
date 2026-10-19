@@ -104,10 +104,10 @@ PROVIDERS: tuple[Provider, ...] = (
     Provider(
         "openrouter",
         "OPENROUTER_API_KEY",
-        {"generation": "anthropic/claude-haiku-4.5", "embedding": "openai/text-embedding-3-small"},
+        {"generation": "anthropic/claude-haiku-5.5", "embedding": "openai/text-embedding-3-small"},
     ),
     Provider("openai", "OPENAI_API_KEY", {"generation": "gpt-5-mini", "embedding": "text-embedding-3-small"}),
-    Provider("anthropic", "ANTHROPIC_API_KEY", {"generation": "claude-haiku-4-5"}),
+    Provider("anthropic", "ANTHROPIC_API_KEY", {"generation": "claude-haiku-5-5"}),
     Provider("ollama", None, {"generation": "qwen3:0.6b", "embedding": "nomic-embed-text"}),
 )
 
