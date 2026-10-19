@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Offline replay of a derivation case now shows the model the images its
+  derivation read, such as screenshots in a Jira issue. Each image is read from
+  the document store by the hash its pinned Observation Revision records, as a
+  sync reads it; an image that was deleted or no longer matches its hash ends
+  the case as `artifact_unavailable`. The `offline-run` summary counts a check
+  that waits for review as unknown instead of leaving its row empty.
+  - Cloud: pass the workspace's document store to
+    `build_offline_evaluation_for_run(..., document_store=...)`.
+
 - Contributors: the smoke scripts default to Claude Haiku 5.5 for generation
   (`anthropic/claude-haiku-5.5` through OpenRouter, `claude-haiku-5-5` with an
   Anthropic key). On OpenRouter it costs a tenth of Haiku 4.5 per token and

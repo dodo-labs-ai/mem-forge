@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
@@ -24,6 +24,7 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.llm.batch_runner import ItemFailure, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import OfflineSemanticJudgeResponse
+from memforge.llm.structured_images import StructuredLlmImage
 from memforge.memory.cross_document_relation import (
     CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
     CROSS_DOCUMENT_RELATION_INPUT_VERSIONS,
@@ -38,6 +39,7 @@ from memforge.pipeline.support_relation_coordinator import UNRESOLVED_RESULTS, M
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.extraction_requests import plan_extraction_requests
 from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionPlan, ExtractionRequest
+from memforge.pipeline.projection_images import ProjectionImageLoadError, load_projection_images
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
@@ -47,6 +49,7 @@ from memforge.source_derivation import (
     source_unit_derivation_context_from_payload,
 )
 from memforge.source_projection import SourceProjection, source_projection_from_payload
+from memforge.storage.document_store import DocumentStore
 from memforge.source_representation import current_representation_of
 
 
@@ -920,10 +923,16 @@ class SourceUnitDerivationReplayExecutor:
 
 
 class ProductionSourceUnitDerivationReplayExecutor:
-    """Run the production extraction planner and prompts against one immutable case."""
+    """Run the production extraction planner and prompts against one immutable case.
 
-    def __init__(self, structured_llm_client: object) -> None:
+    An image the case's derivation read is loaded from ``document_store`` by the
+    hash its pinned Observation Revision records, as production loads it, so the
+    replay shows the model the same image bytes.
+    """
+
+    def __init__(self, structured_llm_client: object, document_store: DocumentStore) -> None:
         self._structured_llm_client = structured_llm_client
+        self._document_store = document_store
 
     async def execute(
         self,
@@ -943,9 +952,6 @@ class ProductionSourceUnitDerivationReplayExecutor:
             The pinned projection is read in the current representation.
             """
 
-            def unavailable(_observation_ids):
-                raise OfflineArtifactUnavailable("offline derivation requires pinned binary artifacts")
-
             nonlocal context, read
             if context is None or read is not work.projection:
                 read = work.projection
@@ -953,7 +959,7 @@ class ProductionSourceUnitDerivationReplayExecutor:
                     projection=current_representation_of(work.projection),
                     base=None,
                     access_context_hash=work.access_context_hash,
-                    image_loader=unavailable,
+                    image_loader=pinned_image_loader(work.projection, self._document_store),
                 )
             return context
 
@@ -983,6 +989,25 @@ class ProductionSourceUnitDerivationReplayExecutor:
             case,
             candidate_manifest,
         )
+
+
+def pinned_image_loader(
+    projection: SourceProjection,
+    document_store: DocumentStore,
+) -> Callable[[Collection[str]], tuple[StructuredLlmImage, ...]]:
+    """Load the image Artifacts of a pinned projection; an image no longer stored as pinned is unavailable."""
+
+    def load(observation_ids: Collection[str]) -> tuple[StructuredLlmImage, ...]:
+        try:
+            return load_projection_images(
+                projection=projection,
+                observation_ids=observation_ids,
+                document_store=document_store,
+            )
+        except ProjectionImageLoadError as exc:
+            raise OfflineArtifactUnavailable(f"pinned image Artifact unavailable: {exc.error_code}") from exc
+
+    return load
 
 
 class SourceUnitReconciliationReplayExecutor:

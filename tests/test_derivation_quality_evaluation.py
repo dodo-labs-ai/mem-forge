@@ -377,6 +377,8 @@ def test_the_summary_counts_checks_and_lists_what_did_not_pass() -> None:
              "reason_code": "memory_count:0", "target_result_id": "r1"},
             {"annotator_kind": "code", "criterion": "typed_output", "label": "pass",
              "reason_code": "typed_output_valid", "target_result_id": "r1"},
+            {"annotator_kind": "code", "criterion": "candidate_execution", "label": "needs_review",
+             "reason_code": "candidate_artifact_unavailable", "target_result_id": "r1"},
         ],
     )
 
@@ -385,4 +387,69 @@ def test_the_summary_counts_checks_and_lists_what_did_not_pass() -> None:
     assert "- Verdict: **fail**" in summary
     assert "| memory_count | 0 | 1 | 0 |" in summary
     assert "| typed_output | 1 | 0 | 0 |" in summary
+    # A check waiting for a person's review is counted as undecided.
+    assert "| candidate_execution | 0 | 0 | 1 |" in summary
     assert "| `aec-1` | memory_count | fail: memory_count:0 |" in summary
+
+
+def _projection_reading_an_image(payload: bytes):
+    from datetime import datetime, timezone
+
+    from memforge.models import ContentItem, NormalizedContent, RawContent
+    from memforge.pipeline.source_projection_adapters import project_source_item
+    from memforge.source_artifacts import StoredSourceArtifact
+
+    item = ContentItem(
+        item_id="confluence-123", title="Page", source_url="https://example.test/123",
+        last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc), version="1",
+        extra={"page_id": "123", "space_key": "ENG"},
+    )
+    return project_source_item(
+        source_id="src-1", source_type="confluence", run_id="run-image", item=item,
+        raw=RawContent(item=item, body=b"<h1>Page</h1>", content_type="text/html"),
+        normalized=NormalizedContent(item=item, markdown_body="# Page"),
+        artifacts=(
+            StoredSourceArtifact(
+                id="artifact-diagram", provider_key="attachment-1", parent_observation_type="page_body",
+                parent_provider_key="123:body", provider_revision="1", filename="diagram.png",
+                media_type="image/png", size_bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+                uri="artifact://diagram-1.png", inference_eligible=True, inference_ineligible_reason=None,
+            ),
+        ),
+    )
+
+
+class _ArtifactStore:
+    def __init__(self, stored: dict[str, bytes]) -> None:
+        self.stored = stored
+
+    def read_artifact(self, uri: str) -> bytes:
+        return self.stored[uri]
+
+
+@pytest.mark.parametrize(
+    ("stored", "refusal"),
+    [
+        ({"artifact://diagram-1.png": b"PNG-bytes"}, None),
+        ({}, "artifact_unavailable"),
+        ({"artifact://diagram-1.png": b"changed"}, "artifact_integrity_failed"),
+    ],
+    ids=["stored_as_pinned", "deleted", "altered"],
+)
+def test_replay_reads_a_pinned_image_only_as_it_was_stored(stored, refusal) -> None:
+    from memforge.evals.offline_evaluation import OfflineArtifactUnavailable, pinned_image_loader
+
+    projection = _projection_reading_an_image(b"PNG-bytes")
+    [image_observation] = [
+        revision.observation_id
+        for revision in projection.observation_revisions
+        if "source_artifact" in revision.metadata
+    ]
+    load = pinned_image_loader(projection, _ArtifactStore(stored))
+
+    if refusal is None:
+        [image] = load({image_observation})
+        assert image.body == b"PNG-bytes"
+    else:
+        with pytest.raises(OfflineArtifactUnavailable, match=refusal):
+            load({image_observation})

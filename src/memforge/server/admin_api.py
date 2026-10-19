@@ -4468,6 +4468,7 @@ def create_admin_app(
                         config,
                         runtime_provider,
                         run,
+                        document_store=app.state.document_store,
                     )
 
                 app.state.evaluation_worker = OfflineEvaluationWorker(
