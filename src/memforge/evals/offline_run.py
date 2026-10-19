@@ -62,7 +62,9 @@ def render_report_markdown(report: Mapping[str, Any]) -> str:
     attention: list[tuple[str, str, str]] = []
     for assessment in assessments:
         criterion = str(assessment.get("criterion"))
+        # A check that waits for a person's review has not decided either way.
         label = str(assessment.get("label") or "unknown")
+        label = "unknown" if label == "needs_review" else label
         labels.setdefault(criterion, Counter())[label] += 1
         if label != "pass":
             attention.append(

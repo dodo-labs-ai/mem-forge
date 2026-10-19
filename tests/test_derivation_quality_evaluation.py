@@ -81,6 +81,7 @@ async def test_seeding_pins_the_first_derivation_of_each_named_document_in_one_c
     assert again.cohort_id == report.cohort_id
     assert report.skipped == {
         "document_not_found": ("doc-never-synced",), "title_not_unique": (), "no_first_derivation": (),
+        "reads_images": (),
     }
     assert (case.case_kind, case.doc_id, case.source_unit_id) == (
         AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION, DOC_ID, attempt.source_unit_id,
@@ -118,6 +119,28 @@ async def test_a_document_can_be_named_by_its_title_within_its_source(db) -> Non
     assert ambiguous.skipped["title_not_unique"] == (f"{SOURCE_ID}:{title}",)
     with pytest.raises(ValueError, match="doc_id, or source_id and title"):
         DerivationCaseRequest(doc_id=DOC_ID, source_id=SOURCE_ID, title=title, rubric=RUBRIC)
+
+
+async def test_a_derivation_that_read_an_image_is_not_pinned(db) -> None:
+    attempt = await _synced_document(db)
+    [revision, *rest] = attempt.projection.observation_revisions
+    image = replace(revision, metadata={**revision.metadata, "source_artifact": {"media_type": "image/png"}})
+    with_image = replace(attempt, projection=replace(attempt.projection, observation_revisions=(image, *rest)))
+
+    class ReadsAnImage:
+        get_document = db.get_document
+        find_source_unit_by_document_id = db.find_source_unit_by_document_id
+
+        async def list_source_derivation_attempts(self, **_filters):
+            return (with_image,)
+
+    report = await seed_source_unit_derivation_cases(
+        ReadsAnImage(), OfflineAgentEvaluation(db, executors={}),
+        requests=[DerivationCaseRequest(doc_id=DOC_ID, rubric=RUBRIC)],
+        role=AgentEvaluationRole.SENTINEL, selection_policy_version="quick-v1", actor=ACTOR,
+    )
+
+    assert (report.cohort_id, report.skipped["reads_images"]) == (None, (DOC_ID,))
 
 
 async def test_a_first_derivation_whose_lifecycle_was_applied_is_pinned(db) -> None:
@@ -377,6 +400,8 @@ def test_the_summary_counts_checks_and_lists_what_did_not_pass() -> None:
              "reason_code": "memory_count:0", "target_result_id": "r1"},
             {"annotator_kind": "code", "criterion": "typed_output", "label": "pass",
              "reason_code": "typed_output_valid", "target_result_id": "r1"},
+            {"annotator_kind": "code", "criterion": "candidate_execution", "label": "needs_review",
+             "reason_code": "candidate_artifact_unavailable", "target_result_id": "r1"},
         ],
     )
 
@@ -385,4 +410,6 @@ def test_the_summary_counts_checks_and_lists_what_did_not_pass() -> None:
     assert "- Verdict: **fail**" in summary
     assert "| memory_count | 0 | 1 | 0 |" in summary
     assert "| typed_output | 1 | 0 | 0 |" in summary
+    # A check waiting for a person's review is counted as undecided.
+    assert "| candidate_execution | 0 | 0 | 1 |" in summary
     assert "| `aec-1` | memory_count | fail: memory_count:0 |" in summary
