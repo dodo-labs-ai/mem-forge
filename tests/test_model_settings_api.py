@@ -194,6 +194,7 @@ def test_the_api_lists_the_provider_descriptors(db, tmp_path) -> None:
     assert by_id["litellm"]["lists_models"] is False
     assert by_id["litellm"]["label"] == "Other provider (LiteLLM route)"
     assert {provider["id"] for provider in providers if provider["lists_token_limits"]} == {
+        "anthropic",
         "openrouter",
         "openai_compatible",
     }

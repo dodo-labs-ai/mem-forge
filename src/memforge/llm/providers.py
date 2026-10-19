@@ -2,9 +2,10 @@
 
 A provider descriptor states what MemForge knows about one way of reaching a
 model: which kinds of model it serves, where its endpoint is, how it
-authenticates, how a model id becomes a LiteLLM route, and where its endpoint
-lists the models of each kind. Settings name a descriptor; nothing else about a
-provider is configured.
+authenticates, how a model id becomes a LiteLLM route, and how its endpoint
+lists the models of each kind and what each listed entry declares
+(:mod:`memforge.llm.model_listings`). Settings name a descriptor; nothing else
+about a provider is configured.
 
 A ``ResolvedInvocation`` is everything the LiteLLM SDK is given for one
 configured model: the route, the endpoint, the credential and a short list of
@@ -33,12 +34,19 @@ from urllib.parse import urlsplit, urlunsplit
 
 import litellm
 
+from memforge.llm.model_listings import (
+    AnthropicListing,
+    ModelListing,
+    OllamaListing,
+    OpenAiCompatibleListing,
+    OpenAiListing,
+    OpenRouterListing,
+)
+
 __all__ = [
     "AUTH_STRATEGIES",
     "KEYLESS_API_KEY",
     "MODEL_KINDS",
-    "KindSignal",
-    "ModelListing",
     "PROVIDER_DESCRIPTORS",
     "AuthStrategy",
     "ModelConfigError",
@@ -197,32 +205,6 @@ class ResolvedInvocation:
         return kwargs
 
 
-# How a model listing tells the models of one kind from the other.
-# ``listing``: each kind has a listing of its own, which holds only models of
-# that kind. ``entry``: one listing holds every model, and each entry says, by
-# its declared capabilities, its family or its name, which kind it is.
-# ``none``: the listing does not say, so every listed model is offered.
-KindSignal = Literal["listing", "entry", "none"]
-
-
-@dataclass(frozen=True)
-class ModelListing:
-    """Where an endpoint lists its models, and how the listing tells their kinds apart."""
-
-    # The path, after the base URL, that lists the models of each served kind.
-    paths: Mapping[ModelKind, str]
-    kind_signal: KindSignal
-    # Whether a base URL entered without an API version is also asked under
-    # ``/v1``, where OpenAI-style servers keep their API.
-    tries_v1: bool = True
-    # Whether an entry can give the token limits of its model: the context
-    # window and the largest output.
-    gives_token_limits: bool = False
-    # Whether an entry declares if its model answers in a JSON schema the
-    # request gives.
-    gives_native_schema: bool = False
-
-
 @dataclass(frozen=True)
 class ProviderDescriptor:
     """One way of reaching a model, as Settings offers it."""
@@ -238,10 +220,9 @@ class ProviderDescriptor:
     route_prefixes: Mapping[ModelKind, str] = field(default_factory=dict)
     default_endpoint: str | None = None
     endpoint_required: bool = False
-    # How the endpoint lists its models; ``None`` when it does not.
-    listing: ModelListing | None = None
-    # The header a model listing request carries the API key in.
-    key_header: Literal["authorization", "x-api-key"] = "authorization"
+    # How the endpoint lists its models and what each entry declares; every
+    # descriptor states one, ``None`` when the endpoint lists none.
+    listing: ModelListing | None = field(kw_only=True)
     # Non-secret settings the provider accepts besides endpoint and model.
     options: tuple[str, ...] = ()
     # The request paths the SDK and the model listing write after the base URL.
@@ -339,7 +320,7 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         auth_strategies=("api_key", "environment"),
         route_prefixes={"generation": "openai", "embedding": "openai"},
         default_endpoint="https://api.openai.com/v1",
-        listing=ModelListing(paths={"generation": "/models", "embedding": "/models"}, kind_signal="entry"),
+        listing=OpenAiListing(),
         options=("organization",),
         request_paths=_OPENAI_REQUEST_PATHS,
         reasoning_off=_openai_lowest_reasoning_effort,
@@ -351,8 +332,7 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         auth_strategies=("api_key", "environment"),
         route_prefixes={"generation": "anthropic"},
         default_endpoint="https://api.anthropic.com",
-        listing=ModelListing(paths={"generation": "/models"}, kind_signal="listing"),
-        key_header="x-api-key",
+        listing=AnthropicListing(),
         # LiteLLM writes ``/v1/messages`` after the base URL itself.
         request_paths=("/v1", "/v1/messages", "/v1/models"),
         # An Anthropic model thinks only when a request asks it to.
@@ -365,15 +345,7 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         auth_strategies=("api_key", "environment"),
         route_prefixes={"generation": "openrouter", "embedding": "openrouter"},
         default_endpoint="https://openrouter.ai/api/v1",
-        listing=ModelListing(
-            paths={"generation": "/models", "embedding": "/embeddings/models"},
-            kind_signal="listing",
-            gives_token_limits=True,
-            # A model whose ``supported_parameters`` name ``structured_outputs``
-            # takes a ``json_schema`` response format
-            # (https://openrouter.ai/docs/guides/features/structured-outputs).
-            gives_native_schema=True,
-        ),
+        listing=OpenRouterListing(),
         request_paths=_OPENAI_REQUEST_PATHS,
         reasoning_off=_openrouter_reasoning_off,
     ),
@@ -384,11 +356,7 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         auth_strategies=("none", "api_key"),
         route_prefixes={"generation": "ollama_chat", "embedding": "ollama"},
         default_endpoint="http://localhost:11434",
-        listing=ModelListing(
-            paths={"generation": "/api/tags", "embedding": "/api/tags"},
-            kind_signal="entry",
-            tries_v1=False,
-        ),
+        listing=OllamaListing(),
         # LiteLLM writes Ollama's own ``/api`` paths after the server address,
         # so the address of its OpenAI-compatible ``/v1`` API is read without it.
         request_paths=(
@@ -419,12 +387,7 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         auth_strategies=("api_key", "none"),
         route_prefixes={"generation": "openai", "embedding": "openai"},
         endpoint_required=True,
-        # vLLM and some gateways give a model's context window in its entry.
-        listing=ModelListing(
-            paths={"generation": "/models", "embedding": "/models"},
-            kind_signal="none",
-            gives_token_limits=True,
-        ),
+        listing=OpenAiCompatibleListing(),
         request_paths=_OPENAI_REQUEST_PATHS,
         # Any server may answer here, and no reasoning parameter is one every
         # such server accepts.
@@ -435,8 +398,10 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         label="Other provider (LiteLLM route)",
         kinds=("generation", "embedding"),
         auth_strategies=("api_key", "environment"),
-        # A route may name any LiteLLM provider, gateways among them, and no
-        # reasoning parameter is one every such provider accepts.
+        # A route may name any LiteLLM provider, gateways among them: there is
+        # no one listing to ask, and no reasoning parameter is one every such
+        # provider accepts.
+        listing=None,
         reasoning_off=_sends_nothing,
     ),
 )
