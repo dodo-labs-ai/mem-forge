@@ -223,6 +223,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/agent-evaluations/derivation-cases/seed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Seed Derivation Evaluation Cases
+         * @description Pin the first derivation of each named Document as a case and freeze their cohort.
+         */
+        post: operations["seed_derivation_evaluation_cases_api_v1_agent_evaluations_derivation_cases_seed_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/agent-evaluations/online-overview": {
         parameters: {
             query?: never;
@@ -299,6 +319,12 @@ export interface paths {
         /**
          * Admit Agent Evaluation Run
          * @description Admit one idempotent run; execution remains worker-owned.
+         *
+         *     A candidate manifest without ``code_revision`` is pinned to the release
+         *     this server runs, the code its worker replays the cohort with, so a run
+         *     admitted after a deployment is a new run rather than the earlier one.
+         *     One without ``model`` is pinned to the route of the generation model in
+         *     use.
          */
         post: operations["admit_agent_evaluation_run_api_v1_agent_evaluations_runs_post"];
         delete?: never;
@@ -2980,6 +3006,45 @@ export interface components {
             label_overrides?: {
                 [key: string]: components["schemas"]["CrossDocumentRelationLabel"];
             };
+        };
+        /**
+         * DerivationCaseRequest
+         * @description One synced Document to pin as a derivation case, by ``doc_id`` or by ``title`` within ``source_id``,
+         *     with the rubric its extraction is checked against.
+         */
+        DerivationCaseRequest: {
+            /** Doc Id */
+            doc_id?: string | null;
+            /**
+             * Population
+             * @default representative_control
+             * @enum {string}
+             */
+            population: "representative_control" | "failure_regression";
+            /** Rubric */
+            rubric: {
+                [key: string]: unknown;
+            };
+            /** Source Id */
+            source_id?: string | null;
+            /** Title */
+            title?: string | null;
+        };
+        /**
+         * DerivationCasesSeedRequest
+         * @description Documents of the request's workspace to pin, and the cohort they form.
+         */
+        DerivationCasesSeedRequest: {
+            /** Cases */
+            cases: components["schemas"]["DerivationCaseRequest"][];
+            /**
+             * Role
+             * @default sentinel
+             * @enum {string}
+             */
+            role: "sentinel" | "development" | "release_holdout";
+            /** Selection Policy Version */
+            selection_policy_version: string;
         };
         /** DiscoveryPreviewItemResponse */
         DiscoveryPreviewItemResponse: {
@@ -6274,6 +6339,39 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    seed_derivation_evaluation_cases_api_v1_agent_evaluations_derivation_cases_seed_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DerivationCasesSeedRequest"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {

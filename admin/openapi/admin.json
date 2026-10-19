@@ -1621,6 +1621,103 @@
         "title": "CrossSourceReviewLabelsRequest",
         "type": "object"
       },
+      "DerivationCaseRequest": {
+        "additionalProperties": false,
+        "description": "One synced Document to pin as a derivation case, by ``doc_id`` or by ``title`` within ``source_id``,\nwith the rubric its extraction is checked against.",
+        "properties": {
+          "doc_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Id"
+          },
+          "population": {
+            "default": "representative_control",
+            "enum": [
+              "representative_control",
+              "failure_regression"
+            ],
+            "title": "Population",
+            "type": "string"
+          },
+          "rubric": {
+            "additionalProperties": true,
+            "minProperties": 1,
+            "title": "Rubric",
+            "type": "object"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "rubric"
+        ],
+        "title": "DerivationCaseRequest",
+        "type": "object"
+      },
+      "DerivationCasesSeedRequest": {
+        "additionalProperties": false,
+        "description": "Documents of the request's workspace to pin, and the cohort they form.",
+        "properties": {
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/DerivationCaseRequest"
+            },
+            "minItems": 1,
+            "title": "Cases",
+            "type": "array"
+          },
+          "role": {
+            "default": "sentinel",
+            "enum": [
+              "sentinel",
+              "development",
+              "release_holdout"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "selection_policy_version": {
+            "minLength": 1,
+            "title": "Selection Policy Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cases",
+          "selection_policy_version"
+        ],
+        "title": "DerivationCasesSeedRequest",
+        "type": "object"
+      },
       "DiscoveryPreviewItemResponse": {
         "properties": {
           "item_id": {
@@ -10296,6 +10393,46 @@
         ]
       }
     },
+    "/api/v1/agent-evaluations/derivation-cases/seed": {
+      "post": {
+        "description": "Pin the first derivation of each named Document as a case and freeze their cohort.",
+        "operationId": "seed_derivation_evaluation_cases_api_v1_agent_evaluations_derivation_cases_seed_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DerivationCasesSeedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Seed Derivation Evaluation Cases",
+        "tags": [
+          "agent-evaluations"
+        ]
+      }
+    },
     "/api/v1/agent-evaluations/online-overview": {
       "get": {
         "description": "Return one authorized workspace evaluation overview.",
@@ -10454,7 +10591,7 @@
     },
     "/api/v1/agent-evaluations/runs": {
       "post": {
-        "description": "Admit one idempotent run; execution remains worker-owned.",
+        "description": "Admit one idempotent run; execution remains worker-owned.\n\nA candidate manifest without ``code_revision`` is pinned to the release\nthis server runs, the code its worker replays the cohort with, so a run\nadmitted after a deployment is a new run rather than the earlier one.\nOne without ``model`` is pinned to the route of the generation model in\nuse.",
         "operationId": "admit_agent_evaluation_run_api_v1_agent_evaluations_runs_post",
         "requestBody": {
           "content": {

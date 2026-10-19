@@ -39,11 +39,20 @@ and paste their output into the PR:
 | --- | --- |
 | The LiteLLM version, `src/memforge/llm/transport.py`, `src/memforge/llm/providers.py`, or adds a provider or route | `uv run python scripts/provider_smoke.py` |
 | The Dockerfile, Compose files, database migrations, startup, or configuration defaults | `scripts/compose_smoke.sh` |
-| Prompts, extraction, judgement, decoding, decision contracts, or default models | Nothing to run yourself; say so in the PR, and a maintainer runs the offline quality evaluation before merging |
+| Prompts, extraction, judgement, decoding, decision contracts, or default models | `scripts/compose_smoke.sh --quality` |
 
 A change that fits several rows needs every check they name. When you are not
 sure whether a change belongs to the prompts and extraction row, treat it as
 if it does. Releases run all of them.
+
+`--quality` adds the quick offline quality evaluation to the Compose smoke: it
+syncs the synthetic documents in `evals/quality/quick`, pins each as a case
+with the rubric in `cohort.json` (how many memories its extraction should give
+and terms they must hold), replays extraction with the configured model and
+prints a summary with a verdict below the smoke table. A `fail` names the case
+and the check; run it again before you conclude, since a model's answers vary.
+Maintainers also run the same evaluation over cases pinned from a real
+workspace, which stay in that workspace.
 
 ### Provider keys for the smoke scripts
 

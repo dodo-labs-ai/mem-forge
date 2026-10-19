@@ -1094,6 +1094,29 @@ class RelationGroupCasesSeedRequest(BaseModel):
     labelled_by: str = Field(min_length=1)
 
 
+class DerivationCaseRequest(BaseModel):
+    """One synced Document to pin as a derivation case, by ``doc_id`` or by ``title`` within ``source_id``,
+    with the rubric its extraction is checked against."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    doc_id: str | None = Field(default=None, min_length=1)
+    source_id: str | None = Field(default=None, min_length=1)
+    title: str | None = Field(default=None, min_length=1)
+    rubric: dict[str, object] = Field(min_length=1)
+    population: Literal["representative_control", "failure_regression"] = "representative_control"
+
+
+class DerivationCasesSeedRequest(BaseModel):
+    """Documents of the request's workspace to pin, and the cohort they form."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cases: list[DerivationCaseRequest] = Field(min_length=1)
+    role: Literal["sentinel", "development", "release_holdout"] = "sentinel"
+    selection_policy_version: str = Field(min_length=1)
+
+
 class CrossSourceReviewConversionReportResponse(BaseModel):
     report_id: str
     review_count: int
@@ -6842,13 +6865,76 @@ def create_admin_app(
             "skipped_groups": dict(report.skipped_groups),
         }
 
+    @evaluation_router.post("/derivation-cases/seed")
+    async def seed_derivation_evaluation_cases(
+        body: DerivationCasesSeedRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Pin the first derivation of each named Document as a case and freeze their cohort."""
+
+        from memforge.evals.offline_evaluation import (
+            AgentEvaluationPopulation,
+            AgentEvaluationRole,
+            OfflineAgentEvaluation,
+        )
+        from memforge.evals.source_unit_derivation_cases import (
+            DerivationCaseRequest as PinRequest,
+            seed_source_unit_derivation_cases,
+        )
+
+        actor = _require_maintenance_operator(request)
+        try:
+            report = await seed_source_unit_derivation_cases(
+                db,
+                OfflineAgentEvaluation(db, executors={}),
+                requests=[
+                    PinRequest(
+                        doc_id=case.doc_id,
+                        source_id=case.source_id,
+                        title=case.title,
+                        rubric=case.rubric,
+                        population=AgentEvaluationPopulation(case.population),
+                    )
+                    for case in body.cases
+                ],
+                role=AgentEvaluationRole(body.role),
+                selection_policy_version=body.selection_policy_version,
+                actor=actor,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "cohort_id": report.cohort_id,
+            "cases": [
+                {
+                    "doc_id": case.doc_id,
+                    "case_id": case.case_id,
+                    "ground_truth_revision_id": case.ground_truth_revision_id,
+                    "population": case.population.value,
+                }
+                for case in report.cases
+            ],
+            "skipped": {reason: list(doc_ids) for reason, doc_ids in report.skipped.items()},
+        }
+
     @evaluation_router.post("/runs", status_code=202)
     async def admit_agent_evaluation_run(
         body: AgentEvaluationRunCreateRequest,
         request: Request,
         db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
     ):
-        """Admit one idempotent run; execution remains worker-owned."""
+        """Admit one idempotent run; execution remains worker-owned.
+
+        A candidate manifest without ``code_revision`` is pinned to the release
+        this server runs, the code its worker replays the cohort with, so a run
+        admitted after a deployment is a new run rather than the earlier one.
+        One without ``model`` is pinned to the route of the generation model in
+        use.
+        """
 
         from memforge.evals.offline_evaluation import (
             OfflineAgentEvaluation,
@@ -6856,7 +6942,14 @@ def create_admin_app(
             agent_evaluation_run_execution_to_payload,
             agent_evaluation_run_to_payload,
         )
+        from memforge.release import current_release
+        from memforge.runtime import resolve_models
 
+        pins: dict[str, object] = {"code_revision": current_release()}
+        if "model" not in body.candidate_manifest:
+            generation = (await resolve_models(db, config)).generation
+            if generation is not None:
+                pins["model"] = generation.route
         try:
             semantic_judge = (
                 SemanticJudgeSpec.from_manifest(body.semantic_judge)
@@ -6865,7 +6958,7 @@ def create_admin_app(
             )
             run, execution = await OfflineAgentEvaluation(db, executors={}).admit_run(
                 cohort_id=body.cohort_id,
-                candidate_manifest=body.candidate_manifest,
+                candidate_manifest={**pins, **body.candidate_manifest},
                 evaluator_suite=body.evaluator_suite,
                 evaluator_version=body.evaluator_version,
                 created_by=resolve_request_principal(request),
