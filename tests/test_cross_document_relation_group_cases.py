@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from memforge.storage.document_store import LocalDocumentStore
+
 import json
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -566,7 +568,9 @@ async def test_the_run_worker_replays_group_cases(db: Database, tmp_path) -> Non
     )
 
     async def evaluation_factory(evaluation_run):
-        return await build_offline_evaluation_for_run(db, config, provider, evaluation_run)
+        return await build_offline_evaluation_for_run(
+            db, config, provider, evaluation_run, document_store=LocalDocumentStore(config.storage.docs_path)
+        )
 
     execution = await OfflineEvaluationWorker(db, evaluation_factory=evaluation_factory, worker_id="worker").run_once()
 

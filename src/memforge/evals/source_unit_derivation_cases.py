@@ -11,10 +11,8 @@ prompts over exactly the input production read, with no live source content.
 
 Only a first derivation is pinned. A later revision is derived against the
 committed base it updates, which a case does not pin, so replay could not plan
-its Evidence work. Replay also has no pinned binary Artifacts, so a derivation
-that read images is not pinned either. A Document with neither is counted by
-reason, as is one that was never synced and a title that names more than one
-Document.
+its Evidence work. A Document that has none is counted by reason, as is one
+that was never synced and a title that names more than one Document.
 """
 
 from __future__ import annotations
@@ -75,7 +73,6 @@ class DerivationCaseSkip(str, Enum):
     DOCUMENT_NOT_FOUND = "document_not_found"
     TITLE_NOT_UNIQUE = "title_not_unique"
     NO_FIRST_DERIVATION = "no_first_derivation"
-    READS_IMAGES = "reads_images"
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,8 +182,6 @@ async def _pin_document_case(
     if not first:
         return DerivationCaseSkip.NO_FIRST_DERIVATION
     attempt = first[-1]
-    if _reads_images(attempt):
-        return DerivationCaseSkip.READS_IMAGES
     authority = attempt.authority_plan_identity
     case = await evaluation.curate_case(
         case_kind=AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION,
@@ -234,11 +229,3 @@ async def _find_document(
         return DerivationCaseSkip.TITLE_NOT_UNIQUE
     return titled[0]
 
-
-def _reads_images(attempt: SourceDerivationAttempt) -> bool:
-    """Whether the derivation read an image Artifact, which replay cannot load."""
-    for revision in attempt.projection.observation_revisions:
-        artifact = revision.metadata.get("source_artifact")
-        if isinstance(artifact, Mapping) and str(artifact.get("media_type") or "").startswith("image/"):
-            return True
-    return False
