@@ -497,7 +497,10 @@ class ModelSettings:
         async def read() -> ModelBinding | None:
             return await self._active(db, kind)
 
-        async def check(binding: ModelBinding) -> ValidationOutcome:
+        async def check(binding: ModelBinding) -> ValidationOutcome | None:
+            checked = binding.validation
+            if binding.state != "ready" or checked is None or not _image_input_unasked(binding):
+                return None
             image_input: bool | None = None
             try:
                 invocation = await resolve_invocation(db, self._config, binding)
@@ -508,8 +511,7 @@ class ModelSettings:
             )
             if client is not None:
                 image_input = await check_image_input(client)
-            assert binding.validation is not None
-            validation = replace(binding.validation, facts={**binding.validation.facts, "image_input": image_input})
+            validation = replace(checked, facts={**checked.facts, "image_input": image_input})
             if binding.saved_at is None:
                 record_unstored_check(binding, binding.state, validation)
             else:
@@ -522,7 +524,7 @@ class ModelSettings:
                 )
             return ValidationOutcome(kind=kind, validation=validation, promoted=False, state=binding.state)
 
-        return await self._check_once(db, kind, "active", read=read, check=check)
+        return await self._check_once(db, kind, "active", read=read, check=check, shared=False)
 
     async def _check_once(
         self,
@@ -531,14 +533,17 @@ class ModelSettings:
         slot: BindingSlot,
         *,
         read: Callable[[], Awaitable[ModelBinding | None]],
-        check: Callable[[ModelBinding], Awaitable[ValidationOutcome]],
+        check: Callable[[ModelBinding], Awaitable[ValidationOutcome | None]],
+        shared: bool = True,
     ) -> ValidationOutcome | None:
         """Run ``check`` on the binding ``read`` returns, one check of the slot at a time.
 
         A caller that waited while a check of the same binding finished takes
         that outcome. Any other caller checks the binding as it is once its
         turn comes, so the state a check leaves follows from the state the
-        check before it left.
+        check before it left. The outcome of a check that is not ``shared``,
+        such as one question added to a check on record, is no outcome a
+        waiting caller can take.
         """
         queue = self._check_queues[kind, slot]
         requested = await read()
@@ -554,7 +559,7 @@ class ModelSettings:
                 return None
             outcome = await check(binding)
             queue.finished += 1
-            queue.subject = _check_subject(db, slot, binding)
+            queue.subject = _check_subject(db, slot, binding) if shared else None
             queue.outcome = outcome
             return outcome
 
