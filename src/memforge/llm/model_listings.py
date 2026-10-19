@@ -71,6 +71,8 @@ class ModelListing(ABC):
     # The path, after the base URL, that lists the models of each served kind.
     paths: ClassVar[Mapping[ModelKind, str]]
     kind_signal: ClassVar[KindSignal]
+    # The field of the listing's answer that holds its entries.
+    entries_field: ClassVar[str] = "data"
     # Whether a base URL entered without an API version is also asked under
     # ``/v1``, where OpenAI-style servers keep their API.
     tries_v1: ClassVar[bool] = True
@@ -82,26 +84,30 @@ class ModelListing(ABC):
     gives_native_schema: ClassVar[bool] = False
 
     @abstractmethod
-    def declared_model(self, entry: Mapping[str, Any], model_id: str, kind: ModelKind) -> DeclaredModel:
-        """Read one entry, listed for ``kind``, of the model ``model_id``."""
+    def declared_model(self, entry: Any, kind: ModelKind) -> DeclaredModel | None:
+        """Read one entry listed for ``kind``; ``None`` for an entry that names no model."""
 
     @property
     def kind_filtered(self) -> bool:
         """Whether the listing tells the models of one kind from the other."""
         return self.kind_signal != "none"
 
+    def entries(self, payload: Any) -> list[Any]:
+        """The entries of a listing's answer."""
+        entries = payload.get(self.entries_field) if isinstance(payload, dict) else None
+        return entries if isinstance(entries, list) else []
+
     def declared_models(self, payload: Any, kind: ModelKind) -> tuple[list[DeclaredModel], int]:
         """Read the models of ``kind`` from a listing, with the number of models it listed.
 
         A listing of one kind holds only models of that kind, and a listing
-        that does not tell the kinds apart gives every model it lists. An entry
-        is an object with an id, or the id alone.
+        that does not tell the kinds apart gives every model it lists.
         """
         seen: set[str] = set()
         listed = 0
         models: list[DeclaredModel] = []
-        for entry in _listed_entries(payload):
-            model = self._declared_entry(entry, kind)
+        for entry in self.entries(payload):
+            model = self.declared_model(entry, kind)
             if model is None or model.id in seen:
                 continue
             seen.add(model.id)
@@ -110,44 +116,47 @@ class ModelListing(ABC):
                 models.append(model)
         return models, listed
 
-    def _declared_entry(self, entry: Any, kind: ModelKind) -> DeclaredModel | None:
-        if isinstance(entry, str):
-            return self._kinds_of_bare_id(entry) if entry else None
-        if not isinstance(entry, dict):
-            return None
-        raw_id = entry.get("id") or entry.get("name") or entry.get("model")
-        if raw_id is None or not str(raw_id):
-            return None
-        return self.declared_model(entry, str(raw_id), kind)
-
-    def _kinds_of_bare_id(self, model_id: str) -> DeclaredModel:
-        return DeclaredModel(id=model_id, kinds=_kinds_by_name(model_id) if self.kind_signal == "entry" else None)
-
 
 class OpenAiListing(ModelListing):
-    """OpenAI's ``/models``: every model in one listing, each entry an id and its owner."""
+    """OpenAI's ``/models``: every model in one listing, each entry an ``id`` and its owner."""
 
     paths = {"generation": "/models", "embedding": "/models"}
     kind_signal = "entry"
 
-    def declared_model(self, entry: Mapping[str, Any], model_id: str, kind: ModelKind) -> DeclaredModel:
-        return DeclaredModel(id=model_id, label=_label(entry, model_id), kinds=_kinds_by_name(model_id))
+    def declared_model(self, entry: Any, kind: ModelKind) -> DeclaredModel | None:
+        model_id = _text(entry, "id")
+        return None if model_id is None else DeclaredModel(id=model_id, kinds=_kinds_by_name(model_id))
 
 
 class AnthropicListing(ModelListing):
-    """Anthropic's ``/v1/models``: generation models only."""
+    """Anthropic's ``/v1/models``: generation models only, each with its ``display_name``.
+
+    ``max_input_tokens`` is the largest input, which stands for the context
+    window as it does in LiteLLM's model map, and ``max_tokens`` the largest
+    output (https://platform.claude.com/docs/en/api/python/models/list).
+    """
 
     paths = {"generation": "/models"}
     kind_signal = "listing"
+    gives_token_limits = True
 
-    def declared_model(self, entry: Mapping[str, Any], model_id: str, kind: ModelKind) -> DeclaredModel:
-        return DeclaredModel(id=model_id, label=_label(entry, model_id))
+    def declared_model(self, entry: Any, kind: ModelKind) -> DeclaredModel | None:
+        model_id = _text(entry, "id")
+        if model_id is None:
+            return None
+        return DeclaredModel(
+            id=model_id,
+            label=_label(entry, "display_name", model_id),
+            context_window_tokens=_token_count(entry.get("max_input_tokens")),
+            max_output_tokens=_token_count(entry.get("max_tokens")),
+        )
 
 
 class OpenRouterListing(ModelListing):
     """OpenRouter's ``/models`` and ``/embeddings/models``, one listing per kind.
 
-    The context window is ``context_length`` and the largest output
+    An entry names its model by ``id`` and ``name``. The context window is
+    ``context_length`` and the largest output
     ``top_provider.max_completion_tokens``. A model whose
     ``supported_parameters`` name ``structured_outputs`` takes a
     ``json_schema`` response format
@@ -159,13 +168,16 @@ class OpenRouterListing(ModelListing):
     gives_token_limits = True
     gives_native_schema = True
 
-    def declared_model(self, entry: Mapping[str, Any], model_id: str, kind: ModelKind) -> DeclaredModel:
+    def declared_model(self, entry: Any, kind: ModelKind) -> DeclaredModel | None:
+        model_id = _text(entry, "id")
+        if model_id is None:
+            return None
         top_provider = entry.get("top_provider")
         if not isinstance(top_provider, dict):
             top_provider = {}
         return DeclaredModel(
             id=model_id,
-            label=_label(entry, model_id),
+            label=_label(entry, "name", model_id),
             context_window_tokens=_token_count(entry.get("context_length")),
             max_output_tokens=_token_count(top_provider.get("max_completion_tokens")),
             native_schema=_declared_native_schema(entry) if kind == "generation" else None,
@@ -173,7 +185,7 @@ class OpenRouterListing(ModelListing):
 
 
 class OllamaListing(ModelListing):
-    """Ollama's ``/api/tags``: every local model in one listing.
+    """Ollama's ``/api/tags``: every local model under ``models``, each named by its tag.
 
     An entry's ``capabilities`` name its kinds; without them its family, or
     its name, does.
@@ -181,32 +193,53 @@ class OllamaListing(ModelListing):
 
     paths = {"generation": "/api/tags", "embedding": "/api/tags"}
     kind_signal = "entry"
+    entries_field = "models"
     tries_v1 = False
 
-    def declared_model(self, entry: Mapping[str, Any], model_id: str, kind: ModelKind) -> DeclaredModel:
-        return DeclaredModel(id=model_id, label=_label(entry, model_id), kinds=_ollama_kinds(entry, model_id))
+    def declared_model(self, entry: Any, kind: ModelKind) -> DeclaredModel | None:
+        model_id = _text(entry, "name")
+        return None if model_id is None else DeclaredModel(id=model_id, kinds=_ollama_kinds(entry, model_id))
 
 
 class OpenAiCompatibleListing(ModelListing):
     """An OpenAI-compatible ``/models``, which does not say which kind a model is.
 
-    Any server may answer here. vLLM and gateways give a model's context window
-    in its entry as ``context_length``, ``context_window`` or
-    ``max_model_len``, and its largest output as
-    ``top_provider.max_completion_tokens`` or ``max_completion_tokens``.
+    Any server may answer here, so this listing takes the shapes such servers
+    write: the entries as a list, or under ``data`` or ``models``; an entry as
+    an id alone, or an object naming its model by ``id``, ``name`` or
+    ``model``. vLLM and gateways give a model's context window in its entry as
+    ``context_length``, ``context_window`` or ``max_model_len``, and its
+    largest output as ``top_provider.max_completion_tokens`` or
+    ``max_completion_tokens``.
     """
 
     paths = {"generation": "/models", "embedding": "/models"}
     kind_signal = "none"
     gives_token_limits = True
 
-    def declared_model(self, entry: Mapping[str, Any], model_id: str, kind: ModelKind) -> DeclaredModel:
+    def entries(self, payload: Any) -> list[Any]:
+        if isinstance(payload, dict):
+            entries = payload.get("data")
+            if entries is None:
+                entries = payload.get("models")
+        else:
+            entries = payload
+        return entries if isinstance(entries, list) else []
+
+    def declared_model(self, entry: Any, kind: ModelKind) -> DeclaredModel | None:
+        if isinstance(entry, str):
+            return DeclaredModel(id=entry) if entry else None
+        model_id = _text(entry, "id") or _text(entry, "name") or _text(entry, "model")
+        if model_id is None:
+            return None
         top_provider = entry.get("top_provider")
         if not isinstance(top_provider, dict):
             top_provider = {}
         return DeclaredModel(
             id=model_id,
-            label=_label(entry, model_id),
+            label=_label(
+                entry, next((key for key in ("display_name", "label", "name") if entry.get(key)), "name"), model_id
+            ),
             context_window_tokens=_first_token_count(
                 entry.get("context_length"),
                 entry.get("context_window"),
@@ -219,19 +252,16 @@ class OpenAiCompatibleListing(ModelListing):
         )
 
 
-def _listed_entries(payload: Any) -> list[Any]:
-    if isinstance(payload, dict):
-        raw_items = payload.get("data")
-        if raw_items is None:
-            raw_items = payload.get("models")
-    else:
-        raw_items = payload
-    return raw_items if isinstance(raw_items, list) else []
+def _text(entry: Any, field: str) -> str | None:
+    """The text of one field of an entry object; ``None`` when it is missing or empty."""
+    value = entry.get(field) if isinstance(entry, dict) else None
+    return str(value) if value is not None and str(value) else None
 
 
-def _label(entry: Mapping[str, Any], model_id: str) -> str | None:
-    raw_label = entry.get("display_name") or entry.get("label") or entry.get("name")
-    return None if raw_label is None or str(raw_label) == model_id else str(raw_label)
+def _label(entry: Mapping[str, Any], field: str, model_id: str) -> str | None:
+    """The display name in ``field`` of an entry, when it says more than the model id."""
+    label = _text(entry, field)
+    return None if label == model_id else label
 
 
 def _token_count(value: Any) -> int | None:
