@@ -17,8 +17,9 @@ Each provider is tried only when it is available:
   from the provider's own environment variables, as a deployment configures it.
 
 A provider that is not available is reported as skipped, so the table shows
-what was verified and what was not. API keys are read from the environment
-only, and never written anywhere.
+what was verified and what was not. API keys are read from the environment,
+or from ``.env.test`` at the repository root for a variable the environment
+leaves unset (see ``scripts/smoke_env.py``), and never written anywhere.
 
 Every check takes the path "Save and validate" in Settings takes. The model is
 bound through its provider descriptor; when the descriptor's endpoint lists its
@@ -493,8 +494,14 @@ async def _main(options: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    from smoke_env import load_smoke_env
+
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
-    return asyncio.run(_main(parse_args(argv)))
+    options = parse_args(argv)
+    # LiteLLM routes read their provider's variables from the process
+    # environment, so the keys of .env.test are loaded into it.
+    load_smoke_env()
+    return asyncio.run(_main(options))
 
 
 if __name__ == "__main__":
