@@ -7,7 +7,6 @@ discovery, and the Memory vector index that belongs to the embedding model.
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -30,12 +29,12 @@ from memforge.llm.bindings import (
     token_limits_for_kind,
 )
 from memforge.llm.embedding_profile import EmbeddingProfile
+from memforge.llm.model_listings import DeclaredModel, ModelListing
 from memforge.llm.providers import (
     PROVIDER_DESCRIPTORS,
     AuthStrategy,
     ModelConfigError,
     ModelKind,
-    ModelListing,
     ProviderDescriptor,
     endpoint_carries_credentials,
     endpoint_origin,
@@ -678,7 +677,6 @@ def build_model_settings_router(
                     ),
                 )
         return await list_endpoint_models(
-            descriptor,
             listing,
             kind,
             endpoint=endpoint,
@@ -881,174 +879,20 @@ def _suggest_host_endpoint(endpoint: str) -> str | None:
     return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
-def _model_list_urls(endpoint: str, listing: ModelListing, kind: ModelKind) -> list[str]:
-    root = endpoint.strip().rstrip("/")
-    path = listing.paths[kind]
-    urls = [f"{root}{path}"]
-    if listing.tries_v1 and not urlsplit(root).path.rstrip("/").endswith("/v1"):
-        urls.append(f"{root}/v1{path}")
-    return list(dict.fromkeys(urls))
-
-
-def _model_list_headers(descriptor: ProviderDescriptor, api_key: str | None) -> dict[str, str]:
-    headers = {"Accept": "application/json"}
-    if not api_key:
-        return headers
-    if descriptor.key_header == "x-api-key":
-        headers["x-api-key"] = api_key
-        headers["anthropic-version"] = "2023-06-01"
-    else:
-        headers["Authorization"] = f"Bearer {api_key}"
-    return headers
-
-
 # How long one model listing request may take, from sending it to the last
 # byte of the answer. The HTTP client's own timeout bounds each wait on its
 # own, which an endpoint that sends a byte now and then never runs out of.
 _LISTING_TIMEOUT_S = 5.0
 
-# Ollama families of models that only embed text; Ollama names a model's family
-# by its architecture.
-_EMBEDDING_FAMILIES = frozenset({"bert", "nomic-bert", "xlm-roberta"})
-# A word in a model id that names a model which does not answer in text: an
-# image, audio or moderation model of an OpenAI-style listing.
-_NON_TEXT_MODEL = re.compile(
-    r"(?<![a-z0-9])(dall-e|image|whisper|tts|transcribe|audio|realtime|moderation|sora)(?![a-z])"
-)
 
-
-def _listed_entries(payload: Any) -> list[Any]:
-    if isinstance(payload, dict):
-        raw_items = payload.get("data")
-        if raw_items is None:
-            raw_items = payload.get("models")
-    else:
-        raw_items = payload
-    return raw_items if isinstance(raw_items, list) else []
-
-
-def _token_count(value: Any) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        return None
-    return value
-
-
-def _first_token_count(*values: Any) -> int | None:
-    for value in values:
-        count = _token_count(value)
-        if count is not None:
-            return count
-    return None
-
-
-def _model_option(item: Any, listing: ModelListing, kind: ModelKind) -> ModelOption | None:
-    """Read one listed model of ``kind``, with the token limits and response schema support its entry gives.
-
-    The context window is read from ``context_length`` (OpenRouter and others),
-    ``context_window`` or ``max_model_len`` (vLLM); the largest output from
-    ``top_provider.max_completion_tokens`` (OpenRouter) or
-    ``max_completion_tokens``. A listing that declares response schema support
-    declares it for a generation model by ``structured_outputs`` among the
-    entry's ``supported_parameters`` (OpenRouter).
-    """
-    if isinstance(item, str):
-        return ModelOption(id=item) if item else None
-    if not isinstance(item, dict):
-        return None
-    raw_id = item.get("id") or item.get("name") or item.get("model")
-    if raw_id is None or not str(raw_id):
-        return None
-    model_id = str(raw_id)
-    raw_label = item.get("display_name") or item.get("label") or item.get("name")
-    top_provider = item.get("top_provider")
-    if not isinstance(top_provider, dict):
-        top_provider = {}
+def _model_option(model: DeclaredModel) -> ModelOption:
     return ModelOption(
-        id=model_id,
-        label=None if raw_label is None or str(raw_label) == model_id else str(raw_label),
-        context_window_tokens=_first_token_count(
-            item.get("context_length"),
-            item.get("context_window"),
-            item.get("max_model_len"),
-        ),
-        max_output_tokens=_first_token_count(
-            top_provider.get("max_completion_tokens"),
-            item.get("max_completion_tokens"),
-        ),
-        native_schema=(
-            _declared_native_schema(item) if listing.gives_native_schema and kind == "generation" else None
-        ),
+        id=model.id,
+        label=model.label,
+        context_window_tokens=model.context_window_tokens,
+        max_output_tokens=model.max_output_tokens,
+        native_schema=model.native_schema,
     )
-
-
-def _declared_native_schema(item: dict[str, Any]) -> bool | None:
-    """Whether an entry's ``supported_parameters`` name ``structured_outputs``; ``None`` without that list."""
-    supported = item.get("supported_parameters")
-    if not isinstance(supported, list):
-        return None
-    return "structured_outputs" in supported
-
-
-def _declared_kinds(item: Any) -> frozenset[ModelKind] | None:
-    """The kinds a listed entry declares through ``capabilities``, as Ollama writes them.
-
-    ``completion`` is a generation model and ``embedding`` an embedding model.
-    Returns ``None`` for an entry that declares no capabilities.
-    """
-    capabilities = item.get("capabilities") if isinstance(item, dict) else None
-    if not isinstance(capabilities, list):
-        return None
-    kinds: set[ModelKind] = set()
-    if "completion" in capabilities:
-        kinds.add("generation")
-    if "embedding" in capabilities:
-        kinds.add("embedding")
-    return frozenset(kinds)
-
-
-def _entry_kinds(item: Any, model_id: str) -> frozenset[ModelKind]:
-    """The kinds one entry of a listing that holds every model serves.
-
-    What the entry declares decides. Otherwise an Ollama family of embedding
-    models, or ``embed`` in the id, makes it an embedding model; an id that
-    names an image, audio or moderation model makes it neither; any other
-    model generates text.
-    """
-    declared = _declared_kinds(item)
-    if declared is not None:
-        return declared
-    details = item.get("details") if isinstance(item, dict) else None
-    if isinstance(details, dict):
-        families = details.get("families")
-        named = {details.get("family"), *(families if isinstance(families, list) else ())}
-        if named & _EMBEDDING_FAMILIES:
-            return frozenset({"embedding"})
-    lowered = model_id.lower()
-    if "embed" in lowered:
-        return frozenset({"embedding"})
-    if _NON_TEXT_MODEL.search(lowered):
-        return frozenset()
-    return frozenset({"generation"})
-
-
-def _extract_model_options(payload: Any, listing: ModelListing, kind: ModelKind) -> tuple[list[ModelOption], int]:
-    """Read the models of ``kind`` from a listing, with the number of models it listed.
-
-    A listing of one kind holds only models of that kind, and a listing that
-    does not tell the kinds apart gives every model it lists.
-    """
-    seen: set[str] = set()
-    listed = 0
-    models: list[ModelOption] = []
-    for item in _listed_entries(payload):
-        option = _model_option(item, listing, kind)
-        if option is None or option.id in seen:
-            continue
-        seen.add(option.id)
-        listed += 1
-        if listing.kind_signal != "entry" or kind in _entry_kinds(item, option.id):
-            models.append(option)
-    return models, listed
 
 
 def _listing_message(models: list[ModelOption], listed: int, kind: ModelKind, *, kind_filtered: bool) -> str:
@@ -1124,7 +968,6 @@ async def listed_native_schema(binding: ModelBinding, api_key: str | None) -> bo
     if listing is None or binding.kind not in listing.paths:
         return None
     listed = await list_endpoint_models(
-        descriptor,
         listing,
         binding.kind,
         endpoint=binding.endpoint or descriptor.default_endpoint or "",
@@ -1136,7 +979,6 @@ async def listed_native_schema(binding: ModelBinding, api_key: str | None) -> bo
 
 
 async def list_endpoint_models(
-    descriptor: ProviderDescriptor,
     listing: ModelListing,
     kind: ModelKind,
     *,
@@ -1154,13 +996,13 @@ async def list_endpoint_models(
     """
     value = endpoint.strip()
     host = urlsplit(value).hostname or "the endpoint"
-    headers = _model_list_headers(descriptor, api_key)
+    headers = listing.request_headers(api_key)
     unsupported: tuple[int, int] | None = None
     redirected: tuple[int, int] | None = None
     non_json_latency_ms: int | None = None
 
     async with httpx.AsyncClient(timeout=_LISTING_TIMEOUT_S, follow_redirects=False) as client:
-        for url in _model_list_urls(value, listing, kind):
+        for url in listing.request_urls(value, kind):
             started = time.perf_counter()
             try:
                 async with asyncio.timeout(_LISTING_TIMEOUT_S):
@@ -1241,8 +1083,9 @@ async def list_endpoint_models(
                 non_json_latency_ms = latency_ms
                 continue
 
-            models, listed = _extract_model_options(data, listing, kind)
-            kind_filtered = listing.kind_signal != "none"
+            declared, listed = listing.declared_models(data, kind)
+            models = [_model_option(model) for model in declared]
+            kind_filtered = listing.kind_filtered
             return ModelDiscoveryResponse(
                 ok=True,
                 models_supported=True,
