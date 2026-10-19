@@ -664,8 +664,8 @@ class StructuredLlmConfig:
     # provider-neutral client a gateway or model alias.
     native_schema_transport: NativeSchemaTransport = "auto"
     # Whether the main model reads images, as its capability check observed.
-    # ``False`` keeps every image out of its requests; ``None``, when no check
-    # has told, sends them as the model reading them.
+    # Callers send no image to a model that reads text only (``False``);
+    # ``None``, when no check has told, is taken as a model that reads them.
     image_input: bool | None = None
     # Some LiteLLM gateways interpret message text as a prompt template. When
     # configured by the deployment adapter, carry the complete prompt as one

@@ -92,6 +92,7 @@ class AdmittingClient:
     """Structured client stand-in with unbounded capacity that admits every Candidate."""
 
     input_policy_identity = "fixture-input-policy"
+    reads_images = True
 
     def __init__(self) -> None:
         self.admission_prompts: list[str] = []

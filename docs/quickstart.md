@@ -270,8 +270,9 @@ model, and validate again. Take the numbers from the model card or from your
 model server; a context window of 32768 and a maximum output of 4096 are
 typical for a local model. When the model field names a model from **Load
 models**, picked from the list or typed, and the provider's list gives its
-limits, as OpenRouter's and Anthropic's do, Settings fills the empty limit fields with them
-and says they came from that list; you can still change them. For a provider
+limits, as OpenRouter's and Anthropic's do, Settings fills the empty limit
+fields with them and says they came from that list; you can still change
+them. For a provider
 whose list can give the limits, the token limits step also offers **Fill from
 the model list**, which loads the list and fills in the limits of the model.
 
@@ -290,7 +291,8 @@ Documents can hold images, such as screenshots in a Jira issue or a diagram on
 a Confluence page. Many generation models read them, and many, especially
 local ones, read text only. When you validate a generation model, MemForge also
 sends it a small image of a number and asks for the number back, so it learns
-which kind of model it has.
+which kind of model it has. A model set in `.env` is checked the same way each
+time the server starts.
 
 With a model that reads text only, MemForge still stores every image and
 still reads the text of every document, but sends the model no images.

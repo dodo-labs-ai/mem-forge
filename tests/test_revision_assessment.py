@@ -336,7 +336,7 @@ def test_whether_the_model_reads_images_is_part_of_reuse_identity():
         return revision_inference_capability_hash(client, extraction_model="model-a", extraction_max_tokens=4096)
 
     assert identity(False) != identity(True)
-    # A client that does not say reads images, as every client did before it could say.
+    # A client that does not say whether its model reads images is taken as one that reads them.
     unsaid = SimpleNamespace(input_policy_identity_for=lambda _model: "budget")
     assert identity(True) == revision_inference_capability_hash(
         unsaid, extraction_model="model-a", extraction_max_tokens=4096

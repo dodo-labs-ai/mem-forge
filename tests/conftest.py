@@ -45,6 +45,20 @@ def migrated_database_template(tmp_path_factory):
         yield
 
 
+@pytest.fixture(autouse=True)
+def no_unstored_model_checks():
+    """Start each test with no check on record for a binding that is not stored.
+
+    A process keeps those checks for as long as it runs; a test is a process
+    start of its own.
+    """
+    from memforge.llm import bindings
+
+    bindings._unstored_checks.clear()
+    yield
+    bindings._unstored_checks.clear()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def no_model_checks_at_server_start():
     """Keep a starting server from checking its models against a provider.

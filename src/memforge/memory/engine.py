@@ -115,6 +115,17 @@ logger = logging.getLogger(__name__)
 _First = TypeVar("_First")
 _Second = TypeVar("_Second")
 _EMPTY_OBSERVATION_REASON = "source observation is explicitly empty"
+_NOT_INFERENCE_ELIGIBLE_REASON = "current Source Artifact revision is not inference eligible"
+# A model that reads text alone cannot read the images the Evidence may cite,
+# however readable they are, so the Review says so.
+_TEXT_ONLY_MODEL_REASON = (
+    "the generation model reads text only, so the images of the current Source Artifact revision were not read"
+)
+
+
+def _protected_reason(reads_images: bool) -> str:
+    """Why the Review proposes removing a Memory whose current Support could not be re-derived."""
+    return _NOT_INFERENCE_ELIGIBLE_REASON if reads_images else _TEXT_ONLY_MODEL_REASON
 
 __all__ = [
     "DeferredProjectedLifecycleHandle",
@@ -1007,7 +1018,10 @@ class MemoryEngine:
         structured_llm_elapsed_ms = 0
         bounded_reconciliation_elapsed_ms = 0
         from memforge.pipeline.projection_images import projection_inference_image_observation_ids
-        if not document_content.strip() and not filtered_memories and not projection_inference_image_observation_ids(projection):
+        reads_images = client_reads_images(self.structured_llm_client)
+        if not document_content.strip() and not filtered_memories and not (
+            reads_images and projection_inference_image_observation_ids(projection)
+        ):
             # Nothing is left to read or relate. Whether each claim's Evidence is gone
             # is a coverage fact, which DestructiveValidation checks before any removal.
             evidence_by_memory = await self.db.get_active_memory_support_evidence_many(
@@ -1026,7 +1040,7 @@ class MemoryEngine:
                     action=ReconcileAction.DELETE,
                     memory_id=memory.id,
                     reason=(
-                        "current Source Artifact revision is not inference eligible"
+                        _protected_reason(reads_images)
                         if memory.id in derivation_protected_ids
                         else _EMPTY_OBSERVATION_REASON
                     ),
@@ -1065,7 +1079,6 @@ class MemoryEngine:
                     item.anchor.observation_revision_id
                     for items in evidence_by_memory.values() for item in items
                 } - {revision.id for revision in projection.observation_revisions})).values())
-                reads_images = client_reads_images(self.structured_llm_client)
                 assessment_context = RevisionAssessmentContext(
                     projection=projection, base=base, access_context_hash=access_context_hash,
                     image_loader=evidence_image_loader, evidence_revisions=evidence_revisions,
@@ -1342,7 +1355,7 @@ class MemoryEngine:
                 ReconcileOperation(
                     action=ReconcileAction.DELETE,
                     memory_id=memory_id,
-                    reason=("current Source Artifact revision is not inference eligible"),
+                    reason=_protected_reason(reads_images),
                     flag_for_review=True,
                 )
                 for memory_id in sorted(derivation_protected_ids)

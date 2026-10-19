@@ -7,6 +7,7 @@ import json
 import sqlite3
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1000,24 +1001,61 @@ async def test_a_model_its_check_finds_reading_text_alone_gets_no_image_at_runti
     assert DefaultRuntimeProvider().build_structured_llm_client(models, max_concurrent=1).reads_images is False
 
 
-async def test_a_starting_server_asks_once_whether_a_ready_model_reads_images(db, tmp_path, providers) -> None:
-    config = _config(tmp_path)
-    settings = _settings(config)
+@pytest.mark.parametrize("config_source", ["environment", "deployment"])
+async def test_a_model_the_environment_names_gets_no_image_once_its_check_finds_it_reads_text_alone(
+    db, tmp_path, providers, config_source
+) -> None:
+    if config_source == "deployment":
+        config = _deployment_config(tmp_path)
+    else:
+        config = _config(tmp_path)
+        config.llm.enrichment_api_key = GENERATION_KEY
+    providers.image_reply = {"digits": ""}
+
+    await _settings(config).validate_unready_active_bindings(db)
+    models = await resolve_models(db, config)
+
+    assert await db.get_model_binding("generation", "active") is None
+    assert models.generation.image_input is False
+
+
+async def _ready_generation_never_asked_about_images(
+    db: Database, settings: ModelSettings, providers: Providers
+) -> bindings.ValidationResult:
     await _ready_generation(db, settings)
     record = await db.get_model_binding("generation", "active")
-    checked_before = bindings.binding_from_record(record).validation
-    unasked = {key: value for key, value in checked_before.facts.items() if key != "image_input"}
+    checked = bindings.binding_from_record(record).validation
+    unasked = {key: value for key, value in checked.facts.items() if key != "image_input"}
     record["validation"] = {**record["validation"], "facts": unasked}
     await db.put_model_binding("generation", "active", record)
     providers.generation_requests.clear()
+    return replace(checked, facts=unasked)
+
+
+async def test_a_starting_server_asks_a_ready_model_once_whether_it_reads_images(db, tmp_path, providers) -> None:
+    settings = _settings(_config(tmp_path))
+    unasked = await _ready_generation_never_asked_about_images(db, settings, providers)
 
     await settings.validate_unready_active_bindings(db)
     asked = bindings.binding_from_record(await db.get_model_binding("generation", "active"))
     await settings.validate_unready_active_bindings(db)
 
     assert asked.state == "ready"
-    assert asked.validation.facts["image_input"] is True
-    assert len(text_requests(providers)) == 1
+    assert asked.validation == replace(unasked, facts={**unasked.facts, "image_input": True})
+    assert len(providers.generation_requests) == 1
+    assert text_requests(providers) == []
+
+
+async def test_a_provider_down_at_start_leaves_a_ready_model_ready(db, tmp_path, providers) -> None:
+    settings = _settings(_config(tmp_path))
+    unasked = await _ready_generation_never_asked_about_images(db, settings, providers)
+    providers.generation_failure = litellm.ServiceUnavailableError("no upstream available", "openai", "gpt-5-mini")
+
+    await settings.validate_unready_active_bindings(db)
+    asked = bindings.binding_from_record(await db.get_model_binding("generation", "active"))
+
+    assert asked.state == "ready"
+    assert asked.validation == replace(unasked, facts={**unasked.facts, "image_input": None})
 
 
 async def test_a_failed_check_moves_a_ready_binding_to_needs_revalidation_and_it_stays_in_use(
