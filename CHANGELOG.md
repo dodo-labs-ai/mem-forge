@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Seeding derivation cases skips a Document whose first derivation read an
+  image (`reads_images`), since replay cannot load binary Artifacts and such a
+  case could only end as `artifact_unavailable`. The `offline-run` summary
+  counts a check that waits for review as unknown instead of leaving its row
+  empty.
+
 - Contributors: the smoke scripts default to Claude Haiku 5.5 for generation
   (`anthropic/claude-haiku-5.5` through OpenRouter, `claude-haiku-5-5` with an
   Anthropic key). On OpenRouter it costs a tenth of Haiku 4.5 per token and
