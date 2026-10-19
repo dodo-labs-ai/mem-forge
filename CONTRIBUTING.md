@@ -12,8 +12,8 @@ uv sync --extra dev
 cd admin-ui && npm ci && cd ..
 ```
 
-Copy `.env.example` to `.env` for local overrides. Never commit `.env`, local
-databases, transcript exports, or source-system credentials.
+Copy `.env.example` to `.env` for local overrides. Never commit `.env`,
+`.env.test`, local databases, transcript exports, or source-system credentials.
 
 ## Before You Open A PR
 
@@ -29,6 +29,36 @@ make ui-build
 
 These Makefile targets are maintainer shortcuts for the underlying `uv` and
 `npm` commands. The public quickstart uses Docker Compose instead.
+
+CI runs the lint, unit tests and the provider request contract tests on every
+pull request. Some changes also need a check that reaches real providers or a
+real Docker install, which CI cannot run. Run the ones your change calls for
+and paste their output into the PR:
+
+| Your change touches | Also run |
+| --- | --- |
+| The LiteLLM version, `src/memforge/llm/transport.py`, `src/memforge/llm/providers.py`, or adds a provider or route | `uv run python scripts/provider_smoke.py` |
+| The Dockerfile, Compose files, database migrations, startup, or configuration defaults | `scripts/compose_smoke.sh` |
+| Prompts, extraction, judgement, decoding, decision contracts, or default models | Nothing to run yourself; say so in the PR, and a maintainer runs the offline quality evaluation before merging |
+
+A change that fits several rows needs every check they name. When you are not
+sure whether a change belongs to the prompts and extraction row, treat it as
+if it does. Releases run all of them.
+
+### Provider keys for the smoke scripts
+
+`provider_smoke.py` checks every provider you have a key for and reports the
+rest as skipped; `compose_smoke.sh` uses OpenRouter for its model steps, or a
+local Ollama with `--ollama`. Keep your keys in one file instead of exporting
+them in every terminal:
+
+```bash
+cp .env.test.example .env.test
+```
+
+Then fill in the keys you have. Git ignores `.env.test`, and both scripts read
+it on start; a variable exported in your shell takes precedence. Keep these
+keys out of `.env`, which configures the MemForge you run.
 
 For agent-session changes, also run the focused Python tests:
 

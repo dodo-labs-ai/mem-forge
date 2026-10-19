@@ -36,9 +36,9 @@
 #   -h, --help              Show this help.
 #
 # Models: with --ollama the smoke uses a local Ollama that has both models
-# pulled; otherwise, when OPENROUTER_API_KEY is exported, it uses OpenRouter.
-# The key is read from the environment only, sent to the API in a request
-# body and never printed. Without a provider the model, sync and retrieval
+# pulled; otherwise, when OPENROUTER_API_KEY is exported or set in .env.test
+# at the repository root (see scripts/smoke_env.py), it uses OpenRouter. The
+# key is sent to the API in a request body and never printed. Without a provider the model, sync and retrieval
 # steps are reported as skipped, and the restart check looks for the source
 # added through the API, directly and through the MCP proxy.
 #
@@ -88,6 +88,10 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# The keys of .env.test, for each variable the environment leaves unset.
+smoke_env=$("$PYTHON" "$REPO_ROOT/scripts/smoke_env.py") || exit 2
+eval "$smoke_env"
 
 if (( no_models )); then
   model_provider=none

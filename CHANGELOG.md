@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Contributors: provider keys for `scripts/provider_smoke.py` and
+  `scripts/compose_smoke.sh` can live in `.env.test` (copied from
+  `.env.test.example`, ignored by git), which both scripts read on start; a
+  variable exported in the shell still takes precedence. `CONTRIBUTING.md` now
+  says which of these checks a change needs.
+
 - Creating a memory by hand (MCP `create_memory` or the admin API) works before
   an embedding model is configured, instead of failing with a server error.
   The memory is kept and found by keyword search; near-duplicates are not
