@@ -37,7 +37,16 @@ LISTINGS = {
             ],
             "has_more": False,
         },
-        {"generation": [DeclaredModel(id="claude-haiku-5-5", label="Claude Haiku 5.5")]},
+        {
+            "generation": [
+                DeclaredModel(
+                    id="claude-haiku-5-5",
+                    label="Claude Haiku 5.5",
+                    context_window_tokens=200000,
+                    max_output_tokens=64000,
+                )
+            ]
+        },
     ),
     "openrouter": (
         {
@@ -162,10 +171,22 @@ def test_a_listing_says_it_gives_exactly_what_its_entries_declare(provider_id) -
     assert listing.gives_native_schema == any(model.native_schema is not None for model in models)
 
 
-def test_a_listing_reads_bare_ids_and_skips_entries_without_one() -> None:
+def test_a_listing_reads_only_the_fields_its_provider_writes() -> None:
     listing = next(d for d in PROVIDER_DESCRIPTORS if d.id == "openai").listing
+    # Fields other providers write: OpenRouter's limits, Ollama's capabilities, Anthropic's display name.
+    entry = {"id": "gpt-5-mini", "context_length": 400000, "capabilities": ["embedding"], "display_name": "GPT"}
 
-    models, listed = listing.declared_models(["gpt-5-mini", "", {"object": "model"}, "gpt-5-mini"], "generation")
+    models, _ = listing.declared_models({"data": [entry], "models": [{"name": "qwen3:0.6b"}]}, "generation")
 
     assert models == [DeclaredModel(id="gpt-5-mini", kinds=frozenset({"generation"}))]
+
+
+def test_an_openai_compatible_listing_takes_the_shapes_any_server_writes() -> None:
+    listing = next(d for d in PROVIDER_DESCRIPTORS if d.id == "openai_compatible").listing
+
+    from_list, listed = listing.declared_models(["local-model", "", {"object": "model"}, "local-model"], "generation")
+    from_models, _ = listing.declared_models({"models": [{"model": "served", "label": "Served model"}]}, "generation")
+
+    assert from_list == [DeclaredModel(id="local-model")]
     assert listed == 1
+    assert from_models == [DeclaredModel(id="served", label="Served model")]

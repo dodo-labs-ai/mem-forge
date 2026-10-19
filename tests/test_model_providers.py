@@ -66,7 +66,7 @@ def test_each_descriptor_states_what_it_serves_and_how_it_is_reached(
     ("provider", "lists_token_limits"),
     [
         ("openai", False),
-        ("anthropic", False),
+        ("anthropic", True),
         ("openrouter", True),
         ("ollama", False),
         ("openai_compatible", True),
