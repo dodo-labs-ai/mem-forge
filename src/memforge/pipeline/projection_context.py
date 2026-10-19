@@ -363,10 +363,18 @@ def _incremental_base_failure(
 def observation_is_inference_eligible(
     observation_type: str,
     metadata: dict,
+    *,
+    reads_images: bool = True,
 ) -> bool:
+    """Whether a model request may read the Observation.
+
+    A binary Artifact is read only as an image the model sees, so it is
+    eligible when its bytes are an image a request can carry and the model
+    reads images.
+    """
     if observation_type != SOURCE_ARTIFACT_OBSERVATION_TYPE:
         return True
-    return source_artifact_inference_eligibility(metadata) is True
+    return reads_images and source_artifact_inference_eligibility(metadata) is True
 
 
 def replied_to_observation_id(

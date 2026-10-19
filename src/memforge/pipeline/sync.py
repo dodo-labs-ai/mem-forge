@@ -3611,7 +3611,7 @@ class GeneSyncOrchestrator:
             project_key=derivation_context.project_key,
             repo_identifier=derivation_context.repo_identifier,
         )
-        from memforge.pipeline.revision_assessment import revision_inference_capability_hash
+        from memforge.pipeline.revision_assessment import client_reads_images, revision_inference_capability_hash
         inference_capability_hash = revision_inference_capability_hash(
             self.structured_llm_client, extraction_model=getattr(self.memory_extractor, "model", None),
             extraction_max_tokens=getattr(self.memory_extractor, "max_tokens", None),
@@ -3629,10 +3629,12 @@ class GeneSyncOrchestrator:
             if projection.deltas[0].previous_unit_revision_id
             else None
         )
+        reads_images = client_reads_images(self.structured_llm_client)
         revision_context = RevisionAssessmentContext(
             projection=projection, base=base_projection,
             access_context_hash=access_context_hash,
             image_loader=lambda ids: self._projection_images(projection=projection, observation_ids=ids),
+            reads_images=reads_images,
         )
 
         async def plan_requests(authority):
@@ -3681,6 +3683,7 @@ class GeneSyncOrchestrator:
                 committed_base_snapshot=committed_base_snapshot,
                 access_context_hash=access_context_hash,
                 inference_capability_hash=inference_capability_hash,
+                reads_images=reads_images,
             )
         )
         result.extraction.derivation_id = result.derivation.id

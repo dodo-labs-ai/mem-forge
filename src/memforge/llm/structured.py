@@ -663,6 +663,10 @@ class StructuredLlmConfig:
     # when the registry lags a deployed model, without teaching this
     # provider-neutral client a gateway or model alias.
     native_schema_transport: NativeSchemaTransport = "auto"
+    # Whether the main model reads images, as its capability check observed.
+    # Callers send no image to a model that reads text only (``False``);
+    # ``None``, when no check has told, is taken as a model that reads them.
+    image_input: bool | None = None
     # Some LiteLLM gateways interpret message text as a prompt template. When
     # configured by the deployment adapter, carry the complete prompt as one
     # placeholder value so template-like source text remains data.
@@ -695,6 +699,7 @@ class StructuredLlmConfig:
         through the descriptor or the decision model's route.
         """
         settings.setdefault("native_schema", invocation.native_schema)
+        settings.setdefault("image_input", invocation.image_input)
         decision_model = settings.get("decision_model")
         if (
             invocation.provider is not None and provider_descriptor(invocation.provider).enforces_response_schema
@@ -1857,6 +1862,14 @@ class LiteLlmStructuredClient:
 
         return self.config.decision_model or None
 
+    @property
+    def reads_images(self) -> bool:
+        """Whether requests to the main model carry the images their Evidence holds.
+
+        Only a model its capability check found to read text alone gets none.
+        """
+        return self.config.image_input is not False
+
     def request_budget(self, model: str | None = None):
         from memforge.llm.request_budget import RequestBudget
 
@@ -1927,10 +1940,11 @@ class LiteLlmStructuredClient:
         response_format: type[BaseModel],
         max_tokens: int,
         model: str | None = None,
+        images: StructuredImageInputs = (),
     ):
-        """Answer ``prompt`` as one validated ``response_format`` object."""
+        """Answer ``prompt``, with the images it is about, as one validated ``response_format`` object."""
         return await self._call_schema(
-            prompt=prompt, response_format=response_format, max_tokens=max_tokens, model=model,
+            prompt=prompt, response_format=response_format, max_tokens=max_tokens, model=model, images=images,
         )
 
     async def evaluate_revision_work(self, prompt, *, response_format, max_tokens, model=None, images=()):

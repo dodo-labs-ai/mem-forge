@@ -40,7 +40,7 @@ from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.extraction_requests import plan_extraction_requests
 from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionPlan, ExtractionRequest
 from memforge.pipeline.projection_images import ProjectionImageLoadError, load_projection_images
-from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+from memforge.pipeline.revision_assessment import RevisionAssessmentContext, client_reads_images
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
@@ -861,6 +861,7 @@ class SourceUnitDerivationReplayExecutor:
 
     The case pins the access context and inference capability hashes of the
     derivation it was curated from, so replay plans the same Evidence work.
+    ``reads_images`` is whether the replaying model sees images.
     """
 
     def __init__(
@@ -873,9 +874,12 @@ class SourceUnitDerivationReplayExecutor:
             [ExtractionRequest, ReplayedEvidenceWork, Mapping[str, object]],
             Awaitable[MemoryExtractionResult],
         ],
+        *,
+        reads_images: bool = True,
     ) -> None:
         self._plan_requests = plan_requests
         self._extract_request = extract_request
+        self._reads_images = reads_images
 
     async def execute(
         self,
@@ -913,6 +917,7 @@ class SourceUnitDerivationReplayExecutor:
                 max_concurrent=_positive_int(candidate_manifest.get("max_concurrent"), default=1),
                 access_context_hash=work.access_context_hash,
                 inference_capability_hash=work.inference_capability_hash,
+                reads_images=self._reads_images,
             )
         )
         return {
@@ -960,6 +965,7 @@ class ProductionSourceUnitDerivationReplayExecutor:
                     base=None,
                     access_context_hash=work.access_context_hash,
                     image_loader=pinned_image_loader(work.projection, self._document_store),
+                    reads_images=client_reads_images(self._structured_llm_client),
                 )
             return context
 
@@ -985,7 +991,8 @@ class ProductionSourceUnitDerivationReplayExecutor:
                 revision_context=reading_context(work),
             )
 
-        return await SourceUnitDerivationReplayExecutor(plan, extract).execute(
+        reads_images = client_reads_images(self._structured_llm_client)
+        return await SourceUnitDerivationReplayExecutor(plan, extract, reads_images=reads_images).execute(
             case,
             candidate_manifest,
         )

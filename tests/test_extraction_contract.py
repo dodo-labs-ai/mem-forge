@@ -584,3 +584,18 @@ def test_planning_failure_without_identifiers_is_its_code() -> None:
     )
 
     assert _planning_failure_extraction(failure).error == "REPROCESS_AUTHORIZATION_MISSING"
+
+
+@pytest.mark.parametrize("reads_images", (True, False))
+def test_images_a_model_cannot_read_protect_the_memories_they_support(reads_images):
+    from memforge.source_derivation import assemble_source_derivation_results
+    from tests.test_projection_context import _confluence_projection_with_images
+
+    projection = _confluence_projection_with_images(2)
+    image_ids = {item.id for item in projection.observations if item.observation_type == "binary_artifact"}
+
+    result = assemble_source_derivation_results(
+        projection=projection, plan=ExtractionPlan(()), results=(), reads_images=reads_images,
+    )
+
+    assert set(result.protected_source_observation_ids) == (set() if reads_images else image_ids)

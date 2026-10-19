@@ -1129,3 +1129,38 @@ async def test_a_new_database_stores_model_settings_as_bindings_and_secrets_only
 
     assert {"model_bindings", "model_secrets"} <= tables
     assert "llm_config" not in tables
+
+
+def _checked(binding, *, facts=None, error_code=None, digest=None):
+    from dataclasses import replace
+
+    validation = ValidationResult(
+        checked_at="2026-10-19T00:00:00+00:00", digest=digest or binding.digest, facts=facts or {}, error_code=error_code,
+    )
+    return replace(binding, validation=validation)
+
+
+@pytest.mark.parametrize("observed", [True, False])
+def test_a_generation_model_reads_images_as_the_check_on_record_observed(observed) -> None:
+    binding = build_binding(kind="generation", provider="ollama", model_id="gemma3", config_source="settings")
+
+    invocation = compile_binding(_checked(binding, facts={"image_input": observed}), None)
+
+    assert invocation.image_input is observed
+
+
+@pytest.mark.parametrize(
+    "checked",
+    [
+        {"facts": {"image_input": None}},
+        {"facts": {}},
+        {"facts": {"image_input": False}, "error_code": "timeout"},
+        {"facts": {"image_input": False}, "digest": "another-binding"},
+    ],
+    ids=["could_not_tell", "never_asked", "failed_check", "binding_changed_since"],
+)
+def test_a_check_that_did_not_observe_this_binding_reading_images_tells_nothing(checked) -> None:
+    binding = build_binding(kind="generation", provider="ollama", model_id="gemma3", config_source="settings")
+
+    assert compile_binding(_checked(binding, **checked), None).image_input is None
+    assert compile_binding(binding, None).image_input is None

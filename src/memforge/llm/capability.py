@@ -6,6 +6,13 @@ object under the runtime's structured-output policy and validates the reply.
 The embedding check embeds two different texts, twice, and validates the
 vectors.
 
+A generation model that passes is then asked to read a number from an image.
+It reads images when it reads the number. It reads text alone when it answers
+without the number, or when its provider refuses the request with the image
+and answers the text request again right after, so that the image is the one
+difference. A check that cannot tell, because the provider did not answer, was
+rate limited or failed both ways, records that it could not tell.
+
 A generation model passes only when the runtime can also size requests to it:
 its context window and its largest output have to be known, from LiteLLM's
 model registry, from the binding or from the ``MEMFORGE_LLM_*`` limits.
@@ -21,11 +28,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from io import BytesIO
 from time import perf_counter
 from typing import Any
 
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import ConfigDict
 
 from memforge.llm.embedding import (
@@ -44,6 +54,7 @@ from memforge.llm.structured import (
     StructuredLlmMetricsCollector,
     StructuredResponseModel,
 )
+from memforge.llm.structured_images import StructuredLlmImage
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +63,7 @@ __all__ = [
     "CapabilityCheck",
     "check_embedding",
     "check_generation",
+    "check_image_input",
     "embedding_error_code",
 ]
 
@@ -67,6 +79,14 @@ _GENERATION_PROMPT = (
     f"whose \"label\" is the text \"{_PROBE_LABEL}\", whose \"confirmed\" is true, and "
     f"whose \"items\" is the list of the texts {', '.join(_PROBE_ITEMS)} in that order."
 )
+_IMAGE_PROMPT = (
+    "The image shows a number of four digits. Reply with one JSON object and nothing else. "
+    "Its \"digits\" field is that number as text, or the empty text when you see no image."
+)
+# Answers that are no answer to the image: a timeout, a rate limit, an upstream
+# that is down or overloaded. A 500 is an answer, since a model that reads no
+# image may answer an image with one.
+_UNANSWERED_STATUSES = frozenset({408, 425, 429, 502, 503, 504, 529})
 _EMBEDDING_PROBE_TEXTS = (
     "The deployment runs every weekday at nine in the morning.",
     "Purple elephants prefer jazz to classical music.",
@@ -103,6 +123,15 @@ class CapabilityCheckResponse(StructuredResponseModel):
     probe: CapabilityProbe
 
 
+class ImageReadingResponse(StructuredResponseModel):
+    """The number a generation model reads from the image of its check."""
+
+    model_config = ConfigDict(extra="forbid")
+    direct_answer = True
+
+    digits: str
+
+
 @dataclass(frozen=True)
 class CapabilityCheck:
     """What one capability check observed, or the code of why it failed."""
@@ -129,12 +158,7 @@ async def check_generation(client: LiteLlmStructuredClient) -> CapabilityCheck:
     status_code: int | None = None
     try:
         with client.metrics_scope(collector):
-            async with asyncio.timeout(GENERATION_CHECK_TIMEOUT_S):
-                reply = await client.answer_schema(
-                    _GENERATION_PROMPT,
-                    response_format=CapabilityCheckResponse,
-                    max_tokens=_GENERATION_CHECK_MAX_TOKENS,
-                )
+            reply = await _ask_text_probe(client)
         if not _is_expected_reply(reply):
             error_code = "structured_output_invalid"
     except TimeoutError:
@@ -162,7 +186,78 @@ async def check_generation(client: LiteLlmStructuredClient) -> CapabilityCheck:
         facts["schema_fallback"] = call.fallback_count > 0
         if call.provider_model:
             facts["provider_model"] = call.provider_model
+    if error_code is None:
+        # ``None`` records that the check asked and could not tell.
+        facts["image_input"] = await check_image_input(client)
     return CapabilityCheck(facts=facts, error_code=error_code)
+
+
+async def _ask_text_probe(client: LiteLlmStructuredClient) -> object:
+    async with asyncio.timeout(GENERATION_CHECK_TIMEOUT_S):
+        return await client.answer_schema(
+            _GENERATION_PROMPT,
+            response_format=CapabilityCheckResponse,
+            max_tokens=_GENERATION_CHECK_MAX_TOKENS,
+        )
+
+
+async def check_image_input(client: LiteLlmStructuredClient) -> bool | None:
+    """Whether a generation model that answers the text probe reads images.
+
+    ``None`` when the check cannot tell. The number is drawn anew for every
+    check, so only a model that sees the image can name it. A provider that
+    turns the image down means text only when it answers the text probe
+    straight after, so the refusal was of the image and not of the request.
+    """
+    digits = _new_probe_digits()
+    image = StructuredLlmImage(
+        source_observation_id="capability-check", media_type="image/png", body=_digits_png(digits)
+    )
+    try:
+        async with asyncio.timeout(GENERATION_CHECK_TIMEOUT_S):
+            reply = await client.answer_schema(
+                _IMAGE_PROMPT,
+                response_format=ImageReadingResponse,
+                max_tokens=_GENERATION_CHECK_MAX_TOKENS,
+                images=(image,),
+            )
+    except TimeoutError:
+        return None
+    except StructuredLlmError as exc:
+        if not _refused(exc):
+            return None
+        try:
+            return False if _is_expected_reply(await _ask_text_probe(client)) else None
+        except (TimeoutError, StructuredLlmError):
+            return None
+    except Exception as exc:
+        logger.warning("Image reading check failed (%s)", type(exc).__name__)
+        return None
+    if not isinstance(reply, ImageReadingResponse):
+        return None
+    return "".join(character for character in reply.digits if character.isdigit()) == digits
+
+
+def _refused(exc: StructuredLlmError) -> bool:
+    """Whether the provider answered the request and turned it down, rather than not answering it."""
+    if exc.terminal_category not in {"provider_error", "request_error"} or exc.status_code is None:
+        return False
+    if exc.unreachable or exc.error_code.startswith("APIConnectionError."):
+        return False
+    return exc.status_code not in _UNANSWERED_STATUSES
+
+
+def _new_probe_digits() -> str:
+    return str(1000 + secrets.randbelow(9000))
+
+
+def _digits_png(digits: str) -> bytes:
+    """A PNG of ``digits`` in large dark type on white."""
+    image = Image.new("RGB", (360, 140), "white")
+    ImageDraw.Draw(image).text((30, 20), digits, fill="black", font=ImageFont.load_default(size=88))
+    encoded = BytesIO()
+    image.save(encoded, "PNG")
+    return encoded.getvalue()
 
 
 async def check_embedding(
