@@ -81,7 +81,6 @@ async def test_seeding_pins_the_first_derivation_of_each_named_document_in_one_c
     assert again.cohort_id == report.cohort_id
     assert report.skipped == {
         "document_not_found": ("doc-never-synced",), "title_not_unique": (), "no_first_derivation": (),
-        "reads_images": (),
     }
     assert (case.case_kind, case.doc_id, case.source_unit_id) == (
         AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION, DOC_ID, attempt.source_unit_id,
@@ -119,28 +118,6 @@ async def test_a_document_can_be_named_by_its_title_within_its_source(db) -> Non
     assert ambiguous.skipped["title_not_unique"] == (f"{SOURCE_ID}:{title}",)
     with pytest.raises(ValueError, match="doc_id, or source_id and title"):
         DerivationCaseRequest(doc_id=DOC_ID, source_id=SOURCE_ID, title=title, rubric=RUBRIC)
-
-
-async def test_a_derivation_that_read_an_image_is_not_pinned(db) -> None:
-    attempt = await _synced_document(db)
-    [revision, *rest] = attempt.projection.observation_revisions
-    image = replace(revision, metadata={**revision.metadata, "source_artifact": {"media_type": "image/png"}})
-    with_image = replace(attempt, projection=replace(attempt.projection, observation_revisions=(image, *rest)))
-
-    class ReadsAnImage:
-        get_document = db.get_document
-        find_source_unit_by_document_id = db.find_source_unit_by_document_id
-
-        async def list_source_derivation_attempts(self, **_filters):
-            return (with_image,)
-
-    report = await seed_source_unit_derivation_cases(
-        ReadsAnImage(), OfflineAgentEvaluation(db, executors={}),
-        requests=[DerivationCaseRequest(doc_id=DOC_ID, rubric=RUBRIC)],
-        role=AgentEvaluationRole.SENTINEL, selection_policy_version="quick-v1", actor=ACTOR,
-    )
-
-    assert (report.cohort_id, report.skipped["reads_images"]) == (None, (DOC_ID,))
 
 
 async def test_a_first_derivation_whose_lifecycle_was_applied_is_pinned(db) -> None:
@@ -413,3 +390,66 @@ def test_the_summary_counts_checks_and_lists_what_did_not_pass() -> None:
     # A check waiting for a person's review is counted as undecided.
     assert "| candidate_execution | 0 | 0 | 1 |" in summary
     assert "| `aec-1` | memory_count | fail: memory_count:0 |" in summary
+
+
+def _projection_reading_an_image(payload: bytes):
+    from datetime import datetime, timezone
+
+    from memforge.models import ContentItem, NormalizedContent, RawContent
+    from memforge.pipeline.source_projection_adapters import project_source_item
+    from memforge.source_artifacts import StoredSourceArtifact
+
+    item = ContentItem(
+        item_id="confluence-123", title="Page", source_url="https://example.test/123",
+        last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc), version="1",
+        extra={"page_id": "123", "space_key": "ENG"},
+    )
+    return project_source_item(
+        source_id="src-1", source_type="confluence", run_id="run-image", item=item,
+        raw=RawContent(item=item, body=b"<h1>Page</h1>", content_type="text/html"),
+        normalized=NormalizedContent(item=item, markdown_body="# Page"),
+        artifacts=(
+            StoredSourceArtifact(
+                id="artifact-diagram", provider_key="attachment-1", parent_observation_type="page_body",
+                parent_provider_key="123:body", provider_revision="1", filename="diagram.png",
+                media_type="image/png", size_bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+                uri="artifact://diagram-1.png", inference_eligible=True, inference_ineligible_reason=None,
+            ),
+        ),
+    )
+
+
+class _ArtifactStore:
+    def __init__(self, stored: dict[str, bytes]) -> None:
+        self.stored = stored
+
+    def read_artifact(self, uri: str) -> bytes:
+        return self.stored[uri]
+
+
+@pytest.mark.parametrize(
+    ("stored", "refusal"),
+    [
+        ({"artifact://diagram-1.png": b"PNG-bytes"}, None),
+        ({}, "artifact_unavailable"),
+        ({"artifact://diagram-1.png": b"changed"}, "artifact_integrity_failed"),
+    ],
+    ids=["stored_as_pinned", "deleted", "altered"],
+)
+def test_replay_reads_a_pinned_image_only_as_it_was_stored(stored, refusal) -> None:
+    from memforge.evals.offline_evaluation import OfflineArtifactUnavailable, pinned_image_loader
+
+    projection = _projection_reading_an_image(b"PNG-bytes")
+    [image_observation] = [
+        revision.observation_id
+        for revision in projection.observation_revisions
+        if "source_artifact" in revision.metadata
+    ]
+    load = pinned_image_loader(projection, _ArtifactStore(stored))
+
+    if refusal is None:
+        [image] = load({image_observation})
+        assert image.body == b"PNG-bytes"
+    else:
+        with pytest.raises(OfflineArtifactUnavailable, match=refusal):
+            load({image_observation})
