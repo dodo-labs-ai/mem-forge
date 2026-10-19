@@ -163,7 +163,6 @@ class ProductChecks:
         descriptor = provider_descriptor(binding.provider)
         assert descriptor.listing is not None
         return await list_endpoint_models(
-            descriptor,
             descriptor.listing,
             binding.kind,
             endpoint=binding.endpoint or "",
