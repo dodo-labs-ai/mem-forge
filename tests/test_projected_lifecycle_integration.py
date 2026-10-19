@@ -1170,9 +1170,25 @@ async def test_runbook_component_revision_creates_one_replacement_for_all_branch
     assert active[0].content == canonical_procedure
 
 
+class _TextOnlyClient(_UnexpectedReconciliationClient):
+    reads_images = False
+
+
 @pytest.mark.asyncio
-async def test_inference_ineligible_artifact_revision_preserves_incumbent_support(
-    db: Database,
+@pytest.mark.parametrize(
+    ("inference_eligible", "client", "reason"),
+    [
+        (False, _UnexpectedReconciliationClient, "current Source Artifact revision is not inference eligible"),
+        (
+            True,
+            _TextOnlyClient,
+            "the generation model reads text only, so the images of the current Source Artifact revision were not read",
+        ),
+    ],
+    ids=["ineligible_artifact", "text_only_model"],
+)
+async def test_an_artifact_the_model_cannot_read_preserves_incumbent_support(
+    db: Database, inference_eligible, client, reason
 ) -> None:
     first = _projection_with_artifact(
         run_id="projection-artifact-valid",
@@ -1229,7 +1245,7 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
         run_id="projection-artifact-invalid",
         payload=b"invalid-image-revision",
         provider_revision="2",
-        inference_eligible=False,
+        inference_eligible=inference_eligible,
         prior=first.source_unit_revisions[0],
         prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
@@ -1237,7 +1253,7 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
-        structured_llm_client=_UnexpectedReconciliationClient(),
+        structured_llm_client=client(),
     )
     stats = await protected_engine.prepare_and_commit_projected_lifecycle(
         projection=second,
@@ -1258,6 +1274,9 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
     current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert current is not None and current.status == "active"
     assert stats["pending_review"] == 1
+    [review] = await db.list_lifecycle_reviews("src-1", status=LifecycleReviewStatus.PENDING)
+    assert review.incumbent_memory_id == incumbent.id
+    assert review.reason == reason
     assert current_support == previous_support
     assert (
         second.source_unit_revisions[0].id == (await db.get_current_source_unit_revision(second.source_units[0].id)).id

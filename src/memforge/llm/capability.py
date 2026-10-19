@@ -63,6 +63,7 @@ __all__ = [
     "CapabilityCheck",
     "check_embedding",
     "check_generation",
+    "check_image_input",
     "embedding_error_code",
 ]
 
@@ -82,8 +83,10 @@ _IMAGE_PROMPT = (
     "The image shows a number of four digits. Reply with one JSON object and nothing else. "
     "Its \"digits\" field is that number as text, or the empty text when you see no image."
 )
-# Answers that are no answer to the image: a timeout, a rate limit.
-_UNANSWERED_STATUSES = frozenset({408, 429})
+# Answers that are no answer to the image: a timeout, a rate limit, an upstream
+# that is down or overloaded. A 500 is an answer, since a model that reads no
+# image may answer an image with one.
+_UNANSWERED_STATUSES = frozenset({408, 425, 429, 502, 503, 504, 529})
 _EMBEDDING_PROBE_TEXTS = (
     "The deployment runs every weekday at nine in the morning.",
     "Purple elephants prefer jazz to classical music.",
@@ -185,7 +188,7 @@ async def check_generation(client: LiteLlmStructuredClient) -> CapabilityCheck:
             facts["provider_model"] = call.provider_model
     if error_code is None:
         # ``None`` records that the check asked and could not tell.
-        facts["image_input"] = await _check_image_input(client)
+        facts["image_input"] = await check_image_input(client)
     return CapabilityCheck(facts=facts, error_code=error_code)
 
 
@@ -198,7 +201,7 @@ async def _ask_text_probe(client: LiteLlmStructuredClient) -> object:
         )
 
 
-async def _check_image_input(client: LiteLlmStructuredClient) -> bool | None:
+async def check_image_input(client: LiteLlmStructuredClient) -> bool | None:
     """Whether a generation model that has just answered the text probe reads images.
 
     ``None`` when the check cannot tell. The number is drawn anew for every

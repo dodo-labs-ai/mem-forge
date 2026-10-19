@@ -298,6 +298,14 @@ def _refusal(status_code: int) -> Exception:
         return litellm.NotFoundError("No endpoints found that support image input", "openrouter", "check-model")
     if status_code == 429:
         return litellm.RateLimitError("rate limited", "openai", "check-model")
+    if status_code == 500:
+        return litellm.InternalServerError("model does not support multimodal", "ollama_chat", "check-model")
+    if status_code == 502:
+        return litellm.BadGatewayError("upstream unavailable", "openrouter", "check-model")
+    if status_code == 503:
+        return litellm.ServiceUnavailableError("no upstream available", "openrouter", "check-model")
+    if status_code == 529:
+        return litellm.APIError(529, "overloaded", "anthropic", "check-model")
     return litellm.BadRequestError("model does not support multimodal requests", "ollama_chat", "check-model")
 
 
@@ -332,7 +340,7 @@ async def test_digits_written_apart_still_name_the_number(monkeypatch) -> None:
     assert check.facts["image_input"] is True
 
 
-@pytest.mark.parametrize("status_code", [400, 404])
+@pytest.mark.parametrize("status_code", [400, 404, 500])
 async def test_a_refused_image_while_the_text_is_answered_again_means_text_alone(monkeypatch, status_code) -> None:
     provider = Provider(monkeypatch, images=_refusal(status_code))
 
@@ -355,8 +363,8 @@ async def test_a_refused_image_tells_nothing_when_the_text_fails_too(monkeypatch
 
 @pytest.mark.parametrize(
     "failure",
-    [_refusal(429), _refused_connection()],
-    ids=["rate_limited", "unreachable"],
+    [_refusal(429), _refusal(502), _refusal(503), _refusal(529), _refused_connection()],
+    ids=["rate_limited", "bad_gateway", "unavailable", "overloaded", "unreachable"],
 )
 async def test_an_unanswered_image_request_tells_nothing_and_asks_no_more(monkeypatch, failure) -> None:
     provider = Provider(monkeypatch, images=failure)

@@ -45,6 +45,7 @@ from memforge.llm.bindings import (
     key_last4,
     key_source,
     new_stored_secret,
+    record_unstored_check,
     resolve_active_binding,
     resolve_credential,
     resolve_invocation,
@@ -58,6 +59,7 @@ from memforge.llm.capability import (
     CapabilityCheck,
     check_embedding,
     check_generation,
+    check_image_input,
 )
 from memforge.llm.providers import (
     MODEL_KINDS,
@@ -245,8 +247,6 @@ class ModelSettings:
         # Asks a provider's model listing what it declares about a model
         # answering in a JSON schema; ``None`` refreshes nothing.
         self._listed_native_schema = listed_native_schema
-        # The state and latest check of each active binding that is not stored.
-        self._unstored_checks: dict[ModelKind, tuple[BindingState, ValidationResult]] = {}
         self._check_queues: dict[tuple[ModelKind, BindingSlot], _CheckQueue] = {
             (kind, slot): _CheckQueue() for kind in MODEL_KINDS for slot in ("active", "candidate")
         }
@@ -476,7 +476,7 @@ class ModelSettings:
             validation = await self._validation(db, binding)
             state = state_after_check(binding.state, passed=validation.passed)
             if binding.saved_at is None:
-                self._unstored_checks[kind] = (state, validation)
+                record_unstored_check(binding, state, validation)
             else:
                 await db.record_model_binding_validation(
                     kind,
@@ -488,6 +488,39 @@ class ModelSettings:
             if kind == "embedding" and validation.passed:
                 await self._settle_first_index(db, replace(binding, state=state, validation=validation))
             return ValidationOutcome(kind=kind, validation=validation, promoted=False, state=state)
+
+        return await self._check_once(db, kind, "active", read=read, check=check)
+
+    async def _ask_image_input(self, db: "Database", kind: ModelKind) -> ValidationOutcome | None:
+        """Ask whether the model of the ready active binding reads images, and add the answer to its check."""
+
+        async def read() -> ModelBinding | None:
+            return await self._active(db, kind)
+
+        async def check(binding: ModelBinding) -> ValidationOutcome:
+            image_input: bool | None = None
+            try:
+                invocation = await resolve_invocation(db, self._config, binding)
+            except ModelConfigError:
+                invocation = None
+            client = None if invocation is None else _check_client(
+                self._config, self._runtime_provider, binding, invocation
+            )
+            if client is not None:
+                image_input = await check_image_input(client)
+            assert binding.validation is not None
+            validation = replace(binding.validation, facts={**binding.validation.facts, "image_input": image_input})
+            if binding.saved_at is None:
+                record_unstored_check(binding, binding.state, validation)
+            else:
+                await db.record_model_binding_validation(
+                    kind,
+                    "active",
+                    updated_at=binding.saved_at,
+                    state=binding.state,
+                    validation=validation_record(validation),
+                )
+            return ValidationOutcome(kind=kind, validation=validation, promoted=False, state=binding.state)
 
         return await self._check_once(db, kind, "active", read=read, check=check)
 
@@ -571,18 +604,21 @@ class ModelSettings:
         stand. A ready generation binding is not checked again, but takes the
         response schema support its provider's listing declares now, as a
         check would; one whose check never asked whether the model reads
-        images is checked once more, so that it asks. A failure of one kind
-        does not stop the check of the other.
+        images is asked that alone, and the answer joins the check on record.
+        A failure of one kind does not stop the check of the other.
         """
         for kind in MODEL_KINDS:
             try:
                 active = await self._active(db, kind)
                 if active is None:
                     continue
-                if active.state == "ready" and not _image_input_unasked(active):
+                if active.state == "ready":
                     await self._refresh_native_schema(db, "active", active)
-                    continue
-                outcome = await self.validate_active(db, kind)
+                    if not _image_input_unasked(active):
+                        continue
+                    outcome = await self._ask_image_input(db, kind)
+                else:
+                    outcome = await self.validate_active(db, kind)
             except Exception as exc:
                 logger.warning(
                     "Could not check the active %s model (%s)",
@@ -798,19 +834,7 @@ class ModelSettings:
             )
 
     async def _active(self, db: "Database", kind: ModelKind) -> ModelBinding | None:
-        """The active binding of ``kind``, with the check this server made of it."""
-        binding = await resolve_active_binding(db, self._config, kind)
-        if binding is None or binding.saved_at is not None:
-            return binding
-        recorded = self._unstored_checks.get(kind)
-        if recorded is None:
-            return binding
-        state, validation = recorded
-        return replace(
-            binding,
-            state=state_after_change(state, previous_digest=validation.digest, digest=binding.digest),
-            validation=validation,
-        )
+        return await resolve_active_binding(db, self._config, kind)
 
     async def _candidate(self, db: "Database", kind: ModelKind) -> ModelBinding | None:
         if not self.writable:
@@ -896,8 +920,21 @@ async def check_binding(
     """
     if binding.kind == "embedding":
         return await check_embedding(invocation)
+    client = _check_client(config, runtime_provider, binding, invocation)
+    if client is None:
+        return CapabilityCheck(error_code="not_configured")
+    return await check_generation(client)
+
+
+def _check_client(
+    config: AppConfig,
+    runtime_provider: RuntimeProvider,
+    binding: ModelBinding,
+    invocation: ResolvedInvocation,
+) -> Any:
+    """The structured client a generation check asks through."""
     llm = config.llm
-    client = runtime_provider.build_structured_llm_client(
+    return runtime_provider.build_structured_llm_client(
         ResolvedModels(
             generation=invocation,
             embedding=None,
@@ -907,9 +944,6 @@ async def check_binding(
         ),
         max_concurrent=llm.enrichment_max_concurrent,
     )
-    if client is None:
-        return CapabilityCheck(error_code="not_configured")
-    return await check_generation(client)
 
 
 def _image_input_unasked(binding: ModelBinding) -> bool:
