@@ -1046,6 +1046,27 @@ async def test_a_starting_server_asks_a_ready_model_once_whether_it_reads_images
     assert text_requests(providers) == []
 
 
+async def test_a_check_requested_while_a_starting_server_asks_about_images_is_made(
+    db, tmp_path, providers
+) -> None:
+    settings = _settings(_config(tmp_path))
+    await _ready_generation_never_asked_about_images(db, settings, providers)
+    providers.generation_gate = threading.Event()
+
+    asking = asyncio.create_task(settings.validate_unready_active_bindings(db))
+    while not providers.generation_requests:
+        await asyncio.sleep(0.005)
+    check = asyncio.create_task(settings.validate_active(db, "generation"))
+    await asyncio.sleep(0.05)
+    providers.generation_gate.set()
+    await asking
+    outcome = await check
+
+    assert len(text_requests(providers)) == 1
+    assert outcome.validation.facts["image_input"] is True
+    assert outcome.state == "ready"
+
+
 async def test_a_provider_down_at_start_leaves_a_ready_model_ready(db, tmp_path, providers) -> None:
     settings = _settings(_config(tmp_path))
     unasked = await _ready_generation_never_asked_about_images(db, settings, providers)

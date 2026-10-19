@@ -202,10 +202,12 @@ async def _ask_text_probe(client: LiteLlmStructuredClient) -> object:
 
 
 async def check_image_input(client: LiteLlmStructuredClient) -> bool | None:
-    """Whether a generation model that has just answered the text probe reads images.
+    """Whether a generation model that answers the text probe reads images.
 
     ``None`` when the check cannot tell. The number is drawn anew for every
-    check, so only a model that sees the image can name it.
+    check, so only a model that sees the image can name it. A provider that
+    turns the image down means text only when it answers the text probe
+    straight after, so the refusal was of the image and not of the request.
     """
     digits = _new_probe_digits()
     image = StructuredLlmImage(
