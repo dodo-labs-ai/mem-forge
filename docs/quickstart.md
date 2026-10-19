@@ -270,7 +270,7 @@ model, and validate again. Take the numbers from the model card or from your
 model server; a context window of 32768 and a maximum output of 4096 are
 typical for a local model. When the model field names a model from **Load
 models**, picked from the list or typed, and the provider's list gives its
-limits, as OpenRouter's does, Settings fills the empty limit fields with them
+limits, as OpenRouter's and Anthropic's do, Settings fills the empty limit fields with them
 and says they came from that list; you can still change them. For a provider
 whose list can give the limits, the token limits step also offers **Fill from
 the model list**, which loads the list and fills in the limits of the model.
@@ -282,6 +282,31 @@ used; the `.env` values apply to whatever Settings leaves empty:
 MEMFORGE_LLM_MAX_INPUT_TOKENS=32768
 MEMFORGE_LLM_CONTEXT_WINDOW_TOKENS=32768
 MEMFORGE_LLM_MAX_OUTPUT_TOKENS=4096
+```
+
+### Models that read text only
+
+Documents can hold images, such as screenshots in a Jira issue or a diagram on
+a Confluence page. Many generation models read them, and many, especially
+local ones, read text only. When you validate a generation model, MemForge also
+sends it a small image of a number and asks for the number back, so it learns
+which kind of model it has.
+
+With a model that reads text only, MemForge still stores every image and
+still reads the text of every document, but sends the model no images.
+Memories that an image-reading model drew from an image are kept as they are,
+and when such a document changes, the **Review** page asks you about them
+instead of the model judging them without the image. If the check could not
+tell, because the provider did not answer or limited the request rate, the
+model is treated as one that reads images, and the check asks again the next
+time you validate the model.
+
+After switching to a model that reads images, reprocess the documents whose
+images you want read:
+
+```bash
+memforge sources reprocess <source-id> --document <document-id> --dry-run
+memforge sources reprocess <source-id> --document <document-id>
 ```
 
 ### Configuring models in `.env`

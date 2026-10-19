@@ -73,6 +73,7 @@ __all__ = [
     "key_last4",
     "key_source",
     "new_stored_secret",
+    "observed_image_input",
     "parameters_for_kind",
     "resolve_active_binding",
     "resolve_active_invocation",
@@ -340,7 +341,23 @@ def compile_binding(binding: ModelBinding, credential: str | None) -> ResolvedIn
         extra_params={**binding.options, **binding.parameters},
         provider=binding.provider,
         native_schema=native_schema,
+        image_input=observed_image_input(binding),
     )
+
+
+def observed_image_input(binding: ModelBinding) -> bool | None:
+    """Whether the generation model reads images, as the check on record for the binding observed.
+
+    A check observes it only when it passed for the binding as it stands, so a
+    binding changed since, or one that has not passed, tells nothing.
+    """
+    validation = binding.validation
+    if binding.kind != "generation" or validation is None or not validation.passed:
+        return None
+    if validation.digest != binding.digest:
+        return None
+    observed = validation.facts.get("image_input")
+    return observed if isinstance(observed, bool) else None
 
 
 def binding_from_settings(

@@ -191,7 +191,7 @@ def _teams_projection(
     )
 
 
-def _requests(projection, *, base=None, committed=None, reprocess=False, images=()):
+def _requests(projection, *, base=None, committed=None, reprocess=False, images=(), reads_images=True):
     """Plan the authority, then the production extraction requests, of one projection."""
     authority = plan_projection_evidence_work(
         projection,
@@ -200,7 +200,9 @@ def _requests(projection, *, base=None, committed=None, reprocess=False, images=
     )
     assert isinstance(authority, ExtractionAuthority)
     return plan_extraction_requests(
-        RevisionAssessmentContext(projection=projection, base=base, access_context_hash="scope", images=images),
+        RevisionAssessmentContext(
+            projection=projection, base=base, access_context_hash="scope", images=images, reads_images=reads_images
+        ),
         authority,
         extractor=NoopMemoryExtractor(),
         source_type=projection.source_type,
@@ -596,6 +598,17 @@ def test_every_eligible_image_is_primary_in_exactly_one_request_and_ineligible_o
         for request in _requests(ineligible)
         for fragment in request.catalog.fragments
     )
+
+
+def test_a_model_that_reads_text_alone_is_given_no_image_and_still_reads_the_text() -> None:
+    projection = _confluence_projection_with_images(3)
+    binary_ids = {item.id for item in projection.observations if item.observation_type == "binary_artifact"}
+
+    requests = _requests(projection, images=_artifact_images(projection), reads_images=False)
+
+    read = {fragment.anchor.observation_id for request in requests for fragment in request.catalog.fragments}
+    assert read and not read & binary_ids
+    assert all(fragment.kind.value != "artifact" for fragment in _primary(requests))
 
 
 def test_legacy_artifact_without_eligibility_metadata_is_read() -> None:

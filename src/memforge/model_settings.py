@@ -570,14 +570,16 @@ class ModelSettings:
         checked under another LiteLLM version have not passed a check as they
         stand. A ready generation binding is not checked again, but takes the
         response schema support its provider's listing declares now, as a
-        check would. A failure of one kind does not stop the check of the other.
+        check would; one whose check never asked whether the model reads
+        images is checked once more, so that it asks. A failure of one kind
+        does not stop the check of the other.
         """
         for kind in MODEL_KINDS:
             try:
                 active = await self._active(db, kind)
                 if active is None:
                     continue
-                if active.state == "ready":
+                if active.state == "ready" and not _image_input_unasked(active):
                     await self._refresh_native_schema(db, "active", active)
                     continue
                 outcome = await self.validate_active(db, kind)
@@ -908,6 +910,12 @@ async def check_binding(
     if client is None:
         return CapabilityCheck(error_code="not_configured")
     return await check_generation(client)
+
+
+def _image_input_unasked(binding: ModelBinding) -> bool:
+    """Whether the check on record for a ready generation binding never asked if its model reads images."""
+    validation = binding.validation
+    return binding.kind == "generation" and validation is not None and "image_input" not in validation.facts
 
 
 def _check_subject(db: "Database", slot: BindingSlot, binding: ModelBinding) -> _CheckSubject:
