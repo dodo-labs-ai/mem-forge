@@ -18,6 +18,7 @@ is kept in a JSON state file so the checks after the restart can look for them.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import secrets
@@ -599,6 +600,43 @@ def _model_plan(args: argparse.Namespace) -> ModelPlan:
     )
 
 
+# -- Quality checks ----------------------------------------------------------------
+
+# The module whose prompts a derivation reads; a run names its content hash.
+_EXTRACTION_PROMPTS = Path(__file__).resolve().parents[1] / "src" / "memforge" / "pipeline" / "memory_extractor.py"
+
+
+def quality_seed_spec(cohort_file: Path, state: State) -> str:
+    """The seed request of the cohort file: each case names its Document by title within the smoke source."""
+    cohort = json.loads(cohort_file.read_text(encoding="utf-8"))
+    source_id = state.get("source_id")
+    if not source_id:
+        raise CheckFailed("no source was added before the quality checks")
+    return json.dumps(
+        {
+            "selection_policy_version": cohort["selection_policy_version"],
+            "role": cohort["role"],
+            "cases": [{**case, "source_id": source_id} for case in cohort["cases"]],
+        }
+    )
+
+
+def quality_run_spec(cohort_file: Path, seeded: dict[str, Any]) -> str:
+    """The run spec for the cohort the seed request froze; the server pins its code and model."""
+    skipped = {reason: names for reason, names in (seeded.get("skipped") or {}).items() if names}
+    if seeded.get("error") or not seeded.get("cohort_id") or skipped:
+        raise CheckFailed(f"the quality cohort was not pinned completely: {seeded.get('error') or skipped}")
+    run = json.loads(cohort_file.read_text(encoding="utf-8"))["run"]
+    prompt_hash = hashlib.sha256(_EXTRACTION_PROMPTS.read_bytes()).hexdigest()
+    return json.dumps(
+        {
+            **run,
+            "cohort_id": seeded["cohort_id"],
+            "candidate_manifest": {**run["candidate_manifest"], "prompt_hash": prompt_hash},
+        }
+    )
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -639,6 +677,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     sync.add_argument("--timeout", type=float, default=900)
 
     api_command("search", "search the source's memories")
+    seed_spec = api_command("quality-seed-spec", "print the quality cohort's seed request")
+    seed_spec.add_argument("--cohort", type=Path, required=True)
+    run_spec = api_command("quality-run-spec", "print the quality run spec for a seed answer read from stdin")
+    run_spec.add_argument("--cohort", type=Path, required=True)
     api_command("persisted", "check what was recorded before the restart")
     return parser.parse_args(argv)
 
@@ -667,6 +709,10 @@ def run(args: argparse.Namespace) -> str:
         return wait_for_sync(args.api, state, timeout=args.timeout)
     if args.command == "search":
         return search_source(args.api, state)
+    if args.command == "quality-seed-spec":
+        return quality_seed_spec(args.cohort, state)
+    if args.command == "quality-run-spec":
+        return quality_run_spec(args.cohort, json.load(sys.stdin))
     return check_persisted(args.api, state)
 
 

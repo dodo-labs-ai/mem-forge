@@ -7345,25 +7345,24 @@ class Database:
         *,
         source_id: str,
         statuses: tuple[str, ...] | None = None,
+        source_unit_id: str | None = None,
     ) -> tuple[SourceDerivationAttempt, ...]:
-        """Return staged derivations for one configured Source."""
+        """Return staged derivations for one configured Source, or for one of its Source Units."""
 
+        conditions = ["source_id = ?"]
+        params: list[object] = [source_id]
         if statuses:
-            placeholders = ",".join("?" for _ in statuses)
-            rows = await self.db.execute_fetchall(
-                f"""SELECT id FROM source_derivation_attempts
-                    WHERE source_id = ?
-                      AND status IN ({placeholders})
-                    ORDER BY created_at, id""",
-                (source_id, *statuses),
-            )
-        else:
-            rows = await self.db.execute_fetchall(
-                """SELECT id FROM source_derivation_attempts
-                   WHERE source_id = ?
-                   ORDER BY created_at, id""",
-                (source_id,),
-            )
+            conditions.append(f"status IN ({','.join('?' for _ in statuses)})")
+            params.extend(statuses)
+        if source_unit_id is not None:
+            conditions.append("source_unit_id = ?")
+            params.append(source_unit_id)
+        rows = await self.db.execute_fetchall(
+            f"""SELECT id FROM source_derivation_attempts
+                WHERE {' AND '.join(conditions)}
+                ORDER BY created_at, id""",
+            tuple(params),
+        )
         return tuple([await self._source_derivation_attempt_unlocked(str(row["id"])) for row in rows])
 
     async def supersede_source_derivation(
