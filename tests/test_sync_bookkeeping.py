@@ -4684,6 +4684,7 @@ async def _stage_completed_v9_recovery_attempt(
     *,
     source_id: str,
     client=None,
+    skipped_reading_group_count: int = 0,
 ) -> SourceDerivationAttempt:
     await db.upsert_source(
         id=source_id,
@@ -4748,7 +4749,10 @@ async def _stage_completed_v9_recovery_attempt(
     )
 
     async def extract(_batch):
-        return MemoryExtractionResult(memories=[])
+        return MemoryExtractionResult(
+            memories=[],
+            metadata={"skipped_reading_group_count": skipped_reading_group_count},
+        )
 
     access_hash = lifecycle_access_context_hash(visibility="workspace", owner_user_id=None, project_key=None, repo_identifier=None)
     capability = revision_inference_capability_hash(client, extraction_model="fixture", extraction_max_tokens=8192)
@@ -5024,6 +5028,45 @@ async def test_exact_provider_rediscovery_reuses_recovered_deferred_intent(
     assert state.runtime_bundles == ()
     assert engine.semantic_calls == 1
     assert engine.commit_only_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deferred", [False, True], ids=["committed", "deferred"])
+async def test_a_recovered_derivation_counts_the_document_parts_it_left_unread(
+    db: Database,
+    deferred: bool,
+) -> None:
+    source_id = "src-recovery-unread-parts"
+    attempt = await _stage_completed_v9_recovery_attempt(
+        db,
+        source_id=source_id,
+        skipped_reading_group_count=2,
+    )
+    engine = (
+        RecoveryDeferredMemoryEngine(blocker_source_unit_id=attempt.source_unit_id)
+        if deferred
+        else RecordingMemoryEngine()
+    )
+    recovery = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=ProjectionFragmentRecordingExtractor(fail_if_called=True),
+        memory_engine=engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    state = await recovery.sync_gene(
+        gene=V9RecoveryReplayGene(attempt),
+        source_name="Recovery unread parts",
+        source_id=source_id,
+        lifecycle_cycle_id="run-recovery-unread-parts",
+    )
+
+    assert (state.last_sync_status, state.docs_processed) == ("success", 1)
+    assert state.skipped_reading_group_count == 2
+    [latest] = await db.get_sync_history(source=source_id, limit=1)
+    assert latest["skipped_reading_group_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -6582,6 +6625,23 @@ async def test_migration_112_adds_the_absence_check_skipped_reason_to_sync_histo
 
     columns = {row[1] for row in await db.db.execute_fetchall("PRAGMA table_info(sync_history)")}
     assert "absence_check_skipped_reason" in columns
+
+
+@pytest.mark.asyncio
+async def test_migration_120_counts_the_document_parts_a_sync_run_left_unread(db: Database):
+    await db.db.execute("ALTER TABLE sync_history DROP COLUMN skipped_reading_group_count")
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 120")
+    await db.db.execute(
+        """INSERT INTO sync_history (source, status, started_at, finished_at)
+           VALUES ('src-before-120', 'success', '2026-10-01T00:00:00+00:00', '2026-10-01T00:00:01+00:00')"""
+    )
+    await db.db.commit()
+
+    await db._run_migrations()  # noqa: SLF001
+    await db._run_migrations()  # noqa: SLF001
+
+    [recorded] = await db.get_sync_history(source="src-before-120", limit=1)
+    assert recorded["skipped_reading_group_count"] == 0
 
 
 @pytest.mark.asyncio

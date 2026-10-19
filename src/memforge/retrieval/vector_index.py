@@ -118,13 +118,14 @@ async def settle_memory_vector_index(
     """Give an installation with no index in use its first one, for ``profile``.
 
     Returns the record of the index in use afterwards. ``None`` means the
-    installation holds vectors of another length than the profile's and has to
-    rebuild its index.
+    installation has to build its first index with a rebuild, as
+    ``first_index_record`` explains.
     """
     in_use = await db.get_active_vector_index()
     if in_use is not None:
         return in_use
-    record = await asyncio.to_thread(first_index_record, chroma_path, profile)
+    holds_memories = await db.count_memories_kept_without_vectors() > 0
+    record = await asyncio.to_thread(first_index_record, chroma_path, profile, holds_memories=holds_memories)
     if record is None:
         return None
     await db.record_active_vector_index(record)
@@ -138,16 +139,28 @@ async def settle_memory_vector_index(
     return in_use
 
 
-def first_index_record(chroma_path: str, profile: EmbeddingProfile) -> dict[str, Any] | None:
+def first_index_record(
+    chroma_path: str,
+    profile: EmbeddingProfile,
+    *,
+    holds_memories: bool,
+) -> dict[str, Any] | None:
     """Describe the first index of an installation, for ``profile``.
 
     Stored vectors of the profile's length are adopted where they are, and the
     model they came from is taken to be the profile's. With no stored vectors
-    the index is a new, empty collection named from the fingerprint. ``None``
-    means stored vectors of another length: nothing can be adopted.
+    the index is a new, empty collection named from the fingerprint, which
+    pending vector work fills.
+
+    ``None`` means the first index has to be built by a rebuild: the stored
+    vectors have another length, or ``holds_memories`` says Memories were kept
+    without vectors while there was no embedding model, which no pending
+    vector work embeds.
     """
     stored_dimension = stored_vector_dimension(chroma_path)
     if stored_dimension is None:
+        if holds_memories:
+            return None
         delete_index_collection(chroma_path, STORED_VECTORS_COLLECTION)
         name = collection_name_for(profile.fingerprint)
         _get_or_create(chroma_path, name)

@@ -9056,7 +9056,7 @@
         "type": "object"
       },
       "SourceSyncStatusResponse": {
-        "description": "A Source's latest sync, read from one of three places.\n\nAn active durable run carries the run fields (``run_id``, ``trigger``,\n``force_full_sync``, ``created_at``, ``next_attempt_at``,\n``recovery_count``, ``progress_revision``, ``progress_updated_at``). A\nsync running in this process carries its live counters (``phase``,\n``docs_*``, ``memories_*``, ``current_title``). The last recorded sync\ncarries its totals, ``run_id``, ``failed_docs`` and\n``absence_check_skipped_reason``, which names the step that kept that run\nfrom removing anything although its scope listing was due. Fields outside\nthe chosen shape are absent.",
+        "description": "A Source's latest sync, read from one of three places.\n\nAn active durable run carries the run fields (``run_id``, ``trigger``,\n``force_full_sync``, ``created_at``, ``next_attempt_at``,\n``recovery_count``, ``progress_revision``, ``progress_updated_at``). A\nsync running in this process carries its live counters (``phase``,\n``docs_*``, ``memories_*``, ``current_title``). The last recorded sync\ncarries its totals, ``run_id``, ``failed_docs``,\n``absence_check_skipped_reason``, which names the step that kept that run\nfrom removing anything although its scope listing was due, and\n``skipped_reading_group_count``, the parts of its Documents the generation\nmodel could not read. Fields outside the chosen shape are absent.",
         "properties": {
           "absence_check_skipped_reason": {
             "anyOf": [
@@ -9294,6 +9294,17 @@
               }
             ],
             "title": "Run Id"
+          },
+          "skipped_reading_group_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skipped Reading Group Count"
           },
           "started_at": {
             "anyOf": [

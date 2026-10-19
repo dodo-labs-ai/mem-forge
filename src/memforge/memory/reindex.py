@@ -161,7 +161,8 @@ class MemoryVectorIndexes:
 
     async def first_index_record(self, profile: EmbeddingProfile) -> dict[str, Any] | None:
         """Describe the first index of an installation, to be recorded by the caller."""
-        return await asyncio.to_thread(first_index_record, self._chroma_path, profile)
+        holds_memories = await self._db.count_memories_kept_without_vectors() > 0
+        return await asyncio.to_thread(first_index_record, self._chroma_path, profile, holds_memories=holds_memories)
 
     async def holds_stored_vectors(self) -> bool:
         """Whether the installation holds vectors from before it recorded any index."""

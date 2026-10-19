@@ -174,6 +174,7 @@ export interface SyncStatus {
   docs_updated?: number;
   docs_failed?: number;
   memories_extracted?: number;
+  skipped_reading_group_count?: number | null;
   docs_stored?: number;
   memories_stored?: number;
   current_title?: string | null;

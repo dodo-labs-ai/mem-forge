@@ -162,6 +162,12 @@ class MemoryLifecycleService:
             extraction_context=provenance,
         )
         doc_id = self._user_memory_doc_id(memory.id, idempotency_key=idempotency_key)
+        if idempotency_key:
+            # A request repeated with its key answers with the Memory it created.
+            for memory_id in await self.db.get_memory_ids_for_doc(doc_id):
+                existing = await self.db.get_memory(memory_id)
+                if existing is not None and existing.status == "active":
+                    return CreateMemoryResult(memory_id=existing.id, status="corroborated")
         await self._write_user_memory_document(
             doc_id=doc_id,
             memory=memory,
