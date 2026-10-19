@@ -223,8 +223,6 @@ class ProviderDescriptor:
     # How the endpoint lists its models and what each entry declares; every
     # descriptor states one, ``None`` when the endpoint lists none.
     listing: ModelListing | None = field(kw_only=True)
-    # The header a model listing request carries the API key in.
-    key_header: Literal["authorization", "x-api-key"] = "authorization"
     # Non-secret settings the provider accepts besides endpoint and model.
     options: tuple[str, ...] = ()
     # The request paths the SDK and the model listing write after the base URL.
@@ -335,7 +333,6 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         route_prefixes={"generation": "anthropic"},
         default_endpoint="https://api.anthropic.com",
         listing=AnthropicListing(),
-        key_header="x-api-key",
         # LiteLLM writes ``/v1/messages`` after the base URL itself.
         request_paths=("/v1", "/v1/messages", "/v1/models"),
         # An Anthropic model thinks only when a request asks it to.

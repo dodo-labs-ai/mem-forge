@@ -1,10 +1,19 @@
 """What a provider's model listing declares about the models it lists.
 
-Every provider that lists its models has a ``ModelListing`` of its own: where
-the listing is, and how one of its entries reads as a ``DeclaredModel``. The
-fields an entry carries are the provider's own, so each listing reads only the
-fields its provider writes, and a provider added to ``PROVIDER_DESCRIPTORS``
-states its listing, or that it has none, as part of its descriptor.
+``ModelListing`` is the one contract every provider that lists its models
+implements, in a class of its own: where to ask (``request_urls``), how to ask
+(``request_headers``), and how the answer reads (``entries`` and
+``declared_model``, into a ``DeclaredModel``). Providers keep the same facts
+in different fields, or give none, so each implementation reads only the
+fields its provider writes. Everything else, the request with its origin and
+redirect rules, Settings and the runtime, uses the contract alone and never
+asks which provider it is.
+
+The contract grows in two directions. A new provider implements it and states
+it on its descriptor, with no change to shared code. A new fact is a
+``DeclaredModel`` field that declares nothing by default, with a ``gives_*``
+flag: each implementation reads it from its provider's own field or leaves it
+undeclared, and code that uses the fact reads it from ``DeclaredModel`` only.
 
 A declaration is what the provider observes about a model. It guides the
 choice of a model and the requests made to it; a capability check, not the
@@ -18,6 +27,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from memforge.llm.providers import ModelKind
@@ -87,6 +97,22 @@ class ModelListing(ABC):
     def declared_model(self, entry: Any, kind: ModelKind) -> DeclaredModel | None:
         """Read one entry listed for ``kind``; ``None`` for an entry that names no model."""
 
+    def request_urls(self, endpoint: str, kind: ModelKind) -> list[str]:
+        """The addresses that may answer with the listing of ``kind``, in the order they are asked."""
+        root = endpoint.strip().rstrip("/")
+        path = self.paths[kind]
+        urls = [f"{root}{path}"]
+        if self.tries_v1 and not urlsplit(root).path.rstrip("/").endswith("/v1"):
+            urls.append(f"{root}/v1{path}")
+        return list(dict.fromkeys(urls))
+
+    def request_headers(self, api_key: str | None) -> dict[str, str]:
+        """The headers of a listing request: the API key, when there is one, as a bearer token."""
+        headers = {"Accept": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
     @property
     def kind_filtered(self) -> bool:
         """Whether the listing tells the models of one kind from the other."""
@@ -139,6 +165,14 @@ class AnthropicListing(ModelListing):
     paths = {"generation": "/models"}
     kind_signal = "listing"
     gives_token_limits = True
+
+    def request_headers(self, api_key: str | None) -> dict[str, str]:
+        """Anthropic takes the API key as ``x-api-key``, with the API version it answers in."""
+        headers = {"Accept": "application/json"}
+        if api_key:
+            headers["x-api-key"] = api_key
+            headers["anthropic-version"] = "2023-06-01"
+        return headers
 
     def declared_model(self, entry: Any, kind: ModelKind) -> DeclaredModel | None:
         model_id = _text(entry, "id")
