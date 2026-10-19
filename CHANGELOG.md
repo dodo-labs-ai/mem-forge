@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Contributors: the smoke scripts default to Claude Haiku 5.5 for generation
+  (`anthropic/claude-haiku-5.5` through OpenRouter, `claude-haiku-5-5` with an
+  Anthropic key). On OpenRouter it costs a tenth of Haiku 4.5 per token and
+  reads up to 1M tokens. `--generation-model` still picks another model.
+
 - Offline quality evaluation can check extraction quality in one command.
   - `scripts/compose_smoke.sh --quality` syncs the synthetic documents of
     `evals/quality/quick`, pins them as derivation cases and runs the quick
