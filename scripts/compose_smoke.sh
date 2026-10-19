@@ -27,7 +27,7 @@
 #   --ollama-url URL        Ollama as the API container reaches it
 #                           (default http://host.docker.internal:11434).
 #   --generation-model ID   Generation model (default qwen3:0.6b with Ollama,
-#                           anthropic/claude-haiku-4.5 with OpenRouter).
+#                           anthropic/claude-haiku-5.5 with OpenRouter).
 #   --embedding-model ID    Embedding model (default nomic-embed-text with
 #                           Ollama, openai/text-embedding-3-small with OpenRouter).
 #   --no-models             Skip the model steps even when a provider is available.
@@ -107,7 +107,7 @@ elif (( use_ollama )); then
   embedding_model=${embedding_model:-nomic-embed-text}
 elif [ -n "${OPENROUTER_API_KEY:-}" ]; then
   model_provider=openrouter
-  generation_model=${generation_model:-anthropic/claude-haiku-4.5}
+  generation_model=${generation_model:-anthropic/claude-haiku-5.5}
   embedding_model=${embedding_model:-openai/text-embedding-3-small}
 else
   model_provider=none
