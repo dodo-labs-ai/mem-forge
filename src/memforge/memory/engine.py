@@ -72,7 +72,7 @@ from memforge.pipeline.projection_fragments import (
     SupportRevalidationLimitation,
     SupportRevalidationLimitationCode,
 )
-from memforge.pipeline.revision_assessment import RevisionAssessmentContext, SupportAssessment
+from memforge.pipeline.revision_assessment import RevisionAssessmentContext, SupportAssessment, client_reads_images
 from memforge.pipeline.revision_work import CHANGE_IMPACT_TASK
 from memforge.pipeline.support_relation_coordinator import (
     MemorySupport,
@@ -1065,9 +1065,11 @@ class MemoryEngine:
                     item.anchor.observation_revision_id
                     for items in evidence_by_memory.values() for item in items
                 } - {revision.id for revision in projection.observation_revisions})).values())
+                reads_images = client_reads_images(self.structured_llm_client)
                 assessment_context = RevisionAssessmentContext(
                     projection=projection, base=base, access_context_hash=access_context_hash,
                     image_loader=evidence_image_loader, evidence_revisions=evidence_revisions,
+                    reads_images=reads_images,
                 )
 
                 def assessment_context_for(baseline):
@@ -1080,6 +1082,7 @@ class MemoryEngine:
                         image_loader=evidence_image_loader, indexes=assessment_context.indexes,
                         known_observations=base.observations if base is not None else (),
                         evidence_revisions=tuple(assessment_context.revisions.values()),
+                        reads_images=reads_images,
                     )
                 contexts_by_revision = {base.source_unit_revisions[0].id: assessment_context} if base else {}
                 for memory in model_incumbents:

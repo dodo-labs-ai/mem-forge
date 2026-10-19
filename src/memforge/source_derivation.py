@@ -315,6 +315,9 @@ class SourceUnitDerivationRequest:
     committed_base_snapshot: CommittedSourceUnitSnapshot | None = None
     access_context_hash: str | None = None
     inference_capability_hash: str | None = None
+    # Whether the model deriving the Unit sees images; its
+    # ``inference_capability_hash`` records the same.
+    reads_images: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -673,6 +676,7 @@ class SourceUnitDeriver:
             projection=request.projection,
             plan=plan,
             results=ordered_results,
+            reads_images=request.reads_images,
         )
         extraction.metadata = {
             **extraction.metadata,
@@ -718,6 +722,7 @@ async def replay_source_unit_derivation(
         projection=request.projection,
         plan=plan,
         results=tuple(results),
+        reads_images=request.reads_images,
     )
     extraction.metadata = {
         **extraction.metadata,
@@ -1367,6 +1372,7 @@ def assemble_source_derivation_results(
     projection: SourceProjection,
     plan: ExtractionPlan,
     results: tuple[MemoryExtractionResult, ...],
+    reads_images: bool = True,
 ) -> MemoryExtractionResult:
     metrics = _aggregate_extraction_metrics(results)
     # ReadingGroups skipped for capacity, whether at planning or when a request was sent.
@@ -1380,6 +1386,7 @@ def assemble_source_derivation_results(
         and not observation_is_inference_eligible(
             observation.observation_type,
             revisions_by_observation_id[observation.id].metadata,
+            reads_images=reads_images,
         )
     )
     memories: list[RawMemory] = []

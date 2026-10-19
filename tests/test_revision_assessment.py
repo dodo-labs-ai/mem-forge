@@ -326,6 +326,23 @@ def test_actual_extraction_allowance_is_part_of_reuse_identity():
     assert original != revision_inference_capability_hash(None, extraction_model="model-b", extraction_max_tokens=4096)
 
 
+def test_whether_the_model_reads_images_is_part_of_reuse_identity():
+    from types import SimpleNamespace
+
+    from memforge.pipeline.revision_assessment import revision_inference_capability_hash
+
+    def identity(reads_images):
+        client = SimpleNamespace(reads_images=reads_images, input_policy_identity_for=lambda _model: "budget")
+        return revision_inference_capability_hash(client, extraction_model="model-a", extraction_max_tokens=4096)
+
+    assert identity(False) != identity(True)
+    # A client that does not say reads images, as every client did before it could say.
+    unsaid = SimpleNamespace(input_policy_identity_for=lambda _model: "budget")
+    assert identity(True) == revision_inference_capability_hash(
+        unsaid, extraction_model="model-a", extraction_max_tokens=4096
+    )
+
+
 def test_changelog_delta_keeps_before_after_field_identity_and_event_context():
     import hashlib
     from dataclasses import replace
