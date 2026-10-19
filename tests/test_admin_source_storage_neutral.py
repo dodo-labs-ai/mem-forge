@@ -105,6 +105,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
                     "error_message": "one failed",
                     "failed_docs": [{"doc_id": "doc-1", "title": "Design", "error": "boom"}],
                     "absence_check_skipped_reason": "absence_confirmation_failed",
+                    "skipped_reading_group_count": 2,
                 }
             ]
 
@@ -173,6 +174,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
         "error_message": "one failed",
         "failed_docs": [{"doc_id": "doc-1", "title": "Design", "error": "boom"}],
         "absence_check_skipped_reason": "absence_confirmation_failed",
+        "skipped_reading_group_count": 2,
         "progress": {
             "schema_version": 1,
             "phase": "processing",

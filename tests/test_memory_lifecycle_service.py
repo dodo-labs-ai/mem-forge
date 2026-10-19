@@ -20,6 +20,7 @@ from memforge.memory.evidence import (
     memory_unit_support_assertion_id,
 )
 from memforge.memory.lifecycle_service import (
+    CreateMemoryResult,
     MaintenanceClosureEntry,
     MemoryLifecycleConflict,
     MemoryLifecycleService,
@@ -320,6 +321,34 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
     assert document.source == "user_memory"
     assert document.client == "codex"
     assert await db.list_document_source_unit_inputs(document.doc_id) == []
+
+
+@pytest.mark.asyncio
+async def test_create_memory_keeps_a_memory_without_vectors_and_answers_a_repeated_request_with_it(db: Database):
+    collection = RecordingCollection()
+    adapters = build_sqlite_adapters(db, collection)
+    store = MemoryStore(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embedding=unconfigured_embedding(),
+    )
+    service = MemoryLifecycleService(db=db, memory_store=store)
+    request = {
+        "content": "Release tags follow vYYYY.MM.N.",
+        "provenance": "Agreed by the release owner during the rollout review.",
+        "owner_user_id": "dev",
+        "client": "codex",
+        "idempotency_key": "create-release-tags",
+    }
+
+    created = await service.create_memory(**request)
+    repeated = await service.create_memory(**request)
+
+    assert created.status == "inserted"
+    assert repeated == CreateMemoryResult(memory_id=created.memory_id, status="corroborated")
+    assert await db.count_searchable_memories() == 1
+    assert collection.records == {}
 
 
 @pytest.mark.asyncio

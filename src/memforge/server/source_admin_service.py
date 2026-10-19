@@ -259,6 +259,7 @@ async def list_source_admin_rows(
                     "absence_check_skipped_reason": _absence_check_skipped_reason(
                         latest.get("absence_check_skipped_reason")
                     ),
+                    "skipped_reading_group_count": latest.get("skipped_reading_group_count", 0),
                     "progress": {
                         "schema_version": 1,
                         "phase": "processing",

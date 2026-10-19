@@ -624,6 +624,9 @@ class SyncState:
     docs_updated: int = 0
     docs_failed: int = 0
     memories_extracted: int = 0
+    # Parts of the run's Documents the generation model could not read: its
+    # answer for the part was rejected, or the part does not fit the model.
+    skipped_reading_group_count: int = 0
     error_message: str | None = None
     failed_docs: list[FailedDoc] = field(default_factory=list)
     failure_retryable: bool = True

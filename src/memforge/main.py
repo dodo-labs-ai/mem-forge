@@ -1988,11 +1988,17 @@ def sync(ctx, source: str | None):
                     if state.last_sync_status == "partial"
                     else "red"
                 )
-                console.print(
+                summary = (
                     f"  [{status_color}]Done:[/] {state.docs_processed} discovered, "
                     f"{state.docs_updated} updated, {state.docs_failed} failed, "
                     f"{state.memories_extracted} memories extracted"
                 )
+                if state.skipped_reading_group_count:
+                    summary += (
+                        f", {state.skipped_reading_group_count} document part(s) "
+                        "unread by the generation model"
+                    )
+                console.print(summary)
             except Exception as e:
                 console.print(f"  [red]Sync failed: {e}[/]")
 

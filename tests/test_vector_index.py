@@ -487,6 +487,78 @@ async def test_validating_the_active_model_settles_the_first_index(db, tmp_path,
     assert after.reindex_target is None
 
 
+async def test_a_memory_kept_before_any_embedding_model_is_embedded_by_the_first_models_rebuild(
+    db, tmp_path, models
+) -> None:
+    import httpx
+
+    from memforge.server.admin_api import create_admin_app
+
+    config = _config(tmp_path, model="")
+    app = create_admin_app(db=db, config=config, principal_resolver=lambda _request: "dev")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        created = await client.post(
+            "/api/v1/memories/create",
+            json={
+                "content": "Deploy through the release pipeline.",
+                "provenance": "Agreed by the release owner during the rollout review.",
+                "memory_type": "fact",
+                "client": "codex",
+            },
+        )
+    kept_index = await db.get_active_vector_index()
+    keyword_engine = await runtime.build_search_engine(db, config)
+    keyword_hits = [hit.memory_id for hit in (await keyword_engine.search("release pipeline", top_k=5))["results"]]
+
+    config.llm.embedding_model = "embed-a"
+    settings = ModelSettings(config, DefaultRuntimeProvider())
+    await settings.validate_active(db, "embedding")
+    waiting = await settings.vector_index(db)
+    finished = await settings.run_reindex(db)
+
+    assert created.status_code == 200, created.text
+    memory_id = created.json()["memory_id"]
+    assert created.json()["status"] == "inserted"
+    assert kept_index is None
+    assert keyword_hits == [memory_id]
+    # An empty first index would leave the kept Memory without a vector for good.
+    assert (waiting.status, waiting.reindex_target, waiting.in_use) == ("reindex_required", "active", None)
+    assert (finished["state"], finished["vector_count"]) == ("active", 1)
+    assert await _vector_hits(db, config) == [memory_id]
+
+
+async def _with_pending_vector_work(db: Database, memory_id: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    await db.upsert_source("src-index", "confluence", "Index", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.db.execute(
+        """INSERT INTO lifecycle_plans (
+               id, reconciliation_scope_id, source_id, source_unit_id,
+               target_unit_revision_id, status, payload_json, payload_hash, created_at
+           ) VALUES ('plan-pending', 'scope-pending', 'src-index', 'unit-1', 'unitrev-1', 'applied', '{}', 'hash', ?)""",
+        (now,),
+    )
+    await db.db.execute(
+        """INSERT INTO lifecycle_vector_outbox (
+               id, lifecycle_plan_id, memory_id, operation, status, created_at, updated_at
+           ) VALUES ('task-pending', 'plan-pending', ?, 'upsert', 'pending', ?, ?)""",
+        (memory_id, now, now),
+    )
+    await db.db.commit()
+
+
+async def test_memories_whose_vectors_are_pending_get_a_new_first_index_directly(db, tmp_path) -> None:
+    config = _config(tmp_path)
+    await db.insert_memory(_memory("mem-pending", "A fact whose vector is still to be delivered"))
+    await _with_pending_vector_work(db, "mem-pending")
+
+    kept = await db.count_memories_kept_without_vectors()
+    in_use = await settle_memory_vector_index(db, config.storage.chroma_path, IDENTITY_A.profile(3))
+
+    # The pending vector work fills the new index, so no rebuild is needed.
+    assert kept == 0
+    assert (in_use["fingerprint"], in_use["adopted"]) == (IDENTITY_A.profile(3).fingerprint, False)
+
+
 @pytest.mark.parametrize("dimension", [3, 8], ids=["the_models_length", "another_length"])
 async def test_stored_vectors_can_be_rebuilt_for_a_model_that_has_not_been_checked(
     db, tmp_path, models, dimension
