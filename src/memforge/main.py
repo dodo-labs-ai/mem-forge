@@ -1138,6 +1138,84 @@ def eval_offline_submit(ctx: click.Context, spec_path: Path, workspace_id: str |
     _emit_tool_payload(ctx, _tool_client(ctx, workspace_id).admit_agent_evaluation_run(payload))
 
 
+def _read_json_object(path: Path, what: str) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise click.ClickException(f"Cannot read {what}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise click.ClickException(f"{what[0].upper()}{what[1:]} must be a JSON object")
+    return payload
+
+
+@eval_group.command("offline-run")
+@click.option(
+    "--spec",
+    "spec_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("--timeout", "timeout_s", default=1800, show_default=True, help="Seconds to wait for the run.")
+@click.option("--poll", "poll_s", default=10, show_default=True, help="Seconds between report reads.")
+@_workspace_id_option
+@click.pass_context
+def eval_offline_run(
+    ctx: click.Context,
+    spec_path: Path,
+    timeout_s: int,
+    poll_s: int,
+    workspace_id: str | None,
+) -> None:
+    """Submit one offline evaluation spec, wait for its run and print a Markdown summary.
+
+    Exits 0 when the run's verdict is pass, 1 when it is fail or unknown, and 2
+    when the run does not finish within --timeout.
+    """
+
+    from memforge.evals.offline_run import render_report_markdown, report_verdict, wait_for_report
+
+    client = _tool_client(ctx, workspace_id)
+    admitted = client.admit_agent_evaluation_run(_read_json_object(spec_path, "evaluation spec"))
+    if admitted.get("error") or admitted.get("code"):
+        _emit_tool_payload(ctx, admitted)
+        ctx.exit(1)
+    run_id = str(admitted["run"]["run_id"])
+    click.echo(f"Run {run_id} admitted; waiting for the worker.", err=True)
+    report = wait_for_report(lambda: client.get_agent_evaluation_run(run_id), timeout_s=timeout_s, poll_s=poll_s)
+    if report is None:
+        click.echo(f"Run {run_id} did not finish within {timeout_s} s.", err=True)
+        ctx.exit(2)
+    if report.get("error"):
+        _emit_tool_payload(ctx, dict(report))
+        ctx.exit(1)
+    click.echo(render_report_markdown(report))
+    ctx.exit(0 if report_verdict(report) == "pass" else 1)
+
+
+@eval_group.command("seed-derivation-cases")
+@click.option(
+    "--spec",
+    "spec_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@_workspace_id_option
+@click.pass_context
+def eval_seed_derivation_cases(ctx: click.Context, spec_path: Path, workspace_id: str | None) -> None:
+    """Pin synced Documents as derivation cases with their rubrics and freeze their cohort.
+
+    The spec names ``selection_policy_version``, an optional ``role`` and the
+    ``cases``, each a ``doc_id`` with its ``rubric``. Requires a maintenance operator.
+    """
+
+    _emit_tool_payload(
+        ctx,
+        _tool_client(ctx, workspace_id).seed_derivation_evaluation_cases(
+            _read_json_object(spec_path, "derivation case spec")
+        ),
+    )
+
+
 @eval_group.command("langfuse-policy-approve")
 @click.option("--source-id", required=True)
 @click.option("--policy-version", required=True)

@@ -73,3 +73,50 @@ def test_the_packaged_proxy_lists_the_expected_tools(tmp_path: Path) -> None:
         tools = {tool["name"] for tool in session.call("tools/list")["tools"]}
 
     assert smoke.EXPECTED_MCP_TOOLS <= tools
+
+
+COHORT = ROOT / "evals" / "quality" / "quick" / "cohort.json"
+
+
+def test_every_quality_case_names_a_document_the_smoke_syncs() -> None:
+    import json
+    import re
+
+    titles = {
+        match.group(1)
+        for path in (ROOT / "evals" / "quality" / "quick" / "docs").glob("*.md")
+        for match in [re.match(r"# (.+)", path.read_text(encoding="utf-8"))]
+        if match
+    }
+    titles |= set(re.findall(r"^# (.+)$", (ROOT / "scripts" / "compose_smoke.sh").read_text(), re.MULTILINE))
+
+    cases = json.loads(COHORT.read_text(encoding="utf-8"))["cases"]
+
+    assert {case["title"] for case in cases} <= titles
+    assert len({case["title"] for case in cases}) == len(cases)
+
+
+def test_the_seed_request_names_each_document_within_the_smoke_source(tmp_path: Path) -> None:
+    import json
+
+    state = smoke.State(tmp_path / "state.json")
+    state.set(source_id="src-smoke")
+
+    spec = json.loads(smoke.quality_seed_spec(COHORT, state))
+
+    assert (spec["selection_policy_version"], spec["role"]) == ("public-quick-v1", "sentinel")
+    assert {case["source_id"] for case in spec["cases"]} == {"src-smoke"}
+    with pytest.raises(smoke.CheckFailed, match="no source"):
+        smoke.quality_seed_spec(COHORT, smoke.State(tmp_path / "empty.json"))
+
+
+def test_the_run_spec_needs_every_case_pinned() -> None:
+    import json
+
+    spec = json.loads(smoke.quality_run_spec(COHORT, {"cohort_id": "aeo-1", "skipped": {"document_not_found": []}}))
+
+    assert spec["cohort_id"] == "aeo-1"
+    assert len(spec["candidate_manifest"]["prompt_hash"]) == 64
+    assert "code_revision" not in spec["candidate_manifest"] and "model" not in spec["candidate_manifest"]
+    with pytest.raises(smoke.CheckFailed, match="not pinned completely"):
+        smoke.quality_run_spec(COHORT, {"cohort_id": "aeo-1", "skipped": {"document_not_found": ["src:Missing"]}})

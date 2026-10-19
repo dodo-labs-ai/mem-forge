@@ -1,0 +1,70 @@
+{
+  "selection_policy_version": "public-quick-v1",
+  "role": "sentinel",
+  "run": {
+    "evaluator_suite": "quick",
+    "evaluator_version": "1",
+    "candidate_manifest": {
+      "schema_version": "public-quick-v1",
+      "contract_version": "public-quick-v1",
+      "replay_harness_version": "1"
+    }
+  },
+  "cases": [
+    {
+      "title": "Decision: the Kestrel job queue is stored in SQLite",
+      "rubric": {
+        "expected_memory_count": {
+          "min": 1
+        },
+        "required_terms": [
+          "SQLite"
+        ]
+      }
+    },
+    {
+      "title": "Convention: Kestrel release tags",
+      "rubric": {
+        "expected_memory_count": {
+          "min": 1
+        },
+        "required_terms": [
+          "calendar"
+        ]
+      }
+    },
+    {
+      "title": "Decision: Kestrel retries a failed job three times",
+      "rubric": {
+        "expected_memory_count": {
+          "min": 1
+        },
+        "required_terms": [
+          "kestrel-dlq"
+        ]
+      }
+    },
+    {
+      "title": "Runbook: rotating the Kestrel signing key",
+      "rubric": {
+        "expected_memory_count": {
+          "min": 1
+        },
+        "required_terms": [
+          "rotate-key"
+        ]
+      }
+    },
+    {
+      "title": "Incident review: the Kestrel queue stalled on 2026-09-12",
+      "rubric": {
+        "expected_memory_count": {
+          "min": 1
+        },
+        "required_terms": [
+          "fsync"
+        ]
+      }
+    }
+  ]
+}
