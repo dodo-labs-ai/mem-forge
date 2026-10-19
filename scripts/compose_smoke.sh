@@ -33,6 +33,9 @@
 #   --no-models             Skip the model steps even when a provider is available.
 #   --sync-timeout SECONDS  How long the source sync may take (default 900).
 #   --report FILE           Also write the Markdown report to FILE.
+#   --quality               Also sync the synthetic documents of
+#                           evals/quality/quick and run the quick offline quality
+#                           evaluation over them; its summary follows the table.
 #   -h, --help              Show this help.
 #
 # Models: with --ollama the smoke uses a local Ollama that has both models
@@ -64,6 +67,8 @@ SKIPPED=3
 
 use_ollama=0
 no_models=0
+run_quality=0
+quality_summary=
 ollama_url=http://host.docker.internal:11434
 generation_model=
 embedding_model=
@@ -81,6 +86,7 @@ while [ $# -gt 0 ]; do
     --generation-model) generation_model=${2:?--generation-model needs a model}; shift ;;
     --embedding-model) embedding_model=${2:?--embedding-model needs a model}; shift ;;
     --no-models) no_models=1 ;;
+    --quality) run_quality=1 ;;
     --sync-timeout) sync_timeout=${2:?--sync-timeout needs seconds}; shift ;;
     --report) report_file=${2:?--report needs a file}; shift ;;
     -h | --help) usage; exit 0 ;;
@@ -212,6 +218,9 @@ Kestrel releases use calendar versions such as 2026.10.1. A release tag is
 always cut from the main branch, never from a feature branch, so that every
 release contains all reviewed changes.
 EOF
+  if (( run_quality )); then
+    cp "$REPO_ROOT"/evals/quality/quick/docs/*.md "$docs_dir"/
+  fi
   chmod 755 "$docs_dir"
   chmod 644 "$docs_dir"/*.md
 
@@ -340,6 +349,38 @@ retrieve_memories() {
   say "API: $searched; MCP: $(tail -n 1 "$detail_file")"
 }
 
+# The quick quality evaluation runs through the CLI in the API image: it pins
+# the cohort's documents as cases, then submits the run and waits for the
+# worker's verdict.
+quality_checks() {
+  local cohort="$REPO_ROOT/evals/quality/quick/cohort.json" seeded run_spec summary status
+  if [ "$model_provider" = none ]; then
+    say "needs a synced source"
+    return "$SKIPPED"
+  fi
+  run_spec="$work_dir/quality-run.json"
+  if ! seeded=$(helper quality-seed-spec --cohort "$cohort" |
+      compose exec -T -e MEMFORGE_API_URL=http://127.0.0.1:8765 api \
+        memforge eval seed-derivation-cases --spec /dev/stdin); then
+    say "pinning the quality cohort failed: $(echo "$seeded" | tr '\n' ' ')"
+    return 1
+  fi
+  if ! printf '%s' "$seeded" | helper quality-run-spec --cohort "$cohort" >"$run_spec"; then
+    say "$(cat "$run_spec")"
+    return 1
+  fi
+  summary=$(compose exec -T -e MEMFORGE_API_URL=http://127.0.0.1:8765 api \
+    memforge eval offline-run --spec /dev/stdin --timeout "$sync_timeout" --poll 5 <"$run_spec")
+  status=$?
+  quality_summary=$summary
+  case $status in
+    0) say "verdict pass over $(grep -c '"title"' "$cohort") cases; summary below the table" ;;
+    2) say "the evaluation run did not finish within ${sync_timeout}s" ;;
+    *) say "verdict $(echo "$summary" | sed -n 's/^- Verdict: \*\*\(.*\)\*\*$/\1/p' | head -n 1) ; summary below the table" ;;
+  esac
+  return "$status"
+}
+
 restart_stack() {
   suspect_service=api
   if ! compose down --remove-orphans >&2 || ! compose up -d --no-build --wait --wait-timeout 300 >&2; then
@@ -430,6 +471,10 @@ print_report() {
     detail=${step_details[$i]//|/\\|}
     echo "| ${step_names[$i]} | ${step_results[$i]} | $(format_seconds "${step_times[$i]}") | $detail |"
   done
+  if [ -n "$quality_summary" ]; then
+    echo
+    echo "$quality_summary"
+  fi
 }
 
 finish() {
@@ -475,5 +520,8 @@ run_step "Model configuration" configure_models
 run_step "Add local source" add_source
 run_step "Local source sync" sync_source
 run_step "Memory retrieval" retrieve_memories
+if (( run_quality )); then
+  run_step "Quick quality evaluation" quality_checks
+fi
 run_step "Restart on the same volume" restart_stack
 run_step "State survives restart" check_persisted

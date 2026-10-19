@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Offline quality evaluation can check extraction quality in one command.
+  - `scripts/compose_smoke.sh --quality` syncs the synthetic documents of
+    `evals/quality/quick`, pins them as derivation cases and runs the quick
+    evaluation with the configured model; its summary and verdict follow the
+    smoke table.
+  - `memforge eval seed-derivation-cases --spec FILE` pins synced Documents, by
+    id or by title within a Source, as cases with a rubric and freezes their
+    cohort (maintenance operator only; the self-hosted owner is one). It calls
+    the new `POST /api/v1/agent-evaluations/derivation-cases/seed`.
+  - `memforge eval offline-run --spec FILE` submits a run, waits for it and
+    prints a Markdown summary; it exits 0 on `pass`, 1 on `fail` or `unknown`
+    and 2 when the run does not finish in time.
+  - Derivation cases gain three checks: every ReadingGroup was read, the
+    Memory count is within the rubric's `expected_memory_count`, and the
+    Memories hold the rubric's `required_terms`. Run reports gain a `verdict`.
+  - A run admitted without `code_revision` or `model` is pinned to the release
+    the server runs and its generation model.
+  - Cloud: the HANA store's `list_source_derivation_attempts` needs the same
+    `source_unit_id` filter.
+
 - Contributors: provider keys for `scripts/provider_smoke.py` and
   `scripts/compose_smoke.sh` can live in `.env.test` (copied from
   `.env.test.example`, ignored by git), which both scripts read on start; a

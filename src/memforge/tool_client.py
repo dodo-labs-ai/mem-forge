@@ -537,6 +537,11 @@ class ToolClient:
 
         return self._resource_json("POST", "/agent-evaluations/runs", spec)
 
+    def seed_derivation_evaluation_cases(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """Pin synced Documents as derivation cases with their rubrics and freeze their cohort."""
+
+        return self._resource_json("POST", "/agent-evaluations/derivation-cases/seed", spec)
+
     def get_agent_evaluation_run(self, run_id: str) -> dict[str, Any]:
         """Read one authorized content-free evaluation report."""
 

@@ -78,6 +78,13 @@ RELATION_LABEL_CRITERION = "relation_label"
 # classifier related to the subject; its reason code is the recorded label and
 # it waits for a person's label.
 UNLABELLED_RELATION_CRITERION = "unlabelled_relation"
+# The criteria of a derivation case beyond its typed output: every ReadingGroup
+# was read (none skipped because the model's answer was rejected even alone or
+# the group did not fit the model), and the rubric's expected Memory count and
+# required terms. Their reason codes hold counts only, never content.
+READING_GROUP_COVERAGE_CRITERION = "reading_group_coverage"
+MEMORY_COUNT_CRITERION = "memory_count"
+REQUIRED_TERMS_CRITERION = "required_terms"
 # A check that scores one item of a case stores its reason code as
 # "reason/item_id", so each stored assessment names the item it scores, such as
 # "none:equivalent/mem-1" for one candidate of a relation group.
@@ -619,6 +626,10 @@ class AgentEvaluationRunReport:
     label_metrics: Mapping[str, Mapping[str, float | int | None]] = field(default_factory=dict)
     label_confusion: Mapping[str, int] = field(default_factory=dict)
     relation_summary: Mapping[str, float | int | None] = field(default_factory=dict)
+    # ``pending`` until every case has a result; then ``fail`` when a result
+    # errored or a check failed, ``unknown`` when a check could not decide, and
+    # ``pass`` otherwise.
+    verdict: str = "pending"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2151,6 +2162,9 @@ class OfflineAgentEvaluation:
                 assessment.criterion == UNLABELLED_RELATION_CRITERION for assessment in code_assessments
             ),
         )
+        error_result_count = sum(
+            result.status is not AgentEvaluationResultStatus.COMPLETED for result in results
+        )
         return AgentEvaluationRunReport(
             run=run,
             results=results,
@@ -2158,14 +2172,18 @@ class OfflineAgentEvaluation:
             completed_result_count=sum(
                 result.status is AgentEvaluationResultStatus.COMPLETED for result in results
             ),
-            error_result_count=sum(
-                result.status is not AgentEvaluationResultStatus.COMPLETED for result in results
-            ),
+            error_result_count=error_result_count,
             check_counts=counts,
             population_summaries=population_summaries,
             label_metrics=label_metrics,
             label_confusion=label_confusion,
             relation_summary=relation_summary,
+            verdict=run_verdict(
+                expected_result_count=len(cohort.items) * run.replicate_count,
+                result_count=len(results),
+                error_result_count=error_result_count,
+                check_counts=counts,
+            ),
         )
 
     async def read_case_outputs(
@@ -2658,6 +2676,8 @@ def deterministic_checks(
                 ),
             )
         )
+        checks.append(_reading_group_coverage_check(extraction))
+        checks.extend(_derivation_rubric_checks(ground_truth.rubric, memories))
     else:
         operations = output.get("operations")
         expected_ids = {
@@ -2787,6 +2807,74 @@ def relation_run_summary(
         "none_recall": label_metrics[none]["recall"],
         "unlabelled_relations": unlabelled_relations,
     }
+
+
+def run_verdict(
+    *,
+    expected_result_count: int,
+    result_count: int,
+    error_result_count: int,
+    check_counts: Mapping[str, int],
+) -> str:
+    """Decide a run from its results and code checks; see ``AgentEvaluationRunReport.verdict``."""
+
+    if result_count < expected_result_count:
+        return "pending"
+    if error_result_count or check_counts.get(DeterministicCheckLabel.FAIL.value, 0):
+        return "fail"
+    if check_counts.get(DeterministicCheckLabel.UNKNOWN.value, 0):
+        return "unknown"
+    return "pass"
+
+
+def _reading_group_coverage_check(extraction: Mapping[str, object]) -> DeterministicCheck:
+    telemetry = extraction.get("evidence_telemetry")
+    skipped = telemetry.get("skipped_reading_group_count", 0) if isinstance(telemetry, Mapping) else 0
+    skipped = skipped if isinstance(skipped, int) else 0
+    return DeterministicCheck(
+        criterion=READING_GROUP_COVERAGE_CRITERION,
+        label=DeterministicCheckLabel.FAIL if skipped else DeterministicCheckLabel.PASS,
+        reason_code=f"reading_groups_skipped:{skipped}" if skipped else "reading_groups_read",
+    )
+
+
+def _derivation_rubric_checks(
+    rubric: Mapping[str, object],
+    memories: Sequence[object],
+) -> list[DeterministicCheck]:
+    """Check the extracted Memories against the counts and terms the rubric expects."""
+
+    checks: list[DeterministicCheck] = []
+    expected_count = rubric.get("expected_memory_count")
+    if isinstance(expected_count, Mapping):
+        low = int(expected_count.get("min", 0))
+        high = expected_count.get("max")
+        within = len(memories) >= low and (high is None or len(memories) <= int(high))
+        checks.append(
+            DeterministicCheck(
+                criterion=MEMORY_COUNT_CRITERION,
+                label=DeterministicCheckLabel.PASS if within else DeterministicCheckLabel.FAIL,
+                reason_code=f"memory_count:{len(memories)}",
+            )
+        )
+    terms = rubric.get("required_terms")
+    if isinstance(terms, list) and terms:
+        contents = [
+            str(memory.get("content") or "").casefold()
+            for memory in memories
+            if isinstance(memory, Mapping)
+        ]
+        missing = sum(
+            not any(str(term).casefold() in content for content in contents) for term in terms
+        )
+        checks.append(
+            DeterministicCheck(
+                criterion=REQUIRED_TERMS_CRITERION,
+                label=DeterministicCheckLabel.FAIL if missing else DeterministicCheckLabel.PASS,
+                reason_code=f"required_terms_missing:{missing}/{len(terms)}",
+            )
+        )
+    return checks
 
 
 def _derivation_evidence_resolves(
@@ -3015,10 +3103,31 @@ def _validate_rubric(
             raise ValueError("relation group rubric requires expected_labels for pinned candidates")
         if any(label not in _RELATION_LABELS for label in expected_labels.values()):
             raise ValueError("relation group expected_labels must be one of " + ", ".join(sorted(_RELATION_LABELS)))
+    if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION:
+        _validate_derivation_rubric(rubric)
     if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION:
         forbidden = rubric.get("forbidden_destructive_memory_ids", [])
         if not isinstance(forbidden, list):
             raise ValueError("forbidden_destructive_memory_ids must be a list")
+
+
+def _validate_derivation_rubric(rubric: Mapping[str, object]) -> None:
+    """A derivation rubric may bound the Memory count and name terms the Memories must hold."""
+
+    expected_count = rubric.get("expected_memory_count")
+    if expected_count is not None:
+        if not isinstance(expected_count, Mapping) or not set(expected_count) <= {"min", "max"}:
+            raise ValueError("expected_memory_count takes min and max")
+        bounds = [expected_count.get(name) for name in ("min", "max") if expected_count.get(name) is not None]
+        if any(not isinstance(bound, int) or isinstance(bound, bool) or bound < 0 for bound in bounds):
+            raise ValueError("expected_memory_count bounds must be non-negative integers")
+        if len(bounds) == 2 and bounds[0] > bounds[1]:
+            raise ValueError("expected_memory_count min cannot exceed max")
+    terms = rubric.get("required_terms")
+    if terms is not None and (
+        not isinstance(terms, list) or any(not isinstance(term, str) or not term.strip() for term in terms)
+    ):
+        raise ValueError("required_terms must be a list of non-empty strings")
 
 
 def _raw_memory_from_payload(payload: Mapping[str, object]) -> RawMemory:
@@ -3436,6 +3545,7 @@ def agent_evaluation_report_public_payload(
             },
             "label_confusion": dict(report.label_confusion),
             "relation_summary": dict(report.relation_summary),
+            "verdict": report.verdict,
         },
         "results": [agent_evaluation_result_to_payload(result) for result in report.results],
         "assessments": [
