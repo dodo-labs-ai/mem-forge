@@ -142,6 +142,7 @@ _SCHEMA_REPAIR_MAX_VALIDATION_FIELDS = 8
 _SCHEMA_REPAIR_LOCATION_CHAR_CAP = 256
 _SCHEMA_REPAIR_RULE_CHAR_CAP = 128
 _SCHEMA_REPAIR_MESSAGE_CHAR_CAP = 256
+_IMAGE_REQUEST_TOO_LARGE = "image_delivery_request_too_large"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1505,37 +1506,39 @@ def _json_text_prompt(
     prompt: str,
     response_format: type[BaseModel],
     *,
-    validation_failure: _StructuredLlmFailure | None = None,
-    validation_source: Literal["native_schema", "json_text"] | None = None,
+    repair_note: str | None = None,
 ) -> str:
-    """Append the schema as a text instruction for the no-tool JSON path."""
+    """Append the schema as a text instruction for the no-tool JSON path, and the repair note of a repair request."""
     schema = json.dumps(response_format.model_json_schema(), ensure_ascii=False)
     request_prompt = (
         f"{prompt}\n\nReturn ONLY a single JSON object that matches this JSON Schema, "
         f"with no markdown fences and no commentary:\n{schema}"
     )
-    if validation_failure is None:
-        return request_prompt
+    return request_prompt if repair_note is None else f"{request_prompt}\n\n{repair_note}"
 
+
+def _repair_note(
+    validation_failure: _StructuredLlmFailure,
+    validation_source: Literal["native_schema", "json_text"] | None,
+    *,
+    field_limit: int = _SCHEMA_REPAIR_MAX_VALIDATION_FIELDS,
+) -> str:
+    """Tell the model which diagnostics its previous response failed, the first ``field_limit`` of each kind."""
     validation_fields = [
         {
             "location": location[:_SCHEMA_REPAIR_LOCATION_CHAR_CAP],
             "rule": rule[:_SCHEMA_REPAIR_RULE_CHAR_CAP],
         }
-        for location, rule in validation_failure.validation_fields[
-            :_SCHEMA_REPAIR_MAX_VALIDATION_FIELDS
-        ]
+        for location, rule in validation_failure.validation_fields[:field_limit]
     ]
     diagnostic_fields: dict[str, object] = {
         "error_code": validation_failure.error_code[:_SCHEMA_REPAIR_RULE_CHAR_CAP],
         "validation_errors": validation_fields,
     }
-    if validation_failure.model_level_messages:
+    if validation_failure.model_level_messages[:field_limit]:
         diagnostic_fields["model_level_errors"] = [
             message[:_SCHEMA_REPAIR_MESSAGE_CHAR_CAP]
-            for message in validation_failure.model_level_messages[
-                :_SCHEMA_REPAIR_MAX_VALIDATION_FIELDS
-            ]
+            for message in validation_failure.model_level_messages[:field_limit]
         ]
     diagnostic = json.dumps(diagnostic_fields, ensure_ascii=False, separators=(",", ":"))
     previous_attempt = (
@@ -1544,7 +1547,7 @@ def _json_text_prompt(
         else "The preceding JSON-text response"
     )
     return (
-        f"{request_prompt}\n\n{previous_attempt} failed local schema validation. "
+        f"{previous_attempt} failed local schema validation. "
         "Return the complete JSON object again after correcting these diagnostics. "
         "The prior response body and invalid values are intentionally not repeated:\n"
         f"{diagnostic}"
@@ -1875,8 +1878,16 @@ class LiteLlmStructuredClient:
         model: str | None = None, images: StructuredImageInputs = (),
     ) -> int:
         """Count the schema fallback transport, including its real instructions."""
+        return self._rendered_request_tokens(
+            _json_text_prompt(prompt, response_format), response_format=response_format, model=model, images=images,
+        )
+
+    def _rendered_request_tokens(
+        self, material: str, *, response_format: type[BaseModel],
+        model: str | None, images: StructuredImageInputs,
+    ) -> int:
+        """Count one request as it is sent: its prompt text, whole, and its images."""
         name = litellm_model_name(model or self.config.model)
-        material = _json_text_prompt(prompt, response_format)
         content = _structured_user_content(material, images)
         if isinstance(images, ArtifactImageDelivery):
             images.validate(model=name, budget_identity=self.request_budget(model).identity)
@@ -1884,7 +1895,7 @@ class LiteLlmStructuredClient:
                                           "schema": response_format.model_json_schema()},
                                          ensure_ascii=False).encode()) + 2048
             if encoded_bytes > images.max_encoded_request_bytes:
-                raise StructuredLlmImageError(error_code="image_delivery_request_too_large")
+                raise StructuredLlmImageError(error_code=_IMAGE_REQUEST_TOO_LARGE)
             # Actual label/schema text plus a conservative documented visual bound.
             # Managed-route native overhead/resolution remain unverified.
             content = [block for block in content if block["type"] == "text"]
@@ -1900,12 +1911,59 @@ class LiteLlmStructuredClient:
         images: StructuredImageInputs = (), reserve_correction: bool = True,
     ) -> bool:
         """Whether the request fits the route beside the route's output capacity."""
-        budget = self.request_budget(model)
-        if budget.available_input(reserve_correction=reserve_correction) < 0:
+        if self.request_budget(model).available_input(reserve_correction=reserve_correction) < 0:
             return False
-        return budget.fits(self.request_tokens(
-            prompt, response_format=response_format, model=model, images=images,
-        ), reserve_correction=reserve_correction)
+        return self._rendered_request_fits(
+            _json_text_prompt(prompt, response_format), response_format=response_format, model=model,
+            images=images, reserve_correction=reserve_correction,
+        )
+
+    def _rendered_request_fits(
+        self, material: str, *, response_format: type[BaseModel], model: str | None,
+        images: StructuredImageInputs, reserve_correction: bool,
+    ) -> bool:
+        """Whether a request, rendered as it is sent, fits the route beside the route's output capacity.
+
+        A request over the encoded size its images allow does not fit either.
+        """
+        try:
+            tokens = self._rendered_request_tokens(material, response_format=response_format, model=model, images=images)
+        except StructuredLlmImageError as exc:
+            if exc.error_code == _IMAGE_REQUEST_TOO_LARGE:
+                return False
+            raise
+        return self.request_budget(model).fits(tokens, reserve_correction=reserve_correction)
+
+    def _repair_prompt(
+        self,
+        prompt: str,
+        response_format: type[BaseModel],
+        failure: _StructuredLlmFailure,
+        source: Literal["native_schema", "json_text"] | None,
+        *,
+        model: str,
+        images: StructuredImageInputs,
+    ) -> str:
+        """The JSON-text repair request, naming as many failed diagnostics as the route has room for.
+
+        A first request is packed with the correction reserve kept free, so
+        its repair has the reserve for its note; a re-ask is packed without
+        it, so its repair may name fewer diagnostics. A repair with no room
+        for its note is not sent, and the invalid response stands.
+        """
+        try:
+            self.request_budget(model)
+        except ValueError:
+            return _json_text_prompt(prompt, response_format, repair_note=_repair_note(failure, source))
+        for field_limit in range(_SCHEMA_REPAIR_MAX_VALIDATION_FIELDS, -1, -1):
+            material = _json_text_prompt(
+                prompt, response_format, repair_note=_repair_note(failure, source, field_limit=field_limit),
+            )
+            if self._rendered_request_fits(
+                material, response_format=response_format, model=model, images=images, reserve_correction=False,
+            ):
+                return material
+        raise failure.to_error()
 
     def _output_tokens(self, model: str | None) -> int | None:
         """The output a request asks for: the route's output capacity.
@@ -2099,8 +2157,14 @@ class LiteLlmStructuredClient:
             async with asyncio.timeout_at(deadline):
                 if isinstance(images, ArtifactImageDelivery) and not self.request_fits(
                     prompt, response_format=response_format, model=model, images=images,
+                    reserve_correction=False,
                 ):
-                    raise StructuredLlmImageError(error_code="image_delivery_input_capacity_exceeded")
+                    # Found before it is sent, it would fail the same way again: a capacity failure of its items.
+                    raise StructuredLlmError(
+                        "structured request exceeds the route's input capacity",
+                        terminal_category="request_error",
+                        error_code=INPUT_CAPACITY_EXCEEDED,
+                    )
                 prepared_images = await asyncio.to_thread(
                     _prepare_structured_llm_images,
                     images,
@@ -2357,21 +2421,14 @@ class LiteLlmStructuredClient:
         validation_failure: _StructuredLlmFailure | None = None,
         validation_source: Literal["native_schema", "json_text"] | None = None,
     ):
-        request_prompt = (
-            prompt
-            if native_schema
-            else _json_text_prompt(
-                prompt,
-                response_format,
-                validation_failure=validation_failure,
-                validation_source=validation_source,
+        if native_schema:
+            request_prompt = prompt
+        elif validation_failure is None:
+            request_prompt = _json_text_prompt(prompt, response_format)
+        else:
+            request_prompt = self._repair_prompt(
+                prompt, response_format, validation_failure, validation_source, model=model_name, images=images,
             )
-        )
-        if isinstance(images, ArtifactImageDelivery) and not self.request_fits(
-            request_prompt, response_format=response_format,
-            model=model_name, images=images,
-        ):
-            raise StructuredLlmImageError(error_code="image_delivery_input_capacity_exceeded")
         messages = [{"role": "user", "content": _structured_user_content(request_prompt, images)}]
         provider_kwargs: dict[str, Any] = {}
         prompt_template_variable = self.config.prompt_template_variable
