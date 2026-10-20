@@ -367,12 +367,12 @@ EARLIER_MESSAGE = "checkpointer 先不自己实现，等官方支持"
 REPLY_MESSAGE = "嗯，如果不严重的话可以等等"
 
 
-def _teams_reply_window():
+def _teams_reply_window(earlier_message=EARLIER_MESSAGE, reply_message=REPLY_MESSAGE):
     from tests.test_projection_context import _teams_projection
 
-    initial = _teams_projection((EARLIER_MESSAGE,))
+    initial = _teams_projection((earlier_message,))
     target = _teams_projection(
-        (EARLIER_MESSAGE, REPLY_MESSAGE),
+        (earlier_message, reply_message),
         run_id="run-teams-reply",
         prior_unit_revision=initial.source_unit_revisions[0],
         prior_observation_revisions={revision.observation_id: revision for revision in initial.observation_revisions},
@@ -425,6 +425,26 @@ async def _extract_teams_reply(client):
             revision_context=RevisionAssessmentContext(projection=target, base=initial, access_context_hash="scope"),
         )
     return extraction, result, earlier, reply, collector.snapshot()
+
+
+def test_a_chinese_reply_to_an_english_message_is_the_only_primary_and_the_prompt_says_it_sets_the_language():
+    english = "We will not implement the checkpointer ourselves; we wait for official support."
+    initial, target, authority = _teams_reply_window(english, REPLY_MESSAGE)
+    extractor = MemoryExtractor(model="fixture", structured_llm_client=Client(limit=40000))
+
+    [request] = extraction_plan(target, authority, extractor=extractor, base=initial).requests
+    prompt = MemoryExtractor.projection_fragment_prompt(
+        request.catalog, source_type="teams", doc_type="teams",
+        revision_context=RevisionAssessmentContext(projection=target, base=initial, access_context_hash="scope"),
+    )
+
+    [earlier] = [f for f in request.catalog.fragments if english in f.presentation_text]
+    [reply] = [f for f in request.catalog.fragments if REPLY_MESSAGE in f.presentation_text]
+    # The Chinese reply is the only Primary; the English message it settles can only be Required.
+    assert reply.primary_eligible and not earlier.primary_eligible
+    assert "THE PRIMARY SETS THE LANGUAGE." in prompt
+    assert "even when its Required evidence is English" in prompt
+    assert "in the Primary's language" in prompt
 
 
 @pytest.mark.asyncio
