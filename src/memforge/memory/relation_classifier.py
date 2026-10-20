@@ -89,21 +89,6 @@ class MemoryPairClassification:
     unjudged: tuple[UnjudgedPair, ...] = ()
 
 
-@dataclass(frozen=True, slots=True)
-class MemoryPairClassificationPolicy:
-    """Task shape of a relation request; capacity packing belongs to the batch runner.
-
-    Every Memory is shown in full, and ``max_output_tokens`` caps the output one
-    request asks for.
-    """
-
-    max_output_tokens: int = 32_768
-
-    def __post_init__(self) -> None:
-        if self.max_output_tokens < 1:
-            raise ValueError("max_output_tokens must be positive")
-
-
 MEMORY_RELATION_RULES = """Use these definitions strictly:
 - EQUIVALENT: the claims express one durable proposition with exactly the same truth conditions.
 - REFINES: one claim is compatible with the other but narrows it, adds a condition, or adds a material detail.
@@ -144,18 +129,6 @@ MEMORY_RELATION_PROMPT = "Classify the semantic relationship of every exact Memo
 
 Return exactly one decision for every pair_index and no other pair_index.
 """
-
-
-# Requested output per relation request: a response envelope plus one decision
-# per pair, which holds only its pair index and label with their JSON keys.
-_RELATION_OUTPUT_BASE_TOKENS = 512
-_RELATION_OUTPUT_TOKENS_PER_PAIR = 32
-
-
-def relation_output_tokens(policy: MemoryPairClassificationPolicy, pair_count: int) -> int:
-    """The output a relation request asks for; the runner bounds it by the route."""
-
-    return min(policy.max_output_tokens, _RELATION_OUTPUT_BASE_TOKENS + _RELATION_OUTPUT_TOKENS_PER_PAIR * pair_count)
 
 
 async def _pair_outcomes(
@@ -265,11 +238,9 @@ class StructuredMemoryPairClassifier:
         *,
         client: Any,
         model: str,
-        policy: MemoryPairClassificationPolicy | None = None,
     ) -> None:
         self._client = client
         self._model = decision_task_model(client, PAIR_REVIEW_TASK, model)
-        self._policy = policy or MemoryPairClassificationPolicy()
 
     async def classify(
         self,
@@ -282,7 +253,7 @@ class StructuredMemoryPairClassifier:
         def render(item_ids: tuple[str, ...], _context: tuple) -> LlmRequest:
             indexed_pairs = tuple((int(item_id), pairs[int(item_id)]) for item_id in item_ids)
             prompt = MEMORY_RELATION_PROMPT.format(groups_json=_grouped_pair_payload(indexed_pairs))
-            return LlmRequest(prompt, MemoryRelationResponse, relation_output_tokens(self._policy, len(item_ids)))
+            return LlmRequest(prompt, MemoryRelationResponse)
 
         def decode(response: MemoryRelationResponse, _item_ids: tuple[str, ...], _context: tuple):
             """Each decision names one supplied pair; the runner rejects an unrequested pair_index."""

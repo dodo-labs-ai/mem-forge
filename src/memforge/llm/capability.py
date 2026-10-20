@@ -70,7 +70,6 @@ __all__ = [
 # The longest a generation check may take, queueing behind other model calls included.
 GENERATION_CHECK_TIMEOUT_S = 60.0
 _EMBEDDING_CHECK_TIMEOUT_S = 30.0
-_GENERATION_CHECK_MAX_TOKENS = 256
 
 _PROBE_LABEL = "memforge"
 _PROBE_ITEMS = ["alpha", "beta", "gamma"]
@@ -197,7 +196,6 @@ async def _ask_text_probe(client: LiteLlmStructuredClient) -> object:
         return await client.answer_schema(
             _GENERATION_PROMPT,
             response_format=CapabilityCheckResponse,
-            max_tokens=_GENERATION_CHECK_MAX_TOKENS,
         )
 
 
@@ -218,7 +216,6 @@ async def check_image_input(client: LiteLlmStructuredClient) -> bool | None:
             reply = await client.answer_schema(
                 _IMAGE_PROMPT,
                 response_format=ImageReadingResponse,
-                max_tokens=_GENERATION_CHECK_MAX_TOKENS,
                 images=(image,),
             )
     except TimeoutError:

@@ -971,9 +971,9 @@ async def test_semantic_judge_is_shadowed_and_exact_assessment_is_reused(db) -> 
 class _SemanticJudgeClient(FixtureBudgetClient):
     models: list[str | None] = field(default_factory=list)
 
-    async def judge_offline_semantics(self, prompt, *, max_tokens, model):
+    async def judge_offline_semantics(self, prompt, *, model):
         self.models.append(model)
-        return await self.call(prompt, max_tokens=max_tokens, model=model)
+        return await self.call(prompt, model=model)
 
 
 def _semantic_judge_client(**budget) -> _SemanticJudgeClient:

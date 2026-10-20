@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from memforge.derivation_work import DerivationWorkJournal
 from memforge.llm.batch_runner import (
+    OUTPUT_CAPACITY_EXCEEDED,
     OUTPUT_INVALID,
     ChainStep,
     ChainTask,
@@ -28,10 +29,6 @@ from memforge.llm.structured import (
     StructuredLlmError,
 )
 from tests.llm_fixture import FIXTURE_MODEL, FixtureBudgetClient
-
-# Above every fixture output limit, so each request shows the runner's bound.
-REQUESTED_OUTPUT = 500
-
 
 class Row(BaseModel):
     id: str
@@ -74,7 +71,7 @@ def failing(error: StructuredLlmError, *, when: Callable[[str], bool]) -> Callab
 
 
 def render(item_ids, context) -> LlmRequest:
-    return LlmRequest(" ".join(["ask", *item_ids, *context]), Rows, REQUESTED_OUTPUT)
+    return LlmRequest(" ".join(["ask", *item_ids, *context]), Rows)
 
 
 def decode(response, item_ids, context):
@@ -155,7 +152,7 @@ SIZE_FAILURES = {
 }
 
 
-async def test_items_pack_into_fitting_requests_in_order_with_bounded_output():
+async def test_items_pack_into_fitting_requests_in_order():
     client = FixtureBudgetClient(respond=answer, input_tokens=5)
     runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
 
@@ -163,7 +160,6 @@ async def test_items_pack_into_fitting_requests_in_order_with_bounded_output():
 
     assert results == {item_id: ((),) for item_id in ids(10)}
     assert [prompt_ids(prompt) for prompt in client.prompts] == [list(ids(10)[:4]), list(ids(10)[4:8]), list(ids(10)[8:])]
-    assert client.max_tokens == [client.output_tokens] * 3
 
 
 @pytest.mark.parametrize("cause", sorted(SIZE_FAILURES))
@@ -185,7 +181,6 @@ async def test_size_failures_split_multi_item_requests_until_they_complete(cause
         (deadline(), "deadline_exceeded"),
         (SIZE_FAILURES["payload_too_large"](), "capacity_exceeded"),
         (SIZE_FAILURES["input_capacity_exceeded"](), "capacity_exceeded"),
-        (SIZE_FAILURES["output_truncated"](), "invalid_response"),
     ],
 )
 async def test_a_single_item_that_still_fails_returns_a_typed_failure(error, category):
@@ -197,6 +192,33 @@ async def test_a_single_item_that_still_fails_returns_a_typed_failure(error, cat
     assert failure == ItemFailure(category, error.error_code, error)
     assert runner.stats.calls == 1
     assert runner.stats.failed_requests == 1
+
+
+async def test_a_single_item_whose_output_is_truncated_exceeds_the_output_capacity():
+    error = SIZE_FAILURES["output_truncated"]()
+    client = FixtureBudgetClient(respond=failing(error, when=lambda _prompt: True))
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+
+    [(item_id, failure)] = (await runner.run_items(item_task(client, ids(1)))).items()
+
+    assert failure == ItemFailure("capacity_exceeded", OUTPUT_CAPACITY_EXCEEDED, error)
+    assert failure.unjudgeable
+    assert runner.stats.calls == 1
+    assert runner.stats.failed_requests == 1
+
+
+async def test_truncated_output_halves_a_multi_item_request_until_each_item_is_alone():
+    error = SIZE_FAILURES["output_truncated"]()
+    client = FixtureBudgetClient(respond=failing(error, when=lambda prompt: "i03" in prompt_ids(prompt)))
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+
+    results = await runner.run_items(item_task(client, ids(4)))
+
+    assert results.pop("i03") == ItemFailure("capacity_exceeded", OUTPUT_CAPACITY_EXCEEDED, error)
+    assert results == {item_id: ((),) for item_id in ids(3)}
+    assert [prompt_ids(prompt) for prompt in client.prompts] == [
+        list(ids(4)), list(ids(4)[:2]), list(ids(4)[2:]), ["i02"], ["i03"],
+    ]
 
 
 @pytest.mark.parametrize("execution_first", (False, True))
@@ -851,8 +873,8 @@ def budget_client(monkeypatch, *, metadata, **caps) -> LiteLlmStructuredClient:
 def test_capacity_comes_from_litellm_metadata_or_operator_caps(monkeypatch, metadata, caps):
     runner = LlmBatchRunner(budget_client(monkeypatch, metadata=metadata, **caps), model=None)
 
-    assert runner.fits(LlmRequest("short prompt", Rows, REQUESTED_OUTPUT))
-    assert not runner.fits(LlmRequest("word " * 5_000, Rows, REQUESTED_OUTPUT))
+    assert runner.fits(LlmRequest("short prompt", Rows))
+    assert not runner.fits(LlmRequest("word " * 5_000, Rows))
 
 
 async def test_a_route_without_capacity_metadata_or_caps_raises(monkeypatch):

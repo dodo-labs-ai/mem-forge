@@ -4329,10 +4329,6 @@ class BlockingMemoryExtractor(NoopMemoryExtractor):
         finally:
             self.active -= 1
 
-    def fragment_output_tokens(self, catalog):
-        del catalog
-        return self.max_tokens
-
     async def extract_projection_fragment_memories(self, catalog, **kwargs):
         del catalog, kwargs
         return await self._extract()
@@ -4755,7 +4751,7 @@ async def _stage_completed_v9_recovery_attempt(
         )
 
     access_hash = lifecycle_access_context_hash(visibility="workspace", owner_user_id=None, project_key=None, repo_identifier=None)
-    capability = revision_inference_capability_hash(client, extraction_model="fixture", extraction_max_tokens=8192)
+    capability = revision_inference_capability_hash(client, extraction_model="fixture")
     plan_requests = fixture_request_planner(
         projection, access_context_hash=access_hash, extractor=ProjectionFragmentRecordingExtractor(),
     )
@@ -10322,7 +10318,7 @@ async def test_sync_gene_records_source_unit_llm_summary_for_changed_and_noop_ru
     class StructuredMemoryExtractor(ProjectionFragmentRecordingExtractor):
         async def extract_projection_fragment_memories(self, catalog, **kwargs):
             self.fragment_calls.append(catalog)
-            await structured_client.extract_projection_fragment_memories("extract", max_tokens=1024)
+            await structured_client.extract_projection_fragment_memories("extract")
             return MemoryExtractionResult(
                 memories=[],
                 metadata={
@@ -10446,7 +10442,7 @@ async def test_source_unit_llm_summary_is_recorded_when_lifecycle_execution_fail
     class FailingStructuredMemoryExtractor(ProjectionFragmentRecordingExtractor):
         async def extract_projection_fragment_memories(self, catalog, **kwargs):
             self.fragment_calls.append(catalog)
-            await structured_client.extract_projection_fragment_memories("extract", max_tokens=1024)
+            await structured_client.extract_projection_fragment_memories("extract")
             raise AssertionError("unreachable")
 
     orchestrator = GeneSyncOrchestrator(
@@ -10523,7 +10519,7 @@ async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: D
 
     class AuditingEngine(NoopMemoryEngine):
         async def prepare_and_commit_projected_lifecycle(self, **kwargs):
-            await client.classify_memory_relations("audit", max_tokens=32)
+            await client.classify_memory_relations("audit")
             raise AssertionError("failed mandatory audit must not commit")
 
     orchestrator = GeneSyncOrchestrator(

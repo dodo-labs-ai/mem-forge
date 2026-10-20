@@ -86,17 +86,15 @@ class _Client:
     input_tokens: int = 100_000
     respond: object = None
     prompts: list[str] = field(default_factory=list)
-    max_tokens: list[int] = field(default_factory=list)
 
     def request_budget(self, model=None):
         return fixture_budget(input_tokens=self.input_tokens, output_tokens=64_000, correction_reserve=0)
 
-    def request_fits(self, prompt, *, response_format, max_tokens, model=None, images=(), reserve_correction=True):
-        return self.request_budget(model).fits(len(prompt.split()), max_tokens, reserve_correction=reserve_correction)
+    def request_fits(self, prompt, *, response_format, model=None, images=(), reserve_correction=True):
+        return self.request_budget(model).fits(len(prompt.split()), reserve_correction=reserve_correction)
 
-    async def classify_cross_document_relations(self, prompt, *, max_tokens, model=None):
+    async def classify_cross_document_relations(self, prompt, *, model=None):
         self.prompts.append(prompt)
-        self.max_tokens.append(max_tokens)
         if self.respond is not None:
             return self.respond(prompt)
         return CrossDocumentRelationResponse(

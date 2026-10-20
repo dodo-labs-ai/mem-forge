@@ -25,10 +25,6 @@ from memforge.storage.adapters.protocols import (
 
 logger = logging.getLogger(__name__)
 
-# Requested output: one short decision per mention, with a floor for the envelope.
-_ENTITY_DECISION_OUTPUT_TOKENS = 256
-_ENTITY_MIN_OUTPUT_TOKENS = 512
-
 __all__ = [
     "EntityResolutionBatch",
     "EntityResolutionContext",
@@ -324,8 +320,7 @@ class EntityResolver:
             prompt = _ENTITY_BATCH_PROMPT.format(
                 cases_json=json.dumps(cases, ensure_ascii=False, sort_keys=True),
             )
-            max_tokens = max(_ENTITY_MIN_OUTPUT_TOKENS, _ENTITY_DECISION_OUTPUT_TOKENS * len(mentions))
-            return LlmRequest(prompt, EntityBatchValidationResponse, max_tokens)
+            return LlmRequest(prompt, EntityBatchValidationResponse)
 
         def decode(response: EntityBatchValidationResponse, _mentions: tuple[str, ...], _context: tuple):
             return ((decision.mention, decision) for decision in response.decisions)

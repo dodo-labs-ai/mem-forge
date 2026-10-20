@@ -114,7 +114,6 @@ class DerivationWorkJournal:
             "schema": payload_hash(request.response_format.model_json_schema()),
             "budget": self._budget_identity,
             "model": self._model,
-            "output": request.max_tokens,
             "release": current_release(),
         })
         work = await self._store.stage_derivation_work(derivation_id=self._derivation_id, work=work)

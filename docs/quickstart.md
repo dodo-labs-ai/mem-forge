@@ -268,11 +268,14 @@ common for local models, validation stops with the code
 **context window** and the **maximum output**, in tokens, with the generation
 model, and validate again. Take the numbers from the model card or from your
 model server; a context window of 32768 and a maximum output of 4096 are
-typical for a local model. When the model field names a model from **Load
-models**, picked from the list or typed, and the provider's list gives its
-limits, as OpenRouter's and Anthropic's do, Settings fills the empty limit
-fields with them and says they came from that list; you can still change
-them. For a provider whose list can give the limits, the token limits step
+typical for a local model. MemForge asks Ollama for that context window with
+every request, so set it no larger than the model supports and your machine
+can hold. For an OpenAI-compatible server such as vLLM or llama.cpp, the
+window is the one the server was started with; enter that number. When the
+model field names a model from **Load models**, picked from the list or typed,
+and the provider's list gives its limits, as OpenRouter's and Anthropic's do,
+Settings fills the empty limit fields with them and says they came from that
+list; you can still change them. For a provider whose list can give the limits, the token limits step
 also offers **Fill from the model list**, which loads the list and fills in
 the limits of the model.
 
