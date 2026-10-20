@@ -1,13 +1,10 @@
-"""Closed-choice calls ask for a direct answer, and get their output back when reasoning spends it."""
+"""Closed-choice calls ask for a direct answer; open generation calls keep the provider's reasoning default."""
 
 from __future__ import annotations
-
-import json
 
 import litellm
 import pytest
 
-from memforge.evals.agent_evaluation import QualitySignalCollector, quality_signal_scope
 from memforge.llm.capability import CapabilityCheckResponse
 from memforge.llm.providers import ResolvedInvocation
 from memforge.llm.structured import (
@@ -16,14 +13,13 @@ from memforge.llm.structured import (
     StructuredLlmCallTelemetry,
     StructuredLlmConfig,
     StructuredLlmError,
-    StructuredLlmMetricsCollector,
     SupportAssessmentWireResponse,
 )
 
 OPENROUTER_ROUTE = "openrouter/anthropic/claude-haiku-5.5"
 OPENROUTER_REASONING_OFF = {"extra_body": {"reasoning": {"enabled": False}}}
-# The cross-document relation budget for one pair: a 256-token envelope and 32 per pair.
-ONE_PAIR_OUTPUT_TOKENS = 288
+# The route's output capacity under these limits: a quarter of the context window.
+ROUTE_OUTPUT_TOKENS = 50_000
 ONE_PAIR_ANSWER = '{"decisions":[{"pair_index":0,"label":"none"}]}'
 
 
@@ -75,7 +71,7 @@ def _response(
 
 
 def _reasoned_away(max_tokens: int, *, reasoning_tokens: int | None = None, content: str = "") -> litellm.ModelResponse:
-    """A reply whose reasoning used the output budget before the answer was written."""
+    """A reply whose reasoning used the requested output before the answer was written."""
     return _response(
         content,
         finish_reason="length",
@@ -112,23 +108,20 @@ def _recording(*responses):
 
 async def _call(client: LiteLlmStructuredClient, operation: str) -> None:
     calls = {
-        "classify_memory_relations": lambda: client.classify_memory_relations("prompt", max_tokens=544),
-        "classify_cross_document_relations": lambda: client.classify_cross_document_relations(
-            "prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS),
+        "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
+        "classify_cross_document_relations": lambda: client.classify_cross_document_relations("prompt"),
         "change_impact": lambda: client.evaluate_revision_work(
-            "prompt", response_format=ChangeImpactWireResponse, max_tokens=1024),
-        "admit_candidates": lambda: client.admit_candidates("prompt", max_tokens=1024),
+            "prompt", response_format=ChangeImpactWireResponse),
+        "admit_candidates": lambda: client.admit_candidates("prompt"),
         "classify_agent_session_evidence_authority": lambda: client.classify_agent_session_evidence_authority("prompt"),
         "validate_entity_batch": lambda: client.validate_entity_batch("prompt"),
         "rerank_memories": lambda: client.rerank_memories("prompt"),
         "judge_offline_semantics": lambda: client.judge_offline_semantics("prompt"),
-        "generation_check": lambda: client.answer_schema(
-            "prompt", response_format=CapabilityCheckResponse, max_tokens=256),
-        "extract_projection_fragment_memories": lambda: client.extract_projection_fragment_memories(
-            "prompt", max_tokens=8192),
+        "generation_check": lambda: client.answer_schema("prompt", response_format=CapabilityCheckResponse),
+        "extract_projection_fragment_memories": lambda: client.extract_projection_fragment_memories("prompt"),
         "assess_claim_revisions": lambda: client.assess_claim_revisions("prompt"),
         "support_assessment": lambda: client.evaluate_revision_work(
-            "prompt", response_format=SupportAssessmentWireResponse, max_tokens=4096),
+            "prompt", response_format=SupportAssessmentWireResponse),
         "generate_agent_knowledge_patch": lambda: client.generate_agent_knowledge_patch("prompt"),
     }
     try:
@@ -194,7 +187,7 @@ async def test_a_route_without_a_known_safe_parameter_is_sent_the_call_as_before
         StructuredLlmConfig.for_invocation(invocation, timeout_s=5.0), completion_transport=transport,
     )
 
-    await client.classify_cross_document_relations("prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS)
+    await client.classify_cross_document_relations("prompt")
 
     [call] = calls
     assert set(call) == {"model", "messages", "timeout", "max_tokens", "num_retries", *invocation.request_kwargs()}
@@ -206,16 +199,14 @@ async def test_the_decision_model_is_asked_for_a_direct_answer_by_its_own_route(
         transport, provider="openai", model="openai/gpt-5.1", decision_model="openai/gpt-5-mini",
     )
 
-    await client.classify_cross_document_relations(
-        "prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS, model=client.decision_model,
-    )
+    await client.classify_cross_document_relations("prompt", model=client.decision_model)
 
     [call] = calls
     assert (call["model"], call["reasoning_effort"]) == ("openai/gpt-5-mini", "minimal")
 
 
 async def test_a_route_that_reasons_by_default_answers_a_one_pair_relation_directly() -> None:
-    """Asked with the provider's default, this route spends all 288 output tokens
+    """Asked with the provider's default, this route spends all its output
     reasoning and returns no content in JSON-text mode; asked to turn reasoning
     off, it returns the answer in 24 tokens with no reasoning."""
 
@@ -227,129 +218,36 @@ async def test_a_route_that_reasons_by_default_answers_a_one_pair_relation_direc
     transport, calls = _recording(openrouter)
     client, telemetry = _client(transport)
 
-    result = await client.classify_cross_document_relations("prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS)
+    result = await client.classify_cross_document_relations("prompt")
 
     assert [(decision.pair_index, decision.label) for decision in result.decisions] == [(0, "none")]
     [call] = calls
-    assert (call["model"], call["max_tokens"]) == (OPENROUTER_ROUTE, ONE_PAIR_OUTPUT_TOKENS)
+    assert (call["model"], call["max_tokens"]) == (OPENROUTER_ROUTE, ROUTE_OUTPUT_TOKENS)
     assert telemetry[-1].terminal_category == "success"
-    assert telemetry[-1].reasoning_budget_retries == 0
-
-
-async def test_reasoning_that_spends_the_budget_anyway_gets_it_back_once() -> None:
-    collector = QualitySignalCollector()
-    metrics = StructuredLlmMetricsCollector()
-    transport, calls = _recording(
-        _reasoned_away(ONE_PAIR_OUTPUT_TOKENS),
-        _response(ONE_PAIR_ANSWER, completion_tokens=310, reasoning_tokens=286),
-    )
-    client, telemetry = _client(transport)
-
-    with quality_signal_scope(collector), client.metrics_scope(metrics):
-        result = await client.classify_cross_document_relations("prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS)
-
-    assert result.decisions[0].label == "none"
-    assert [call["max_tokens"] for call in calls] == [ONE_PAIR_OUTPUT_TOKENS, 2 * ONE_PAIR_OUTPUT_TOKENS]
-    assert all(call["extra_body"] == OPENROUTER_REASONING_OFF["extra_body"] for call in calls)
-    [call_telemetry] = telemetry
-    assert call_telemetry.terminal_category == "success"
-    assert call_telemetry.reasoning_budget_retries == 1
-    assert (call_telemetry.attempt_count, call_telemetry.retry_count, call_telemetry.fallback_count) == (2, 0, 0)
-    [attempt] = call_telemetry.diagnostic_attempts
-    assert (attempt.error_code, attempt.requested_max_tokens, attempt.finish_reason) == (
-        "output_truncated", ONE_PAIR_OUTPUT_TOKENS, "length")
-    outcome = next(signal for signal in collector.snapshot() if signal.event_name == "structured_output_outcome")
-    assert (outcome.outcome, outcome.reason_code) == ("degraded", "reasoning_budget_recovered")
-    summary = metrics.summary(source_unit_elapsed_ms=1)
-    assert summary.reasoning_budget_retries == 1
-    assert summary.to_payload()["reasoning_budget_retries"] == 1
-
-
-async def test_the_raised_budget_stays_within_the_models_output_limit() -> None:
-    transport, calls = _recording(
-        _reasoned_away(ONE_PAIR_OUTPUT_TOKENS),
-        _response(ONE_PAIR_ANSWER),
-    )
-    client, _telemetry = _client(transport, max_output_tokens=400)
-
-    await client.classify_cross_document_relations("prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS)
-
-    assert [call["max_tokens"] for call in calls] == [ONE_PAIR_OUTPUT_TOKENS, 400]
-
-
-async def test_the_raised_budget_stays_within_the_context_window_left_by_the_prompt() -> None:
-    transport, calls = _recording(
-        _response("", finish_reason="length", prompt_tokens=199_500,
-                  completion_tokens=ONE_PAIR_OUTPUT_TOKENS, reasoning_tokens=ONE_PAIR_OUTPUT_TOKENS),
-        _response(ONE_PAIR_ANSWER),
-    )
-    client, _telemetry = _client(transport)
-
-    await client.classify_cross_document_relations("prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS)
-
-    assert [call["max_tokens"] for call in calls] == [ONE_PAIR_OUTPUT_TOKENS, 500]
-    # A context window with no room left past the first budget gets no second request.
-    transport, calls = _recording(
-        _response("", finish_reason="length", prompt_tokens=199_712,
-                  completion_tokens=ONE_PAIR_OUTPUT_TOKENS, reasoning_tokens=ONE_PAIR_OUTPUT_TOKENS),
-    )
-    client, _telemetry = _client(transport)
-    with pytest.raises(StructuredLlmError) as failed:
-        await client.classify_cross_document_relations("prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS)
-    assert failed.value.error_code == "output_truncated"
-    assert len(calls) == 1
-
-
-async def test_a_second_truncation_fails_the_call_without_another_request() -> None:
-    transport, calls = _recording(
-        _reasoned_away(ONE_PAIR_OUTPUT_TOKENS),
-        _reasoned_away(2 * ONE_PAIR_OUTPUT_TOKENS, content='{"decisions":[{"pair_in'),
-    )
-    client, telemetry = _client(transport)
-
-    with pytest.raises(StructuredLlmError) as failed:
-        await client.classify_cross_document_relations("prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS)
-
-    assert failed.value.error_code == "output_truncated"
-    assert len(calls) == 2
-    assert telemetry[-1].reasoning_budget_retries == 1
-    assert [attempt.requested_max_tokens for attempt in telemetry[-1].diagnostic_attempts] == [
-        ONE_PAIR_OUTPUT_TOKENS, 2 * ONE_PAIR_OUTPUT_TOKENS]
 
 
 @pytest.mark.parametrize(
     "reply",
     [
-        # The answer itself outgrew its budget.
-        _reasoned_away(ONE_PAIR_OUTPUT_TOKENS, reasoning_tokens=40, content='{"decisions":[{"pair_in'),
+        # Reasoning used the route's output capacity.
+        _reasoned_away(ROUTE_OUTPUT_TOKENS),
+        # The answer itself outgrew the route's output capacity.
+        _reasoned_away(ROUTE_OUTPUT_TOKENS, reasoning_tokens=40, content='{"decisions":[{"pair_in'),
         # The provider does not report reasoning.
-        _response("", finish_reason="length", completion_tokens=ONE_PAIR_OUTPUT_TOKENS),
+        _response("", finish_reason="length", completion_tokens=ROUTE_OUTPUT_TOKENS),
     ],
+    ids=["reasoning", "answer", "unreported"],
 )
-async def test_a_truncation_reasoning_did_not_cause_is_not_sent_again(reply) -> None:
+async def test_a_truncated_reply_fails_the_call_without_another_request(reply) -> None:
     transport, calls = _recording(reply)
     client, telemetry = _client(transport)
 
     with pytest.raises(StructuredLlmError) as failed:
-        await client.classify_cross_document_relations("prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS)
+        await client.classify_cross_document_relations("prompt")
 
     assert failed.value.error_code == "output_truncated"
-    assert len(calls) == 1
-    assert telemetry[-1].reasoning_budget_retries == 0
-
-
-async def test_an_open_call_whose_reasoning_spent_its_budget_also_gets_it_back_once() -> None:
-    transport, calls = _recording(
-        _reasoned_away(2048),
-        _response(json.dumps({"memories": []})),
-    )
-    client, telemetry = _client(transport)
-
-    await client.extract_projection_fragment_memories("prompt", max_tokens=2048)
-
-    assert [call["max_tokens"] for call in calls] == [2048, 4096]
-    assert all("extra_body" not in call for call in calls)
-    assert telemetry[-1].reasoning_budget_retries == 1
+    assert [call["max_tokens"] for call in calls] == [ROUTE_OUTPUT_TOKENS]
+    assert telemetry[-1].terminal_category == "invalid_response"
 
 
 async def test_a_provider_that_refuses_to_turn_reasoning_off_is_asked_without_it_from_then_on() -> None:
@@ -361,8 +259,8 @@ async def test_a_provider_that_refuses_to_turn_reasoning_off_is_asked_without_it
     transport, calls = _recording(refusal, _response(ONE_PAIR_ANSWER), _response(ONE_PAIR_ANSWER))
     client, telemetry = _client(transport)
 
-    await client.classify_cross_document_relations("prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS)
-    await client.classify_cross_document_relations("prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS)
+    await client.classify_cross_document_relations("prompt")
+    await client.classify_cross_document_relations("prompt")
 
     assert ["extra_body" in call for call in calls] == [True, False, False]
     assert [entry.terminal_category for entry in telemetry] == ["success", "success"]
@@ -375,8 +273,8 @@ async def test_a_rejection_that_is_not_about_reasoning_is_not_sent_again_without
     client, _telemetry = _client(transport)
 
     with pytest.raises(StructuredLlmError) as failed:
-        await client.classify_cross_document_relations("prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS)
-    await client.classify_cross_document_relations("prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS)
+        await client.classify_cross_document_relations("prompt")
+    await client.classify_cross_document_relations("prompt")
 
     assert failed.value.terminal_category == "request_error"
     assert ["extra_body" in call for call in calls] == [True, True]
@@ -396,30 +294,9 @@ async def test_a_route_that_rejects_native_schema_falls_back_with_reasoning_stil
     client, telemetry = _client(transport)
 
     for _ in range(2):
-        await client.classify_cross_document_relations("prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS)
+        await client.classify_cross_document_relations("prompt")
 
     # Each call is one rejected native-schema request and one JSON-text request.
     assert [("response_format" in call, "extra_body" in call) for call in calls] == [
         (True, True), (False, True), (True, True), (False, True)]
     assert [entry.attempt_count for entry in telemetry] == [2, 2]
-
-
-@pytest.mark.parametrize("native_schema", [False, True], ids=["json_text_repair", "json_text_fallback"])
-async def test_the_attempt_after_an_invalid_raised_budget_reply_keeps_the_raised_budget(
-    monkeypatch, native_schema,
-) -> None:
-    monkeypatch.setattr("memforge.llm.structured.litellm.supports_response_schema", lambda **_kwargs: native_schema)
-    invalid = '{"decisions":[{"pair_index":0,"label":"unrelated"}]}'
-    transport, calls = _recording(
-        _reasoned_away(ONE_PAIR_OUTPUT_TOKENS),
-        _response(invalid, completion_tokens=310, reasoning_tokens=286),
-        _response(ONE_PAIR_ANSWER, completion_tokens=310, reasoning_tokens=286),
-    )
-    # The route is sent no reasoning-off parameter, so it keeps reasoning on every attempt.
-    client, telemetry = _client(transport, provider="litellm")
-
-    result = await client.classify_cross_document_relations("prompt", max_tokens=ONE_PAIR_OUTPUT_TOKENS)
-
-    assert result.decisions[0].label == "none"
-    assert [call["max_tokens"] for call in calls] == [ONE_PAIR_OUTPUT_TOKENS] + [2 * ONE_PAIR_OUTPUT_TOKENS] * 2
-    assert telemetry[-1].reasoning_budget_retries == 1

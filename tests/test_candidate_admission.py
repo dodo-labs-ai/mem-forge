@@ -291,6 +291,29 @@ async def test_a_candidate_that_alone_exceeds_capacity_is_skipped_locally():
 
 
 @pytest.mark.asyncio
+async def test_a_candidate_whose_output_alone_exceeds_the_route_output_capacity_is_skipped_locally():
+    from memforge.llm.structured import OUTPUT_TRUNCATED
+
+    truncated = candidate(MOST_SPECIFIC)
+    judged = candidate(INDEPENDENT)
+
+    class TruncatingClient(AdmissionClient):
+        async def admit_candidates(self, prompt, **kwargs):
+            if any(row["claim"] == MOST_SPECIFIC for row in admission_payload(prompt)["candidates"]):
+                self.calls += 1
+                raise StructuredLlmError("fixture truncation", terminal_category="invalid_response",
+                                         error_code=OUTPUT_TRUNCATED)
+            return await super().admit_candidates(prompt, **kwargs)
+
+    client = TruncatingClient()
+    result = await admit_candidates([truncated, judged], client=client, model="fixture", unit_title=None)
+    assert result.admitted == (judged,)
+    assert [(r.candidate, r.reject_reason) for r in result.rejected] == [(truncated, "capacity_exceeded")]
+    # The request of both is halved; the truncated Candidate alone is not sent again.
+    assert client.calls == 3
+
+
+@pytest.mark.asyncio
 async def test_a_transient_admission_failure_raises():
     with pytest.raises(CandidateAdmissionError) as raised:
         await admit_candidates([candidate(MOST_SPECIFIC)], client=AdmissionClient(fail_at=1), model="fixture", unit_title=None)

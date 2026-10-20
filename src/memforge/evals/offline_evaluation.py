@@ -72,8 +72,6 @@ Evaluation input:
 SEMANTIC_JUDGE_PROMPT_HASH = hashlib.sha256(
     _SEMANTIC_JUDGE_PROMPT_TEMPLATE.encode("utf-8")
 ).hexdigest()
-# The judge answers with two enum fields; this leaves room for provider framing.
-_SEMANTIC_JUDGE_MAX_OUTPUT_TOKENS = 512
 # The deterministic criterion of a labelled cross-document relation pair; its
 # reason code is "expected:actual".
 RELATION_LABEL_CRITERION = "relation_label"
@@ -835,11 +833,7 @@ class StructuredOfflineSemanticJudge:
         if not callable(method):
             raise TypeError("structured client does not support offline semantic judging")
         response = await LlmBatchRunner(self._client, model=spec.model).run_one(
-            LlmRequest(
-                prompt=prompt,
-                response_format=OfflineSemanticJudgeResponse,
-                max_tokens=_SEMANTIC_JUDGE_MAX_OUTPUT_TOKENS,
-            ),
+            LlmRequest(prompt=prompt, response_format=OfflineSemanticJudgeResponse),
             call=method,
         )
         if isinstance(response, ItemFailure):

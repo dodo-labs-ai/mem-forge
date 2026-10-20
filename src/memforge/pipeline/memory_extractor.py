@@ -9,7 +9,6 @@ from collections.abc import Mapping
 from dataclasses import replace
 from time import perf_counter
 
-from memforge.config import DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
 from memforge.evals.agent_evaluation import QualitySignal, record_quality_signal
 from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import (
@@ -31,7 +30,6 @@ from memforge.pipeline.projection_fragments import (
     FragmentSelectionErrorCode,
     ProjectionFragmentCatalog,
 )
-from memforge.pipeline.evidence_fragments import EvidenceFragmentKind
 from memforge.pipeline.projection_context import ExtractionAuthority
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext, reading_group_label
 from memforge.pipeline.unit_title import unit_title_block
@@ -39,15 +37,6 @@ from memforge.pipeline.unit_title import unit_title_block
 logger = logging.getLogger(__name__)
 
 __all__ = ["ExtractionReading", "MemoryExtractor"]
-
-# Requested extraction output: a response envelope plus, per authorized Primary
-# Fragment, room for its claims (at least one claim, else about half its text).
-# An image's content is not text the Fragment presents, so an image Fragment
-# has room for the claims of a page of about 8,000 characters.
-_FRAGMENT_OUTPUT_BASE_TOKENS = 512
-_FRAGMENT_OUTPUT_MIN_TOKENS = 768
-_FRAGMENT_OUTPUT_CHARS_PER_TOKEN = 2
-_ARTIFACT_FRAGMENT_OUTPUT_TOKENS = 4096
 
 
 PROJECTION_FRAGMENT_EXTRACTION_PROMPT = """You are extracting durable atomic knowledge from one authorized Source Unit catalog.
@@ -91,13 +80,6 @@ _SELECTION_CORRECTION_BLOCK = (
     "whose central assertion has no eligible Primary. Use only the refs supplied above.\n"
     "</correction>"
 )
-
-
-def _fragment_output_tokens(fragment) -> int:
-    """Room for the claims one Primary Fragment can hold."""
-    if fragment.kind is EvidenceFragmentKind.ARTIFACT:
-        return _ARTIFACT_FRAGMENT_OUTPUT_TOKENS
-    return max(_FRAGMENT_OUTPUT_MIN_TOKENS, len(fragment.presentation_text) // _FRAGMENT_OUTPUT_CHARS_PER_TOKEN)
 
 
 class ExtractionReading:
@@ -159,18 +141,17 @@ class ExtractionReading:
             return self.catalog
         return _read_catalog(self.context, self.catalog.fragments, tuple(self.items[item_id] for item_id in item_ids))
 
-    def request(self, item_ids, *, output_tokens, fits) -> LlmRequest:
+    def request(self, item_ids, *, fits) -> LlmRequest:
         """The one request that reads these items, with the Artifact images its catalog cites."""
-        return self.request_for(self.catalog_for(item_ids), output_tokens=output_tokens, fits=fits)
+        return self.request_for(self.catalog_for(item_ids), fits=fits)
 
-    def request_for(self, catalog: ProjectionFragmentCatalog, *, output_tokens, fits) -> LlmRequest:
+    def request_for(self, catalog: ProjectionFragmentCatalog, *, fits) -> LlmRequest:
         """The request that reads one catalog of these items."""
         request = LlmRequest(
             MemoryExtractor.projection_fragment_prompt(
                 catalog, source_type=self.source_type, doc_type=self.doc_type, revision_context=self.context,
             ),
             ProjectionFragmentMemoryExtractionResponse,
-            output_tokens(catalog),
         )
         return self.context.attach_images(request, catalog, fits=fits)
 
@@ -201,24 +182,15 @@ class MemoryExtractor:
     provider-neutral standalone library use.
     """
 
-    def fragment_output_tokens(self, catalog) -> int:
-        """Request output for this request's authorized content, not a full document."""
-        requested = _FRAGMENT_OUTPUT_BASE_TOKENS + sum(
-            _fragment_output_tokens(fragment) for fragment in catalog.fragments if fragment.primary_eligible
-        )
-        return min(self.max_tokens, requested)
-
     def __init__(
         self,
         model: str = "claude-sonnet-4-20250514",
         base_url: str | None = None,
         api_key: str | None = None,
-        max_tokens: int = DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS,
         request_timeout_s: float = 300.0,
         structured_llm_client=None,
     ) -> None:
         self.model = model
-        self.max_tokens = max_tokens
         self.structured_llm_client = structured_llm_client
         if self.structured_llm_client is None and api_key:
             self.structured_llm_client = LiteLlmStructuredClient(
@@ -282,7 +254,7 @@ class MemoryExtractor:
 
         def render(item_ids, _parts) -> LlmRequest:
             request_catalog = reading.catalog_for(item_ids)
-            request = reading.request_for(request_catalog, output_tokens=self.fragment_output_tokens, fits=runner.fits)
+            request = reading.request_for(request_catalog, fits=runner.fits)
             rendered[tuple(item_ids)] = (request, request_catalog)
             return request
 

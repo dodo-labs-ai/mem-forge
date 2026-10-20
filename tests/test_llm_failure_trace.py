@@ -42,7 +42,7 @@ async def test_failed_attempt_retains_full_io_even_when_fallback_recovers(monkey
     monkeypatch.setattr("litellm.acompletion", complete)
     prompt = "完整输入" * 100000
     with failure_trace_context(doc_id="doc-1", trace_id="a" * 32):
-        await client(sink)._call_schema(prompt=prompt, response_format=RerankResponse, max_tokens=100)
+        await client(sink)._call_schema(prompt=prompt, response_format=RerankResponse)
     record = next(iter(sink.records.values()))
     assert record["prompt"] == prompt
     assert record["trace_id"] == "a" * 32
@@ -61,7 +61,7 @@ async def test_business_validation_failure_retains_original_provider_response(mo
     async def complete(**kwargs):
         return response(raw)
     monkeypatch.setattr("litellm.acompletion", complete)
-    parsed = await client(sink)._call_schema(prompt="request", response_format=RerankResponse, max_tokens=100)
+    parsed = await client(sink)._call_schema(prompt="request", response_format=RerankResponse)
     assert not sink.records
     with pytest.raises(ValueError, match="unknown ref"):
         async with validation_trace(parsed, work_id="work-1"):
@@ -81,7 +81,7 @@ async def test_trace_sink_failure_preserves_original_validation_error(monkeypatc
     async def complete(**kwargs):
         return response('{"results":[]}')
     monkeypatch.setattr("litellm.acompletion", complete)
-    parsed = await client(BrokenSink())._call_schema(prompt="request", response_format=RerankResponse, max_tokens=100)
+    parsed = await client(BrokenSink())._call_schema(prompt="request", response_format=RerankResponse)
     with pytest.raises(ValueError, match="original"):
         async with validation_trace(parsed):
             raise ValueError("original")
@@ -95,8 +95,8 @@ async def test_success_and_disabled_capture_create_no_artifacts(monkeypatch, tmp
         return response('{"results":[]}')
     monkeypatch.setattr("litellm.acompletion", complete)
     sink = Sink()
-    await client(sink)._call_schema(prompt="request", response_format=RerankResponse, max_tokens=100)
-    await client()._call_schema(prompt="request", response_format=RerankResponse, max_tokens=100)
+    await client(sink)._call_schema(prompt="request", response_format=RerankResponse)
+    await client()._call_schema(prompt="request", response_format=RerankResponse)
     assert not sink.records
     assert not list(tmp_path.iterdir())
 
@@ -150,7 +150,7 @@ async def test_capture_preserves_non_exception_base_exception(monkeypatch):
         raise SystemExit("shutdown")
     monkeypatch.setattr("litellm.acompletion", complete)
     with pytest.raises(SystemExit, match="shutdown"):
-        await client(Sink())._call_schema(prompt="request", response_format=RerankResponse, max_tokens=100)
+        await client(Sink())._call_schema(prompt="request", response_format=RerankResponse)
 
 
 @pytest.mark.asyncio
@@ -163,7 +163,7 @@ async def test_actual_logical_deadline_artifact_records_terminal_reason(monkeypa
         await asyncio.sleep(1)
     monkeypatch.setattr("litellm.acompletion", complete)
     with pytest.raises(Exception):
-        await slow._call_schema(prompt="request", response_format=RerankResponse, max_tokens=100)
+        await slow._call_schema(prompt="request", response_format=RerankResponse)
     record = next(iter(sink.records.values()))
     assert record["failures"][-1]["error_code"] == "logical_deadline_exceeded"
     assert record["attempts"][0]["request"]["timeout"] > 0
@@ -181,7 +181,7 @@ async def test_concurrent_validation_capture_keeps_each_documents_own_io(monkeyp
     shared = client(sink)
     async def run(doc):
         with failure_trace_context(doc_id=doc):
-            parsed = await shared._call_schema(prompt=doc, response_format=RerankResponse, max_tokens=100)
+            parsed = await shared._call_schema(prompt=doc, response_format=RerankResponse)
             with pytest.raises(ValueError):
                 async with validation_trace(parsed):
                     raise ValueError(doc)
@@ -209,7 +209,7 @@ async def test_local_timeout_artifact_is_complete_and_marks_missing_output(monke
         raise TimeoutError("transport timeout")
     monkeypatch.setattr("litellm.acompletion", complete)
     with pytest.raises(Exception):
-        await client()._call_schema(prompt="full request", response_format=RerankResponse, max_tokens=100,
+        await client()._call_schema(prompt="full request", response_format=RerankResponse,
             retry_with_json_text=False)
     record = json.loads(next(tmp_path.iterdir()).read_bytes())
     assert record["prompt"] == "full request"

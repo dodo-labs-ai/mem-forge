@@ -34,9 +34,7 @@ def plan_extraction_requests(
     runner = LlmBatchRunner(extractor.structured_llm_client, model=extractor.model)
     planned = runner.plan_items(
         tuple(reading.items),
-        lambda item_ids, _parts: reading.request(
-            item_ids, output_tokens=extractor.fragment_output_tokens, fits=runner.fits,
-        ),
+        lambda item_ids, _parts: reading.request(item_ids, fits=runner.fits),
     )
     skipped = reading.report_unread(dict.fromkeys(planned.unfit, INPUT_CAPACITY_EXCEEDED))
     source_unit_id = context.projection.source_units[0].id

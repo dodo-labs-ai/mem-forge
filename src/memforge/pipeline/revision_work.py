@@ -16,10 +16,8 @@ from dataclasses import dataclass, replace
 from functools import partial
 import json
 import logging
-import math
 from typing import Literal
 
-import litellm
 from pydantic import BaseModel, ConfigDict
 
 from memforge.derivation_work import DerivationWork, DerivationWorkJournal, DerivationWorkStore, payload_hash
@@ -34,7 +32,6 @@ from memforge.llm.structured import (
     EvidenceDisplay,
     SupportAssessmentWireResponse as AssessmentResponse,
     SupportedWireResult,
-    litellm_model_name,
 )
 from memforge.memory.evidence import EvidenceRole
 from memforge.models import Memory, RawMemory
@@ -129,18 +126,6 @@ Copy work IDs exactly. Give no explanation.
 CHANGE_IMPACT_CONTRACT = "change-impact-v4"
 CHANGE_IMPACT_TASK = DecisionTask("change_impact", CHANGE_IMPACT_CONTRACT)
 
-# The smallest output any Support Assessment or Change Impact request reserves.
-_MIN_OUTPUT_TOKENS = 1024
-# Requested Support Assessment output: one judgment row per work item plus a
-# dense allowance of refs per supplied Fragment, and room for the carried state
-# to grow. This is an allowance, not a requirement to emit every pair; the
-# runner bounds it by the route's output capacity and splits work whose output
-# is truncated.
-_ITEM_OUTPUT_TOKENS = 384
-_REF_OUTPUT_TOKENS = 16
-_STATE_OUTPUT_GROWTH = 1.25
-# One {work_id, impact} row is about 20 tokens with its JSON punctuation; rounded up.
-_IMPACT_ROW_OUTPUT_TOKENS = 32
 
 
 class SupportReadingState(BaseModel):
@@ -318,9 +303,7 @@ class RevisionWorkExecutor:
                 unit_title=unit_title_block(context.projection.unit_title, guidance="It is no change of this revision."),
                 payload=json.dumps(wire.encode_changes(payload), ensure_ascii=False, separators=(",", ":")),
             )
-            request = LlmRequest(
-                prompt, ImpactResponse, max(_MIN_OUTPUT_TOKENS, len(item_ids) * _IMPACT_ROW_OUTPUT_TOKENS),
-            )
+            request = LlmRequest(prompt, ImpactResponse)
             return context.attach_images(request, bundle, fits=self._impact_runner.fits)
 
         journal = self._journal("change_impact", CHANGE_IMPACT_CONTRACT, catalog, items, model=self.impact_model)
@@ -494,10 +477,7 @@ class RevisionWorkExecutor:
                 unit_title=unit_title_block(context.projection.unit_title),
                 payload=json.dumps(wire.encode(payload), ensure_ascii=False, separators=(",", ":")),
             )
-            request = LlmRequest(
-                prompt, AssessmentResponse,
-                self._output(step.item_ids, len(step_catalog.fragments) + len(carried.fragments), step.states.values()),
-            )
+            request = LlmRequest(prompt, AssessmentResponse)
             return context.attach_images(request, readable, fits=self._runner.fits)
 
         def decode(response, step: ChainStep):
@@ -598,17 +578,6 @@ class RevisionWorkExecutor:
         fragments = tuple(fragment for part in parts for fragment in part.fragments)
         read = {fragment.anchor for fragment in fragments} | context.reading_context(fragments)
         return catalog.subset(fragment.reference for fragment in catalog.fragments if fragment.anchor in read)
-
-    def _output(self, item_ids, fragments, states=()):
-        state_tokens = litellm.token_counter(
-            model=litellm_model_name(self.model),
-            text=json.dumps([state.model_dump(mode="json") for state in states], ensure_ascii=False),
-        )
-        return max(
-            _MIN_OUTPUT_TOKENS,
-            len(item_ids) * (_ITEM_OUTPUT_TOKENS + _REF_OUTPUT_TOKENS * fragments)
-            + math.ceil(state_tokens * _STATE_OUTPUT_GROWTH),
-        )
 
     @staticmethod
     def _identity(items):

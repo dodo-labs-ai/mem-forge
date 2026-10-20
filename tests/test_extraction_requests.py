@@ -32,12 +32,6 @@ from tests.test_revision_work import Client
 LONG_READING_CHARS = 20_000
 
 
-def bounded_output(extractor, catalog):
-    """The output a planned request is sent with: requested, then bounded by the route."""
-    budget = extractor.structured_llm_client.request_budget(extractor.model)
-    return budget.output_reserve(extractor.fragment_output_tokens(catalog))
-
-
 def extraction_plan(projection, authority, *, extractor, base=None):
     context = RevisionAssessmentContext(projection=projection, base=base, access_context_hash="scope")
     return plan_extraction_requests(
@@ -103,8 +97,7 @@ def test_large_complete_table_reaches_actual_request_budget(representation, rows
             prompt = MemoryExtractor.projection_fragment_prompt(
                 request.catalog, source_type=projection.source_type, doc_type="document", revision_context=context,
             )
-            assert client.request_fits(prompt, response_format=ProjectionFragmentMemoryExtractionResponse,
-                                       max_tokens=bounded_output(extractor, request.catalog))
+            assert client.request_fits(prompt, response_format=ProjectionFragmentMemoryExtractionResponse)
 
 
 def test_first_import_streams_every_reading_group_through_complete_requests():
@@ -112,7 +105,7 @@ def test_first_import_streams_every_reading_group_through_complete_requests():
     assert len(body) > LONG_READING_CHARS
     projection = _projection(primary_content=body, context_content="Country: US.\n")
     client = Client(limit=12000)
-    extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=client)
+    extractor = MemoryExtractor(model="fixture", structured_llm_client=client)
     context = RevisionAssessmentContext(projection=projection, base=None, access_context_hash="scope")
     reading = ExtractionReading.of_authority(
         context, whole(projection), source_type=projection.source_type, doc_type="document",
@@ -125,7 +118,7 @@ def test_first_import_streams_every_reading_group_through_complete_requests():
             catalog, source_type=projection.source_type,
             doc_type="document", revision_context=context,
         )
-        return len(prompt) + bounded_output(extractor, catalog) // 8
+        return len(prompt)
 
     client.limit = max(single_group_cost(item_id) for item_id in reading.items) + 256
     requests = plan(projection, whole(projection), extractor=extractor)
@@ -176,7 +169,7 @@ def test_a_changed_list_item_reads_its_whole_list_but_authorizes_only_the_change
 
 def test_reading_context_is_never_primary():
     projection = _jira_projection(2)
-    extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=Client(limit=40000))
+    extractor = MemoryExtractor(model="fixture", structured_llm_client=Client(limit=40000))
     comment = next(item.id for item in projection.observations if item.observation_type == "comment")
     [request] = plan(projection, ExtractionAuthority({comment: None}), extractor=extractor)
     by_observation = {}
@@ -201,13 +194,13 @@ def test_reading_context_longer_than_20000_characters_is_read_whole():
         replace(item, content=content) if item.id == core.id else item for item in projection.observation_revisions
     ))
     comment = next(item.id for item in projection.observations if item.observation_type == "comment")
-    extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=Client(limit=200_000))
+    extractor = MemoryExtractor(model="fixture", structured_llm_client=Client(limit=200_000))
     [request] = plan(projection, ExtractionAuthority({comment: None}), extractor=extractor)
 
     assert long_description.strip() in "\n".join(texts(request))
 
 
-def test_small_real_window_packs_whole_tables_without_fixed_output_reservation(monkeypatch):
+def test_small_real_window_packs_whole_tables_beside_the_route_output_capacity(monkeypatch):
     monkeypatch.setattr("memforge.llm.structured.litellm.get_model_info",
                         lambda _: {"max_input_tokens": 1000000, "max_output_tokens": 64000})
     client = LiteLlmStructuredClient(StructuredLlmConfig(
@@ -252,7 +245,7 @@ async def test_a_multi_item_request_that_times_out_is_halved_and_every_item_comp
             ]})
 
     client = TimingOutClient()
-    extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=client)
+    extractor = MemoryExtractor(model="fixture", structured_llm_client=client)
     [request] = plan(projection, ExtractionAuthority({body_id(projection): None}), extractor=extractor)
     result = await extractor.extract_projection_fragment_memories(
         request.catalog, source_type="confluence", revision_context=context,
@@ -287,7 +280,7 @@ async def test_a_reading_group_the_provider_rejects_alone_is_skipped_locally():
                 {"content": text.strip(), "memory_type": "fact", "primary_ref": ref, "required_refs": [], "evidence_displays": evidence_displays(ref, [])},
             ]})
 
-    extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=OverflowingClient(limit=40000))
+    extractor = MemoryExtractor(model="fixture", structured_llm_client=OverflowingClient(limit=40000))
     [request] = plan(projection, ExtractionAuthority({body_id(projection): None}), extractor=extractor)
     result = await extractor.extract_projection_fragment_memories(
         request.catalog, source_type="confluence", revision_context=context,
@@ -319,7 +312,7 @@ async def test_a_reading_group_whose_output_stays_invalid_is_skipped_locally():
                 {"content": text.strip(), "memory_type": "fact", "primary_ref": ref, "required_refs": [], "evidence_displays": evidence_displays(ref, [])},
             ]})
 
-    extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=MalformedClient(limit=40000))
+    extractor = MemoryExtractor(model="fixture", structured_llm_client=MalformedClient(limit=40000))
     [request] = plan(projection, ExtractionAuthority({body_id(projection): None}), extractor=extractor)
     result = await extractor.extract_projection_fragment_memories(
         request.catalog, source_type="confluence", revision_context=context,
@@ -401,7 +394,7 @@ async def _extract_teams_reply(client):
     from memforge.evals.agent_evaluation import QualitySignalCollector, quality_signal_scope
 
     initial, target, authority = _teams_reply_window()
-    extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=client)
+    extractor = MemoryExtractor(model="fixture", structured_llm_client=client)
     extraction = extraction_plan(target, authority, extractor=extractor, base=initial)
     [request] = extraction.requests
     [earlier] = [f for f in request.catalog.fragments if EARLIER_MESSAGE in f.presentation_text]
@@ -464,23 +457,3 @@ async def test_teams_reply_still_selected_as_required_only_skips_its_reading_gro
     assert unit.metadata["skipped_reading_group_count"] == 1
     assert unit.metadata["fragment_selection_rejection_counts"] == {"ineligible_role": 2}
     assert unit.metadata["selection_skipped_reading_group_count"] == 1
-
-
-def test_an_image_fragment_has_room_for_the_claims_of_a_page_of_text():
-    from types import SimpleNamespace
-
-    from memforge.pipeline.evidence_fragments import EvidenceFragmentKind
-
-    extractor = MemoryExtractor(structured_llm_client=Client(), model="model-a", max_tokens=32768)
-
-    def requested(*fragments):
-        return extractor.fragment_output_tokens(SimpleNamespace(fragments=list(fragments)))
-
-    image = SimpleNamespace(primary_eligible=True, kind=EvidenceFragmentKind.ARTIFACT, presentation_text="")
-    short = SimpleNamespace(primary_eligible=True, kind=EvidenceFragmentKind.TEXT, presentation_text="Small claim.")
-    context = SimpleNamespace(primary_eligible=False, kind=EvidenceFragmentKind.ARTIFACT, presentation_text="")
-
-    # The envelope, then each Primary Fragment's room: an image's content is not its text.
-    assert requested(image) == 512 + 4096
-    assert requested(short) == 512 + 768
-    assert requested(image, short, context) == 512 + 4096 + 768

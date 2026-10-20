@@ -52,6 +52,8 @@ type FailureCategory = Literal[
 ]
 
 OUTPUT_INVALID = "output_invalid"
+# Output still cut off at the route's output capacity: the item alone needs more.
+OUTPUT_CAPACITY_EXCEEDED = "output_capacity_exceeded"
 # Contract: one bounded correction, with the same input and refs.
 _MAX_CORRECTIONS = 1
 # The one correction of a response that cannot be read into rows, unless the
@@ -78,15 +80,15 @@ _UNJUDGEABLE: frozenset[FailureCategory] = frozenset({"capacity_exceeded", "inva
 
 @dataclass(frozen=True)
 class LlmRequest:
+    """One model request; it asks for the route's output capacity, so it states no output size."""
+
     prompt: str
     response_format: type[BaseModel]
-    # The output the task asks for; the runner bounds it by the route's capacity.
-    max_tokens: int
     images: StructuredImageInputs = ()
 
 
-# A client task method, called as ``call(prompt, max_tokens=..., model=...)``
-# plus ``images=...`` when the request carries images.
+# A client task method, called as ``call(prompt, model=...)`` plus
+# ``images=...`` when the request carries images.
 StructuredCall = Callable[..., Awaitable[BaseModel]]
 
 
@@ -94,7 +96,7 @@ class BudgetedClient(Protocol):
     def request_budget(self, model: str | None = None) -> RequestBudget: ...
 
     def request_fits(
-        self, prompt: str, *, response_format: type[BaseModel], max_tokens: int,
+        self, prompt: str, *, response_format: type[BaseModel],
         model: str | None = None, images: StructuredImageInputs = (),
         reserve_correction: bool = True,
     ) -> bool: ...
@@ -269,17 +271,16 @@ class LlmBatchRunner:
     def fits(self, request: LlmRequest, *, correction: bool = False) -> bool:
         """Whether the request fits; a first attempt keeps room for its correction."""
 
-        bounded = self._bounded(request)
         return self._client.request_fits(
-            bounded.prompt, response_format=bounded.response_format, max_tokens=bounded.max_tokens,
-            model=self._model, images=bounded.images, reserve_correction=not correction,
+            request.prompt, response_format=request.response_format,
+            model=self._model, images=request.images, reserve_correction=not correction,
         )
 
     def fit(self, render: Callable[[], LlmRequest]) -> LlmRequest | None:
-        """Render one request bounded by the route, or None when it cannot fit."""
+        """Render one request, or None when it cannot fit the route."""
 
         try:
-            request = self._bounded(render())
+            request = render()
         except RequestTooLarge:
             return None
         return request if self.fits(request) else None
@@ -349,10 +350,6 @@ class LlmBatchRunner:
         )
         outcome = (await self.run_items(task))[only]
         return outcome if isinstance(outcome, ItemFailure) else outcome[0]
-
-    def _bounded(self, request: LlmRequest) -> LlmRequest:
-        budget = self._client.request_budget(self._model)
-        return replace(request, max_tokens=budget.output_reserve(request.max_tokens))
 
     def _pack_items(
         self, item_ids: Sequence[ItemId], render: Callable[[tuple[ItemId, ...], tuple[Part, ...]], LlmRequest],
@@ -487,7 +484,7 @@ class LlmBatchRunner:
         """A re-ask is the correction itself, so it keeps no room for another one."""
 
         try:
-            request = self._bounded(corrected(ids))
+            request = corrected(ids)
         except RequestTooLarge:
             return None
         return (ids, request) if self.fits(request, correction=True) else None
@@ -659,7 +656,7 @@ class LlmBatchRunner:
             self.stats.prompt_chars += len(prompt)
             try:
                 with failure_trace_context(**lineage, correction_attempt=corrections + 1):
-                    response = await call(prompt, max_tokens=request.max_tokens, model=self._model, **image_kwargs)
+                    response = await call(prompt, model=self._model, **image_kwargs)
             except StructuredLlmError as error:
                 return _failure_from_error(error)
             capture = None
@@ -798,6 +795,9 @@ def _invalid(row: RejectedRow) -> ItemFailure:
 
 
 def _failure_from_error(error: StructuredLlmError) -> ItemFailure:
+    if error.error_code == OUTPUT_TRUNCATED:
+        # The request already asked for the route's output capacity.
+        return ItemFailure("capacity_exceeded", OUTPUT_CAPACITY_EXCEEDED, error)
     if error.terminal_category == "deadline_exceeded":
         category: FailureCategory = "deadline_exceeded"
     elif error.error_code in _CAPACITY_ERROR_CODES:
@@ -812,7 +812,7 @@ def _failure_from_error(error: StructuredLlmError) -> ItemFailure:
 def _is_size_failure(failure: ItemFailure) -> bool:
     """A smaller request may succeed: time, input size or output length ran out."""
 
-    return failure.category in {"deadline_exceeded", "capacity_exceeded"} or failure.error_code == OUTPUT_TRUNCATED
+    return failure.category in {"deadline_exceeded", "capacity_exceeded"}
 
 
 def _splits_items(failure: ItemFailure) -> bool:

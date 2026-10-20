@@ -56,8 +56,8 @@ class Client:
         from memforge.llm.request_budget import RequestBudget
         return RequestBudget(model or "fixture", self.limit, self.limit * 8, 32768, 1, "fixture")
 
-    def request_fits(self, prompt, *, max_tokens, reserve_correction=True, **kwargs):
-        return len(prompt) + max_tokens // 8 <= self.limit - (256 if reserve_correction else 0)
+    def request_fits(self, prompt, *, reserve_correction=True, **kwargs):
+        return len(prompt) <= self.limit - (256 if reserve_correction else 0)
 
     def request_tokens(self, prompt, **kwargs):
         return len(prompt)
@@ -305,12 +305,6 @@ async def test_unusable_baseline_reads_the_whole_revision_before_concluding():
     # Without a usable baseline the first part is the whole revision.
     assert [payload(p)["works"][0]["may_conclude"] for p in client.prompts] == [False] * (len(client.prompts) - 1) + [True]
     assert all(payload(p)["removed_historical"] == [] for p in client.prompts)
-
-
-def test_output_allowance_is_requested_in_full_and_bounded_only_by_the_route():
-    items = work_items(RULE, 32)
-    executor = RevisionWorkExecutor(client=Client(), model="gpt-4o")
-    assert executor._output([item.id for item in items], 300) > executor.client.request_budget().output_limit
 
 
 @pytest.mark.asyncio

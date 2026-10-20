@@ -81,19 +81,25 @@ class RequestBudget:
 
     @property
     def identity(self):
-        payload = {"version": "request-budget-v3", **asdict(self)}
+        payload = {"version": "request-budget-v4", **asdict(self)}
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
-    def output_reserve(self, requested: int) -> int:
-        """Bound variable output while leaving space for the request itself."""
-        return min(requested, self.output_limit, max(1, self.context_limit // 4))
+    @property
+    def output_tokens(self) -> int:
+        """The output every request on the route asks for: the route's output capacity.
 
-    def available_input(self, output_tokens: int, *, reserve_correction: bool = True) -> int:
-        if not 0 < output_tokens <= self.output_limit:
-            return -1
-        return int(min(self.input_limit, self.context_limit - output_tokens) * self.fraction) - (
+        It is the model's output limit, but no more than a quarter of the
+        context window, so that the input always keeps the rest. A provider
+        counts only the output it generates, so asking for the capacity costs
+        nothing over asking for less.
+        """
+        return min(self.output_limit, max(1, self.context_limit // 4))
+
+    def available_input(self, *, reserve_correction: bool = True) -> int:
+        """The input a request may hold beside the route's output capacity."""
+        return int(min(self.input_limit, self.context_limit - self.output_tokens) * self.fraction) - (
             self.correction_reserve if reserve_correction else 0
         )
 
-    def fits(self, estimated_tokens: int, output_tokens: int, *, reserve_correction: bool = True) -> bool:
-        return estimated_tokens <= self.available_input(output_tokens, reserve_correction=reserve_correction)
+    def fits(self, estimated_tokens: int, *, reserve_correction: bool = True) -> bool:
+        return estimated_tokens <= self.available_input(reserve_correction=reserve_correction)

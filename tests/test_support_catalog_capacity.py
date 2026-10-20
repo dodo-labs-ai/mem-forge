@@ -21,12 +21,12 @@ class BudgetClient(Client):
     def request_budget(self, model=None):
         return RequestBudget('gpt-4o', 1000000, 1000000, 64000, .8, 'fixture')
 
-    def request_fits(self, prompt, *, max_tokens, reserve_correction=True, **kwargs):
-        return self.request_budget().fits(self.request_tokens(prompt), max_tokens, reserve_correction=reserve_correction)
+    def request_fits(self, prompt, *, reserve_correction=True, **kwargs):
+        return self.request_budget().fits(self.request_tokens(prompt), reserve_correction=reserve_correction)
 
 
 @pytest.mark.asyncio
-async def test_ordered_reading_fits_one_request_despite_dense_output_estimate():
+async def test_ordered_reading_of_many_claims_fits_one_request_beside_the_route_output_capacity():
     items = work_items('Two reviewers approve US releases.\n\n' + '\n\n'.join(
         f'Routine unchanged rule {i}.' for i in range(169)), 183)
     client, store = BudgetClient(), Store()
@@ -38,7 +38,7 @@ async def test_ordered_reading_fits_one_request_despite_dense_output_estimate():
     assert all(work['may_conclude'] for work in request['works'])
     assert len(results) == 183 and all(row.supported for row in results.values())
     work = next(w for w in store.works.values() if w.kind == 'support_assess')
-    assert work.manifest['output'] == 64000
+    assert 'output' not in work.manifest
     assert work.manifest['scope']['contract'] == SUPPORT_ASSESSMENT_CONTRACT
     # The journal keeps the provider's aliased wire response; reuse decodes it again.
     assert all(row['work_id'].startswith('WRK-') for row in work.result['results'])
@@ -61,6 +61,22 @@ async def test_truncated_multi_claim_output_is_halved_until_each_request_complet
     assert [len(payload(p)['works']) for p in client.prompts] == [4, 2, 1, 1, 2, 1, 1]
     # One Change Impact request judged all four AFFECTED before the seven reading requests.
     assert len(client.impact_prompts) == 1 and executor.calls == 8 and len(executor.final_work_ids) == 4
+
+
+@pytest.mark.asyncio
+async def test_a_claim_whose_output_alone_is_truncated_is_unresolved_capacity():
+    class TruncatingClient(BudgetClient):
+        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+            if response_format is SupportAssessmentWireResponse:
+                self.prompts.append(prompt)
+                raise StructuredLlmError('fixture truncation', error_code=OUTPUT_TRUNCATED)
+            return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
+    client = TruncatingClient()
+    executor = RevisionWorkExecutor(client=client, model='gpt-4o')
+    [result] = (await executor.assess_many(work_items(CHANGED, 1))).values()
+    assert result.supported is None and result.unresolved == 'capacity'
+    assert all(len(payload(p)['works']) == 1 for p in client.prompts)
+    assert not executor.final_work_ids
 
 
 def test_aliases_preserve_text_and_role_eligibility_and_expand_four_digits():
@@ -132,4 +148,4 @@ async def test_valid_support_json_with_incomplete_transport_is_rejected(monkeypa
     client = LiteLlmStructuredClient(StructuredLlmConfig(
         model='gpt-4o', base_url=None, api_key=None, timeout_s=10, num_retries=0))
     with pytest.raises(StructuredLlmError):
-        await client.evaluate_revision_work('fixture', response_format=SupportAssessmentWireResponse, max_tokens=1024)
+        await client.evaluate_revision_work('fixture', response_format=SupportAssessmentWireResponse)

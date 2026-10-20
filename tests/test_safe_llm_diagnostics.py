@@ -29,11 +29,11 @@ async def test_diagnostics_preserve_recovery_and_original_failure(monkeypatch, k
     collector = QualitySignalCollector()
     with quality_signal_scope(collector):
         if recover:
-            result = await client.evaluate_revision_work('fixture', response_format=ScoresResponse, max_tokens=1024)
+            result = await client.evaluate_revision_work('fixture', response_format=ScoresResponse)
             assert result.scores[key] == 1
         else:
             with pytest.raises(StructuredLlmError) as caught:
-                await client.evaluate_revision_work('fixture', response_format=ScoresResponse, max_tokens=1024)
+                await client.evaluate_revision_work('fixture', response_format=ScoresResponse)
             assert caught.value.error_code == 'ValidationError'
             _require_safe_diagnostic_path('validation_location', caught.value.diagnostic.validation_location)
     attempts = [s for s in collector.snapshot() if s.event_name == 'structured_llm_attempt_outcome']
@@ -57,11 +57,11 @@ async def test_broken_diagnostic_reporting_cannot_change_call_outcome(monkeypatc
     client = LiteLlmStructuredClient(StructuredLlmConfig(
         model='openai/gpt-4o', base_url=None, api_key=None, timeout_s=10, num_retries=0))
     if recover:
-        result = await client.evaluate_revision_work('fixture', response_format=ScoresResponse, max_tokens=1024)
+        result = await client.evaluate_revision_work('fixture', response_format=ScoresResponse)
         assert result.scores['field'] == 1
     else:
         with pytest.raises(StructuredLlmError) as caught:
-            await client.evaluate_revision_work('fixture', response_format=ScoresResponse, max_tokens=1024)
+            await client.evaluate_revision_work('fixture', response_format=ScoresResponse)
         assert caught.value.error_code == 'ValidationError'
     assert 'PRIVATE_SOURCE_TEXT' not in caplog.text
 
