@@ -1810,7 +1810,9 @@ export interface paths {
          *
          *     It is what a model that newly reads images needs, since a sync reads only
          *     Documents that changed. A Source whose run cannot be queued now, such as
-         *     one with a run already pending, is reported and left as it is.
+         *     one with a run already pending, is reported and left as it is. A queued
+         *     Document that cannot be reprocessed from what was stored is recorded as
+         *     a failed item of its run.
          */
         post: operations["reprocess_image_documents_api_v1_sources_image_documents_reprocess_post"];
         delete?: never;
@@ -2275,9 +2277,11 @@ export interface paths {
          *
          *     A Source that can ask its provider for one Document by id reads each
          *     Document's current state from the provider; any other Source reads the
-         *     stored input, so it needs no local daemon. ``dry_run`` reports what the
-         *     run would read and an estimate of its model calls without writing or
-         *     contacting the provider.
+         *     stored input, so it needs no local daemon. ``all_documents`` takes every
+         *     current Document of the Source. ``dry_run`` reports what the run would
+         *     read and an estimate of its model calls without writing or contacting
+         *     the provider. A queued Document the run cannot reprocess is recorded as
+         *     a failed item of the run.
          */
         post: operations["reprocess_source_documents_api_v1_sources__source_id__reprocess_post"];
         delete?: never;
@@ -5984,9 +5988,10 @@ export interface components {
         UnqueuedSource: {
             /**
              * Reason
-             * @description Why the Source's reprocess was not queued, such as a run already pending.
+             * @description Why the Source's reprocess was not queued: another run is pending or running, the Source is paused or no longer active, it has not completed a sync, or its projection scope is changing.
+             * @enum {string}
              */
-            reason: string;
+            reason: "source_busy" | "source_paused" | "source_not_active" | "source_not_synced" | "projection_scope_transition_open";
             /** Source Id */
             source_id: string;
         };

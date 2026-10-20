@@ -230,22 +230,34 @@ async def test_reprocess_reads_the_stored_unit_at_its_current_revision_without_t
 
 
 @pytest.mark.asyncio
-async def test_stored_input_with_no_text_is_read_when_its_revision_has_artifacts(db):
+@pytest.mark.parametrize(
+    ("key", "attested", "read"),
+    [(ARTIFACT_ISSUE, True, True), (ARTIFACT_ISSUE, False, False), ("PAY-2", True, False)],
+    ids=["artifacts-attested", "artifacts-unattested", "no-artifacts"],
+)
+async def test_stored_input_with_no_text_is_read_when_its_gene_attests_it_and_its_revision_has_artifacts(
+    db, key, attested, read,
+):
     harness = await synced(db)
-    for key in (ARTIFACT_ISSUE, "PAY-2"):
-        stored = await _unit_input(db, SOURCE_ID, doc_id(key))
-        harness.store.source_artifacts[stored.raw_content_uri] = b""
-
-    with_artifact = await load_stored_source_document(
-        db, harness.store, harness.gene, source_id=SOURCE_ID, document_id=doc_id(ARTIFACT_ISSUE),
-    )
-    with pytest.raises(StoredDocumentUnavailable) as without_artifact:
-        await load_stored_source_document(
-            db, harness.store, harness.gene, source_id=SOURCE_ID, document_id=doc_id("PAY-2"),
+    stored = await _unit_input(db, SOURCE_ID, doc_id(key))
+    harness.store.source_artifacts[stored.raw_content_uri] = b""
+    if attested:
+        harness.gene.raw_from_stored_input = lambda item, body, content_type: RawContent(
+            item=item, body=body, content_type=content_type,
+            authoritative_empty=True, empty_evidence="binary file has no text body",
         )
 
-    assert [artifact.media_type for artifact in with_artifact.artifacts] == ["image/png"]
-    assert without_artifact.value.reason is StoredDocumentUnavailableReason.CONTENT_EMPTY
+    async def load():
+        return await load_stored_source_document(
+            db, harness.store, harness.gene, source_id=SOURCE_ID, document_id=doc_id(key),
+        )
+
+    if read:
+        assert [artifact.media_type for artifact in (await load()).artifacts] == ["image/png"]
+    else:
+        with pytest.raises(StoredDocumentUnavailable) as refused:
+            await load()
+        assert refused.value.reason is StoredDocumentUnavailableReason.CONTENT_EMPTY
 
 
 @pytest.mark.asyncio
@@ -677,8 +689,67 @@ async def test_the_image_documents_route_counts_then_queues_the_documents_with_a
     run = await db.get_source_sync_run(run_id)
     assert (run.trigger, run.reprocess_document_ids) == ("reprocess", (doc_id(ARTIFACT_ISSUE),))
     # The run queued first is still pending, so the Source is reported and left as it is.
-    assert again.json()["document_count"] == 0
-    assert [item["source_id"] for item in again.json()["unqueued"]] == [SOURCE_ID]
+    assert again.json() == {
+        "document_count": 0,
+        "source_count": 0,
+        "unqueued": [{"source_id": SOURCE_ID, "reason": "source_busy"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_reprocess_route_says_a_source_without_documents_has_none_to_reprocess(db, tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    harness = await synced(db)
+    await db.upsert_source(
+        id="src-empty", type="jira", name="Empty", config_json=json.dumps({"sync_mode": "local_agent"}),
+        access_policy="workspace", owner_user_id="dev",
+    )
+    app = create_admin_app(db=db, config=_admin_config(tmp_path), document_store=harness.store)
+    with TestClient(app) as client:
+        refused = client.post("/api/v1/sources/src-empty/reprocess", json={"all_documents": True, "dry_run": True})
+
+    assert (refused.status_code, refused.json()["detail"]) == (409, "source_has_no_documents")
+
+
+@pytest.mark.asyncio
+async def test_documents_with_an_image_are_those_of_active_sources_the_viewer_manages(db):
+    from memforge.server.source_admin_service import image_documents_by_source
+
+    await synced(db)
+    managed = await image_documents_by_source(db, viewer_id="dev", viewer_role="member")
+    others = await image_documents_by_source(db, viewer_id="someone-else", viewer_role="member")
+    await db.db.execute("UPDATE sources SET status = 'paused' WHERE id = ?", (SOURCE_ID,))
+    await db.db.commit()
+    paused = await image_documents_by_source(db, viewer_id="dev", viewer_role="member")
+
+    assert managed == {SOURCE_ID: (doc_id(ARTIFACT_ISSUE),)}
+    assert others == {}
+    assert paused == {}
+
+
+@pytest.mark.asyncio
+async def test_an_artifact_removed_by_a_later_sync_no_longer_makes_an_image_document(db):
+    from memforge.server.source_admin_service import image_documents_by_source
+
+    harness = await synced(db)
+    harness.gene.provider_open = True
+    fetch = harness.gene.fetch
+
+    async def fetch_without_artifacts(item):
+        return replace(await fetch(item), artifacts=())
+
+    harness.gene.fetch = fetch_without_artifacts
+    for key in ISSUES:
+        await db.db.execute("UPDATE documents SET content_hash = 'changed' WHERE doc_id = ?", (doc_id(key),))
+    await db.db.commit()
+    state = await harness.orchestrator().sync_gene(
+        gene=harness.gene, source_name="Jira", source_id=SOURCE_ID, force_full_sync=True,
+    )
+
+    assert state.docs_failed == 0
+    assert await db.list_current_document_artifacts(SOURCE_ID) == ()
+    assert await image_documents_by_source(db, viewer_id="dev", viewer_role="member") == {}
 
 
 @pytest.mark.asyncio

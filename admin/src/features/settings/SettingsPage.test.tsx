@@ -347,7 +347,7 @@ describe("a model that reads images", () => {
     expect(within(generation).queryByText(/^Image input:/)).not.toBeInTheDocument();
   });
 
-  function switchingTo(previous: ModelBinding) {
+  function switchingTo(previous: ModelBinding, imageDocuments: Route = () => ({ document_count: 24, source_count: 3 })) {
     const promoted = readingImages(true, { model_id: "gpt-5.5", route: "openai/gpt-5.5" });
     const server = settingsServer(settingsWith(previous));
     const page = renderPage(server, {
@@ -362,7 +362,7 @@ describe("a model that reads images", () => {
         validation: promoted.validation,
         settings: server.change({ generation: kindSettings(promoted) }).generation,
       }),
-      "GET /api/v1/sources/image-documents": () => ({ document_count: 24, source_count: 3 }),
+      "GET /api/v1/sources/image-documents": imageDocuments,
       "POST /api/v1/sources/image-documents/reprocess": () => ({ document_count: 24, source_count: 3, unqueued: [] }),
     });
     return page;
@@ -391,6 +391,34 @@ describe("a model that reads images", () => {
     ]);
   });
 
+  test("validating a saved edit that reads images offers the re-read too", async () => {
+    const previous = readingImages(false);
+    const promoted = readingImages(true, { model_id: "gpt-5.5", route: "openai/gpt-5.5" });
+    const server = settingsServer({
+      ...makeModelSettings(),
+      generation: kindSettings(previous, { ...promoted, state: "not_validated", validation: null }),
+    });
+    const { calls } = renderPage(server, {
+      [`POST ${SETTINGS_ROUTE}/generation/candidate/validate`]: () => ({
+        passed: true,
+        promoted: true,
+        reindex_required: false,
+        error_code: null,
+        validation: promoted.validation,
+        settings: server.change({ generation: kindSettings(promoted) }).generation,
+      }),
+      "GET /api/v1/sources/image-documents": () => ({ document_count: 3, source_count: 1 }),
+    });
+    const generation = await card("Generation model");
+
+    await userEvent.click(within(generation).getByRole("button", { name: "Save and validate" }));
+
+    expect(await screen.findByRole("dialog", { name: "Re-read documents with images?" })).toHaveTextContent(
+      "the images in 3 documents haven't been read yet",
+    );
+    expect(writes(calls)).toEqual([`POST ${SETTINGS_ROUTE}/generation/candidate/validate`]);
+  });
+
   test("Later closes the offer without re-reading anything", async () => {
     const { calls } = switchingTo(readingImages(false));
 
@@ -400,6 +428,31 @@ describe("a model that reads images", () => {
 
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(writes(calls)).not.toContain("POST /api/v1/sources/image-documents/reprocess");
+  });
+
+  test.each([
+    ["no document has an image", () => ({ document_count: 0, source_count: 0 })],
+    ["the documents cannot be counted", () => errorResponse(500, "Internal Server Error")],
+  ])("the offer is left out when %s", async (_, imageDocuments: Route) => {
+    const { calls } = switchingTo(readingImages(false), imageDocuments);
+
+    await saveModel("gpt-5.5");
+
+    await waitFor(() =>
+      expect(calls.map((request) => new URL(request.url).pathname)).toContain("/api/v1/sources/image-documents"),
+    );
+    expect(await within(inUse(await card("Generation model"))).findByText("gpt-5.5")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  test("a model that read text only by a validation of settings since changed offers nothing", async () => {
+    const stale = readingImages(false);
+    const { calls } = switchingTo({ ...stale, validation: { ...stale.validation!, current: false } });
+
+    await saveModel("gpt-5.5");
+
+    expect(await within(inUse(await card("Generation model"))).findByText("gpt-5.5")).toBeInTheDocument();
+    expect(calls.map((request) => new URL(request.url).pathname)).not.toContain("/api/v1/sources/image-documents");
   });
 
   test.each([

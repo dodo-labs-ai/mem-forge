@@ -88,6 +88,13 @@ interface ModelFormProps {
  * search index, which puts the model to use when it ends. While a rebuild
  * runs the embedding model cannot be changed.
  */
+/** Whether a model reads images, as a passed validation of it as it stands observed; undefined when none did. */
+function observedImageInput(binding: ModelKindSettings["active"]): boolean | null | undefined {
+  const validation = binding?.validation;
+  if (!validation?.passed || !validation.current) return undefined;
+  return validationFacts(validation).image_input;
+}
+
 export function ModelForm({ kind, title, settings, providers, vectorIndex, onUnsavedChange }: ModelFormProps) {
   const { active, candidate } = settings;
   const stored = candidate ?? active;
@@ -171,15 +178,11 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
   }
 
   function validateSaved() {
-    const readTextOnly =
-      kind === "generation" && active?.validation?.passed === true && validationFacts(active.validation).image_input === false;
+    const readTextOnly = kind === "generation" && observedImageInput(active) === false;
     validate.mutate(undefined, {
       onSuccess: (result) => {
         showStored(result.settings);
-        const promoted = result.promoted ? result.settings.active : null;
-        if (readTextOnly && promoted?.validation && validationFacts(promoted.validation).image_input === true) {
-          offerReRead();
-        }
+        if (readTextOnly && result.promoted && observedImageInput(result.settings.active) === true) offerReRead();
       },
     });
   }

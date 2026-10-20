@@ -73,7 +73,7 @@ from memforge.source_artifacts import (
 )
 
 logger = logging.getLogger(__name__)
-# Why a selected image file has no text body: its content is its Artifact.
+# Why a selected binary file, an image or a PDF, has no text body: its content is its Artifact.
 _BINARY_FILE_EMPTY_EVIDENCE = "github_binary_file_has_no_text_body"
 
 __all__ = ["GitHubRepoGene"]
@@ -454,11 +454,11 @@ class GitHubRepoGene(Gene):
             )
 
     def raw_from_stored_input(self, item: ContentItem, body: bytes, content_type: str) -> RawContent:
-        """Rebuild a stored file, a package of one, or a selected image file.
+        """Rebuild a stored file, a package of one, or a selected binary file.
 
-        An image file is stored with no text body, as it was fetched, and its
-        item names its media type; that is the evidence the fetch gave for its
-        empty text. Its bytes come from the committed Artifact.
+        A binary file, an image or a PDF, is stored with no text body, as it was
+        fetched, and its item names its media type; that is the evidence the
+        fetch gave for its empty text. Its bytes come from the committed Artifact.
         """
         package = decode_package(body, GITHUB_REPO_PACKAGE_KIND)
         if package is not None:
