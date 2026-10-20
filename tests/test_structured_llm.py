@@ -1452,6 +1452,42 @@ async def test_litellm_structured_client_repairs_invalid_json_fallback_with_vali
     assert telemetry[0].terminal_category == "success"
 
 
+def test_a_repair_names_only_the_diagnostics_the_correction_reserve_has_room_for() -> None:
+    from memforge.llm.structured import _StructuredLlmFailure, _json_text_prompt, _repair_note
+
+    model = "anthropic/claude-sonnet-4-6"
+    sizing = LiteLlmStructuredClient(StructuredLlmConfig(
+        model=model, base_url=None, api_key=None, timeout_s=1.0,
+        max_input_tokens=200_000, context_window_tokens=200_000, max_output_tokens=64_000,
+    ))
+    request = sizing.request_tokens("prompt", response_format=CapabilityCheckResponse, model=model)
+    reserve = sizing.request_budget(model).correction_reserve
+    # Packed with the correction reserve kept free, as the batch runner packs a first request.
+    client = LiteLlmStructuredClient(StructuredLlmConfig(
+        model=model, base_url=None, api_key=None, timeout_s=1.0, input_budget_fraction=1.0,
+        max_input_tokens=request + reserve, context_window_tokens=200_000, max_output_tokens=64_000,
+    ))
+    failure = _StructuredLlmFailure(
+        terminal_category="invalid_response",
+        error_code="ValueError",
+        validation_fields=tuple((f"字段{index}" * 128, "规则" * 64) for index in range(8)),
+        model_level_messages=("说明" * 128,) * 8,
+    )
+    every_diagnostic = _json_text_prompt(
+        "prompt", CapabilityCheckResponse, repair_note=_repair_note(failure, "json_text"),
+    )
+
+    repair = client._repair_prompt("prompt", CapabilityCheckResponse, failure, "json_text", model=model, images=())
+
+    assert not client._rendered_request_fits(
+        every_diagnostic, response_format=CapabilityCheckResponse, model=model, images=(), reserve_correction=False,
+    )
+    assert client._rendered_request_fits(
+        repair, response_format=CapabilityCheckResponse, model=model, images=(), reserve_correction=False,
+    )
+    assert "字段0" in repair and "字段7" not in repair
+
+
 @pytest.mark.asyncio
 async def test_litellm_structured_client_repairs_invalid_json_first_response(
     monkeypatch,
