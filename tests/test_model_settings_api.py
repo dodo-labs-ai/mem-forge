@@ -1634,8 +1634,22 @@ def test_discovery_lists_the_models_of_an_endpoint(db, tmp_path, monkeypatch) ->
     assert payload["ok"] is True
     assert payload["models_supported"] is True
     assert payload["models"] == [
-        {"id": "model-a", "label": None, "context_window_tokens": None, "max_output_tokens": None, "native_schema": None},
-        {"id": "model-b", "label": "Model B", "context_window_tokens": None, "max_output_tokens": None, "native_schema": None},
+        {
+            "id": "model-a",
+            "label": None,
+            "context_window_tokens": None,
+            "max_output_tokens": None,
+            "native_schema": None,
+            "image_input": None,
+        },
+        {
+            "id": "model-b",
+            "label": "Model B",
+            "context_window_tokens": None,
+            "max_output_tokens": None,
+            "native_schema": None,
+            "image_input": None,
+        },
     ]
     assert payload["kind_filtered"] is False
     assert payload["message"] == "Connected. Found 2 models; the endpoint does not say which are embedding models."
@@ -1657,12 +1671,14 @@ OPENROUTER_CHAT_MODELS = {
             "context_length": 1_000_000,
             "top_provider": {"context_length": 1_000_000, "max_completion_tokens": 128_000},
             "supported_parameters": ["max_tokens", "response_format", "structured_outputs", "tools"],
+            "architecture": {"input_modalities": ["text", "image", "file"]},
         },
         {
             "id": "openai/gpt-5-mini",
             "name": "OpenAI: GPT-5 Mini",
             "top_provider": {"max_completion_tokens": None},
             "supported_parameters": ["max_tokens", "response_format"],
+            "architecture": {"input_modalities": ["text"]},
         },
         {"id": "meituan/longcat-2.0", "name": "Meituan: LongCat 2.0"},
     ]
@@ -1710,7 +1726,7 @@ def test_openrouter_lists_each_kind_from_its_own_listing(db, tmp_path, monkeypat
     assert generation["message"] == "Connected. Found 3 generation models."
 
 
-def test_discovery_carries_the_token_limits_and_the_response_schema_support_a_listing_gives(
+def test_discovery_carries_the_token_limits_response_schema_support_and_image_input_a_listing_gives(
     db, tmp_path, monkeypatch
 ) -> None:
     """OpenRouter declares a model's response schema support by ``structured_outputs``; JSON mode alone is not it."""
@@ -1726,6 +1742,7 @@ def test_discovery_carries_the_token_limits_and_the_response_schema_support_a_li
             "context_window_tokens": 1_000_000,
             "max_output_tokens": 128_000,
             "native_schema": True,
+            "image_input": True,
         },
         {
             "id": "openai/gpt-5-mini",
@@ -1733,6 +1750,7 @@ def test_discovery_carries_the_token_limits_and_the_response_schema_support_a_li
             "context_window_tokens": None,
             "max_output_tokens": None,
             "native_schema": False,
+            "image_input": False,
         },
         {
             "id": "meituan/longcat-2.0",
@@ -1740,6 +1758,7 @@ def test_discovery_carries_the_token_limits_and_the_response_schema_support_a_li
             "context_window_tokens": None,
             "max_output_tokens": None,
             "native_schema": None,
+            "image_input": None,
         },
     ]
 

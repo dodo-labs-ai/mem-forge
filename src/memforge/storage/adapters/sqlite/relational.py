@@ -667,6 +667,9 @@ class SqliteRelationalStore:
     ) -> dict[str, tuple[str, ...]]:
         return await self._db.list_current_source_unit_observation_ids(source_id)
 
+    async def list_current_document_artifacts(self, source_id: str) -> tuple[tuple[str, dict[str, Any]], ...]:
+        return await self._db.list_current_document_artifacts(source_id)
+
     async def list_current_source_units(
         self,
         source_id: str,
