@@ -178,8 +178,8 @@ class EntityClient(FixtureBudgetClient):
             prompt, **kwargs,
         )
 
-    async def validate_entity_batch(self, prompt, *, max_tokens, model):
-        return await self.call(prompt, max_tokens=max_tokens, model=model)
+    async def validate_entity_batch(self, prompt, *, model):
+        return await self.call(prompt, model=model)
 
 
 def _fixed_client(decisions: list[EntityBatchValidationDecision]) -> EntityClient:

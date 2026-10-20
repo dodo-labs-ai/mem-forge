@@ -869,7 +869,6 @@ def _build_default_sync_runtime(
 
     memory_extractor = MemoryExtractor(
         model=models.generation_route,
-        max_tokens=config.llm.memory_extraction_max_tokens,
         request_timeout_s=models.request_timeout_s,
         structured_llm_client=structured_llm_client,
     )

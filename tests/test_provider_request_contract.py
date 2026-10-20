@@ -100,7 +100,11 @@ _UNHURRIED_CALL_S = 60.0
 _REQUEST_TIMEOUT_S = 0.5
 # A request ended at its timeout ends well before the stalling endpoint gives up.
 _ENDED_AT_ITS_TIMEOUT_S = GIVES_UP_AFTER_S / 2
-_MAX_TOKENS = 64
+# The limits every structured client's route states. A quarter of the context
+# window is far above the output limit, so the output limit is the route's
+# output capacity.
+_CONTEXT_WINDOW = 4096
+_OUTPUT_LIMIT = 64
 _PROMPT = "Rank the matching memories"
 _ANSWER = {"ranking": [3, 1]}
 _JSON_TEXT_INSTRUCTION = "Return ONLY a single JSON object"
@@ -898,6 +902,9 @@ def _invocation(
 
 def _structured_client(invocation: ResolvedInvocation, **settings: Any) -> LiteLlmStructuredClient:
     settings.setdefault("timeout_s", _UNHURRIED_CALL_S)
+    settings.setdefault("max_input_tokens", _CONTEXT_WINDOW)
+    settings.setdefault("context_window_tokens", _CONTEXT_WINDOW)
+    settings.setdefault("max_output_tokens", _OUTPUT_LIMIT)
     return LiteLlmStructuredClient(StructuredLlmConfig.for_invocation(invocation, **settings))
 
 
@@ -951,7 +958,7 @@ async def test_a_request_carries_the_configured_credential_in_the_header_its_pro
     if kind == "generation":
         wire.respond = _answer(contract)
         await _structured_client(_invocation(row, kind)).answer_schema(
-            _PROMPT, response_format=_Ranking, max_tokens=_MAX_TOKENS
+            _PROMPT, response_format=_Ranking
         )
     else:
         wire.respond = _embed(contract)
@@ -972,7 +979,7 @@ async def test_a_structured_request_reaches_the_provider_as_its_api_takes_it_and
     wire.respond = _answer(contract)
     client = _structured_client(_invocation(row, "generation"))
 
-    answer = await client.answer_schema(_PROMPT, response_format=_Ranking, max_tokens=_MAX_TOKENS)
+    answer = await client.answer_schema(_PROMPT, response_format=_Ranking)
 
     assert answer == _Ranking(**_ANSWER)
     [request] = wire.requests
@@ -980,7 +987,7 @@ async def test_a_structured_request_reaches_the_provider_as_its_api_takes_it_and
     assert (request.method, str(request.url)) == ("POST", contract.url)
     _assert_nothing_but_the_request(request)
     assert body["model"] == contract.model
-    assert _at(body, contract.output_limit) == _MAX_TOKENS
+    assert _at(body, contract.output_limit) == client.request_budget().output_tokens == _OUTPUT_LIMIT
     assert {name: body.get(name) for name in contract.fields} == dict(contract.fields)
     assert _PROMPT in _prompt_text(body)
     if contract.schema == "json_schema":
@@ -1010,13 +1017,56 @@ async def test_only_a_direct_answer_asks_the_provider_to_answer_without_reasonin
     invocation = _invocation(row, "generation", model_id=case.model_id)
     client = _structured_client(invocation)
 
-    await client.answer_schema(_PROMPT, response_format=_DirectRanking, max_tokens=_MAX_TOKENS)
-    await client.answer_schema(_PROMPT, response_format=_Ranking, max_tokens=_MAX_TOKENS)
+    await client.answer_schema(_PROMPT, response_format=_DirectRanking)
+    await client.answer_schema(_PROMPT, response_format=_Ranking)
 
     assert descriptor.reasoning_off(invocation.route) == case.parameters
     direct, reasoned = wire.bodies()
     assert {name: direct[name] for name in set(direct) - set(reasoned)} == dict(case.sent)
     assert set(reasoned) <= set(direct)
+
+
+@pytest.mark.parametrize("descriptor", PROVIDER_DESCRIPTORS, ids=lambda descriptor: descriptor.id)
+def test_only_ollama_sets_the_context_window_per_request(descriptor) -> None:
+    """Ollama sizes its window per request; every other provider fixes it."""
+    if descriptor.id == "ollama":
+        assert descriptor.context_window(8192) == {"num_ctx": 8192}
+    else:
+        assert descriptor.context_window is None
+
+
+@pytest.mark.parametrize("row", _rows_for("generation", "structured_generation"))
+async def test_an_ollama_request_states_the_context_window_of_its_route(wire, row) -> None:
+    wire.respond = _answer(row.generation)
+    client = _structured_client(_invocation(row, "generation"))
+
+    await client.answer_schema(_PROMPT, response_format=_Ranking)
+
+    [body] = wire.bodies()
+    if row.descriptor == "ollama":
+        assert body["options"]["num_ctx"] == client.request_budget().context_limit == _CONTEXT_WINDOW
+    else:
+        assert "num_ctx" not in json.dumps(body)
+
+
+def test_an_ollama_route_takes_its_window_only_from_the_binding(monkeypatch) -> None:
+    """The window Ollama runs a request in is what the operator's machine holds,
+    so the model's own window, as LiteLLM reads it from an Ollama server, sizes nothing."""
+    monkeypatch.setattr(
+        litellm,
+        "get_model_info",
+        lambda model: {"max_input_tokens": 131072, "context_window": 131072, "max_output_tokens": 32768},
+    )
+    row = next(row for row in MATRIX if row.descriptor == "ollama" and row.contract("generation") is not None)
+    invocation = _invocation(row, "generation")
+
+    unstated = _structured_client(invocation, max_input_tokens=None, context_window_tokens=None, max_output_tokens=None)
+    stated = _structured_client(invocation, max_input_tokens=None, context_window_tokens=16384, max_output_tokens=None)
+
+    with pytest.raises(ValueError, match="context_window_tokens"):
+        unstated.request_budget()
+    assert stated.request_budget().context_limit == 16384
+    assert stated._context_window(stated.config.model) == {"num_ctx": 16384}
 
 
 # -- Embedding ----------------------------------------------------------------------
@@ -1095,7 +1145,7 @@ def _product_call(kind: ModelKind, invocation: ResolvedInvocation) -> Awaitable[
     """The call the product makes, bounded by its own deadline."""
     if kind == "generation":
         client = _structured_client(invocation, timeout_s=_REQUEST_TIMEOUT_S)
-        return client.answer_schema(_PROMPT, response_format=_Ranking, max_tokens=_MAX_TOKENS)
+        return client.answer_schema(_PROMPT, response_format=_Ranking)
     return _embedding_runtime(invocation, timeout_s=_REQUEST_TIMEOUT_S).embed_query("alpha")
 
 
@@ -1142,7 +1192,7 @@ async def test_a_redirect_fails_the_request_and_its_key_and_payload_are_not_sent
     if kind == "generation":
         client = _structured_client(_invocation(row, kind))
         with pytest.raises(StructuredLlmError) as raised:
-            await client.answer_schema(_PROMPT, response_format=_Ranking, max_tokens=_MAX_TOKENS)
+            await client.answer_schema(_PROMPT, response_format=_Ranking)
     else:
         runtime = _embedding_runtime(_invocation(row, kind), num_retries=3)
         with pytest.raises(EmbeddingProviderError) as raised:
@@ -1169,7 +1219,7 @@ async def test_a_failed_request_is_sent_again_and_its_run_retried_only_when_its_
     if kind == "generation":
         client = _structured_client(_invocation(row, kind), num_retries=1)
         with pytest.raises(StructuredLlmError) as raised:
-            await client.answer_schema(_PROMPT, response_format=_Ranking, max_tokens=_MAX_TOKENS)
+            await client.answer_schema(_PROMPT, response_format=_Ranking)
         first = wire.requests[0].content
         # A rejected schema request may be followed by its JSON-text form,
         # which is another request, not the same one again.

@@ -50,8 +50,8 @@ class RecordingRerankClient(FixtureBudgetClient):
     def prompt(self) -> str | None:
         return self.prompts[-1] if self.prompts else None
 
-    async def rerank_memories(self, prompt: str, *, max_tokens: int, model: str | None = None):
-        return await self.call(prompt, max_tokens=max_tokens, model=model)
+    async def rerank_memories(self, prompt: str, *, model: str | None = None):
+        return await self.call(prompt, model=model)
 
 
 class QueryScoredKeyword:

@@ -12,8 +12,6 @@ from fastapi.testclient import TestClient
 from memforge.agent_knowledge import AGENT_SESSION_INTENT_CONTRACT, AgentKnowledgePatchProposal
 from memforge.agent_sessions import (
     AGENT_SESSION_AUTHORITY_CONTRACT,
-    AGENT_SESSION_AUTHORITY_DECISION_OUTPUT_TOKENS,
-    AGENT_SESSION_AUTHORITY_MIN_OUTPUT_TOKENS,
     AGENT_SESSION_WINDOW_RETRY_AFTER_SECONDS,
     _classify_agent_session_authority,
     _run_agent_patch_with_activity,
@@ -118,8 +116,8 @@ class _RouteBudget:
     def request_budget(self, model=None):
         return fixture_budget(input_tokens=self.input_tokens, output_tokens=self.output_tokens, correction_reserve=0)
 
-    def request_fits(self, prompt, *, response_format, max_tokens, model=None, images=(), reserve_correction=True):
-        return self.request_budget(model).fits(len(prompt.split()), max_tokens, reserve_correction=reserve_correction)
+    def request_fits(self, prompt, *, response_format, model=None, images=(), reserve_correction=True):
+        return self.request_budget(model).fits(len(prompt.split()), reserve_correction=reserve_correction)
 
 
 class _AuthorizesAllCandidateUserEvidence(_RouteBudget):
@@ -194,13 +192,7 @@ def test_agent_session_authority_classification_packs_candidates_with_full_conte
         async def classify_agent_session_evidence_authority(self, prompt: str, **kwargs):
             candidate_ids = _authority_prompt_candidate_ids(prompt)
             context_ids = _authority_prompt_context_ids(prompt)
-            calls.append(
-                {
-                    "candidate_ids": candidate_ids,
-                    "context_ids": context_ids,
-                    "max_tokens": kwargs["max_tokens"],
-                }
-            )
+            calls.append({"candidate_ids": candidate_ids, "context_ids": context_ids})
             return AgentSessionAuthorityResponse.model_validate(
                 {
                     "decisions": [
@@ -235,14 +227,6 @@ def test_agent_session_authority_classification_packs_candidates_with_full_conte
         all_ids[:candidates_per_request],
         all_ids[candidates_per_request:candidate_count],
     ]
-    assert all(
-        call["max_tokens"]
-        == max(
-            AGENT_SESSION_AUTHORITY_MIN_OUTPUT_TOKENS,
-            AGENT_SESSION_AUTHORITY_DECISION_OUTPUT_TOKENS * len(call["candidate_ids"]),
-        )
-        for call in calls
-    )
     assert all(
         set(call["candidate_ids"]) | set(call["context_ids"]) == set(all_ids)
         for call in calls
@@ -622,7 +606,7 @@ def test_agent_session_window_does_not_build_prompt_during_active_maintenance(tm
         asyncio.run(database.close())
 
 
-def test_agent_session_window_uses_bounded_completion_budget(tmp_path):
+def test_agent_session_window_leaves_its_output_to_the_route_capacity(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
     class RecordingWindowClient(_RouteBudget):
@@ -632,12 +616,11 @@ def test_agent_session_window_uses_bounded_completion_budget(tmp_path):
         async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
             self.calls.append(kwargs)
             return _knowledge_patch(
-                title="Bounded patch",
-                claim_text="Agent-session patch generation uses a bounded completion budget.",
+                title="Route capacity patch",
+                claim_text="Agent-session patch generation asks for the route's output capacity.",
             )
 
     cfg = _config(tmp_path)
-    cfg.llm.enrichment_max_tokens = 64000
     database = Database(str(tmp_path / "api.db"))
     window_client = RecordingWindowClient()
 
@@ -667,8 +650,9 @@ def test_agent_session_window_uses_bounded_completion_budget(tmp_path):
             )
 
         assert response.status_code == 200, response.text
+        # The structured client sizes the output by the route; the request names no output size.
         assert window_client.calls
-        assert window_client.calls[0]["max_tokens"] == 8192
+        assert all("max_tokens" not in call for call in window_client.calls)
     finally:
         asyncio.run(database.close())
 

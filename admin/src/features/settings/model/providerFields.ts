@@ -63,12 +63,25 @@ export function parameterField(name: string): ExtraField {
 }
 
 /**
+ * The context window of a provider that opens the window every request asks
+ * for: the server reserves memory for all of it, so it is a choice for the
+ * machine rather than a fact of the model.
+ */
+const REQUESTED_CONTEXT_WINDOW_HINT =
+  "In tokens: the window the server opens for every request, its answer included. A larger window takes more of the server's memory; 16384 suits most documents.";
+
+/**
  * A token limit field. The limits are optional while LiteLLM or the server
  * environment has them for the model, and required once validation found that
  * nothing has.
  */
-export function tokenLimitField(name: string, { required }: { required: boolean }): ExtraField {
-  const field = TOKEN_LIMIT_FIELDS[name] ?? { label: fallbackLabel(name), hint: null };
+export function tokenLimitField(
+  name: string,
+  { required, setsContextWindow = false }: { required: boolean; setsContextWindow?: boolean },
+): ExtraField {
+  const listed = TOKEN_LIMIT_FIELDS[name] ?? { label: fallbackLabel(name), hint: null };
+  const field =
+    setsContextWindow && name === "context_window_tokens" ? { ...listed, hint: REQUESTED_CONTEXT_WINDOW_HINT } : listed;
   return required ? field : { ...field, label: optionalLabel(field.label) };
 }
 

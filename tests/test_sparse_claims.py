@@ -101,7 +101,7 @@ async def test_valid_json_with_incomplete_finish_is_not_empty_success(monkeypatc
     client = LiteLlmStructuredClient(StructuredLlmConfig(model="openai/gpt-4o-mini", api_key="fixture", base_url=None,
         timeout_s=5, num_retries=0, native_schema_transport="response_format"))
     with pytest.raises(StructuredLlmError) as caught:
-        await client.assess_claim_revisions("fixture", max_tokens=512)
+        await client.assess_claim_revisions("fixture")
     assert caught.value.error_code == error_code
 
 

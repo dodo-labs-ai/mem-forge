@@ -3614,7 +3614,6 @@ class GeneSyncOrchestrator:
         from memforge.pipeline.revision_assessment import client_reads_images, revision_inference_capability_hash
         inference_capability_hash = revision_inference_capability_hash(
             self.structured_llm_client, extraction_model=getattr(self.memory_extractor, "model", None),
-            extraction_max_tokens=getattr(self.memory_extractor, "max_tokens", None),
         )
         committed_base_snapshot = await self._committed_base_snapshot_for(
             projection,

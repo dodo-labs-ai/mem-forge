@@ -66,12 +66,6 @@ Never rewrite or merge claim text. Return only the decisions object required by 
 response schema.
 """
 
-# Requested output: one decision per Candidate holds only its ID, verdict,
-# reject reason and duplicate IDs with their JSON keys, with a floor for the
-# envelope. The runner bounds it by the route.
-_DECISION_OUTPUT_TOKENS = 70
-_MIN_OUTPUT_TOKENS = 1024
-
 # The model's reasons, then the program's reasons for a Candidate it could not judge.
 type RejectReason = Literal["low_value", "capacity_exceeded", "invalid_response"]
 
@@ -150,8 +144,7 @@ async def admit_candidates(
                 evidence.artifact_observation_ids, images=images, image_loader=image_loader)
         except EvidenceArtifactUnavailable as error:
             raise CandidateAdmissionError("candidate_admission_artifact_unavailable", str(error)) from error
-        max_tokens = max(_MIN_OUTPUT_TOKENS, _DECISION_OUTPUT_TOKENS * len(item_ids))
-        return LlmRequest(prompt, CandidateAdmissionResponse, max_tokens, request_images)
+        return LlmRequest(prompt, CandidateAdmissionResponse, request_images)
 
     def decode(response: CandidateAdmissionResponse, _item_ids: tuple[str, ...], round_ids: tuple[str, ...]):
         """Each decision is validated alone: its own rule, and every duplicate it names is a supplied round claim."""

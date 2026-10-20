@@ -235,7 +235,7 @@ class _RecordingClient:
         statement = question["candidate"]["statement"]
         return "contradicts" if "monthly" in statement else "none"
 
-    async def classify_cross_document_relations(self, prompt, *, max_tokens, model=None):
+    async def classify_cross_document_relations(self, prompt, *, model=None):
         self.prompts.append(prompt)
         questions = _questions(prompt)
         return CrossDocumentRelationResponse(

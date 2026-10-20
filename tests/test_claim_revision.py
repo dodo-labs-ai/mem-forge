@@ -161,26 +161,6 @@ async def test_duplicate_edge_and_missing_candidate_fail_closed():
 
 
 @pytest.mark.asyncio
-async def test_single_pair_does_not_require_large_model_output_window():
-    client = Client("equivalent")
-    requested = []
-
-    def fits(prompt, **kwargs):
-        requested.append(kwargs["max_tokens"])
-        return kwargs["max_tokens"] <= 8192
-
-    client.request_fits = fits
-    result = await reconcile_memories(
-        new_extractions=[candidate()],
-        existing_memories=[memory()],
-        llm_model="test-model", structured_llm_client=client,
-        supports=dict([pinned("memory", True)]),
-    )
-    assert result.failure is None and client.calls == 1
-    assert max(requested) <= 8192
-
-
-@pytest.mark.asyncio
 async def test_refinement_preserving_an_unsupported_incumbent_stays_unresolved():
     client = Client("refines", "challenger_to_candidate", eligibility=True)
     result = await reconcile_memories(
@@ -331,7 +311,8 @@ async def test_small_output_cap_can_assess_one_complete_pair():
     from memforge.llm.request_budget import RequestBudget
     client = Client("equivalent")
     client.request_budget = lambda model=None: RequestBudget("fixture", 16000, 16000, 1024, .8, "fixture")
-    client.request_fits = lambda prompt, **kwargs: kwargs["max_tokens"] <= 1024
+    client.request_fits = lambda prompt, *, reserve_correction=True, **kwargs: client.request_budget().fits(
+        len(prompt.split()), reserve_correction=reserve_correction)
     result = await reconcile_memories(new_extractions=[candidate()], existing_memories=[memory()],
         llm_model="test-model", structured_llm_client=client, supports=dict([pinned("memory", True)]))
     assert result.failure is None and client.calls == 1

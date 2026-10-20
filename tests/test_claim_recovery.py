@@ -103,7 +103,7 @@ async def test_provider_validation_diagnostic_reaches_durable_lifecycle_event(mo
     client = LiteLlmStructuredClient(StructuredLlmConfig(model="openai/gpt-4o-mini", api_key="fixture",
         base_url=None, timeout_s=5, num_retries=0, native_schema_transport="response_format"))
     with pytest.raises(StructuredLlmError) as caught:
-        await client.assess_claim_revisions("fixture", max_tokens=1024)
+        await client.assess_claim_revisions("fixture")
     error = caught.value
     assert error.validation_fields
     assert error.diagnostic.validation_location == "results.0.relations.0.relation"
@@ -116,7 +116,7 @@ async def test_provider_validation_diagnostic_reaches_durable_lifecycle_event(mo
     assert bundle.event.validation_location == "results.0.relations.0.relation"
     assert bundle.event.validation_rule == "literal_error"
     assert bundle.event.model == "openai/gpt-4o-mini"
-    assert bundle.event.requested_max_tokens == 1024
+    assert bundle.event.requested_max_tokens == client.request_budget().output_tokens
     assert "invalid\"" not in str(bundle.event)
     from memforge.evals.agent_evaluation import AgentRuntimeEventQuery
     from datetime import timedelta

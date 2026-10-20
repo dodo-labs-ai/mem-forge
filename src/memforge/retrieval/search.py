@@ -90,8 +90,6 @@ _METADATA_IDENTIFIER_CHANNELS = {"bm25_metadata_tokens", "metadata_alias"}
 
 _QUOTED_IDENTITY_RE = re.compile(r'"([^"\n]+)"|“([^”\n]+)”')
 _MAX_QUOTED_IDENTITY_LENGTH = 256
-# Requested output for one listwise ranking: a short array of memory numbers.
-_RERANK_OUTPUT_TOKENS = 256
 
 
 # ---------------------------------------------------------------------------
@@ -1145,7 +1143,7 @@ class SearchEngine:
         try:
             # The ranking is one indivisible request; any failure keeps the fused order.
             response = await LlmBatchRunner(self._structured_llm_client, model=self._config.rerank_model).run_one(
-                LlmRequest(prompt, RerankResponse, _RERANK_OUTPUT_TOKENS),
+                LlmRequest(prompt, RerankResponse),
                 call=self._structured_llm_client.rerank_memories,
             )
             if isinstance(response, ItemFailure):

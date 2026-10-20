@@ -372,5 +372,5 @@ async def test_refused_change_impact_reply_is_a_failure_not_a_label(monkeypatch)
     client = LiteLlmStructuredClient(StructuredLlmConfig(
         model="gpt-4o", base_url=None, api_key=None, timeout_s=10, num_retries=0))
     with pytest.raises(StructuredLlmError) as raised:
-        await client.evaluate_revision_work("fixture", response_format=ChangeImpactWireResponse, max_tokens=1024)
+        await client.evaluate_revision_work("fixture", response_format=ChangeImpactWireResponse)
     assert raised.value.error_code == "change_impact_response_incomplete"
