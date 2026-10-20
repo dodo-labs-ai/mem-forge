@@ -2136,7 +2136,10 @@ def test_sap_route_uses_sdk_bedrock_metadata_and_preserves_operator_caps(monkeyp
     from memforge.pipeline.memory_extractor import MemoryExtractor
     from types import SimpleNamespace
     monkeypatch.setattr("memforge.llm.structured.litellm.token_counter", lambda **kwargs: 100)
-    catalog = SimpleNamespace(fragments=[SimpleNamespace(primary_eligible=True, presentation_text="Small claim.")])
+    from memforge.pipeline.evidence_fragments import EvidenceFragmentKind
+    catalog = SimpleNamespace(fragments=[
+        SimpleNamespace(primary_eligible=True, kind=EvidenceFragmentKind.TEXT, presentation_text="Small claim."),
+    ])
     requested = MemoryExtractor(structured_llm_client=client, model=config.model).fragment_output_tokens(catalog)
     assert requested > config.max_output_tokens
     runner = LlmBatchRunner(client, model=config.model)

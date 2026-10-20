@@ -172,7 +172,8 @@ class ModelValidationResult(BaseModel):
         default_factory=dict,
         description=(
             "What the check observed: latency_ms; for generation structured_output_mode "
-            "('native_schema' or 'json_text'), schema_fallback, token_limits_known and "
+            "('native_schema' or 'json_text'), schema_fallback, token_limits_known, "
+            "image_input (whether the model reads images; null when the check could not tell) and "
             "provider_model; for embedding dimension and provider_model. provider_model is "
             "present only when the provider reported one."
         ),
@@ -412,6 +413,13 @@ class ModelOption(BaseModel):
         description=(
             "Whether the listing declares that the model answers in the JSON schema a request "
             "gives; null when it declares nothing about it."
+        ),
+    )
+    image_input: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the listing declares that the generation model takes images as input; "
+            "null when it declares nothing about it."
         ),
     )
 
@@ -892,6 +900,7 @@ def _model_option(model: DeclaredModel) -> ModelOption:
         context_window_tokens=model.context_window_tokens,
         max_output_tokens=model.max_output_tokens,
         native_schema=model.native_schema,
+        image_input=model.image_input,
     )
 
 

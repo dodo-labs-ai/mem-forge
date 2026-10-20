@@ -9,6 +9,14 @@ export function NameCell({ row }: { row: SourceRow }) {
 }
 
 export function ActionsCell({ row }: { row: SourceRow }) {
-  const { actions, onViewDetails, onDelete } = useSourceTable();
-  return <SourceRowActions row={row} actions={actions} onViewDetails={onViewDetails} onDelete={onDelete} />;
+  const { actions, onViewDetails, onDelete, onReRead } = useSourceTable();
+  return (
+    <SourceRowActions
+      row={row}
+      actions={actions}
+      onViewDetails={onViewDetails}
+      onDelete={onDelete}
+      onReRead={onReRead}
+    />
+  );
 }

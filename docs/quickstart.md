@@ -302,14 +302,19 @@ and when such a document changes, the **Review** page asks you about them
 instead of the model judging them without the image. If the check could not
 tell, because the provider did not answer or limited the request rate, the
 model is treated as one that reads images, and the check asks again the next
-time you validate the model.
+time you validate the model. When you pick a model from **Load models**,
+Settings also says whether the provider's list declares that it takes images.
 
-After switching to a model that reads images, reprocess the documents whose
-images you want read:
+A sync reads only the documents that changed, so the images in the others stay
+unread when you switch to a model that reads images. When such a model replaces
+one that read text only, Settings offers to re-read the documents that have
+images. You can also re-read every document of a source at any time with
+**Re-read all documents** in its menu on the **Sources** page, which says first
+how many model calls it takes, or from the command line:
 
 ```bash
-memforge sources reprocess <source-id> --document <document-id> --dry-run
-memforge sources reprocess <source-id> --document <document-id>
+memforge sources reprocess <source-id> --all --dry-run
+memforge sources reprocess <source-id> --all
 ```
 
 ### Configuring models in `.env`

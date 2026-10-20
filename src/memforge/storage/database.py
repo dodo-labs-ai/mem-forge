@@ -9062,6 +9062,30 @@ class Database:
                 result[unit_id].append(str(row["observation_id"]))
         return {unit_id: tuple(ids) for unit_id, ids in result.items()}
 
+    async def list_current_document_artifacts(self, source_id: str) -> tuple[tuple[str, dict[str, Any]], ...]:
+        """The current binary Artifacts of the Source's current Documents, as (document id, metadata).
+
+        Each row is one current Artifact Observation of the current Source Unit
+        that holds the Document, with the metadata of its current revision.
+        """
+        rows = await self.db.execute_fetchall(
+            """SELECT lineage.document_id AS document_id, revision.metadata_json AS metadata_json
+               FROM source_unit_document_lineage_history lineage
+               JOIN source_units su
+                 ON su.id = lineage.source_unit_id AND su.current_revision_id IS NOT NULL
+               JOIN source_observations so
+                 ON so.source_unit_id = su.id AND so.observation_type = ?
+               JOIN source_observation_revisions revision
+                 ON revision.id = so.current_revision_id
+               WHERE lineage.source_id = ? AND lineage.is_current = 1
+               ORDER BY lineage.document_id, so.id""",
+            (SOURCE_ARTIFACT_OBSERVATION_TYPE, source_id),
+        )
+        return tuple(
+            (str(row["document_id"]), dict(json.loads(row["metadata_json"] or "{}")))
+            for row in rows
+        )
+
     async def list_current_source_units(
         self,
         source_id: str,

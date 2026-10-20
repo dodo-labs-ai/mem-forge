@@ -18,6 +18,8 @@ interface ConfirmDialogProps {
   title: string;
   description: ReactNode;
   confirmLabel: string;
+  /** The label of the button that closes the dialog without acting. */
+  cancelLabel?: string;
   /** `danger` styles the confirm button for irreversible actions. */
   tone?: "default" | "danger";
   /** When set, the user must type this text before confirming. */
@@ -40,6 +42,7 @@ export function ConfirmDialog({
   title,
   description,
   confirmLabel,
+  cancelLabel = "Cancel",
   tone = "default",
   confirmationText,
   continueLabel,
@@ -108,7 +111,7 @@ export function ConfirmDialog({
         ) : null}
         <DialogFooter>
           <Button variant="outline" onClick={() => reset(false)} disabled={pending}>
-            Cancel
+            {cancelLabel}
           </Button>
           {reviewing ? (
             <Button variant={actionVariant} onClick={() => setContinued(true)} disabled={!ready}>

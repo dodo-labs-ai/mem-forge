@@ -31,6 +31,7 @@ from memforge.pipeline.projection_fragments import (
     FragmentSelectionErrorCode,
     ProjectionFragmentCatalog,
 )
+from memforge.pipeline.evidence_fragments import EvidenceFragmentKind
 from memforge.pipeline.projection_context import ExtractionAuthority
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext, reading_group_label
 from memforge.pipeline.unit_title import unit_title_block
@@ -41,9 +42,12 @@ __all__ = ["ExtractionReading", "MemoryExtractor"]
 
 # Requested extraction output: a response envelope plus, per authorized Primary
 # Fragment, room for its claims (at least one claim, else about half its text).
+# An image's content is not text the Fragment presents, so an image Fragment
+# has room for the claims of a page of about 8,000 characters.
 _FRAGMENT_OUTPUT_BASE_TOKENS = 512
 _FRAGMENT_OUTPUT_MIN_TOKENS = 768
 _FRAGMENT_OUTPUT_CHARS_PER_TOKEN = 2
+_ARTIFACT_FRAGMENT_OUTPUT_TOKENS = 4096
 
 
 PROJECTION_FRAGMENT_EXTRACTION_PROMPT = """You are extracting durable atomic knowledge from one authorized Source Unit catalog.
@@ -87,6 +91,13 @@ _SELECTION_CORRECTION_BLOCK = (
     "whose central assertion has no eligible Primary. Use only the refs supplied above.\n"
     "</correction>"
 )
+
+
+def _fragment_output_tokens(fragment) -> int:
+    """Room for the claims one Primary Fragment can hold."""
+    if fragment.kind is EvidenceFragmentKind.ARTIFACT:
+        return _ARTIFACT_FRAGMENT_OUTPUT_TOKENS
+    return max(_FRAGMENT_OUTPUT_MIN_TOKENS, len(fragment.presentation_text) // _FRAGMENT_OUTPUT_CHARS_PER_TOKEN)
 
 
 class ExtractionReading:
@@ -193,8 +204,7 @@ class MemoryExtractor:
     def fragment_output_tokens(self, catalog) -> int:
         """Request output for this request's authorized content, not a full document."""
         requested = _FRAGMENT_OUTPUT_BASE_TOKENS + sum(
-            max(_FRAGMENT_OUTPUT_MIN_TOKENS, len(fragment.presentation_text) // _FRAGMENT_OUTPUT_CHARS_PER_TOKEN)
-            for fragment in catalog.fragments if fragment.primary_eligible
+            _fragment_output_tokens(fragment) for fragment in catalog.fragments if fragment.primary_eligible
         )
         return min(self.max_tokens, requested)
 

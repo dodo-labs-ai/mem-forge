@@ -27,6 +27,16 @@ function authenticationProperty(model: ModelBinding): Property {
   };
 }
 
+/** Whether the generation model reads images, as its latest validation found; nothing before it asked. */
+function imageInputProperty(imageInput: boolean | null | undefined): Property | null {
+  if (imageInput === undefined) return null;
+  if (imageInput === true) return { label: "Image input", value: "Supported" };
+  if (imageInput === false) {
+    return { label: "Image input", value: "Not supported", hint: "Images in documents are not read." };
+  }
+  return { label: "Image input", value: "Unknown", hint: "Validation could not tell. Images are sent as usual." };
+}
+
 /** The settings and the observations of the latest validation, as labeled values. */
 function modelProperties(model: ModelBinding, providers: readonly ModelProvider[]): Property[] {
   const properties: Property[] = [
@@ -41,6 +51,8 @@ function modelProperties(model: ModelBinding, providers: readonly ModelProvider[
   const facts = model.validation?.passed ? validationFacts(model.validation) : {};
   if (facts.dimension !== undefined) properties.push({ label: "Vector size", value: facts.dimension });
   if (facts.latency_ms !== undefined) properties.push({ label: "Response time", value: `${facts.latency_ms} ms` });
+  const imageInput = imageInputProperty(facts.image_input);
+  if (imageInput) properties.push(imageInput);
   return properties;
 }
 

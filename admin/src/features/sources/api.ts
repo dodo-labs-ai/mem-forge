@@ -11,6 +11,7 @@ import type { LocalAgentJob } from "./model/types";
 export const sourceKeys = {
   all: ["sources"] as const,
   list: ["sources", "list"] as const,
+  imageDocuments: ["sources", "image-documents"] as const,
   preferences: ["sources", "preferences"] as const,
   types: ["genes"] as const,
 };
@@ -116,6 +117,72 @@ function useSourceMutation<TVariables>(run: (variables: TVariables) => Promise<u
       queryClient.invalidateQueries({ queryKey: localSyncKeys.jobs }),
     ]),
   });
+}
+
+/**
+ * Reads how many current documents have an image a model can read, in the
+ * sources the user can re-read. It is read when asked, not kept fresh.
+ */
+export function useFetchImageDocuments() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return () =>
+    queryClient.fetchQuery({
+      queryKey: sourceKeys.imageDocuments,
+      queryFn: () => unwrap(api.GET("/api/v1/sources/image-documents")),
+      staleTime: 0,
+    });
+}
+
+/** Queues a re-read of the documents with an image, one run per source. */
+export function useReReadImageDocuments() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => unwrap(api.POST("/api/v1/sources/image-documents/reprocess")),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: sourceKeys.all }),
+  });
+}
+
+/** What re-reading every document of a source would read, and the model calls it would take. */
+export function useReReadPreview(sourceId: string | null) {
+  const api = useApi();
+  return useQuery({
+    // Kept apart from the source keys, which every source write refreshes.
+    queryKey: ["source-re-read-preview", sourceId] as const,
+    queryFn: async () => {
+      const preview = await unwrap(
+        api.POST("/api/v1/sources/{source_id}/reprocess", {
+          params: { path: { source_id: sourceId! } },
+          body: { all_documents: true, dry_run: true },
+        }),
+      );
+      if (!("units" in preview)) throw new Error("The server queued a re-read instead of previewing it.");
+      return preview;
+    },
+    enabled: sourceId !== null,
+    staleTime: 0,
+    gcTime: 0,
+  });
+}
+
+/**
+ * Queues a re-read of a source with the current models: of the documents
+ * named, or, with none named, of every current document.
+ */
+export function useReReadSource() {
+  const api = useApi();
+  return useSourceMutation(({ sourceId, documentIds }: { sourceId: string; documentIds: string[] | null }) =>
+    unwrap(
+      api.POST("/api/v1/sources/{source_id}/reprocess", {
+        params: { path: { source_id: sourceId } },
+        body:
+          documentIds === null
+            ? { all_documents: true, dry_run: false }
+            : { document_ids: documentIds, all_documents: false, dry_run: false },
+      }),
+    ),
+  );
 }
 
 export function useSetPinned() {
