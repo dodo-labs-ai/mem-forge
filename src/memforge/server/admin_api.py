@@ -235,6 +235,7 @@ from memforge.server.memory_admin_service import (
 from memforge.server.source_admin_service import (
     can_manage_source,
     can_manage_workspace,
+    image_documents_by_source,
     list_source_admin_rows,
     normalize_workspace_role,
 )
@@ -2103,8 +2104,35 @@ class SourceSyncRequest(BaseModel):
 
 
 class SourceReprocessRequest(BaseModel):
-    document_ids: list[str] = Field(min_length=1)
+    document_ids: list[str] = Field(
+        default_factory=list,
+        description="The Documents to reprocess; leave it empty with all_documents.",
+    )
+    all_documents: bool = Field(
+        default=False,
+        description="Reprocess every current Document of the Source instead of document_ids.",
+    )
     dry_run: bool = False
+
+
+class ImageDocumentsResponse(BaseModel):
+    """The current Documents with an image a model can read, in the Sources the caller can reprocess."""
+
+    document_count: int
+    source_count: int
+
+
+class UnqueuedSource(BaseModel):
+    source_id: str
+    reason: str = Field(description="Why the Source's reprocess was not queued, such as a run already pending.")
+
+
+class ImageDocumentsReprocessResponse(BaseModel):
+    """The reprocess runs queued for the Documents with an image, one per Source."""
+
+    document_count: int = Field(description="The Documents whose reprocess was queued.")
+    source_count: int = Field(description="The Sources a reprocess run was queued for.")
+    unqueued: list[UnqueuedSource] = Field(default_factory=list)
 
 
 class LocalAgentJobCreateRequest(BaseModel):
@@ -6426,6 +6454,60 @@ def create_admin_app(
 
         return {"data": sources}
 
+    @source_router.get("/image-documents", response_model=ImageDocumentsResponse)
+    async def count_image_documents(
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Count the current Documents with an image a model can read, in the Sources the caller can reprocess."""
+        documents = await image_documents_by_source(
+            db,
+            viewer_id=resolve_request_principal(request),
+            viewer_role=resolve_request_workspace_role(request),
+        )
+        return ImageDocumentsResponse(
+            document_count=sum(len(ids) for ids in documents.values()),
+            source_count=len(documents),
+        )
+
+    @source_router.post("/image-documents/reprocess", status_code=202, response_model=ImageDocumentsReprocessResponse)
+    async def reprocess_image_documents(
+        request: Request,
+        db: Database = Depends(get_db),
+        sync_service: SyncService = Depends(get_sync_service),
+    ):
+        """Queue a reprocess of the Documents with an image, one run per Source.
+
+        It is what a model that newly reads images needs, since a sync reads only
+        Documents that changed. A Source whose run cannot be queued now, such as
+        one with a run already pending, is reported and left as it is.
+        """
+        documents = await image_documents_by_source(
+            db,
+            viewer_id=resolve_request_principal(request),
+            viewer_role=resolve_request_workspace_role(request),
+        )
+        queued_documents = 0
+        queued_sources = 0
+        unqueued: list[UnqueuedSource] = []
+        for source_id, document_ids in documents.items():
+            if await db.get_open_projection_scope_transition(source_id) is not None:
+                unqueued.append(UnqueuedSource(source_id=source_id, reason="projection_scope_transition_open"))
+                continue
+            try:
+                await sync_service.enqueue_reprocess(source_id, document_ids)
+            except SourcePausedError:
+                unqueued.append(UnqueuedSource(source_id=source_id, reason="source_paused"))
+                continue
+            except (SourceActivityConflict, SourceSyncBoundaryError, ValueError) as exc:
+                unqueued.append(UnqueuedSource(source_id=source_id, reason=str(exc)))
+                continue
+            queued_documents += len(document_ids)
+            queued_sources += 1
+        return ImageDocumentsReprocessResponse(
+            document_count=queued_documents, source_count=queued_sources, unqueued=unqueued,
+        )
+
     async def _searchable_source_rows(
         request: Request,
         db: Database,
@@ -8305,7 +8387,14 @@ def create_admin_app(
         _require_source_discoverability(request, source)
         _require_source_management(request, source)
         _require_source_sync_support(source)
-        document_ids = tuple(dict.fromkeys(document_id.strip() for document_id in req.document_ids if document_id.strip()))
+        if req.all_documents:
+            if req.document_ids:
+                raise HTTPException(status_code=400, detail="document_ids_with_all_documents")
+            document_ids = tuple(sorted(await db.list_indexed_doc_ids(source_id)))
+        else:
+            document_ids = tuple(
+                dict.fromkeys(document_id.strip() for document_id in req.document_ids if document_id.strip())
+            )
         if not document_ids:
             raise HTTPException(status_code=400, detail="document_ids_required")
         if await db.get_open_projection_scope_transition(source_id) is not None:

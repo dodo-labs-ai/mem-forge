@@ -639,6 +639,63 @@ async def test_the_reprocess_route_previews_then_queues_one_run(db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_the_reprocess_route_reads_every_current_document_when_asked_for_all(db, tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    harness = await synced(db)
+    app = create_admin_app(db=db, config=_admin_config(tmp_path), document_store=harness.store)
+    route = f"/api/v1/sources/{SOURCE_ID}/reprocess"
+    with TestClient(app) as client:
+        both = client.post(route, json={"document_ids": ["jira-PAY-1"], "all_documents": True})
+        preview = client.post(route, json={"all_documents": True, "dry_run": True})
+        queued = client.post(route, json={"all_documents": True})
+
+    every_document = tuple(sorted(doc_id(key) for key in ISSUES))
+    assert (both.status_code, both.json()["detail"]) == (400, "document_ids_with_all_documents")
+    assert tuple(sorted(unit["document_id"] for unit in preview.json()["units"])) == every_document
+    assert queued.status_code == 202
+    run = await db.get_source_sync_run(queued.json()["run_id"])
+    assert run.reprocess_document_ids == every_document
+
+
+@pytest.mark.asyncio
+async def test_the_image_documents_route_counts_then_queues_the_documents_with_an_image(db, tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    harness = await synced(db)
+    app = create_admin_app(db=db, config=_admin_config(tmp_path), document_store=harness.store)
+    with TestClient(app) as client:
+        counted = client.get("/api/v1/sources/image-documents")
+        queued = client.post("/api/v1/sources/image-documents/reprocess")
+        again = client.post("/api/v1/sources/image-documents/reprocess")
+
+    assert counted.json() == {"document_count": 1, "source_count": 1}
+    assert queued.status_code == 202
+    assert queued.json() == {"document_count": 1, "source_count": 1, "unqueued": []}
+    async with db.db.execute("SELECT run_id FROM source_sync_runs WHERE source_id = ?", (SOURCE_ID,)) as cursor:
+        [run_id] = [row[0] async for row in cursor]
+    run = await db.get_source_sync_run(run_id)
+    assert (run.trigger, run.reprocess_document_ids) == ("reprocess", (doc_id(ARTIFACT_ISSUE),))
+    # The run queued first is still pending, so the Source is reported and left as it is.
+    assert again.json()["document_count"] == 0
+    assert [item["source_id"] for item in again.json()["unqueued"]] == [SOURCE_ID]
+
+
+@pytest.mark.asyncio
+async def test_an_artifact_a_model_cannot_read_does_not_make_an_image_document(db, tmp_path):
+    harness = await synced(db)
+    await _rewrite_committed_artifact_metadata(
+        db, harness, lambda artifact: artifact.update(
+            inference_eligible=False, inference_ineligible_reason="unsupported_inference_media_type",
+        ),
+    )
+
+    from memforge.server.source_admin_service import image_documents_by_source
+
+    assert await image_documents_by_source(db, viewer_id="dev", viewer_role="owner") == {}
+
+
+@pytest.mark.asyncio
 async def test_the_reprocess_route_refuses_an_open_projection_scope_transition(db, tmp_path):
     from memforge.server.admin_api import create_admin_app
 
