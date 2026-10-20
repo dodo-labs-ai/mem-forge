@@ -2373,6 +2373,53 @@
         "title": "HealthResponse",
         "type": "object"
       },
+      "ImageDocumentsReprocessResponse": {
+        "description": "The reprocess runs queued for the Documents with an image, one per Source.",
+        "properties": {
+          "document_count": {
+            "description": "The Documents whose reprocess was queued.",
+            "title": "Document Count",
+            "type": "integer"
+          },
+          "source_count": {
+            "description": "The Sources a reprocess run was queued for.",
+            "title": "Source Count",
+            "type": "integer"
+          },
+          "unqueued": {
+            "items": {
+              "$ref": "#/components/schemas/UnqueuedSource"
+            },
+            "title": "Unqueued",
+            "type": "array"
+          }
+        },
+        "required": [
+          "document_count",
+          "source_count"
+        ],
+        "title": "ImageDocumentsReprocessResponse",
+        "type": "object"
+      },
+      "ImageDocumentsResponse": {
+        "description": "The current Documents with an image a model can read, in the Sources the caller can reprocess.",
+        "properties": {
+          "document_count": {
+            "title": "Document Count",
+            "type": "integer"
+          },
+          "source_count": {
+            "title": "Source Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "document_count",
+          "source_count"
+        ],
+        "title": "ImageDocumentsResponse",
+        "type": "object"
+      },
       "JiraSessionExpireRequest": {
         "properties": {
           "base_url": {
@@ -6674,6 +6721,18 @@
             "title": "Id",
             "type": "string"
           },
+          "image_input": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the listing declares that the generation model takes images as input; null when it declares nothing about it.",
+            "title": "Image Input"
+          },
           "label": {
             "anyOf": [
               {
@@ -6958,7 +7017,7 @@
           },
           "facts": {
             "additionalProperties": true,
-            "description": "What the check observed: latency_ms; for generation structured_output_mode ('native_schema' or 'json_text'), schema_fallback, token_limits_known and provider_model; for embedding dimension and provider_model. provider_model is present only when the provider reported one.",
+            "description": "What the check observed: latency_ms; for generation structured_output_mode ('native_schema' or 'json_text'), schema_fallback, token_limits_known, image_input (whether the model reads images; null when the check could not tell) and provider_model; for embedding dimension and provider_model. provider_model is present only when the provider reported one.",
             "title": "Facts",
             "type": "object"
           },
@@ -7822,6 +7881,183 @@
         "title": "RelationRestoreResponse",
         "type": "object"
       },
+      "ReprocessPreviewResponse": {
+        "description": "What a reprocess would read, answered to a dry run.",
+        "properties": {
+          "available_unit_count": {
+            "title": "Available Unit Count",
+            "type": "integer"
+          },
+          "estimated_model_calls": {
+            "title": "Estimated Model Calls",
+            "type": "integer"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "unavailable_unit_count": {
+            "title": "Unavailable Unit Count",
+            "type": "integer"
+          },
+          "units": {
+            "items": {
+              "$ref": "#/components/schemas/ReprocessUnitPreviewResponse"
+            },
+            "title": "Units",
+            "type": "array"
+          }
+        },
+        "required": [
+          "source_id",
+          "units",
+          "available_unit_count",
+          "unavailable_unit_count",
+          "estimated_model_calls"
+        ],
+        "title": "ReprocessPreviewResponse",
+        "type": "object"
+      },
+      "ReprocessUnitPreviewResponse": {
+        "description": "What reprocessing one Document would read; an unavailable one has only its reason.",
+        "properties": {
+          "active_memory_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Memory Count"
+          },
+          "artifact_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Artifact Count"
+          },
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "document_id": {
+            "title": "Document Id",
+            "type": "string"
+          },
+          "estimated_model_calls": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Model Calls"
+          },
+          "extraction_item_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extraction Item Count"
+          },
+          "reading_chars": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reading Chars"
+          },
+          "reading_group_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reading Group Count"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "source_unit_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Unit Id"
+          },
+          "support_reading_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Support Reading Count"
+          },
+          "unit_revision_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit Revision Id"
+          }
+        },
+        "required": [
+          "document_id",
+          "available"
+        ],
+        "title": "ReprocessUnitPreviewResponse",
+        "type": "object"
+      },
       "ResolvedProjectResponse": {
         "description": "Where memories from a source actually landed after the resolver ran.",
         "properties": {
@@ -8521,13 +8757,66 @@
         "title": "SourceProjectsResponse",
         "type": "object"
       },
-      "SourceReprocessRequest": {
+      "SourceReprocessQueuedResponse": {
+        "description": "The reprocess run queued for the Documents.",
         "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
           "document_ids": {
             "items": {
               "type": "string"
             },
-            "minItems": 1,
+            "title": "Document Ids",
+            "type": "array"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "message",
+          "source_id",
+          "run_id",
+          "status",
+          "created_at",
+          "document_ids"
+        ],
+        "title": "SourceReprocessQueuedResponse",
+        "type": "object"
+      },
+      "SourceReprocessRequest": {
+        "properties": {
+          "all_documents": {
+            "default": false,
+            "description": "Reprocess every current Document of the Source instead of document_ids.",
+            "title": "All Documents",
+            "type": "boolean"
+          },
+          "document_ids": {
+            "description": "The Documents to reprocess; leave it empty with all_documents.",
+            "items": {
+              "type": "string"
+            },
             "title": "Document Ids",
             "type": "array"
           },
@@ -8537,9 +8826,6 @@
             "type": "boolean"
           }
         },
-        "required": [
-          "document_ids"
-        ],
         "title": "SourceReprocessRequest",
         "type": "object"
       },
@@ -9485,6 +9771,25 @@
           "total_sources"
         ],
         "title": "StatsResponse",
+        "type": "object"
+      },
+      "UnqueuedSource": {
+        "properties": {
+          "reason": {
+            "description": "Why the Source's reprocess was not queued, such as a run already pending.",
+            "title": "Reason",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "reason"
+        ],
+        "title": "UnqueuedSource",
         "type": "object"
       },
       "UnrecognizedSessionLinesResponse": {
@@ -14345,6 +14650,50 @@
         ]
       }
     },
+    "/api/v1/sources/image-documents": {
+      "get": {
+        "description": "Count the current Documents with an image a model can read, in the Sources the caller can reprocess.",
+        "operationId": "count_image_documents_api_v1_sources_image_documents_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageDocumentsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Count Image Documents",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/api/v1/sources/image-documents/reprocess": {
+      "post": {
+        "description": "Queue a reprocess of the Documents with an image, one run per Source.\n\nIt is what a model that newly reads images needs, since a sync reads only\nDocuments that changed. A Source whose run cannot be queued now, such as\none with a run already pending, is reported and left as it is.",
+        "operationId": "reprocess_image_documents_api_v1_sources_image_documents_reprocess_post",
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageDocumentsReprocessResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Reprocess Image Documents",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
     "/api/v1/sources/searchable": {
       "get": {
         "description": "List search-eligible sources for MCP/source-id discovery.",
@@ -15637,13 +15986,25 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReprocessPreviewResponse"
+                }
+              }
+            },
+            "description": "The dry run's preview."
+          },
           "202": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourceReprocessQueuedResponse"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "The queued run."
           },
           "422": {
             "content": {

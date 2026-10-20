@@ -380,3 +380,48 @@ test("a sync after an upgrade shows that it retries the items an earlier version
   expect(notice).toHaveTextContent("MemForge was upgraded");
   expect(within(drawer).getAllByText("Retrying")).toHaveLength(2);
 });
+
+test("Re-read all documents says how many documents and model calls it takes, then queues the re-read", async () => {
+  const { calls } = renderPage([makeSource()], {
+    "POST /api/v1/sources/src-wiki/reprocess": async (request: Request) => {
+      const body = await request.clone().json();
+      return body.dry_run
+        ? {
+            source_id: "src-wiki",
+            units: [],
+            available_unit_count: 312,
+            unavailable_unit_count: 2,
+            estimated_model_calls: 940,
+          }
+        : {
+            ok: true,
+            message: "Reprocess enqueued",
+            source_id: "src-wiki",
+            run_id: "ssr-1",
+            status: "pending",
+            created_at: "2026-10-20T09:00:00Z",
+            document_ids: [],
+          };
+    },
+  });
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await userEvent.click(await within(table).findByRole("button", { name: "More actions for Payroll wiki" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: /Re-read all documents/ }));
+
+  const dialog = await screen.findByRole("dialog", { name: "Re-read all 312 documents?" });
+  expect(dialog).toHaveTextContent("Every document in Payroll wiki is processed again with the current models.");
+  expect(dialog).toHaveTextContent("about 940 model calls");
+  expect(dialog).toHaveTextContent("2 documents can't be re-read from what was stored");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Re-read documents" }));
+
+  await vi.waitFor(() => expect(toast.success).toHaveBeenCalledWith("Re-reading 312 documents in Payroll wiki"));
+  const bodies = await Promise.all(
+    calls
+      .filter((request) => request.method === "POST" && new URL(request.url).pathname.endsWith("/reprocess"))
+      .map((request) => request.clone().json()),
+  );
+  expect(bodies).toEqual([
+    { all_documents: true, dry_run: true },
+    { all_documents: true, dry_run: false },
+  ]);
+});

@@ -580,17 +580,38 @@ def test_sources_reprocess_cli_names_documents_on_the_active_api_target(monkeypa
                 "api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
                 "source_id": "src-1",
                 "document_ids": ["jira-PAY-1", "jira-PAY-2"],
+                "all_documents": False,
                 "dry_run": dry_run,
             },
         )
     ]
 
 
-def test_sources_reprocess_cli_requires_a_document():
-    result = CliRunner().invoke(cli, ["sources", "reprocess", "src-1"])
+def test_sources_reprocess_cli_takes_every_document_with_all(monkeypatch):
+    FakeToolClient.reset({"ok": True})
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient, raising=False)
+
+    result = CliRunner().invoke(
+        cli,
+        ["sources", "reprocess", "src-1", "--all"],
+        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "MEMFORGE_API_TOKEN": "t"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert FakeToolClient.calls[0][1]["document_ids"] == []
+    assert FakeToolClient.calls[0][1]["all_documents"] is True
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [[], ["--all", "--document", "jira-PAY-1"]],
+    ids=["neither", "both"],
+)
+def test_sources_reprocess_cli_takes_documents_or_all(arguments):
+    result = CliRunner().invoke(cli, ["sources", "reprocess", "src-1", *arguments])
 
     assert result.exit_code != 0
-    assert "--document" in result.output
+    assert "--document" in result.output and "--all" in result.output
 
 
 def test_target_profile_sets_default_api_url(monkeypatch, tmp_path: Path):

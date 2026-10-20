@@ -2429,22 +2429,33 @@ def sources_schedule_show(ctx, source_id: str, workspace_id: str | None):
     "--document",
     "document_ids",
     multiple=True,
-    required=True,
     help="Document to reprocess at its current revision (repeatable).",
 )
+@click.option("--all", "all_documents", is_flag=True, help="Reprocess every current Document of the source.")
 @click.option("--dry-run", is_flag=True, help="Report what would be read and the model calls, without writing.")
 @_workspace_id_option
 @click.pass_context
-def sources_reprocess(ctx, source_id: str, document_ids: tuple[str, ...], dry_run: bool, workspace_id: str | None):
+def sources_reprocess(
+    ctx,
+    source_id: str,
+    document_ids: tuple[str, ...],
+    all_documents: bool,
+    dry_run: bool,
+    workspace_id: str | None,
+):
     """Reprocess Documents of one source with the current adapter and compiler.
 
+    Name the Documents with --document, or take every current one with --all.
     Reads each Document's current state from the provider when the source can
     ask for one Document by id, and its stored input otherwise: every
     ReadingGroup is extracted and every Support is read over the whole Unit.
     """
+    if bool(document_ids) == all_documents:
+        raise click.UsageError("Name the Documents with --document, or pass --all.")
     payload = _tool_client(ctx, workspace_id).reprocess_source_documents(
         source_id=source_id,
         document_ids=list(document_ids),
+        all_documents=all_documents,
         dry_run=dry_run,
     )
     _emit_tool_payload(ctx, payload)

@@ -1775,6 +1775,50 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sources/image-documents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Count Image Documents
+         * @description Count the current Documents with an image a model can read, in the Sources the caller can reprocess.
+         */
+        get: operations["count_image_documents_api_v1_sources_image_documents_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/image-documents/reprocess": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reprocess Image Documents
+         * @description Queue a reprocess of the Documents with an image, one run per Source.
+         *
+         *     It is what a model that newly reads images needs, since a sync reads only
+         *     Documents that changed. A Source whose run cannot be queued now, such as
+         *     one with a run already pending, is reported and left as it is.
+         */
+        post: operations["reprocess_image_documents_api_v1_sources_image_documents_reprocess_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sources/searchable": {
         parameters: {
             query?: never;
@@ -3308,6 +3352,34 @@ export interface components {
             status: string;
             vector_store: components["schemas"]["ComponentHealth"];
         };
+        /**
+         * ImageDocumentsReprocessResponse
+         * @description The reprocess runs queued for the Documents with an image, one per Source.
+         */
+        ImageDocumentsReprocessResponse: {
+            /**
+             * Document Count
+             * @description The Documents whose reprocess was queued.
+             */
+            document_count: number;
+            /**
+             * Source Count
+             * @description The Sources a reprocess run was queued for.
+             */
+            source_count: number;
+            /** Unqueued */
+            unqueued?: components["schemas"]["UnqueuedSource"][];
+        };
+        /**
+         * ImageDocumentsResponse
+         * @description The current Documents with an image a model can read, in the Sources the caller can reprocess.
+         */
+        ImageDocumentsResponse: {
+            /** Document Count */
+            document_count: number;
+            /** Source Count */
+            source_count: number;
+        };
         /** JiraSessionExpireRequest */
         JiraSessionExpireRequest: {
             /** Base Url */
@@ -4796,6 +4868,11 @@ export interface components {
             context_window_tokens?: number | null;
             /** Id */
             id: string;
+            /**
+             * Image Input
+             * @description Whether the listing declares that the generation model takes images as input; null when it declares nothing about it.
+             */
+            image_input?: boolean | null;
             /** Label */
             label?: string | null;
             /**
@@ -4921,7 +4998,7 @@ export interface components {
             error_code?: string | null;
             /**
              * Facts
-             * @description What the check observed: latency_ms; for generation structured_output_mode ('native_schema' or 'json_text'), schema_fallback, token_limits_known and provider_model; for embedding dimension and provider_model. provider_model is present only when the provider reported one.
+             * @description What the check observed: latency_ms; for generation structured_output_mode ('native_schema' or 'json_text'), schema_fallback, token_limits_known, image_input (whether the model reads images; null when the check could not tell) and provider_model; for embedding dimension and provider_model. provider_model is present only when the provider reported one.
              */
             facts?: {
                 [key: string]: unknown;
@@ -5252,6 +5329,54 @@ export interface components {
             restored_dismissal_ids: string[];
         };
         /**
+         * ReprocessPreviewResponse
+         * @description What a reprocess would read, answered to a dry run.
+         */
+        ReprocessPreviewResponse: {
+            /** Available Unit Count */
+            available_unit_count: number;
+            /** Estimated Model Calls */
+            estimated_model_calls: number;
+            /** Source Id */
+            source_id: string;
+            /** Unavailable Unit Count */
+            unavailable_unit_count: number;
+            /** Units */
+            units: components["schemas"]["ReprocessUnitPreviewResponse"][];
+        };
+        /**
+         * ReprocessUnitPreviewResponse
+         * @description What reprocessing one Document would read; an unavailable one has only its reason.
+         */
+        ReprocessUnitPreviewResponse: {
+            /** Active Memory Count */
+            active_memory_count?: number | null;
+            /** Artifact Count */
+            artifact_count?: number | null;
+            /** Available */
+            available: boolean;
+            /** Detail */
+            detail?: string | null;
+            /** Document Id */
+            document_id: string;
+            /** Estimated Model Calls */
+            estimated_model_calls?: number | null;
+            /** Extraction Item Count */
+            extraction_item_count?: number | null;
+            /** Reading Chars */
+            reading_chars?: number | null;
+            /** Reading Group Count */
+            reading_group_count?: number | null;
+            /** Reason */
+            reason?: string | null;
+            /** Source Unit Id */
+            source_unit_id?: string | null;
+            /** Support Reading Count */
+            support_reading_count?: number | null;
+            /** Unit Revision Id */
+            unit_revision_id?: string | null;
+        };
+        /**
          * ResolvedProjectResponse
          * @description Where memories from a source actually landed after the resolver ran.
          */
@@ -5517,10 +5642,39 @@ export interface components {
             /** Source Id */
             source_id: string;
         };
-        /** SourceReprocessRequest */
-        SourceReprocessRequest: {
+        /**
+         * SourceReprocessQueuedResponse
+         * @description The reprocess run queued for the Documents.
+         */
+        SourceReprocessQueuedResponse: {
+            /** Created At */
+            created_at: string;
             /** Document Ids */
             document_ids: string[];
+            /** Message */
+            message: string;
+            /** Ok */
+            ok: boolean;
+            /** Run Id */
+            run_id: string;
+            /** Source Id */
+            source_id: string;
+            /** Status */
+            status: string;
+        };
+        /** SourceReprocessRequest */
+        SourceReprocessRequest: {
+            /**
+             * All Documents
+             * @description Reprocess every current Document of the Source instead of document_ids.
+             * @default false
+             */
+            all_documents: boolean;
+            /**
+             * Document Ids
+             * @description The Documents to reprocess; leave it empty with all_documents.
+             */
+            document_ids?: string[];
             /**
              * Dry Run
              * @default false
@@ -5825,6 +5979,16 @@ export interface components {
             total_memories: number;
             /** Total Sources */
             total_sources: number;
+        };
+        /** UnqueuedSource */
+        UnqueuedSource: {
+            /**
+             * Reason
+             * @description Why the Source's reprocess was not queued, such as a run already pending.
+             */
+            reason: string;
+            /** Source Id */
+            source_id: string;
         };
         /**
          * UnrecognizedSessionLinesResponse
@@ -9011,6 +9175,46 @@ export interface operations {
             };
         };
     };
+    count_image_documents_api_v1_sources_image_documents_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImageDocumentsResponse"];
+                };
+            };
+        };
+    };
+    reprocess_image_documents_api_v1_sources_image_documents_reprocess_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImageDocumentsReprocessResponse"];
+                };
+            };
+        };
+    };
     list_searchable_sources_api_v1_sources_searchable_get: {
         parameters: {
             query?: never;
@@ -9783,13 +9987,22 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Successful Response */
+            /** @description The dry run's preview. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReprocessPreviewResponse"];
+                };
+            };
+            /** @description The queued run. */
             202: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceReprocessQueuedResponse"];
                 };
             };
             /** @description Validation Error */
