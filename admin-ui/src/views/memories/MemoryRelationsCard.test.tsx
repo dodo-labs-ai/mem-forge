@@ -45,7 +45,6 @@ function memoryFixture(overrides: Partial<Memory> = {}): Memory {
     valid_until: null,
     created_at: "2026-08-08T09:00:00+00:00",
     updated_at: "2026-08-08T09:00:00+00:00",
-    extraction_context: null,
     entity_refs: [],
     evidence: [],
     origin_source_type: null,

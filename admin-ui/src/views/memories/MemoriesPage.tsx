@@ -138,7 +138,6 @@ function searchHitToMemoryRow(hit: SearchHit): Memory {
     valid_until: null,
     created_at: hit.last_observed_at ?? new Date().toISOString(),
     updated_at: hit.last_observed_at ?? new Date().toISOString(),
-    extraction_context: null,
     entity_refs: [],
     evidence: [],
     origin_source_type: null,

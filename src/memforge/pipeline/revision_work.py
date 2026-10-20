@@ -668,7 +668,6 @@ def _revalidated_memory(memory: Memory, selection, support_validation: dict) -> 
         valid_from=memory.valid_from.isoformat() if memory.valid_from else None,
         valid_until=memory.valid_until.isoformat() if memory.valid_until else None,
         evidence_quote=primary.excerpt,
-        extraction_context=primary.excerpt or "",
         evidence_anchor="revalidated_noop",
         source_observation_id=primary.anchor.observation_id,
         required_source_observation_ids=list(
