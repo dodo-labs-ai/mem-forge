@@ -448,6 +448,9 @@ class RelationalStore(Protocol):
         self,
         source_id: str,
     ) -> dict[str, tuple[str, ...]]: ...
+    async def list_current_document_artifacts(self, source_id: str) -> tuple[tuple[str, dict[str, Any]], ...]:
+        """The current binary Artifacts of the Source's current Documents, as (document id, metadata)."""
+        ...
     async def list_current_source_units(
         self,
         source_id: str,

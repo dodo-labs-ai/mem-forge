@@ -99,6 +99,7 @@ export function validationFacts(validation: ModelValidation): ModelValidationFac
   if (isNumber(raw.dimension)) facts.dimension = raw.dimension;
   if (typeof raw.schema_fallback === "boolean") facts.schema_fallback = raw.schema_fallback;
   if (typeof raw.token_limits_known === "boolean") facts.token_limits_known = raw.token_limits_known;
+  if (typeof raw.image_input === "boolean" || raw.image_input === null) facts.image_input = raw.image_input;
   if (typeof raw.provider_model === "string" && raw.provider_model !== "") facts.provider_model = raw.provider_model;
   return facts;
 }

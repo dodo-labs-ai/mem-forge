@@ -226,16 +226,19 @@ async def load_stored_source_document(
     if unit_input is None or not _owns_stored_raw(document_store, unit_input):
         raise unavailable(StoredDocumentUnavailableReason.RAW_CONTENT_MISSING)
     body = document_store.read_artifact(str(unit_input.raw_content_uri))
-    if not body.strip():
-        raise unavailable(StoredDocumentUnavailableReason.CONTENT_EMPTY)
     artifacts = _committed_artifacts(committed, unavailable)
+    item = replace(unit_input.item, labels=list(unit_input.item.labels), extra=dict(unit_input.item.extra))
+    raw = gene.raw_from_stored_input(item, body, unit_input.raw_content_type)
+    # A Document whose content is its Artifacts, such as an image file, has no
+    # text body, and its Gene attests that from what was stored, as its fetch did.
+    if not body.strip() and not (artifacts and raw.authoritative_empty):
+        raise unavailable(StoredDocumentUnavailableReason.CONTENT_EMPTY)
     if not all(_stored(document_store, artifact.uri, artifact.media_type) for artifact in artifacts):
         raise unavailable(StoredDocumentUnavailableReason.ARTIFACT_MISSING)
-    item = replace(unit_input.item, labels=list(unit_input.item.labels), extra=dict(unit_input.item.extra))
     return StoredSourceDocument(
         unit_input=unit_input,
         item=item,
-        raw=gene.raw_from_stored_input(item, body, unit_input.raw_content_type),
+        raw=raw,
         artifacts=artifacts,
         committed=committed,
     )

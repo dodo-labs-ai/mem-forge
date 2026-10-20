@@ -3,6 +3,7 @@ import { Check, CircleCheck, ListRestart, Loader2, RefreshCw, Undo2 } from "luci
 import { useEffect, useId, useMemo, useState, type ChangeEvent } from "react";
 import { FormProvider, useForm, useWatch } from "react-hook-form";
 import { isReindexInProgress } from "@/api";
+import { useFetchImageDocuments } from "@/features/sources";
 import { errorMessage } from "@/lib/errors";
 import { ErrorNotice, Notice } from "@/patterns";
 import { Button } from "@/ui/button";
@@ -35,7 +36,7 @@ import {
   type ListedLimits,
   type ModelFormValues,
 } from "./model/modelForm";
-import { awaitsTokenLimits, needsTokenLimits } from "./model/modelStatus";
+import { awaitsTokenLimits, needsTokenLimits, validationFacts } from "./model/modelStatus";
 import {
   AUTH_HINTS,
   AUTH_LABELS,
@@ -54,6 +55,7 @@ import { rebuildLabel, startRefusalReason } from "./model/searchIndex";
 import type { AuthStrategy, ModelKind, ModelKindSettings, ModelOption, ModelProvider, VectorIndex } from "./model/types";
 import { ModelSuggestions } from "./ModelSuggestions";
 import { PendingEditNotice } from "./PendingEditNotice";
+import { ReReadImagesDialog } from "./ReReadImagesDialog";
 import { TokenLimitFields } from "./TokenLimitFields";
 
 const INPUT_CLASS = "font-mono read-only:bg-surface-subtle";
@@ -86,6 +88,13 @@ interface ModelFormProps {
  * search index, which puts the model to use when it ends. While a rebuild
  * runs the embedding model cannot be changed.
  */
+/** Whether a model reads images, as a passed validation of it as it stands observed; undefined when none did. */
+function observedImageInput(binding: ModelKindSettings["active"]): boolean | null | undefined {
+  const validation = binding?.validation;
+  if (!validation?.passed || !validation.current) return undefined;
+  return validationFacts(validation).image_input;
+}
+
 export function ModelForm({ kind, title, settings, providers, vectorIndex, onUnsavedChange }: ModelFormProps) {
   const { active, candidate } = settings;
   const stored = candidate ?? active;
@@ -132,6 +141,9 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
   const discard = useDiscardCandidate(kind);
   const discovery = useDiscoverModels(kind);
   const rebuild = useStartReindex();
+  const fetchImageDocuments = useFetchImageDocuments();
+  /** The documents with an image, while the offer to re-read them is open. */
+  const [reReadCount, setReReadCount] = useState<number | null>(null);
   const rebuilding = vectorIndex?.status === "reindexing";
   const busy = save.isPending || validate.isPending || discard.isPending || rebuild.isPending;
   const locked = busy || rebuilding;
@@ -166,7 +178,27 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
   }
 
   function validateSaved() {
-    validate.mutate(undefined, { onSuccess: (result) => showStored(result.settings) });
+    const readTextOnly = kind === "generation" && observedImageInput(active) === false;
+    validate.mutate(undefined, {
+      onSuccess: (result) => {
+        showStored(result.settings);
+        if (readTextOnly && result.promoted && observedImageInput(result.settings.active) === true) offerReRead();
+      },
+    });
+  }
+
+  /**
+   * Offers to re-read the documents with an image, which a model that read
+   * text only read without their images. When they cannot be counted the
+   * offer is left out; each source's menu still re-reads its documents.
+   */
+  function offerReRead() {
+    fetchImageDocuments().then(
+      ({ document_count: count }) => {
+        if (count > 0) setReReadCount(count);
+      },
+      () => undefined,
+    );
   }
 
   const submit = form.handleSubmit((submitted) => {
@@ -336,6 +368,9 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
           ? "Rebuilding…"
           : (rebuildAction ?? "Save and validate");
 
+  const listedImageInput =
+    kind === "generation" ? (outcome?.models.find((option) => option.id === model.trim())?.image_input ?? null) : null;
+
   return (
     <FormProvider {...form}>
       <form onSubmit={submit} noValidate aria-label={`${title} settings`} className="space-y-4">
@@ -502,6 +537,12 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
                   onSelect={chooseModel}
                 />
               ) : null}
+              {listedImageInput !== null && provider ? (
+                <p className="text-xs text-muted-foreground">
+                  Image input: {listedImageInput ? "supported" : "not supported"}, according to {provider.label}'s model
+                  list.
+                </p>
+              ) : null}
 
               {parameterNames(provider, kind).map((name) => {
                 const copy = parameterField(name);
@@ -592,6 +633,12 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
           </p>
         </div>
       </form>
+      <ReReadImagesDialog
+        documentCount={reReadCount}
+        onOpenChange={(open) => {
+          if (!open) setReReadCount(null);
+        }}
+      />
     </FormProvider>
   );
 }

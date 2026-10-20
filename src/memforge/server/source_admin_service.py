@@ -19,6 +19,7 @@ from memforge.source_access import (
     source_owner_user_id,
 )
 from memforge.release import current_release
+from memforge.source_artifacts import source_artifact_inference_eligibility
 from memforge.source_item_failures import SourceItemFailure
 from memforge.sync_progress import source_progress_unit, source_sync_progress_from_pipeline
 from memforge.storage.admin_source import SourceAdminReader
@@ -31,6 +32,33 @@ LOCAL_WORKSPACE_ROLE = SELF_HOSTED_OWNER_ROLE
 MANAGED_SOURCE_TYPES = frozenset({"agent_session"})
 # The failed Documents a Source row lists; its count covers every one.
 MAX_LISTED_FAILED_ITEMS = 100
+
+
+async def image_documents_by_source(db: Any, *, viewer_id: str, viewer_role: str) -> dict[str, tuple[str, ...]]:
+    """The current Documents with an image a model can read, of each Source the viewer can reprocess.
+
+    A Source counts when the viewer manages it and it is active and syncs, as
+    a reprocess requires. A Document counts when one of its current Artifacts
+    is eligible for inference, which only an image of a supported format and
+    size is.
+    """
+    documents: dict[str, tuple[str, ...]] = {}
+    for source in await db.list_sources():
+        if source.get("status") != "active" or not source_type_supports_sync(str(source.get("type") or "")):
+            continue
+        if not can_manage_source(source, viewer_id=viewer_id, viewer_role=viewer_role):
+            continue
+        rows = await db.list_current_document_artifacts(str(source["id"]))
+        document_ids = tuple(
+            dict.fromkeys(
+                document_id
+                for document_id, metadata in rows
+                if source_artifact_inference_eligibility(metadata) is True
+            )
+        )
+        if document_ids:
+            documents[str(source["id"])] = document_ids
+    return documents
 
 
 def normalize_workspace_role(role: str | None) -> str:

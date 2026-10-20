@@ -191,6 +191,7 @@ from memforge.runtime import (
     DefaultRuntimeProvider,
     RuntimeHealthComponent,
     RuntimeProvider,
+    SourceNotActiveError,
     SourceSyncBoundaryError,
     SourceSyncWorker,
     SourceSyncUnsupportedError,
@@ -235,6 +236,7 @@ from memforge.server.memory_admin_service import (
 from memforge.server.source_admin_service import (
     can_manage_source,
     can_manage_workspace,
+    image_documents_by_source,
     list_source_admin_rows,
     normalize_workspace_role,
 )
@@ -2103,8 +2105,88 @@ class SourceSyncRequest(BaseModel):
 
 
 class SourceReprocessRequest(BaseModel):
-    document_ids: list[str] = Field(min_length=1)
+    document_ids: list[str] = Field(
+        default_factory=list,
+        description="The Documents to reprocess; leave it empty with all_documents.",
+    )
+    all_documents: bool = Field(
+        default=False,
+        description="Reprocess every current Document of the Source instead of document_ids.",
+    )
     dry_run: bool = False
+
+
+class ReprocessUnitPreviewResponse(BaseModel):
+    """What reprocessing one Document would read; an unavailable one has only its reason."""
+
+    document_id: str
+    available: bool
+    reason: str | None = None
+    detail: str | None = None
+    source_unit_id: str | None = None
+    unit_revision_id: str | None = None
+    artifact_count: int | None = None
+    active_memory_count: int | None = None
+    support_reading_count: int | None = None
+    reading_group_count: int | None = None
+    extraction_item_count: int | None = None
+    reading_chars: int | None = None
+    estimated_model_calls: int | None = None
+
+
+class ReprocessPreviewResponse(BaseModel):
+    """What a reprocess would read, answered to a dry run."""
+
+    source_id: str
+    units: list[ReprocessUnitPreviewResponse]
+    available_unit_count: int
+    unavailable_unit_count: int
+    estimated_model_calls: int
+
+
+class SourceReprocessQueuedResponse(BaseModel):
+    """The reprocess run queued for the Documents."""
+
+    ok: bool
+    message: str
+    source_id: str
+    run_id: str
+    status: str
+    created_at: str
+    document_ids: list[str]
+
+
+class ImageDocumentsResponse(BaseModel):
+    """The current Documents with an image a model can read, in the Sources the caller can reprocess."""
+
+    document_count: int
+    source_count: int
+
+
+class UnqueuedSource(BaseModel):
+    source_id: str
+    reason: Literal[
+        "source_busy",
+        "source_paused",
+        "source_not_active",
+        "source_not_synced",
+        "source_missing",
+        "projection_scope_transition_open",
+    ] = Field(
+        description=(
+            "Why the Source's reprocess was not queued: another run is pending or running, the "
+            "Source is paused or no longer active, it has not completed a sync, it was deleted "
+            "meanwhile, or its projection scope is changing."
+        ),
+    )
+
+
+class ImageDocumentsReprocessResponse(BaseModel):
+    """The reprocess runs queued for the Documents with an image, one per Source."""
+
+    document_count: int = Field(description="The Documents whose reprocess was queued.")
+    source_count: int = Field(description="The Sources a reprocess run was queued for.")
+    unqueued: list[UnqueuedSource] = Field(default_factory=list)
 
 
 class LocalAgentJobCreateRequest(BaseModel):
@@ -6426,6 +6508,71 @@ def create_admin_app(
 
         return {"data": sources}
 
+    @source_router.get("/image-documents", response_model=ImageDocumentsResponse)
+    async def count_image_documents(
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Count the current Documents with an image a model can read, in the Sources the caller can reprocess."""
+        documents = await image_documents_by_source(
+            db,
+            viewer_id=resolve_request_principal(request),
+            viewer_role=resolve_request_workspace_role(request),
+        )
+        return ImageDocumentsResponse(
+            document_count=sum(len(ids) for ids in documents.values()),
+            source_count=len(documents),
+        )
+
+    @source_router.post("/image-documents/reprocess", status_code=202, response_model=ImageDocumentsReprocessResponse)
+    async def reprocess_image_documents(
+        request: Request,
+        db: Database = Depends(get_db),
+        sync_service: SyncService = Depends(get_sync_service),
+    ):
+        """Queue a reprocess of the Documents with an image, one run per Source.
+
+        It is what a model that newly reads images needs, since a sync reads only
+        Documents that changed. A Source whose run cannot be queued now, such as
+        one with a run already pending, is reported and left as it is. A queued
+        Document that cannot be reprocessed from what was stored is recorded as
+        a failed item of its run.
+        """
+        documents = await image_documents_by_source(
+            db,
+            viewer_id=resolve_request_principal(request),
+            viewer_role=resolve_request_workspace_role(request),
+        )
+        queued_documents = 0
+        queued_sources = 0
+        unqueued: list[UnqueuedSource] = []
+        for source_id, document_ids in documents.items():
+            if await db.get_open_projection_scope_transition(source_id) is not None:
+                unqueued.append(UnqueuedSource(source_id=source_id, reason="projection_scope_transition_open"))
+                continue
+            try:
+                await sync_service.enqueue_reprocess(source_id, document_ids)
+            except SourcePausedError:
+                unqueued.append(UnqueuedSource(source_id=source_id, reason="source_paused"))
+                continue
+            except SourceNotActiveError:
+                unqueued.append(UnqueuedSource(source_id=source_id, reason="source_not_active"))
+                continue
+            except SourceActivityConflict:
+                unqueued.append(UnqueuedSource(source_id=source_id, reason="source_busy"))
+                continue
+            except SourceSyncBoundaryError:
+                unqueued.append(UnqueuedSource(source_id=source_id, reason="source_not_synced"))
+                continue
+            except ValueError:
+                unqueued.append(UnqueuedSource(source_id=source_id, reason="source_missing"))
+                continue
+            queued_documents += len(document_ids)
+            queued_sources += 1
+        return ImageDocumentsReprocessResponse(
+            document_count=queued_documents, source_count=queued_sources, unqueued=unqueued,
+        )
+
     async def _searchable_source_rows(
         request: Request,
         db: Database,
@@ -8281,7 +8428,14 @@ def create_admin_app(
             "coalesced": run.coalesced,
         }
 
-    @source_router.post("/{source_id}/reprocess", status_code=202)
+    @source_router.post(
+        "/{source_id}/reprocess",
+        status_code=202,
+        responses={
+            200: {"model": ReprocessPreviewResponse, "description": "The dry run's preview."},
+            202: {"model": SourceReprocessQueuedResponse, "description": "The queued run."},
+        },
+    )
     async def reprocess_source_documents(
         request: Request,
         source_id: str,
@@ -8295,9 +8449,11 @@ def create_admin_app(
 
         A Source that can ask its provider for one Document by id reads each
         Document's current state from the provider; any other Source reads the
-        stored input, so it needs no local daemon. ``dry_run`` reports what the
-        run would read and an estimate of its model calls without writing or
-        contacting the provider.
+        stored input, so it needs no local daemon. ``all_documents`` takes every
+        current Document of the Source. ``dry_run`` reports what the run would
+        read and an estimate of its model calls without writing or contacting
+        the provider. A queued Document the run cannot reprocess is recorded as
+        a failed item of the run.
         """
         source = await db.get_source(source_id)
         if not source:
@@ -8305,9 +8461,18 @@ def create_admin_app(
         _require_source_discoverability(request, source)
         _require_source_management(request, source)
         _require_source_sync_support(source)
-        document_ids = tuple(dict.fromkeys(document_id.strip() for document_id in req.document_ids if document_id.strip()))
-        if not document_ids:
-            raise HTTPException(status_code=400, detail="document_ids_required")
+        if req.all_documents:
+            if req.document_ids:
+                raise HTTPException(status_code=400, detail="document_ids_with_all_documents")
+            document_ids = tuple(sorted(await db.list_indexed_doc_ids(source_id)))
+            if not document_ids:
+                raise HTTPException(status_code=409, detail="source_has_no_documents")
+        else:
+            document_ids = tuple(
+                dict.fromkeys(document_id.strip() for document_id in req.document_ids if document_id.strip())
+            )
+            if not document_ids:
+                raise HTTPException(status_code=400, detail="document_ids_required")
         if await db.get_open_projection_scope_transition(source_id) is not None:
             raise HTTPException(status_code=409, detail="projection_scope_transition_open")
         if req.dry_run:

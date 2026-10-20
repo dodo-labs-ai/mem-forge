@@ -42,6 +42,8 @@ export interface ModelValidationFacts {
   schema_fallback?: boolean;
   /** Generation: false when the server has no token limits for the model. */
   token_limits_known?: boolean;
+  /** Generation: whether the model reads images; null when validation could not tell. */
+  image_input?: boolean | null;
   /** Embedding: the length of the vectors the model returned. */
   dimension?: number;
   /** The model name the provider reported, when it reported one. */
