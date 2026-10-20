@@ -268,11 +268,20 @@ common for local models, validation stops with the code
 **context window** and the **maximum output**, in tokens, with the generation
 model, and validate again. Take the numbers from the model card or from your
 model server; a context window of 32768 and a maximum output of 4096 are
-typical for a local model. When the model field names a model from **Load
-models**, picked from the list or typed, and the provider's list gives its
-limits, as OpenRouter's and Anthropic's do, Settings fills the empty limit
-fields with them and says they came from that list; you can still change
-them. For a provider whose list can give the limits, the token limits step
+typical for a local model. Ollama runs every request in the context window
+the request asks for, so for Ollama this step appears for every model, and MemForge
+asks for the window you enter: set it no larger than the model supports and
+your machine can hold. A larger window takes more memory; while a request
+runs, `ollama ps` shows the window under CONTEXT and, under PROCESSOR, whether
+the model still fits on the GPU. For an OpenAI-compatible server such as vLLM or
+llama.cpp, the window is the one the server was started with; enter that
+number. A quarter of the window is kept for the answer, so a window of 8192
+leaves a request about 3,900 tokens of input; a window of 16384 or more suits
+most documents. When the
+model field names a model from **Load models**, picked from the list or typed,
+and the provider's list gives its limits, as OpenRouter's and Anthropic's do,
+Settings fills the empty limit fields with them and says they came from that
+list; you can still change them. For a provider whose list can give the limits, the token limits step
 also offers **Fill from the model list**, which loads the list and fills in
 the limits of the model.
 
@@ -284,6 +293,12 @@ MEMFORGE_LLM_MAX_INPUT_TOKENS=32768
 MEMFORGE_LLM_CONTEXT_WINDOW_TOKENS=32768
 MEMFORGE_LLM_MAX_OUTPUT_TOKENS=4096
 ```
+
+Every request asks for the most the model can write, up to a quarter of the
+context window. A provider bills only what the model writes, but some, such as
+AWS Bedrock and Azure OpenAI, count the requested output against your rate
+quota while a request runs. If requests hit that quota, a lower maximum output
+lets more of them run at once.
 
 ### Models that read text only
 

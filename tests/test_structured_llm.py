@@ -54,7 +54,7 @@ class SupportVerdictResponse(StructuredResponseModel):
 
 
 async def validate_support_verdict(client: LiteLlmStructuredClient) -> SupportVerdictResponse:
-    return await client.evaluate_revision_work("prompt", response_format=SupportVerdictResponse, max_tokens=512)
+    return await client.evaluate_revision_work("prompt", response_format=SupportVerdictResponse)
 
 def _png_bytes(*, width: int = 1, height: int = 1) -> bytes:
     output = BytesIO()
@@ -128,7 +128,7 @@ async def test_structured_llm_admission_is_shared_across_client_instances(
         max_concurrent=2,
     )
     clients = (LiteLlmStructuredClient(config), LiteLlmStructuredClient(config))
-    tasks = [asyncio.create_task(clients[index % 2].admit_candidates(f"prompt-{index}", max_tokens=512)) for index in range(6)]
+    tasks = [asyncio.create_task(clients[index % 2].admit_candidates(f"prompt-{index}")) for index in range(6)]
 
     await asyncio.wait_for(two_admitted.wait(), timeout=0.5)
     await asyncio.sleep(0)
@@ -232,7 +232,7 @@ async def test_structured_llm_metrics_scope_isolates_concurrent_source_units(
 
     async def extract(prompt: str, collector: StructuredLlmMetricsCollector):
         with client.metrics_scope(collector):
-            await client.extract_projection_fragment_memories(prompt, max_tokens=1024)
+            await client.extract_projection_fragment_memories(prompt)
 
     await asyncio.gather(
         extract("source-a", source_a),
@@ -325,7 +325,7 @@ async def test_litellm_structured_client_uses_response_schema_for_source_support
     assert calls[0]["response_format"] is AgentSessionAuthorityResponse
     assert "tools" not in calls[0]
     assert "tool_choice" not in calls[0]
-    assert calls[0]["max_tokens"] == 4096
+    assert calls[0]["max_tokens"] == client.request_budget().output_tokens
 
 
 @pytest.mark.asyncio
@@ -350,14 +350,14 @@ async def test_litellm_structured_client_uses_response_schema_for_memory_extract
         )
     )
 
-    response = await client.extract_projection_fragment_memories("prompt", max_tokens=8192)
+    response = await client.extract_projection_fragment_memories("prompt")
 
     assert response.memories[0].content == "Service A uses PostgreSQL 16."
     assert calls[0]["messages"] == [{"role": "user", "content": "prompt"}]
     assert calls[0]["response_format"] is ProjectionFragmentMemoryExtractionResponse
     assert "tools" not in calls[0]
     assert "tool_choice" not in calls[0]
-    assert calls[0]["max_tokens"] == 8192
+    assert calls[0]["max_tokens"] == client.request_budget().output_tokens
 
 
 @pytest.mark.asyncio
@@ -391,7 +391,7 @@ async def test_litellm_structured_client_uses_response_schema_for_semantic_judge
     assert response.confidence == "high"
     assert calls[0]["response_format"] is OfflineSemanticJudgeResponse
     assert calls[0]["model"] == "anthropic/judge-model-v1"
-    assert calls[0]["max_tokens"] == 512
+    assert calls[0]["max_tokens"] == client.request_budget("judge-model-v1").output_tokens
 
 
 @pytest.mark.asyncio
@@ -416,7 +416,6 @@ async def test_litellm_structured_client_sends_images_in_same_logical_extraction
 
     await client.extract_projection_fragment_memories(
         "Inspect the attached PRIMARY observation.",
-        max_tokens=8192,
         images=(
             StructuredLlmImage(
                 source_observation_id="obs-image-1",
@@ -485,7 +484,6 @@ async def test_litellm_structured_client_normalizes_oversized_images_once_per_lo
 
     await client.extract_projection_fragment_memories(
         "prompt",
-        max_tokens=1024,
         images=(
             StructuredLlmImage(
                 source_observation_id="obs-image-1",
@@ -532,7 +530,6 @@ async def test_litellm_structured_client_rejects_invalid_image_before_provider_c
     with pytest.raises(StructuredLlmError) as raised:
         await client.extract_projection_fragment_memories(
             "prompt",
-            max_tokens=1024,
             images=(
                 StructuredLlmImage(
                     source_observation_id="obs-image-1",
@@ -570,12 +567,12 @@ async def test_litellm_structured_client_uses_response_schema_for_agent_session_
         )
     )
 
-    response = await client.classify_agent_session_evidence_authority("prompt", max_tokens=1024)
+    response = await client.classify_agent_session_evidence_authority("prompt")
 
     assert response.decisions[0].evidence_id == "E1"
     assert calls[0]["messages"] == [{"role": "user", "content": "prompt"}]
     assert calls[0]["response_format"] is AgentSessionAuthorityResponse
-    assert calls[0]["max_tokens"] == 1024
+    assert calls[0]["max_tokens"] == client.request_budget().output_tokens
 
 
 @pytest.mark.asyncio
@@ -603,7 +600,7 @@ async def test_agent_session_authority_classifier_retries_invalid_native_schema_
         )
     )
 
-    response = await client.classify_agent_session_evidence_authority("prompt", max_tokens=1024)
+    response = await client.classify_agent_session_evidence_authority("prompt")
 
     assert response.decisions[0].evidence_id == "E1"
     assert response.decisions[0].is_authoritative is True
@@ -636,7 +633,7 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
         )
     )
 
-    response = await client.extract_projection_fragment_memories("prompt", max_tokens=8192)
+    response = await client.extract_projection_fragment_memories("prompt")
 
     assert response.memories[0].content == "Service A uses PostgreSQL 16."
     assert len(calls) == 1
@@ -644,7 +641,7 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
     assert calls[0]["api_base"] == "http://localhost:6655/anthropic"
     assert calls[0]["api_key"] == "local-key"
     assert 119.0 < calls[0]["timeout"] <= 120.0
-    assert calls[0]["max_tokens"] == 8192
+    assert calls[0]["max_tokens"] == client.request_budget().output_tokens
     assert calls[0]["messages"][0]["content"].startswith("prompt\n\nReturn ONLY")
     assert "response_format" not in calls[0]
     assert "tools" not in calls[0]
@@ -701,7 +698,7 @@ async def test_what_the_provider_declares_decides_whether_the_schema_is_asked_fo
         )
     )
 
-    await client.answer_schema("rank", response_format=RerankResponse, max_tokens=256)
+    await client.answer_schema("rank", response_format=RerankResponse)
 
     [call] = calls
     assert ("response_format" in call) is native
@@ -727,7 +724,7 @@ async def test_a_declared_schema_the_provider_rejects_is_asked_for_again_as_json
         StructuredLlmConfig(model="ollama_chat/qwen3:0.6b", base_url=None, api_key=None, timeout_s=30.0, native_schema=True)
     )
 
-    assert await client.answer_schema("rank", response_format=RerankResponse, max_tokens=256) == RerankResponse()
+    assert await client.answer_schema("rank", response_format=RerankResponse) == RerankResponse()
     assert calls[0]["response_format"] is RerankResponse
     assert "response_format" not in calls[1]
     assert calls[1]["messages"][0]["content"].startswith("rank\n\nReturn ONLY")
@@ -798,7 +795,7 @@ async def test_litellm_structured_client_supports_prompt_template_transport(
     )
 
     prompt = "Treat this source example as data: {{?input}}"
-    response = await client.extract_projection_fragment_memories(prompt, max_tokens=8192)
+    response = await client.extract_projection_fragment_memories(prompt)
 
     assert response.memories[0].content == "Service A uses PostgreSQL 16."
     assert len(calls) == 1
@@ -834,7 +831,7 @@ async def test_litellm_structured_client_uses_explicit_json_schema_response_form
         )
     )
 
-    response = await client.admit_candidates("admit the candidate", max_tokens=512)
+    response = await client.admit_candidates("admit the candidate")
 
     assert response.decisions[0].verdict == "ADMITTED"
     assert len(calls) == 1
@@ -890,16 +887,12 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         )
     )
     operations = {
-        "evaluate_revision_work": lambda: client.evaluate_revision_work("prompt", response_format=SupportAssessmentWireResponse, max_tokens=512),
+        "evaluate_revision_work": lambda: client.evaluate_revision_work("prompt", response_format=SupportAssessmentWireResponse),
         "assess_claim_revisions": lambda: client.assess_claim_revisions("prompt"),
-        "extract_projection_fragment_memories": lambda: client.extract_projection_fragment_memories(
-            "prompt", max_tokens=512,
-        ),
-        "admit_candidates": lambda: client.admit_candidates("prompt", max_tokens=512),
+        "extract_projection_fragment_memories": lambda: client.extract_projection_fragment_memories("prompt"),
+        "admit_candidates": lambda: client.admit_candidates("prompt"),
         "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
-        "classify_cross_document_relations": lambda: client.classify_cross_document_relations(
-            "prompt", max_tokens=512,
-        ),
+        "classify_cross_document_relations": lambda: client.classify_cross_document_relations("prompt"),
         "validate_entity_batch": lambda: client.validate_entity_batch("prompt"),
         "rerank_memories": lambda: client.rerank_memories("prompt"),
         "generate_agent_knowledge_patch": lambda: client.generate_agent_knowledge_patch("prompt"),
@@ -911,7 +904,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
             model="gateway/judge-model",
         ),
         "answer_schema": lambda: client.answer_schema(
-            "prompt", response_format=CapabilityCheckResponse, max_tokens=512,
+            "prompt", response_format=CapabilityCheckResponse,
         ),
     }
     public_async_operations = {
@@ -953,7 +946,7 @@ async def test_litellm_structured_client_repairs_invalid_json_backslash_escapes(
         )
     )
 
-    response = await client.extract_projection_fragment_memories("prompt", max_tokens=8192)
+    response = await client.extract_projection_fragment_memories("prompt")
 
     assert response.memories[0].content == r"Use regex \s+ for whitespace."
 
@@ -985,7 +978,7 @@ async def test_litellm_structured_client_repairs_unescaped_quotes_without_changi
         )
     )
 
-    response = await client.extract_projection_fragment_memories("prompt", max_tokens=8192)
+    response = await client.extract_projection_fragment_memories("prompt")
 
     assert response.memories[0].content == 'Use "规则" for validation.'
     assert len(calls) == 1
@@ -1068,7 +1061,7 @@ async def test_litellm_structured_client_rejects_quote_repair_when_schema_is_inv
     )
 
     with pytest.raises(StructuredLlmError) as raised:
-        await client.extract_projection_fragment_memories("prompt", max_tokens=8192)
+        await client.extract_projection_fragment_memories("prompt")
 
     assert raised.value.error_code == "ValidationError"
     assert any(
@@ -1175,7 +1168,7 @@ async def test_litellm_structured_client_reports_content_free_validation_fields(
     )
 
     with pytest.raises(StructuredLlmError) as raised:
-        await client.extract_projection_fragment_memories("prompt", max_tokens=1024)
+        await client.extract_projection_fragment_memories("prompt")
 
     assert raised.value.error_code == "ValidationError"
     assert raised.value.validation_fields == (
@@ -1218,7 +1211,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
         )
     )
 
-    assert (await client.admit_candidates("prompt", max_tokens=512)).decisions[0].verdict == "ADMITTED"
+    assert (await client.admit_candidates("prompt")).decisions[0].verdict == "ADMITTED"
     assert (await client.classify_memory_relations("prompt")).decisions[0].classification == "refines"
     assert (await client.validate_entity_batch("prompt")).decisions[0].matched_id == 7
     assert (await client.rerank_memories("prompt")).ranking == [2, 0, 1]
@@ -1302,7 +1295,7 @@ async def test_litellm_structured_client_falls_back_once_to_json_text(monkeypatc
         )
     )
 
-    response = await client.extract_projection_fragment_memories("prompt", max_tokens=8192)
+    response = await client.extract_projection_fragment_memories("prompt")
 
     assert response.memories[0].content == "Service A uses PostgreSQL 16."
     assert len(calls) == 2
@@ -1341,7 +1334,7 @@ async def test_litellm_structured_client_fails_closed_after_both_strategies_are_
     )
 
     with pytest.raises(StructuredLlmError):
-        await client.extract_projection_fragment_memories("prompt", max_tokens=8192)
+        await client.extract_projection_fragment_memories("prompt")
     assert len(calls) == 3
     assert calls[0]["response_format"] is ProjectionFragmentMemoryExtractionResponse
     assert "response_format" not in calls[1]
@@ -1381,7 +1374,7 @@ async def test_litellm_structured_client_does_not_resend_truncated_output(monkey
 
     with quality_signal_scope(collector):
         with pytest.raises(StructuredLlmError) as raised:
-            await client.extract_projection_fragment_memories("prompt", max_tokens=32_768)
+            await client.extract_projection_fragment_memories("prompt")
 
     assert raised.value.error_code == "output_truncated"
     assert raised.value.terminal_category == "invalid_response"
@@ -1394,7 +1387,7 @@ async def test_litellm_structured_client_does_not_resend_truncated_output(monkey
     assert attempt.structured_mode == "native_schema"
     assert attempt.schema_transport == "auto"
     assert attempt.error_code == "output_truncated"
-    assert attempt.requested_max_tokens == 32_768
+    assert attempt.requested_max_tokens == client.request_budget().output_tokens
     assert attempt.finish_reason == "max_tokens"
     assert attempt.stop_reason == "max_tokens"
     assert attempt.provider_request_id == "sap-request-456"
@@ -1439,10 +1432,7 @@ async def test_litellm_structured_client_repairs_invalid_json_fallback_with_vali
         telemetry_sink=telemetry.append,
     )
 
-    response = await client.extract_projection_fragment_memories(
-        "prompt",
-        max_tokens=1024,
-    )
+    response = await client.extract_projection_fragment_memories("prompt")
 
     assert response.memories[0].content == "A durable constraint."
     assert len(calls) == 3
@@ -1498,10 +1488,7 @@ async def test_litellm_structured_client_repairs_invalid_json_first_response(
         telemetry_sink=telemetry.append,
     )
 
-    response = await client.extract_projection_fragment_memories(
-        "prompt",
-        max_tokens=1024,
-    )
+    response = await client.extract_projection_fragment_memories("prompt")
 
     assert response.memories[0].content == "A durable constraint."
     assert len(calls) == 2
@@ -1541,7 +1528,7 @@ async def test_litellm_structured_client_repair_names_model_level_rule(monkeypat
         ),
     )
 
-    response = await client.generate_agent_knowledge_patch("prompt", max_tokens=1024)
+    response = await client.generate_agent_knowledge_patch("prompt")
 
     assert response.action == "no_output"
     assert len(calls) == 2
@@ -1586,10 +1573,7 @@ async def test_litellm_structured_client_bounds_schema_repair_diagnostics(
         )
     )
 
-    response = await client.extract_projection_fragment_memories(
-        "prompt",
-        max_tokens=1024,
-    )
+    response = await client.extract_projection_fragment_memories("prompt")
 
     assert response.memories == []
     repair_prompt = calls[1]["messages"][0]["content"]
@@ -1616,7 +1600,7 @@ async def test_litellm_structured_client_fails_closed_when_litellm_rejects_schem
     )
 
     with pytest.raises(StructuredLlmError, match="request failed without a response to validate") as raised:
-        await client.admit_candidates("prompt", max_tokens=512)
+        await client.admit_candidates("prompt")
     assert (raised.value.terminal_category, raised.value.error_code) == ("request_error", "Exception")
 
 
@@ -1636,7 +1620,7 @@ async def test_litellm_structured_client_fails_closed_on_missing_content(monkeyp
     )
 
     with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response") as raised:
-        await client.admit_candidates("prompt", max_tokens=512)
+        await client.admit_candidates("prompt")
     assert raised.value.error_code == "structured_llm_error"
 
 
@@ -1669,7 +1653,7 @@ async def test_litellm_structured_client_bounds_native_and_json_fallback_by_one_
 
     started = perf_counter()
     with pytest.raises(StructuredLlmError, match="logical deadline exceeded"):
-        await client.extract_projection_fragment_memories("prompt", max_tokens=1024)
+        await client.extract_projection_fragment_memories("prompt")
     elapsed = perf_counter() - started
 
     assert elapsed < 0.25
@@ -1729,7 +1713,7 @@ async def test_litellm_structured_client_shares_one_transport_retry_budget_acros
         telemetry_sink=telemetry.append,
     )
 
-    response = await client.extract_projection_fragment_memories("prompt", max_tokens=1024)
+    response = await client.extract_projection_fragment_memories("prompt")
 
     assert response.memories[0].content == "A durable fact."
     assert len(calls) == 3
@@ -1770,7 +1754,7 @@ async def test_litellm_structured_client_aggregates_available_usage_without_esti
         telemetry_sink=telemetry.append,
     )
 
-    await client.extract_projection_fragment_memories("prompt", max_tokens=1024)
+    await client.extract_projection_fragment_memories("prompt")
 
     assert telemetry[0].prompt_tokens == 11
     assert telemetry[0].completion_tokens == 7
@@ -1805,7 +1789,7 @@ async def test_litellm_structured_client_does_not_use_schema_fallback_for_provid
     )
 
     with pytest.raises(StructuredLlmError) as raised:
-        await client.extract_projection_fragment_memories("prompt", max_tokens=1024)
+        await client.extract_projection_fragment_memories("prompt")
 
     assert raised.value.terminal_category == "provider_error"
     assert len(calls) == 2
@@ -1858,7 +1842,6 @@ async def test_litellm_structured_client_does_not_retain_provider_failure_contex
     with pytest.raises(StructuredLlmError) as raised:
         await client.extract_projection_fragment_memories(
             "prompt",
-            max_tokens=1024,
             images=(
                 StructuredLlmImage(
                     source_observation_id="obs-image-1",
@@ -1907,7 +1890,7 @@ async def test_litellm_structured_client_classifies_remote_disconnect_without_le
     )
 
     with pytest.raises(StructuredLlmError) as raised:
-        await client.extract_projection_fragment_memories("prompt", max_tokens=1024)
+        await client.extract_projection_fragment_memories("prompt")
 
     assert raised.value.error_code == "APIConnectionError.remote_disconnect"
     assert private_request_detail not in str(raised.value)
@@ -1956,7 +1939,7 @@ async def test_litellm_structured_client_reports_request_size_rejections_without
     )
 
     with pytest.raises(StructuredLlmError) as raised:
-        await client.extract_projection_fragment_memories("prompt", max_tokens=1024)
+        await client.extract_projection_fragment_memories("prompt")
 
     assert raised.value.error_code == error_code
     assert raised.value.terminal_category == "provider_error"
@@ -1986,7 +1969,7 @@ async def test_litellm_structured_client_distinguishes_provider_timeout_from_log
     )
 
     with pytest.raises(StructuredLlmError) as raised:
-        await client.extract_projection_fragment_memories("prompt", max_tokens=1024)
+        await client.extract_projection_fragment_memories("prompt")
 
     assert raised.value.terminal_category == "provider_error"
     assert telemetry[0].terminal_category == "provider_error"
@@ -2009,7 +1992,7 @@ async def test_litellm_structured_client_fails_closed_on_invalid_schema(monkeypa
     )
 
     with pytest.raises(StructuredLlmError):
-        await client.admit_candidates("prompt", max_tokens=512)
+        await client.admit_candidates("prompt")
 
 
 @pytest.mark.asyncio
@@ -2028,7 +2011,7 @@ async def test_litellm_structured_client_fails_closed_when_decisions_missing(mon
     )
 
     with pytest.raises(StructuredLlmError):
-        await client.admit_candidates("prompt", max_tokens=512)
+        await client.admit_candidates("prompt")
 
 
 @pytest.mark.asyncio
@@ -2049,24 +2032,29 @@ async def test_litellm_structured_client_disables_nested_litellm_retries(monkeyp
             timeout_s=120.0,
         )
     )
-    await client.extract_projection_fragment_memories("prompt", max_tokens=8192)
+    await client.extract_projection_fragment_memories("prompt")
 
     # The adapter owns one exact logical retry budget; allowing LiteLLM to
     # retry again would multiply both the deadline and attempt telemetry.
     assert calls[0]["num_retries"] == 0
 
 
-def test_revision_input_budget_counts_complete_schema_and_output_reserve(monkeypatch):
-    client = LiteLlmStructuredClient(StructuredLlmConfig(model='openai/test', base_url=None, api_key=None, timeout_s=1,
-        max_input_tokens=10000, context_window_tokens=10000, max_output_tokens=5000, input_budget_fraction=0.8))
+def test_revision_input_budget_counts_complete_schema_and_the_route_output_capacity(monkeypatch):
+    def client(max_output_tokens):
+        return LiteLlmStructuredClient(StructuredLlmConfig(model='openai/test', base_url=None, api_key=None,
+            timeout_s=1, max_input_tokens=10000, context_window_tokens=10000, max_output_tokens=max_output_tokens,
+            input_budget_fraction=0.8))
     monkeypatch.setattr('memforge.llm.structured.litellm.get_model_info', lambda *a, **kw: {})
     messages = []
     def count(**kwargs):
         messages.append(kwargs['messages'])
-        return 4000
+        return 5000
     monkeypatch.setattr('memforge.llm.structured.litellm.token_counter', count)
-    assert client.request_fits('source claim', response_format=SupportAssessmentWireResponse, max_tokens=1000)
-    assert not client.request_fits('source claim', response_format=SupportAssessmentWireResponse, max_tokens=5000)
+    # The route's output capacity takes its share of the context window first. An
+    # output limit of 1000 leaves 7200 input tokens and 5000, held to a quarter of
+    # the window, leaves 6000; each then keeps its 1024-token correction reserve.
+    assert client(1000).request_fits('source claim', response_format=SupportAssessmentWireResponse)
+    assert not client(5000).request_fits('source claim', response_format=SupportAssessmentWireResponse)
     assert 'required_refs' in str(messages)
 
 
@@ -2105,6 +2093,57 @@ def test_known_model_uses_sdk_capacity_without_unrequested_app_cap(monkeypatch):
     assert client.request_budget().output_limit == 64000
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "call"),
+    [
+        ('{"memories":[]}', lambda client: client.extract_projection_fragment_memories("prompt")),
+        ('{"decisions":[]}', lambda client: client.admit_candidates("prompt")),
+        ('{"ranking":[]}', lambda client: client.rerank_memories("prompt")),
+    ],
+    ids=["extraction", "admission", "rerank"],
+)
+async def test_every_task_asks_for_the_route_output_capacity(monkeypatch, answer, call):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse(answer)
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("memforge.llm.structured.litellm.get_model_info", lambda *args, **kwargs: {
+        "max_input_tokens": 16000, "context_window": 16000, "max_output_tokens": 64000,
+    })
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(StructuredLlmConfig(model="openai/known", base_url=None, api_key=None, timeout_s=1))
+
+    await call(client)
+
+    assert client.request_budget().output_tokens == 4000
+    assert [kwargs["max_tokens"] for kwargs in calls] == [4000]
+
+
+@pytest.mark.asyncio
+async def test_a_route_without_known_limits_leaves_the_output_to_the_provider_default(monkeypatch):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse('{"ranking":[1]}')
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("memforge.llm.structured.litellm.get_model_info", lambda *args, **kwargs: {})
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(StructuredLlmConfig(model="gateway/unknown", base_url=None, api_key=None, timeout_s=1))
+
+    response = await client.rerank_memories("prompt")
+
+    assert response.ranking == [1]
+    with pytest.raises(ValueError):
+        client.request_budget()
+    assert [kwargs["max_tokens"] for kwargs in calls] == [None]
+
+
 def test_unknown_route_requires_explicit_capacity(monkeypatch):
     monkeypatch.setattr('memforge.llm.structured.litellm.get_model_info', lambda *args, **kwargs: {})
     client = LiteLlmStructuredClient(StructuredLlmConfig(model='gateway/unknown', base_url=None, api_key=None, timeout_s=1))
@@ -2116,8 +2155,8 @@ def test_correction_consumes_its_existing_reserve(monkeypatch):
     client = LiteLlmStructuredClient(StructuredLlmConfig(model='openai/known', base_url=None, api_key=None, timeout_s=1,
         max_input_tokens=10000, context_window_tokens=20000, max_output_tokens=1000))
     monkeypatch.setattr('memforge.llm.structured.litellm.token_counter', lambda **kwargs: 7500)
-    assert not client.request_fits('correction', response_format=SupportAssessmentWireResponse, max_tokens=1000)
-    assert client.request_fits('correction', response_format=SupportAssessmentWireResponse, max_tokens=1000, reserve_correction=False)
+    assert not client.request_fits('correction', response_format=SupportAssessmentWireResponse)
+    assert client.request_fits('correction', response_format=SupportAssessmentWireResponse, reserve_correction=False)
 
 
 def test_sap_route_uses_sdk_bedrock_metadata_and_preserves_operator_caps(monkeypatch):
@@ -2132,19 +2171,12 @@ def test_sap_route_uses_sdk_bedrock_metadata_and_preserves_operator_caps(monkeyp
     budget = client.request_budget()
     assert seen == ["bedrock/anthropic.claude-sonnet-4-6"]
     assert (budget.input_limit, budget.context_limit, budget.output_limit) == (10000, 16000, 1024)
+    assert budget.output_tokens == config.max_output_tokens
     from memforge.llm.batch_runner import LlmBatchRunner, LlmRequest
-    from memforge.pipeline.memory_extractor import MemoryExtractor
-    from types import SimpleNamespace
     monkeypatch.setattr("memforge.llm.structured.litellm.token_counter", lambda **kwargs: 100)
-    from memforge.pipeline.evidence_fragments import EvidenceFragmentKind
-    catalog = SimpleNamespace(fragments=[
-        SimpleNamespace(primary_eligible=True, kind=EvidenceFragmentKind.TEXT, presentation_text="Small claim."),
-    ])
-    requested = MemoryExtractor(structured_llm_client=client, model=config.model).fragment_output_tokens(catalog)
-    assert requested > config.max_output_tokens
     runner = LlmBatchRunner(client, model=config.model)
-    planned = runner.fit(lambda: LlmRequest("extract", ProjectionFragmentMemoryExtractionResponse, requested))
-    assert planned.max_tokens == config.max_output_tokens
+    request = LlmRequest("extract", ProjectionFragmentMemoryExtractionResponse)
+    assert runner.fit(lambda: request) == request
 
 
 @pytest.mark.asyncio
@@ -2171,7 +2203,7 @@ async def test_cross_document_relations_reject_a_refused_empty_reply(
         timeout_s=1.0, num_retries=1,
     ))
     with pytest.raises(StructuredLlmError) as error:
-        await client.classify_cross_document_relations("prompt", max_tokens=512)
+        await client.classify_cross_document_relations("prompt")
     assert error.value.error_code == error_code
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from dataclasses import dataclass, field
@@ -14,9 +15,12 @@ else:
 
 __all__ = ["AgentEvaluationConfig", "AppConfig", "SyncConfig", "load_config"]
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_BASE_DIR = Path.home() / ".memforge"
-DEFAULT_ENRICHMENT_MAX_TOKENS = 8192
-DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS = 32768
+# Variables that would set the output of single tasks. Every request asks for
+# the route's output capacity, so they are read only to say they set nothing.
+_RETIRED_OUTPUT_LIMIT_VARIABLES = ("MEMFORGE_ENRICHMENT_MAX_TOKENS", "MEMFORGE_MEMORY_EXTRACTION_MAX_TOKENS")
 DEFAULT_SEARCH_TOP_K = 20
 DEFAULT_RANK_WINDOW_SIZE = 50
 DEFAULT_RRF_K = 20
@@ -58,8 +62,6 @@ class LlmConfig:
     decision_model: str = ""
     enrichment_base_url: str = "https://api.anthropic.com"
     enrichment_api_key: str = ""
-    enrichment_max_tokens: int = DEFAULT_ENRICHMENT_MAX_TOKENS
-    memory_extraction_max_tokens: int = DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
     enrichment_max_concurrent: int = 3
     max_input_tokens: int | None = None
     context_window_tokens: int | None = None
@@ -167,14 +169,13 @@ class AppConfig:
             "MEMFORGE_ENRICHMENT_API_KEY",
             self.llm.enrichment_api_key,
         )
-        self.llm.enrichment_max_tokens = int(
-            os.environ.get("MEMFORGE_ENRICHMENT_MAX_TOKENS")
-            or self.llm.enrichment_max_tokens
-        )
-        self.llm.memory_extraction_max_tokens = int(
-            os.environ.get("MEMFORGE_MEMORY_EXTRACTION_MAX_TOKENS")
-            or self.llm.memory_extraction_max_tokens
-        )
+        for variable in _RETIRED_OUTPUT_LIMIT_VARIABLES:
+            if os.environ.get(variable):
+                logger.warning(
+                    "%s has no effect: every model request asks for the route's output capacity, "
+                    "which MEMFORGE_LLM_MAX_OUTPUT_TOKENS or the model's token limits bound",
+                    variable,
+                )
         for name in ("max_input_tokens", "context_window_tokens", "max_output_tokens"):
             raw_value = os.environ.get(f"MEMFORGE_LLM_{name.upper()}") or getattr(self.llm, name)
             value = int(raw_value) if raw_value is not None else None

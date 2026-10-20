@@ -318,12 +318,19 @@ def test_processing_limitation_cannot_retry_whole_document():
     assert error.retryable is False
 
 
-def test_actual_extraction_allowance_is_part_of_reuse_identity():
+def test_the_extraction_model_and_its_route_budget_are_part_of_reuse_identity():
+    from types import SimpleNamespace
+
     from memforge.pipeline.revision_assessment import revision_inference_capability_hash
 
-    original = revision_inference_capability_hash(None, extraction_model="model-a", extraction_max_tokens=4096)
-    assert original != revision_inference_capability_hash(None, extraction_model="model-a", extraction_max_tokens=8192)
-    assert original != revision_inference_capability_hash(None, extraction_model="model-b", extraction_max_tokens=4096)
+    def client(budget):
+        return SimpleNamespace(input_policy_identity_for=lambda _model: budget)
+
+    original = revision_inference_capability_hash(client("budget-a"), extraction_model="model-a")
+    assert original == revision_inference_capability_hash(client("budget-a"), extraction_model="model-a")
+    assert original != revision_inference_capability_hash(client("budget-a"), extraction_model="model-b")
+    # The route budget sets the output every request asks for, so a changed budget is a changed reading.
+    assert original != revision_inference_capability_hash(client("budget-b"), extraction_model="model-a")
 
 
 def test_whether_the_model_reads_images_is_part_of_reuse_identity():
@@ -333,14 +340,12 @@ def test_whether_the_model_reads_images_is_part_of_reuse_identity():
 
     def identity(reads_images):
         client = SimpleNamespace(reads_images=reads_images, input_policy_identity_for=lambda _model: "budget")
-        return revision_inference_capability_hash(client, extraction_model="model-a", extraction_max_tokens=4096)
+        return revision_inference_capability_hash(client, extraction_model="model-a")
 
     assert identity(False) != identity(True)
     # A client that does not say whether its model reads images is taken as one that reads them.
     unsaid = SimpleNamespace(input_policy_identity_for=lambda _model: "budget")
-    assert identity(True) == revision_inference_capability_hash(
-        unsaid, extraction_model="model-a", extraction_max_tokens=4096
-    )
+    assert identity(True) == revision_inference_capability_hash(unsaid, extraction_model="model-a")
 
 
 def test_changelog_delta_keeps_before_after_field_identity_and_event_context():

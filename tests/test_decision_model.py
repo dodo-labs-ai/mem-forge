@@ -196,18 +196,18 @@ async def test_unset_decision_model_builds_a_client_that_runs_every_task_on_the_
 
 
 class DecisionImpactClient(ImpactClient):
-    """Records the model of every Change Impact call and capacity lookup."""
+    """Records the model of every Change Impact call and capacity check."""
 
     decision_model = DECISION_MODEL
 
     def __init__(self):
         super().__init__()
-        self.budget_models = []
+        self.fit_models = []
         self.impact_models = []
 
-    def request_budget(self, model=None):
-        self.budget_models.append(model)
-        return super().request_budget(model)
+    def request_fits(self, prompt, **kwargs):
+        self.fit_models.append(kwargs.get("model"))
+        return super().request_fits(prompt, **kwargs)
 
     async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
         if "<change_impact>" in prompt:
@@ -239,7 +239,7 @@ async def test_change_impact_records_the_model_that_answered_it(monkeypatch, reg
     ).assess_many(unaffected_cohort())
 
     assert client.impact_models == [expected]
-    assert expected in client.budget_models
+    assert expected in client.fit_models
     [work] = impact_works(store)
     assert work.manifest["model"] == expected
     assert work.manifest["budget"] == client.input_policy_identity_for(expected)
@@ -254,9 +254,9 @@ class DecisionRelationClient(RelationClient):
     def __post_init__(self):
         self.models = []
 
-    async def classify_cross_document_relations(self, prompt, *, max_tokens, model=None):
+    async def classify_cross_document_relations(self, prompt, *, model=None):
         self.models.append(model)
-        return await super().classify_cross_document_relations(prompt, max_tokens=max_tokens, model=model)
+        return await super().classify_cross_document_relations(prompt, model=model)
 
 
 @pytest.mark.asyncio
@@ -296,9 +296,9 @@ class DecisionEntityClient(EntityClient):
     decision_model: str = DECISION_MODEL
     models: list[str | None] = field(default_factory=list)
 
-    async def validate_entity_batch(self, prompt, *, max_tokens, model):
+    async def validate_entity_batch(self, prompt, *, model):
         self.models.append(model)
-        return await super().validate_entity_batch(prompt, max_tokens=max_tokens, model=model)
+        return await super().validate_entity_batch(prompt, model=model)
 
 
 @pytest.mark.asyncio
@@ -452,8 +452,8 @@ async def test_decision_model_calls_use_their_own_schema_transport_and_report_th
         telemetry_sink=telemetry.append,
     )
 
-    await client.classify_cross_document_relations("classify", max_tokens=512, model=DECISION_MODEL)
-    await client.classify_cross_document_relations("classify", max_tokens=512)
+    await client.classify_cross_document_relations("classify", model=DECISION_MODEL)
+    await client.classify_cross_document_relations("classify")
 
     assert [call["model"] for call in calls] == [DECISION_MODEL, MAIN_MODEL]
     assert calls[0]["response_format"]["type"] == "json_schema"

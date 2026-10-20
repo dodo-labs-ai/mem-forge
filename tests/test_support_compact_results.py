@@ -83,12 +83,12 @@ async def test_live_client_contract_uses_compact_schema_and_rejects_truncated_js
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(StructuredLlmConfig(
         model='openai/gpt-4o', base_url=None, api_key=None, timeout_s=10, num_retries=0))
-    result = await client.evaluate_revision_work('fixture', response_format=SupportAssessmentWireResponse, max_tokens=1024)
+    result = await client.evaluate_revision_work('fixture', response_format=SupportAssessmentWireResponse)
     assert len(result.results) == 1 and 'reason' not in result.results[0].model_dump()
     assert len(seen) == 1
     reply.choices[0].finish_reason = 'length'
     with pytest.raises(StructuredLlmError):
-        await client.evaluate_revision_work('fixture', response_format=SupportAssessmentWireResponse, max_tokens=1024)
+        await client.evaluate_revision_work('fixture', response_format=SupportAssessmentWireResponse)
 
 
 @pytest.mark.asyncio

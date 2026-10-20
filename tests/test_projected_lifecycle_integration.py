@@ -1587,8 +1587,8 @@ class _AdmissionClient(FixtureBudgetClient):
             by_id[candidate["id"]] for candidate in admission_payload(prompt)["candidates"] if candidate["id"] in by_id
         ]))
 
-    async def admit_candidates(self, prompt: str, *, max_tokens: int, model=None, images=()):
-        return await self.call(prompt, max_tokens=max_tokens, model=model)
+    async def admit_candidates(self, prompt: str, *, model=None, images=()):
+        return await self.call(prompt, model=model)
 
     def input_policy_identity_for(self, model=None):
         return f"fixture-admission:{self.input_tokens}:{self.output_tokens}:{model}"

@@ -66,7 +66,7 @@ def client_reads_images(client) -> bool:
     return getattr(client, "reads_images", True) is not False
 
 
-def revision_inference_capability_hash(client, *, extraction_model=None, extraction_max_tokens=None) -> str:
+def revision_inference_capability_hash(client, *, extraction_model=None) -> str:
     from memforge.pipeline.projection_images import projection_inference_capability_hash
 
     payload = {
@@ -75,7 +75,6 @@ def revision_inference_capability_hash(client, *, extraction_model=None, extract
         "revision_input_policy": REVISION_INPUT_POLICY,
         "revision_input": client.input_policy_identity_for(extraction_model) if client is not None else None,
         "extraction_model": extraction_model,
-        "extraction_max_tokens": extraction_max_tokens,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 

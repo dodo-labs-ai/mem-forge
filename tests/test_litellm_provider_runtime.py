@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -23,16 +24,22 @@ def test_llm_base_url_env_can_be_cleared_for_provider_env_auth(monkeypatch):
     assert config.llm.embedding_base_url == ""
 
 
-def test_memory_extraction_output_budget_has_an_independent_env_override(monkeypatch):
+@pytest.mark.parametrize("variable", ["MEMFORGE_MEMORY_EXTRACTION_MAX_TOKENS", "MEMFORGE_ENRICHMENT_MAX_TOKENS"])
+def test_a_task_output_limit_variable_is_warned_about_and_has_no_effect(monkeypatch, caplog, variable):
+    from dataclasses import asdict
+
     from memforge.config import AppConfig
 
-    monkeypatch.setenv("MEMFORGE_ENRICHMENT_MAX_TOKENS", "4096")
-    monkeypatch.setenv("MEMFORGE_MEMORY_EXTRACTION_MAX_TOKENS", "24576")
+    unset = asdict(AppConfig().llm)
+    monkeypatch.setenv(variable, "24576")
 
-    config = AppConfig()
+    with caplog.at_level(logging.WARNING, logger="memforge.config"):
+        config = AppConfig()
 
-    assert config.llm.enrichment_max_tokens == 4096
-    assert config.llm.memory_extraction_max_tokens == 24576
+    assert asdict(config.llm) == unset
+    [warning] = [record for record in caplog.records if record.name == "memforge.config"]
+    assert warning.levelno == logging.WARNING
+    assert f"{variable} has no effect" in warning.getMessage()
 
 
 @pytest.mark.asyncio

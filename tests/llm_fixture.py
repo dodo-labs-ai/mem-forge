@@ -46,7 +46,6 @@ class FixtureBudgetClient:
     correction_reserve: int = 0
     max_concurrent: int = 1
     prompts: list[str] = field(default_factory=list)
-    max_tokens: list[int] = field(default_factory=list)
     peak_in_flight: int = 0
     _in_flight: int = 0
 
@@ -56,14 +55,11 @@ class FixtureBudgetClient:
             correction_reserve=self.correction_reserve,
         )
 
-    def request_fits(self, prompt, *, response_format, max_tokens, model=None, images=(), reserve_correction=True):
-        return self.request_budget(model).fits(
-            len(prompt.split()), max_tokens, reserve_correction=reserve_correction,
-        )
+    def request_fits(self, prompt, *, response_format, model=None, images=(), reserve_correction=True):
+        return self.request_budget(model).fits(len(prompt.split()), reserve_correction=reserve_correction)
 
-    async def call(self, prompt: str, *, max_tokens: int, model: str | None, images=()) -> BaseModel:
+    async def call(self, prompt: str, *, model: str | None, images=()) -> BaseModel:
         self.prompts.append(prompt)
-        self.max_tokens.append(max_tokens)
         self._in_flight += 1
         self.peak_in_flight = max(self.peak_in_flight, self._in_flight)
         try:
@@ -117,7 +113,6 @@ class NoopMemoryExtractor:
     """Fragment extractor stand-in with unbounded capacity and no candidates."""
 
     model = "fixture"
-    max_tokens = FIXTURE_EXTRACTION_OUTPUT_TOKENS
     structured_llm_client = SimpleNamespace(
         request_budget=lambda model=None: fixture_budget(
             input_tokens=FIXTURE_CONTEXT_WINDOW,
@@ -127,10 +122,6 @@ class NoopMemoryExtractor:
         request_fits=lambda *args, **kwargs: True,
         request_tokens=lambda prompt, **kwargs: max(1, len(prompt) // 4),
     )
-
-    def fragment_output_tokens(self, catalog):
-        del catalog
-        return self.max_tokens
 
     async def extract_projection_fragment_memories(self, catalog, **kwargs):
         del catalog, kwargs

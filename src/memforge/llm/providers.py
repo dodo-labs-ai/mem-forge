@@ -110,6 +110,16 @@ def _sends_nothing(route: str) -> dict[str, Any]:
     return {}
 
 
+def _ollama_num_ctx(context_window: int) -> dict[str, Any]:
+    """Ollama's ``num_ctx`` option, which LiteLLM passes through to the request.
+
+    Ollama sizes the window per request, from a small default, and drops the
+    beginning of a longer prompt without an error
+    (https://docs.ollama.com/faq#how-can-i-specify-the-context-window-size).
+    """
+    return {"num_ctx": context_window}
+
+
 def _openrouter_reasoning_off(route: str) -> dict[str, Any]:
     """OpenRouter's own ``reasoning`` request field, which LiteLLM writes into
     the request body from ``extra_body``."""
@@ -234,6 +244,12 @@ class ProviderDescriptor:
     # The SDK keyword arguments that ask the generation model at a route to
     # answer without reasoning first, as LiteLLM passes them to this provider.
     reasoning_off: Callable[[str], dict[str, Any]] = _sends_nothing
+    # The SDK keyword arguments that set the context window of a generation
+    # request, for a provider that sizes the window per request; ``None`` for a
+    # provider that fixes it, by model or when its server starts. A window set
+    # per request is the one the binding states: it is what the operator's
+    # machine holds, which the model's own window does not tell.
+    context_window: Callable[[int], dict[str, Any]] | None = None
     # The kinds whose requests go to the provider's OpenAI-compatible API, with
     # the path of that API after the base URL. They are sent on LiteLLM's
     # ``openai/`` route, which carries the API key and the timeout of every
@@ -373,6 +389,7 @@ PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
             *(f"/v1{path}" for path in _OPENAI_REQUEST_PATHS),
         ),
         reasoning_off=_ollama_thinking_off,
+        context_window=_ollama_num_ctx,
         # LiteLLM's ``ollama/`` route posts an embedding request with neither
         # the API key nor the timeout
         # (https://github.com/BerriAI/litellm/issues/47261), and Ollama's

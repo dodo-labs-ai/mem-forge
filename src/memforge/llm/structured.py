@@ -686,7 +686,8 @@ class StructuredLlmConfig:
     # The extra request parameters of the resolved invocation.
     extra_params: Mapping[str, Any] = dataclass_field(default_factory=dict)
     # The provider descriptor of the resolved invocation, which says how a
-    # direct-answer request asks the model not to reason first.
+    # direct-answer request asks the model not to reason first and how a
+    # request states its context window.
     provider: str | None = None
 
     @classmethod
@@ -722,7 +723,7 @@ class StructuredLlmAttemptTelemetry:
     attempt_index: int
     structured_mode: Literal["native_schema", "json_text"]
     schema_transport: str
-    requested_max_tokens: int
+    requested_max_tokens: int | None
     terminal_category: StructuredLlmTerminalCategory
     error_code: str
     finish_reason: str | None
@@ -759,9 +760,6 @@ class StructuredLlmCallTelemetry:
     model: str | None = None
     # The model id the provider reported in its latest answer, if it reported one.
     provider_model: str | None = None
-    # Times the call was sent again with its output budget raised by the
-    # reasoning that used the budget up; at most one.
-    reasoning_budget_retries: int = 0
 
 
 @dataclass(frozen=True)
@@ -782,7 +780,6 @@ class StructuredLlmMetricsSummary:
     terminal_category_counts: Mapping[str, int]
     operation_counts: Mapping[str, int]
     error_code_counts: Mapping[str, int]
-    reasoning_budget_retries: int = 0
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -790,7 +787,6 @@ class StructuredLlmMetricsSummary:
             "provider_attempts": self.provider_attempts,
             "retries": self.retries,
             "schema_fallbacks": self.schema_fallbacks,
-            "reasoning_budget_retries": self.reasoning_budget_retries,
             "reported_input_tokens": self.reported_input_tokens,
             "reported_output_tokens": self.reported_output_tokens,
             "reported_total_tokens": self.reported_total_tokens,
@@ -861,7 +857,6 @@ class StructuredLlmMetricsCollector:
             provider_attempts=sum(call.attempt_count for call in calls),
             retries=sum(call.retry_count for call in calls),
             schema_fallbacks=sum(call.fallback_count for call in calls),
-            reasoning_budget_retries=sum(call.reasoning_budget_retries for call in calls),
             reported_input_tokens=reported_input_tokens,
             reported_output_tokens=reported_output_tokens,
             reported_total_tokens=reported_total_tokens,
@@ -911,9 +906,6 @@ class _StructuredCallState:
     attempt_count: int = 0
     retry_count: int = 0
     fallback_count: int = 0
-    reasoning_budget_retries: int = 0
-    # The output budget reasoning was shown to need; every later attempt of the call uses it.
-    reasoning_max_tokens: int | None = None
     final_mode: Literal["native_schema", "json_text"] = "native_schema"
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -947,7 +939,7 @@ class _StructuredCallState:
         attempt_index: int,
         structured_mode: Literal["native_schema", "json_text"],
         schema_transport: str,
-        requested_max_tokens: int,
+        requested_max_tokens: int | None,
         failure: _StructuredLlmFailure,
     ) -> None:
         self.diagnostic_attempts.append(
@@ -980,7 +972,7 @@ class _StructuredCallState:
         attempt_index: int,
         structured_mode: Literal["native_schema", "json_text"],
         schema_transport: str,
-        requested_max_tokens: int,
+        requested_max_tokens: int | None,
         exc: BaseException,
     ) -> None:
         failure = _structured_failure(exc, terminal_category="invalid_response")
@@ -1033,7 +1025,6 @@ class _StructuredCallState:
             diagnostic_attempts=tuple(self.diagnostic_attempts),
             model=self.model,
             provider_model=self.provider_model,
-            reasoning_budget_retries=self.reasoning_budget_retries,
         )
 
 
@@ -1410,19 +1401,6 @@ _PROVIDER_REQUEST_HEADER_NAMES = (
     "x-amzn-requestid",
     "x-correlation-id",
 )
-
-
-def _response_reasoning_tokens(response: object) -> int | None:
-    """The output tokens the provider reports its model spent reasoning, if it reports them."""
-
-    details = _object_value(_object_value(response, "usage"), "completion_tokens_details")
-    raw = _object_value(details, "reasoning_tokens")
-    if isinstance(raw, bool) or raw is None:
-        return None
-    try:
-        return max(0, int(raw))
-    except (TypeError, ValueError):
-        return None
 
 
 def _response_provider_request_id(response: object) -> str | None:
@@ -1827,11 +1805,12 @@ class LiteLlmStructuredClient:
     A schema that is a direct answer is requested with the parameters the
     provider descriptor gives for answering without reasoning first. A provider
     whose rejection of a request names those parameters is sent the request
-    without them, and is not sent them again for that model. A reply cut off at
-    its output limit after reasoning used most of that limit is requested once
-    more, with the limit raised by the reasoning it used, and the call's later
-    attempts keep the raised limit, so a model that reasons anyway still gets
-    the room its answer was sized for.
+    without them, and is not sent them again for that model.
+
+    Every request asks for the route's output capacity, and a request to a
+    provider that sizes the context window per request states the route's
+    window. A reply cut off at that capacity is an answer the route cannot
+    hold.
     """
 
     def __init__(
@@ -1875,7 +1854,13 @@ class LiteLlmStructuredClient:
 
         name = litellm_model_name(model or self.config.model)
         if name not in self._request_budgets:
-            self._request_budgets[name] = RequestBudget.resolve(name, self.config)
+            sized_per_request = (
+                self.config.provider is not None
+                and provider_descriptor(self.config.provider).context_window is not None
+            )
+            self._request_budgets[name] = RequestBudget.resolve(
+                name, self.config, catalog_window=not sized_per_request
+            )
         return self._request_budgets[name]
 
     @property
@@ -1911,16 +1896,27 @@ class LiteLlmStructuredClient:
         )
 
     def request_fits(
-        self, prompt: str, *, response_format: type[BaseModel],
-        max_tokens: int, model: str | None = None,
+        self, prompt: str, *, response_format: type[BaseModel], model: str | None = None,
         images: StructuredImageInputs = (), reserve_correction: bool = True,
     ) -> bool:
+        """Whether the request fits the route beside the route's output capacity."""
         budget = self.request_budget(model)
-        if budget.available_input(max_tokens, reserve_correction=reserve_correction) < 0:
+        if budget.available_input(reserve_correction=reserve_correction) < 0:
             return False
         return budget.fits(self.request_tokens(
             prompt, response_format=response_format, model=model, images=images,
-        ), max_tokens, reserve_correction=reserve_correction)
+        ), reserve_correction=reserve_correction)
+
+    def _output_tokens(self, model: str | None) -> int | None:
+        """The output a request asks for: the route's output capacity.
+
+        A route whose limits are not known yet, as when its first check runs,
+        asks for none, and the provider's default applies.
+        """
+        try:
+            return self.request_budget(model).output_tokens
+        except ValueError:
+            return None
 
     @contextmanager
     def metrics_scope(
@@ -1932,93 +1928,79 @@ class LiteLlmStructuredClient:
         with structured_llm_metrics_scope(collector) as selected:
             yield selected
 
-
     async def answer_schema(
         self,
         prompt: str,
         *,
         response_format: type[BaseModel],
-        max_tokens: int,
         model: str | None = None,
         images: StructuredImageInputs = (),
     ):
         """Answer ``prompt``, with the images it is about, as one validated ``response_format`` object."""
         return await self._call_schema(
-            prompt=prompt, response_format=response_format, max_tokens=max_tokens, model=model, images=images,
+            prompt=prompt, response_format=response_format, model=model, images=images,
         )
 
-    async def evaluate_revision_work(self, prompt, *, response_format, max_tokens, model=None, images=()):
-        return await self._call_schema(prompt=prompt, response_format=response_format,
-                                       max_tokens=max_tokens, model=model, images=images)
-
+    async def evaluate_revision_work(self, prompt, *, response_format, model=None, images=()):
+        return await self._call_schema(prompt=prompt, response_format=response_format, model=model, images=images)
 
     async def assess_claim_revisions(
-        self, prompt: str, *, max_tokens: int = 32_768,
-        model: str | None = None, images: StructuredImageInputs = (),
+        self, prompt: str, *, model: str | None = None, images: StructuredImageInputs = (),
     ) -> ClaimRevisionWireResponse:
         return await self._call_schema(
-            prompt=prompt, response_format=ClaimRevisionWireResponse,
-            max_tokens=max_tokens, model=model, images=images,
+            prompt=prompt, response_format=ClaimRevisionWireResponse, model=model, images=images,
         )
 
     async def extract_projection_fragment_memories(
         self,
         prompt: str,
         *,
-        max_tokens: int,
         model: str | None = None,
         images: StructuredImageInputs = (),
     ) -> ProjectionFragmentMemoryExtractionResponse:
         return await self._call_schema(
             prompt=prompt,
             response_format=ProjectionFragmentMemoryExtractionResponse,
-            max_tokens=max_tokens,
             model=model,
             images=images,
         )
 
     async def admit_candidates(
-        self, prompt: str, *, max_tokens: int, model: str | None = None,
+        self, prompt: str, *, model: str | None = None,
         images: StructuredImageInputs = (),
     ) -> CandidateAdmissionResponse:
         return await self._call_schema(
-            prompt=prompt, response_format=CandidateAdmissionResponse,
-            max_tokens=max_tokens, model=model, images=images,
+            prompt=prompt, response_format=CandidateAdmissionResponse, model=model, images=images,
         )
 
     async def classify_memory_relations(
         self,
         prompt: str,
         *,
-        max_tokens: int = 32_768,
         model: str | None = None,
     ) -> MemoryRelationResponse:
         return await self._call_schema(
             prompt=prompt,
             response_format=MemoryRelationResponse,
-            max_tokens=max_tokens,
             model=model,
         )
 
     async def classify_cross_document_relations(
-        self, prompt: str, *, max_tokens: int, model: str | None = None,
+        self, prompt: str, *, model: str | None = None,
     ) -> CrossDocumentRelationResponse:
         return await self._call_schema(
-            prompt=prompt, response_format=CrossDocumentRelationResponse,
-            max_tokens=max_tokens, model=model,
+            prompt=prompt, response_format=CrossDocumentRelationResponse, model=model,
         )
 
     async def validate_entity_batch(
         self,
         prompt: str,
         *,
-        max_tokens: int = 2048,
         model: str | None = None,
     ) -> EntityBatchValidationResponse:
         return await self._call_schema(
             prompt=prompt,
             response_format=EntityBatchValidationResponse,
-            max_tokens=max_tokens,
             model=model,
         )
 
@@ -2026,13 +2008,11 @@ class LiteLlmStructuredClient:
         self,
         prompt: str,
         *,
-        max_tokens: int = 256,
         model: str | None = None,
     ) -> RerankResponse:
         return await self._call_schema(
             prompt=prompt,
             response_format=RerankResponse,
-            max_tokens=max_tokens,
             model=model,
         )
 
@@ -2040,13 +2020,11 @@ class LiteLlmStructuredClient:
         self,
         prompt: str,
         *,
-        max_tokens: int = 512,
         model: str | None = None,
     ) -> OfflineSemanticJudgeResponse:
         return await self._call_schema(
             prompt=prompt,
             response_format=OfflineSemanticJudgeResponse,
-            max_tokens=max_tokens,
             model=model,
         )
 
@@ -2054,7 +2032,6 @@ class LiteLlmStructuredClient:
         self,
         prompt: str,
         *,
-        max_tokens: int = 2048,
         model: str | None = None,
     ):
         from memforge.agent_knowledge import AgentKnowledgePatchModelResponse
@@ -2062,7 +2039,6 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt,
             response_format=AgentKnowledgePatchModelResponse,
-            max_tokens=max_tokens,
             model=model,
         )
 
@@ -2070,13 +2046,11 @@ class LiteLlmStructuredClient:
         self,
         prompt: str,
         *,
-        max_tokens: int = 4096,
         model: str | None = None,
     ) -> AgentSessionAuthorityResponse:
         return await self._call_schema(
             prompt=prompt,
             response_format=AgentSessionAuthorityResponse,
-            max_tokens=max_tokens,
             model=model,
         )
 
@@ -2085,7 +2059,6 @@ class LiteLlmStructuredClient:
         *,
         prompt: str,
         response_format: type[BaseModel],
-        max_tokens: int,
         model: str | None = None,
         retry_with_json_text: bool = True,
         images: StructuredImageInputs = (),
@@ -2095,7 +2068,7 @@ class LiteLlmStructuredClient:
                 schema=response_format, operation=_schema_operation_name(response_format)) as capture:
             async with admission.semaphore:
                 result = await self._call_schema_admitted(
-                    prompt=prompt, response_format=response_format, max_tokens=max_tokens,
+                    prompt=prompt, response_format=response_format,
                     model=model, retry_with_json_text=retry_with_json_text, images=images,
                 )
             if capture is not None:
@@ -2107,12 +2080,12 @@ class LiteLlmStructuredClient:
         *,
         prompt: str,
         response_format: type[BaseModel],
-        max_tokens: int,
         model: str | None,
         retry_with_json_text: bool,
         images: StructuredImageInputs,
     ):
         model_name = litellm_model_name(model or self.config.model)
+        max_tokens = self._output_tokens(model)
         started = perf_counter()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.0, self.config.timeout_s)
@@ -2125,7 +2098,7 @@ class LiteLlmStructuredClient:
         try:
             async with asyncio.timeout_at(deadline):
                 if isinstance(images, ArtifactImageDelivery) and not self.request_fits(
-                    prompt, response_format=response_format, max_tokens=max_tokens, model=model, images=images,
+                    prompt, response_format=response_format, model=model, images=images,
                 ):
                     raise StructuredLlmImageError(error_code="image_delivery_input_capacity_exceeded")
                 prepared_images = await asyncio.to_thread(
@@ -2222,7 +2195,7 @@ class LiteLlmStructuredClient:
         *,
         prompt: str,
         response_format: type[BaseModel],
-        max_tokens: int,
+        max_tokens: int | None,
         model_name: str,
         retry_with_json_text: bool,
         deadline: float,
@@ -2303,7 +2276,7 @@ class LiteLlmStructuredClient:
         prompt: str,
         response_format: type[BaseModel],
         model_name: str,
-        max_tokens: int,
+        max_tokens: int | None,
         native_schema_transport: NativeSchemaTransport,
         deadline: float,
         state: _StructuredCallState,
@@ -2375,7 +2348,7 @@ class LiteLlmStructuredClient:
         prompt: str,
         response_format: type[BaseModel],
         model_name: str,
-        max_tokens: int,
+        max_tokens: int | None,
         native_schema: bool,
         native_schema_transport: NativeSchemaTransport,
         deadline: float,
@@ -2384,8 +2357,6 @@ class LiteLlmStructuredClient:
         validation_failure: _StructuredLlmFailure | None = None,
         validation_source: Literal["native_schema", "json_text"] | None = None,
     ):
-        if state.reasoning_max_tokens is not None:
-            max_tokens = max(max_tokens, state.reasoning_max_tokens)
         request_prompt = (
             prompt
             if native_schema
@@ -2397,7 +2368,7 @@ class LiteLlmStructuredClient:
             )
         )
         if isinstance(images, ArtifactImageDelivery) and not self.request_fits(
-            request_prompt, response_format=response_format, max_tokens=max_tokens,
+            request_prompt, response_format=response_format,
             model=model_name, images=images,
         ):
             raise StructuredLlmImageError(error_code="image_delivery_input_capacity_exceeded")
@@ -2422,43 +2393,17 @@ class LiteLlmStructuredClient:
         schema_transport = native_schema_transport if native_schema else "json_text"
         direct_answer = bool(getattr(response_format, "direct_answer", False))
 
-        async def complete(output_tokens: int):
-            return await self._completion_with_retries(
-                model_name=model_name,
-                messages=messages,
-                max_tokens=output_tokens,
-                provider_kwargs=provider_kwargs,
-                reasoning_off=self._reasoning_off(model_name) if direct_answer else {},
-                response_format=response_format if native_schema else None,
-                native_schema_transport=native_schema_transport,
-                deadline=deadline,
-                state=state,
-            )
-
-        response, attempt_index = await complete(max_tokens)
-        raised_tokens = self._output_tokens_after_reasoning(
-            response, requested=max_tokens, model_name=model_name, state=state,
+        response, attempt_index = await self._completion_with_retries(
+            model_name=model_name,
+            messages=messages,
+            max_tokens=max_tokens,
+            provider_kwargs=provider_kwargs,
+            reasoning_off=self._reasoning_off(model_name) if direct_answer else {},
+            response_format=response_format if native_schema else None,
+            native_schema_transport=native_schema_transport,
+            deadline=deadline,
+            state=state,
         )
-        if raised_tokens is not None:
-            state.record_invalid_response_attempt(
-                response,
-                attempt_index=attempt_index,
-                structured_mode=structured_mode,
-                schema_transport=schema_transport,
-                requested_max_tokens=max_tokens,
-                exc=_output_truncated_error(),
-            )
-            state.reasoning_budget_retries += 1
-            logger.warning(
-                "Structured LLM reasoning used most of the %d output tokens of model %s for schema %s; "
-                "requesting it once more with %d",
-                max_tokens,
-                model_name,
-                response_format.__name__,
-                raised_tokens,
-            )
-            max_tokens = state.reasoning_max_tokens = raised_tokens
-            response, attempt_index = await complete(max_tokens)
         try:
             _raise_for_unfinished_response(response, response_format)
             raw_content = _message_content(response)
@@ -2484,6 +2429,19 @@ class LiteLlmStructuredClient:
                 raise
             raise _InvalidModelOutput(type(exc).__name__) from exc
 
+    def _context_window(self, model_name: str) -> dict[str, Any]:
+        """The parameters that set the context window of a request to ``model_name``, for a provider that sizes it per request."""
+
+        if self.config.provider is None:
+            return {}
+        try:
+            context_window = provider_descriptor(self.config.provider).context_window
+            if context_window is None:
+                return {}
+            return context_window(self.request_budget(model_name).context_limit)
+        except (ModelConfigError, ValueError):
+            return {}
+
     def _reasoning_off(self, model_name: str) -> dict[str, Any]:
         """The parameters that ask ``model_name`` to answer without reasoning first."""
 
@@ -2494,38 +2452,12 @@ class LiteLlmStructuredClient:
         except ModelConfigError:
             return {}
 
-    def _output_tokens_after_reasoning(
-        self, response: object, *, requested: int, model_name: str, state: _StructuredCallState,
-    ) -> int | None:
-        """The output budget to request a reply again with, when reasoning used up the first.
-
-        Applies once per logical call, to a reply cut off at its limit whose
-        reasoning took most of it. The raised budget stays within the model's
-        output limit and, with the prompt the provider counted, its context
-        window, and holds for the call's later repair or JSON-text attempts.
-        """
-
-        if state.reasoning_budget_retries or not _response_truncated(response):
-            return None
-        reasoning_tokens = _response_reasoning_tokens(response)
-        if reasoning_tokens is None or 2 * reasoning_tokens <= requested:
-            return None
-        try:
-            budget = self.request_budget(model_name)
-        except ValueError:
-            return None
-        raised = min(requested + reasoning_tokens, budget.output_limit)
-        usage = _response_usage(response)
-        if usage is not None:
-            raised = min(raised, budget.context_limit - usage[0])
-        return raised if raised > requested else None
-
     async def _completion_with_retries(
         self,
         *,
         model_name: str,
         messages: list[dict[str, str]],
-        max_tokens: int,
+        max_tokens: int | None,
         provider_kwargs: dict[str, Any],
         reasoning_off: Mapping[str, Any],
         response_format: type[BaseModel] | None,
@@ -2546,7 +2478,7 @@ class LiteLlmStructuredClient:
             failure: _StructuredLlmFailure | None = None
             retry = False
             rejected = False
-            request_kwargs = {**provider_kwargs, **reasoning_off}
+            request_kwargs = {**provider_kwargs, **self._context_window(model_name), **reasoning_off}
             capture = current_capture()
             if capture is not None:
                 capture.begin_attempt(dict(model=model_name, messages=messages,
@@ -2658,7 +2590,6 @@ class LiteLlmStructuredClient:
             "attempt_count": telemetry.attempt_count,
             "retry_count": telemetry.retry_count,
             "fallback_count": telemetry.fallback_count,
-            "reasoning_budget_retries": telemetry.reasoning_budget_retries,
             "final_mode": telemetry.final_mode,
             "elapsed_ms": telemetry.elapsed_ms,
             "terminal_category": telemetry.terminal_category,
@@ -2674,8 +2605,6 @@ class LiteLlmStructuredClient:
             reason_code = "call_cancelled"
         elif telemetry.terminal_category == "success" and telemetry.fallback_count > 0:
             outcome, reason_code = "degraded", "schema_fallback_recovered"
-        elif telemetry.terminal_category == "success" and telemetry.reasoning_budget_retries > 0:
-            outcome, reason_code = "degraded", "reasoning_budget_recovered"
         elif telemetry.terminal_category == "success":
             outcome, reason_code = "expected", "schema_conformant"
         else:

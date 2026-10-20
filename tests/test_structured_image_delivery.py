@@ -113,8 +113,7 @@ async def test_invalid_bundle_never_calls_provider(authentic, mutation):
     elif mutation == "budget":
         changed = replace(changed, budget_identity="different-budget")
     with pytest.raises((StructuredLlmImageError, StructuredLlmError)):
-        await client(transport).evaluate_revision_work("same prompt", response_format=Reply,
-                                                       max_tokens=32768, model=MODEL, images=changed)
+        await client(transport).evaluate_revision_work("same prompt", response_format=Reply, model=MODEL, images=changed)
     assert calls == []
 
 
@@ -130,18 +129,18 @@ async def test_retry_native_fallback_preserves_exact_delivery_and_labels(authent
         return SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=content))])
 
     selected = client(transport)
-    assert selected.request_fits("same prompt", response_format=Reply, max_tokens=32768, images=authentic)
+    assert selected.request_fits("same prompt", response_format=Reply, images=authentic)
     # Compare actual text-only public count with delivery visual upper bound:
     # there is no automatic 85-token image contribution on the bundle path.
     tokens = selected.request_tokens("same prompt", response_format=Reply, images=authentic)
     assert tokens > authentic.visual_token_upper_bound == 7 * 1568
-    result = await selected.evaluate_revision_work("same prompt", response_format=Reply, max_tokens=32768,
+    result = await selected.evaluate_revision_work("same prompt", response_format=Reply,
                                                    model=MODEL, images=authentic)
     assert result.answer == "fake-only" and len(calls) == 3
     image_sets = [[b for b in c["messages"][0]["content"] if b["type"] == "image_url"] for c in calls]
     assert image_sets[0] == image_sets[1] == image_sets[2] and len(image_sets[0]) == 7
     for call in calls:
-        assert call["model"] == MODEL and call["max_tokens"] == 32768
+        assert call["model"] == MODEL and call["max_tokens"] == selected.request_budget().output_tokens
         blocks = call["messages"][0]["content"]
         assert blocks[-1]["type"] == "text" and "same prompt" in blocks[-1]["text"]
         labels = [b["text"] for b in blocks[:-1] if b["type"] == "text"]
@@ -177,7 +176,7 @@ def test_complete_capacity_failure_and_catalog_mismatch(authentic):
         build(authentic.original.body, client(), max_images=1)
     limited = build(authentic.original.body, client(), max_encoded_request_bytes=1)
     with pytest.raises(StructuredLlmImageError):
-        client().request_fits("same prompt", response_format=Reply, max_tokens=32768, images=limited)
+        client().request_fits("same prompt", response_format=Reply, images=limited)
     wrong = replace(authentic, source_binding=tuple((k, "another-observation" if k == "observation_id" else v)
                                                    for k, v in authentic.source_binding))
     with pytest.raises(StructuredLlmImageError):
@@ -201,9 +200,9 @@ async def test_fallback_prompt_growth_rechecks_capacity_before_provider(authenti
     limited = replace(authentic, max_encoded_request_bytes=encoded)
     limited = replace(limited, manifest_sha256=digest(limited.identity()))
     selected = client(transport)
-    assert selected.request_fits("same prompt", response_format=Reply, max_tokens=32768, images=limited)
+    assert selected.request_fits("same prompt", response_format=Reply, images=limited)
     with pytest.raises(StructuredLlmError):
-        await selected.evaluate_revision_work("same prompt", response_format=Reply, max_tokens=32768,
+        await selected.evaluate_revision_work("same prompt", response_format=Reply,
                                               images=limited)
     assert len(calls) == 1
 
@@ -228,6 +227,6 @@ async def test_falsey_completion_transport_is_not_the_default_provider(monkeypat
     # Defensive provider-boundary interception keeps a regression offline.
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", forbidden_default)
     response = await client(FalseyTransport()).evaluate_revision_work(
-        "fixture prompt", response_format=Reply, max_tokens=32768, model=MODEL,
+        "fixture prompt", response_format=Reply, model=MODEL,
     )
     assert response.answer == "fake-only" and len(calls) == 1

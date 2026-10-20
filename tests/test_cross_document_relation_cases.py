@@ -303,7 +303,7 @@ class _LabelClient:
     def request_fits(self, prompt, **_kwargs):
         return True
 
-    async def classify_cross_document_relations(self, prompt, *, max_tokens, model=None):
+    async def classify_cross_document_relations(self, prompt, *, model=None):
         label = "contradicts" if "weekly" in prompt else "none"
         return CrossDocumentRelationResponse(decisions=[{"pair_index": 0, "label": label}])
 
@@ -311,7 +311,7 @@ class _LabelClient:
 class _UpdatesClient(_LabelClient):
     """Labels every pair updates."""
 
-    async def classify_cross_document_relations(self, prompt, *, max_tokens, model=None):
+    async def classify_cross_document_relations(self, prompt, *, model=None):
         return CrossDocumentRelationResponse(decisions=[{"pair_index": 0, "label": "updates"}])
 
 

@@ -33,7 +33,6 @@ from memforge.storage.database import Database
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 
 AGENT_SESSION_SOURCE_TYPE = "agent_session"
-AGENT_SESSION_KNOWLEDGE_PATCH_MAX_TOKENS = 8192
 AGENT_SESSION_LLM_FAILED_CODE = "agent_session_llm_failed"
 AGENT_SESSION_LLM_UNAVAILABLE_CATEGORY = "unavailable"
 AGENT_SESSION_LLM_UNAVAILABLE_CODE = "llm_unavailable"
@@ -195,10 +194,6 @@ _MAX_CANONICAL_EVENT_TEXT_CHARS = 4_000
 # The agent-session authority Decision contract: its question, options and
 # prompt. It is recorded with every processed agent-session window.
 AGENT_SESSION_AUTHORITY_CONTRACT = "agent-session-authority-v1"
-# Requested output: one decision per candidate holds only its evidence ID and
-# authority kind with their JSON keys, with a floor for the envelope.
-AGENT_SESSION_AUTHORITY_DECISION_OUTPUT_TOKENS = 48
-AGENT_SESSION_AUTHORITY_MIN_OUTPUT_TOKENS = 1024
 AGENT_SESSION_AUTHORITY_TASK = DecisionTask("agent_session_authority", AGENT_SESSION_AUTHORITY_CONTRACT)
 
 
@@ -420,11 +415,7 @@ async def _classify_agent_session_authority(
                 for event in events
             ],
         )
-        max_tokens = max(
-            AGENT_SESSION_AUTHORITY_MIN_OUTPUT_TOKENS,
-            AGENT_SESSION_AUTHORITY_DECISION_OUTPUT_TOKENS * len(evidence_ids),
-        )
-        return LlmRequest(prompt, AgentSessionAuthorityResponse, max_tokens)
+        return LlmRequest(prompt, AgentSessionAuthorityResponse)
 
     def decode(generated: Any, _evidence_ids: tuple[str, ...], _context: tuple):
         response = (
@@ -1041,11 +1032,7 @@ async def submit_agent_session_window(
         )
 
     async def generate_proposal(prompt: str) -> AgentKnowledgePatchProposal:
-        request = LlmRequest(
-            prompt,
-            AgentKnowledgePatchModelResponse,
-            min(config.llm.enrichment_max_tokens, AGENT_SESSION_KNOWLEDGE_PATCH_MAX_TOKENS),
-        )
+        request = LlmRequest(prompt, AgentKnowledgePatchModelResponse)
 
         async def record_failure(exc: BaseException) -> None:
             await _record_window_outcome(

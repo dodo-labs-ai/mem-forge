@@ -23,7 +23,7 @@ from memforge.memory.evidence import (
     MemoryEvidenceItemProjection,
     MemoryEvidenceUnitProjection,
 )
-from memforge.memory.relation_classifier import MemoryPairClassificationPolicy, run_pair_items
+from memforge.memory.relation_classifier import run_pair_items
 from memforge.models import Memory
 from memforge.pipeline.evidence_fragments import (
     CanonicalFieldRange,
@@ -59,12 +59,6 @@ CROSS_DOCUMENT_RELATION_INPUT_VERSIONS = frozenset(
     {"cross-document-relation-v2", "cross-document-relation-v3", CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION}
 )
 CROSS_DOCUMENT_RELATION_TASK = DecisionTask("cross_document_relation", CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION)
-
-# Requested output per request: a response envelope plus one label-only row per
-# pair. A {"pair_index": ..., "label": ...} row is under 20 tokens with its JSON
-# punctuation; the allowance rounds it up to cover large pair indexes.
-_OUTPUT_BASE_TOKENS = 256
-_OUTPUT_TOKENS_PER_PAIR = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -533,10 +527,6 @@ def cross_document_relation_prompt(
     )
 
 
-def cross_document_relation_output_tokens(policy: MemoryPairClassificationPolicy, pair_count: int) -> int:
-    return min(policy.max_output_tokens, _OUTPUT_BASE_TOKENS + _OUTPUT_TOKENS_PER_PAIR * pair_count)
-
-
 class StructuredCrossDocumentRelationClassifier:
     """Label exact pairs with the Structured LLM; any pair left without a label fails the run.
 
@@ -550,11 +540,9 @@ class StructuredCrossDocumentRelationClassifier:
         *,
         client: Any,
         model: str,
-        policy: MemoryPairClassificationPolicy | None = None,
     ) -> None:
         self._client = client
         self._model = decision_task_model(client, CROSS_DOCUMENT_RELATION_TASK, model)
-        self._policy = policy or MemoryPairClassificationPolicy()
 
     async def classify(
         self,
@@ -594,11 +582,7 @@ class StructuredCrossDocumentRelationClassifier:
                 subject,
                 [(int(item_id), asked[int(item_id)].candidate) for item_id in item_ids],
             )
-            return LlmRequest(
-                prompt,
-                CrossDocumentRelationResponse,
-                cross_document_relation_output_tokens(self._policy, len(item_ids)),
-            )
+            return LlmRequest(prompt, CrossDocumentRelationResponse)
 
         def decode(response: CrossDocumentRelationResponse, _item_ids: tuple[str, ...], _context: tuple):
             """Each decision is its pair's row; the runner rejects an unrequested pair_index."""
