@@ -166,14 +166,20 @@ export function useReReadPreview(sourceId: string | null) {
   });
 }
 
-/** Queues a re-read of every current document of a source with the current models. */
+/**
+ * Queues a re-read of a source with the current models: of the documents
+ * named, or, with none named, of every current document.
+ */
 export function useReReadSource() {
   const api = useApi();
-  return useSourceMutation((sourceId: string) =>
+  return useSourceMutation(({ sourceId, documentIds }: { sourceId: string; documentIds: string[] | null }) =>
     unwrap(
       api.POST("/api/v1/sources/{source_id}/reprocess", {
         params: { path: { source_id: sourceId } },
-        body: { all_documents: true, dry_run: false },
+        body:
+          documentIds === null
+            ? { all_documents: true, dry_run: false }
+            : { document_ids: documentIds, all_documents: false, dry_run: false },
       }),
     ),
   );

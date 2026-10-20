@@ -20,12 +20,15 @@ export function ReReadImagesDialog({ documentCount, onOpenChange }: ReReadImages
 
   async function confirm() {
     const queued = await reRead.mutateAsync();
-    toast.success(`Re-reading ${pluralize(queued.document_count, "document")}`, {
-      description:
-        (queued.unqueued ?? []).length > 0
-          ? "Some sources are busy. Re-read them later from their menu on the Sources page."
-          : "See progress on the Sources page.",
-    });
+    const later = "Re-read them later from their menu on the Sources page.";
+    if (queued.document_count === 0) {
+      toast.warning("No documents are being re-read", { description: `Their sources are busy. ${later}` });
+    } else {
+      toast.success(`Re-reading ${pluralize(queued.document_count, "document")}`, {
+        description:
+          (queued.unqueued ?? []).length > 0 ? `Some sources are busy. ${later}` : "See progress on the Sources page.",
+      });
+    }
   }
 
   return (

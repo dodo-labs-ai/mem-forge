@@ -191,6 +191,7 @@ from memforge.runtime import (
     DefaultRuntimeProvider,
     RuntimeHealthComponent,
     RuntimeProvider,
+    SourceNotActiveError,
     SourceSyncBoundaryError,
     SourceSyncWorker,
     SourceSyncUnsupportedError,
@@ -2164,7 +2165,19 @@ class ImageDocumentsResponse(BaseModel):
 
 class UnqueuedSource(BaseModel):
     source_id: str
-    reason: str = Field(description="Why the Source's reprocess was not queued, such as a run already pending.")
+    reason: Literal[
+        "source_busy",
+        "source_paused",
+        "source_not_active",
+        "source_not_synced",
+        "projection_scope_transition_open",
+    ] = Field(
+        description=(
+            "Why the Source's reprocess was not queued: another run is pending or running, the "
+            "Source is paused or no longer active, it has not completed a sync, or its projection "
+            "scope is changing."
+        ),
+    )
 
 
 class ImageDocumentsReprocessResponse(BaseModel):
@@ -6520,7 +6533,9 @@ def create_admin_app(
 
         It is what a model that newly reads images needs, since a sync reads only
         Documents that changed. A Source whose run cannot be queued now, such as
-        one with a run already pending, is reported and left as it is.
+        one with a run already pending, is reported and left as it is. A queued
+        Document that cannot be reprocessed from what was stored is recorded as
+        a failed item of its run.
         """
         documents = await image_documents_by_source(
             db,
@@ -6539,8 +6554,14 @@ def create_admin_app(
             except SourcePausedError:
                 unqueued.append(UnqueuedSource(source_id=source_id, reason="source_paused"))
                 continue
-            except (SourceActivityConflict, SourceSyncBoundaryError, ValueError) as exc:
-                unqueued.append(UnqueuedSource(source_id=source_id, reason=str(exc)))
+            except SourceNotActiveError:
+                unqueued.append(UnqueuedSource(source_id=source_id, reason="source_not_active"))
+                continue
+            except SourceActivityConflict:
+                unqueued.append(UnqueuedSource(source_id=source_id, reason="source_busy"))
+                continue
+            except SourceSyncBoundaryError:
+                unqueued.append(UnqueuedSource(source_id=source_id, reason="source_not_synced"))
                 continue
             queued_documents += len(document_ids)
             queued_sources += 1
@@ -8424,9 +8445,11 @@ def create_admin_app(
 
         A Source that can ask its provider for one Document by id reads each
         Document's current state from the provider; any other Source reads the
-        stored input, so it needs no local daemon. ``dry_run`` reports what the
-        run would read and an estimate of its model calls without writing or
-        contacting the provider.
+        stored input, so it needs no local daemon. ``all_documents`` takes every
+        current Document of the Source. ``dry_run`` reports what the run would
+        read and an estimate of its model calls without writing or contacting
+        the provider. A queued Document the run cannot reprocess is recorded as
+        a failed item of the run.
         """
         source = await db.get_source(source_id)
         if not source:
@@ -8438,12 +8461,14 @@ def create_admin_app(
             if req.document_ids:
                 raise HTTPException(status_code=400, detail="document_ids_with_all_documents")
             document_ids = tuple(sorted(await db.list_indexed_doc_ids(source_id)))
+            if not document_ids:
+                raise HTTPException(status_code=409, detail="source_has_no_documents")
         else:
             document_ids = tuple(
                 dict.fromkeys(document_id.strip() for document_id in req.document_ids if document_id.strip())
             )
-        if not document_ids:
-            raise HTTPException(status_code=400, detail="document_ids_required")
+            if not document_ids:
+                raise HTTPException(status_code=400, detail="document_ids_required")
         if await db.get_open_projection_scope_transition(source_id) is not None:
             raise HTTPException(status_code=409, detail="projection_scope_transition_open")
         if req.dry_run:

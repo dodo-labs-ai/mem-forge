@@ -9776,7 +9776,14 @@
       "UnqueuedSource": {
         "properties": {
           "reason": {
-            "description": "Why the Source's reprocess was not queued, such as a run already pending.",
+            "description": "Why the Source's reprocess was not queued: another run is pending or running, the Source is paused or no longer active, it has not completed a sync, or its projection scope is changing.",
+            "enum": [
+              "source_busy",
+              "source_paused",
+              "source_not_active",
+              "source_not_synced",
+              "projection_scope_transition_open"
+            ],
             "title": "Reason",
             "type": "string"
           },
@@ -14674,7 +14681,7 @@
     },
     "/api/v1/sources/image-documents/reprocess": {
       "post": {
-        "description": "Queue a reprocess of the Documents with an image, one run per Source.\n\nIt is what a model that newly reads images needs, since a sync reads only\nDocuments that changed. A Source whose run cannot be queued now, such as\none with a run already pending, is reported and left as it is.",
+        "description": "Queue a reprocess of the Documents with an image, one run per Source.\n\nIt is what a model that newly reads images needs, since a sync reads only\nDocuments that changed. A Source whose run cannot be queued now, such as\none with a run already pending, is reported and left as it is. A queued\nDocument that cannot be reprocessed from what was stored is recorded as\na failed item of its run.",
         "operationId": "reprocess_image_documents_api_v1_sources_image_documents_reprocess_post",
         "responses": {
           "202": {
@@ -15962,7 +15969,7 @@
     },
     "/api/v1/sources/{source_id}/reprocess": {
       "post": {
-        "description": "Reprocess the Source Units of these Documents with the current adapter and compiler.\n\nA Source that can ask its provider for one Document by id reads each\nDocument's current state from the provider; any other Source reads the\nstored input, so it needs no local daemon. ``dry_run`` reports what the\nrun would read and an estimate of its model calls without writing or\ncontacting the provider.",
+        "description": "Reprocess the Source Units of these Documents with the current adapter and compiler.\n\nA Source that can ask its provider for one Document by id reads each\nDocument's current state from the provider; any other Source reads the\nstored input, so it needs no local daemon. ``all_documents`` takes every\ncurrent Document of the Source. ``dry_run`` reports what the run would\nread and an estimate of its model calls without writing or contacting\nthe provider. A queued Document the run cannot reprocess is recorded as\na failed item of the run.",
         "operationId": "reprocess_source_documents_api_v1_sources__source_id__reprocess_post",
         "parameters": [
           {

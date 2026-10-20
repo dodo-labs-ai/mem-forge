@@ -54,7 +54,7 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRe
           </DropdownMenuItem>
           <DropdownMenuItem
             className="items-start"
-            disabled={!canSync || !sync.enabled}
+            disabled={!capabilities?.can_configure || source.status !== "active" || !sync.enabled}
             onClick={() => onReRead(source)}
           >
             <span className="flex flex-col gap-0.5">
