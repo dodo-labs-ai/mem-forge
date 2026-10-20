@@ -881,18 +881,13 @@ class MemoryEvidenceDocumentDetail(BaseModel):
 
 
 class MemoryEvidenceArtifactDetail(BaseModel):
+    """The Artifact an Evidence item cites; its item holds the Observation, role and digest."""
+
     artifact_id: str
-    observation_id: str
-    observation_revision_id: str
     parent_observation_id: str
-    evidence_reference_id: str
-    evidence_unit_id: str
-    evidence_role: str
     filename: str
     content_type: str
     size_bytes: int
-    sha256: str
-    summary: str | None = None
     url: str
 
 
@@ -3486,21 +3481,10 @@ def _memory_evidence_unit_detail(
             metadata = dict(item.artifact_metadata)
             artifact = MemoryEvidenceArtifactDetail(
                 artifact_id=str(metadata.get("artifact_id") or item.anchor.observation_id),
-                observation_id=item.anchor.observation_id,
-                observation_revision_id=item.anchor.observation_revision_id,
                 parent_observation_id=str(metadata.get("parent_observation_id") or ""),
-                evidence_reference_id=item.reference_id,
-                evidence_unit_id=group.evidence_unit_id,
-                evidence_role=item.role.value,
                 filename=str(metadata.get("filename") or "artifact"),
                 content_type=str(metadata.get("media_type") or "application/octet-stream"),
                 size_bytes=int(metadata.get("size_bytes") or 0),
-                sha256=item.raw_content_sha256,
-                summary=(
-                    str(metadata["summary"])
-                    if metadata.get("summary") is not None
-                    else None
-                ),
                 url=(
                     "/api/v1/source-artifacts/"
                     + quote(item.anchor.observation_revision_id, safe="")

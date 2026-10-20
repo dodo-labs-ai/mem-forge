@@ -89,7 +89,6 @@ from memforge.source_projection import (
     SourceProjection,
     SourceProjectionAdapter,
     SourceRelationType,
-    with_source_artifact_summaries,
 )
 from memforge.source_artifacts import (
     StoredSourceArtifact,
@@ -2487,10 +2486,6 @@ class GeneSyncOrchestrator:
                 recovery_commit.superseded_derivation_id,
                 reason_code=DERIVATION_INPUT_SUPERSEDED,
             )
-        projection = with_source_artifact_summaries(
-            projection,
-            extraction.artifact_summaries,
-        )
         source_updated_at = (
             datetime.fromisoformat(context.source_updated_at) if context.source_updated_at is not None else None
         )
@@ -3405,10 +3400,6 @@ class GeneSyncOrchestrator:
         if extraction_result.error_type:
             raise _memory_extraction_error(doc_id=doc_id, extraction=extraction_result)
         diagnostics.skipped_reading_group_count = _skipped_reading_group_count(extraction_result)
-        projection = with_source_artifact_summaries(
-            projection,
-            extraction_result.artifact_summaries,
-        )
         logger.debug(
             "Extracted %d raw memories from %s",
             len(raw_memories),

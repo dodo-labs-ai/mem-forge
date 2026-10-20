@@ -3899,32 +3899,21 @@ export interface components {
             /** Visibility */
             visibility: string;
         };
-        /** MemoryEvidenceArtifactDetail */
+        /**
+         * MemoryEvidenceArtifactDetail
+         * @description The Artifact an Evidence item cites; its item holds the Observation, role and digest.
+         */
         MemoryEvidenceArtifactDetail: {
             /** Artifact Id */
             artifact_id: string;
             /** Content Type */
             content_type: string;
-            /** Evidence Reference Id */
-            evidence_reference_id: string;
-            /** Evidence Role */
-            evidence_role: string;
-            /** Evidence Unit Id */
-            evidence_unit_id: string;
             /** Filename */
             filename: string;
-            /** Observation Id */
-            observation_id: string;
-            /** Observation Revision Id */
-            observation_revision_id: string;
             /** Parent Observation Id */
             parent_observation_id: string;
-            /** Sha256 */
-            sha256: string;
             /** Size Bytes */
             size_bytes: number;
-            /** Summary */
-            summary?: string | null;
             /** Url */
             url: string;
         };

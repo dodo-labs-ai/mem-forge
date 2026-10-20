@@ -17,7 +17,7 @@ from typing import Any, Literal
 from memforge.evals.agent_evaluation import AgentRuntimeBundle
 from memforge.memory.evidence import ResolvedEvidenceSelection
 from memforge.source_activity import SourceActivityLease
-from memforge.source_artifacts import RawSourceArtifact, SourceArtifactSummary
+from memforge.source_artifacts import RawSourceArtifact
 
 # ---------------------------------------------------------------------------
 # Entity name canonicalization
@@ -389,7 +389,6 @@ class MemoryExtractionResult:
     """Output of Call 2 (memory extraction)."""
 
     memories: list[RawMemory] = field(default_factory=list)
-    artifact_summaries: tuple[SourceArtifactSummary, ...] = ()
     protected_source_observation_ids: tuple[str, ...] = ()
     derivation_id: str | None = None
     error_type: str | None = None
