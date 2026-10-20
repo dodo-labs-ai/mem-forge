@@ -669,6 +669,41 @@ async def test_a_json_repository_file_is_read_as_file_text(package_kind):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content_type", "attested"),
+    [("image/png", True), ("text/markdown", False)],
+    ids=["image_file", "text_file"],
+)
+async def test_a_stored_image_file_is_rebuilt_as_the_empty_text_its_fetch_attested(content_type, attested):
+    item = ContentItem(
+        item_id="github-repo-src-diagram",
+        title="diagram",
+        source_url="https://github.example.test/payroll/architecture/blob/main/docs/diagram.png",
+        last_modified=datetime(2026, 7, 7, tzinfo=timezone.utc),
+        content_type=content_type,
+        extra={
+            "connection_mode": "cloud_pull",
+            "repo_url": "https://github.example.test/payroll/architecture",
+            "relative_path": "docs/diagram.png",
+        },
+    )
+    gene = GitHubRepoGene(
+        config={"connection_mode": "cloud_pull", "repo_url": "https://github.example.test/payroll/architecture"},
+        source_id="src-github-repo",
+    )
+
+    stored = gene.raw_from_stored_input(item, b"", content_type)
+
+    assert stored.authoritative_empty is attested
+    if attested:
+        require_attested_content(stored, await gene.normalize(stored))
+        assert stored.empty_evidence == "github_binary_file_has_no_text_body"
+    else:
+        with pytest.raises(ValueError, match="did not attest"):
+            require_attested_content(stored, await gene.normalize(stored))
+
+
+@pytest.mark.asyncio
 async def test_local_push_explicit_empty_manifest_does_not_fall_back_to_inbox(tmp_path):
     (tmp_path / "stale.json").write_text(
         '{"package_kind":"github_repo_document","doc_id":"stale"}',

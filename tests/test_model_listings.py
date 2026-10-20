@@ -33,6 +33,7 @@ LISTINGS = {
                     "created_at": "2026-09-21T00:00:00Z",
                     "max_input_tokens": 200000,
                     "max_tokens": 64000,
+                    "capabilities": {"image_input": {"supported": True}, "pdf_input": {"supported": True}},
                 }
             ],
             "has_more": False,
@@ -44,6 +45,7 @@ LISTINGS = {
                     label="Claude Haiku 5.5",
                     context_window_tokens=200000,
                     max_output_tokens=64000,
+                    image_input=True,
                 )
             ]
         },
@@ -57,6 +59,7 @@ LISTINGS = {
                     "context_length": 200000,
                     "top_provider": {"max_completion_tokens": 64000},
                     "supported_parameters": ["max_tokens", "structured_outputs", "tools"],
+                    "architecture": {"input_modalities": ["text", "image", "file"], "output_modalities": ["text"]},
                 },
                 {
                     "id": "qwen/qwen3-32b",
@@ -64,6 +67,7 @@ LISTINGS = {
                     "context_length": 40960,
                     "top_provider": {"max_completion_tokens": None},
                     "supported_parameters": ["max_tokens", "tools"],
+                    "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
                 },
             ]
         },
@@ -75,15 +79,18 @@ LISTINGS = {
                     context_window_tokens=200000,
                     max_output_tokens=64000,
                     native_schema=True,
+                    image_input=True,
                 ),
                 DeclaredModel(
                     id="qwen/qwen3-32b",
                     label="Qwen: Qwen3 32B",
                     context_window_tokens=40960,
                     native_schema=False,
+                    image_input=False,
                 ),
             ],
-            # The embedding listing has the same entry shape; schema support is a generation matter.
+            # The embedding listing has the same entry shape; schema support and image input are
+            # generation matters.
             "embedding": [
                 DeclaredModel(
                     id="anthropic/claude-haiku-5.5",
@@ -105,6 +112,12 @@ LISTINGS = {
                     "capabilities": ["completion", "tools", "thinking"],
                 },
                 {
+                    "name": "gemma3:4b",
+                    "model": "gemma3:4b",
+                    "details": {"family": "gemma3", "families": ["gemma3"]},
+                    "capabilities": ["completion", "vision"],
+                },
+                {
                     "name": "nomic-embed-text:latest",
                     "model": "nomic-embed-text:latest",
                     "details": {"family": "nomic-bert", "families": ["nomic-bert"]},
@@ -112,7 +125,11 @@ LISTINGS = {
             ]
         },
         {
-            "generation": [DeclaredModel(id="qwen3:0.6b", kinds=frozenset({"generation"}))],
+            "generation": [
+                DeclaredModel(id="qwen3:0.6b", kinds=frozenset({"generation"}), image_input=False),
+                DeclaredModel(id="gemma3:4b", kinds=frozenset({"generation"}), image_input=True),
+            ],
+            # An entry without capabilities declares nothing about images.
             "embedding": [DeclaredModel(id="nomic-embed-text:latest", kinds=frozenset({"embedding"}))],
         },
     ),
@@ -169,6 +186,7 @@ def test_a_listing_says_it_gives_exactly_what_its_entries_declare(provider_id) -
         model.context_window_tokens is not None or model.max_output_tokens is not None for model in models
     )
     assert listing.gives_native_schema == any(model.native_schema is not None for model in models)
+    assert listing.gives_image_input == any(model.image_input is not None for model in models)
 
 
 def test_a_listing_reads_only_the_fields_its_provider_writes() -> None:

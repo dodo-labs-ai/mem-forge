@@ -15,7 +15,12 @@ from memforge.config import AppConfig, SyncConfig
 from memforge.models import ContentItem, GeneMetadata, NormalizedContent, RawContent, SyncState
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.source_projection_adapters import DEFAULT_SOURCE_PROJECTION_ADAPTER
-from memforge.pipeline.stored_document import reprocess_preview
+from memforge.pipeline.stored_document import (
+    StoredDocumentUnavailable,
+    StoredDocumentUnavailableReason,
+    load_stored_source_document,
+    reprocess_preview,
+)
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
 from memforge.runtime import SourceSyncWorker, SyncService
 from memforge.source_activity import SourceSyncRunActive
@@ -222,6 +227,25 @@ async def test_reprocess_reads_the_stored_unit_at_its_current_revision_without_t
     # Other Units are not read, and nothing is inferred removed.
     assert await db.get_current_source_unit_revision((await harness.unit("PAY-2")).id) == untouched_revision
     assert await db.get_document(doc_id("PAY-2")) is not None
+
+
+@pytest.mark.asyncio
+async def test_stored_input_with_no_text_is_read_when_its_revision_has_artifacts(db):
+    harness = await synced(db)
+    for key in (ARTIFACT_ISSUE, "PAY-2"):
+        stored = await _unit_input(db, SOURCE_ID, doc_id(key))
+        harness.store.source_artifacts[stored.raw_content_uri] = b""
+
+    with_artifact = await load_stored_source_document(
+        db, harness.store, harness.gene, source_id=SOURCE_ID, document_id=doc_id(ARTIFACT_ISSUE),
+    )
+    with pytest.raises(StoredDocumentUnavailable) as without_artifact:
+        await load_stored_source_document(
+            db, harness.store, harness.gene, source_id=SOURCE_ID, document_id=doc_id("PAY-2"),
+        )
+
+    assert [artifact.media_type for artifact in with_artifact.artifacts] == ["image/png"]
+    assert without_artifact.value.reason is StoredDocumentUnavailableReason.CONTENT_EMPTY
 
 
 @pytest.mark.asyncio
