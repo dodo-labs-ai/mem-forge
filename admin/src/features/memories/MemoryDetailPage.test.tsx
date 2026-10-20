@@ -69,10 +69,8 @@ test("content, PDF and artifact links retain the selected workspace while source
   const group = memory.evidence![0]!;
   group.document!.pdf_url = "/api/v1/source-units/su-1/pdf";
   group.items[0]!.artifact = {
-    artifact_id: "artifact-1", content_type: "application/pdf", evidence_reference_id: "eref-1",
-    evidence_role: "primary", evidence_unit_id: "eu-1", filename: "evidence.pdf",
-    observation_id: "obs-1", observation_revision_id: "obsrev-1", parent_observation_id: "parent-1",
-    sha256: "a".repeat(64), size_bytes: 10, url: "/api/v1/evidence-units/eu-1/artifacts/eref-1",
+    artifact_id: "artifact-1", content_type: "application/pdf", filename: "evidence.pdf",
+    parent_observation_id: "parent-1", size_bytes: 10, url: "/api/v1/evidence-units/eu-1/artifacts/eref-1",
   };
   renderRoutes([{ path: "/memories/:memoryId", element: <MemoryDetailPage /> }], {
     path: `/memories/${memory.id}`,

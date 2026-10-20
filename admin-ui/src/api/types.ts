@@ -99,8 +99,6 @@ export interface MemoryEvidenceArtifact {
   filename: string;
   content_type: string;
   size_bytes: number;
-  sha256: string;
-  summary: string | null;
   url: string;
 }
 

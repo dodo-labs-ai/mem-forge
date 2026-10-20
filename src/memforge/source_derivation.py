@@ -58,7 +58,7 @@ from memforge.pipeline.projection_context import (
 )
 from memforge.pipeline.projection_fragments import FragmentSelectionErrorCode
 from memforge.pipeline.revision_assessment import REVISION_INPUT_POLICY
-from memforge.source_artifacts import SOURCE_ARTIFACT_OBSERVATION_TYPE, SourceArtifactSummary
+from memforge.source_artifacts import SOURCE_ARTIFACT_OBSERVATION_TYPE
 from memforge.source_projection import (
     AnchorKind,
     SourceAnchor,
@@ -1025,13 +1025,6 @@ def memory_extraction_output_payload(
         raise ValueError("failed derivation batches have no reusable output payload")
     return {
         "memories": [_raw_memory_payload(memory) for memory in result.memories],
-        "artifact_summaries": [
-            {
-                "source_observation_id": summary.source_observation_id,
-                "summary": summary.summary,
-            }
-            for summary in result.artifact_summaries
-        ],
         "evidence_telemetry": _safe_evidence_telemetry(result.metadata),
     }
 
@@ -1042,8 +1035,7 @@ def memory_extraction_result_from_output_payload(
     """Restore one previously validated derivation batch result."""
 
     raw_memories = payload.get("memories")
-    raw_summaries = payload.get("artifact_summaries")
-    if not isinstance(raw_memories, list) or not isinstance(raw_summaries, list):
+    if not isinstance(raw_memories, list):
         raise ValueError("Source derivation output payload is invalid")
     memories = []
     for value in raw_memories:
@@ -1073,19 +1065,8 @@ def memory_extraction_result_from_output_payload(
                 ),
             )
         )
-    summaries = []
-    for value in raw_summaries:
-        if not isinstance(value, Mapping):
-            raise ValueError("Source derivation Artifact summary payload is invalid")
-        summaries.append(
-            SourceArtifactSummary(
-                source_observation_id=str(value.get("source_observation_id") or ""),
-                summary=str(value.get("summary") or ""),
-            )
-        )
     return MemoryExtractionResult(
         memories=memories,
-        artifact_summaries=tuple(summaries),
         metadata=_safe_evidence_telemetry(payload.get("evidence_telemetry")),
     )
 
@@ -1319,11 +1300,6 @@ def _projection_identity_payload(
             for value in values:
                 if isinstance(value, dict):
                     value["observed_at"] = None
-                    metadata = value.get("metadata")
-                    if isinstance(metadata, dict):
-                        source_artifact = metadata.get("source_artifact")
-                        if isinstance(source_artifact, dict):
-                            source_artifact.pop("summary", None)
     return identity
 
 
@@ -1391,25 +1367,11 @@ def assemble_source_derivation_results(
     )
     memories: list[RawMemory] = []
     failures: list[MemoryExtractionResult] = []
-    summaries_by_observation_id: dict[str, SourceArtifactSummary] = {}
-    invalid_summary_count = 0
-    projected_image_ids = {
-        revision.observation_id
-        for revision in projection.observation_revisions
-        if isinstance(revision.metadata.get("source_artifact"), Mapping)
-        and str(revision.metadata["source_artifact"].get("media_type") or "").startswith("image/")
-    }
     for result in results:
         if result.error_type:
             failures.append(result)
             continue
         memories.extend(result.memories)
-        for summary in result.artifact_summaries:
-            observation_id = summary.source_observation_id
-            if observation_id not in projected_image_ids or observation_id in summaries_by_observation_id:
-                invalid_summary_count += 1
-                continue
-            summaries_by_observation_id[observation_id] = summary
     incomplete = len(results) != len(plan.requests)
     if failures or incomplete:
         first = failures[0] if failures else None
@@ -1425,18 +1387,15 @@ def assemble_source_derivation_results(
                 "safe_error_code": (first.metadata.get("safe_error_code") if first else "EXTRACTION_WORK_INCOMPLETE"),
                 "safe_validation_fields": (first.metadata.get("safe_validation_fields", []) if first else []),
                 "lifecycle_mutation_skipped": True,
-                "discarded_invalid_artifact_summary_count": (invalid_summary_count),
             },
         )
     return MemoryExtractionResult(
         memories=memories,
-        artifact_summaries=tuple(summaries_by_observation_id.values()),
         protected_source_observation_ids=protected_observation_ids,
         metadata={
             **metrics,
             "batch_count": len(results),
             "failed_batch_count": 0,
-            "discarded_invalid_artifact_summary_count": invalid_summary_count,
         },
     )
 
@@ -1459,9 +1418,6 @@ def aggregate_extraction_metrics(
         "extraction_queue_wait_ms",
         "input_binary_bytes",
         "multimodal_calls",
-        "artifact_summary_count",
-        "discarded_orphan_artifact_summary_count",
-        "discarded_invalid_artifact_summary_count",
         *_EVIDENCE_TELEMETRY_COUNTS,
     )
     aggregated: dict[str, object] = {
