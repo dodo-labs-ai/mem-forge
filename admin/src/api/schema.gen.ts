@@ -4949,6 +4949,11 @@ export interface components {
                 [key: string]: string[];
             };
             /**
+             * Sets Context Window
+             * @description Whether every generation request asks the provider for the context window the binding states, so that the window is what the serving machine holds rather than the model's own.
+             */
+            sets_context_window: boolean;
+            /**
              * Token Limits
              * @description The token limits a binding of each served kind may state for its model: context_window_tokens and max_output_tokens for a generation model.
              */

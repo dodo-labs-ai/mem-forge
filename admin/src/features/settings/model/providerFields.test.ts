@@ -46,6 +46,24 @@ test("only a generation model states token limits, each named in tokens", () => 
   expect(tokenLimitField("max_output_tokens", { required: true }).label).toBe("Maximum output");
 });
 
+test("a provider that opens the window each request asks for says the window costs the server memory", () => {
+  const ollama = providerById("ollama");
+  const window = tokenLimitField("context_window_tokens", {
+    required: true,
+    setsContextWindow: ollama.sets_context_window,
+  });
+
+  expect(window.label).toBe("Context window");
+  expect(window.hint).toMatch(/the window the server opens for every request.*more of the server's memory/);
+  expect(
+    tokenLimitField("context_window_tokens", { required: true, setsContextWindow: providerById("openai").sets_context_window })
+      .hint,
+  ).toBe("In tokens: the most the model takes in one request, its answer included.");
+  expect(tokenLimitField("max_output_tokens", { required: true, setsContextWindow: true }).hint).toBe(
+    "In tokens: the most the model writes in one answer.",
+  );
+});
+
 test("a token limit is marked optional until validation finds that the model needs it", () => {
   expect(tokenLimitField("context_window_tokens", { required: false }).label).toBe("Context window (optional)");
   expect(tokenLimitLabel("max_output_tokens")).toBe("Maximum output");

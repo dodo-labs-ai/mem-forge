@@ -6883,6 +6883,11 @@
             "title": "Parameters",
             "type": "object"
           },
+          "sets_context_window": {
+            "description": "Whether every generation request asks the provider for the context window the binding states, so that the window is what the serving machine holds rather than the model's own.",
+            "title": "Sets Context Window",
+            "type": "boolean"
+          },
           "token_limits": {
             "additionalProperties": {
               "items": {
@@ -6911,6 +6916,7 @@
           "model_is_route",
           "lists_models",
           "lists_token_limits",
+          "sets_context_window",
           "options",
           "parameters",
           "token_limits"

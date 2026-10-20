@@ -10,7 +10,9 @@
   rejected with `output_capacity_exceeded`.
   - An Ollama binding states its context window, and every request asks Ollama
     for it as `num_ctx`. The window is no longer read from the Ollama server,
-    so validating an Ollama model always asks for the token limits.
+    so validating an Ollama model always asks for the token limits. The
+    provider list gains `sets_context_window`, and Settings says, for such a
+    provider, that the window costs the server memory.
   - `MEMFORGE_ENRICHMENT_MAX_TOKENS` and `MEMFORGE_MEMORY_EXTRACTION_MAX_TOKENS`
     set nothing and log a warning. `MEMFORGE_LLM_MAX_OUTPUT_TOKENS` or the
     binding's maximum output bounds the output.

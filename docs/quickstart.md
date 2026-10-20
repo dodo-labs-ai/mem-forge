@@ -271,7 +271,9 @@ model server; a context window of 32768 and a maximum output of 4096 are
 typical for a local model. Ollama runs every request in the context window
 the request asks for, so for Ollama this step appears for every model, and MemForge
 asks for the window you enter: set it no larger than the model supports and
-your machine can hold. For an OpenAI-compatible server such as vLLM or
+your machine can hold. A larger window takes more memory; while a request
+runs, `ollama ps` shows the window under CONTEXT and, under PROCESSOR, whether
+the model still fits on the GPU. For an OpenAI-compatible server such as vLLM or
 llama.cpp, the window is the one the server was started with; enter that
 number. A quarter of the window is kept for the answer, so a window of 8192
 leaves a request about 3,900 tokens of input; a window of 16384 or more suits

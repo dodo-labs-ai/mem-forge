@@ -577,6 +577,7 @@ export function ModelForm({ kind, title, settings, providers, vectorIndex, onUns
                   names={limitNames}
                   missing={stored !== null && needsTokenLimits(stored)}
                   listedBy={limitsFromList}
+                  setsContextWindow={provider.sets_context_window}
                 />
               ) : null}
             </>
