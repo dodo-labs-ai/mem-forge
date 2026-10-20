@@ -110,12 +110,6 @@ def _sends_nothing(route: str) -> dict[str, Any]:
     return {}
 
 
-def _applies_no_window(context_window: int) -> dict[str, Any]:
-    """Apply nothing: the provider fixes the window, by model or when its server
-    starts, and refuses a request that does not fit it."""
-    return {}
-
-
 def _ollama_num_ctx(context_window: int) -> dict[str, Any]:
     """Ollama's ``num_ctx`` option, which LiteLLM passes through to the request.
 
@@ -250,9 +244,12 @@ class ProviderDescriptor:
     # The SDK keyword arguments that ask the generation model at a route to
     # answer without reasoning first, as LiteLLM passes them to this provider.
     reasoning_off: Callable[[str], dict[str, Any]] = _sends_nothing
-    # The SDK keyword arguments that hold the provider to the context window a
-    # generation request is sized by.
-    context_window: Callable[[int], dict[str, Any]] = _applies_no_window
+    # The SDK keyword arguments that set the context window of a generation
+    # request, for a provider that sizes the window per request; ``None`` for a
+    # provider that fixes it, by model or when its server starts. A window set
+    # per request is the one the binding states: it is what the operator's
+    # machine holds, which the model's own window does not tell.
+    context_window: Callable[[int], dict[str, Any]] | None = None
     # The kinds whose requests go to the provider's OpenAI-compatible API, with
     # the path of that API after the base URL. They are sent on LiteLLM's
     # ``openai/`` route, which carries the API key and the timeout of every

@@ -10,8 +10,10 @@ from datetime import datetime, timezone
 import pytest
 
 from memforge.models import ContentItem, NormalizedContent, RawContent
+from memforge.llm.batch_runner import OUTPUT_CAPACITY_EXCEEDED
 from memforge.llm.structured import (
     INPUT_CAPACITY_EXCEEDED,
+    OUTPUT_TRUNCATED,
     LiteLlmStructuredClient,
     ProjectionFragmentMemoryExtractionResponse,
     StructuredLlmConfig,
@@ -260,7 +262,21 @@ async def test_a_multi_item_request_that_times_out_is_halved_and_every_item_comp
 
 
 @pytest.mark.asyncio
-async def test_a_reading_group_the_provider_rejects_alone_is_skipped_locally():
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (
+            StructuredLlmError("too large", terminal_category="provider_error", error_code=INPUT_CAPACITY_EXCEEDED),
+            INPUT_CAPACITY_EXCEEDED,
+        ),
+        (
+            StructuredLlmError("cut off", terminal_category="invalid_response", error_code=OUTPUT_TRUNCATED),
+            OUTPUT_CAPACITY_EXCEEDED,
+        ),
+    ],
+    ids=["input", "output"],
+)
+async def test_a_reading_group_beyond_the_route_capacity_alone_is_skipped_locally(error, reason, caplog):
     projection = _projection(
         primary_content="Rule one applies.\n\nRule two is far too large.\n", context_content="Country: US.\n",
     )
@@ -272,9 +288,7 @@ async def test_a_reading_group_the_provider_rejects_alone_is_skipped_locally():
                 "\n</evidence_fragment_catalog>", 1)[0])
             rows = payload["primary_candidates"]
             if any("too large" in row[1] for row in rows):
-                raise StructuredLlmError(
-                    "too large", terminal_category="provider_error", error_code=INPUT_CAPACITY_EXCEEDED,
-                )
+                raise error
             ref, text = rows[0][0], rows[0][1]
             return ProjectionFragmentMemoryExtractionResponse.model_validate({"memories": [
                 {"content": text.strip(), "memory_type": "fact", "primary_ref": ref, "required_refs": [], "evidence_displays": evidence_displays(ref, [])},
@@ -282,13 +296,15 @@ async def test_a_reading_group_the_provider_rejects_alone_is_skipped_locally():
 
     extractor = MemoryExtractor(model="fixture", structured_llm_client=OverflowingClient(limit=40000))
     [request] = plan(projection, ExtractionAuthority({body_id(projection): None}), extractor=extractor)
-    result = await extractor.extract_projection_fragment_memories(
-        request.catalog, source_type="confluence", revision_context=context,
-    )
+    with caplog.at_level("WARNING", logger="memforge.pipeline.memory_extractor"):
+        result = await extractor.extract_projection_fragment_memories(
+            request.catalog, source_type="confluence", revision_context=context,
+        )
 
     assert result.error_type is None
     assert [m.content for m in result.memories] == ["Rule one applies."]
     assert result.metadata["skipped_reading_group_count"] == 1
+    assert f"reason={reason}" in caplog.text
 
 
 @pytest.mark.asyncio

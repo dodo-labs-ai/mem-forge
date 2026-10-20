@@ -686,7 +686,8 @@ class StructuredLlmConfig:
     # The extra request parameters of the resolved invocation.
     extra_params: Mapping[str, Any] = dataclass_field(default_factory=dict)
     # The provider descriptor of the resolved invocation, which says how a
-    # direct-answer request asks the model not to reason first.
+    # direct-answer request asks the model not to reason first and how a
+    # request states its context window.
     provider: str | None = None
 
     @classmethod
@@ -1804,11 +1805,12 @@ class LiteLlmStructuredClient:
     A schema that is a direct answer is requested with the parameters the
     provider descriptor gives for answering without reasoning first. A provider
     whose rejection of a request names those parameters is sent the request
-    without them, and is not sent them again for that model. A reply cut off at
-    its output limit after reasoning used most of that limit is requested once
-    more, with the limit raised by the reasoning it used, and the call's later
-    attempts keep the raised limit, so a model that reasons anyway still gets
-    the room its answer was sized for.
+    without them, and is not sent them again for that model.
+
+    Every request asks for the route's output capacity, and a request to a
+    provider that sizes the context window per request states the route's
+    window. A reply cut off at that capacity is an answer the route cannot
+    hold.
     """
 
     def __init__(
@@ -1852,7 +1854,13 @@ class LiteLlmStructuredClient:
 
         name = litellm_model_name(model or self.config.model)
         if name not in self._request_budgets:
-            self._request_budgets[name] = RequestBudget.resolve(name, self.config)
+            sized_per_request = (
+                self.config.provider is not None
+                and provider_descriptor(self.config.provider).context_window is not None
+            )
+            self._request_budgets[name] = RequestBudget.resolve(
+                name, self.config, catalog_window=not sized_per_request
+            )
         return self._request_budgets[name]
 
     @property
@@ -1920,7 +1928,6 @@ class LiteLlmStructuredClient:
         with structured_llm_metrics_scope(collector) as selected:
             yield selected
 
-
     async def answer_schema(
         self,
         prompt: str,
@@ -1936,7 +1943,6 @@ class LiteLlmStructuredClient:
 
     async def evaluate_revision_work(self, prompt, *, response_format, model=None, images=()):
         return await self._call_schema(prompt=prompt, response_format=response_format, model=model, images=images)
-
 
     async def assess_claim_revisions(
         self, prompt: str, *, model: str | None = None, images: StructuredImageInputs = (),
@@ -2424,13 +2430,15 @@ class LiteLlmStructuredClient:
             raise _InvalidModelOutput(type(exc).__name__) from exc
 
     def _context_window(self, model_name: str) -> dict[str, Any]:
-        """The parameters that hold the provider to the context window requests to ``model_name`` are sized by."""
+        """The parameters that set the context window of a request to ``model_name``, for a provider that sizes it per request."""
 
         if self.config.provider is None:
             return {}
         try:
-            window = self.request_budget(model_name).context_limit
-            return provider_descriptor(self.config.provider).context_window(window)
+            context_window = provider_descriptor(self.config.provider).context_window
+            if context_window is None:
+                return {}
+            return context_window(self.request_budget(model_name).context_limit)
         except (ModelConfigError, ValueError):
             return {}
 
@@ -2443,7 +2451,6 @@ class LiteLlmStructuredClient:
             return provider_descriptor(self.config.provider).reasoning_off(model_name)
         except ModelConfigError:
             return {}
-
 
     async def _completion_with_retries(
         self,

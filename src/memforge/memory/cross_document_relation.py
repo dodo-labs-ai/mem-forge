@@ -61,7 +61,6 @@ CROSS_DOCUMENT_RELATION_INPUT_VERSIONS = frozenset(
 CROSS_DOCUMENT_RELATION_TASK = DecisionTask("cross_document_relation", CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION)
 
 
-
 @dataclass(frozen=True, slots=True)
 class RelationSubject:
     """What the classifier sees of one Memory; identity stays out of the prompt.
