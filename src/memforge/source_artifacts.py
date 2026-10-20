@@ -35,7 +35,6 @@ MAX_SOURCE_ARTIFACT_IMAGE_PIXELS = 40_000_000
 # Base64 and request framing expand the provider payload. Bound the original
 # batch so the prepared wire request retains cross-endpoint headroom.
 MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH = 15 * 1024 * 1024
-MAX_SOURCE_ARTIFACT_SUMMARY_CHARS = 240
 SOURCE_ARTIFACT_STREAM_CHUNK_BYTES = 256 * 1024
 SOURCE_ARTIFACT_SPOOL_MEMORY_BYTES = 1024 * 1024
 # The image media types a model request can carry, with the encoding each one's bytes must have.
@@ -279,27 +278,6 @@ class StoredSourceArtifact:
 
 
 @dataclass(frozen=True, slots=True)
-class SourceArtifactSummary:
-    """Agent selection hint produced for one supplied Artifact Observation."""
-
-    source_observation_id: str
-    summary: str
-
-    def __post_init__(self) -> None:
-        observation_id = self.source_observation_id.strip()
-        summary = " ".join(self.summary.split())
-        if not observation_id:
-            raise SourceArtifactContractError("Source Artifact summary requires an Observation id")
-        if not summary or len(summary) > MAX_SOURCE_ARTIFACT_SUMMARY_CHARS:
-            raise SourceArtifactContractError(
-                "Source Artifact summary must be between 1 and "
-                f"{MAX_SOURCE_ARTIFACT_SUMMARY_CHARS} characters"
-            )
-        object.__setattr__(self, "source_observation_id", observation_id)
-        object.__setattr__(self, "summary", summary)
-
-
-@dataclass(frozen=True, slots=True)
 class SourceArtifactRevision:
     """One immutable Artifact revision reconstructed from Source Projection."""
 
@@ -317,7 +295,6 @@ class SourceArtifactRevision:
     uri: str
     inference_eligible: bool
     inference_ineligible_reason: str | None = None
-    summary: str | None = None
 
     @property
     def resource_url(self) -> str:
@@ -338,7 +315,6 @@ class SourceArtifactRevision:
             "sha256": self.sha256,
             "inference_eligible": self.inference_eligible,
             "inference_ineligible_reason": self.inference_ineligible_reason,
-            "summary": self.summary,
             "url": self.resource_url,
         }
 
@@ -374,12 +350,6 @@ def source_artifact_revision_from_metadata(
         if inference_fields is None:
             return None
         inference_eligible, inference_ineligible_reason = inference_fields
-        summary_value = raw.get("summary")
-        summary = None
-        if summary_value is not None:
-            summary = " ".join(str(summary_value).split())
-            if not summary or len(summary) > MAX_SOURCE_ARTIFACT_SUMMARY_CHARS:
-                return None
         artifact = SourceArtifactRevision(
             artifact_id=str(raw["artifact_id"]),
             observation_id=observation_id,
@@ -395,7 +365,6 @@ def source_artifact_revision_from_metadata(
             uri=str(raw["uri"]),
             inference_eligible=inference_eligible,
             inference_ineligible_reason=inference_ineligible_reason,
-            summary=summary,
         )
     except (KeyError, TypeError, ValueError):
         return None

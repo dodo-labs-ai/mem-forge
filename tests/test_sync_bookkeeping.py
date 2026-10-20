@@ -91,7 +91,6 @@ from memforge.source_activity import SourceActivityKind
 from memforge.source_artifacts import (
     RawSourceArtifact,
     SourceArtifactDownload,
-    SourceArtifactSummary,
 )
 from memforge.source_derivation import (
     DERIVATION_INPUT_SUPERSEDED,
@@ -136,17 +135,6 @@ async def db(tmp_path):
 
 async def _skip_retry_delay(_delay: float) -> None:
     """Preserve retry attempts without turning contract tests into wall-clock tests."""
-
-
-def test_projection_fanout_aggregates_discarded_orphan_summary_metric() -> None:
-    metrics = _aggregate_extraction_metrics(
-        [
-            MemoryExtractionResult(metadata={"discarded_orphan_artifact_summary_count": 1}),
-            MemoryExtractionResult(metadata={"discarded_orphan_artifact_summary_count": 2}),
-        ]
-    )
-
-    assert metrics["discarded_orphan_artifact_summary_count"] == 3
 
 
 def test_projection_fanout_aggregates_selection_rejections_and_their_outcomes() -> None:
@@ -3446,21 +3434,15 @@ class ProjectionFragmentCandidateExtractor(ProjectionFragmentRecordingExtractor)
         )
 
 
-class ProjectionFragmentArtifactSummaryExtractor(ProjectionFragmentRecordingExtractor):
+class ProjectionFragmentImageReadingExtractor(ProjectionFragmentRecordingExtractor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.image_calls: list[object] = []
+
     async def extract_projection_fragment_memories(self, catalog, **kwargs):
         self.fragment_calls.append(catalog)
-        images = kwargs["revision_context"].images_for(catalog)
-        return MemoryExtractionResult(
-            memories=[],
-            artifact_summaries=tuple(
-                SourceArtifactSummary(
-                    source_observation_id=image.source_observation_id,
-                    summary="Architecture diagram showing the stable image flow.",
-                )
-                for image in images
-            ),
-            metadata={"structured_llm_calls": 1},
-        )
+        self.image_calls.append(kwargs["revision_context"].images_for(catalog))
+        return MemoryExtractionResult(memories=[], metadata={"structured_llm_calls": 1})
 
 
 @pytest.mark.asyncio
@@ -3808,49 +3790,6 @@ class ImageOnlyGitHubArtifactGene(JiraArtifactGene):
 
 
 @pytest.mark.asyncio
-async def test_artifact_summary_commits_with_the_same_projected_revision(db: Database) -> None:
-    source_id = "src-jira-artifact-summary"
-    await db.upsert_source(
-        id=source_id,
-        type="jira",
-        name="Jira Artifact Summary",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    memory_engine = RecordingMemoryEngine()
-    extractor = ProjectionFragmentArtifactSummaryExtractor()
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        memory_extractor=extractor,
-        memory_engine=memory_engine,
-        memory_store=None,
-        max_concurrent=1,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=JiraArtifactGene(issue_id="424243", issue_key="PAY-43"),
-        source_name="Jira Artifact Summary",
-        source_id=source_id,
-    )
-
-    assert state.last_sync_status == "success"
-    assert len(memory_engine.projected_lifecycle_calls) == 1
-    committed_projection = memory_engine.projected_lifecycle_calls[0]["projection"]
-    artifact_revision = next(
-        revision for revision in committed_projection.observation_revisions if "source_artifact" in revision.metadata
-    )
-    assert artifact_revision.metadata["source_artifact"]["summary"] == (
-        "Architecture diagram showing the stable image flow."
-    )
-    persisted = await db.get_source_artifact_revision(artifact_revision.id)
-    assert persisted is not None
-    assert persisted.summary == "Architecture diagram showing the stable image flow."
-    assert len(extractor.fragment_calls) == 1
-
-
-@pytest.mark.asyncio
 async def test_artifact_only_source_unit_enters_multimodal_extraction(db: Database) -> None:
     source_id = "src-github-image-only"
     await db.upsert_source(
@@ -3862,7 +3801,7 @@ async def test_artifact_only_source_unit_enters_multimodal_extraction(db: Databa
         owner_user_id="dev",
     )
     memory_engine = RecordingMemoryEngine()
-    extractor = ProjectionFragmentArtifactSummaryExtractor()
+    extractor = ProjectionFragmentImageReadingExtractor()
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
@@ -3885,9 +3824,9 @@ async def test_artifact_only_source_unit_enters_multimodal_extraction(db: Databa
     artifact_revision = next(
         revision for revision in committed_projection.observation_revisions if "source_artifact" in revision.metadata
     )
-    assert artifact_revision.metadata["source_artifact"]["summary"] == (
-        "Architecture diagram showing the stable image flow."
-    )
+    [images] = extractor.image_calls
+    assert [image.source_observation_id for image in images] == [artifact_revision.observation_id]
+    assert await db.get_source_artifact_revision(artifact_revision.id) is not None
 
 
 @pytest.mark.asyncio

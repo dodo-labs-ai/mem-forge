@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- An image Evidence item's `artifact` in `GET /api/v1/memories/{id}` describes
+  only the Artifact: `artifact_id`, `parent_observation_id`, `filename`,
+  `content_type`, `size_bytes` and `url`. The item gives its Observation,
+  revision, reference, role and digest, and its group the Evidence Unit. The
+  item's `text` says what the image shows for the claim. `summary` is gone, with the extraction result,
+  derivation payload and telemetry fields that carried it; MCP `get_memory`
+  keeps `filename`, `content_type`, `size_bytes` and `url`.
+  - Cloud: `SourceArtifactSummary`, `MAX_SOURCE_ARTIFACT_SUMMARY_CHARS`,
+    `with_source_artifact_summaries`, `MemoryExtractionResult.artifact_summaries`
+    and `SourceArtifactRevision.summary` are removed.
+
 - Claim Extraction writes a Memory in the language of its Primary Evidence,
   even when its Required Evidence is in another language: a Chinese reply that
   settles an English message gives a Chinese Memory. Identifiers, names and

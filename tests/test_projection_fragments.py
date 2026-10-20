@@ -1240,12 +1240,16 @@ async def test_extractor_persists_only_resolved_parts_and_never_falls_back() -> 
     assert memory.resolved_evidence_selection is not None
     assert len(memory.resolved_evidence_selection.parts) == 2
 
-    restored = memory_extraction_result_from_output_payload(
-        memory_extraction_output_payload(result)
-    )
+    payload = memory_extraction_output_payload(result)
+    restored = memory_extraction_result_from_output_payload(payload)
     assert restored.memories[0].resolved_evidence_selection == (
         memory.resolved_evidence_selection
     )
+    # A stored payload restores its Memories whatever other keys it was stored with.
+    stored = memory_extraction_result_from_output_payload({
+        **payload, "artifact_summaries": [{"source_observation_id": "obs-image", "summary": "x" * 500}],
+    })
+    assert stored.memories == restored.memories
 
 
 @pytest.mark.asyncio

@@ -4299,17 +4299,10 @@ def test_mcp_proxy_keeps_what_an_agent_reads_of_artifact_evidence_on_get_memory(
     proxy = _load_plugin_mcp_proxy()
     artifact = {
         "artifact_id": "artifact-1",
-        "observation_id": "obs-1",
-        "observation_revision_id": "obsrev-1",
         "parent_observation_id": "obs-parent",
-        "evidence_reference_id": "eref-1",
-        "evidence_unit_id": "evidence-1",
-        "evidence_role": "primary",
         "filename": "diagram.png",
         "content_type": "image/png",
         "size_bytes": 3,
-        "sha256": "abc",
-        "summary": "Architecture diagram showing the request flow.",
         "url": "/api/v1/source-artifacts/obsrev-1",
     }
     monkeypatch.setattr(
@@ -4356,8 +4349,6 @@ def test_mcp_proxy_keeps_what_an_agent_reads_of_artifact_evidence_on_get_memory(
         "kind": "artifact",
         "current": True,
         "artifact": {
-            "summary": "Architecture diagram showing the request flow.",
-            "evidence_role": "primary",
             "filename": "diagram.png",
             "content_type": "image/png",
             "size_bytes": 3,

@@ -695,7 +695,6 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
             "uri": uri,
             "inference_eligible": True,
             "inference_ineligible_reason": None,
-            "summary": "Service case review screen showing the investigation areas.",
         }
     }
     await db.db.execute(
@@ -822,14 +821,19 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
 
     assert detail.status_code == 200
     [evidence_unit] = detail.json()["evidence"]
-    artifact = evidence_unit["items"][-1]["artifact"]
-    assert artifact["observation_revision_id"] == "obsrev-image"
-    assert artifact["evidence_reference_id"] == "eref-image"
-    assert artifact["evidence_role"] == "context"
-    assert artifact["content_type"] == "image/png"
-    assert artifact["sha256"] == digest
-    assert artifact["summary"] == ("Service case review screen showing the investigation areas.")
-    assert artifact["url"] == "/api/v1/source-artifacts/obsrev-image"
+    image_item = evidence_unit["items"][-1]
+    assert (image_item["observation_revision_id"], image_item["evidence_reference_id"], image_item["role"]) == (
+        "obsrev-image", "eref-image", "context",
+    )
+    assert image_item["raw_content_sha256"] == digest
+    assert image_item["artifact"] == {
+        "artifact_id": "artifact-42",
+        "parent_observation_id": "obs-page",
+        "filename": "diagram\u202foverview.png",
+        "content_type": "image/png",
+        "size_bytes": len(image),
+        "url": "/api/v1/source-artifacts/obsrev-image",
+    }
     assert [item["role"] for item in evidence_unit["items"]] == [
         "primary",
         "required",
