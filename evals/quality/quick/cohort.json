@@ -65,6 +65,18 @@
           "fsync"
         ]
       }
+    },
+    {
+      "title": "决定：Kestrel 的失败告警只发到 #kestrel-oncall",
+      "rubric": {
+        "expected_memory_count": {
+          "min": 1
+        },
+        "required_terms": [
+          "告警",
+          "kestrel-oncall"
+        ]
+      }
     }
   ]
 }

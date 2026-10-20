@@ -64,10 +64,17 @@ def _planned_requests(projection, authority):
         doc_type="document",
     ).requests
 
-def test_extraction_contract_version_is_pinned_into_derivation_identity() -> None:
-    # Stored derivations and batch ids hash this value; changing it supersedes
-    # every stored derivation instead of resuming it.
-    assert PROJECTION_EXTRACTION_CONTRACT_VERSION == "projection-extraction-v23"
+def test_extraction_contract_version_names_one_extraction_prompt() -> None:
+    # Stored derivations and batch ids hash the version, not the extraction
+    # prompt template, so a template under an unchanged version would resume
+    # work done under another. A new template takes a new version, and both
+    # change here together.
+    digest = hashlib.sha256(PROJECTION_FRAGMENT_EXTRACTION_PROMPT.encode()).hexdigest()
+
+    assert (PROJECTION_EXTRACTION_CONTRACT_VERSION, digest) == (
+        "projection-extraction-v24",
+        "42618632901d695e695e5cbfa9dbcfb76ae09bd63ab6915487ebd66aef8f505d",
+    )
 
 
 @pytest.mark.parametrize("status,version,reason,ready", (
@@ -92,9 +99,10 @@ def test_extraction_prompt_carries_the_durable_memory_quality_contract() -> None
         "Fold a rejected alternative into the chosen decision",
         "NO META-MEMORIES",
         "OPERATIONAL DOES NOT MEAN TRANSIENT",
-        "For each candidate, preserve the language of its owned source evidence.",
-        "When that evidence is primarily Chinese, write memory.content in Chinese.",
-        "Read-only context may resolve meaning but must not change the candidate's language.",
+        "THE PRIMARY SETS THE LANGUAGE.",
+        "when that ref is primarily Chinese, write Chinese, even when its Required evidence is English.",
+        "write any meaning taken from Required evidence or context in the Primary's language.",
+        "Required evidence and structural context may resolve meaning but never change the language.",
     )
 
     assert DURABLE_MEMORY_QUALITY_RULES in PROJECTION_FRAGMENT_EXTRACTION_PROMPT
