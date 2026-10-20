@@ -697,6 +697,24 @@ async def test_the_image_documents_route_counts_then_queues_the_documents_with_a
 
 
 @pytest.mark.asyncio
+async def test_a_source_deleted_while_the_image_documents_are_queued_is_reported(db, tmp_path, monkeypatch):
+    from memforge.server.admin_api import create_admin_app
+
+    harness = await synced(db)
+
+    async def deleted(self, source_id, document_ids):
+        raise ValueError(f"Source not found: {source_id}")
+
+    monkeypatch.setattr(SyncService, "enqueue_reprocess", deleted)
+    app = create_admin_app(db=db, config=_admin_config(tmp_path), document_store=harness.store)
+    with TestClient(app) as client:
+        queued = client.post("/api/v1/sources/image-documents/reprocess")
+
+    assert queued.status_code == 202
+    assert queued.json()["unqueued"] == [{"source_id": SOURCE_ID, "reason": "source_missing"}]
+
+
+@pytest.mark.asyncio
 async def test_the_reprocess_route_says_a_source_without_documents_has_none_to_reprocess(db, tmp_path):
     from memforge.server.admin_api import create_admin_app
 

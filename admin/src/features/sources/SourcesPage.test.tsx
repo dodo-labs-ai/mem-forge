@@ -453,13 +453,16 @@ test("Re-read all documents still re-reads every document when the documents can
   expect((await reprocessPosts(calls)).at(-1)).toEqual({ all_documents: true, dry_run: false });
 });
 
-test("Re-read all documents explains a source with nothing to re-read and offers no re-read", async () => {
+test.each([
+  ["source_has_no_documents", "This source has no documents yet. Sync it first."],
+  ["source_sync_not_supported", "source_sync_not_supported"],
+])("Re-read all documents shows the refusal %s and offers no re-read", async (code, shown) => {
   renderPage([makeSource()], {
-    "POST /api/v1/sources/src-wiki/reprocess": () => errorResponse(409, "source_has_no_documents"),
+    "POST /api/v1/sources/src-wiki/reprocess": () => errorResponse(409, code),
   });
   await openReRead();
 
   const dialog = await screen.findByRole("dialog", { name: "Re-read all documents?" });
-  expect(await within(dialog).findByText("This source has no documents yet. Sync it first.")).toBeInTheDocument();
+  expect(await within(dialog).findByText(shown)).toBeInTheDocument();
   expect(within(dialog).getByRole("button", { name: "Re-read documents" })).toBeDisabled();
 });

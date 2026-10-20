@@ -5988,10 +5988,10 @@ export interface components {
         UnqueuedSource: {
             /**
              * Reason
-             * @description Why the Source's reprocess was not queued: another run is pending or running, the Source is paused or no longer active, it has not completed a sync, or its projection scope is changing.
+             * @description Why the Source's reprocess was not queued: another run is pending or running, the Source is paused or no longer active, it has not completed a sync, it was deleted meanwhile, or its projection scope is changing.
              * @enum {string}
              */
-            reason: "source_busy" | "source_paused" | "source_not_active" | "source_not_synced" | "projection_scope_transition_open";
+            reason: "source_busy" | "source_paused" | "source_not_active" | "source_not_synced" | "source_missing" | "projection_scope_transition_open";
             /** Source Id */
             source_id: string;
         };
