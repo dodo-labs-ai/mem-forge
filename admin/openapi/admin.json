@@ -3875,6 +3875,7 @@
         "type": "object"
       },
       "MemoryEvidenceArtifactDetail": {
+        "description": "The Artifact an Evidence item cites; its item holds the Observation, role and digest.",
         "properties": {
           "artifact_id": {
             "title": "Artifact Id",
@@ -3884,52 +3885,17 @@
             "title": "Content Type",
             "type": "string"
           },
-          "evidence_reference_id": {
-            "title": "Evidence Reference Id",
-            "type": "string"
-          },
-          "evidence_role": {
-            "title": "Evidence Role",
-            "type": "string"
-          },
-          "evidence_unit_id": {
-            "title": "Evidence Unit Id",
-            "type": "string"
-          },
           "filename": {
             "title": "Filename",
-            "type": "string"
-          },
-          "observation_id": {
-            "title": "Observation Id",
-            "type": "string"
-          },
-          "observation_revision_id": {
-            "title": "Observation Revision Id",
             "type": "string"
           },
           "parent_observation_id": {
             "title": "Parent Observation Id",
             "type": "string"
           },
-          "sha256": {
-            "title": "Sha256",
-            "type": "string"
-          },
           "size_bytes": {
             "title": "Size Bytes",
             "type": "integer"
-          },
-          "summary": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Summary"
           },
           "url": {
             "title": "Url",
@@ -3938,16 +3904,10 @@
         },
         "required": [
           "artifact_id",
-          "observation_id",
-          "observation_revision_id",
           "parent_observation_id",
-          "evidence_reference_id",
-          "evidence_unit_id",
-          "evidence_role",
           "filename",
           "content_type",
           "size_bytes",
-          "sha256",
           "url"
         ],
         "title": "MemoryEvidenceArtifactDetail",

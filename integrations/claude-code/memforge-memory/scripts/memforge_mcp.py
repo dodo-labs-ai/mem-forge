@@ -1917,7 +1917,7 @@ def _compact_memory_evidence_artifact(
 ) -> dict[str, Any]:
     return {
         key: artifact[key]
-        for key in ("summary", "evidence_role", "filename", "content_type", "size_bytes", "url")
+        for key in ("filename", "content_type", "size_bytes", "url")
         if key in artifact
     }
 

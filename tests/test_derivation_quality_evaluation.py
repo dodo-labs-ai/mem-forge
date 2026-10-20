@@ -187,7 +187,6 @@ class _AnswerExecutor:
                 "memories": [
                     {"content": memory, "resolved_evidence_selection": selection} for memory in self._memories
                 ],
-                "artifact_summaries": [],
                 "evidence_telemetry": {"skipped_reading_group_count": self._skipped},
             },
             "error_type": None,

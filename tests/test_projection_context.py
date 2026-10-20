@@ -17,11 +17,7 @@ from memforge.pipeline.projection_context import (
 )
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.source_projection_adapters import project_source_item
-from memforge.source_projection import (
-    with_source_artifact_summaries,
-)
 from memforge.source_artifacts import (
-    SourceArtifactSummary,
     StoredSourceArtifact,
 )
 from tests.llm_fixture import NoopMemoryExtractor
@@ -673,58 +669,3 @@ def test_preceding_observation_is_the_reply_target_else_the_declared_predecessor
     core, first, second = (item.id for item in jira.observations)
     assert preceding_observation_id(jira, first) == core
     assert preceding_observation_id(jira, second) == first
-
-
-def test_source_projection_attaches_summary_only_to_exact_image_revision() -> None:
-    projection = _confluence_projection_with_images(1)
-    artifact_observation = next(
-        item
-        for item in projection.observations
-        if item.observation_type == "binary_artifact"
-    )
-
-    enriched = with_source_artifact_summaries(
-        projection,
-        (
-            SourceArtifactSummary(
-                source_observation_id=artifact_observation.id,
-                summary="Architecture diagram showing the bounded request flow.",
-            ),
-        ),
-    )
-
-    revision = next(
-        item
-        for item in enriched.observation_revisions
-        if item.observation_id == artifact_observation.id
-    )
-    assert revision.id == next(
-        item.id
-        for item in projection.observation_revisions
-        if item.observation_id == artifact_observation.id
-    )
-    assert revision.metadata["source_artifact"]["summary"] == (
-        "Architecture diagram showing the bounded request flow."
-    )
-
-    primary_observation = next(
-        item
-        for item in projection.observations
-        if item.observation_type != "binary_artifact"
-    )
-    with pytest.raises(ValueError, match="non-Artifact"):
-        with_source_artifact_summaries(
-            projection,
-            (
-                SourceArtifactSummary(
-                    source_observation_id=primary_observation.id,
-                    summary="Invalid target.",
-                ),
-            ),
-        )
-    summary = SourceArtifactSummary(
-        source_observation_id=artifact_observation.id,
-        summary="Duplicate target.",
-    )
-    with pytest.raises(ValueError, match="must be unique"):
-        with_source_artifact_summaries(projection, (summary, summary))
