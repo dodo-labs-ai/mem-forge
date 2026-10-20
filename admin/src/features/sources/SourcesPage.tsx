@@ -38,6 +38,7 @@ import {
 import type { Source } from "./model/types";
 import { sourceColumns } from "./sourceColumns";
 import { SourceTableContext } from "./sourceTableContext";
+import { ReReadSourceDialog } from "./ReReadSourceDialog";
 import { SourceDetailDrawer } from "./SourceDetailDrawer";
 import { useSourceActions } from "./useSourceActions";
 
@@ -66,6 +67,7 @@ export function SourcesPage() {
   const [filter, setFilter] = useState<SourceFilter>("all");
   const [openRowKey, setOpenRowKey] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Source | null>(null);
+  const [pendingReRead, setPendingReRead] = useState<Source | null>(null);
   const tableRef = useRef<HTMLDivElement>(null);
 
   const daemonState = localSyncState(daemonQuery);
@@ -209,7 +211,13 @@ export function SourcesPage() {
             }
           />
           <SourceTableContext.Provider
-            value={{ typeLabels, actions, onViewDetails: viewDetails, onDelete: setPendingDelete }}
+            value={{
+              typeLabels,
+              actions,
+              onViewDetails: viewDetails,
+              onDelete: setPendingDelete,
+              onReRead: setPendingReRead,
+            }}
           >
             <DataTable
               aria-label="Sources"
@@ -247,6 +255,13 @@ export function SourcesPage() {
         tone="danger"
         confirmationText={pendingDelete?.name}
         onConfirm={() => deleteSource.mutateAsync(pendingDelete!.id)}
+      />
+
+      <ReReadSourceDialog
+        source={pendingReRead}
+        onOpenChange={(open) => {
+          if (!open) setPendingReRead(null);
+        }}
       />
     </div>
   );

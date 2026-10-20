@@ -20,10 +20,11 @@ interface SourceRowActionsProps {
   actions: SourceActions;
   onViewDetails: (source: Source) => void;
   onDelete: (source: Source) => void;
+  onReRead: (source: Source) => void;
 }
 
 /** One primary button (the fix when the source needs the user) and a menu of the rest. */
-export function SourceRowActions({ row, actions, onViewDetails, onDelete }: SourceRowActionsProps) {
+export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRead }: SourceRowActionsProps) {
   const navigate = useNavigate();
   const { source, attention, activity } = row;
   const capabilities = source.capabilities;
@@ -50,6 +51,16 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete }: Sour
           <DropdownMenuItem onClick={() => onViewDetails(source)}>View details</DropdownMenuItem>
           <DropdownMenuItem disabled={!canSync || !sync.enabled} onClick={() => actions.syncNow(source, sync.retryTarget)}>
             {sync.label}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            className="items-start"
+            disabled={!canSync || !sync.enabled}
+            onClick={() => onReRead(source)}
+          >
+            <span className="flex flex-col gap-0.5">
+              <span>Re-read all documents</span>
+              <span className="text-xs text-muted-foreground">Process every document again with the current models.</span>
+            </span>
           </DropdownMenuItem>
           <DropdownMenuItem className="items-start" onClick={() => navigate(sourceEvaluationPath(source.id))}>
             <span className="flex flex-col gap-0.5">

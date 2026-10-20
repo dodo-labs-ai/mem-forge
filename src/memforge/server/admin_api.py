@@ -2115,6 +2115,46 @@ class SourceReprocessRequest(BaseModel):
     dry_run: bool = False
 
 
+class ReprocessUnitPreviewResponse(BaseModel):
+    """What reprocessing one Document would read; an unavailable one has only its reason."""
+
+    document_id: str
+    available: bool
+    reason: str | None = None
+    detail: str | None = None
+    source_unit_id: str | None = None
+    unit_revision_id: str | None = None
+    artifact_count: int | None = None
+    active_memory_count: int | None = None
+    support_reading_count: int | None = None
+    reading_group_count: int | None = None
+    extraction_item_count: int | None = None
+    reading_chars: int | None = None
+    estimated_model_calls: int | None = None
+
+
+class ReprocessPreviewResponse(BaseModel):
+    """What a reprocess would read, answered to a dry run."""
+
+    source_id: str
+    units: list[ReprocessUnitPreviewResponse]
+    available_unit_count: int
+    unavailable_unit_count: int
+    estimated_model_calls: int
+
+
+class SourceReprocessQueuedResponse(BaseModel):
+    """The reprocess run queued for the Documents."""
+
+    ok: bool
+    message: str
+    source_id: str
+    run_id: str
+    status: str
+    created_at: str
+    document_ids: list[str]
+
+
 class ImageDocumentsResponse(BaseModel):
     """The current Documents with an image a model can read, in the Sources the caller can reprocess."""
 
@@ -8363,7 +8403,14 @@ def create_admin_app(
             "coalesced": run.coalesced,
         }
 
-    @source_router.post("/{source_id}/reprocess", status_code=202)
+    @source_router.post(
+        "/{source_id}/reprocess",
+        status_code=202,
+        responses={
+            200: {"model": ReprocessPreviewResponse, "description": "The dry run's preview."},
+            202: {"model": SourceReprocessQueuedResponse, "description": "The queued run."},
+        },
+    )
     async def reprocess_source_documents(
         request: Request,
         source_id: str,

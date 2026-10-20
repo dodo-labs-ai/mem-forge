@@ -283,6 +283,139 @@ describe("Save and validate", () => {
   });
 });
 
+describe("a model that reads images", () => {
+  const BASE_FACTS = makeValidation().facts;
+
+  function readingImages(imageInput: boolean | null | undefined, overrides: Partial<ModelBinding> = {}): ModelBinding {
+    const facts = imageInput === undefined ? BASE_FACTS : { ...BASE_FACTS, image_input: imageInput };
+    return makeBinding({ validation: makeValidation({ facts }), ...overrides });
+  }
+
+  function settingsWith(generation: ModelBinding): ModelSettings {
+    return { ...makeModelSettings(), generation: kindSettings(generation) };
+  }
+
+  test.each([
+    [true, "Supported", null],
+    [false, "Not supported", "Images in documents are not read."],
+    [null, "Unknown", "Validation could not tell. Images are sent as usual."],
+  ])("the model in use says what its validation found about image input (%s)", async (imageInput, value, hint) => {
+    renderPage(settingsWith(readingImages(imageInput)));
+    const model = inUse(await card("Generation model"));
+
+    expect(within(model).getByText("Image input")).toBeInTheDocument();
+    expect(within(model).getByText(value)).toBeInTheDocument();
+    if (hint) expect(within(model).getByText(hint)).toBeInTheDocument();
+  });
+
+  test("a model whose validation never asked shows nothing about image input", async () => {
+    renderPage(settingsWith(readingImages(undefined)));
+
+    expect(within(inUse(await card("Generation model"))).queryByText("Image input")).not.toBeInTheDocument();
+  });
+
+  test("a model picked from the list says what the provider's list declares about image input", async () => {
+    renderPage(makeModelSettings(), {
+      [`POST ${SETTINGS_ROUTE}/generation/discover-models`]: () => ({
+        ok: true,
+        models_supported: true,
+        kind_filtered: true,
+        models: [
+          { id: "gpt-5.5", image_input: true },
+          { id: "gpt-5.5-nano", image_input: false },
+          { id: "gpt-5.5-mini" },
+        ],
+        message: "Connected. Found 3 generation models.",
+        latency_ms: 42,
+      }),
+    });
+    const generation = await card("Generation model");
+    await userEvent.clear(within(generation).getByLabelText("Model"));
+    await userEvent.click(within(generation).getByRole("button", { name: "Load models" }));
+    await within(generation).findByRole("group", { name: "Suggested models" });
+    async function pick(id: string) {
+      await userEvent.clear(within(generation).getByLabelText("Model"));
+      const suggestions = within(generation).getByRole("group", { name: "Suggested models" });
+      await userEvent.click(within(suggestions).getByRole("button", { name: id }));
+    }
+
+    await pick("gpt-5.5");
+    expect(within(generation).getByText(/^Image input: supported, according to .*'s model list\.$/)).toBeInTheDocument();
+    await pick("gpt-5.5-nano");
+    expect(within(generation).getByText(/^Image input: not supported, according to/)).toBeInTheDocument();
+    await pick("gpt-5.5-mini");
+    expect(within(generation).queryByText(/^Image input:/)).not.toBeInTheDocument();
+  });
+
+  function switchingTo(previous: ModelBinding) {
+    const promoted = readingImages(true, { model_id: "gpt-5.5", route: "openai/gpt-5.5" });
+    const server = settingsServer(settingsWith(previous));
+    const page = renderPage(server, {
+      [`PUT ${SETTINGS_ROUTE}/generation/candidate`]: () =>
+        server.change({ generation: kindSettings(previous, { ...promoted, state: "not_validated", validation: null }) })
+          .generation,
+      [`POST ${SETTINGS_ROUTE}/generation/candidate/validate`]: () => ({
+        passed: true,
+        promoted: true,
+        reindex_required: false,
+        error_code: null,
+        validation: promoted.validation,
+        settings: server.change({ generation: kindSettings(promoted) }).generation,
+      }),
+      "GET /api/v1/sources/image-documents": () => ({ document_count: 24, source_count: 3 }),
+      "POST /api/v1/sources/image-documents/reprocess": () => ({ document_count: 24, source_count: 3, unqueued: [] }),
+    });
+    return page;
+  }
+
+  async function saveModel(id: string) {
+    const generation = await card("Generation model");
+    await userEvent.clear(within(generation).getByLabelText("Model"));
+    await userEvent.type(within(generation).getByLabelText("Model"), id);
+    await userEvent.click(within(generation).getByRole("button", { name: "Save and validate" }));
+  }
+
+  test("replacing a model that read text only offers to re-read the documents with images", async () => {
+    const { calls } = switchingTo(readingImages(false));
+
+    await saveModel("gpt-5.5");
+    const dialog = await screen.findByRole("dialog", { name: "Re-read documents with images?" });
+    expect(dialog).toHaveTextContent("the images in 24 documents haven't been read yet");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Re-read 24 documents" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(writes(calls)).toEqual([
+      `PUT ${SETTINGS_ROUTE}/generation/candidate`,
+      `POST ${SETTINGS_ROUTE}/generation/candidate/validate`,
+      "POST /api/v1/sources/image-documents/reprocess",
+    ]);
+  });
+
+  test("Later closes the offer without re-reading anything", async () => {
+    const { calls } = switchingTo(readingImages(false));
+
+    await saveModel("gpt-5.5");
+    const dialog = await screen.findByRole("dialog", { name: "Re-read documents with images?" });
+    await userEvent.click(within(dialog).getByRole("button", { name: "Later" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(writes(calls)).not.toContain("POST /api/v1/sources/image-documents/reprocess");
+  });
+
+  test.each([
+    ["could not tell", null],
+    ["never asked", undefined],
+  ])("replacing a model whose validation %s offers nothing, since its documents were read with images", async (_, imageInput) => {
+    const { calls } = switchingTo(readingImages(imageInput));
+
+    await saveModel("gpt-5.5");
+
+    expect(await within(inUse(await card("Generation model"))).findByText("gpt-5.5")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(calls.map((request) => new URL(request.url).pathname)).not.toContain("/api/v1/sources/image-documents");
+  });
+});
+
 describe("the fields a provider needs", () => {
   test("a provider with its own address fills it in, and one without a key hides the key field", async () => {
     renderPage();
