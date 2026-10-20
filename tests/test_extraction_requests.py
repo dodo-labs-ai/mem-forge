@@ -464,3 +464,23 @@ async def test_teams_reply_still_selected_as_required_only_skips_its_reading_gro
     assert unit.metadata["skipped_reading_group_count"] == 1
     assert unit.metadata["fragment_selection_rejection_counts"] == {"ineligible_role": 2}
     assert unit.metadata["selection_skipped_reading_group_count"] == 1
+
+
+def test_an_image_fragment_has_room_for_the_claims_of_a_page_of_text():
+    from types import SimpleNamespace
+
+    from memforge.pipeline.evidence_fragments import EvidenceFragmentKind
+
+    extractor = MemoryExtractor(structured_llm_client=Client(), model="model-a", max_tokens=32768)
+
+    def requested(*fragments):
+        return extractor.fragment_output_tokens(SimpleNamespace(fragments=list(fragments)))
+
+    image = SimpleNamespace(primary_eligible=True, kind=EvidenceFragmentKind.ARTIFACT, presentation_text="")
+    short = SimpleNamespace(primary_eligible=True, kind=EvidenceFragmentKind.TEXT, presentation_text="Small claim.")
+    context = SimpleNamespace(primary_eligible=False, kind=EvidenceFragmentKind.ARTIFACT, presentation_text="")
+
+    # The envelope, then each Primary Fragment's room: an image's content is not its text.
+    assert requested(image) == 512 + 4096
+    assert requested(short) == 512 + 768
+    assert requested(image, short, context) == 512 + 4096 + 768
