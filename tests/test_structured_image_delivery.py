@@ -11,7 +11,13 @@ import pytest
 from litellm.exceptions import ServiceUnavailableError
 import json
 
-from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError
+from memforge.llm.batch_runner import _failure_from_error
+from memforge.llm.structured import (
+    INPUT_CAPACITY_EXCEEDED,
+    LiteLlmStructuredClient,
+    StructuredLlmConfig,
+    StructuredLlmError,
+)
 from memforge.llm.structured import _json_text_prompt, _structured_user_content
 from memforge.llm.structured_image_delivery import ArtifactImageDelivery, DOCUMENTED_BOUNDS, digest, pixel_digest
 from memforge.llm.structured_images import StructuredLlmImage, StructuredLlmImageError, prepare_structured_llm_images
@@ -26,10 +32,25 @@ class Reply(BaseModel):
 
 
 def client(transport=None, **options):
+    limits = {"max_input_tokens": 1_000_000, "context_window_tokens": 1_000_000, "max_output_tokens": 64_000}
     return LiteLlmStructuredClient(StructuredLlmConfig(
-        MODEL, None, None, 60, native_schema_transport="json_schema_response_format",
-        max_input_tokens=1_000_000, context_window_tokens=1_000_000, max_output_tokens=64_000, **options,
+        MODEL, None, None, 60, native_schema_transport="json_schema_response_format", **{**limits, **options},
     ), completion_transport=transport)
+
+
+def edge_client(input_tokens, transport=None):
+    """A client whose route holds exactly ``input_tokens`` of input when no correction room is kept."""
+    return client(transport, max_input_tokens=input_tokens, input_budget_fraction=1.0)
+
+
+def answering(calls, *replies):
+    """A transport that answers with ``replies`` in turn, then with a valid reply."""
+    async def transport(**kwargs):
+        calls.append(kwargs)
+        content = replies[len(calls) - 1] if len(calls) <= len(replies) else '{"answer":"yes"}'
+        return SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop",
+                                                        message=SimpleNamespace(content=content))])
+    return transport
 
 
 def build(body, selected_client, **options):
@@ -175,8 +196,8 @@ def test_complete_capacity_failure_and_catalog_mismatch(authentic):
     with pytest.raises(StructuredLlmImageError):
         build(authentic.original.body, client(), max_images=1)
     limited = build(authentic.original.body, client(), max_encoded_request_bytes=1)
-    with pytest.raises(StructuredLlmImageError):
-        client().request_fits("same prompt", response_format=Reply, images=limited)
+    # A request over the encoded size limit does not fit, as one over the token budget does not.
+    assert not client().request_fits("same prompt", response_format=Reply, images=limited)
     wrong = replace(authentic, source_binding=tuple((k, "another-observation" if k == "observation_id" else v)
                                                    for k, v in authentic.source_binding))
     with pytest.raises(StructuredLlmImageError):
@@ -204,6 +225,73 @@ async def test_fallback_prompt_growth_rechecks_capacity_before_provider(authenti
     with pytest.raises(StructuredLlmError):
         await selected.evaluate_revision_work("same prompt", response_format=Reply,
                                               images=limited)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_fits_only_without_correction_room_is_sent(authentic):
+    """A re-ask is packed without room for another correction, so the client sends what fits as it is."""
+    tokens = client().request_tokens("same prompt", response_format=Reply, images=authentic)
+    calls = []
+    edge = edge_client(tokens, answering(calls))
+    images = build(authentic.original.body, edge)
+
+    assert not edge.request_fits("same prompt", response_format=Reply, images=images)
+    assert edge.request_fits("same prompt", response_format=Reply, images=images, reserve_correction=False)
+    reply = await edge.evaluate_revision_work("same prompt", response_format=Reply, images=images)
+
+    assert reply.answer == "yes"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_request_beyond_the_route_is_a_capacity_failure_of_its_items(authentic):
+    tokens = client().request_tokens("same prompt", response_format=Reply, images=authentic)
+    calls = []
+    edge = edge_client(tokens - 2, answering(calls))
+    images = build(authentic.original.body, edge)
+
+    with pytest.raises(StructuredLlmError) as raised:
+        await edge.evaluate_revision_work("same prompt", response_format=Reply, images=images)
+
+    assert raised.value.error_code == INPUT_CAPACITY_EXCEEDED
+    assert raised.value.terminal_category == "request_error"
+    assert _failure_from_error(raised.value).category == "capacity_exceeded"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_repair_request_is_counted_as_it_is_sent(authentic):
+    """The repair of an invalid answer fits where the request, its schema instruction and its note fit, once each."""
+    roomy_calls = []
+    roomy = client(answering(roomy_calls, '{"not_answer":true}'))
+    await roomy.evaluate_revision_work("same prompt", response_format=Reply, images=authentic)
+    repair = roomy_calls[1]["messages"][0]["content"][0]["text"]
+    sent = roomy._rendered_request_tokens(repair, response_format=Reply, model=MODEL, images=authentic)
+    calls = []
+    edge = edge_client(sent, answering(calls, '{"not_answer":true}'))
+
+    reply = await edge.evaluate_revision_work(
+        "same prompt", response_format=Reply, images=build(authentic.original.body, edge),
+    )
+
+    assert reply.answer == "yes"
+    assert len(calls) == 2
+    assert calls[1]["messages"][0]["content"][0]["text"] == repair
+
+
+@pytest.mark.asyncio
+async def test_a_repair_without_room_for_its_note_leaves_the_answer_invalid(authentic):
+    """A re-ask keeps no correction room; when its answer is invalid, that is the failure, not its size."""
+    tokens = client().request_tokens("same prompt", response_format=Reply, images=authentic)
+    calls = []
+    edge = edge_client(tokens, answering(calls, '{"not_answer":true}'))
+
+    with pytest.raises(StructuredLlmError) as raised:
+        await edge.evaluate_revision_work("same prompt", response_format=Reply, images=build(authentic.original.body, edge))
+
+    assert raised.value.terminal_category == "invalid_response"
+    assert _failure_from_error(raised.value).category == "invalid_response"
     assert len(calls) == 1
 
 

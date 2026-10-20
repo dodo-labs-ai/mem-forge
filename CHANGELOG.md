@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- A structured request with images is checked as it is sent: rendered once,
+  with no room kept for a correction, which only the packing of a first
+  request keeps. A request that does not fit, or that exceeds the encoded size
+  its images allow, fails as `input_capacity_exceeded`, a capacity failure the
+  batch runner splits or skips, instead of `image_delivery_input_capacity_exceeded`.
+  A repair request names as many failed fields as the request has room for; a
+  re-ask with no room for its note is not repaired, and its invalid answer
+  stands.
+
 - Every structured model request asks for the route's output capacity: the
   model's maximum output, up to a quarter of its context window. A route whose
   limits are unknown sends no maximum and the provider's default applies. An
