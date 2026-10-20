@@ -73,6 +73,8 @@ class DeclaredModel:
     max_output_tokens: int | None = None
     # Whether the model answers in a JSON schema the request gives.
     native_schema: bool | None = None
+    # Whether the generation model takes images as input.
+    image_input: bool | None = None
 
 
 class ModelListing(ABC):
@@ -92,6 +94,8 @@ class ModelListing(ABC):
     # Whether an entry declares if its model answers in a JSON schema the
     # request gives.
     gives_native_schema: ClassVar[bool] = False
+    # Whether an entry declares if its generation model takes images as input.
+    gives_image_input: ClassVar[bool] = False
 
     @abstractmethod
     def declared_model(self, entry: Any, kind: ModelKind) -> DeclaredModel | None:
@@ -159,12 +163,14 @@ class AnthropicListing(ModelListing):
 
     ``max_input_tokens`` is the largest input, which stands for the context
     window as it does in LiteLLM's model map, and ``max_tokens`` the largest
-    output (https://platform.claude.com/docs/en/api/python/models/list).
+    output. ``capabilities.image_input.supported`` says whether the model
+    takes image content (https://platform.claude.com/docs/en/api/models/list).
     """
 
     paths = {"generation": "/models"}
     kind_signal = "listing"
     gives_token_limits = True
+    gives_image_input = True
 
     def request_headers(self, api_key: str | None) -> dict[str, str]:
         """Anthropic takes the API key as ``x-api-key``, with the API version it answers in."""
@@ -183,6 +189,7 @@ class AnthropicListing(ModelListing):
             label=_label(entry, "display_name", model_id),
             context_window_tokens=_token_count(entry.get("max_input_tokens")),
             max_output_tokens=_token_count(entry.get("max_tokens")),
+            image_input=_supported(entry.get("capabilities"), "image_input"),
         )
 
 
@@ -194,13 +201,15 @@ class OpenRouterListing(ModelListing):
     ``top_provider.max_completion_tokens``. A model whose
     ``supported_parameters`` name ``structured_outputs`` takes a
     ``json_schema`` response format
-    (https://openrouter.ai/docs/guides/features/structured-outputs).
+    (https://openrouter.ai/docs/guides/features/structured-outputs), and one
+    whose ``architecture.input_modalities`` name ``image`` takes images.
     """
 
     paths = {"generation": "/models", "embedding": "/embeddings/models"}
     kind_signal = "listing"
     gives_token_limits = True
     gives_native_schema = True
+    gives_image_input = True
 
     def declared_model(self, entry: Any, kind: ModelKind) -> DeclaredModel | None:
         model_id = _text(entry, "id")
@@ -215,6 +224,7 @@ class OpenRouterListing(ModelListing):
             context_window_tokens=_token_count(entry.get("context_length")),
             max_output_tokens=_token_count(top_provider.get("max_completion_tokens")),
             native_schema=_declared_native_schema(entry) if kind == "generation" else None,
+            image_input=_input_modality(entry, "image") if kind == "generation" else None,
         )
 
 
@@ -222,17 +232,28 @@ class OllamaListing(ModelListing):
     """Ollama's ``/api/tags``: every local model under ``models``, each named by its tag.
 
     An entry's ``capabilities`` name its kinds; without them its family, or
-    its name, does.
+    its name, does. ``vision`` among them says a generation model takes
+    images; an Ollama that lists no capabilities declares nothing about it.
     """
 
     paths = {"generation": "/api/tags", "embedding": "/api/tags"}
     kind_signal = "entry"
     entries_field = "models"
     tries_v1 = False
+    gives_image_input = True
 
     def declared_model(self, entry: Any, kind: ModelKind) -> DeclaredModel | None:
         model_id = _text(entry, "name")
-        return None if model_id is None else DeclaredModel(id=model_id, kinds=_ollama_kinds(entry, model_id))
+        if model_id is None:
+            return None
+        capabilities = entry.get("capabilities")
+        return DeclaredModel(
+            id=model_id,
+            kinds=_ollama_kinds(entry, model_id),
+            image_input=(
+                "vision" in capabilities if kind == "generation" and isinstance(capabilities, list) else None
+            ),
+        )
 
 
 class OpenAiCompatibleListing(ModelListing):
@@ -318,6 +339,22 @@ def _declared_native_schema(entry: Mapping[str, Any]) -> bool | None:
     if not isinstance(supported, list):
         return None
     return "structured_outputs" in supported
+
+
+def _supported(capabilities: Any, name: str) -> bool | None:
+    """Anthropic's ``capabilities.<name>.supported``; ``None`` when the entry does not say."""
+    capability = capabilities.get(name) if isinstance(capabilities, dict) else None
+    supported = capability.get("supported") if isinstance(capability, dict) else None
+    return supported if isinstance(supported, bool) else None
+
+
+def _input_modality(entry: Mapping[str, Any], modality: str) -> bool | None:
+    """Whether OpenRouter's ``architecture.input_modalities`` name ``modality``; ``None`` without that list."""
+    architecture = entry.get("architecture")
+    modalities = architecture.get("input_modalities") if isinstance(architecture, dict) else None
+    if not isinstance(modalities, list):
+        return None
+    return modality in modalities
 
 
 def _ollama_kinds(entry: Mapping[str, Any], model_id: str) -> frozenset[ModelKind]:
