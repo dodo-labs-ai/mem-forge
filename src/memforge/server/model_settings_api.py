@@ -133,6 +133,12 @@ class ModelProviderResponse(BaseModel):
             "context window and its largest output."
         ),
     )
+    sets_context_window: bool = Field(
+        description=(
+            "Whether every generation request asks the provider for the context window the binding "
+            "states, so that the window is what the serving machine holds rather than the model's own."
+        ),
+    )
     options: list[str] = Field(description="The names of the non-secret options the provider accepts.")
     parameters: dict[ModelKind, list[str]] = Field(
         description="The request parameters a binding of each served kind may set.",
@@ -719,6 +725,7 @@ def _descriptor_response(descriptor: ProviderDescriptor) -> ModelProviderRespons
         model_is_route=descriptor.model_is_route,
         lists_models=descriptor.lists_models,
         lists_token_limits=descriptor.lists_token_limits,
+        sets_context_window=descriptor.context_window is not None,
         options=list(descriptor.options),
         parameters={kind: list(parameters_for_kind(kind)) for kind in descriptor.kinds},
         token_limits={kind: list(token_limits_for_kind(kind)) for kind in descriptor.kinds},

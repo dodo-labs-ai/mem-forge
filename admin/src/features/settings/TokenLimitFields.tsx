@@ -14,6 +14,8 @@ interface TokenLimitFieldsProps {
   missing: boolean;
   /** The provider whose model list the values were filled in from, while the fields still hold them. */
   listedBy: string | null;
+  /** True when every request asks the provider for the context window entered here. */
+  setsContextWindow: boolean;
 }
 
 /**
@@ -23,7 +25,7 @@ interface TokenLimitFieldsProps {
  * A provider whose model list gives the limits fills them in when the model
  * field names one of its models.
  */
-export function TokenLimitFields({ id, names, missing, listedBy }: TokenLimitFieldsProps) {
+export function TokenLimitFields({ id, names, missing, listedBy, setsContextWindow }: TokenLimitFieldsProps) {
   const { register, formState } = useFormContext<ModelFormValues>();
   const headingId = `${id}-heading`;
   const purposeId = `${id}-purpose`;
@@ -53,7 +55,7 @@ export function TokenLimitFields({ id, names, missing, listedBy }: TokenLimitFie
       </div>
       <div className="grid gap-4 sm:grid-cols-2">
         {names.map((name) => {
-          const copy = tokenLimitField(name, { required: missing });
+          const copy = tokenLimitField(name, { required: missing, setsContextWindow });
           const fieldId = `${id}-${name}`;
           const error = formState.errors.tokenLimits?.[name]?.message;
           return (

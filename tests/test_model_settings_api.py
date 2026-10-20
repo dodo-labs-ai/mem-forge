@@ -197,6 +197,7 @@ def test_the_api_lists_the_provider_descriptors(db, tmp_path) -> None:
         "model_is_route": False,
         "lists_models": True,
         "lists_token_limits": False,
+        "sets_context_window": False,
         "options": ["organization"],
         "parameters": {"generation": [], "embedding": ["dimensions"]},
         "token_limits": {
@@ -218,6 +219,7 @@ def test_the_api_lists_the_provider_descriptors(db, tmp_path) -> None:
         "openrouter",
         "openai_compatible",
     }
+    assert [provider["id"] for provider in providers if provider["sets_context_window"]] == ["ollama"]
 
 
 def test_a_fresh_installation_reads_as_writable_with_no_bindings(db, tmp_path) -> None:
