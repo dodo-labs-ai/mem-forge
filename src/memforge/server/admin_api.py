@@ -2170,12 +2170,13 @@ class UnqueuedSource(BaseModel):
         "source_paused",
         "source_not_active",
         "source_not_synced",
+        "source_missing",
         "projection_scope_transition_open",
     ] = Field(
         description=(
             "Why the Source's reprocess was not queued: another run is pending or running, the "
-            "Source is paused or no longer active, it has not completed a sync, or its projection "
-            "scope is changing."
+            "Source is paused or no longer active, it has not completed a sync, it was deleted "
+            "meanwhile, or its projection scope is changing."
         ),
     )
 
@@ -6562,6 +6563,9 @@ def create_admin_app(
                 continue
             except SourceSyncBoundaryError:
                 unqueued.append(UnqueuedSource(source_id=source_id, reason="source_not_synced"))
+                continue
+            except ValueError:
+                unqueued.append(UnqueuedSource(source_id=source_id, reason="source_missing"))
                 continue
             queued_documents += len(document_ids)
             queued_sources += 1

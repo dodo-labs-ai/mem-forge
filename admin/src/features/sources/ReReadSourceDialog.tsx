@@ -1,4 +1,5 @@
 import { toast } from "sonner";
+import { ApiError } from "@/api";
 import { errorMessage } from "@/lib/errors";
 import { formatCount, pluralize } from "@/lib/format";
 import { ConfirmDialog } from "@/patterns";
@@ -22,13 +23,18 @@ function refusal(error: unknown): string {
   return REFUSALS[message] ?? message;
 }
 
+/** Whether the dry run failed to answer, as a server error or a lost request does, rather than refused. */
+function unanswered(error: unknown): boolean {
+  return !(error instanceof ApiError) || error.status >= 500;
+}
+
 /**
  * Confirms re-reading every document of a source with the current models. A
  * sync reads only documents that changed, so this is how a source is read
  * again after a model changes. A dry run first counts the documents that can
  * be re-read from what was stored, and the model calls they take, and only
  * those are re-read. When the dry run cannot answer, re-reading is still
- * offered for every document.
+ * offered for every document; when the server refuses it, the refusal shows.
  */
 export function ReReadSourceDialog({ source, onOpenChange }: ReReadSourceDialogProps) {
   const preview = useReReadPreview(source?.id ?? null);
@@ -36,7 +42,7 @@ export function ReReadSourceDialog({ source, onOpenChange }: ReReadSourceDialogP
   const report = preview.data;
   const readable = report?.units.filter((unit) => unit.available).map((unit) => unit.document_id) ?? [];
   const refused = preview.isError ? refusal(preview.error) : null;
-  const unestimated = preview.isError && !(errorMessage(preview.error) in REFUSALS);
+  const unestimated = preview.isError && unanswered(preview.error);
 
   async function confirm() {
     await reRead.mutateAsync({ sourceId: source!.id, documentIds: report ? readable : null });
