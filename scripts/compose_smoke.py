@@ -602,8 +602,19 @@ def _model_plan(args: argparse.Namespace) -> ModelPlan:
 
 # -- Quality checks ----------------------------------------------------------------
 
-# The module whose prompts a derivation reads; a run names its content hash.
-_EXTRACTION_PROMPTS = Path(__file__).resolve().parents[1] / "src" / "memforge" / "pipeline" / "memory_extractor.py"
+# The modules the extraction prompt is built from; a run names their content hash.
+_EXTRACTION_PROMPT_MODULES = tuple(
+    Path(__file__).resolve().parents[1] / "src" / "memforge" / "pipeline" / name
+    for name in ("memory_extractor.py", "extraction_contract.py", "memory_value.py")
+)
+
+
+def _extraction_prompt_hash() -> str:
+    digest = hashlib.sha256()
+    for module in _EXTRACTION_PROMPT_MODULES:
+        digest.update(module.read_bytes())
+    return digest.hexdigest()
+
 
 
 def quality_seed_spec(cohort_file: Path, state: State) -> str:
@@ -627,7 +638,7 @@ def quality_run_spec(cohort_file: Path, seeded: dict[str, Any]) -> str:
     if seeded.get("error") or not seeded.get("cohort_id") or skipped:
         raise CheckFailed(f"the quality cohort was not pinned completely: {seeded.get('error') or skipped}")
     run = json.loads(cohort_file.read_text(encoding="utf-8"))["run"]
-    prompt_hash = hashlib.sha256(_EXTRACTION_PROMPTS.read_bytes()).hexdigest()
+    prompt_hash = _extraction_prompt_hash()
     return json.dumps(
         {
             **run,

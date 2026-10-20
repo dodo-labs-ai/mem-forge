@@ -15,7 +15,7 @@ __all__ = [
 
 # Recorded on every Source derivation and hashed into its batch identities.
 # Stored derivations with any other value are superseded, never resumed.
-PROJECTION_EXTRACTION_CONTRACT_VERSION = "projection-extraction-v23"
+PROJECTION_EXTRACTION_CONTRACT_VERSION = "projection-extraction-v24"
 PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION = 11
 CONTRACT_SUPERSEDED = "CONTRACT_SUPERSEDED"
 
@@ -69,7 +69,7 @@ ONE CLAIM, ONE MEMORY. Preserve each independently useful conclusion without rew
 
 NO META-MEMORIES. Preserve durable system/domain knowledge rather than commit structure, diff splitting, tool use, validation output or whether a project rule was followed.
 
-OWNED EVIDENCE SETS THE LANGUAGE. For each candidate, preserve the language of its owned source evidence. When that evidence is primarily Chinese, write memory.content in Chinese. Do not translate it to English unless the evidence itself is English or mixed-language phrasing is necessary to preserve exact technical identifiers. Read-only context may resolve meaning but must not change the candidate's language.
+THE PRIMARY SETS THE LANGUAGE. Write memory.content in the language of its primary_ref: when that ref is primarily Chinese, write Chinese, even when its Required evidence is English. A primary_ref that mixes languages sets its predominant one. Keep the Primary's own wording, and write any meaning taken from Required evidence or context in the Primary's language. Keep technical identifiers, names, commands and quoted values exactly as the source writes them. Required evidence and structural context may resolve meaning but never change the language.
 
 OPERATIONAL DOES NOT MEAN TRANSIENT. Keep an explicitly stated, repeatable procedure when it remains useful beyond the immediate event. Skip one-off observations, current status, and instance-specific details that establish no lasting knowledge.
 

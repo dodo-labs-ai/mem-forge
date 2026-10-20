@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Claim Extraction writes a Memory in the language of its Primary Evidence,
+  even when its Required Evidence is in another language: a Chinese reply that
+  settles an English message gives a Chinese Memory. Identifiers, names and
+  quoted values stay as the source writes them. The extraction contract is
+  `projection-extraction-v24`, and a test ties the extraction prompt to that
+  version. The quick quality cohort gains a Chinese case.
+
 - A structured request with images is checked as it is sent: rendered once,
   with no room kept for a correction, which only the packing of a first
   request keeps. A request that does not fit, or that exceeds the encoded size
