@@ -1027,11 +1027,12 @@ async def test_only_a_direct_answer_asks_the_provider_to_answer_without_reasonin
 
 
 @pytest.mark.parametrize("descriptor", PROVIDER_DESCRIPTORS, ids=lambda descriptor: descriptor.id)
-def test_only_ollama_is_held_to_the_context_window_a_request_is_sized_by(descriptor) -> None:
-    """Ollama sizes its window per request; every other provider fixes it and states it."""
-    expected = {"num_ctx": 8192} if descriptor.id == "ollama" else {}
-
-    assert descriptor.context_window(8192) == expected
+def test_only_ollama_sets_the_context_window_per_request(descriptor) -> None:
+    """Ollama sizes its window per request; every other provider fixes it."""
+    if descriptor.id == "ollama":
+        assert descriptor.context_window(8192) == {"num_ctx": 8192}
+    else:
+        assert descriptor.context_window is None
 
 
 @pytest.mark.parametrize("row", _rows_for("generation", "structured_generation"))
@@ -1046,6 +1047,26 @@ async def test_an_ollama_request_states_the_context_window_of_its_route(wire, ro
         assert body["options"]["num_ctx"] == client.request_budget().context_limit == _CONTEXT_WINDOW
     else:
         assert "num_ctx" not in json.dumps(body)
+
+
+def test_an_ollama_route_takes_its_window_only_from_the_binding(monkeypatch) -> None:
+    """The window Ollama runs a request in is what the operator's machine holds,
+    so the model's own window, as LiteLLM reads it from an Ollama server, sizes nothing."""
+    monkeypatch.setattr(
+        litellm,
+        "get_model_info",
+        lambda model: {"max_input_tokens": 131072, "context_window": 131072, "max_output_tokens": 32768},
+    )
+    row = next(row for row in MATRIX if row.descriptor == "ollama" and row.contract("generation") is not None)
+    invocation = _invocation(row, "generation")
+
+    unstated = _structured_client(invocation, max_input_tokens=None, context_window_tokens=None, max_output_tokens=None)
+    stated = _structured_client(invocation, max_input_tokens=None, context_window_tokens=16384, max_output_tokens=None)
+
+    with pytest.raises(ValueError, match="context_window_tokens"):
+        unstated.request_budget()
+    assert stated.request_budget().context_limit == 16384
+    assert stated._context_window(stated.config.model) == {"num_ctx": 16384}
 
 
 # -- Embedding ----------------------------------------------------------------------

@@ -63,6 +63,23 @@ def test_a_known_model_logs_nothing(monkeypatch, caplog) -> None:
     assert _records(caplog) == []
 
 
+def test_a_window_sized_per_request_is_only_the_stated_one(monkeypatch) -> None:
+    monkeypatch.setattr(
+        litellm,
+        "get_model_info",
+        lambda model: {"max_input_tokens": 131072, "context_window": 131072, "max_output_tokens": 32768},
+    )
+
+    with pytest.raises(ValueError, match="context_window_tokens"):
+        RequestBudget.resolve("ollama_chat/qwen3:8b", LlmConfig(), catalog_window=False)
+    budget = RequestBudget.resolve(
+        "ollama_chat/qwen3:8b", LlmConfig(context_window_tokens=16384), catalog_window=False,
+    )
+
+    assert (budget.input_limit, budget.context_limit, budget.output_limit) == (131072, 16384, 32768)
+    assert budget.output_tokens == 4096
+
+
 def _budget(*, input_limit: int, context_limit: int, output_limit: int, correction_reserve: int = 0) -> RequestBudget:
     return RequestBudget(
         "fixture/model", input_limit, context_limit, output_limit, 1.0, "fixture", correction_reserve,

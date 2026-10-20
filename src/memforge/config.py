@@ -18,7 +18,8 @@ __all__ = ["AgentEvaluationConfig", "AppConfig", "SyncConfig", "load_config"]
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_DIR = Path.home() / ".memforge"
-# Output limits of single tasks, which the route's output capacity replaces.
+# Variables that would set the output of single tasks. Every request asks for
+# the route's output capacity, so they are read only to say they set nothing.
 _RETIRED_OUTPUT_LIMIT_VARIABLES = ("MEMFORGE_ENRICHMENT_MAX_TOKENS", "MEMFORGE_MEMORY_EXTRACTION_MAX_TOKENS")
 DEFAULT_SEARCH_TOP_K = 20
 DEFAULT_RANK_WINDOW_SIZE = 50

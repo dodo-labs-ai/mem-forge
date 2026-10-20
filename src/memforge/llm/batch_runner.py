@@ -124,7 +124,7 @@ class ItemFailure:
     """Why one item has no result.
 
     ``capacity_exceeded`` means the item alone exceeds the route's input
-    capacity; ``invalid_response`` means the item's row stayed rejected after its
+    capacity, or its answer the route's output capacity; ``invalid_response`` means the item's row stayed rejected after its
     re-ask, or a response that holds only this item could not be read into rows
     after its correction. The caller owns the stage outcome: Support keeps an
     unjudgeable incumbent; Claim Extraction skips the unjudgeable ReadingGroup.

@@ -127,7 +127,6 @@ CHANGE_IMPACT_CONTRACT = "change-impact-v4"
 CHANGE_IMPACT_TASK = DecisionTask("change_impact", CHANGE_IMPACT_CONTRACT)
 
 
-
 class SupportReadingState(BaseModel):
     """Program-owned state of one Support's ordered reading; the model only adds witnesses."""
 

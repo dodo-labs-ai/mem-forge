@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Every structured model request asks for the route's output capacity: the
+  model's maximum output, up to a quarter of its context window. A route whose
+  limits are unknown sends no maximum and the provider's default applies. An
+  answer cut off at that capacity is a capacity failure, like an input that does
+  not fit: a request of several items is split, and a single item is skipped or
+  rejected with `output_capacity_exceeded`.
+  - An Ollama binding states its context window, and every request asks Ollama
+    for it as `num_ctx`. The window is no longer read from the Ollama server,
+    so validating an Ollama model always asks for the token limits.
+  - `MEMFORGE_ENRICHMENT_MAX_TOKENS` and `MEMFORGE_MEMORY_EXTRACTION_MAX_TOKENS`
+    set nothing and log a warning. `MEMFORGE_LLM_MAX_OUTPUT_TOKENS` or the
+    binding's maximum output bounds the output.
+  - Structured call telemetry drops `reasoning_budget_retries` and
+    `reasoning_budget_recovered`; `requested_max_tokens` is empty when no
+    maximum was sent.
+  - Cloud: `MemoryExtractor` takes no `max_tokens`, `LlmConfig` has no
+    `enrichment_max_tokens` or `memory_extraction_max_tokens`, and
+    `LlmRequest` takes no output limit (its third field is `images`).
+
 - Offline replay of a derivation case now shows the model the images its
   derivation read, such as screenshots in a Jira issue. Each image is read from
   the document store by the hash its pinned Observation Revision records, as a
