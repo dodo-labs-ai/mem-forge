@@ -9977,7 +9977,6 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
                         content="A7 remains enabled.",
                         memory_type="fact",
                         evidence_quote="Keep A7.",
-                        extraction_context="Keep A7.",
                         source_observation_id=fragment.anchor.observation_id,
                         resolved_evidence_selection=catalog.resolve_selection(primary_ref=fragment.reference),
                     )

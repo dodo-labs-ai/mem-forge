@@ -205,7 +205,6 @@ class Memory:
     superseded_at: datetime | None = None
     replacement_reason: str | None = None
     replacement_kind: ReplacementKind | None = None
-    extraction_context: str | None = None
 
 
 @dataclass
@@ -217,7 +216,6 @@ class RawMemory:
     entity_refs: list[str] = field(default_factory=list)
     valid_from: str | None = None
     valid_until: str | None = None
-    extraction_context: str | None = None
     evidence_quote: str | None = None
     # Current-revision coordinates of the Primary part of the resolved
     # Evidence selection, kept in the derivation output payload.

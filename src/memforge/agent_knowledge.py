@@ -645,7 +645,6 @@ class AgentKnowledgeBundleService:
             source_type="agent_session",
             replacement_reason=reason,
             replacement_kind=replacement_kind,
-            memory_extraction_context=provenance,
             submitted_at=observed_at,
             observed_at=observed_at,
             source_updated_at=observed_at,
@@ -877,7 +876,6 @@ class AgentKnowledgeBundleService:
         del client, workspace
         candidate_memory = self._build_claim_memory(
             memory_id=_stable_id("agent_candidate", source_id, session_id, content_hash(memory_content)),
-            claim_text=proposal.claim_text,
             memory_content=memory_content,
             memory_type=proposal.memory_type,
             owner_user_id=owner_user_id,
@@ -972,7 +970,6 @@ class AgentKnowledgeBundleService:
             raise RuntimeError(f"unexpected agent claim create lifecycle action: {lifecycle.action}")
         memory = self._build_claim_memory(
             memory_id=memory_id,
-            claim_text=claim_text,
             memory_content=memory_content,
             memory_type=memory_type,
             owner_user_id=owner_user_id,
@@ -1035,7 +1032,6 @@ class AgentKnowledgeBundleService:
         incumbent_memory_id: str | None,
         reconcile_action: ReconcileAction,
         reconciliation_reason: str,
-        memory_extraction_context: str | None = None,
         primary_event_id: str | None = None,
         required_event_ids: tuple[str, ...] = (),
         unsupported_incumbent_authority: IncumbentAuthority = (
@@ -1142,7 +1138,6 @@ class AgentKnowledgeBundleService:
             RawMemory(
                 content=memory_content,
                 memory_type=memory_type,
-                extraction_context=(memory_extraction_context or claim_text).strip(),
                 evidence_quote=claim_text.strip(),
             )
             if memory_content is not None
@@ -1201,7 +1196,6 @@ class AgentKnowledgeBundleService:
                 incumbent_candidates[memory_id] = RawMemory(
                     content=current.content,
                     memory_type=current.memory_type,
-                    extraction_context=str(claim["claim_text"]).strip(),
                     evidence_quote=str(claim["claim_text"]).strip(),
                 )
         if incumbent_memory_id is not None and incumbent_memory_id not in incumbents:
@@ -1248,7 +1242,6 @@ class AgentKnowledgeBundleService:
             incumbent_candidates[incumbent_memory_id] = RawMemory(
                 content=requested_memory.content,
                 memory_type=requested_memory.memory_type,
-                extraction_context=str(requested_claim["claim_text"]).strip(),
                 evidence_quote=str(requested_claim["claim_text"]).strip(),
             )
             source_support = {**source_support, incumbent_memory_id: ()}
@@ -1445,7 +1438,6 @@ class AgentKnowledgeBundleService:
         source_type: str,
         replacement_reason: str,
         replacement_kind: ReplacementKind,
-        memory_extraction_context: str | None = None,
         submitted_at: datetime,
         observed_at: datetime,
         source_updated_at: datetime | None,
@@ -1488,7 +1480,6 @@ class AgentKnowledgeBundleService:
             reconciliation_reason=replacement_reason,
             primary_event_id=proposal.primary_event_id,
             required_event_ids=tuple(proposal.required_event_ids),
-            memory_extraction_context=memory_extraction_context,
             unsupported_authority_actor_id=owner_user_id,
         )
         plan, unit = self._bind_relation_evidence_to_plan(
@@ -1558,13 +1549,11 @@ class AgentKnowledgeBundleService:
             raise RuntimeError(f"unexpected agent claim replace lifecycle action: {lifecycle.action}")
         memory = self._build_claim_memory(
             memory_id=new_memory_id,
-            claim_text=claim_text,
             memory_content=memory_content,
             memory_type=memory_type,
             owner_user_id=owner_user_id,
             repo_identifier=repo_identifier,
             project_key=project_key,
-            extraction_context=memory_extraction_context,
         )
         relation_outcome = self._relation_outcome_bundle(
             unit=unit,
@@ -1688,13 +1677,11 @@ class AgentKnowledgeBundleService:
         self,
         *,
         memory_id: str,
-        claim_text: str,
         memory_content: str,
         memory_type: str,
         owner_user_id: str,
         repo_identifier: str | None,
         project_key: str | None,
-        extraction_context: str | None = None,
     ) -> Memory:
         return Memory(
             id=memory_id,
@@ -1708,7 +1695,6 @@ class AgentKnowledgeBundleService:
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
             status="active",
-            extraction_context=(extraction_context or claim_text).strip(),
         )
 
     async def _write_concept_document(

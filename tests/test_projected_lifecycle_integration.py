@@ -2536,7 +2536,6 @@ async def test_noop_rebinds_support_to_current_source_revision(db: Database) -> 
             RawMemory(
                 content=incumbent.content,
                 memory_type=incumbent.memory_type,
-                extraction_context="A7 is removed.",
                 evidence_quote="A7 is removed.",
             )
         ],
@@ -7542,7 +7541,6 @@ async def test_projected_memory_support_survives_relation_work_retry_and_empty_c
         content="A7 applies only to regular payroll.",
         memory_type="decision",
         evidence_quote="A7 applies only to regular payroll.",
-        extraction_context="A7 applies only to regular payroll.",
         evidence_anchor="projection_batch",
         source_observation_id=primary.id,
     )
@@ -7837,7 +7835,6 @@ async def _create_relation_discovery_fixture(
                 content="A7 applies only to regular payroll.",
                 memory_type="decision",
                 evidence_quote="A7 applies only to regular payroll.",
-                extraction_context="A7 applies only to regular payroll.",
             )
         ]),
         doc_type="design-doc",
@@ -8355,7 +8352,6 @@ async def test_relation_discovery_records_relation_after_lifecycle_commit(
         content="A7 applies only to regular payroll.",
         memory_type="decision",
         evidence_quote="A7 applies only to regular payroll.",
-        extraction_context="A7 applies only to regular payroll.",
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
@@ -8763,7 +8759,6 @@ async def test_new_projected_memory_commit_survives_vector_outbox_delivery_failu
         content="A7 applies only to regular payroll.",
         memory_type="decision",
         evidence_quote="A7 applies only to regular payroll.",
-        extraction_context="A7 applies only to regular payroll.",
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
@@ -9030,7 +9025,6 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
                 content="A7 is retained and marked as reduced retro chain.",
                 memory_type="decision",
                 entity_refs=["A7"],
-                extraction_context="A7 is retained and marked as reduced retro chain.",
                 evidence_quote="A7 is retained and marked as reduced retro chain.",
             )
         ],
@@ -9127,7 +9121,6 @@ async def test_projected_quality_consumes_typed_observation_semantics(
     raw = RawMemory(
         content="The ticket priority changed from high to low.",
         memory_type="fact",
-        extraction_context="opaque provider payload",
         source_observation_id=_body_observation(projection).id,
     )
     adapters = build_sqlite_adapters(db, object())
@@ -9158,26 +9151,23 @@ async def test_projected_quality_consumes_typed_observation_semantics(
 
 
 @pytest.mark.parametrize(
-    ("run_id", "content", "context", "expected_added", "expected_skipped"),
+    ("run_id", "content", "expected_added", "expected_skipped"),
     [
         (
             "projection-quality-metadata",
             "The ACD document was authored by Alice and last modified on 2026-06-01.",
-            "Author: Alice; Last modified: 2026-06-01",
             0,
             1,
         ),
         (
             "projection-quality-open-question",
             "The team should discuss whether the payroll cutoff moves to Thursday.",
-            "Open question for the next design discussion.",
             0,
             1,
         ),
         (
             "projection-quality-conditional-rule",
             "The AP result is recalculated only when the retro trigger remains OPEN.",
-            "The rule is conditional on the trigger remaining OPEN.",
             1,
             0,
         ),
@@ -9188,7 +9178,6 @@ async def test_projected_lifecycle_enforces_candidate_quality_before_persistence
     db: Database,
     run_id: str,
     content: str,
-    context: str,
     expected_added: int,
     expected_skipped: int,
 ) -> None:
@@ -9197,7 +9186,6 @@ async def test_projected_lifecycle_enforces_candidate_quality_before_persistence
     raw = RawMemory(
         content=content,
         memory_type="fact",
-        extraction_context=context,
         evidence_quote=revision.content,
         source_observation_id=_body_observation(projection).id,
     )
