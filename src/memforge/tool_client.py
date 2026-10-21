@@ -381,7 +381,6 @@ class ToolClient:
         sync_snapshot_id: str,
         local_agent_job_id: str,
         local_agent_attempt_count: int,
-        scope_attestations: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Declare covered membership and request only missing content bodies.
 
@@ -399,8 +398,6 @@ class ToolClient:
             "local_agent_attempt_count": local_agent_attempt_count,
             "package_contract_version": LOCAL_PACKAGE_CONTRACT_VERSION,
         }
-        if scope_attestations is not None:
-            body["scope_attestations"] = scope_attestations
         return self._resource_json(
             "POST",
             f"/sources/{quote(source_id, safe='')}/adapter/manifest",
@@ -463,65 +460,74 @@ class ToolClient:
             body,
         )
 
-    def push_teams_window_package(
+    def conversation_collection_request(
         self,
         *,
         source_id: str,
-        conversation_id: str,
-        window_id: str,
-        revision_hash: str,
-        raw_payload: dict[str, Any],
-        title: str | None = None,
-        root_message_id: str | None = None,
-        window_type: str | None = None,
-        source_url: str | None = None,
-        raw_hash: str | None = None,
-        sync_snapshot_id: str | None = None,
-        local_agent_job_id: str | None = None,
-        local_agent_attempt_count: int | None = None,
-        artifact_source_unit_key: str | None = None,
-        artifact_input_hashes: list[str] | None = None,
-        submitted_by: str | None = None,
-        submitted_at: str | None = None,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
     ) -> dict[str, Any]:
-        """Push one raw Teams conversation-window package into a configured Teams source."""
-        source_id = source_id.strip()
-        if not source_id:
-            return {"error": "source_id is required"}
-        body: dict[str, Any] = {
-            "conversation_id": conversation_id,
-            "window_id": window_id,
-            "revision_hash": revision_hash,
-            "raw_payload": raw_payload,
-        }
-        if title is not None:
-            body["title"] = title
-        if root_message_id is not None:
-            body["root_message_id"] = root_message_id
-        if window_type is not None:
-            body["window_type"] = window_type
-        if source_url is not None:
-            body["source_url"] = source_url
-        if raw_hash is not None:
-            body["raw_hash"] = raw_hash
-        if sync_snapshot_id is not None:
-            body["sync_snapshot_id"] = sync_snapshot_id
-        if local_agent_job_id is not None:
-            body["local_agent_job_id"] = local_agent_job_id
-        if local_agent_attempt_count is not None:
-            body["local_agent_attempt_count"] = local_agent_attempt_count
-        if artifact_source_unit_key is not None:
-            body["artifact_source_unit_key"] = artifact_source_unit_key
-        if artifact_input_hashes:
-            body["artifact_input_hashes"] = list(artifact_input_hashes)
-        if submitted_by is not None:
-            body["submitted_by"] = submitted_by
-        if submitted_at is not None:
-            body["submitted_at"] = submitted_at
+        """Ask the server what this collection attempt of a conversation Source collects."""
+
         return self._resource_json(
             "POST",
-            f"/sources/{quote(source_id, safe='')}/adapter/packages",
-            body,
+            f"/sources/{quote(source_id.strip(), safe='')}/conversation-collection/request",
+            {"local_agent_job_id": local_agent_job_id, "local_agent_attempt_count": local_agent_attempt_count},
+        )
+
+    def submit_conversation_manifest(
+        self,
+        *,
+        source_id: str,
+        manifest: dict[str, Any],
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+    ) -> dict[str, Any]:
+        """Upload one attempt's Collection Manifest; the answer names the bodies the server lacks."""
+
+        return self._resource_json(
+            "POST",
+            f"/sources/{quote(source_id.strip(), safe='')}/conversation-collection/manifest",
+            {
+                "manifest": manifest,
+                "local_agent_job_id": local_agent_job_id,
+                "local_agent_attempt_count": local_agent_attempt_count,
+            },
+        )
+
+    def plan_conversation_collection(
+        self,
+        *,
+        source_id: str,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+    ) -> dict[str, Any]:
+        """Ask the server what this uploaded attempt would change, without processing it."""
+
+        return self._resource_json(
+            "POST",
+            f"/sources/{quote(source_id.strip(), safe='')}/conversation-collection/plan",
+            {"local_agent_job_id": local_agent_job_id, "local_agent_attempt_count": local_agent_attempt_count},
+        )
+
+    def submit_conversation_bodies(
+        self,
+        *,
+        source_id: str,
+        bodies: list[dict[str, Any]],
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+    ) -> dict[str, Any]:
+        """Upload message bodies of one attempt, each ``{conversation_id, message_id, record}``."""
+
+        return self._resource_json(
+            "POST",
+            f"/sources/{quote(source_id.strip(), safe='')}/conversation-collection/bodies",
+            {
+                "bodies": bodies,
+                "local_agent_job_id": local_agent_job_id,
+                "local_agent_attempt_count": local_agent_attempt_count,
+            },
         )
 
     def list_sources(self) -> dict[str, Any]:
@@ -597,42 +603,6 @@ class ToolClient:
             "POST",
             f"/agent-evaluations/annotations/langfuse/{quote(task_id, safe='')}/import",
             {},
-        )
-
-    def get_source_projection_inventory(
-        self,
-        source_id: str,
-        *,
-        unit_type: str | None = None,
-        conversation_id: str | None = None,
-        observed_from_lte: str | None = None,
-        observed_to_gte: str | None = None,
-        observed_to_lt: str | None = None,
-        cursor: str | None = None,
-        limit: int = 200,
-    ) -> dict[str, Any]:
-        source_id = source_id.strip()
-        if not source_id:
-            return {"error": "source_id is required"}
-        query = urlencode(
-            {
-                key: value
-                for key, value in {
-                    "unit_type": unit_type,
-                    "conversation_id": conversation_id,
-                    "observed_from_lte": observed_from_lte,
-                    "observed_to_gte": observed_to_gte,
-                    "observed_to_lt": observed_to_lt,
-                    "cursor": cursor,
-                    "limit": limit,
-                }.items()
-                if value is not None
-            }
-        )
-        return self._resource_json(
-            "GET",
-            f"/sources/{quote(source_id, safe='')}/projection-inventory?{query}",
-            None,
         )
 
     def list_memory_reviews(

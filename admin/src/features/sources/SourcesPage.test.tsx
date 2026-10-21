@@ -112,7 +112,7 @@ test("Sync now starts a sync for that source", async () => {
   await vi.waitFor(() => expect(calls.some((request) => request.method === "POST")).toBe(true));
   const syncCall = calls.find((request) => request.method === "POST")!;
   expect(new URL(syncCall.url).pathname).toBe("/api/v1/sources/src-wiki/sync");
-  expect(await syncCall.clone().json()).toEqual({ force_full_sync: false });
+  expect(await syncCall.clone().json()).toEqual({ dry_run: false, force_full_sync: false });
 });
 
 test.each(["row", "card", "drawer"])("Jira Sign in from the %s starts authentication without leaving V2", async (entry) => {
@@ -274,6 +274,7 @@ test("Retry now starts the waiting server run instead of a new sync", async () =
   const retryCall = calls.find((request) => request.method === "POST")!;
   expect(new URL(retryCall.url).pathname).toBe("/api/v1/sources/src-wiki/sync");
   expect(await retryCall.clone().json()).toEqual({
+    dry_run: false,
     force_full_sync: false,
     retry_target: { execution_kind: "source_sync_run", execution_id: "ssr-waiting" },
   });

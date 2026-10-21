@@ -93,6 +93,12 @@ class CanonicalRecordSchema:
     model_interpretation: str | None = None
     framing_fields: tuple[tuple[str, str], ...] = ()
 
+    @property
+    def qualified_name(self) -> str:
+        """The schema as records and manifests name it: ``name:version``."""
+
+        return f"{self.name}:{self.version}"
+
 
 @dataclass(frozen=True, slots=True)
 class EvidenceRepresentationContract:

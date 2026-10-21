@@ -61,6 +61,7 @@ from tests.test_candidate_admission import AdmissionClient
 from tests.test_evidence_catalog_source_matrix import TEXTUAL_BUILTIN_SOURCE_TYPES, _projection_inputs
 from tests.test_revision_assessment import memory
 from tests.test_revision_work import Client
+from tests.conversation_fixture import teams_unit_payload
 
 COMMENT = "Decision: retain A7 for regular payroll."
 NOW = datetime(2026, 9, 26, tzinfo=timezone.utc)
@@ -70,7 +71,7 @@ LEGACY_TITLE_PROFILE = UNIT_TITLE_OBSERVATION_PROFILE
 
 
 def jira(summary="Payroll run fails", *, issue_type=None, description="Payroll context.", comments_truncated=False,
-         prior=None, run_id="run-1"):
+         comments=(("501", COMMENT),), prior=None, run_id="run-1"):
     item = ContentItem(
         item_id="jira-SFPAY-180000", title=summary, source_url="https://jira.example.test/browse/SFPAY-180000",
         last_modified=NOW, version=run_id, extra={"issue_key": "SFPAY-180000"},
@@ -83,11 +84,17 @@ def jira(summary="Payroll run fails", *, issue_type=None, description="Payroll c
     payload = {
         "id": "180000", "key": "SFPAY-180000", "fields": fields,
         "renderedFields": {"description": f"<p>{escape(description)}</p>" if description else None},
-        "_comments": [{"id": "501", "body": COMMENT, "renderedBody": f"<p>{escape(COMMENT)}</p>"}],
+        "_comments": [
+            {"id": comment_id, "body": body, "renderedBody": f"<p>{escape(body)}</p>"} for comment_id, body in comments
+        ],
         "_comments_included": True,
-        "_comments_total": 2 if comments_truncated else 1,
+        "_comments_total": len(comments) + 1 if comments_truncated else len(comments),
         "changelog": {"startAt": 0, "histories": [], "total": 0},
-        **({"_comments_truncated": {"returned": 1, "total": 2}} if comments_truncated else {}),
+        **(
+            {"_comments_truncated": {"returned": len(comments), "total": len(comments) + 1}}
+            if comments_truncated
+            else {}
+        ),
     }
     return project_source_item(
         source_id="src-jira", source_type="jira", run_id=run_id, item=item,
@@ -108,11 +115,7 @@ def teams(messages, *, conversation_name="Payroll Dev", prior=None, run_id="run-
         extra={"conversation_id": "conversation-1", "window_id": "window-1", "root_message_id": messages[0]["id"],
                "block_start": times[0], "block_end": times[-1]},
     )
-    payload = {
-        "conversation_id": "conversation-1", "window_id": "window-1", "conversation_type": "group_chat",
-        "title": item.title, "channel_name": conversation_name, "conversation_name": conversation_name,
-        "messages": messages, "first_message_time": times[0], "last_message_time": times[-1],
-    }
+    payload = teams_unit_payload(messages, conversation_id="conversation-1", conversation_name=conversation_name)
     return project_source_item(
         source_id="src-teams", source_type="teams", run_id=run_id, item=item,
         raw=RawContent(item=item, body=json.dumps(payload).encode(), content_type="application/json"),
@@ -374,11 +377,6 @@ def test_a_unit_whose_prior_revision_held_only_its_title_is_compared_with_that_r
     [
         pytest.param(lambda: jira(), lambda prior: jira(comments_truncated=True, prior=prior, run_id="run-2"), id="jira"),
         pytest.param(
-            lambda: teams([FIRST_MESSAGE]),
-            lambda prior: teams([FIRST_MESSAGE, LATER_MESSAGE], prior=prior, run_id="run-2"),
-            id="teams",
-        ),
-        pytest.param(
             lambda: agent_session(COMMENT),
             lambda prior: agent_session(f"{COMMENT}\n\nAgreed.", prior=prior, run_id="run-2"),
             id="agent_session",
@@ -413,8 +411,8 @@ async def test_a_partial_unit_that_stored_its_title_is_recorded_and_read_without
 
 @pytest.mark.asyncio
 async def test_an_observation_a_partial_projection_carries_keeps_its_current_revision(tmp_path, monkeypatch):
-    stored = with_stored_title(teams([FIRST_MESSAGE]))
-    partial = teams([LATER_MESSAGE], prior=stored, run_id="run-2")
+    stored = with_stored_title(jira(comments=(("501", COMMENT), ("502", "Second comment."))))
+    partial = jira(comments=(("502", "Second comment."),), comments_truncated=True, prior=stored, run_id="run-2")
     [carried] = [revision for revision in stored.observation_revisions if revision.id in partial.carried_observation_revision_ids]
 
     db = await database_with_stored_title(tmp_path, monkeypatch, stored)

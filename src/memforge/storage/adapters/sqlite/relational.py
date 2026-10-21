@@ -691,6 +691,21 @@ class SqliteRelationalStore:
             limit=limit,
         )
 
+    async def list_current_observation_holders(
+        self,
+        source_id: str,
+        *,
+        observation_type: str,
+        provider_keys: Collection[str],
+        locator_equals: Mapping[str, str],
+    ) -> tuple[tuple[str, SourceUnit], ...]:
+        return await self._db.list_current_observation_holders(
+            source_id,
+            observation_type=observation_type,
+            provider_keys=provider_keys,
+            locator_equals=locator_equals,
+        )
+
     async def count_active_source_memories_without_support(self, source_id: str) -> int:
         return await self._db.count_active_source_memories_without_support(source_id)
 

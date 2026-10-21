@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Conversation Sources collect through one server-owned conversation layer
+  (`memforge.conversations`), and Teams is its first Source. A connector
+  implements only the provider port; the layer decides thread and window
+  Units per message, proven intervals, absence, Rolling Retention and scope
+  transitions from each attempt's Collection Manifest. Teams keeps its stored
+  Unit and Observation identities and records: migration 122 adds the
+  collection tables and renames Teams Unit Types to `conversation_window` and
+  `conversation_thread`, and migration 123 drops the Projection Scope
+  Attestation column. The local agent asks
+  `POST /api/v1/sources/{id}/conversation-collection/request`, uploads the
+  manifest, artifacts and bodies, then starts processing, or asks for the plan
+  when the sync was requested with `dry_run` to verify a migration. A
+  conversation the Source cannot read keeps its Support, and the run is
+  `partial` and names it. Older agents get `local_agent_upgrade_required`; the
+  Teams window-package route and the device ledger and audit log are removed.
+  - Cloud: a store implements the `CollectionStore` protocol (collection
+    request, manifest and body methods and `prune_conversation_collections`)
+    and `list_current_observation_holders`; `list_active_local_agent_jobs` returns
+    every queued and leased job so a dry run never joins a real collection.
 - A derivation evaluation case can pin a Document's later update: a seed request
   names it with `derivation_id`, and the case also pins the projection of the
   committed base revision the update was derived against, so replay plans the

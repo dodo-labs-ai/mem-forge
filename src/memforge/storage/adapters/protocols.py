@@ -463,6 +463,16 @@ class RelationalStore(Protocol):
         cursor: str | None = None,
         limit: int = 200,
     ) -> SourceUnitInventoryPage: ...
+    async def list_current_observation_holders(
+        self,
+        source_id: str,
+        *,
+        observation_type: str,
+        provider_keys: Collection[str],
+        locator_equals: Mapping[str, str],
+    ) -> tuple[tuple[str, SourceUnit], ...]:
+        """The current Source Units holding a current Observation of this type, paired with its provider key."""
+        ...
     async def create_projection_scope_transition(
         self,
         transition: ProjectionScopeTransition,

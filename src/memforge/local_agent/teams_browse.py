@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 from memforge.auth.teams_auth import TeamsAuthenticator
-from memforge.genes.teams_gene import AuthenticationError, _TeamsAPIClient
+from memforge.genes.teams_client import AuthenticationError, TeamsChatClient
 
 _CHAT_API_AUDIENCE = "https://ic3.teams.office.com"
 
@@ -62,7 +62,7 @@ async def browse_teams_conversations(*, region: str = "emea") -> dict[str, Any]:
     if not chat_token:
         raise ValueError("Missing Chat API token.")
 
-    client = _TeamsAPIClient(region=region)
+    client = TeamsChatClient(region=region)
     client._chat_client = httpx.AsyncClient(
         base_url=client._chat_base,
         headers={"Authorization": f"Bearer {chat_token}"},

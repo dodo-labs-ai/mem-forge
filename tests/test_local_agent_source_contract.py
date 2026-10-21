@@ -34,7 +34,6 @@ from memforge.local_agent.replay_adapter import (
 )
 from memforge.server.source_admin_service import source_ownership_and_capabilities
 from memforge.models import content_hash
-from memforge.local_agent.teams_ledger import build_teams_window_id
 
 
 def _canonical_payload_hash(payload: dict[str, object]) -> str:
@@ -100,7 +99,7 @@ def test_local_agent_attempt_identity_and_retry_status_are_deterministic() -> No
     assert local_agent_collection_attempt_id("teams", "job-1", 2) == "job-1:attempt:2"
     with pytest.raises(ValueError, match="does not match"):
         local_agent_collection_attempt_id("jira", "job-1", 2, "spoofed")
-    with pytest.raises(ValueError, match="not registered"):
+    with pytest.raises(ValueError, match="not collected by a local agent"):
         local_agent_collection_attempt_id("unregistered", "job-1", 2)
 
 
@@ -148,7 +147,7 @@ def test_local_agent_job_payload_preserves_complete_collection_scope() -> None:
 
 
 def test_local_replay_adapter_registry_has_no_provider_fallback() -> None:
-    assert registered_local_source_types() == frozenset({"github_repo", "jira", "local_markdown", "teams"})
+    assert registered_local_source_types() == frozenset({"github_repo", "jira", "local_markdown"})
     with pytest.raises(
         ValueError,
         match="local source replay adapter is not registered: unknown",
@@ -198,30 +197,6 @@ def test_local_agent_input_identity_uses_document_and_content_identity() -> None
             },
             "markdown",
         ),
-        (
-            "teams",
-            {
-                "package_kind": "teams_window_document",
-                "doc_id": "doc-a",
-                "version": "version-a",
-                "revision_hash": "version-a",
-                "raw_hash": "payload-hash",
-                "conversation_id": "19:chat-a@example.test",
-                "window_id": "window-a",
-                "raw_payload": {
-                    "conversation_id": "19:chat-a@example.test",
-                    "window_id": "window-a",
-                    "messages": [
-                        {
-                            "id": "message-a",
-                            "content": "Decision",
-                            "time": "2026-07-16T09:00:00+00:00",
-                        }
-                    ],
-                },
-            },
-            "raw_payload",
-        ),
     ],
 )
 def test_replay_package_identity_validation_covers_every_local_source_type(
@@ -229,18 +204,7 @@ def test_replay_package_identity_validation_covers_every_local_source_type(
     package: dict[str, object],
     missing_payload_field: str,
 ) -> None:
-    if source_type == "teams":
-        window_id = build_teams_window_id(
-            source_id="src-teams",
-            conversation_id="19:chat-a@example.test",
-            root_or_anchor_message_id="message-a",
-            window_type="time_block",
-        )
-        package["window_id"] = window_id
-        package["root_message_id"] = "message-a"
-        package["window_type"] = "time_block"
-        package["raw_payload"]["window_id"] = window_id
-    if source_type in {"jira", "teams"}:
+    if source_type == "jira":
         semantic_hash = _canonical_payload_hash(package["raw_payload"])
         package["semantic_hash"] = semantic_hash
         if source_type == "jira":
@@ -290,42 +254,6 @@ def test_replay_package_identity_validation_covers_every_local_source_type(
                 semantic_hash,
             ),
             expected_package_sha256=hashlib.sha256(incomplete_body).hexdigest(),
-        )
-
-
-def test_teams_replay_rejects_message_without_stable_source_time() -> None:
-    package = {
-        "package_kind": "teams_window_document",
-        "doc_id": "doc-teams",
-        "version": "revision-a",
-        "revision_hash": "revision-a",
-        "raw_hash": "raw-a",
-        "conversation_id": "19:chat-a@example.test",
-        "window_id": "window-a",
-        "raw_payload": {
-            "conversation_id": "19:chat-a@example.test",
-            "window_id": "window-a",
-            "messages": [{"id": "message-a", "content": "Decision"}],
-        },
-    }
-    semantic_hash = _canonical_payload_hash(package["raw_payload"])
-    package["semantic_hash"] = semantic_hash
-    body = json.dumps(package).encode()
-
-    with pytest.raises(
-        ValueError,
-        match="source_lifecycle_local_replay_artifact_invalid",
-    ):
-        validate_local_agent_replay_package(
-            "teams",
-            body,
-            expected_doc_id="doc-teams",
-            expected_version="revision-a",
-            expected_input_sha256=local_agent_semantic_input_sha256(
-                "doc-teams",
-                semantic_hash,
-            ),
-            expected_package_sha256=hashlib.sha256(body).hexdigest(),
         )
 
 

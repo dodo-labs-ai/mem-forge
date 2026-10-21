@@ -308,14 +308,22 @@ def test_teams_browse_job_reauths_when_no_local_session(monkeypatch):
 
 
 def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
+    from memforge.local_agent.conversation_executor import DeviceCollectionResult
+
     calls = {"collect": 0}
     auth_jobs: list[dict] = []
 
-    async def fake_collect(job, *, source_id: str, limit: int, report_progress=None):
+    async def fake_collect(job, payload, source_id, client, report_progress):
         calls["collect"] += 1
         if calls["collect"] == 1:
             raise ValueError("No Teams session found.")
-        return {"documents": [], "poll_audits": []}
+        return DeviceCollectionResult(
+            collection_attempt_id="laj-sync:attempt:1",
+            conversations=1,
+            messages=3,
+            bodies_uploaded=2,
+            processing={"run_id": "run-1"},
+        )
 
     def fake_auth(job):
         auth_jobs.append(job)
@@ -331,17 +339,7 @@ def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
             assert workspace_id == "workspace-a"
             return self
 
-        def get_source_projection_inventory(self, source_id: str, **filters):
-            del filters
-            assert source_id == "src-teams"
-            return {"units": []}
-
-        def prepare_local_source_snapshot(self, **kwargs):
-            assert kwargs["coverage"] == "bounded_delta"
-            assert kwargs["items"] == []
-            return {"required_doc_ids": [], "reused_count": 0}
-
-    monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect)
+    monkeypatch.setattr(main, "_collect_teams_on_device", fake_collect)
     monkeypatch.setattr(main, "_run_cloud_teams_auth_job", fake_auth)
     monkeypatch.setattr(main, "_current_teams_chat_token_hashes", lambda: set())
 
@@ -352,14 +350,7 @@ def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
             "operation": "teams_sync",
             "source_id": "src-teams",
             "workspace_id": "workspace-a",
-            "payload": {
-                "source_id": "src-teams",
-                "workspace_id": "workspace-a",
-                "audit_log_path": str(tmp_path / "teams-audit.jsonl"),
-                "ledger_state_path": str(tmp_path / "teams-ledger.json"),
-                "wait_seconds": 1,
-                "conversation_ids": ["19:conversation@thread.tacv2"],
-            },
+            "payload": {"source_id": "src-teams", "workspace_id": "workspace-a", "wait_seconds": 1},
         },
         FakeClient(),
     )
@@ -367,13 +358,14 @@ def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
     assert result["operation"] == "teams_sync"
     assert result["source_id"] == "src-teams"
     assert result["counts"] == {
-        "selected": 0,
-        "pushed": 0,
-        "failed": 0,
-        "skipped_existing": 0,
-        "polls": 0,
+        "conversations": 1,
+        "messages": 3,
+        "bodies_uploaded": 2,
+        "artifacts_uploaded": 0,
+        "artifacts_unavailable": 0,
     }
-    assert result["sync_started"] is False
+    assert result["sync_started"] is True
+    assert result["source_sync_run_id"] == "run-1"
     assert calls["collect"] == 2
     assert auth_jobs[0]["operation"] == "teams_auth"
 

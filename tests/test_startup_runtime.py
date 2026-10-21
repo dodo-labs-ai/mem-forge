@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
-import logging
+from types import SimpleNamespace
 from unittest.mock import create_autospec
 
 import pytest
-from rich.logging import RichHandler
 from fastapi.testclient import TestClient
+from rich.logging import RichHandler
 
 from memforge.config import AppConfig
+from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.models import Memory, SyncState, Visibility, content_hash
-from memforge.source_projection import ProjectionScopeAttestation
 from memforge.storage.database import Database
 from tests.test_sync_bookkeeping import _hold_document
 from tests.vector_index_fixture import use_collection_as_index
@@ -38,7 +39,7 @@ class FakeCollection:
 
 
 @pytest.mark.asyncio
-async def test_default_runtime_provider_forwards_projection_scope_attestations(monkeypatch):
+async def test_default_runtime_provider_forwards_the_collection_attempt(monkeypatch):
     from memforge import runtime
 
     shared_run_source_sync = create_autospec(
@@ -47,23 +48,17 @@ async def test_default_runtime_provider_forwards_projection_scope_attestations(m
         return_value=SyncState(source="src-teams", last_sync_status="success"),
     )
     monkeypatch.setattr(runtime, "run_source_sync", shared_run_source_sync)
-    attestation = ProjectionScopeAttestation(
-        subject_type="conversation",
-        subject_key="19:conversation@example.test",
-        collection_attempt_id="job-a:attempt:1",
-        target_scope_fingerprint="scope-a",
-        evidence={"poll": {"access_probe_status": "ok"}},
-    )
+    attempt = CollectionAttempt(workspace_id="default", collection_attempt_id="job-a:attempt:1")
 
     state = await runtime.DefaultRuntimeProvider().run_source_sync(
         object(),
         AppConfig(),
         {"id": "src-teams", "type": "teams", "name": "Teams", "config": {}},
-        projection_scope_attestations=(attestation,),
+        collection_attempt=attempt,
     )
 
     assert state.last_sync_status == "success"
-    assert shared_run_source_sync.await_args.kwargs["projection_scope_attestations"] == (attestation,)
+    assert shared_run_source_sync.await_args.kwargs["collection_attempt"] == attempt
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -1989,7 +1984,6 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             lifecycle_cycle_id=None,
             scope_transition_run_id=None,
             reusable_projection_doc_ids=frozenset(),
-            projection_scope_attestations=(),
             record_terminal_result=True,
             failed_item_retry=None,
         ):
@@ -2001,7 +1995,6 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
                 source_activity,
                 scope_transition_run_id,
                 reusable_projection_doc_ids,
-                projection_scope_attestations,
                 record_terminal_result,
             )
             self.lifecycle_cycle_id = lifecycle_cycle_id
@@ -2115,7 +2108,6 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             lifecycle_cycle_id=None,
             scope_transition_run_id=None,
             reusable_projection_doc_ids=frozenset(),
-            projection_scope_attestations=(),
             record_terminal_result=True,
             failed_item_retry=None,
         ):
@@ -2128,7 +2120,6 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
                 lifecycle_cycle_id,
                 scope_transition_run_id,
                 reusable_projection_doc_ids,
-                projection_scope_attestations,
                 record_terminal_result,
             )
             self.gene = gene
@@ -3293,8 +3284,9 @@ def test_config_env_overrides_startup_runtime_values(monkeypatch, tmp_path):
 
 
 def test_cli_logging_uses_stderr_for_stdio_safety(monkeypatch):
-    import memforge.main as main_module
     from rich.console import Console
+
+    import memforge.main as main_module
 
     monkeypatch.setattr(main_module, "log_console", Console(stderr=True, force_terminal=True))
     root = logging.getLogger()
@@ -3310,8 +3302,9 @@ def test_cli_logging_uses_stderr_for_stdio_safety(monkeypatch):
 
 
 def test_logging_without_a_terminal_writes_one_plain_line_per_record(monkeypatch, capsys):
-    import memforge.main as main_module
     from rich.console import Console
+
+    import memforge.main as main_module
 
     monkeypatch.setattr(main_module, "log_console", Console(stderr=True, force_terminal=False))
     root = logging.getLogger()
@@ -3332,3 +3325,66 @@ def test_logging_without_a_terminal_writes_one_plain_line_per_record(monkeypatch
     assert " ERROR memforge.test: Relation discovery work failed" in err
     assert "ValueError: text view requires a complete pinned representation" in err
     assert "│" not in err
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_run_syncs_within_its_collection_attempt_and_then_drops_its_bodies(db, tmp_path):
+    from memforge.conversations.collections import CollectedBody, StoredCollections
+    from memforge.conversations.manifest import CollectionManifest
+    from memforge.conversations.records import MessageIdentity
+    from memforge.local_agent.source_contract import local_agent_source_config_revision
+    from memforge.runtime import SourceSyncWorker
+
+    source = {
+        "id": "src-teams-run",
+        "type": "teams",
+        "config": {"region": "emea", "conversation_ids": ["19:chat@thread.v2"], "initial_history_days": 14},
+    }
+    await db.upsert_source(
+        id=source["id"],
+        type="teams",
+        name="Teams",
+        config_json=json.dumps(source["config"]),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    attempt = "job-1:attempt:1"
+    collections = StoredCollections(db, workspace_id="default")
+    await collections.record_manifest(
+        CollectionManifest(
+            source_id=source["id"],
+            collection_attempt_id=attempt,
+            config_revision="cfg",
+            record_schema="teams-message:2",
+            received_at=datetime.now(timezone.utc),
+            conversations=(),
+            messages=(),
+        )
+    )
+    await collections.record_bodies(
+        source["id"], attempt, {MessageIdentity("19:chat@thread.v2", "m1"): CollectedBody(record={"id": "m1"})}
+    )
+    run = await db.enqueue_source_sync_run(
+        source_id=source["id"],
+        trigger="local_agent",
+        input_snapshot_id=attempt,
+        source_config_revision=local_agent_source_config_revision(source),
+    )
+    worker = SourceSyncWorker(db, _config(tmp_path), worker_id="test-worker")
+    synced: dict[str, object] = {}
+
+    async def build_runtime():
+        return SimpleNamespace(runtime_event_trace_sink=None)
+
+    async def run_source_sync(run, **kwargs):
+        synced.update(kwargs)
+        return SyncState(source=source["id"], last_sync_status="success", last_sync_at=datetime.now(timezone.utc))
+
+    worker._build_runtime = build_runtime
+    worker._run_source_sync_with_heartbeat = run_source_sync
+    await worker.run_once()
+
+    assert synced["collection_attempt"] == CollectionAttempt(workspace_id="default", collection_attempt_id=attempt)
+    assert (await db.get_source_sync_run(run.run_id)).status == "success"
+    assert await collections.bodies(source["id"], attempt) == {}
+    assert await collections.manifest(source["id"], attempt) is not None
