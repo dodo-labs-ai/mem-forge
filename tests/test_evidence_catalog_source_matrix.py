@@ -19,6 +19,7 @@ from memforge.pipeline.source_projection_adapters import (
     project_source_item,
 )
 from tests.llm_fixture import NoopMemoryExtractor
+from tests.conversation_fixture import teams_unit_payload
 
 
 NOW = datetime(2026, 8, 12, tzinfo=timezone.utc)
@@ -195,17 +196,10 @@ def _projection_inputs(
             "window_id": "window-1",
             "root_message_id": "msg-1",
         }
-        raw_value = {
-            "conversation_id": "conversation-1",
-            "window_id": "window-1",
-            "messages": [
-                {
-                    "id": "msg-1",
-                    "content": rule,
-                    "time": "2026-08-12T10:00:00Z",
-                }
-            ],
-        }
+        raw_value = teams_unit_payload(
+            [{"id": "msg-1", "content": rule, "time": "2026-08-12T10:00:00Z"}],
+            conversation_id="conversation-1",
+        )
         content_type = "application/json"
         markdown = "normalized Teams window"
         target_observation_type = "message"

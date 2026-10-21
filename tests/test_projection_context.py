@@ -21,6 +21,7 @@ from memforge.source_artifacts import (
     StoredSourceArtifact,
 )
 from tests.llm_fixture import NoopMemoryExtractor
+from tests.conversation_fixture import teams_unit_payload
 
 
 def _committed_snapshot(projection) -> CommittedSourceUnitSnapshot:
@@ -180,7 +181,7 @@ def _teams_projection(
         source_type="teams",
         run_id=run_id,
         item=item,
-        raw=RawContent(item=item, body=json.dumps(messages).encode(), content_type="application/json"),
+        raw=RawContent(item=item, body=json.dumps(teams_unit_payload(messages["messages"])).encode(), content_type="application/json"),
         normalized=NormalizedContent(item=item, markdown_body="normalized Teams window"),
         prior_unit_revision=prior_unit_revision,
         prior_observation_revisions=prior_observation_revisions,
@@ -416,7 +417,7 @@ def test_v9_initial_tombstoned_message_has_no_primary_work(reprocess) -> None:
         item=item,
         raw=RawContent(
             item=item,
-            body=json.dumps(payload).encode(),
+            body=json.dumps(teams_unit_payload(payload["messages"])).encode(),
             content_type="application/json",
         ),
         normalized=NormalizedContent(
@@ -647,11 +648,11 @@ def test_preceding_observation_is_the_reply_target_else_the_declared_predecessor
         ),
         raw=RawContent(
             item=ContentItem(item_id="teams-window-1", title="PCC Agent Dev", source_url="", last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc)),
-            body=json.dumps({"messages": [
+            body=json.dumps(teams_unit_payload([
                 {"id": "msg-1", "content": "Question", "time": "2026-07-15T10:00:00Z"},
                 {"id": "msg-2", "content": "Aside", "time": "2026-07-15T10:01:00Z"},
                 {"id": "msg-3", "content": "Answer", "time": "2026-07-15T10:02:00Z", "reply_to_id": "msg-1"},
-            ]}).encode(),
+            ])).encode(),
             content_type="application/json",
         ),
         normalized=NormalizedContent(

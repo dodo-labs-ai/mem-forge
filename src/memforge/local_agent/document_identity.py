@@ -36,16 +36,3 @@ def build_jira_doc_id(*, source_id: str, issue_key: str) -> str:
             digest,
         ]
     )
-
-
-def build_teams_doc_id(*, source_id: str, window_id: str) -> str:
-    identity = "|".join([source_id.strip(), window_id.strip()])
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
-    return "-".join(
-        [
-            "teams",
-            slugify(source_id)[:30],
-            slugify(window_id)[:50] or "window",
-            digest,
-        ]
-    )

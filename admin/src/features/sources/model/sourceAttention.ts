@@ -140,6 +140,18 @@ export function sourceAttention({ source, readiness, activity, now = new Date() 
       actionLabel: "View details",
     };
   }
+  // A partial sync with nothing in the failure record names its own reason,
+  // such as a conversation the source can no longer read.
+  const partialReason = activity?.state === "partial" ? activity.error?.message?.trim() : undefined;
+  if (partialReason) {
+    return {
+      reason: "partially_synced",
+      title: "Last sync was partial",
+      detail: partialReason,
+      action: "configure",
+      actionLabel: "Configure",
+    };
+  }
 
   if (isOverdue(source, activity, now)) {
     return {

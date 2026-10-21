@@ -17,10 +17,8 @@ from memforge.github_repo_utils import build_github_repo_doc_id
 from memforge.local_agent.document_identity import (
     build_jira_doc_id,
     build_local_markdown_doc_id,
-    build_teams_doc_id,
 )
 from memforge.local_agent.source_contract import (
-    TEAMS_TOMBSTONE_REASONS,
     local_agent_semantic_input_sha256,
     local_file_package_semantic_hash,
 )
@@ -267,91 +265,6 @@ class JiraReplayAdapter(LocalSourceReplayAdapter):
         return semantic_hash
 
 
-class TeamsReplayAdapter(LocalSourceReplayAdapter):
-    source_type = "teams"
-    package_kind = "teams_window_document"
-
-    def derive_document_id(
-        self,
-        *,
-        source_id: str,
-        package: Mapping[str, Any],
-    ) -> str:
-        raw_payload = package.get("raw_payload")
-        if not isinstance(raw_payload, Mapping):
-            raise ValueError(INVALID_REPLAY_ARTIFACT)
-        from memforge.local_agent.teams_contract import (
-            TeamsMessageEvidenceError,
-            validate_teams_window_payload,
-        )
-
-        try:
-            validate_teams_window_payload(
-                raw_payload,
-                conversation_id=str(package.get("conversation_id") or "").strip(),
-                window_id=str(package.get("window_id") or "").strip(),
-                source_id=source_id,
-                root_message_id=str(package.get("root_message_id") or "").strip(),
-                window_type=str(package.get("window_type") or "").strip(),
-                tombstone_reasons=TEAMS_TOMBSTONE_REASONS,
-            )
-        except TeamsMessageEvidenceError as exc:
-            raise ValueError(INVALID_REPLAY_ARTIFACT) from exc
-        return build_teams_doc_id(
-            source_id=source_id,
-            window_id=str(package.get("window_id") or ""),
-        )
-
-    def _validate_semantics(
-        self,
-        package: Mapping[str, Any],
-        package_version: str,
-    ) -> str:
-        raw_payload = package.get("raw_payload")
-        if not isinstance(raw_payload, Mapping) or not raw_payload:
-            raise ValueError(INVALID_REPLAY_ARTIFACT)
-        from memforge.local_agent.teams_contract import (
-            TeamsMessageEvidenceError,
-            validate_teams_window_payload,
-        )
-
-        try:
-            validate_teams_window_payload(
-                raw_payload,
-                conversation_id=str(package.get("conversation_id") or "").strip(),
-                window_id=str(package.get("window_id") or "").strip(),
-                source_id=None,
-                root_message_id=str(package.get("root_message_id") or "").strip(),
-                window_type=str(package.get("window_type") or "").strip(),
-                tombstone_reasons=TEAMS_TOMBSTONE_REASONS,
-            )
-        except TeamsMessageEvidenceError as exc:
-            raise ValueError(INVALID_REPLAY_ARTIFACT) from exc
-        source_artifacts = package.get("source_artifacts")
-        if source_artifacts:
-            try:
-                artifact_semantic_refs = source_artifact_semantic_refs(source_artifacts)
-            except SourceArtifactContractError:
-                raise ValueError(INVALID_REPLAY_ARTIFACT)
-            semantic_hash = _semantic_json_hash(
-                {
-                    "raw_payload": raw_payload,
-                    "source_artifacts": artifact_semantic_refs,
-                }
-            )
-        else:
-            semantic_hash = _semantic_json_hash(raw_payload)
-        if (
-            not str(package.get("conversation_id") or "").strip()
-            or not str(package.get("window_id") or "").strip()
-            or str(package.get("revision_hash") or "").strip() != package_version
-            or not str(package.get("raw_hash") or "").strip()
-            or str(package.get("semantic_hash") or "").strip() != semantic_hash
-        ):
-            raise ValueError(INVALID_REPLAY_ARTIFACT)
-        return semantic_hash
-
-
 _ADAPTERS: dict[str, LocalSourceReplayAdapter] = {}
 
 
@@ -372,7 +285,6 @@ for _builtin_adapter in (
     GitHubRepoReplayAdapter(),
     JiraReplayAdapter(),
     LocalMarkdownReplayAdapter(),
-    TeamsReplayAdapter(),
 ):
     register_local_source_replay_adapter(_builtin_adapter)
 

@@ -37,6 +37,31 @@ class ProjectionCoverage(str, Enum):
         return self in {self.COMPLETE_SNAPSHOT, self.TOMBSTONED_DELTA}
 
 
+class UnitRemovalReason(str, Enum):
+    """Why a Source Unit is removed; its tombstone records the reason."""
+
+    # The provider no longer has it: a listing or a proof of absence shows so.
+    ABSENT_FROM_SOURCE = "absent_from_source"
+    # Its latest content is older than the Source's Rolling Retention.
+    OUTSIDE_ROLLING_RETENTION = "outside_rolling_retention"
+    # The user deselected what it belongs to.
+    REMOVED_FROM_SCOPE = "removed_from_scope"
+    # Every member moved to another Unit.
+    EMPTIED = "emptied"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRemoval:
+    """Why one Document leaves its Source, and the evidence that allowed it.
+
+    ``evidence`` names the proof: the run's scope listing or complete
+    snapshot, or the collection attempt whose Collection Manifest decided it.
+    """
+
+    reason: UnitRemovalReason
+    evidence: str
+
+
 class ProjectionScopeTransitionStatus(str, Enum):
     """Durable state of one configured-source membership transition."""
 
@@ -44,32 +69,6 @@ class ProjectionScopeTransitionStatus(str, Enum):
     RUNNING = "running"
     APPLIED = "applied"
     FAILED = "failed"
-
-
-@dataclass(frozen=True, slots=True)
-class ProjectionScopeAttestation:
-    """Attempt-scoped control evidence for one projection-scope subject."""
-
-    subject_type: str
-    subject_key: str
-    collection_attempt_id: str
-    target_scope_fingerprint: str
-    evidence: Mapping[str, object]
-    transition_id: str | None = None
-
-    def __post_init__(self) -> None:
-        if not all(
-            value.strip()
-            for value in (
-                self.subject_type,
-                self.subject_key,
-                self.collection_attempt_id,
-                self.target_scope_fingerprint,
-            )
-        ):
-            raise ValueError("Projection Scope Attestation identity is incomplete")
-        if self.transition_id is not None and not self.transition_id.strip():
-            raise ValueError("Projection Scope Attestation transition id is empty")
 
 
 class DeltaAxis(str, Enum):
@@ -361,7 +360,6 @@ class ProjectionRequest:
     previous_checkpoint: Mapping[str, object] | None = None
     scope_transition: Mapping[str, object] | None = None
     access_context: Mapping[str, object] = field(default_factory=dict)
-    scope_attestations: tuple[ProjectionScopeAttestation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -528,44 +526,6 @@ class SourceProjection:
 @runtime_checkable
 class SourceProjectionAdapter(Protocol):
     async def project(self, envelope: ProjectionEnvelope) -> SourceProjection: ...
-    def reconciliation_coverage(
-        self,
-        *,
-        source_type: str,
-        transition: ProjectionScopeTransition,
-        current_units: tuple[SourceUnit, ...],
-        run_attestations: tuple[ProjectionScopeAttestation, ...] = (),
-    ) -> ProjectionCoverage | None: ...
-
-
-def projection_scope_attestation_to_payload(
-    attestation: ProjectionScopeAttestation,
-) -> dict[str, object]:
-    return {
-        "subject_type": attestation.subject_type,
-        "subject_key": attestation.subject_key,
-        "collection_attempt_id": attestation.collection_attempt_id,
-        "target_scope_fingerprint": attestation.target_scope_fingerprint,
-        "transition_id": attestation.transition_id,
-        "evidence": dict(attestation.evidence),
-    }
-
-
-def projection_scope_attestation_from_payload(
-    payload: Mapping[str, object],
-) -> ProjectionScopeAttestation:
-    evidence = payload.get("evidence")
-    if not isinstance(evidence, Mapping):
-        raise ValueError("Projection Scope Attestation evidence must be an object")
-    transition_id = payload.get("transition_id")
-    return ProjectionScopeAttestation(
-        subject_type=str(payload.get("subject_type") or ""),
-        subject_key=str(payload.get("subject_key") or ""),
-        collection_attempt_id=str(payload.get("collection_attempt_id") or ""),
-        target_scope_fingerprint=str(payload.get("target_scope_fingerprint") or ""),
-        transition_id=(str(transition_id) if transition_id is not None else None),
-        evidence=dict(evidence),
-    )
 
 
 @runtime_checkable
@@ -607,6 +567,14 @@ class ProjectionStore(Protocol):
         cursor: str | None = None,
         limit: int = 200,
     ) -> SourceUnitInventoryPage: ...
+    async def list_current_observation_holders(
+        self,
+        source_id: str,
+        *,
+        observation_type: str,
+        provider_keys: Collection[str],
+        locator_equals: Mapping[str, str],
+    ) -> tuple[tuple[str, SourceUnit], ...]: ...
 
 
 def source_projection_to_payload(projection: SourceProjection) -> dict[str, object]:

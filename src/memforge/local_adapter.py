@@ -42,7 +42,6 @@ from memforge.github_repo_utils import (
 from memforge.local_agent.document_identity import (
     build_jira_doc_id,
     build_local_markdown_doc_id,
-    build_teams_doc_id,
 )
 from memforge.local_agent.source_contract import local_file_package_semantic_hash
 from memforge.models import content_hash, slugify
@@ -54,13 +53,10 @@ from memforge.source_time import SOURCE_UPDATED_AT_KEY, source_time_iso
 LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
 GITHUB_REPO_SOURCE_TYPE = "github_repo"
 JIRA_SOURCE_TYPE = "jira"
-TEAMS_SOURCE_TYPE = "teams"
 GITHUB_REPO_PACKAGE_KIND = "github_repo_document"
 GITHUB_REPO_CONTENT_ROLE = "repository_file"
 JIRA_PACKAGE_KIND = "jira_document"
 JIRA_CONTENT_ROLE = "jira_issue"
-TEAMS_PACKAGE_KIND = "teams_window_document"
-TEAMS_CONTENT_ROLE = "teams_conversation_window"
 
 logger = logging.getLogger(__name__)
 
@@ -255,27 +251,6 @@ def _jira_title_from_payload(payload: dict[str, Any], fallback: str) -> str:
     summary = str(fields.get("summary") or "").strip()
     key = str(payload.get("key") or fallback).strip()
     return summary or key or fallback
-
-
-def _teams_title_from_payload(payload: dict[str, Any], fallback: str) -> str:
-    title = str(payload.get("title") or "").strip()
-    if title:
-        return title
-    channel = str(payload.get("channel_name") or "").strip()
-    team = str(payload.get("team_name") or "").strip()
-    if channel:
-        return f"{team} / {channel}" if team else channel
-    conversation_type = str(payload.get("conversation_type") or "").strip()
-    if conversation_type == "group_chat":
-        return str(payload.get("team_name") or "Group chat").strip()
-    if conversation_type == "individual_chat":
-        participants = payload.get("participants")
-        if isinstance(participants, list):
-            names = ", ".join(str(name) for name in participants if str(name).strip())
-            if names:
-                return names
-        return "Direct message"
-    return fallback
 
 
 async def submit_local_markdown_document(
@@ -706,155 +681,6 @@ async def submit_jira_package(
         "doc_id": doc_id,
         "base_url": configured_base_url,
         "issue_key": normalized_issue_key,
-        "document_hash": payload_hash,
-        "semantic_hash": payload_hash,
-        "package_path": package_path,
-        "package_uri": package_uri,
-        "package_sha256": package_sha256,
-        "package_manifest_entry": manifest_entry,
-        "submitted_at": submitted_at,
-    }
-
-
-async def submit_teams_window_package(
-    *,
-    db: Database,
-    config: AppConfig,
-    source: dict[str, Any],
-    conversation_id: str,
-    window_id: str,
-    revision_hash: str,
-    raw_payload: dict[str, Any],
-    title: str | None = None,
-    root_message_id: str | None = None,
-    window_type: str | None = None,
-    source_url: str | None = None,
-    raw_hash: str | None = None,
-    submitted_by: str | None = None,
-    submitted_at: str | None = None,
-    document_store: DocumentStore | None = None,
-    collection_attempt_id: str | None = None,
-    source_artifacts: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Validate, package, and persist one raw Teams window captured by the local daemon."""
-    if source.get("type") != TEAMS_SOURCE_TYPE:
-        raise ValueError(f"source {source.get('id')} is type {source.get('type')!r}, not 'teams'")
-    if not isinstance(raw_payload, dict) or not raw_payload:
-        raise ValueError("raw_payload is required")
-
-    normalized_conversation_id = (conversation_id or "").strip()
-    normalized_window_id = (window_id or "").strip()
-    normalized_revision_hash = (revision_hash or "").strip()
-    if not normalized_conversation_id:
-        raise ValueError("conversation_id is required")
-    if not normalized_window_id:
-        raise ValueError("window_id is required")
-    if not normalized_revision_hash:
-        raise ValueError("revision_hash is required")
-
-    from memforge.local_agent.source_contract import TEAMS_TOMBSTONE_REASONS
-    from memforge.local_agent.teams_contract import validate_teams_window_payload
-
-    source_id = str(source["id"])
-    payload_kind = validate_teams_window_payload(
-        raw_payload,
-        conversation_id=normalized_conversation_id,
-        window_id=normalized_window_id,
-        source_id=source_id,
-        root_message_id=root_message_id,
-        window_type=window_type,
-        tombstone_reasons=TEAMS_TOMBSTONE_REASONS,
-    )
-    if (
-        payload_kind == "scope_attestation"
-        and str(raw_payload.get("collection_attempt_id") or "").strip() != str(collection_attempt_id or "").strip()
-    ):
-        raise ValueError("Teams scope attestation collection attempt mismatch")
-
-    submitted_at = submitted_at or _now_iso()
-    source_artifacts = list(source_artifacts or [])
-    artifact_semantic_refs = source_artifact_semantic_refs(source_artifacts)
-    payload_hash = (
-        _hash_json(
-            {
-                "raw_payload": raw_payload,
-                "source_artifacts": artifact_semantic_refs,
-            }
-        )
-        if artifact_semantic_refs
-        else _hash_json(raw_payload)
-    )
-    doc_id = build_teams_doc_id(source_id=source_id, window_id=normalized_window_id)
-    doc_title = (title or "").strip() or _teams_title_from_payload(raw_payload, normalized_window_id)
-    package = {
-        "package_kind": TEAMS_PACKAGE_KIND,
-        "content_role": TEAMS_CONTENT_ROLE,
-        "doc_id": doc_id,
-        "title": doc_title,
-        "source_url": (source_url or f"teams-window://{source_id}/{doc_id}/{normalized_revision_hash}").strip(),
-        "last_modified": submitted_at,
-        "space_or_project": str(
-            raw_payload.get("team_name")
-            or raw_payload.get("channel_name")
-            or raw_payload.get("title")
-            or source.get("name")
-            or ""
-        ),
-        "version": normalized_revision_hash,
-        "conversation_id": normalized_conversation_id,
-        "root_message_id": (root_message_id or "").strip(),
-        "window_id": normalized_window_id,
-        "window_type": (window_type or "").strip(),
-        "revision_hash": normalized_revision_hash,
-        "content_type": "application/json",
-        "raw_hash": raw_hash or payload_hash,
-        "semantic_hash": payload_hash,
-        "submitted_at": submitted_at,
-        "submitted_by": submitted_by,
-        "raw_payload": raw_payload,
-        "source_artifacts": source_artifacts,
-    }
-
-    payload_text = json.dumps(package, indent=2, sort_keys=True)
-    package_uri, package_sha256, package_path = await _persist_package(
-        config=config,
-        document_store=document_store,
-        source=source,
-        source_id=source_id,
-        doc_id=doc_id,
-        payload_text=payload_text,
-        extension=".teams-package.json",
-    )
-
-    manifest_entry = None
-    if package_uri:
-        manifest_entry = _package_manifest_entry(
-            doc_id=doc_id,
-            title=doc_title,
-            source_url=package["source_url"],
-            last_modified=submitted_at,
-            space_or_project=package["space_or_project"],
-            version=normalized_revision_hash,
-            package_uri=package_uri,
-            package_path=package_path,
-            submitted_at=submitted_at,
-            submitted_by=submitted_by,
-            change_kind="tombstone" if raw_payload.get("_tombstone") is True else "upsert",
-            extra={
-                "conversation_id": normalized_conversation_id,
-                "root_message_id": package["root_message_id"],
-                "window_id": normalized_window_id,
-                "window_type": package["window_type"],
-                "revision_hash": normalized_revision_hash,
-                "semantic_hash": payload_hash,
-            },
-        )
-    return {
-        "source_id": source_id,
-        "doc_id": doc_id,
-        "conversation_id": normalized_conversation_id,
-        "window_id": normalized_window_id,
-        "revision_hash": normalized_revision_hash,
         "document_hash": payload_hash,
         "semantic_hash": payload_hash,
         "package_path": package_path,

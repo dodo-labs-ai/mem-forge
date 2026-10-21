@@ -387,6 +387,23 @@ test("notes a finished sync that skipped its deletion check", () => {
   );
 });
 
+test("a partial sync shows the reason the server gave", () => {
+  const reason = "1 conversation could not be read: Release crew. Their memories are kept. "
+    + "Restore access, or deselect a conversation that is no longer used.";
+  const partialSync: SyncStatus = {
+    status: "partial",
+    run_id: "ssr-4",
+    started_at: "2026-07-08T10:00:00Z",
+    finished_at: "2026-07-08T10:01:00Z",
+    error_message: reason,
+    progress: { schema_version: 1, phase: "processing", progress: { completed: 2, unit: "conversation" } },
+  };
+  assert.equal(
+    presentSourceSyncActivity(sourceSyncActivityFromStatus(partialSync), "Teams", "conversations").notice,
+    reason,
+  );
+});
+
 test("notes the document parts a finished sync could not read", () => {
   const finishedSync: SyncStatus = {
     status: "success",

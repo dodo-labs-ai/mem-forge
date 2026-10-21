@@ -1355,6 +1355,144 @@
         "title": "ConfigGroupResponse",
         "type": "object"
       },
+      "ConversationArtifactLinkRequest": {
+        "properties": {
+          "input_sha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Input Sha256",
+            "type": "string"
+          },
+          "provider_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Provider Key",
+            "type": "string"
+          },
+          "provider_revision": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Provider Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider_key",
+          "provider_revision",
+          "input_sha256"
+        ],
+        "title": "ConversationArtifactLinkRequest",
+        "type": "object"
+      },
+      "ConversationBodiesRequest": {
+        "properties": {
+          "bodies": {
+            "items": {
+              "$ref": "#/components/schemas/ConversationBodyRequest"
+            },
+            "maxItems": 2000,
+            "title": "Bodies",
+            "type": "array"
+          },
+          "local_agent_attempt_count": {
+            "minimum": 1.0,
+            "title": "Local Agent Attempt Count",
+            "type": "integer"
+          },
+          "local_agent_job_id": {
+            "title": "Local Agent Job Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "local_agent_job_id",
+          "local_agent_attempt_count",
+          "bodies"
+        ],
+        "title": "ConversationBodiesRequest",
+        "type": "object"
+      },
+      "ConversationBodyRequest": {
+        "properties": {
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/ConversationArtifactLinkRequest"
+            },
+            "maxItems": 100,
+            "title": "Artifacts",
+            "type": "array"
+          },
+          "conversation_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "message_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Message Id",
+            "type": "string"
+          },
+          "record": {
+            "additionalProperties": true,
+            "title": "Record",
+            "type": "object"
+          }
+        },
+        "required": [
+          "conversation_id",
+          "message_id",
+          "record"
+        ],
+        "title": "ConversationBodyRequest",
+        "type": "object"
+      },
+      "ConversationCollectionAttemptRequest": {
+        "description": "The local-agent job attempt an upload of a conversation collection belongs to.",
+        "properties": {
+          "local_agent_attempt_count": {
+            "minimum": 1.0,
+            "title": "Local Agent Attempt Count",
+            "type": "integer"
+          },
+          "local_agent_job_id": {
+            "title": "Local Agent Job Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "local_agent_job_id",
+          "local_agent_attempt_count"
+        ],
+        "title": "ConversationCollectionAttemptRequest",
+        "type": "object"
+      },
+      "ConversationManifestRequest": {
+        "properties": {
+          "local_agent_attempt_count": {
+            "minimum": 1.0,
+            "title": "Local Agent Attempt Count",
+            "type": "integer"
+          },
+          "local_agent_job_id": {
+            "title": "Local Agent Job Id",
+            "type": "string"
+          },
+          "manifest": {
+            "additionalProperties": true,
+            "title": "Manifest",
+            "type": "object"
+          }
+        },
+        "required": [
+          "local_agent_job_id",
+          "local_agent_attempt_count",
+          "manifest"
+        ],
+        "title": "ConversationManifestRequest",
+        "type": "object"
+      },
       "CreateSourceRequest": {
         "properties": {
           "access_policy": {
@@ -3070,15 +3208,6 @@
             ],
             "title": "Package Contract Version"
           },
-          "scope_attestations": {
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "maxItems": 10000,
-            "title": "Scope Attestations",
-            "type": "array"
-          },
           "sync_snapshot_id": {
             "title": "Sync Snapshot Id",
             "type": "string"
@@ -3095,7 +3224,7 @@
         "type": "object"
       },
       "LocalSourcePackageRequest": {
-        "description": "One raw local-source package pushed by the local daemon/adapter.\n\nFile-like sources use ``markdown_body`` as raw file text for the declared\n``content_type``. Structured sources such as Jira and Teams use\n``raw_payload`` and defer canonical markdown rendering to the source gene.\n``source_updated_at`` is a file-like source's own time for this content\n(an offset-aware ISO time); structured sources carry their times in\n``raw_payload``.",
+        "description": "One raw local-source package pushed by the local daemon/adapter.\n\nFile-like sources use ``markdown_body`` as raw file text for the declared\n``content_type``. Structured sources such as Jira use ``raw_payload`` and\ndefer canonical markdown rendering to the source gene.\n``source_updated_at`` is a file-like source's own time for this content\n(an offset-aware ISO time); structured sources carry their times in\n``raw_payload``.",
         "properties": {
           "artifact_input_hashes": {
             "items": {
@@ -3141,17 +3270,6 @@
             "default": "text/markdown",
             "title": "Content Type",
             "type": "string"
-          },
-          "conversation_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Conversation Id"
           },
           "issue_key": {
             "anyOf": [
@@ -3263,28 +3381,6 @@
             ],
             "title": "Resolved Relative Path"
           },
-          "revision_hash": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Revision Hash"
-          },
-          "root_message_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Root Message Id"
-          },
           "source_updated_at": {
             "anyOf": [
               {
@@ -3371,28 +3467,6 @@
               }
             ],
             "title": "Vault Id"
-          },
-          "window_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Window Id"
-          },
-          "window_type": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Window Type"
           }
         },
         "title": "LocalSourcePackageRequest",
@@ -9224,6 +9298,12 @@
       },
       "SourceSyncRequest": {
         "properties": {
+          "dry_run": {
+            "default": false,
+            "description": "For a conversation Source with stored Units, to verify a migration: collect, then report what the attempt would change without processing it.",
+            "title": "Dry Run",
+            "type": "boolean"
+          },
           "force_full_sync": {
             "default": false,
             "title": "Force Full Sync",
@@ -15320,6 +15400,210 @@
         ]
       }
     },
+    "/api/v1/sources/{source_id}/conversation-collection/bodies": {
+      "post": {
+        "description": "Keep message bodies of one device collection attempt, each matching its manifest message.",
+        "operationId": "receive_conversation_bodies_api_v1_sources__source_id__conversation_collection_bodies_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConversationBodiesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Receive Conversation Bodies",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/api/v1/sources/{source_id}/conversation-collection/manifest": {
+      "post": {
+        "description": "Keep the Collection Manifest of one device collection attempt and name what the server lacks.",
+        "operationId": "receive_conversation_manifest_api_v1_sources__source_id__conversation_collection_manifest_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConversationManifestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Receive Conversation Manifest",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/api/v1/sources/{source_id}/conversation-collection/plan": {
+      "post": {
+        "description": "What one uploaded device collection attempt would change, without processing it.\n\nThe plan is the one a sync run would make now, including the removals\nof an open Projection Scope transition.",
+        "operationId": "plan_conversation_collection_api_v1_sources__source_id__conversation_collection_plan_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConversationCollectionAttemptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Plan Conversation Collection",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/api/v1/sources/{source_id}/conversation-collection/request": {
+      "post": {
+        "description": "The request one device collection attempt answers; asking again returns the same request.",
+        "operationId": "conversation_collection_request_api_v1_sources__source_id__conversation_collection_request_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConversationCollectionAttemptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Conversation Collection Request",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
     "/api/v1/sources/{source_id}/force-resync": {
       "post": {
         "description": "Enqueue a full source sync without clearing the prior successful cursor.",
@@ -15703,8 +15987,8 @@
     },
     "/api/v1/sources/{source_id}/projection-inventory": {
       "get": {
-        "description": "Return one filtered page of server-owned active Source Units.",
-        "operationId": "get_source_projection_inventory_api_v1_sources__source_id__projection_inventory_get",
+        "description": "Tell an agent that reads the projection inventory to upgrade: the server owns every conversation decision.",
+        "operationId": "retired_projection_inventory_api_v1_sources__source_id__projection_inventory_get",
         "parameters": [
           {
             "in": "path",
@@ -15713,112 +15997,6 @@
             "schema": {
               "title": "Source Id",
               "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "unit_type",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Unit Type"
-            }
-          },
-          {
-            "in": "query",
-            "name": "conversation_id",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Conversation Id"
-            }
-          },
-          {
-            "in": "query",
-            "name": "observed_from_lte",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Observed From Lte"
-            }
-          },
-          {
-            "in": "query",
-            "name": "observed_to_gte",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Observed To Gte"
-            }
-          },
-          {
-            "in": "query",
-            "name": "observed_to_lt",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Observed To Lt"
-            }
-          },
-          {
-            "in": "query",
-            "name": "cursor",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Cursor"
-            }
-          },
-          {
-            "in": "query",
-            "name": "limit",
-            "required": false,
-            "schema": {
-              "default": 200,
-              "title": "Limit",
-              "type": "integer"
             }
           }
         ],
@@ -15842,7 +16020,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Get Source Projection Inventory",
+        "summary": "Retired Projection Inventory",
         "tags": [
           "sources"
         ]

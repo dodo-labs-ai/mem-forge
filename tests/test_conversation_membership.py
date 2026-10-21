@@ -1,0 +1,309 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pytest
+
+from memforge.conversations.coverage import ConversationCoverage, ProvenInterval
+from memforge.conversations.membership import (
+    ConversationState,
+    ReturnedMessage,
+    plan_conversation,
+)
+from memforge.conversations.port import ConversationLabel, ConversationRef, ThreadingModel
+from memforge.conversations.records import MessageIdentity, record_revision
+from memforge.conversations.units import Member, StoredUnit, UnitKind, UnitRef, thread_unit_key, window_unit_key
+from memforge.source_projection import UnitRemovalReason
+
+SOURCE = "src-chat"
+CONVERSATION = "c1"
+DAY = datetime(2026, 10, 20, tzinfo=timezone.utc)
+
+
+def _at(hhmm: str) -> datetime:
+    hours, minutes = (int(part) for part in hhmm.split(":"))
+    return DAY.replace(hour=hours, minute=minutes)
+
+
+def _member(message_id: str, hhmm: str, text: str = "hello") -> Member:
+    record = {"content": text, "time": _at(hhmm).isoformat(), "conversation_id": CONVERSATION}
+    return Member(
+        identity=MessageIdentity(CONVERSATION, message_id),
+        created_at=_at(hhmm),
+        record=record,
+        revision=record_revision(record),
+    )
+
+
+def _returned(message_id: str, hhmm: str, text: str = "hello", *, root: str | None = None) -> ReturnedMessage:
+    return ReturnedMessage(member=_member(message_id, hhmm, text), thread_root_id=root)
+
+
+def _window(key: str, *members: Member) -> StoredUnit:
+    return StoredUnit(
+        ref=UnitRef(unit_id=f"unit-{key}", document_id=f"doc-{key}", provider_key=key, kind=UnitKind.WINDOW,
+                    conversation_id=CONVERSATION),
+        members=members,
+    )
+
+
+def _thread(key: str, root: str, *members: Member) -> StoredUnit:
+    return StoredUnit(
+        ref=UnitRef(unit_id=f"unit-{key}", document_id=f"doc-{key}", provider_key=key, kind=UnitKind.THREAD,
+                    conversation_id=CONVERSATION, thread_root_id=root),
+        members=members,
+    )
+
+
+def _conversation(threading: ThreadingModel = ThreadingModel.INLINE) -> ConversationRef:
+    return ConversationRef(
+        label=ConversationLabel(conversation_id=CONVERSATION, kind="channel", name="General"),
+        threading=threading,
+        poll_includes_replies=True,
+    )
+
+
+def _coverage(start: str | None = None, end: str = "23:59") -> ConversationCoverage:
+    intervals = () if start is None else (ProvenInterval(start=_at(start), end=_at(end)),)
+    return ConversationCoverage(intervals=intervals, covers_replies=True)
+
+
+def _plan(returned=(), units=(), *, coverage=None, threading=ThreadingModel.INLINE, threads=()):
+    """Plan over ``units`` read with their members, and ``threads`` known only by reference.
+
+    As the layer reads it, a thread is rooted when it holds its root.
+    """
+
+    read_threads = [unit for unit in units if unit.kind is UnitKind.THREAD]
+    return plan_conversation(
+        source_id=SOURCE,
+        conversation=_conversation(threading),
+        coverage=coverage or _coverage(),
+        returned=returned,
+        state=ConversationState(
+            conversation_id=CONVERSATION,
+            units=tuple(units),
+            threads={
+                **{unit.thread_root_id: unit.ref for unit in threads},
+                **{unit.thread_root_id: unit.ref for unit in read_threads},
+            },
+            rooted_threads=frozenset(
+                unit.thread_root_id
+                for unit in (*threads, *read_threads)
+                if any(member.identity.message_id == unit.thread_root_id for member in unit.members)
+            ),
+        ),
+    )
+
+
+def _members(planned) -> dict[str, list[str]]:
+    return {unit.provider_key: [member.identity.message_id for member in unit.members] for unit in planned.units}
+
+
+def test_new_top_level_messages_open_windows_by_the_policy():
+    plan = _plan([_returned("a", "09:00"), _returned("b", "09:30"), _returned("c", "12:00")])
+
+    assert _members(plan) == {
+        window_unit_key(source_id=SOURCE, conversation_id=CONVERSATION, anchor_message_id="a"): ["a", "b"],
+        window_unit_key(source_id=SOURCE, conversation_id=CONVERSATION, anchor_message_id="c"): ["c"],
+    }
+    assert all(unit.stored is None for unit in plan.units)
+
+
+def test_an_unchanged_unit_is_not_projected_again():
+    window = _window("w", _member("a", "09:00"))
+
+    plan = _plan([_returned("a", "09:00")], [window], coverage=_coverage("08:00"))
+
+    assert plan.units == () and plan.removals == ()
+
+
+def test_an_edited_message_replaces_its_record_in_place():
+    window = _window("w", _member("a", "09:00"), _member("b", "09:10"))
+
+    plan = _plan([_returned("b", "09:10", "edited")], [window])
+
+    (unit,) = plan.units
+    assert unit.provider_key == "w" and unit.stored is window
+    assert [member.record["content"] for member in unit.members] == ["hello", "edited"]
+
+
+def test_a_member_outside_every_proven_interval_is_carried():
+    window = _window("w", _member("a", "09:00"), _member("b", "10:40"))
+
+    plan = _plan([_returned("b", "10:40"), _returned("c", "10:50")], [window], coverage=_coverage("10:30"))
+
+    assert _members(plan) == {"w": ["a", "b", "c"]}
+
+
+def test_only_the_members_inside_the_interval_are_removed_from_a_straddling_window():
+    window = _window("w", _member("a", "10:00"), _member("b", "10:40"))
+
+    plan = _plan([], [window], coverage=_coverage("10:30"))
+
+    assert _members(plan) == {"w": ["a"]}
+    assert plan.removals == ()
+
+
+def test_a_window_whose_every_member_is_proven_absent_is_removed_as_absent():
+    window = _window("w", _member("a", "10:00"))
+
+    plan = _plan([], [window], coverage=_coverage("09:00"))
+
+    assert plan.units == ()
+    assert [(removal.unit.provider_key, removal.reason) for removal in plan.removals] == [
+        ("w", UnitRemovalReason.ABSENT_FROM_SOURCE)
+    ]
+
+
+def test_a_root_gaining_replies_moves_to_its_thread_over_two_runs():
+    root = _member("r", "09:00")
+    window = _window("w", root, _member("b", "09:20"))
+    thread_key = thread_unit_key(source_id=SOURCE, conversation_id=CONVERSATION, thread_root_id="r")
+
+    first = _plan([_returned("x", "09:40", root="r")], [window])
+
+    assert _members(first) == {thread_key: ["r", "x"]}
+    (thread,) = first.units
+    assert thread.kind is UnitKind.THREAD and thread.thread_root_id == "r"
+
+    committed_thread = _thread(thread_key, "r", root, _member("x", "09:40"))
+    second = _plan([], [window, committed_thread])
+
+    assert _members(second) == {"w": ["b"]}
+
+
+def test_a_moved_root_that_was_the_only_member_empties_its_window():
+    root = _member("r", "09:00")
+    window = _window("w", root)
+
+    plan = _plan([], [window, _thread("t", "r", root, _member("x", "09:40"))])
+
+    assert [(removal.unit.provider_key, removal.reason) for removal in plan.removals] == [("w", UnitRemovalReason.EMPTIED)]
+
+
+def test_a_root_of_an_unloaded_committed_thread_leaves_its_window():
+    window = _window("w", _member("r", "09:00"), _member("b", "09:20"))
+    thread = _thread("t", "r", _member("r", "09:00"), _member("x", "09:40"))
+
+    plan = _plan([], [window], threads=[thread])
+
+    assert _members(plan) == {"w": ["b"]}
+
+
+def test_a_thread_without_its_root_takes_it_from_the_window_before_the_window_gives_it_up():
+    root = _member("r", "09:00")
+    window = _window("w", root, _member("b", "09:20"))
+    rootless = _thread("t", "r", _member("x", "09:40"))
+
+    first = _plan([], [window, rootless])
+
+    assert _members(first) == {"t": ["r", "x"]}
+
+    second = _plan([], [window, _thread("t", "r", root, _member("x", "09:40"))])
+
+    assert _members(second) == {"w": ["b"]}
+
+
+def test_a_thread_without_its_root_takes_the_root_when_it_is_returned():
+    rootless = _thread("t", "r", _member("x", "09:40"))
+
+    plan = _plan([_returned("r", "09:00")], [rootless])
+
+    assert _members(plan) == {"t": ["r", "x"]}
+
+
+def test_a_thread_known_but_not_read_cannot_take_a_reply():
+    thread = _thread("t", "r", _member("r", "09:00"))
+
+    with pytest.raises(ValueError, match="was not read"):
+        _plan([_returned("y", "15:00", root="r")], [], threads=[thread])
+
+
+def test_new_replies_join_their_existing_thread():
+    thread = _thread("t", "r", _member("r", "09:00"), _member("x", "09:40"))
+
+    plan = _plan([_returned("y", "15:00", root="r")], [thread])
+
+    assert _members(plan) == {"t": ["r", "x", "y"]}
+
+
+def test_a_new_root_returned_with_its_replies_never_enters_a_window():
+    plan = _plan([_returned("r", "09:00"), _returned("x", "09:10", root="r")])
+
+    key = thread_unit_key(source_id=SOURCE, conversation_id=CONVERSATION, thread_root_id="r")
+    assert _members(plan) == {key: ["r", "x"]}
+
+
+def test_post_reply_posts_are_threads_from_the_start():
+    plan = _plan([_returned("p", "09:00")], threading=ThreadingModel.POST_REPLY)
+
+    key = thread_unit_key(source_id=SOURCE, conversation_id=CONVERSATION, thread_root_id="p")
+    assert _members(plan) == {key: ["p"]}
+
+
+def test_flat_conversations_have_windows_only():
+    plan = _plan([_returned("r", "09:00"), _returned("x", "09:10", root="r")], threading=ThreadingModel.FLAT)
+
+    key = window_unit_key(source_id=SOURCE, conversation_id=CONVERSATION, anchor_message_id="r")
+    assert _members(plan) == {key: ["r", "x"]}
+
+
+def test_a_message_in_a_thread_and_a_window_is_updated_in_both_until_the_root_moves():
+    root = _member("r", "09:00")
+    window = _window("w", root)
+    thread_key = thread_unit_key(source_id=SOURCE, conversation_id=CONVERSATION, thread_root_id="r")
+
+    first = _plan([_returned("r", "09:00", "edited"), _returned("x", "09:10", root="r")], [window])
+
+    assert _members(first) == {thread_key: ["r", "x"], "w": ["r"]}
+    assert {unit.provider_key: unit.members[0].record["content"] for unit in first.units} == {
+        thread_key: "edited",
+        "w": "edited",
+    }
+
+
+def test_equal_message_ids_in_two_conversations_never_match():
+    other = StoredUnit(
+        ref=UnitRef(unit_id="u2", document_id="d2", provider_key="w2", kind=UnitKind.WINDOW, conversation_id="c2"),
+        members=(
+            Member(identity=MessageIdentity("c2", "a"), created_at=_at("09:00"), record={}, revision="x"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="another conversation"):
+        _plan([_returned("a", "09:00")], [other])
+    assert MessageIdentity("c1", "a") != MessageIdentity("c2", "a")
+
+
+def test_spans_follow_the_decided_membership():
+    window = _window("w", _member("a", "09:50"), _member("b", "10:40"))
+
+    plan = _plan([_returned("b", "10:40"), _returned("c", "10:50")], [window], coverage=_coverage("10:30"))
+
+    (unit,) = plan.units
+    assert (unit.span.earliest, unit.span.latest) == (_at("09:50"), _at("10:50"))
+
+
+def test_a_root_proven_absent_does_not_join_the_thread_its_reply_opens():
+    window = _window("w", _member("r", "10:00"), _member("m", "10:10"))
+    thread_key = thread_unit_key(source_id=SOURCE, conversation_id=CONVERSATION, thread_root_id="r")
+
+    plan = _plan([_returned("m", "10:10"), _returned("x", "10:20", root="r")], [window], coverage=_coverage("09:00"))
+
+    assert _members(plan) == {thread_key: ["x"], "w": ["m"]}
+
+
+def test_a_message_seen_without_its_record_is_carried_and_never_proven_absent():
+    window = _window("w", _member("a", "10:00"), _member("b", "10:10"))
+
+    plan = plan_conversation(
+        source_id=SOURCE,
+        conversation=_conversation(),
+        coverage=_coverage("09:00"),
+        returned=[],
+        state=ConversationState(conversation_id=CONVERSATION, units=(window,)),
+        seen_without_record={MessageIdentity(CONVERSATION, "a")},
+    )
+
+    assert _members(plan) == {"w": ["a"]}

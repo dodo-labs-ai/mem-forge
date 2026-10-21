@@ -2049,6 +2049,89 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sources/{source_id}/conversation-collection/bodies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Receive Conversation Bodies
+         * @description Keep message bodies of one device collection attempt, each matching its manifest message.
+         */
+        post: operations["receive_conversation_bodies_api_v1_sources__source_id__conversation_collection_bodies_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/{source_id}/conversation-collection/manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Receive Conversation Manifest
+         * @description Keep the Collection Manifest of one device collection attempt and name what the server lacks.
+         */
+        post: operations["receive_conversation_manifest_api_v1_sources__source_id__conversation_collection_manifest_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/{source_id}/conversation-collection/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Plan Conversation Collection
+         * @description What one uploaded device collection attempt would change, without processing it.
+         *
+         *     The plan is the one a sync run would make now, including the removals
+         *     of an open Projection Scope transition.
+         */
+        post: operations["plan_conversation_collection_api_v1_sources__source_id__conversation_collection_plan_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/{source_id}/conversation-collection/request": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Conversation Collection Request
+         * @description The request one device collection attempt answers; asking again returns the same request.
+         */
+        post: operations["conversation_collection_request_api_v1_sources__source_id__conversation_collection_request_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sources/{source_id}/force-resync": {
         parameters: {
             query?: never;
@@ -2205,10 +2288,10 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Get Source Projection Inventory
-         * @description Return one filtered page of server-owned active Source Units.
+         * Retired Projection Inventory
+         * @description Tell an agent that reads the projection inventory to upgrade: the server owns every conversation decision.
          */
-        get: operations["get_source_projection_inventory_api_v1_sources__source_id__projection_inventory_get"];
+        get: operations["retired_projection_inventory_api_v1_sources__source_id__projection_inventory_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2944,6 +3027,58 @@ export interface components {
              */
             order: number;
         };
+        /** ConversationArtifactLinkRequest */
+        ConversationArtifactLinkRequest: {
+            /** Input Sha256 */
+            input_sha256: string;
+            /** Provider Key */
+            provider_key: string;
+            /** Provider Revision */
+            provider_revision: string;
+        };
+        /** ConversationBodiesRequest */
+        ConversationBodiesRequest: {
+            /** Bodies */
+            bodies: components["schemas"]["ConversationBodyRequest"][];
+            /** Local Agent Attempt Count */
+            local_agent_attempt_count: number;
+            /** Local Agent Job Id */
+            local_agent_job_id: string;
+        };
+        /** ConversationBodyRequest */
+        ConversationBodyRequest: {
+            /** Artifacts */
+            artifacts?: components["schemas"]["ConversationArtifactLinkRequest"][];
+            /** Conversation Id */
+            conversation_id: string;
+            /** Message Id */
+            message_id: string;
+            /** Record */
+            record: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * ConversationCollectionAttemptRequest
+         * @description The local-agent job attempt an upload of a conversation collection belongs to.
+         */
+        ConversationCollectionAttemptRequest: {
+            /** Local Agent Attempt Count */
+            local_agent_attempt_count: number;
+            /** Local Agent Job Id */
+            local_agent_job_id: string;
+        };
+        /** ConversationManifestRequest */
+        ConversationManifestRequest: {
+            /** Local Agent Attempt Count */
+            local_agent_attempt_count: number;
+            /** Local Agent Job Id */
+            local_agent_job_id: string;
+            /** Manifest */
+            manifest: {
+                [key: string]: unknown;
+            };
+        };
         /** CreateSourceRequest */
         CreateSourceRequest: {
             /**
@@ -3648,10 +3783,6 @@ export interface components {
             local_agent_job_id: string;
             /** Package Contract Version */
             package_contract_version?: number | null;
-            /** Scope Attestations */
-            scope_attestations?: {
-                [key: string]: unknown;
-            }[];
             /** Sync Snapshot Id */
             sync_snapshot_id: string;
         };
@@ -3660,8 +3791,8 @@ export interface components {
          * @description One raw local-source package pushed by the local daemon/adapter.
          *
          *     File-like sources use ``markdown_body`` as raw file text for the declared
-         *     ``content_type``. Structured sources such as Jira and Teams use
-         *     ``raw_payload`` and defer canonical markdown rendering to the source gene.
+         *     ``content_type``. Structured sources such as Jira use ``raw_payload`` and
+         *     defer canonical markdown rendering to the source gene.
          *     ``source_updated_at`` is a file-like source's own time for this content
          *     (an offset-aware ISO time); structured sources carry their times in
          *     ``raw_payload``.
@@ -3680,8 +3811,6 @@ export interface components {
              * @default text/markdown
              */
             content_type: string;
-            /** Conversation Id */
-            conversation_id?: string | null;
             /** Issue Key */
             issue_key?: string | null;
             /** Local Agent Attempt Count */
@@ -3709,10 +3838,6 @@ export interface components {
             repo_url?: string | null;
             /** Resolved Relative Path */
             resolved_relative_path?: string | null;
-            /** Revision Hash */
-            revision_hash?: string | null;
-            /** Root Message Id */
-            root_message_id?: string | null;
             /** Source Updated At */
             source_updated_at?: string | null;
             /** Source Url */
@@ -3731,10 +3856,6 @@ export interface components {
             title?: string | null;
             /** Vault Id */
             vault_id?: string | null;
-            /** Window Id */
-            window_id?: string | null;
-            /** Window Type */
-            window_type?: string | null;
         };
         /** LoginRequest */
         LoginRequest: {
@@ -5820,6 +5941,12 @@ export interface components {
         };
         /** SourceSyncRequest */
         SourceSyncRequest: {
+            /**
+             * Dry Run
+             * @description For a conversation Source with stored Units, to verify a migration: collect, then report what the attempt would change without processing it.
+             * @default false
+             */
+            dry_run: boolean;
             /**
              * Force Full Sync
              * @default false
@@ -9608,6 +9735,146 @@ export interface operations {
             };
         };
     };
+    receive_conversation_bodies_api_v1_sources__source_id__conversation_collection_bodies_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationBodiesRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    receive_conversation_manifest_api_v1_sources__source_id__conversation_collection_manifest_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationManifestRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    plan_conversation_collection_api_v1_sources__source_id__conversation_collection_plan_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationCollectionAttemptRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    conversation_collection_request_api_v1_sources__source_id__conversation_collection_request_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationCollectionAttemptRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     trigger_force_resync_api_v1_sources__source_id__force_resync_post: {
         parameters: {
             query?: never;
@@ -9870,17 +10137,9 @@ export interface operations {
             };
         };
     };
-    get_source_projection_inventory_api_v1_sources__source_id__projection_inventory_get: {
+    retired_projection_inventory_api_v1_sources__source_id__projection_inventory_get: {
         parameters: {
-            query?: {
-                unit_type?: string | null;
-                conversation_id?: string | null;
-                observed_from_lte?: string | null;
-                observed_to_gte?: string | null;
-                observed_to_lt?: string | null;
-                cursor?: string | null;
-                limit?: number;
-            };
+            query?: never;
             header?: never;
             path: {
                 source_id: string;

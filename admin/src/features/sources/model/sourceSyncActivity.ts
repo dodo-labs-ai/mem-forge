@@ -242,6 +242,7 @@ export function presentSourceSyncActivity(
         ? `Deletion check skipped: ${ABSENCE_CHECK_SKIPPED_NOTICES[reason]}. Nothing was removed; the next sync checks again.`
         : "",
       unreadPartsNotice(activity.skippedReadingGroupCount ?? 0),
+      activity.state === "partial" ? activity.error?.message?.trim() ?? "" : "",
     ].filter(Boolean);
     return notices.length > 0 ? { ...presentation, notice: notices.join(" ") } : presentation;
   }
