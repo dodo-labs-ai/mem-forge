@@ -3996,7 +3996,6 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
                     "status": "active",
                     "retirement_reason": None,
                     "replacement_reason": None,
-                    "extraction_context": "large admin context",
                     "entity_refs": ["periodcutoffblockerhint"],
                     "evidence": [
                         {

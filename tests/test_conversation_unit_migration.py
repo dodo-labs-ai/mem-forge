@@ -20,7 +20,7 @@ REINCARNATED_KEY = f"{THREAD_KEY}#incarnation:unit-old:3"
 
 
 async def _database_before_the_conversation_layer(path: str) -> None:
-    """A database at schema 120 whose Teams Units were stored before the conversation layer named them."""
+    """A database at schema 121 whose Teams Units were stored before the conversation layer named them."""
 
     connection = await aiosqlite.connect(path)
     await connection.executescript(SCHEMA)
@@ -29,7 +29,7 @@ async def _database_before_the_conversation_layer(path: str) -> None:
         "ALTER TABLE source_sync_snapshot_manifests ADD COLUMN scope_attestations_json TEXT NOT NULL DEFAULT '[]'"
     )
     for version, description, _statements in MIGRATIONS:
-        if version >= 121:
+        if version >= 122:
             break
         await connection.execute(
             "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",

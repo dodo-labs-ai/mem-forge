@@ -1134,7 +1134,6 @@ CREATE TABLE IF NOT EXISTS memories (
     superseded_at       TEXT,
     replacement_reason  TEXT,
     replacement_kind    TEXT,
-    extraction_context  TEXT,
     created_at          TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
     CHECK (visibility IN ('private','workspace')),
@@ -4933,6 +4932,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
     ),
     (
         121,
+        "Remove Memory extraction context",
+        # A Memory's source text is its Evidence excerpt. The column is dropped
+        # where a database created before this version still has it.
+        [],
+    ),
+    (
+        122,
         "Collect conversation Sources through the shared conversation layer",
         # The layer finds a message's Unit by its Observation's provider key,
         # keeps the request and Collection Manifest of each collection attempt, and names
@@ -4975,7 +4981,7 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         ],
     ),
     (
-        122,
+        123,
         "Drop projection-scope attestations from document snapshot manifests",
         # A conversation Source proves its removals with its Collection
         # Manifest; no other Source attests a projection scope.
@@ -5488,7 +5494,7 @@ class Database:
                     await self._purge_memory_unlocked(memory_id)
         if version == 79:
             await self._migrate_agent_runtime_event_v3_unlocked()
-        if version == 121:
+        if version == 122:
             await self._name_teams_units_as_conversation_units_unlocked()
         for sql in statements:
             try:
@@ -5513,11 +5519,13 @@ class Database:
         if version == 105:
             superseded = await self._remove_source_activity_epoch_unlocked()
             logger.info("Superseded %d unapplied derivations staged with a Source activity epoch", superseded)
-        if version == 122:
+        if version == 123:
             await self._drop_columns_if_present_unlocked("source_sync_snapshot_manifests", "scope_attestations_json")
         if version == 107:
             await self._drop_columns_if_present_unlocked("memories", "confidence")
             await self._drop_columns_if_present_unlocked("agent_claims", "confidence")
+        if version == 121:
+            await self._drop_columns_if_present_unlocked("memories", "extraction_context")
         if version == 26:
             await self._backfill_relation_run_snapshot_audit()
         if version in (30, 31, 66):
@@ -10868,9 +10876,6 @@ class Database:
                 entity_refs=[str(value) for value in raw.get("entity_refs", [])],
                 valid_from=_parse_date(raw.get("valid_from")),
                 valid_until=_parse_date(raw.get("valid_until")),
-                extraction_context=(
-                    str(raw.get("extraction_context")) if raw.get("extraction_context") is not None else None
-                ),
             )
             await self._insert_memory_unlocked(memory)
             await self._link_memory_entities_unlocked(
@@ -13508,9 +13513,9 @@ class Database:
                 corroboration_count,
                 valid_from, valid_until,
                 superseded_by, status, retirement_reason, retired_at,
-                superseded_at, replacement_reason, replacement_kind, extraction_context,
+                superseded_at, replacement_reason, replacement_kind,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 mem.id,
                 mem.memory_type,
@@ -13530,7 +13535,6 @@ class Database:
                 mem.superseded_at.isoformat() if mem.superseded_at else None,
                 mem.replacement_reason,
                 mem.replacement_kind,
-                mem.extraction_context,
                 mem.created_at.isoformat() if mem.created_at else now,
                 mem.updated_at.isoformat() if mem.updated_at else now,
             ),
@@ -13549,9 +13553,9 @@ class Database:
                 corroboration_count,
                 valid_from, valid_until,
                 superseded_by, status, retirement_reason, retired_at,
-                superseded_at, replacement_reason, replacement_kind, extraction_context,
+                superseded_at, replacement_reason, replacement_kind,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 memory_type=excluded.memory_type,
                 content=excluded.content,
@@ -13570,7 +13574,6 @@ class Database:
                 superseded_at=excluded.superseded_at,
                 replacement_reason=excluded.replacement_reason,
                 replacement_kind=excluded.replacement_kind,
-                extraction_context=excluded.extraction_context,
                 updated_at=excluded.updated_at""",
             (
                 mem.id,
@@ -13591,7 +13594,6 @@ class Database:
                 mem.superseded_at.isoformat() if mem.superseded_at else None,
                 mem.replacement_reason,
                 mem.replacement_kind,
-                mem.extraction_context,
                 mem.created_at.isoformat() if mem.created_at else now,
                 mem.updated_at.isoformat() if mem.updated_at else now,
             ),
@@ -14322,7 +14324,7 @@ class Database:
                     corroboration_count = ?,
                     valid_from = ?, valid_until = ?, superseded_by = ?,
                     status = ?, retirement_reason = ?, retired_at = ?,
-                    superseded_at = ?, replacement_reason = ?, replacement_kind = ?, extraction_context = ?,
+                    superseded_at = ?, replacement_reason = ?, replacement_kind = ?,
                     updated_at = ?
                    WHERE id = ?""",
                 (
@@ -14343,7 +14345,6 @@ class Database:
                     memory.superseded_at.isoformat() if memory.superseded_at else None,
                     memory.replacement_reason,
                     memory.replacement_kind,
-                    memory.extraction_context,
                     memory.updated_at.isoformat() if memory.updated_at else None,
                     memory.id,
                 ),
@@ -15951,9 +15952,9 @@ class Database:
                     corroboration_count,
                     valid_from, valid_until,
                     superseded_by, status, retirement_reason, retired_at,
-                    superseded_at, replacement_reason, replacement_kind, extraction_context,
+                    superseded_at, replacement_reason, replacement_kind,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         new_memory.id,
                         new_memory.memory_type,
@@ -15973,7 +15974,6 @@ class Database:
                         new_memory.superseded_at.isoformat() if new_memory.superseded_at else None,
                         new_memory.replacement_reason,
                         new_memory.replacement_kind,
-                        new_memory.extraction_context,
                         new_memory.created_at.isoformat() if new_memory.created_at else now,
                         now,
                     ),
@@ -22949,6 +22949,7 @@ class Database:
         document: DocumentRecord,
         incumbent: Memory,
         challenger: Memory,
+        provenance: str,
         review: MemoryReview,
         reviewer: str,
         review_note: str,
@@ -22996,7 +22997,7 @@ class Database:
                     challenger.id,
                     document.doc_id,
                     "user_correction",
-                    challenger.extraction_context,
+                    provenance,
                     source_updated_at=challenger.updated_at,
                 )
                 update = await self.db.execute(
@@ -23821,7 +23822,6 @@ class Database:
             superseded_at=_parse_dt(d.get("superseded_at")),
             replacement_reason=d.get("replacement_reason"),
             replacement_kind=d.get("replacement_kind"),
-            extraction_context=d.get("extraction_context"),
             created_at=_parse_dt(d.get("created_at")),
             updated_at=_parse_dt(d.get("updated_at")),
         )

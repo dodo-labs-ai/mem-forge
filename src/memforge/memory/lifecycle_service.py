@@ -159,7 +159,6 @@ class MemoryLifecycleService:
             created_at=now,
             updated_at=now,
             status="active",
-            extraction_context=provenance,
         )
         doc_id = self._user_memory_doc_id(memory.id, idempotency_key=idempotency_key)
         if idempotency_key:
@@ -561,7 +560,6 @@ class MemoryLifecycleService:
             created_at=now,
             updated_at=now,
             status="active" if can_apply else "pending_review",
-            extraction_context=provenance,
         )
         correction_doc_id = f"correction-{challenger.id}"
         review = MemoryReview(
@@ -619,6 +617,7 @@ class MemoryLifecycleService:
                 document=correction_document,
                 incumbent=old,
                 challenger=challenger,
+                provenance=provenance,
                 review=review,
                 reviewer=actor_user_id,
                 review_note=reason,

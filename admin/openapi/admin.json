@@ -3722,17 +3722,6 @@
             "title": "Evidence",
             "type": "array"
           },
-          "extraction_context": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Extraction Context"
-          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -4657,17 +4646,6 @@
               }
             ],
             "title": "Created At"
-          },
-          "extraction_context": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Extraction Context"
           },
           "id": {
             "title": "Id",

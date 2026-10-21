@@ -796,7 +796,6 @@ def _memory_payload(
         "owner_user_id": defaults.owner_user_id,
         "project_key": defaults.project_key,
         "repo_identifier": defaults.repo_identifier,
-        "extraction_context": canonical_excerpt,
         "valid_from": valid_from.isoformat() if valid_from is not None else None,
         "valid_until": valid_until.isoformat() if valid_until is not None else None,
         "entity_refs": list(raw.entity_refs),

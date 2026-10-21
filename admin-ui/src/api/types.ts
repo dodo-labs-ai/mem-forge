@@ -25,7 +25,6 @@ export interface Memory {
   valid_until: string | null;
   created_at: string;
   updated_at: string;
-  extraction_context: string | null;
   entity_refs: string[];
   evidence: MemoryEvidenceGroup[];
   /** Source type for the leading glyph: extraction origin, else first source. */

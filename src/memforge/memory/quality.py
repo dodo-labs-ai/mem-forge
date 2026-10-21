@@ -29,7 +29,7 @@ def classify_memory_candidate(
 ) -> MemoryCandidateQuality:
     """Classify whether a raw memory is useful enough to persist."""
     content = _normalize(raw.content)
-    context = _normalize(raw.extraction_context or "")
+    context = _normalize(raw.evidence_quote or "")
 
     if not content:
         return MemoryCandidateQuality(keep=False, skip_reason="empty")
