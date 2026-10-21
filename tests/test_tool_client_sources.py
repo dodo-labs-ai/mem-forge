@@ -275,50 +275,25 @@ def test_push_jira_package_posts_raw_payload_without_markdown_body():
     ]
 
 
-def test_push_teams_window_package_posts_raw_payload_without_markdown_body():
-    client = _RecordingClient({"doc_id": "teams-doc"})
+def test_conversation_collection_calls_use_the_source_resource():
+    client = _RecordingClient({"missing": []})
+    attempt = {"local_agent_job_id": "laj-teams", "local_agent_attempt_count": 1}
 
-    result = client.push_teams_window_package(
-        source_id="src-teams",
-        conversation_id="19:channel@example.test",
-        window_id="teams-thread:src-teams:conv:root",
-        revision_hash="rev-1",
-        raw_payload={"messages": [{"id": "root-1", "content": "Decision captured."}]},
-        title="Teams decision",
-        root_message_id="root-1",
-        window_type="thread",
-        source_url="teams-window://src-teams/conv/window/rev-1",
-        raw_hash="raw-1",
-        sync_snapshot_id="laj-teams:attempt:1",
-        artifact_source_unit_key="teams-thread:src-teams:conv:root",
-        artifact_input_hashes=["a" * 64],
-        submitted_by="codex",
-        submitted_at="2026-07-08T08:00:00Z",
+    client.conversation_collection_request(source_id="src teams", **attempt)
+    client.submit_conversation_manifest(source_id="src teams", manifest={"manifest_version": 1}, **attempt)
+    client.submit_conversation_bodies(
+        source_id="src teams",
+        bodies=[{"conversation_id": "19:chat@thread.v2", "message_id": "m1", "record": {"content": "hi"}}],
+        **attempt,
     )
 
-    assert result["doc_id"] == "teams-doc"
-    assert client.calls == [
-        (
-            "POST",
-            "/api/v1/sources/src-teams/adapter/packages",
-            {
-                "conversation_id": "19:channel@example.test",
-                "window_id": "teams-thread:src-teams:conv:root",
-                "revision_hash": "rev-1",
-                "raw_payload": {"messages": [{"id": "root-1", "content": "Decision captured."}]},
-                "title": "Teams decision",
-                "root_message_id": "root-1",
-                "window_type": "thread",
-                "source_url": "teams-window://src-teams/conv/window/rev-1",
-                "raw_hash": "raw-1",
-                "sync_snapshot_id": "laj-teams:attempt:1",
-                "artifact_source_unit_key": "teams-thread:src-teams:conv:root",
-                "artifact_input_hashes": ["a" * 64],
-                "submitted_by": "codex",
-                "submitted_at": "2026-07-08T08:00:00Z",
-            },
-        )
+    assert [(method, url) for method, url, _body in client.calls] == [
+        ("POST", "/api/v1/sources/src%20teams/conversation-collection/request"),
+        ("POST", "/api/v1/sources/src%20teams/conversation-collection/manifest"),
+        ("POST", "/api/v1/sources/src%20teams/conversation-collection/bodies"),
     ]
+    assert client.calls[1][2] == {"manifest": {"manifest_version": 1}, **attempt}
+    assert client.calls[2][2]["bodies"][0]["message_id"] == "m1"
 
 
 def test_start_source_processing_posts_snapshot_identity():
@@ -369,21 +344,6 @@ def test_start_source_processing_resolves_the_workspace_resource_url(monkeypatch
             "POST",
             "https://memforge.example.com/api/v1/sources/src-local/process?workspace_id=team_alpha",
             {"force_full_sync": False},
-        )
-    ]
-
-
-def test_get_source_projection_inventory_uses_source_resource_url():
-    client = _RecordingClient({"units": []})
-
-    result = client.get_source_projection_inventory("src teams")
-
-    assert result == {"units": []}
-    assert client.calls == [
-        (
-            "GET",
-            "/api/v1/sources/src%20teams/projection-inventory?limit=200",
-            None,
         )
     ]
 

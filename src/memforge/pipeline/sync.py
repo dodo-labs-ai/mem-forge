@@ -21,7 +21,7 @@ import math
 import threading
 import uuid
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -36,6 +36,7 @@ from memforge.evals.agent_evaluation import (
     publish_runtime_events,
 )
 from memforge.genes import source_rediscovers_documents
+from memforge.genes.conversation_gene import ConversationGene
 from memforge.genes.base import SourceConfigurationError
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
@@ -85,10 +86,11 @@ from memforge.source_projection import (
     ProjectionEnvelope,
     ProjectionRequest,
     ProjectionRunMode,
-    ProjectionScopeAttestation,
     SourceProjection,
     SourceProjectionAdapter,
     SourceRelationType,
+    SourceRemoval,
+    UnitRemovalReason,
 )
 from memforge.source_artifacts import (
     StoredSourceArtifact,
@@ -183,6 +185,13 @@ class SourceSyncMode(str, Enum):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _absent(doc_ids: set[str], *, evidence: str) -> dict[str, SourceRemoval]:
+    """Documents the provider no longer has, as the run's evidence shows."""
+    return {
+        doc_id: SourceRemoval(reason=UnitRemovalReason.ABSENT_FROM_SOURCE, evidence=evidence) for doc_id in doc_ids
+    }
 
 
 def _aggregate_extraction_metrics(
@@ -510,6 +519,13 @@ def _failure_category(error: str) -> str:
     if "certificate_verify_failed" in normalized or "certificate verify" in normalized:
         return "certificate"
     return "other"
+
+
+def summarize_unreadable_conversations(names: Sequence[str]) -> str:
+    return (
+        f"{_plural(len(names), 'conversation')} could not be read: {', '.join(names)}. "
+        "Their memories are kept. Restore access, or deselect a conversation that is no longer used."
+    )
 
 
 def summarize_failed_documents(docs_failed: int, failed_docs: list[FailedDoc]) -> str:
@@ -908,7 +924,6 @@ class GeneSyncOrchestrator:
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
-        projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         record_terminal_result: bool = True,
         failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
     ) -> SyncState:
@@ -949,8 +964,10 @@ class GeneSyncOrchestrator:
 
         Every per-Document failure is recorded in the failure ledger, which
         owns its retry, so a run whose failures are all per-Document ones
-        advances the incremental cursor; its status is ``partial``. A failure
-        of the run itself keeps the cursor.
+        advances the incremental cursor; its status is ``partial``. A
+        conversation the Source cannot read also makes the run ``partial``,
+        without a ledger row: it keeps its Support until the user restores
+        access or deselects it. A failure of the run itself keeps the cursor.
 
         Returns
         -------
@@ -1016,6 +1033,7 @@ class GeneSyncOrchestrator:
         recovered_deferred_results: tuple[dict[str, Any], ...] = ()
         recovered_failed_results: tuple[dict[str, Any], ...] = ()
         transition_run = scope_transition is not None
+        unreadable_conversations: tuple[str, ...] = ()
 
         def fail_document(failure: RunItemFailure, *, error: str | None = None) -> None:
             failed_docs.append(
@@ -1107,6 +1125,11 @@ class GeneSyncOrchestrator:
                         run_id=transition_run_id,
                     )
                     transition_started = True
+                    if isinstance(gene, ConversationGene):
+                        gene.begin_scope_transition(
+                            previous_scope=scope_transition.previous_scope,
+                            target_scope=scope_transition.target_scope,
+                        )
 
                 # ----------------------------------------------------------
                 # Step 1: Get indexed doc_ids for deletion detection
@@ -1384,7 +1407,6 @@ class GeneSyncOrchestrator:
                                     else None
                                 ),
                                 projection_access_context=configured_access_context,
-                                projection_scope_attestations=projection_scope_attestations,
                                 authoritative_snapshot=authoritative_snapshot,
                                 source_activity=source_activity,
                                 lifecycle_execution_owner_id=durable_cycle_id,
@@ -1646,9 +1668,14 @@ class GeneSyncOrchestrator:
             tombstoned_source_unit_ids: set[str] = set()
             run_committed = docs_failed + deferred_failures == 0
             absence_is_authoritative = run_coverage.proves_absence and run_committed
-            absent_doc_ids: set[str] | None = None
-            if absence_is_authoritative:
-                absent_doc_ids = indexed_doc_ids - crawled_doc_ids
+            removals: dict[str, SourceRemoval] | None = None
+            if isinstance(gene, ConversationGene):
+                # Each conversation Unit carries the evidence that removes it,
+                # so its removal does not wait on other Units of the run.
+                if not reprocessing:
+                    removals = gene.removals()
+            elif absence_is_authoritative:
+                removals = _absent(indexed_doc_ids - crawled_doc_ids, evidence="complete snapshot")
             elif run_committed and not reprocessing and scope_transition is None:
                 try:
                     absent_doc_ids = await self._absent_from_scope_listing(
@@ -1656,6 +1683,8 @@ class GeneSyncOrchestrator:
                         source_id=source_id,
                         indexed_doc_ids=indexed_doc_ids,
                     )
+                    if absent_doc_ids is not None:
+                        removals = _absent(absent_doc_ids, evidence="scope listing")
                 except AbsenceCheckSkipped as exc:
                     # The run's content is committed; only the absence proof is
                     # missing, so every unlisted Document keeps its Support and
@@ -1670,7 +1699,7 @@ class GeneSyncOrchestrator:
                         exc.__cause__,
                     )
 
-            if absent_doc_ids is not None:
+            if removals is not None:
                 if progress_callback:
                     progress_callback(
                         {
@@ -1691,14 +1720,14 @@ class GeneSyncOrchestrator:
                     source_name=source_name,
                     run_id=run_id,
                     lifecycle_cycle_id=(scope_transition.id if scope_transition is not None else durable_cycle_id),
-                    absent_doc_ids=absent_doc_ids,
+                    removals=removals,
                     source_filter_summary=_source_filter_summary(gene, last_sync_time),
                     source_activity=source_activity,
                 )
                 for deletion_failure in deletion_failures:
                     fail_document(deletion_failure)
                 docs_failed += len(deletion_failures)
-                settled_doc_ids.update(absent_doc_ids - {failure.document_id for failure in deletion_failures})
+                settled_doc_ids.update(set(removals) - {failure.document_id for failure in deletion_failures})
                 if deleted_count > 0:
                     logger.info(
                         "Soft-deleted memories from %d removed documents",
@@ -1755,13 +1784,10 @@ class GeneSyncOrchestrator:
 
             if scope_transition is not None:
                 scoped_reconciliation_coverage = None
-                if docs_failed == 0:
-                    scoped_reconciliation_coverage = self.source_projection_adapter.reconciliation_coverage(
-                        source_type=configured_source_type,
-                        transition=scope_transition,
-                        current_units=await self.db.list_current_source_units(source_id),
-                        run_attestations=projection_scope_attestations,
-                    )
+                if docs_failed == 0 and isinstance(gene, ConversationGene) and await gene.completes_scope_transition():
+                    # Deselected conversations are removed and every readable
+                    # target conversation was polled in this attempt.
+                    scoped_reconciliation_coverage = ProjectionCoverage.TOMBSTONED_DELTA
                 if (absence_is_authoritative or scoped_reconciliation_coverage is not None) and docs_failed == 0:
                     scope_transition = await self.db.complete_projection_scope_transition(
                         scope_transition.id,
@@ -1789,8 +1815,8 @@ class GeneSyncOrchestrator:
             # ----------------------------------------------------------
             # Record failed Documents and determine final status
             # ----------------------------------------------------------
-            # Every failure left is one Document's: the ledger records it and
-            # retries it, so the run is partial and its cursor advances.
+            # Every Document failure left is in the ledger, which retries it,
+            # so the run is partial and its cursor advances.
             await self._record_failed_items(
                 source_id,
                 release=release,
@@ -1798,7 +1824,12 @@ class GeneSyncOrchestrator:
                 settled_doc_ids=settled_doc_ids,
                 source_activity=source_activity,
             )
-            status = "success" if docs_failed == 0 else "partial"
+            # A conversation the Source cannot read keeps its Support and
+            # fails nothing; the run is partial until the user restores
+            # access or deselects it.
+            if not reprocessing and isinstance(gene, ConversationGene):
+                unreadable_conversations = gene.unreadable_conversations()
+            status = "success" if docs_failed == 0 and not unreadable_conversations else "partial"
 
         except Exception as e:
             logger.error(
@@ -1859,11 +1890,15 @@ class GeneSyncOrchestrator:
 
         if docs_failed > 0 and error_message is None:
             error_message = summarize_failed_documents(docs_failed, failed_docs)
+        if unreadable_conversations:
+            error_message = " ".join(
+                part for part in (error_message, summarize_unreadable_conversations(unreadable_conversations)) if part
+            )
 
         # Advance the incremental watermark after a sync whose failures, if
         # any, are all recorded in the failure ledger, including no-change
-        # runs where discovery returns zero items. A Projection Scope
-        # transition advances it only once complete. A reprocess discovers
+        # runs where discovery returns zero items. A run with a Projection
+        # Scope transition advances it only when it succeeds. A reprocess discovers
         # nothing, so the cursor stays where the last sync left it.
         if not reprocessing and (status == "success" or (status == "partial" and not transition_run)):
             sync_at = finished_at
@@ -1961,13 +1996,28 @@ class GeneSyncOrchestrator:
 
         A Source that can ask its provider for one Document by id reads its
         current item, asking with the item the Document's failure ledger row
-        kept when the Document never committed a Unit. Any other Source
-        fetches the item that row kept, as discovery returned it: it names
-        the revision that failed, which the Unit's stored input does not
-        hold. A Document without such a row reads the stored input of its
-        Unit's current revision.
+        kept when the Document never committed a Unit. A conversation Source
+        plans every run afresh from committed Units, so it reads the stored
+        input of the Unit's current revision; when the Unit never committed,
+        discovery plans it again while its content is in reach, so nothing is
+        left to retry. Any other Source fetches the item the failure ledger
+        row kept, as discovery returned it: it names the revision that failed,
+        which the Unit's stored input does not hold. A Document without such a
+        row reads the stored input of its Unit's current revision.
         """
 
+        if isinstance(gene, ConversationGene):
+            try:
+                stored = await load_stored_source_document(
+                    self.db, self.doc_store, gene, source_id=source_id, document_id=document_id,
+                )
+            except StoredDocumentUnavailable as exc:
+                if exc.reason is StoredDocumentUnavailableReason.SOURCE_UNIT_MISSING:
+                    raise StoredDocumentUnavailable(
+                        StoredDocumentUnavailableReason.PROVIDER_DOCUMENT_MISSING, document_id
+                    ) from exc
+                raise
+            return stored.item, stored
         if not rediscovering:
             if failure is not None and failure.item is not None:
                 return failure.item, None
@@ -2575,7 +2625,6 @@ class GeneSyncOrchestrator:
         projection_scope: dict[str, object] | None = None,
         scope_transition: dict[str, object] | None = None,
         projection_access_context: dict[str, object] | None = None,
-        projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         authoritative_snapshot: bool = False,
         source_activity: SourceActivityLease | None = None,
         lifecycle_execution_owner_id: str | None = None,
@@ -2619,7 +2668,6 @@ class GeneSyncOrchestrator:
                         projection_scope=projection_scope,
                         scope_transition=scope_transition,
                         projection_access_context=projection_access_context,
-                        projection_scope_attestations=projection_scope_attestations,
                         authoritative_snapshot=authoritative_snapshot,
                         source_activity=source_activity,
                         lifecycle_execution_owner_id=lifecycle_execution_owner_id,
@@ -2672,7 +2720,6 @@ class GeneSyncOrchestrator:
         projection_scope: dict[str, object] | None,
         scope_transition: dict[str, object] | None,
         projection_access_context: dict[str, object] | None,
-        projection_scope_attestations: tuple[ProjectionScopeAttestation, ...],
         authoritative_snapshot: bool,
     ) -> tuple[SourceProjection, tuple[StoredSourceArtifact, ...]]:
         """Project fetched content onto its Source Unit and store the Artifacts it returned.
@@ -2724,7 +2771,6 @@ class GeneSyncOrchestrator:
                             run_mode=ProjectionRunMode.FULL_SNAPSHOT,
                             scope_transition=scope_transition,
                             access_context=dict(projection_access_context or {}),
-                            scope_attestations=projection_scope_attestations,
                         ),
                         item=item,
                         raw=raw,
@@ -2764,7 +2810,6 @@ class GeneSyncOrchestrator:
                     run_mode=ProjectionRunMode.FULL_SNAPSHOT,
                     scope_transition=scope_transition,
                     access_context=dict(projection_access_context or {}),
-                    scope_attestations=projection_scope_attestations,
                 ),
                 item=item,
                 raw=raw,
@@ -2804,7 +2849,6 @@ class GeneSyncOrchestrator:
                             run_mode=ProjectionRunMode.FULL_SNAPSHOT,
                             scope_transition=scope_transition,
                             access_context=dict(projection_access_context or {}),
-                            scope_attestations=projection_scope_attestations,
                         ),
                         item=item,
                         raw=raw,
@@ -2844,7 +2888,6 @@ class GeneSyncOrchestrator:
                         run_mode=ProjectionRunMode.FULL_SNAPSHOT,
                         scope_transition=scope_transition,
                         access_context=dict(projection_access_context or {}),
-                        scope_attestations=projection_scope_attestations,
                     ),
                     item=item,
                     raw=raw,
@@ -2868,7 +2911,6 @@ class GeneSyncOrchestrator:
         projection_scope: dict[str, object] | None = None,
         scope_transition: dict[str, object] | None = None,
         projection_access_context: dict[str, object] | None = None,
-        projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         authoritative_snapshot: bool = False,
         source_activity: SourceActivityLease | None = None,
         source_unit_id_callback: Callable[[str], None] | None = None,
@@ -2972,7 +3014,6 @@ class GeneSyncOrchestrator:
                 projection_scope=projection_scope,
                 scope_transition=scope_transition,
                 projection_access_context=projection_access_context,
-                projection_scope_attestations=projection_scope_attestations,
                 authoritative_snapshot=authoritative_snapshot,
             )
         source_unit = projection_probe.source_units[0]
@@ -3048,7 +3089,6 @@ class GeneSyncOrchestrator:
                             ),
                             scope_transition=scope_transition,
                             access_context=dict(projection_access_context or {}),
-                            scope_attestations=projection_scope_attestations,
                         ),
                         item=item,
                         raw=raw,
@@ -4058,31 +4098,32 @@ class GeneSyncOrchestrator:
         source_name: str,
         run_id: str,
         lifecycle_cycle_id: str,
-        absent_doc_ids: set[str],
+        removals: Mapping[str, SourceRemoval],
         source_filter_summary: str | None,
         source_activity: SourceActivityLease | None = None,
     ) -> tuple[int, list[RunItemFailure], set[str]]:
-        """Remove the held Documents this run proved the provider no longer has.
+        """Remove the held Documents this run proved removable.
 
-        For each absent document, persist an explicit Source Unit tombstone,
-        apply a gate-checked complete lifecycle ledger, and only then remove
-        document storage when no review is required.
+        For each document, persist an explicit Source Unit tombstone carrying
+        its removal reason, apply a gate-checked complete lifecycle ledger, and
+        only then remove document storage when no review is required. The
+        deletion context records the reason and the evidence that allowed it.
 
         Returns the count, failures, and Source Units whose tombstones committed.
         """
-        if not absent_doc_ids:
+        if not removals:
             return 0, [], set()
 
         logger.info(
             "Detected %d deletions for source %s",
-            len(absent_doc_ids),
+            len(removals),
             source_id,
         )
 
         deleted_count = 0
         failed_deletions: list[RunItemFailure] = []
         tombstoned_source_unit_ids: set[str] = set()
-        for doc_id in sorted(absent_doc_ids):
+        for doc_id in sorted(removals):
             title = doc_id
             try:
                 # Get existing document info before deletion
@@ -4150,13 +4191,14 @@ class GeneSyncOrchestrator:
                 if prior_unit_revision is None:
                     raise RuntimeError("source absence cannot be reconciled without a current Source Unit revision")
                 prior_observation_revisions = await self.db.get_current_source_observation_revisions(source_unit.id)
+                removal = removals[doc_id]
                 tombstone = project_source_unit_tombstone(
                     source_type=source_type,
                     run_id=(f"{run_id}:tombstone:{uuid.uuid5(uuid.NAMESPACE_URL, f'{source_id}:{doc_id}').hex}"),
                     source_unit=source_unit,
                     prior_unit_revision=prior_unit_revision,
                     prior_observation_revisions=prior_observation_revisions,
-                    reason="absent_from_source",
+                    reason=removal.reason.value,
                 )
                 target_revision = tombstone.source_unit_revisions[0]
                 lifecycle_result = await self.memory_engine.apply_projected_tombstone(
@@ -4176,8 +4218,9 @@ class GeneSyncOrchestrator:
                         doc_id,
                         source_id=source_id,
                         deletion_context={
-                            "deletion_kind": "source_absence",
-                            "reason": "proven_absent_by_latest_successful_sync",
+                            "deletion_kind": "source_removal",
+                            "reason": removal.reason.value,
+                            "evidence": removal.evidence,
                             "source_filter_summary": source_filter_summary,
                             "source_unit_id": source_unit.id,
                             "target_unit_revision_id": target_revision.id,

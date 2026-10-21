@@ -337,7 +337,7 @@ export function TeamsSourceSetup({
             <div className="mt-4 grid gap-5 sm:grid-cols-2 sm:gap-x-8">
               <SettingsField
                 label="Initial history"
-                help="How far back to collect when this source is first connected or its history is expanded. Older supported memories do not expire as time passes."
+                help="How far back to collect when this source is first connected or its history is expanded. Edits, deletions and new replies are followed within this period; older messages keep their memories but are no longer checked for changes."
               >
                 <Select<number>
                   value={config.initial_history_days}

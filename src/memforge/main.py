@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from importlib import metadata
-from itertools import chain
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from typing import Any, Callable
@@ -67,11 +66,9 @@ from memforge.local_agent.folder_picker import FolderPickerCancelled, FolderPick
 from memforge.local_agent.document_identity import (
     build_jira_doc_id,
     build_local_markdown_doc_id,
-    build_teams_doc_id,
 )
 from memforge.local_agent.source_contract import (
     GitHubProviderConnectionError,
-    TEAMS_TOMBSTONE_REASONS,
     local_agent_sync_snapshot_id,
     source_processing_receipt,
 )
@@ -103,8 +100,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_CLI_CONFIG_PATH = Path.home() / ".memforge" / "cli.toml"
 DEFAULT_LOCAL_AGENT_STATE_PATH = Path.home() / ".memforge" / "local-agent-state.json"
 DEFAULT_LOCAL_AGENT_LOCK_PATH = Path.home() / ".memforge" / "local-agent-daemon.lock"
-DEFAULT_TEAMS_AUDIT_LOG_PATH = Path.home() / ".memforge" / "teams-sync-audit.jsonl"
-DEFAULT_TEAMS_LEDGER_STATE_PATH = Path.home() / ".memforge" / "teams-ledger-state.json"
 DEFAULT_KB_INCLUDE = [
     "*.md",
     "**/*.md",
@@ -2024,6 +2019,8 @@ def sync(ctx, source: str | None):
 
     async def _run():
         config: AppConfig = ctx.obj["config"]
+        from memforge.genes.conversation_gene import ConversationGene
+        from memforge.genes import GENE_REGISTRY
         from memforge.runtime import build_sync_runtime, run_source_sync
 
         db = await _get_db(config)
@@ -2048,6 +2045,14 @@ def sync(ctx, source: str | None):
                 continue
 
             source_type = src["type"]
+            gene_class = GENE_REGISTRY.get(source_type)
+            if gene_class is not None and issubclass(gene_class, ConversationGene):
+                # Its local agent collects each attempt; the server processes what was uploaded.
+                console.print(
+                    f"\n[yellow]Skipping {src['name']}[/] (type={source_type}): "
+                    "a conversation Source is collected by its local agent; sync it from the Admin UI."
+                )
+                continue
 
             console.print(f"\n[bold]Syncing: {src['name']}[/] (type={source_type})")
 
@@ -3395,7 +3400,6 @@ def _required_local_source_doc_ids(
     sync_snapshot_id: str,
     local_agent_job_id: str,
     local_agent_attempt_count: int,
-    scope_attestations: list[dict[str, Any]] | None = None,
 ) -> set[str]:
     """Plan one fenced collection and validate the returned materialization set."""
     plan = client.prepare_local_source_snapshot(
@@ -3405,7 +3409,6 @@ def _required_local_source_doc_ids(
         sync_snapshot_id=sync_snapshot_id,
         local_agent_job_id=local_agent_job_id,
         local_agent_attempt_count=local_agent_attempt_count,
-        scope_attestations=scope_attestations,
     )
     _raise_if_local_agent_lease_not_current(plan)
     if plan.get("error"):
@@ -3791,10 +3794,8 @@ def _run_cloud_teams_browse_job(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def _teams_auth_exception(exc: Exception) -> bool:
-    try:
-        from memforge.genes.teams_gene import AuthenticationError
-    except Exception:
-        AuthenticationError = ()  # type: ignore[assignment]
+    from memforge.genes.teams_client import AuthenticationError
+
     if isinstance(exc, AuthenticationError):
         return True
     text = str(exc).lower()
@@ -3844,39 +3845,30 @@ def _run_cloud_teams_sync_job(
     *,
     report_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    from memforge.local_agent.teams_audit import write_teams_audit_event
+    """Collect one job attempt of a Teams Source on this device and hand it over to the server.
+
+    An expired Teams session is renewed once through the browser before the
+    attempt fails. The shared device executor uploads the attempt and starts
+    its processing, or for a dry run asks for its plan.
+    """
+
+    from memforge.local_agent.conversation_executor import ConversationUploadError
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, client, error = _local_agent_job_source_client(
-        job,
-        payload,
-        operation=operation,
-        client=client,
-    )
+    source_id, client, error = _local_agent_job_source_client(job, payload, operation=operation, client=client)
     if error:
         return error
-
-    run_id = str(job.get("job_id") or f"teams-sync-{int(time.time())}")
-    sync_snapshot_id = local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count"))
-    audit_path = Path(str(payload.get("audit_log_path") or DEFAULT_TEAMS_AUDIT_LOG_PATH))
-    limit = _cloud_job_limit(payload.get("limit"), default=0)
-    _report_local_agent_progress(
-        report_progress,
-        _sync_progress_snapshot(phase="connecting"),
-    )
+    _report_local_agent_progress(report_progress, _sync_progress_snapshot(phase="connecting"))
     try:
-        collection = asyncio.run(
-            _collect_teams_documents_from_cloud_job(
-                job,
-                source_id=source_id,
-                limit=limit,
-                report_progress=report_progress,
-            )
-        )
-    except Exception as exc:
-        collect_error: Exception | None = exc
-        if _teams_auth_exception(exc):
+        try:
+            result = asyncio.run(_collect_teams_on_device(job, payload, source_id, client, report_progress))
+        except ConversationUploadError:
+            # The server refused an upload; a new Teams session would not change its answer.
+            raise
+        except Exception as exc:
+            if not _teams_auth_exception(exc):
+                raise
             reauth = _run_cloud_teams_auth_job(
                 {
                     **job,
@@ -3888,1034 +3880,60 @@ def _run_cloud_teams_sync_job(
                     },
                 }
             )
-            if not reauth.get("error"):
-                try:
-                    collection = asyncio.run(
-                        _collect_teams_documents_from_cloud_job(
-                            job,
-                            source_id=source_id,
-                            limit=limit,
-                            report_progress=report_progress,
-                        )
-                    )
-                    collect_error = None
-                except Exception as retry_exc:
-                    collect_error = retry_exc
-            else:
-                collect_error = RuntimeError(str(reauth.get("error") or "Teams authentication failed."))
-        if collect_error is not None:
-            write_teams_audit_event(
-                audit_path,
-                {
-                    "event": "teams_sync_run",
-                    "run_id": run_id,
-                    "operation": operation,
-                    "source_id": source_id,
-                    "status": "collect_failed",
-                    "error_type": type(collect_error).__name__,
-                    "error": str(collect_error),
-                },
-            )
-            return {
-                "operation": operation,
-                "source_id": source_id,
-                "error": str(collect_error),
-                "error_type": type(collect_error).__name__,
-                "retryable": True,
-            }
-
-    documents, poll_audits = _teams_collection_documents_and_polls(collection)
-    inventory_findings: list[dict[str, str]] = []
-    try:
-        teams_config = _teams_direct_rest_config_from_cloud_payload(payload)
-        configured_conversation_ids = set(teams_config["conversation_ids"])
-        projection_scope_attestations = _teams_projection_scope_attestations(
-            source_id=source_id,
-            job=job,
-            poll_audits=poll_audits,
-            configured_conversation_ids=configured_conversation_ids,
-            configured_source=teams_config,
-            scope_transition=(
-                payload.get("projection_scope_transition")
-                if isinstance(payload.get("projection_scope_transition"), dict)
-                else None
-            ),
-        )
-        retention_cutoff = next(
-            (
-                str(item.get("evidence", {}).get("rolling_retention_cutoff") or "")
-                for item in projection_scope_attestations
-                if isinstance(item.get("evidence"), dict) and item.get("evidence", {}).get("rolling_retention_cutoff")
-            ),
-            None,
-        )
-        inventory_documents = (
-            _iter_teams_inventory_tombstones(
-                client=client,
-                source_id=source_id,
-                current_documents=documents,
-                poll_audits=poll_audits,
-                configured_conversation_ids=configured_conversation_ids,
-                scope_transition=(
-                    payload.get("projection_scope_transition")
-                    if isinstance(payload.get("projection_scope_transition"), dict)
-                    else None
-                ),
-                rolling_retention_cutoff=retention_cutoff,
-                findings=inventory_findings,
-            )
-            if not limit
-            else iter(())
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        inventory_documents = iter(())
-        projection_scope_attestations = []
-        inventory_setup_error = str(exc)
-    else:
-        inventory_setup_error = None
-    progress_summary = _teams_progress_summary(documents, poll_audits)
-    for poll in poll_audits:
-        event = {"event": "teams_conversation_poll", "run_id": run_id, "source_id": source_id, **poll}
-        write_teams_audit_event(audit_path, event)
-    pushed: list[dict[str, Any]] = []
-    failed: list[dict[str, Any]] = []
-    skipped_existing: list[dict[str, Any]] = []
-    scoped_client = client
-    submitted_by = str(payload.get("submitted_by") or "memforge-local-agent")
-    sync_started = False
-    inventory_error = inventory_setup_error
-    lease_lost = False
-
-    processed_messages = 0
-    candidate_documents: list[dict[str, Any]] = []
-    documents_to_push: list[dict[str, Any]] = []
-    if inventory_error is None:
-        try:
-            candidate_documents = list(chain(inventory_documents, documents))
-            documents_by_doc_id: dict[str, dict[str, Any]] = {}
-            manifest_items: list[dict[str, str]] = []
-            for doc in candidate_documents:
-                window_id = str(doc["window_id"])
-                doc_id = build_teams_doc_id(source_id=source_id, window_id=window_id)
-                if doc_id in documents_by_doc_id:
-                    raise ValueError(f"Teams collection contains duplicate window identity: {window_id}")
-                documents_by_doc_id[doc_id] = doc
-                raw_payload = doc.get("raw_payload") if isinstance(doc.get("raw_payload"), dict) else {}
-                manifest_items.append(
-                    {
-                        "doc_id": doc_id,
-                        "revision": str(doc["revision_hash"]),
-                        "change_kind": "tombstone" if raw_payload.get("_tombstone") is True else "upsert",
-                    }
-                )
-            required_doc_ids = _required_local_source_doc_ids(
-                scoped_client,
-                source_id=source_id,
-                items=manifest_items,
-                coverage="bounded_delta",
-                known_doc_ids=set(documents_by_doc_id),
-                sync_snapshot_id=sync_snapshot_id,
-                local_agent_job_id=str(job["job_id"]),
-                local_agent_attempt_count=int(job["attempt_count"]),
-                scope_attestations=projection_scope_attestations,
-            )
-            documents_to_push = [
-                doc
-                for doc_id, doc in documents_by_doc_id.items()
-                if doc_id in required_doc_ids
-            ]
-            skipped_existing.extend(
-                {
-                    "window_id": str(doc["window_id"]),
-                    "revision_hash": str(doc["revision_hash"]),
-                }
-                for doc_id, doc in documents_by_doc_id.items()
-                if doc_id not in required_doc_ids
-            )
-        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
-            inventory_error = str(exc)
-    artifact_inputs_by_window: dict[str, list[str]] = {}
-    artifact_failures_by_window: dict[str, dict[str, Any]] = {}
-    if inventory_error is None and documents_to_push:
-        try:
-            (
-                artifact_inputs_by_window,
-                artifact_failures_by_window,
-            ) = asyncio.run(
-                _upload_teams_hosted_content_inputs(
-                    documents_to_push,
-                    source_id=source_id,
-                    region=_teams_region_from_payload(payload),
-                    client=scoped_client,
-                    local_agent_job_id=str(job["job_id"]),
-                    local_agent_attempt_count=int(job["attempt_count"]),
-                )
-            )
-        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
-            inventory_error = str(exc)
-    selected_count = len(skipped_existing)
-    document_iterator = iter(documents_to_push)
-    while inventory_error is None:
-        try:
-            doc = next(document_iterator)
-        except StopIteration:
-            break
-        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
-            inventory_error = str(exc)
-            break
-        selected_count += 1
-        current_source_time = doc.get("date_from") or doc.get("date_to") or doc.get("last_modified")
-        _report_local_agent_progress(
-            report_progress,
-            _sync_progress_snapshot(
-                phase="uploading",
-                completed=processed_messages,
-                total=progress_summary.get("messages", 0),
-                unit="message",
-                source_time_start=current_source_time,
-                source_time_end=current_source_time,
-                failed=len(failed),
-            ),
-        )
-        processed_messages += _int_or_zero(doc.get("message_count"))
-        window_id = str(doc["window_id"])
-        revision_hash = str(doc["revision_hash"])
-        window_id_hash = hashlib.sha256(window_id.encode("utf-8")).hexdigest()
-        write_teams_audit_event(
-            audit_path,
-            {
-                "event": "teams_window_projection",
-                "run_id": run_id,
-                "source_id": source_id,
-                "raw_conversation_id": doc.get("conversation_id"),
-                "raw_root_message_id": doc.get("root_message_id"),
-                "window_id_hash": window_id_hash,
-                "window_type": doc.get("window_type"),
-                "revision_hash": revision_hash,
-                "receipt_status": "new",
-                "message_count": doc.get("message_count"),
-            },
-        )
-        artifact_failure = artifact_failures_by_window.get(window_id)
-        if artifact_failure is not None:
-            failed.append(
-                {
-                    "window_id": window_id,
-                    "revision_hash": revision_hash,
-                    **artifact_failure,
-                }
-            )
-            write_teams_audit_event(
-                audit_path,
-                {
-                    "event": "teams_memory_patch",
-                    "run_id": run_id,
-                    "source_id": source_id,
-                    "window_id_hash": window_id_hash,
-                    "revision_hash": revision_hash,
-                    "patch_status": "failed",
-                    "error": artifact_failure.get("error"),
-                    "status_code": artifact_failure.get("status_code"),
-                    "claim_add": 0,
-                    "claim_update": 0,
-                    "claim_supersede": 0,
-                    "claim_noop": 0,
-                    "claim_rejected_ambiguous": 0,
-                },
-            )
-            continue
-        artifact_input_hashes = artifact_inputs_by_window.get(window_id, [])
-        response = scoped_client.push_teams_window_package(
-            source_id=source_id,
-            conversation_id=str(doc["conversation_id"]),
-            root_message_id=str(doc.get("root_message_id") or ""),
-            window_id=window_id,
-            window_type=str(doc.get("window_type") or ""),
-            revision_hash=revision_hash,
-            raw_payload=doc.get("raw_payload") if isinstance(doc.get("raw_payload"), dict) else {},
-            title=str(doc["title"]),
-            source_url=str(doc.get("source_url") or ""),
-            raw_hash=str(doc["raw_hash"]),
-            submitted_by=submitted_by,
-            sync_snapshot_id=sync_snapshot_id,
-            local_agent_job_id=str(job["job_id"]),
-            local_agent_attempt_count=int(job["attempt_count"]),
-            artifact_source_unit_key=window_id if artifact_input_hashes else None,
-            artifact_input_hashes=artifact_input_hashes,
-        )
-        if isinstance(response, dict) and response.get("error"):
-            failed.append(
-                {
-                    "window_id": window_id,
-                    "revision_hash": revision_hash,
-                    "error": response.get("error"),
-                    "detail": response.get("detail"),
-                    "status_code": response.get("status_code"),
-                }
-            )
-            write_teams_audit_event(
-                audit_path,
-                {
-                    "event": "teams_memory_patch",
-                    "run_id": run_id,
-                    "source_id": source_id,
-                    "window_id_hash": window_id_hash,
-                    "revision_hash": revision_hash,
-                    "patch_status": "failed",
-                    "error": response.get("error"),
-                    "status_code": response.get("status_code"),
-                    "claim_add": 0,
-                    "claim_update": 0,
-                    "claim_supersede": 0,
-                    "claim_noop": 0,
-                    "claim_rejected_ambiguous": 0,
-                },
-            )
-            if _local_agent_lease_not_current(response):
-                lease_lost = True
-                break
-            continue
-        pushed.append(
-            {
-                "window_id": window_id,
-                "revision_hash": revision_hash,
-                "doc_id": response.get("doc_id") if isinstance(response, dict) else None,
-                "document_hash": response.get("document_hash") if isinstance(response, dict) else None,
-            }
-        )
-        write_teams_audit_event(
-            audit_path,
-            {
-                "event": "teams_memory_patch",
-                "run_id": run_id,
-                "source_id": source_id,
-                "window_id_hash": window_id_hash,
-                "revision_hash": revision_hash,
-                "patch_status": "pushed",
-                "document_hash": response.get("document_hash") if isinstance(response, dict) else None,
-                "claim_add": 0,
-                "claim_update": 0,
-                "claim_supersede": 0,
-                "claim_noop": 0,
-                "claim_rejected_ambiguous": 0,
-            },
-        )
-
-    for finding in inventory_findings:
-        write_teams_audit_event(
-            audit_path,
-            {
-                "event": "teams_projection_inventory_finding",
-                "run_id": run_id,
-                "source_id": source_id,
-                **finding,
-            },
-        )
-
-    _report_local_agent_progress(
-        report_progress,
-        _sync_progress_snapshot(
-            phase="uploading",
-            completed=processed_messages,
-            total=progress_summary.get("messages", 0),
-            unit="message",
-            source_time_start=progress_summary.get("date_from"),
-            source_time_end=progress_summary.get("date_to"),
-            failed=len(failed),
-        ),
-    )
-
-    sync_result = None
-    if (
-        selected_count or _teams_scope_attestations_have_poll_evidence(projection_scope_attestations)
-    ) and not failed and inventory_error is None and not lease_lost:
-        # Teams is incremental by stable window id and revision. Processing the
-        # historical input set lets the server collapse each window to its
-        # latest revision; document-style authoritative snapshots do not apply.
-        sync_result = scoped_client.start_source_processing(
-            source_id=source_id,
-            force_full_sync=bool(payload.get("force_full_sync", False)),
-            sync_snapshot_id=sync_snapshot_id,
-            local_agent_job_id=str(job["job_id"]),
-            local_agent_attempt_count=int(job["attempt_count"]),
-        )
-        sync_started = not bool(sync_result.get("error"))
-
-    result = {
-        "operation": operation,
-        "source_id": source_id,
-        "counts": {
-            "selected": selected_count,
-            "pushed": len(pushed),
-            "failed": len(failed),
-            "skipped_existing": len(skipped_existing),
-            "polls": len(poll_audits),
-        },
-        "messages": progress_summary.get("messages", 0),
-        "conversations": progress_summary.get("conversations", 0),
-        "date_from": progress_summary.get("date_from"),
-        "date_to": progress_summary.get("date_to"),
-        "pushed": pushed,
-        "failed": failed,
-        "skipped_existing": skipped_existing,
-        "sync_started": sync_started,
-        **(source_processing_receipt(sync_result) if sync_result else {}),
-        "audit_log_path": str(audit_path.expanduser()),
-    }
-    if inventory_findings:
-        result["counts"]["inventory_findings"] = len(inventory_findings)
-        result["inventory_findings"] = list(inventory_findings)
-    if lease_lost:
-        result["error"] = "local agent lease is no longer current"
-        result["error_type"] = "LocalAgentLeaseLost"
-    elif inventory_error is not None:
-        result["error"] = f"server projection inventory is not reconcilable: {inventory_error}"
-        result["error_type"] = "TeamsProjectionInventoryError"
-    elif failed:
-        result["error"] = "one or more Teams windows failed to push"
-    if sync_result and sync_result.get("error"):
-        result["error"] = (
-            "one or more Teams windows failed to push; source processing failed to start"
-            if failed
-            else "source processing failed to start"
-        )
-        result["sync_error"] = sync_result
-    if result.get("error"):
-        result["retryable"] = not lease_lost
-
-    write_teams_audit_event(
-        audit_path,
-        {
-            "event": "teams_sync_run",
-            "run_id": run_id,
+            if reauth.get("error"):
+                raise RuntimeError(str(reauth.get("error") or "Teams authentication failed.")) from exc
+            result = asyncio.run(_collect_teams_on_device(job, payload, source_id, client, report_progress))
+    except ConversationUploadError as exc:
+        _raise_if_local_agent_lease_not_current(exc.response)
+        return {"operation": operation, "source_id": source_id, "error": str(exc), "retryable": True}
+    except Exception as exc:
+        return {
             "operation": operation,
             "source_id": source_id,
-            "status": (
-                "inventory_failed"
-                if inventory_error is not None
-                else "completed"
-                if not result.get("error")
-                else "completed_with_error"
-            ),
-            "selected_windows": selected_count,
-            "pushed_windows": len(pushed),
-            "failed_windows": len(failed),
-            "skipped_existing_windows": len(skipped_existing),
-            "inventory_findings": len(inventory_findings),
-            "polls": len(poll_audits),
-            "sync_started": result["sync_started"],
-            "sync_error": result.get("sync_error"),
-            "claim_add": 0,
-            "claim_update": 0,
-            "claim_supersede": 0,
-            "claim_noop": 0,
-            "claim_rejected_ambiguous": 0,
-        },
-    )
-    return result
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "retryable": True,
+        }
+    outcome: dict[str, Any] = {"operation": operation, "source_id": source_id, "counts": result.counts}
+    if result.plan is not None:
+        return {**outcome, "dry_run": True, "plan": result.plan}
+    return {**outcome, "sync_started": True, **source_processing_receipt(result.processing)}
 
 
-def _teams_collection_documents_and_polls(collection: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if isinstance(collection, dict):
-        documents = collection.get("documents")
-        poll_audits = collection.get("poll_audits")
-        return (
-            documents if isinstance(documents, list) else [],
-            poll_audits if isinstance(poll_audits, list) else [],
-        )
-    if isinstance(collection, list):
-        return collection, []
-    return [], []
-
-
-def _teams_hosted_content_refs(document: dict[str, Any]) -> list[dict[str, str | None]]:
-    """Return bounded exact inline-image identities from one selected window."""
-
-    raw_payload = document.get("raw_payload")
-    if not isinstance(raw_payload, dict):
-        return []
-    conversation_id = str(document.get("conversation_id") or "").strip()
-    conversation_type = str(raw_payload.get("conversation_type") or "").strip()
-    team_id = str(raw_payload.get("team_id") or "").strip() or None
-    raw_messages = raw_payload.get("messages")
-    if not conversation_id or not isinstance(raw_messages, list):
-        return []
-    refs: list[dict[str, str | None]] = []
-    seen: set[tuple[str, str]] = set()
-    for raw_message in raw_messages:
-        if not isinstance(raw_message, dict):
-            continue
-        message_id = str(raw_message.get("id") or "").strip()
-        hosted_ids = raw_message.get("hosted_content_ids")
-        if not message_id or not isinstance(hosted_ids, list):
-            continue
-        for value in hosted_ids:
-            hosted_id = str(value or "").strip()
-            identity = (message_id, hosted_id)
-            if not hosted_id or identity in seen:
-                continue
-            seen.add(identity)
-            refs.append(
-                {
-                    "conversation_id": conversation_id,
-                    "conversation_type": conversation_type,
-                    "team_id": team_id,
-                    "message_id": message_id,
-                    "root_message_id": str(raw_message.get("rootMessageId") or "").strip() or message_id,
-                    "hosted_content_id": hosted_id,
-                }
-            )
-    return refs
-
-
-def _teams_hosted_content_filename(hosted_content_id: str, media_type: str) -> str:
-    extension = {
-        "image/gif": ".gif",
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/webp": ".webp",
-    }.get(media_type, "")
-    return f"teams-hosted-{hosted_content_id}{extension}"
-
-
-async def _upload_teams_hosted_content_inputs(
-    documents: list[dict[str, Any]],
-    *,
-    source_id: str,
-    region: str,
-    client: ToolClient,
-    local_agent_job_id: str,
-    local_agent_attempt_count: int,
-) -> tuple[dict[str, list[str]], dict[str, dict[str, Any]]]:
-    """Materialize hosted images only for manifest-selected Teams windows."""
-
-    from memforge.genes.teams_gene import _TeamsAPIClient
-
-    refs_by_window = {
-        str(document.get("window_id") or ""): _teams_hosted_content_refs(document) for document in documents
-    }
-    if not any(refs_by_window.values()):
-        return {}, {}
-
-    teams_api = _TeamsAPIClient(region=region)
-    inputs_by_window: dict[str, list[str]] = {}
-    failures_by_window: dict[str, dict[str, Any]] = {}
-    try:
-        for document in documents:
-            window_id = str(document.get("window_id") or "")
-            input_hashes: list[str] = []
-            for ref in refs_by_window.get(window_id, []):
-                try:
-                    content, media_type = await teams_api.get_hosted_content(
-                        conversation_id=str(ref["conversation_id"] or ""),
-                        message_id=str(ref["message_id"] or ""),
-                        hosted_content_id=str(ref["hosted_content_id"] or ""),
-                        conversation_type=str(ref["conversation_type"] or ""),
-                        team_id=(str(ref["team_id"]) if ref["team_id"] is not None else None),
-                        root_message_id=str(ref["root_message_id"] or ""),
-                    )
-                except Exception as exc:
-                    failures_by_window[window_id] = {
-                        "error": "Teams hosted-content download failed",
-                        "detail": str(exc),
-                        "error_type": type(exc).__name__,
-                    }
-                    break
-                message_id = str(ref["message_id"] or "")
-                hosted_content_id = str(ref["hosted_content_id"] or "")
-                response = client.push_source_artifact(
-                    source_id=source_id,
-                    source_unit_key=window_id,
-                    provider_key=(f"{message_id}/hostedContents/{hosted_content_id}"),
-                    provider_revision=f"{message_id}:{hosted_content_id}",
-                    parent_observation_type="message",
-                    parent_provider_key=message_id,
-                    filename=_teams_hosted_content_filename(
-                        hosted_content_id,
-                        media_type,
-                    ),
-                    media_type=media_type,
-                    content=content,
-                    local_agent_job_id=local_agent_job_id,
-                    local_agent_attempt_count=local_agent_attempt_count,
-                )
-                _raise_if_local_agent_lease_not_current(response)
-                input_hash = str(response.get("input_sha256") or "").strip()
-                if response.get("error") or len(input_hash) != 64:
-                    failures_by_window[window_id] = {
-                        "error": response.get("error") or "Teams hosted-content upload failed",
-                        "detail": response.get("detail"),
-                        "status_code": response.get("status_code"),
-                    }
-                    break
-                input_hashes.append(input_hash)
-            if window_id not in failures_by_window and input_hashes:
-                inputs_by_window[window_id] = input_hashes
-    finally:
-        await teams_api.close()
-    return inputs_by_window, failures_by_window
-
-
-def _teams_projection_scope_attestations(
-    *,
-    source_id: str,
+async def _collect_teams_on_device(
     job: dict[str, Any],
-    poll_audits: list[dict[str, Any]],
-    configured_conversation_ids: set[str],
-    configured_source: dict[str, Any],
-    scope_transition: dict[str, Any] | None,
-) -> list[dict[str, Any]]:
-    """Build control-plane coverage evidence without creating content units."""
-
-    from memforge.local_agent.source_contract import (
-        canonical_teams_conversation_ids,
-        local_agent_sync_snapshot_id,
-    )
-    from memforge.source_projection_config import (
-        canonical_projection_scope,
-        projection_scope_fingerprint,
-    )
-
-    transition_id = str((scope_transition or {}).get("id") or "").strip() or None
-    target_scope = (scope_transition or {}).get("target_scope")
-    if not isinstance(target_scope, dict):
-        target_scope = canonical_projection_scope("teams", configured_source)
-    target_conversations = set(canonical_teams_conversation_ids(target_scope, require_nonempty=True))
-    if target_conversations != configured_conversation_ids:
-        raise ValueError("Teams target scope does not match the leased collection config")
-    collection_attempt_id = local_agent_sync_snapshot_id(
-        job.get("job_id"),
-        job.get("attempt_count"),
-    )
-    target_scope_fingerprint = projection_scope_fingerprint(target_scope)
-    retention_days = target_scope.get("rolling_retention_days")
-    retention_cutoff = None
-    if retention_days not in (None, ""):
-        collection_reference_time = _parse_teams_coverage_time(job.get("created_at"))
-        if collection_reference_time is None:
-            raise ValueError("Teams rolling retention requires a stable collection creation time")
-        retention_cutoff = (collection_reference_time - timedelta(days=int(retention_days))).isoformat()
-    audits = {
-        str(audit.get("raw_conversation_id") or "").strip(): audit
-        for audit in poll_audits
-        if str(audit.get("raw_conversation_id") or "").strip()
-    }
-    documents: list[dict[str, Any]] = []
-    for conversation_id in sorted(target_conversations):
-        audit = audits.get(conversation_id)
-        evidence = {
-            "target_subject_keys": sorted(target_conversations),
-            "poll": audit,
-        }
-        if retention_cutoff is not None:
-            evidence["rolling_retention_cutoff"] = retention_cutoff
-        documents.append(
-            {
-                "subject_type": "conversation",
-                "subject_key": conversation_id,
-                "transition_id": transition_id,
-                "collection_attempt_id": collection_attempt_id,
-                "target_scope_fingerprint": target_scope_fingerprint,
-                "evidence": evidence,
-            }
-        )
-    return documents
-
-
-def _teams_scope_attestations_have_poll_evidence(attestations: list[dict[str, Any]]) -> bool:
-    """Return whether every target subject produced evidence for adapter validation."""
-
-    if not attestations:
-        return False
-    expected_subjects = sorted(str(item.get("subject_key") or "") for item in attestations)
-    attempt_ids = {str(item.get("collection_attempt_id") or "") for item in attestations}
-    if not all(expected_subjects) or len(set(expected_subjects)) != len(expected_subjects) or len(attempt_ids) != 1:
-        return False
-    for attestation in attestations:
-        evidence = attestation.get("evidence")
-        poll = evidence.get("poll") if isinstance(evidence, dict) else None
-        if not isinstance(poll, dict) or evidence.get("target_subject_keys") != expected_subjects:
-            return False
-    return True
-
-
-def _iter_teams_inventory_tombstones(
-    *,
+    payload: dict[str, Any],
+    source_id: str,
     client: ToolClient,
-    source_id: str,
-    current_documents: list[dict[str, Any]],
-    poll_audits: list[dict[str, Any]],
-    configured_conversation_ids: set[str],
-    scope_transition: dict[str, Any] | None,
-    rolling_retention_cutoff: str | None = None,
-    findings: list[dict[str, str]] | None = None,
+    report_progress: Callable[[dict[str, Any]], None] | None,
 ):
-    """Page only relevant inventory slices and yield required tombstones."""
+    from memforge.genes.teams_client import TeamsChatClient
+    from memforge.genes.teams_provider import TeamsConversationProvider
+    from memforge.local_agent.conversation_executor import run_device_collection
 
-    findings = findings if findings is not None else []
-    plans = _teams_inventory_query_plans(
-        poll_audits=poll_audits,
-        configured_conversation_ids=configured_conversation_ids,
-        scope_transition=scope_transition,
-        rolling_retention_cutoff=rolling_retention_cutoff,
-    )
-    for plan in plans:
-        cursor = None
-        seen_cursors: set[str] = set()
-        while True:
-            try:
-                response = client.get_source_projection_inventory(
-                    source_id,
-                    unit_type="teams_window",
-                    conversation_id=plan["conversation_id"],
-                    observed_from_lte=plan.get("observed_from_lte"),
-                    observed_to_gte=plan.get("observed_to_gte"),
-                    observed_to_lt=plan.get("observed_to_lt"),
-                    cursor=cursor,
-                    limit=200,
-                )
-            except Exception as exc:
-                raise RuntimeError(str(exc)) from exc
-            if not isinstance(response, dict) or response.get("error"):
-                error = (
-                    str(response.get("error") or "").strip() if isinstance(response, dict) else ""
-                ) or "server projection inventory response is invalid"
-                raise RuntimeError(error)
-            units = _validated_teams_projection_inventory_units(
-                response.get("units"),
-                source_id=source_id,
-                findings=findings,
-            )
-            reconciled = _reconcile_teams_documents_with_server_inventory(
-                documents=current_documents,
-                poll_audits=poll_audits,
-                inventory_units=units,
-                configured_conversation_ids=configured_conversation_ids,
-                destructive_enabled=True,
-                rolling_retention_cutoff=rolling_retention_cutoff,
-            )
-            yield from reconciled[len(current_documents) :]
-            next_cursor = str(response.get("next_cursor") or "").strip()
-            if not next_cursor:
-                break
-            if next_cursor in seen_cursors or next_cursor == cursor or not units:
-                raise RuntimeError("server projection inventory cursor did not advance")
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
-
-
-def _teams_inventory_query_plans(
-    *,
-    poll_audits: list[dict[str, Any]],
-    configured_conversation_ids: set[str],
-    scope_transition: dict[str, Any] | None,
-    rolling_retention_cutoff: str | None = None,
-) -> list[dict[str, str]]:
-    audits = {
-        str(audit.get("raw_conversation_id") or "").strip(): audit
-        for audit in poll_audits
-        if str(audit.get("raw_conversation_id") or "").strip()
-    }
-    previous_scope = (
-        scope_transition.get("previous_scope")
-        if isinstance(scope_transition, dict) and isinstance(scope_transition.get("previous_scope"), dict)
-        else {}
-    )
-    target_scope = (
-        scope_transition.get("target_scope")
-        if isinstance(scope_transition, dict) and isinstance(scope_transition.get("target_scope"), dict)
-        else {}
-    )
-    plans: list[dict[str, str]] = []
-    for conversation_id in sorted(configured_conversation_ids):
-        audit = audits.get(conversation_id)
-        if _teams_poll_proves_complete_absence(audit):
-            plans.append({"conversation_id": conversation_id})
-            continue
-        if not audit or str(audit.get("stop_reason") or "") != "cutoff_reached":
-            continue
-        covered_from = _parse_teams_coverage_time(audit.get("absence_covered_from"))
-        covered_to = _parse_teams_coverage_time(audit.get("absence_covered_to"))
-        if not covered_from or not covered_to or covered_from > covered_to:
-            continue
-        plans.append(
-            {
-                "conversation_id": conversation_id,
-                "observed_from_lte": covered_to.isoformat(),
-                "observed_to_gte": covered_from.isoformat(),
-            }
+    def report(phase: str, completed: int, total: int) -> None:
+        unit = "conversation" if phase == "fetching" else "message"
+        _report_local_agent_progress(
+            report_progress,
+            _sync_progress_snapshot(phase=phase, completed=completed, total=total, unit=unit),
         )
-        if rolling_retention_cutoff:
-            plans.append(
-                {
-                    "conversation_id": conversation_id,
-                    "observed_to_lt": rolling_retention_cutoff,
-                }
-            )
 
-    removed_conversations = _teams_scope_selector_values(previous_scope) - (_teams_scope_selector_values(target_scope))
-    for conversation_id in sorted(removed_conversations):
-        plans.append({"conversation_id": conversation_id})
-    return plans
-
-
-def _teams_scope_selector_values(scope: object) -> set[str]:
-    from memforge.local_agent.source_contract import canonical_teams_conversation_ids
-
-    if not isinstance(scope, dict):
-        return set()
-    return set(canonical_teams_conversation_ids(scope))
-
-
-def _validated_teams_projection_inventory_units(
-    value: object,
-    *,
-    source_id: str,
-    findings: list[dict[str, str]],
-) -> list[dict[str, Any]]:
-    """Validate the server-owned inventory before any destructive decision."""
-
-    from memforge.local_agent.teams_ledger import decode_teams_window_id
-
-    if not isinstance(value, list):
-        raise ValueError("units must be a list")
-    units: list[dict[str, Any]] = []
-    for unit in value:
-        if not isinstance(unit, dict):
-            raise ValueError("unit must be an object")
-        locator = unit.get("locator")
-        provider_key = str(unit.get("provider_key") or "").strip()
-        source_unit_id = str(unit.get("source_unit_id") or "").strip()
-        if (
-            str(unit.get("unit_type") or "").strip() != "teams_window"
-            or not source_unit_id
-            or not provider_key
-            or not isinstance(locator, dict)
-            or not str(locator.get("conversation_id") or "").strip()
-        ):
-            raise ValueError("unit is missing canonical Teams window identity")
-        conversation_id = str(locator.get("conversation_id") or "").strip()
-        window_id = str(locator.get("window_id") or "").strip()
-        document_id = str(locator.get("document_id") or "").strip()
-        opaque_legacy_identity = bool(
-            document_id and provider_key == document_id and (not window_id or window_id == document_id)
-        )
-        if not window_id or not window_id.startswith(("teams-block:v1:", "teams-thread:v1:")):
-            if opaque_legacy_identity:
-                _record_teams_inventory_finding(findings, source_unit_id)
-                continue
-            raise ValueError("unit is missing canonical Teams window identity")
-        try:
-            decoded = decode_teams_window_id(window_id)
-        except ValueError as exc:
-            if opaque_legacy_identity:
-                _record_teams_inventory_finding(findings, source_unit_id)
-                continue
-            raise ValueError("unit is missing canonical Teams window identity") from exc
-        if (
-            decoded["source_id"] != source_id
-            or decoded["conversation_id"] != conversation_id
-            or provider_key not in {window_id, document_id}
-        ):
-            raise ValueError("unit is missing canonical Teams window identity")
-        units.append(unit)
-    return units
-
-
-def _record_teams_inventory_finding(
-    findings: list[dict[str, str]],
-    source_unit_id: str,
-) -> None:
-    if any(finding.get("source_unit_id") == source_unit_id for finding in findings):
-        return
-    findings.append(
-        {
-            "source_unit_id": source_unit_id,
-            "reason": "canonical_teams_window_identity_unavailable",
-        }
-    )
-
-
-def _reconcile_teams_documents_with_server_inventory(
-    *,
-    documents: list[dict[str, Any]],
-    poll_audits: list[dict[str, Any]],
-    inventory_units: list[dict[str, Any]],
-    configured_conversation_ids: set[str],
-    destructive_enabled: bool,
-    rolling_retention_cutoff: str | None = None,
-) -> list[dict[str, Any]]:
-    """Return current documents plus server-inventory-backed window tombstones."""
-
-    if not destructive_enabled:
-        return documents
-    current_window_ids = {
-        str(document.get("window_id") or "").strip()
-        for document in documents
-        if str(document.get("window_id") or "").strip()
-    }
-    audits = {
-        str(audit.get("raw_conversation_id") or "").strip(): audit
-        for audit in poll_audits
-        if str(audit.get("raw_conversation_id") or "").strip()
-    }
-    result = list(documents)
-    for unit in inventory_units:
-        locator = unit.get("locator")
-        if not isinstance(locator, dict):
-            continue
-        window_id = str(locator.get("window_id") or unit.get("provider_key") or "").strip()
-        conversation_id = str(locator.get("conversation_id") or "").strip()
-        if not window_id or not conversation_id or window_id in current_window_ids:
-            continue
-        reason = None
-        if conversation_id not in configured_conversation_ids:
-            reason = "conversation_removed_from_projection_scope"
-        else:
-            audit = audits.get(conversation_id)
-            if _teams_poll_proves_complete_absence(audit):
-                reason = "not_returned_by_complete_conversation_poll"
-            elif _teams_poll_proves_bounded_unit_absence(audit, locator):
-                reason = "not_returned_by_bounded_conversation_poll"
-            elif _teams_poll_proves_unit_outside_rolling_retention(
-                audit,
-                locator,
-                rolling_retention_cutoff,
-            ):
-                reason = "outside_rolling_retention"
-        if reason is not None:
-            result.append(
-                _teams_window_tombstone_document(
-                    conversation_id=conversation_id,
-                    window_id=window_id,
-                    locator=locator,
-                    reason=reason,
-                    rolling_retention_cutoff=rolling_retention_cutoff,
-                )
-            )
-    return result
-
-
-def _teams_poll_proves_complete_absence(audit: dict[str, Any] | None) -> bool:
-    return bool(
-        audit
-        and audit.get("pagination_complete") is True
-        and str(audit.get("access_probe_status") or "").strip().lower() == "ok"
-        and str(audit.get("stop_reason") or "").strip() == "no_backward_link"
-    )
-
-
-def _teams_poll_proves_bounded_unit_absence(
-    audit: dict[str, Any] | None,
-    locator: dict[str, Any],
-) -> bool:
-    if (
-        not audit
-        or str(audit.get("access_probe_status") or "").strip().lower() != "ok"
-        or str(audit.get("stop_reason") or "").strip() != "cutoff_reached"
-    ):
-        return False
-    coverage_from = _parse_teams_coverage_time(audit.get("absence_covered_from"))
-    coverage_to = _parse_teams_coverage_time(audit.get("absence_covered_to"))
-    observed_from = _parse_teams_coverage_time(locator.get("observed_from"))
-    observed_to = _parse_teams_coverage_time(locator.get("observed_to"))
-    return bool(
-        coverage_from
-        and coverage_to
-        and observed_from
-        and observed_to
-        and coverage_from <= observed_from <= observed_to <= coverage_to
-    )
-
-
-def _teams_poll_proves_unit_outside_rolling_retention(
-    audit: dict[str, Any] | None,
-    locator: dict[str, Any],
-    rolling_retention_cutoff: str | None,
-) -> bool:
-    if (
-        not audit
-        or str(audit.get("access_probe_status") or "").strip().lower() != "ok"
-        or str(audit.get("stop_reason") or "").strip() != "cutoff_reached"
-    ):
-        return False
-    attested_from = _parse_teams_coverage_time(audit.get("absence_covered_from"))
-    attested_to = _parse_teams_coverage_time(audit.get("absence_covered_to"))
-    coverage_from = _parse_teams_coverage_time(rolling_retention_cutoff)
-    observed_to = _parse_teams_coverage_time(locator.get("observed_to"))
-    return bool(
-        attested_from
-        and attested_to
-        and attested_from <= attested_to
-        and coverage_from
-        and observed_to
-        and observed_to < coverage_from
-    )
-
-
-def _parse_teams_coverage_time(value: object) -> datetime | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
+    teams = TeamsChatClient(region=_teams_region_from_payload(payload))
     try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return None
-    return parsed.astimezone(timezone.utc)
-
-
-def _teams_window_tombstone_document(
-    *,
-    conversation_id: str,
-    window_id: str,
-    locator: dict[str, Any],
-    reason: str,
-    rolling_retention_cutoff: str | None = None,
-) -> dict[str, Any]:
-    if reason not in TEAMS_TOMBSTONE_REASONS:
-        raise ValueError(f"unsupported Teams tombstone reason: {reason}")
-    from memforge.local_agent.teams_ledger import decode_teams_window_id
-
-    decoded = decode_teams_window_id(window_id)
-    raw_payload = {
-        "conversation_id": conversation_id,
-        "window_id": window_id,
-        "messages": [],
-        "_authoritative_snapshot": True,
-        "_tombstone": True,
-        "tombstone_reason": reason,
-        "prior_observed_from": locator.get("observed_from"),
-        "prior_observed_to": locator.get("observed_to"),
-    }
-    if reason == "outside_rolling_retention":
-        raw_payload["rolling_retention_cutoff"] = rolling_retention_cutoff
-    canonical_payload = json.dumps(
-        raw_payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    revision_hash = hashlib.sha256(canonical_payload).hexdigest()
-    observed_from = str(locator.get("observed_from") or "")
-    observed_to = str(locator.get("observed_to") or "")
-    return {
-        "conversation_id": conversation_id,
-        "root_message_id": decoded["root_or_anchor_message_id"],
-        "window_id": window_id,
-        "window_type": decoded["window_type"],
-        "revision_hash": revision_hash,
-        "title": "Removed Teams window",
-        "source_url": str(locator.get("url") or ""),
-        "last_modified": observed_to or observed_from,
-        "date_from": observed_from or None,
-        "date_to": observed_to or None,
-        "raw_payload": raw_payload,
-        "raw_hash": revision_hash,
-        "message_count": 0,
-        "tombstone": True,
-    }
+        await teams.validate()
+        return await run_device_collection(
+            TeamsConversationProvider(teams),
+            client,
+            source_id=source_id,
+            local_agent_job_id=str(job["job_id"]),
+            local_agent_attempt_count=int(job["attempt_count"]),
+            config_revision=str(payload.get("source_config_revision") or ""),
+            dry_run=bool(payload.get("dry_run")),
+            force_full_sync=bool(payload.get("force_full_sync", False)),
+            report=report,
+        )
+    finally:
+        await teams.close()
 
 
 def _github_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -5159,117 +4177,6 @@ def _jira_cloud_config_from_job_payload(payload: dict[str, Any]) -> dict[str, An
     return config
 
 
-async def _collect_teams_documents_from_cloud_job(
-    job: dict[str, Any],
-    *,
-    source_id: str,
-    limit: int,
-    report_progress: Callable[[dict[str, Any]], None] | None = None,
-) -> dict[str, list[dict[str, Any]]]:
-    from memforge.genes.teams_gene import TeamsGene
-
-    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    config = _teams_direct_rest_config_from_cloud_payload(payload)
-    config.pop("local_agent_documents_dir", None)
-    config.pop("local_agent_package_manifest", None)
-    config.pop("audit_log_path", None)
-    config.setdefault("ledger_state_path", str(DEFAULT_TEAMS_LEDGER_STATE_PATH))
-    gene = TeamsGene(config, source_id)
-    await gene.authenticate()
-    _report_local_agent_progress(
-        report_progress,
-        _sync_progress_snapshot(phase="discovering", completed=0, unit="message"),
-    )
-    documents: list[dict[str, Any]] = []
-    poll_inputs: list[dict[str, Any]] = []
-    try:
-        async for item in gene.discover(None):
-            if limit and len(documents) >= limit:
-                break
-            raw = await gene.fetch(item)
-            raw_payload = json.loads(raw.body.decode("utf-8"))
-            if not isinstance(raw_payload, dict):
-                raise ValueError("Teams window payload must be an object")
-            conversation_id = str(item.extra.get("conversation_id") or "")
-            root_message_id = str(item.extra.get("root_message_id") or item.item_id)
-            window_type = "thread" if item.extra.get("is_thread") else "time_block"
-            window_id = str(
-                item.extra.get("window_id")
-                or _teams_window_id(
-                    source_id=source_id,
-                    conversation_id=conversation_id,
-                    root_message_id=root_message_id,
-                    window_type=window_type,
-                )
-            )
-            raw_payload["conversation_id"] = conversation_id
-            raw_payload["window_id"] = window_id
-            raw_hash = hashlib.sha256(
-                json.dumps(
-                    raw_payload,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
-            revision_hash = str(item.version or hashlib.sha256(f"{window_id}\n{raw_hash}".encode("utf-8")).hexdigest())
-            messages = raw_payload.get("messages") if isinstance(raw_payload, dict) else []
-            message_count = item.extra.get("message_count") or (len(messages) if isinstance(messages, list) else None)
-            message_times = (
-                [
-                    str(message.get("time") or "")
-                    for message in messages
-                    if isinstance(message, dict) and message.get("time")
-                ]
-                if isinstance(messages, list)
-                else []
-            )
-            documents.append(
-                {
-                    "conversation_id": conversation_id,
-                    "root_message_id": root_message_id,
-                    "window_id": window_id,
-                    "window_type": window_type,
-                    "revision_hash": revision_hash,
-                    "title": item.title,
-                    "source_url": item.source_url,
-                    "last_modified": item.last_modified.isoformat(),
-                    "date_from": min(message_times) if message_times else item.last_modified.isoformat(),
-                    "date_to": max(message_times) if message_times else item.last_modified.isoformat(),
-                    "raw_payload": raw_payload,
-                    "raw_hash": raw_hash,
-                    "message_count": message_count,
-                }
-            )
-            message_count_value = sum(_int_or_zero(doc.get("message_count")) for doc in documents)
-            _report_local_agent_progress(
-                report_progress,
-                _sync_progress_snapshot(
-                    phase="discovering",
-                    completed=message_count_value,
-                    unit="message",
-                ),
-            )
-            poll_inputs.append(
-                {
-                    "conversation_id": conversation_id,
-                    "message_count": message_count,
-                    "last_modified": item.last_modified.isoformat(),
-                    "window_type": window_type,
-                }
-            )
-    finally:
-        api_client = getattr(gene, "_client", None)
-        if api_client is not None:
-            await api_client.close()
-    poll_audits = gene.get_poll_audits() if hasattr(gene, "get_poll_audits") else []
-    if not poll_audits:
-        poll_audits = _teams_poll_audits_from_documents(poll_inputs)
-    _attest_teams_documents_from_poll_audits(documents, poll_audits)
-
-    return {"documents": documents, "poll_audits": poll_audits}
-
-
 def _report_local_agent_progress(
     reporter: Callable[[dict[str, Any]], None] | None,
     progress: dict[str, Any],
@@ -5312,179 +4219,11 @@ def _sync_progress_snapshot(
     return normalize_sync_progress_snapshot(snapshot)
 
 
-def _teams_progress_summary(
-    documents: list[dict[str, Any]],
-    poll_audits: list[dict[str, Any]],
-) -> dict[str, Any]:
-    date_from_values = [
-        str(value)
-        for value in (
-            [poll.get("covered_created_from") for poll in poll_audits]
-            + [doc.get("date_from") or doc.get("last_modified") for doc in documents]
-        )
-        if value
-    ]
-    date_to_values = [
-        str(value)
-        for value in (
-            [poll.get("covered_created_to") for poll in poll_audits]
-            + [doc.get("date_to") or doc.get("last_modified") for doc in documents]
-        )
-        if value
-    ]
-    messages = sum(
-        _int_or_zero(
-            poll.get("selected_message_keys_seen")
-            or poll.get("unique_message_keys_seen")
-            or poll.get("raw_messages_seen")
-        )
-        for poll in poll_audits
-    )
-    if messages == 0:
-        messages = sum(_int_or_zero(doc.get("message_count")) for doc in documents)
-    return {
-        "date_from": min(date_from_values) if date_from_values else None,
-        "date_to": max(date_to_values) if date_to_values else None,
-        "messages": messages,
-        "conversations": len(poll_audits)
-        or len({str(doc.get("conversation_id")) for doc in documents if doc.get("conversation_id")}),
-    }
-
-
-def _teams_direct_rest_config_from_cloud_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    from memforge.local_agent.source_contract import (
-        TEAMS_CONVERSATION_SELECTOR_FIELDS,
-        canonical_teams_conversation_ids,
-    )
-
-    config = dict(payload)
-    direct_ids = canonical_teams_conversation_ids(config, require_nonempty=True)
-    for field in TEAMS_CONVERSATION_SELECTOR_FIELDS:
-        config.pop(field, None)
-    config["conversation_ids"] = list(direct_ids)
-    return config
-
-
-def _teams_poll_audits_from_documents(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_conversation: dict[str, list[dict[str, Any]]] = {}
-    for item in items:
-        conversation_id = str(item.get("conversation_id") or "")
-        if not conversation_id:
-            continue
-        by_conversation.setdefault(conversation_id, []).append(item)
-
-    audits: list[dict[str, Any]] = []
-    for conversation_id, conversation_items in sorted(by_conversation.items()):
-        raw_messages = sum(_int_or_zero(item.get("message_count")) for item in conversation_items)
-        timestamps = [str(item.get("last_modified") or "") for item in conversation_items if item.get("last_modified")]
-        covered_from = min(timestamps) if timestamps else None
-        covered_to = max(timestamps) if timestamps else None
-        audits.append(
-            {
-                "raw_conversation_id": conversation_id,
-                "pagination_complete": False,
-                "access_probe_status": "ok",
-                "stop_reason": "missing_provider_poll_audit",
-                "covered_created_from": covered_from,
-                "covered_created_to": covered_to,
-                "raw_messages_seen": raw_messages,
-                "unique_message_keys_seen": raw_messages,
-                "duplicate_raw_messages": 0,
-                "upsert_new": raw_messages,
-                "upsert_updated": 0,
-                "upsert_unchanged": 0,
-                "explicit_delete_markers": 0,
-                "missing_once_candidates": 0,
-                "field_contract_version": "teams_chatsvc_rest_v1",
-            }
-        )
-    return audits
-
-
-def _teams_complete_poll_conversation_ids(
-    poll_audits: list[dict[str, Any]],
-) -> set[str]:
-    """Return conversations whose successful poll proves window completeness."""
-
-    return {
-        str(audit.get("raw_conversation_id") or "")
-        for audit in poll_audits
-        if str(audit.get("raw_conversation_id") or "")
-        and audit.get("pagination_complete") is True
-        and str(audit.get("access_probe_status") or "").strip().lower() == "ok"
-        and str(audit.get("stop_reason") or "").strip() == "no_backward_link"
-    }
-
-
-def _attest_teams_documents_from_poll_audits(
-    documents: list[dict[str, Any]],
-    poll_audits: list[dict[str, Any]],
-) -> None:
-    """Attach only provider-proven unit/time coverage to returned windows."""
-
-    audits = {
-        str(audit.get("raw_conversation_id") or ""): audit
-        for audit in poll_audits
-        if str(audit.get("raw_conversation_id") or "")
-    }
-    complete_conversation_ids = _teams_complete_poll_conversation_ids(poll_audits)
-    for document in documents:
-        conversation_id = str(document.get("conversation_id") or "")
-        raw_payload = document.get("raw_payload")
-        if not isinstance(raw_payload, dict):
-            continue
-        changed = False
-        if conversation_id in complete_conversation_ids:
-            # This proves only the returned stable window's current membership;
-            # source-wide absence still requires inventory reconciliation.
-            raw_payload["_authoritative_snapshot"] = True
-            changed = True
-        else:
-            audit = audits.get(conversation_id)
-            if (
-                audit
-                and str(audit.get("access_probe_status") or "").strip().lower() == "ok"
-                and str(audit.get("stop_reason") or "").strip() == "cutoff_reached"
-            ):
-                covered_from = _parse_teams_coverage_time(audit.get("absence_covered_from"))
-                covered_to = _parse_teams_coverage_time(audit.get("absence_covered_to"))
-                if covered_from and covered_to and covered_from <= covered_to:
-                    raw_payload["_scope_coverage_from"] = covered_from.isoformat()
-                    raw_payload["_scope_coverage_to"] = covered_to.isoformat()
-                    changed = True
-        if changed:
-            document["raw_hash"] = hashlib.sha256(
-                json.dumps(
-                    raw_payload,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
-
-
 def _int_or_zero(value: Any) -> int:
     try:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
-
-
-def _teams_window_id(
-    *,
-    source_id: str,
-    conversation_id: str,
-    root_message_id: str,
-    window_type: str,
-) -> str:
-    from memforge.local_agent.teams_ledger import build_teams_window_id
-
-    return build_teams_window_id(
-        source_id=source_id,
-        conversation_id=conversation_id,
-        root_or_anchor_message_id=root_message_id,
-        window_type=window_type,
-    )
 
 
 def _cloud_job_limit(value: Any, *, default: int) -> int:

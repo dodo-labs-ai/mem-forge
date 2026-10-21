@@ -37,13 +37,14 @@ from memforge.local_agent.source_contract import (
     source_with_sync_inputs,
 )
 from memforge.source_projection_config import projection_access_fingerprint, source_access_context
-from memforge.source_projection import ProjectionScopeAttestation
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.health import MemoryIndexHealthChecker, MemoryIndexHealthReport
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.store import MemoryStore
 from memforge.models import SourceSyncRun, SyncState
+from memforge.genes.conversation_gene import CollectionAttempt, ConversationGene
+from memforge.conversations.collections import StoredCollections
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.sync_memory import SyncMemoryObserver
 from memforge.pipeline.sync import (
@@ -287,10 +288,10 @@ class RuntimeProvider(Protocol):
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
-        projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         record_terminal_result: bool = True,
         source_activity: SourceActivityLease | None = None,
         failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
+        collection_attempt: CollectionAttempt | None = None,
     ) -> SyncState: ...
 
 
@@ -433,10 +434,10 @@ class DefaultRuntimeProvider:
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
-        projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         record_terminal_result: bool = True,
         source_activity: SourceActivityLease | None = None,
         failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
+        collection_attempt: CollectionAttempt | None = None,
     ) -> SyncState:
         return await run_source_sync(
             db=db,
@@ -451,10 +452,10 @@ class DefaultRuntimeProvider:
             lifecycle_cycle_id=lifecycle_cycle_id,
             scope_transition_run_id=scope_transition_run_id,
             reusable_projection_doc_ids=reusable_projection_doc_ids,
-            projection_scope_attestations=projection_scope_attestations,
             record_terminal_result=record_terminal_result,
             source_activity=source_activity,
             failed_item_retry=failed_item_retry,
+            collection_attempt=collection_attempt,
         )
 
 
@@ -945,11 +946,16 @@ async def run_source_sync(
     lifecycle_cycle_id: str | None = None,
     scope_transition_run_id: str | None = None,
     reusable_projection_doc_ids: frozenset[str] = frozenset(),
-    projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
     record_terminal_result: bool = True,
     source_activity: SourceActivityLease | None = None,
     failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
+    collection_attempt: CollectionAttempt | None = None,
 ) -> SyncState:
+    """Run one Source sync under a Source activity lease.
+
+    ``collection_attempt`` names the collection attempt a conversation Source
+    syncs within; a document Source ignores it.
+    """
     activity_id = source_activity.id if source_activity is not None else None
     owns_activity = False
     heartbeat_task: asyncio.Task[None] | None = None
@@ -992,6 +998,14 @@ async def run_source_sync(
             config=source_config,
             source_id=source["id"],
         )
+        if isinstance(gene, ConversationGene):
+            if collection_attempt is None:
+                raise ValueError("a conversation Source syncs only within a collection attempt")
+            gene.bind_conversation_run(
+                projection_store=db,
+                collections=StoredCollections(db, workspace_id=collection_attempt.workspace_id),
+                collection_attempt_id=collection_attempt.collection_attempt_id,
+            )
         sync_kwargs: dict[str, Any] = {
             "gene": gene,
             "source_name": source["name"],
@@ -1005,7 +1019,6 @@ async def run_source_sync(
             "lifecycle_cycle_id": lifecycle_cycle_id,
             "scope_transition_run_id": scope_transition_run_id,
             "reusable_projection_doc_ids": reusable_projection_doc_ids,
-            "projection_scope_attestations": projection_scope_attestations,
             "record_terminal_result": record_terminal_result,
             "failed_item_retry": failed_item_retry,
         }
@@ -1444,7 +1457,6 @@ class SourceSyncWorker:
 
             # An operator reprocess reads the provider or stored Documents, not collected input.
             reprocessing = bool(run.reprocess_document_ids)
-            projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = ()
             authoritative_collection = False
             reusable_projection_doc_ids: frozenset[str] = frozenset()
             if not reprocessing:
@@ -1453,14 +1465,6 @@ class SourceSyncWorker:
                     workspace_id=run.workspace_id,
                     input_snapshot_id=run.input_snapshot_id,
                 )
-                if run.input_snapshot_id is not None:
-                    manifest_status = await self.db.get_source_sync_snapshot_manifest_status(
-                        source_id=run.source_id,
-                        workspace_id=run.workspace_id,
-                        snapshot_id=run.input_snapshot_id,
-                    )
-                    if manifest_status is not None:
-                        projection_scope_attestations = tuple(manifest_status.get("scope_attestations") or ())
                 local_operation = local_agent_sync_operation(source["type"], source.get("config"))
                 if run.input_snapshot_id is None:
                     if local_operation is not None and run.input_generation_watermark is None:
@@ -1508,10 +1512,15 @@ class SourceSyncWorker:
                 lifecycle_cycle_id=(f"{run.run_id}:attempt:{run.lease_attempt_count}"),
                 scope_transition_run_id=run.run_id,
                 reusable_projection_doc_ids=reusable_projection_doc_ids,
-                projection_scope_attestations=projection_scope_attestations,
                 record_terminal_result=False,
                 source_activity=run.source_activity,
                 failed_item_retry=failed_item_retry_for_run(run),
+                collection_attempt=CollectionAttempt(
+                    workspace_id=run.workspace_id,
+                    # A device collected into the run's input snapshot; a
+                    # reprocess collects nothing and plans no attempt.
+                    collection_attempt_id=run.input_snapshot_id or f"{run.run_id}:attempt:{run.lease_attempt_count}",
+                ),
             )
             if final_state is None:
                 final_state = SyncState(
@@ -1548,6 +1557,8 @@ class SourceSyncWorker:
                 if not failed:
                     raise SourceSyncLeaseLost(f"source sync lease lost before failure update for run {run.run_id}")
                 _publish_terminal_runtime_bundles(runtime, final_state)
+                if next_attempt_at is None:
+                    await self._release_collection(run, source)
                 return run
             completed = await self.db.complete_source_sync_run(
                 run.run_id,
@@ -1558,6 +1569,7 @@ class SourceSyncWorker:
             if not completed:
                 raise SourceSyncLeaseLost(f"source sync lease lost before completion for run {run.run_id}")
             _publish_terminal_runtime_bundles(runtime, final_state)
+            await self._release_collection(run, source)
             return run
         except asyncio.CancelledError:
             raise
@@ -1595,6 +1607,25 @@ class SourceSyncWorker:
             if not failed:
                 logger.warning("Source sync worker stopped failure update after losing lease for run %s", run.run_id)
             return run
+
+    async def _release_collection(self, run: SourceSyncRun, source: Mapping[str, Any]) -> None:
+        """Drop the collected bodies a conversation run has finished with, and every older collection.
+
+        A run that will be retried keeps them: its retry plans the same
+        collection attempt again. The run has ended by now, so a failure here
+        leaves its outcome alone; the next run that ends prunes everything
+        older than itself.
+        """
+
+        gene_class = GENE_REGISTRY.get(str(source.get("type") or ""))
+        if run.input_snapshot_id is None or gene_class is None or not issubclass(gene_class, ConversationGene):
+            return
+        try:
+            await StoredCollections(self.db, workspace_id=run.workspace_id).prune(
+                run.source_id, run.input_snapshot_id
+            )
+        except Exception:
+            logger.exception("Could not drop the collected bodies of run %s", run.run_id)
 
     async def run_forever(self, *, poll_seconds: float | None = None) -> None:
         interval = max(0.1, poll_seconds if poll_seconds is not None else self.config.sync.worker_poll_seconds)

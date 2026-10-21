@@ -19,7 +19,9 @@ from memforge.config import AppConfig
 from memforge.genes.github_pages_gene import _content_item_from_url
 from memforge.genes.github_repo_gene import LAST_COMMIT_AT_KEY, GitHubRepoGene
 from memforge.genes.jira_gene import JiraGene
-from memforge.genes.teams_gene import TeamsGene, _TeamsAPIClient
+from memforge.genes.teams_client import TeamsChatClient
+from memforge.genes.teams_gene import TeamsGene
+from tests.conversation_fixture import teams_unit_payload
 from memforge.local_adapter import submit_local_markdown_document
 from memforge.local_agent.teams_contract import MILLISECONDS_PER_SECOND
 from memforge.memory.cross_document_relation import load_relation_subjects
@@ -457,14 +459,14 @@ async def test_jira_issue_time_is_its_updated_field() -> None:
 async def test_teams_window_time_is_its_latest_message_time() -> None:
     gene = TeamsGene(config={"conversation_ids": ["19:conversation@thread.v2"]}, source_id="src-teams")
     item = _item("teams-window-1")
-    payload = {
-        "messages": [
+    payload = teams_unit_payload(
+        [
             {"id": "m1", "content": "First", "time": "2026-07-30T10:00:00Z"},
             {"id": "m2", "content": "Edited", "time": "2026-07-30T10:01:00Z",
              "edited_time": "2026-07-30T11:30:00+00:00"},
             {"id": "m3", "content": "Last", "time": "2026-07-30T10:05:00Z"},
         ]
-    }
+    )
 
     normalized = await gene.normalize(
         RawContent(item=item, body=json.dumps(payload).encode(), content_type="application/json")
@@ -503,7 +505,7 @@ def test_an_unreadable_provider_time_is_unknown_and_the_projection_continues() -
 
 
 def test_teams_edit_time_is_the_chat_service_edittime() -> None:
-    client = _TeamsAPIClient(region="emea")
+    client = TeamsChatClient(region="emea")
     message = {
         "id": "message-1",
         "conversationid": "19:chat@example",
@@ -524,9 +526,8 @@ def test_teams_edit_time_is_the_chat_service_edittime() -> None:
 
 
 def test_an_edited_teams_message_takes_its_edit_time() -> None:
-    payload = {
-        "conversation_id": "19:chat@example",
-        "messages": [
+    payload = teams_unit_payload(
+        [
             {"id": "m1", "content": "Payroll runs on Thursdays.", "time": "2026-04-15T12:00:00+00:00"},
             {
                 "id": "m2",
@@ -535,7 +536,8 @@ def test_an_edited_teams_message_takes_its_edit_time() -> None:
                 "edited_time": "2026-04-16T08:30:00+00:00",
             },
         ],
-    }
+        conversation_id="19:chat@example",
+    )
 
     projection = _project(
         "teams",

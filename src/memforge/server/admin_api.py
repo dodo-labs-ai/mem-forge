@@ -54,6 +54,13 @@ from memforge.evals.agent_evaluation import (
     OnlineEvaluationCoveragePolicy,
     SourceEvaluationStatus,
 )
+from memforge.conversations.collections import ArtifactLink, CollectedBody, StoredCollections
+from memforge.conversations.intake import CollectionIntake, CollectionRejected
+from memforge.conversations.manifest import ManifestFormatError, request_to_payload
+from memforge.conversations.reader import SourceProjectionUnitReader
+from memforge.conversations.records import MessageIdentity, canonical_record_json
+from memforge.conversations.report import plan_report
+from memforge.source_artifact_inputs import retain_artifact_input
 from memforge.genes import (
     GENE_REGISTRY,
     create_gene,
@@ -61,6 +68,7 @@ from memforge.genes import (
     source_rediscovers_documents,
     source_type_supports_sync,
 )
+from memforge.genes.conversation_gene import ConversationGene
 from memforge.genes.atlassian_auth import (
     release_atlassian_request_limiter,
     require_https_base_url,
@@ -217,7 +225,6 @@ from memforge.source_secrets import (
 )
 from memforge.source_projection import (
     ProjectionScopeTransition,
-    SourceUnitInventoryFilter,
 )
 from memforge.source_projection_config import projection_scope_transition_id, source_access_context
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
@@ -262,6 +269,7 @@ from memforge.local_agent.source_contract import (
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
     local_agent_sync_operation,
+    local_agent_sync_snapshot_id,
     local_package_requires_source_time,
     validate_local_agent_replay_package,
 )
@@ -2094,6 +2102,13 @@ class SourceSyncRetryTarget(BaseModel):
 
 class SourceSyncRequest(BaseModel):
     force_full_sync: bool = False
+    dry_run: bool = Field(
+        default=False,
+        description=(
+            "For a conversation Source with stored Units, to verify a migration: collect, then report what the "
+            "attempt would change without processing it."
+        ),
+    )
     sync_snapshot_id: str | None = None
     local_agent_job_id: str | None = None
     local_agent_attempt_count: int | None = Field(default=None, ge=1)
@@ -2327,8 +2342,8 @@ class LocalSourcePackageRequest(BaseModel):
     """One raw local-source package pushed by the local daemon/adapter.
 
     File-like sources use ``markdown_body`` as raw file text for the declared
-    ``content_type``. Structured sources such as Jira and Teams use
-    ``raw_payload`` and defer canonical markdown rendering to the source gene.
+    ``content_type``. Structured sources such as Jira use ``raw_payload`` and
+    defer canonical markdown rendering to the source gene.
     ``source_updated_at`` is a file-like source's own time for this content
     (an offset-aware ISO time); structured sources carry their times in
     ``raw_payload``.
@@ -2346,11 +2361,6 @@ class LocalSourcePackageRequest(BaseModel):
     symlink_chain: list[dict[str, str]] = Field(default_factory=list)
     resolved_relative_path: str | None = None
     issue_key: str | None = None
-    conversation_id: str | None = None
-    root_message_id: str | None = None
-    window_id: str | None = None
-    window_type: str | None = None
-    revision_hash: str | None = None
     source_url: str | None = None
     title: str | None = None
     raw_hash: str | None = None
@@ -2431,8 +2441,123 @@ class LocalSourceManifestRequest(BaseModel):
     sync_snapshot_id: str
     local_agent_job_id: str
     local_agent_attempt_count: int = Field(ge=1)
-    scope_attestations: list[dict[str, Any]] = Field(default_factory=list, max_length=10_000)
     package_contract_version: int | None = Field(default=None, ge=1)
+
+
+CONVERSATION_MANIFEST_MAX_MESSAGES = 200_000
+CONVERSATION_RECORD_MAX_BYTES = 1_000_000
+
+
+class ConversationCollectionAttemptRequest(BaseModel):
+    """The local-agent job attempt an upload of a conversation collection belongs to."""
+
+    local_agent_job_id: str
+    local_agent_attempt_count: int = Field(ge=1)
+
+
+class ConversationManifestRequest(ConversationCollectionAttemptRequest):
+    manifest: dict[str, Any]
+
+    @field_validator("manifest")
+    @classmethod
+    def _bounded(cls, manifest: dict[str, Any]) -> dict[str, Any]:
+        messages = manifest.get("messages")
+        if isinstance(messages, list) and len(messages) > CONVERSATION_MANIFEST_MAX_MESSAGES:
+            raise ValueError(f"a Collection Manifest records at most {CONVERSATION_MANIFEST_MAX_MESSAGES} messages")
+        return manifest
+
+
+class ConversationArtifactLinkRequest(BaseModel):
+    provider_key: str = Field(min_length=1, max_length=1024)
+    provider_revision: str = Field(min_length=1, max_length=1024)
+    input_sha256: str = Field(min_length=64, max_length=64)
+
+
+class ConversationBodyRequest(BaseModel):
+    conversation_id: str = Field(min_length=1, max_length=512)
+    message_id: str = Field(min_length=1, max_length=512)
+    record: dict[str, Any]
+    artifacts: list[ConversationArtifactLinkRequest] = Field(default_factory=list, max_length=100)
+
+    @field_validator("record")
+    @classmethod
+    def _bounded(cls, record: dict[str, Any]) -> dict[str, Any]:
+        if len(canonical_record_json(record).encode("utf-8")) > CONVERSATION_RECORD_MAX_BYTES:
+            raise ValueError(f"a message record holds at most {CONVERSATION_RECORD_MAX_BYTES} bytes")
+        return record
+
+
+class ConversationBodiesRequest(ConversationCollectionAttemptRequest):
+    bodies: list[ConversationBodyRequest] = Field(max_length=2_000)
+
+
+async def _require_ready_snapshot_manifest(
+    db: Database,
+    *,
+    source: Mapping[str, Any],
+    source_id: str,
+    workspace_id: str,
+    input_snapshot_id: str,
+    req: Any,
+    lease_payload: Mapping[str, Any],
+) -> None:
+    """Require the document snapshot manifest of this job attempt, with every declared item materialized."""
+
+    manifest_status = await db.get_source_sync_snapshot_manifest_status(
+        source_id=source_id,
+        workspace_id=workspace_id,
+        snapshot_id=input_snapshot_id,
+    )
+    if manifest_status is None:
+        raise HTTPException(status_code=409, detail="source_snapshot_manifest_required")
+    if (
+        manifest_status["local_agent_job_id"] != (req.local_agent_job_id if req else None)
+        or manifest_status["local_agent_attempt_count"] != (req.local_agent_attempt_count if req else None)
+        or manifest_status["source_config_revision"] != str(lease_payload["source_config_revision"])
+    ):
+        raise HTTPException(status_code=409, detail="source_snapshot_manifest_stale")
+    if not manifest_status["ready"]:
+        raise HTTPException(status_code=409, detail="source_snapshot_materialization_incomplete")
+    if (
+        local_agent_collection_is_authoritative(source.get("type"))
+        and manifest_status["coverage"] != "complete_snapshot"
+    ):
+        raise HTTPException(status_code=409, detail="authoritative_snapshot_coverage_required")
+
+
+def _conversation_gene(source: Mapping[str, Any]) -> ConversationGene | None:
+    """The conversation Gene of a Source, or ``None`` for a Source of another family."""
+
+    gene_class = GENE_REGISTRY.get(str(source.get("type") or ""))
+    if gene_class is None or not issubclass(gene_class, ConversationGene):
+        return None
+    return create_gene(str(source["type"]), dict(source.get("config") or {}), str(source["id"]))
+
+
+@dataclass(frozen=True, slots=True)
+class _ConversationUpload:
+    """One device collection attempt of a conversation Source, as its uploads address it."""
+
+    gene: ConversationGene
+    collections: StoredCollections
+    intake: CollectionIntake
+    collection_attempt_id: str
+    config_revision: str
+
+
+def _collection_intake(db: Database, collections: StoredCollections) -> CollectionIntake:
+    return CollectionIntake(reader=SourceProjectionUnitReader(db), collections=collections)
+
+
+async def _require_complete_collection(intake: CollectionIntake, source_id: str, collection_attempt_id: str) -> None:
+    """Refuse to plan or process an attempt before its manifest and every body it lacks are uploaded."""
+
+    try:
+        missing = await intake.missing_bodies_of(source_id, collection_attempt_id)
+    except CollectionRejected as exc:
+        raise HTTPException(status_code=409, detail="conversation_manifest_required") from exc
+    if missing:
+        raise HTTPException(status_code=409, detail="conversation_bodies_incomplete")
 
 
 class AgentSessionWindowRequest(BaseModel):
@@ -7254,64 +7379,6 @@ def create_admin_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"source_id": source_id, "gate": _lifecycle_gate_payload(gate)}
 
-    @source_router.get("/{source_id}/projection-inventory")
-    async def get_source_projection_inventory(
-        request: Request,
-        source_id: str,
-        unit_type: str | None = None,
-        conversation_id: str | None = None,
-        observed_from_lte: str | None = None,
-        observed_to_gte: str | None = None,
-        observed_to_lt: str | None = None,
-        cursor: str | None = None,
-        limit: int = 200,
-        db: Database = Depends(get_db),
-    ):
-        """Return one filtered page of server-owned active Source Units."""
-
-        source = await db.get_source(source_id)
-        if source is None:
-            raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_sync_execution(request, source)
-        try:
-            page = await db.list_current_source_units_page(
-                source_id,
-                filters=SourceUnitInventoryFilter(
-                    unit_type=unit_type,
-                    locator_equals=({"conversation_id": conversation_id} if conversation_id else {}),
-                    observed_from_lte=observed_from_lte,
-                    observed_to_gte=observed_to_gte,
-                    observed_to_lt=observed_to_lt,
-                ),
-                cursor=cursor,
-                limit=limit,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        transition = await db.get_open_projection_scope_transition(source_id)
-        return {
-            "source_id": source_id,
-            "source_type": source["type"],
-            "next_cursor": page.next_cursor,
-            "projection_scope_transition": (
-                {
-                    "id": transition.id,
-                    "previous_scope": dict(transition.previous_scope),
-                    "target_scope": dict(transition.target_scope),
-                }
-                if transition is not None
-                else None
-            ),
-            "units": [
-                {
-                    "source_unit_id": unit.id,
-                    "unit_type": unit.unit_type,
-                    "provider_key": unit.provider_key,
-                    "locator": dict(unit.locator),
-                }
-                for unit in page.units
-            ],
-        }
 
     async def _decide_lifecycle_review(
         source_id: str,
@@ -8163,6 +8230,7 @@ def create_admin_app(
         source: dict[str, Any],
         *,
         force_full_sync: bool,
+        dry_run: bool = False,
     ) -> dict[str, Any] | None:
         operation = local_agent_sync_operation(source["type"], source.get("config"))
         if operation is None:
@@ -8178,7 +8246,7 @@ def create_admin_app(
         job_id = f"laj-{uuid.uuid4().hex}"
         payload = local_agent_sync_job_payload(
             source,
-            {"force_full_sync": force_full_sync, "retry_failed_items": True},
+            {"force_full_sync": force_full_sync, "retry_failed_items": True, **({"dry_run": True} if dry_run else {})},
         )
         transition = await db.get_open_projection_scope_transition(source["id"])
         if transition is not None:
@@ -8245,12 +8313,18 @@ def create_admin_app(
         _require_source_sync_support(source)
 
         retry_run_id = req.retry_target.execution_id if req and req.retry_target else None
+        dry_run = bool(req and req.dry_run)
+        if dry_run and (retry_run_id is not None or _conversation_gene(source) is None):
+            # A dry run plans one new device collection of a conversation Source.
+            raise HTTPException(status_code=400, detail="dry_run_requires_a_new_conversation_collection")
         if retry_run_id is None:
             local_job = await _enqueue_local_source_collection_job(
-                request, db, source, force_full_sync=bool(req and req.force_full_sync),
+                request, db, source, force_full_sync=bool(req and req.force_full_sync), dry_run=dry_run
             )
             if local_job is not None:
                 return local_job
+            if dry_run:
+                raise HTTPException(status_code=400, detail="dry_run_requires_a_new_conversation_collection")
 
         try:
             run = await sync_service.enqueue_source(
@@ -8316,26 +8390,25 @@ def create_admin_app(
             job_id=req.local_agent_job_id if req else None,
             attempt_count=req.local_agent_attempt_count if req else None,
         )
-        manifest_status = await db.get_source_sync_snapshot_manifest_status(
-            source_id=source_id,
-            workspace_id=workspace_id,
-            snapshot_id=input_snapshot_id,
-        )
-        if manifest_status is None:
-            raise HTTPException(status_code=409, detail="source_snapshot_manifest_required")
-        if (
-            manifest_status["local_agent_job_id"] != (req.local_agent_job_id if req else None)
-            or manifest_status["local_agent_attempt_count"] != (req.local_agent_attempt_count if req else None)
-            or manifest_status["source_config_revision"] != str(lease_payload["source_config_revision"])
-        ):
-            raise HTTPException(status_code=409, detail="source_snapshot_manifest_stale")
-        if not manifest_status["ready"]:
-            raise HTTPException(status_code=409, detail="source_snapshot_materialization_incomplete")
-        if (
-            local_agent_collection_is_authoritative(current_source.get("type"))
-            and manifest_status["coverage"] != "complete_snapshot"
-        ):
-            raise HTTPException(status_code=409, detail="authoritative_snapshot_coverage_required")
+        if lease_payload.get("dry_run"):
+            # A dry run reports its plan; nothing it collected is processed.
+            raise HTTPException(status_code=409, detail="dry_run_job_is_not_processed")
+        if _conversation_gene(current_source) is not None:
+            await _require_complete_collection(
+                _collection_intake(db, StoredCollections(db, workspace_id=workspace_id)),
+                source_id,
+                input_snapshot_id,
+            )
+        else:
+            await _require_ready_snapshot_manifest(
+                db,
+                source=current_source,
+                source_id=source_id,
+                workspace_id=workspace_id,
+                input_snapshot_id=input_snapshot_id,
+                req=req,
+                lease_payload=lease_payload,
+            )
         try:
             run = await sync_service.enqueue_source(
                 source_id,
@@ -8558,11 +8631,7 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        if source.get("type") not in {
-            "github_repo",
-            "jira",
-            "teams",
-        }:
+        if source.get("type") not in {"github_repo", "jira"} and _conversation_gene(source) is None:
             raise HTTPException(status_code=400, detail="source does not support local Artifact inputs")
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
@@ -8613,65 +8682,21 @@ def create_admin_app(
                 content.write(chunk)
             if declared_length is not None and observed_size != declared_length:
                 raise HTTPException(status_code=400, detail="Source Artifact transport length mismatch")
-            content_sha256 = digest.hexdigest()
-            descriptor = {
-                **{key: str(value).strip() for key, value in required_values.items()},
-                "media_type": normalized_media_type,
-                "size_bytes": observed_size,
-                "content_sha256": content_sha256,
-            }
-            input_sha256 = hashlib.sha256(
-                json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            ).hexdigest()
-            existing = await db.get_source_sync_inputs_by_raw_hashes(
+            content.seek(0)
+            input_sha256 = await retain_artifact_input(
+                db,
+                artifact_store,
                 source_id=source_id,
                 workspace_id=workspace_id,
-                raw_sha256s=(input_sha256,),
-            )
-            if existing:
-                return {
-                    "input_sha256": input_sha256,
-                    "content_sha256": content_sha256,
-                    "size_bytes": observed_size,
-                }
-            content.seek(0)
-            # This write does not hold the Source activity lease, so the
-            # attempt writes a key of its own: a cleanup task queued by an
-            # earlier failed attempt can never name the object written here.
-            artifact_uri = await asyncio.to_thread(
-                artifact_store.store_source_artifact,
-                source_id=source_id,
-                artifact_id=f"local-input-{input_sha256[:24]}-{uuid.uuid4().hex}",
-                filename=str(filename).strip(),
+                identity={key: str(value).strip() for key, value in required_values.items()},
+                media_type=normalized_media_type,
                 content=content,
-                content_type=normalized_media_type,
                 size_bytes=observed_size,
-                sha256=content_sha256,
+                content_sha256=digest.hexdigest(),
             )
-            try:
-                retained = await db.create_source_sync_input(
-                    source_id=source_id,
-                    workspace_id=workspace_id,
-                    raw_uri=artifact_uri,
-                    raw_sha256=input_sha256,
-                    raw_content_type=normalized_media_type,
-                    metadata={"local_source_artifact": descriptor},
-                )
-            except Exception:
-                raced = await db.get_source_sync_inputs_by_raw_hashes(
-                    source_id=source_id,
-                    workspace_id=workspace_id,
-                    raw_sha256s=(input_sha256,),
-                )
-                if not raced or raced[0].raw_uri != artifact_uri:
-                    await db.enqueue_source_artifact_cleanup_task(
-                        source_id=source_id,
-                        artifact_uri=artifact_uri,
-                    )
-                raise
             return {
-                "input_sha256": retained.raw_sha256,
-                "content_sha256": content_sha256,
+                "input_sha256": input_sha256,
+                "content_sha256": digest.hexdigest(),
                 "size_bytes": observed_size,
             }
         finally:
@@ -8697,11 +8722,9 @@ def create_admin_app(
             GITHUB_REPO_SOURCE_TYPE,
             JIRA_SOURCE_TYPE,
             LOCAL_MARKDOWN_SOURCE_TYPE,
-            TEAMS_SOURCE_TYPE,
             submit_github_repo_document,
             submit_jira_package,
             submit_local_markdown_document,
-            submit_teams_window_package,
         )
 
         source = await db.get_source(source_id)
@@ -8712,7 +8735,6 @@ def create_admin_app(
             LOCAL_MARKDOWN_SOURCE_TYPE,
             GITHUB_REPO_SOURCE_TYPE,
             JIRA_SOURCE_TYPE,
-            TEAMS_SOURCE_TYPE,
         }:
             raise HTTPException(
                 status_code=400,
@@ -8789,26 +8811,6 @@ def create_admin_app(
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
                     document_store=artifact_store,
-                    source_artifacts=source_artifacts,
-                )
-            elif source_type == TEAMS_SOURCE_TYPE:
-                result = await submit_teams_window_package(
-                    db=db,
-                    config=config,
-                    source=source,
-                    conversation_id=req.conversation_id or "",
-                    window_id=req.window_id or "",
-                    revision_hash=req.revision_hash or "",
-                    raw_payload=req.raw_payload,
-                    title=req.title,
-                    root_message_id=req.root_message_id,
-                    window_type=req.window_type,
-                    source_url=req.source_url,
-                    raw_hash=req.raw_hash,
-                    submitted_by=req.submitted_by,
-                    submitted_at=req.submitted_at,
-                    document_store=artifact_store,
-                    collection_attempt_id=input_snapshot_id,
                     source_artifacts=source_artifacts,
                 )
             else:
@@ -8920,6 +8922,170 @@ def create_admin_app(
         public_result.pop("package_manifest_entry", None)
         return {**public_result, "sync_started": False}
 
+    async def _conversation_upload(
+        request: Request,
+        db: Database,
+        *,
+        source_id: str,
+        workspace_id: str,
+        attempt: ConversationCollectionAttemptRequest,
+    ) -> _ConversationUpload:
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        gene = _conversation_gene(source)
+        if gene is None:
+            raise HTTPException(status_code=400, detail="source_is_not_a_conversation_source")
+        _require_source_sync_execution(request, source)
+        _require_source_sync_support(source)
+        lease_payload = await _require_current_local_agent_lease(
+            request,
+            db,
+            source=source,
+            job_id=attempt.local_agent_job_id,
+            attempt_count=attempt.local_agent_attempt_count,
+        )
+        collections = StoredCollections(db, workspace_id=workspace_id)
+        return _ConversationUpload(
+            gene=gene,
+            collections=collections,
+            intake=_collection_intake(db, collections),
+            collection_attempt_id=local_agent_sync_snapshot_id(
+                attempt.local_agent_job_id, attempt.local_agent_attempt_count
+            ),
+            config_revision=str(lease_payload["source_config_revision"]),
+        )
+
+    @source_router.post("/{source_id}/conversation-collection/request")
+    async def conversation_collection_request(
+        source_id: str,
+        req: ConversationCollectionAttemptRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """The request one device collection attempt answers; asking again returns the same request."""
+
+        upload = await _conversation_upload(request, db, source_id=source_id, workspace_id=workspace_id, attempt=req)
+        collection_request = await upload.gene.issue_collection_request(
+            upload.collections, upload.collection_attempt_id, now=datetime.now(timezone.utc)
+        )
+        return {
+            "collection_attempt_id": upload.collection_attempt_id,
+            "request": request_to_payload(collection_request),
+        }
+
+    @source_router.post("/{source_id}/conversation-collection/plan")
+    async def plan_conversation_collection(
+        source_id: str,
+        req: ConversationCollectionAttemptRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """What one uploaded device collection attempt would change, without processing it.
+
+        The plan is the one a sync run would make now, including the removals
+        of an open Projection Scope transition.
+        """
+
+        upload = await _conversation_upload(request, db, source_id=source_id, workspace_id=workspace_id, attempt=req)
+        await _require_complete_collection(upload.intake, source_id, upload.collection_attempt_id)
+        upload.gene.bind_conversation_run(
+            projection_store=db,
+            collections=upload.collections,
+            collection_attempt_id=upload.collection_attempt_id,
+        )
+        transition = await db.get_open_projection_scope_transition(source_id)
+        if transition is not None:
+            upload.gene.begin_scope_transition(
+                previous_scope=transition.previous_scope, target_scope=transition.target_scope
+            )
+        return {
+            "collection_attempt_id": upload.collection_attempt_id,
+            **plan_report(await upload.gene.preview(), source_id=source_id),
+        }
+
+    @source_router.post("/{source_id}/conversation-collection/manifest")
+    async def receive_conversation_manifest(
+        source_id: str,
+        req: ConversationManifestRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """Keep the Collection Manifest of one device collection attempt and name what the server lacks."""
+
+        upload = await _conversation_upload(request, db, source_id=source_id, workspace_id=workspace_id, attempt=req)
+        try:
+            missing = await upload.intake.receive_manifest(
+                req.manifest,
+                source_id=source_id,
+                collection_attempt_id=upload.collection_attempt_id,
+                config_revision=upload.config_revision,
+                record_schema=upload.gene.record_schema,
+                received_at=datetime.now(timezone.utc),
+            )
+        except ManifestFormatError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except CollectionRejected as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "collection_attempt_id": upload.collection_attempt_id,
+            "missing": [
+                {
+                    "conversation_id": item.identity.conversation_id,
+                    "message_id": item.identity.message_id,
+                    "body": item.body,
+                    "artifacts": [
+                        {"provider_key": artifact.provider_key, "provider_revision": artifact.provider_revision}
+                        for artifact in item.artifacts
+                    ],
+                }
+                for item in missing
+            ],
+        }
+
+    @source_router.post("/{source_id}/conversation-collection/bodies")
+    async def receive_conversation_bodies(
+        source_id: str,
+        req: ConversationBodiesRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """Keep message bodies of one device collection attempt, each matching its manifest message."""
+
+        upload = await _conversation_upload(request, db, source_id=source_id, workspace_id=workspace_id, attempt=req)
+        try:
+            await upload.intake.receive_bodies(
+                {
+                    MessageIdentity(body.conversation_id, body.message_id): CollectedBody(
+                        record=body.record,
+                        artifacts=tuple(
+                            ArtifactLink(
+                                provider_key=link.provider_key,
+                                provider_revision=link.provider_revision,
+                                input_sha256=link.input_sha256,
+                            )
+                            for link in body.artifacts
+                        ),
+                    )
+                    for body in req.bodies
+                },
+                source_id=source_id,
+                collection_attempt_id=upload.collection_attempt_id,
+            )
+        except CollectionRejected as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"collection_attempt_id": upload.collection_attempt_id, "received": len(req.bodies)}
+
+    @source_router.get("/{source_id}/projection-inventory")
+    async def retired_projection_inventory(source_id: str):
+        """Tell an agent that reads the projection inventory to upgrade: the server owns every conversation decision."""
+
+        raise HTTPException(status_code=409, detail="local_agent_upgrade_required")
+
     @source_router.post("/{source_id}/adapter/manifest")
     async def prepare_local_source_manifest(
         source_id: str,
@@ -8935,14 +9101,13 @@ def create_admin_app(
             SnapshotManifestItem,
             plan_snapshot_manifest,
         )
-        from memforge.source_projection import (
-            projection_scope_attestation_from_payload,
-            projection_scope_attestation_to_payload,
-        )
-
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
+        if _conversation_gene(source) is not None:
+            # A conversation Source uploads a Collection Manifest; an agent
+            # that sends it document snapshots is told to upgrade.
+            raise HTTPException(status_code=409, detail="local_agent_upgrade_required")
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
         coverage = CollectionCoverage(req.coverage)
@@ -8971,23 +9136,6 @@ def create_admin_app(
                 req.sync_snapshot_id,
             )
             manifest_items = [(item.doc_id, item.revision, item.change_kind) for item in req.items]
-            scope_attestations = tuple(
-                sorted(
-                    (projection_scope_attestation_from_payload(item) for item in req.scope_attestations),
-                    key=lambda item: (
-                        item.subject_type,
-                        item.subject_key,
-                        item.transition_id or "",
-                    ),
-                )
-            )
-            if any(item.collection_attempt_id != snapshot_id for item in scope_attestations):
-                raise ValueError("Projection Scope Attestation belongs to another collection attempt")
-            attestation_keys = {
-                (item.subject_type, item.subject_key, item.transition_id) for item in scope_attestations
-            }
-            if len(attestation_keys) != len(scope_attestations):
-                raise ValueError("Projection Scope Attestation subjects must be unique")
             retained_inputs = await db.find_source_sync_input_attestations(
                 source_id=source_id,
                 workspace_id=workspace_id,
@@ -9017,9 +9165,6 @@ def create_admin_app(
                             (item.model_dump() for item in req.items),
                             key=lambda item: item["doc_id"],
                         ),
-                        "scope_attestations": [
-                            projection_scope_attestation_to_payload(item) for item in scope_attestations
-                        ],
                     },
                     sort_keys=True,
                     separators=(",", ":"),
@@ -9037,7 +9182,6 @@ def create_admin_app(
                 local_agent_job_id=req.local_agent_job_id,
                 local_agent_attempt_count=req.local_agent_attempt_count,
                 source_config_revision=str(lease_payload["source_config_revision"]),
-                scope_attestations=scope_attestations,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

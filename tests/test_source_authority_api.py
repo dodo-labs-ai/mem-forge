@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -12,15 +11,11 @@ from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
 from memforge.models import (
-    ContentItem,
     Memory,
     MemoryExtractionResult,
-    NormalizedContent,
-    RawContent,
     SyncState,
     content_hash,
 )
-from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.storage.database import Database
 from tests.test_sync_bookkeeping import (
@@ -469,10 +464,6 @@ def test_agent_session_rejects_ordinary_sync_and_hides_historical_sync_failure(t
                 headers=owner_headers,
                 json={"enabled": True, "interval_minutes": 60},
             )
-            inventory = client.get(
-                f"/api/v1/sources/{source_id}/projection-inventory",
-                headers=owner_headers,
-            )
 
         assert listed.status_code == 200, listed.text
         source = next(row for row in listed.json()["data"] if row["id"] == source_id)
@@ -482,7 +473,6 @@ def test_agent_session_rejects_ordinary_sync_and_hides_historical_sync_failure(t
         for response in (synced, force_synced, scheduled):
             assert response.status_code == 409, response.text
             assert response.json()["detail"] == "source_sync_not_supported"
-        assert inventory.status_code == 200, inventory.text
         assert asyncio.run(database.get_latest_source_sync_run(source_id=source_id)) is None
         history = asyncio.run(database.get_sync_history(source=source_id, limit=1))
         assert history[0]["status"] == "failed"
@@ -1069,8 +1059,20 @@ def test_teams_initial_history_change_does_not_create_destructive_scope_transiti
 
 
 def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp_path):
-    from memforge.local_adapter import build_teams_doc_id
-    from memforge.local_agent.teams_ledger import build_teams_window_id
+    from memforge.conversations.collect import CollectedAttempt
+    from memforge.conversations.manifest import (
+        ConversationEvidence,
+        PollEvidence,
+        manifest_to_payload,
+        request_from_payload,
+    )
+    from memforge.conversations.port import (
+        ConversationAccess,
+        ConversationStatus,
+        PollOutcome,
+        ProviderMessage,
+    )
+    from memforge.genes.teams_provider import teams_conversation_ref, teams_message_record
 
     database = _connect_database(tmp_path)
     try:
@@ -1089,62 +1091,85 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
                 "local_agent_job_id": leased["job_id"],
                 "local_agent_attempt_count": leased["attempt_count"],
             }
-            window_id = build_teams_window_id(
-                source_id=source_id,
-                conversation_id="19:conversation-a@example.test",
-                root_or_anchor_message_id="m1",
-                window_type="time_block",
+            attempt_id = f"{leased['job_id']}:attempt:{leased['attempt_count']}"
+            requested = client.post(
+                f"/api/v1/sources/{source_id}/conversation-collection/request", headers=headers, json=context
             )
-            manifest = client.post(
+            requested_again = client.post(
+                f"/api/v1/sources/{source_id}/conversation-collection/request", headers=headers, json=context
+            )
+            [requested_conversation] = request_from_payload(requested.json()["request"]).conversations
+            conversation = teams_conversation_ref({"id": "19:conversation-a@example.test", "type": "group_chat"})
+            sent_at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=1)
+            collection = CollectedAttempt(
+                source_id=source_id,
+                collection_attempt_id=attempt_id,
+                config_revision=leased["payload"]["source_config_revision"],
+                record_schema="teams-message:2",
+                conversations=[
+                    ConversationEvidence(
+                        conversation_id=conversation.conversation_id,
+                        status=ConversationStatus(ConversationAccess.READABLE, "listed"),
+                        ref=conversation,
+                        polls=tuple(
+                            PollEvidence(
+                                requested=interval,
+                                outcome=PollOutcome.HISTORY_EXHAUSTED,
+                                started_at=sent_at + timedelta(hours=1),
+                                earliest_returned_at=sent_at,
+                            )
+                            for interval in requested_conversation.intervals
+                        ),
+                    )
+                ],
+            )
+            message = {"id": "m1", "from": "Ada", "content": "hello", "time": sent_at, "attachments": []}
+            collection.add(
+                conversation.conversation_id,
+                ProviderMessage(
+                    message_id="m1", created_at=sent_at, record=teams_message_record(message, conversation)
+                ),
+            )
+            manifest = manifest_to_payload(collection.manifest(received_at=sent_at))
+            del manifest["received_at"]
+            outdated_agent = client.post(
                 f"/api/v1/sources/{source_id}/adapter/manifest",
                 headers=headers,
-                json={
-                    **context,
-                    "sync_snapshot_id": (f"{leased['job_id']}:attempt:{leased['attempt_count']}"),
-                    "coverage": "bounded_delta",
-                    "scope_attestations": [
-                        {
-                            "subject_type": "conversation",
-                            "subject_key": "19:conversation-a@example.test",
-                            "collection_attempt_id": f"{leased['job_id']}:attempt:{leased['attempt_count']}",
-                            "target_scope_fingerprint": "scope-fingerprint",
-                            "transition_id": None,
-                            "evidence": {"poll": {"access_probe_status": "ok"}},
-                        }
-                    ],
-                    "items": [
-                        {
-                            "doc_id": build_teams_doc_id(
-                                source_id=source_id,
-                                window_id=window_id,
-                            ),
-                            "revision": "revision-a",
-                            "change_kind": "upsert",
-                        }
-                    ],
-                },
+                json={**context, "sync_snapshot_id": attempt_id, "coverage": "bounded_delta", "items": []},
             )
-            accepted = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
+            incomplete_process = client.post(
+                f"/api/v1/sources/{source_id}/process", headers=headers, json=context
+            )
+            malformed_manifest = client.post(
+                f"/api/v1/sources/{source_id}/conversation-collection/manifest",
+                headers=headers,
+                json={**context, "manifest": {**manifest, "conversations": "not a list"}},
+            )
+            unanswered_manifest = client.post(
+                f"/api/v1/sources/{source_id}/conversation-collection/manifest",
+                headers=headers,
+                json={**context, "manifest": {**manifest, "conversations": [], "messages": []}},
+            )
+            retired_inventory = client.get(f"/api/v1/sources/{source_id}/projection-inventory", headers=headers)
+            uploaded_manifest = client.post(
+                f"/api/v1/sources/{source_id}/conversation-collection/manifest",
+                headers=headers,
+                json={**context, "manifest": manifest},
+            )
+            missing_process = client.post(f"/api/v1/sources/{source_id}/process", headers=headers, json=context)
+            [identity] = collection.bodies
+            uploaded_bodies = client.post(
+                f"/api/v1/sources/{source_id}/conversation-collection/bodies",
                 headers=headers,
                 json={
                     **context,
-                    "conversation_id": "19:conversation-a@example.test",
-                    "window_id": window_id,
-                    "revision_hash": "revision-a",
-                    "root_message_id": "m1",
-                    "window_type": "time_block",
-                    "raw_payload": {
-                        "conversation_id": "19:conversation-a@example.test",
-                        "window_id": window_id,
-                        "messages": [
-                            {
-                                "id": "m1",
-                                "content": "hello",
-                                "time": "2026-07-16T09:00:00+00:00",
-                            }
-                        ],
-                    },
+                    "bodies": [
+                        {
+                            "conversation_id": identity.conversation_id,
+                            "message_id": identity.message_id,
+                            "record": collection.bodies[identity],
+                        }
+                    ],
                 },
             )
             accepted_process = client.post(
@@ -1178,39 +1203,91 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
                 json=completion_body,
             )
 
-        assert manifest.status_code == 200, manifest.text
-        assert accepted.status_code == 200, accepted.text
+        assert requested.status_code == 200, requested.text
+        assert requested_again.json() == requested.json()
+        assert requested.json()["collection_attempt_id"] == attempt_id
+        assert [item["conversation_id"] for item in requested.json()["request"]["conversations"]] == [
+            "19:conversation-a@example.test"
+        ]
+        assert outdated_agent.status_code == 409, outdated_agent.text
+        assert outdated_agent.json()["detail"] == "local_agent_upgrade_required"
+        assert incomplete_process.status_code == 409, incomplete_process.text
+        assert incomplete_process.json()["detail"] == "conversation_manifest_required"
+        assert malformed_manifest.status_code == 422, malformed_manifest.text
+        assert unanswered_manifest.status_code == 409, unanswered_manifest.text
+        assert "exactly the requested conversations" in unanswered_manifest.json()["detail"]
+        assert retired_inventory.status_code == 409, retired_inventory.text
+        assert retired_inventory.json()["detail"] == "local_agent_upgrade_required"
+        assert uploaded_manifest.status_code == 200, uploaded_manifest.text
+        assert uploaded_manifest.json()["missing"] == [
+            {"conversation_id": "19:conversation-a@example.test", "message_id": "m1", "body": True, "artifacts": []}
+        ]
+        assert missing_process.status_code == 409, missing_process.text
+        assert missing_process.json()["detail"] == "conversation_bodies_incomplete"
+        assert uploaded_bodies.status_code == 200, uploaded_bodies.text
         assert accepted_process.status_code == 202, accepted_process.text
-        expected_attempt_id = f"{leased['job_id']}:attempt:{leased['attempt_count']}"
-        retained_inputs = asyncio.run(
-            database.list_source_sync_inputs(
-                source_id=source_id,
-                input_snapshot_id=expected_attempt_id,
-            )
-        )
-        assert len(retained_inputs) == 1
-        manifest_status = asyncio.run(
-            database.get_source_sync_snapshot_manifest_status(
-                source_id=source_id,
-                workspace_id="default",
-                snapshot_id=expected_attempt_id,
-            )
-        )
-        assert manifest_status is not None
-        assert manifest_status["scope_attestations"][0].subject_key == "19:conversation-a@example.test"
-        assert all(
-            unit.unit_type != "teams_scope_attestation"
-            for unit in asyncio.run(database.list_current_source_units(source_id))
-        )
         process_run = asyncio.run(database.get_source_sync_run(accepted_process.json()["run_id"]))
         assert process_run is not None
-        assert process_run.input_snapshot_id == expected_attempt_id
+        assert process_run.input_snapshot_id == attempt_id
         assert stale.status_code == 409, stale.text
         assert stale.json()["detail"] == "local_agent_lease_not_current"
         assert first_complete.status_code == 200, first_complete.text
         assert repeated_complete.status_code == 200, repeated_complete.text
         assert repeated_complete.json()["status"] == "succeeded"
         assert forbidden_repeat.status_code == 404, forbidden_repeat.text
+    finally:
+        asyncio.run(database.close())
+
+
+def test_a_dry_run_is_its_own_device_job_and_is_refused_where_nothing_new_is_collected(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
+        with TestClient(app) as client:
+            teams_id = client.post("/api/v1/sources", headers=headers, json=_teams_payload()).json()["id"]
+            jira_id = client.post(
+                "/api/v1/sources", headers=headers, json=_jira_payload(sync_mode="local_agent")
+            ).json()["id"]
+            real = client.post(f"/api/v1/sources/{teams_id}/sync", headers=headers)
+            dry = client.post(f"/api/v1/sources/{teams_id}/sync", headers=headers, json={"dry_run": True})
+            dry_again = client.post(f"/api/v1/sources/{teams_id}/sync", headers=headers, json={"dry_run": True})
+            real_again = client.post(f"/api/v1/sources/{teams_id}/sync", headers=headers)
+            document_source = client.post(f"/api/v1/sources/{jira_id}/sync", headers=headers, json={"dry_run": True})
+            retry = client.post(
+                f"/api/v1/sources/{teams_id}/sync",
+                headers=headers,
+                json={"dry_run": True, "retry_target": {"execution_kind": "source_sync_run", "execution_id": "run-1"}},
+            )
+            # A Source whose only job is a dry run, so the lease hands over that job.
+            preview_id = client.post(
+                "/api/v1/sources", headers=headers, json=_teams_payload("Teams preview")
+            ).json()["id"]
+            client.post(f"/api/v1/sources/{preview_id}/sync", headers=headers, json={"dry_run": True})
+            leased = client.post(
+                "/api/cloud/local-agent/jobs/lease", headers=headers, json={"limit": 5, "lease_seconds": 60}
+            ).json()["jobs"]
+            [dry_job] = [job for job in leased if job["source_id"] == preview_id]
+            dry_processed = client.post(
+                f"/api/v1/sources/{preview_id}/process",
+                headers=headers,
+                json={
+                    "local_agent_job_id": dry_job["job_id"],
+                    "local_agent_attempt_count": dry_job["attempt_count"],
+                },
+            )
+
+        assert real.status_code == dry.status_code == 202, (real.text, dry.text)
+        assert dry.json()["job_id"] != real.json()["job_id"]
+        assert dry_again.json()["job_id"] == dry.json()["job_id"]
+        assert real_again.json()["job_id"] == real.json()["job_id"]
+        real_job = asyncio.run(database.get_local_agent_job(real.json()["job_id"]))
+        assert "dry_run" not in real_job["payload"]
+        assert document_source.status_code == 400, document_source.text
+        assert retry.status_code == 400, retry.text
+        assert retry.json()["detail"] == "dry_run_requires_a_new_conversation_collection"
+        assert dry_processed.status_code == 409, dry_processed.text
+        assert dry_processed.json()["detail"] == "dry_run_job_is_not_processed"
     finally:
         asyncio.run(database.close())
 
@@ -1419,92 +1496,6 @@ def test_local_source_force_resync_collects_fresh_raw_data_before_processing(tmp
         assert "run_id" not in force.json()
         assert leased.json()["jobs"][0]["operation"] == "teams_sync"
         assert leased.json()["jobs"][0]["payload"]["force_full_sync"] is True
-    finally:
-        asyncio.run(database.close())
-
-
-def test_projection_inventory_returns_server_owned_active_units(tmp_path):
-    database = _connect_database(tmp_path)
-    try:
-        app = _app(tmp_path, database)
-        owner_headers = {
-            "x-test-user": "owner-a",
-            "x-test-workspace-role": "member",
-        }
-        with TestClient(app) as client:
-            created = client.post(
-                "/api/v1/sources",
-                headers=owner_headers,
-                json=_teams_payload(),
-            )
-            source_id = created.json()["id"]
-
-            item = ContentItem(
-                item_id="window-1",
-                title="Teams window",
-                source_url="https://teams.example.test/window-1",
-                last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
-                version="revision-1",
-                extra={
-                    "conversation_id": "19:conversation-a@example.test",
-                    "window_id": "window-1",
-                    "root_message_id": "message-1",
-                },
-            )
-            payload = {
-                "messages": [
-                    {
-                        "id": "message-1",
-                        "content": "Current answer",
-                        "time": "2026-07-16T09:00:00Z",
-                    }
-                ]
-            }
-            projection = project_source_item(
-                source_id=source_id,
-                source_type="teams",
-                run_id="run-inventory-route",
-                item=item,
-                raw=RawContent(
-                    item=item,
-                    body=json.dumps(payload).encode(),
-                    content_type="application/json",
-                ),
-                normalized=NormalizedContent(
-                    item=item,
-                    markdown_body="Current answer",
-                ),
-            )
-            asyncio.run(database.record_source_projection(projection))
-
-            response = client.get(
-                f"/api/v1/sources/{source_id}/projection-inventory",
-                headers=owner_headers,
-            )
-            forbidden = client.get(
-                f"/api/v1/sources/{source_id}/projection-inventory",
-                headers={
-                    "x-test-user": "viewer-a",
-                    "x-test-workspace-role": "viewer",
-                },
-            )
-
-        assert response.status_code == 200, response.text
-        assert response.json() == {
-            "source_id": source_id,
-            "source_type": "teams",
-            "next_cursor": None,
-            "projection_scope_transition": None,
-            "units": [
-                {
-                    "source_unit_id": projection.source_units[0].id,
-                    "unit_type": "teams_window",
-                    "provider_key": "window-1",
-                    "locator": dict(projection.source_units[0].locator),
-                }
-            ],
-        }
-        assert forbidden.status_code == 403
     finally:
         asyncio.run(database.close())
 

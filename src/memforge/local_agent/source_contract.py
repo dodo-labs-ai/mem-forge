@@ -63,15 +63,16 @@ _LOCAL_AGENT_JOB_CONFIG_FIELDS_BY_SOURCE_TYPE = {
             "individual_chats",
             "initial_history_days",
             "rolling_retention_days",
-            "incremental_overlap_hours",
-            "page_size",
         }
     ),
 }
 # ``retry_failed_items`` marks a job a person requested: the sync its snapshot
-# starts retries every failed Document of the Source.
+# starts retries every failed Document of the Source. ``dry_run`` asks a
+# conversation Source's job to report what its attempt would change instead of
+# processing it.
 LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS = frozenset(
     {
+        "dry_run",
         "force_full_sync",
         "retry_failed_items",
     }
@@ -91,14 +92,6 @@ package without a source time, so the agent uploads that file once more with
 its time (design ``source-sync-to-memory.md`` 0.9).
 """
 TEAMS_ROLLING_RETENTION_PRESETS = (365, 730, 1095)
-TEAMS_TOMBSTONE_REASONS = frozenset(
-    {
-        "not_returned_by_complete_conversation_poll",
-        "not_returned_by_bounded_conversation_poll",
-        "conversation_removed_from_projection_scope",
-        "outside_rolling_retention",
-    }
-)
 TEAMS_CONVERSATION_SELECTOR_FIELDS = (
     "conversation_ids",
     "channels",
@@ -247,9 +240,8 @@ def local_agent_collection_attempt_id(
 
     normalized_source_type = str(source_type or "").strip().lower()
     requested = str(requested_snapshot_id or "").strip()
-    from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
-
-    get_local_source_replay_adapter(normalized_source_type)
+    if normalized_source_type not in _LOCAL_AGENT_JOB_CONFIG_FIELDS_BY_SOURCE_TYPE:
+        raise ValueError(f"{normalized_source_type or 'unknown'} sources are not collected by a local agent")
     canonical = local_agent_sync_snapshot_id(job_id, attempt_count)
     if requested and requested != canonical:
         raise ValueError("local agent snapshot does not match the leased job attempt")

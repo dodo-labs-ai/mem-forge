@@ -1,1593 +1,241 @@
-"""Tests for the Microsoft Teams gene."""
+"""The Teams Gene: its configuration, its selection, and Units stored before Teams joined the conversation layer."""
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import json
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock
+from datetime import datetime, timezone
 
-import httpx
 import pytest
 
-from memforge.genes.teams_gene import (
-    AuthenticationError,
-    TeamsMessagePaginationError,
-    TeamsGene,
-    _TeamsAPIClient,
-    _group_into_blocks,
-)
-from memforge.models import ConfigFieldType, require_attested_content
-from memforge.local_agent.source_contract import local_agent_semantic_input_sha256
-from memforge.local_agent.document_identity import build_teams_doc_id
-from memforge.local_agent.teams_ledger import build_teams_window_id
-from memforge.source_artifacts import (
-    MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
-    SourceArtifactContractError,
-)
+from memforge.source_adapters.conversation import project_native
+from memforge.conversations.records import record_revision
+from memforge.conversations.units import UnitKind
+from memforge.genes.teams_gene import TeamsGene
+from memforge.models import ConfigFieldType, ContentItem
+from memforge.source_adapters.teams import message_record, teams_unit_shape
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def test_metadata_fields():
+    meta = TeamsGene.metadata()
+    assert meta.name == "teams"
+    assert meta.display_name == "Microsoft Teams"
+    assert meta.data_shape == "message"
+    assert meta.auth_method == "browser_cookie"
+    assert meta.default_sync_interval_minutes == 60
 
 
-def _msg(id: str, author: str, content: str, time: datetime, parent_id: str | None = None) -> dict:
-    """Build a mock Teams message dict."""
-    return {
-        "id": id,
-        "from": author,
-        "content": content,
-        "time": time,
-        "parentMessageId": parent_id,
-        "mentions": [],
-        "attachments": [],
+def test_config_schema_groups():
+    schema = TeamsGene.config_schema()
+    group_keys = [g.key for g in schema.groups]
+    assert group_keys == ["connection", "scope", "sync"]
+
+
+def test_config_schema_fields():
+    schema = TeamsGene.config_schema()
+    field_keys = [f.key for f in schema.fields]
+    assert "region" in field_keys
+    assert "conversation_ids" in field_keys
+    assert "channels" not in field_keys
+    assert "group_chats" not in field_keys
+    assert "individual_chats" not in field_keys
+    assert "initial_history_days" in field_keys
+    assert "rolling_retention_days" in field_keys
+    assert "max_age_days" not in field_keys
+    assert "conversation_gap_minutes" not in field_keys
+    assert "max_block_messages" not in field_keys
+    retention = next(f for f in schema.fields if f.key == "rolling_retention_days")
+    assert retention.options == ["forever", "365", "730", "1095"]
+
+
+@pytest.mark.parametrize("retention_days", [365, 730, 1095])
+def test_normalize_config_accepts_product_retention_presets(retention_days: int):
+    config = {
+        "conversation_ids": ["19:chat@example.test"],
+        "rolling_retention_days": retention_days,
+    }
+
+    TeamsGene.normalize_config(config)
+
+    assert config["rolling_retention_days"] == retention_days
+
+
+def test_normalize_config_collapses_legacy_direct_selectors():
+    config = {
+        "conversation_ids": ["19:chat@example.test"],
+        "channels": ["19:channel@thread.tacv2"],
+        "group_chats": ["19:chat@example.test"],
+        "individual_chats": ["19:person@example.test"],
+    }
+
+    TeamsGene.normalize_config(config)
+
+    assert config == {
+        "conversation_ids": [
+            "19:chat@example.test",
+            "19:channel@thread.tacv2",
+            "19:person@example.test",
+        ],
+        "initial_history_days": 14,
+        "rolling_retention_days": None,
     }
 
 
-NOW = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
-
-
-class FakeDocumentStore:
-    def __init__(self):
-        self._objects: dict[str, bytes] = {}
-
-    def store_raw(self, source_id, doc_id, title, content, content_type, extension=None):
-        uri = f"fake://{source_id}/{doc_id}/{title}{extension or ''}"
-        self._objects[uri] = content
-        return uri
-
-    def read_artifact(self, uri):
-        return self._objects[uri]
-
-
-# ---------------------------------------------------------------------------
-# Gene metadata and config
-# ---------------------------------------------------------------------------
-
-
-class TestMetadata:
-    def test_metadata_fields(self):
-        meta = TeamsGene.metadata()
-        assert meta.name == "teams"
-        assert meta.display_name == "Microsoft Teams"
-        assert meta.data_shape == "message"
-        assert meta.auth_method == "browser_cookie"
-        assert meta.default_sync_interval_minutes == 60
-
-    def test_config_schema_groups(self):
-        schema = TeamsGene.config_schema()
-        group_keys = [g.key for g in schema.groups]
-        assert group_keys == ["connection", "scope", "sync"]
-
-    def test_config_schema_fields(self):
-        schema = TeamsGene.config_schema()
-        field_keys = [f.key for f in schema.fields]
-        assert "region" in field_keys
-        assert "conversation_ids" in field_keys
-        assert "channels" not in field_keys
-        assert "group_chats" not in field_keys
-        assert "individual_chats" not in field_keys
-        assert "initial_history_days" in field_keys
-        assert "rolling_retention_days" in field_keys
-        assert "max_age_days" not in field_keys
-        assert "conversation_gap_minutes" not in field_keys
-        assert "max_block_messages" not in field_keys
-        retention = next(f for f in schema.fields if f.key == "rolling_retention_days")
-        assert retention.options == ["forever", "365", "730", "1095"]
-
-    @pytest.mark.parametrize("retention_days", [365, 730, 1095])
-    def test_normalize_config_accepts_product_retention_presets(self, retention_days: int):
-        config = {
-            "conversation_ids": ["19:chat@example.test"],
-            "rolling_retention_days": retention_days,
-        }
-
-        TeamsGene.normalize_config(config)
-
-        assert config["rolling_retention_days"] == retention_days
-
-    def test_normalize_config_collapses_legacy_direct_selectors(self):
-        config = {
-            "conversation_ids": ["19:chat@example.test"],
-            "channels": ["19:channel@thread.tacv2"],
-            "group_chats": ["19:chat@example.test"],
-            "individual_chats": ["19:person@example.test"],
-        }
-
-        TeamsGene.normalize_config(config)
-
-        assert config == {
-            "conversation_ids": [
-                "19:chat@example.test",
-                "19:channel@thread.tacv2",
-                "19:person@example.test",
-            ],
-            "initial_history_days": 14,
-            "rolling_retention_days": None,
-        }
-
-    def test_normalize_config_rejects_display_name_selectors(self):
-        with pytest.raises(
-            ValueError,
-            match="teams_sync_requires_direct_conversation_ids",
-        ):
-            TeamsGene.normalize_config({"channels": ["Team Name/General"]})
-
-    def test_legacy_max_age_migrates_to_initial_history_without_retention(self):
-        config = {
-            "conversation_ids": ["19:chat@example.test"],
-            "max_age_days": 45,
-            "conversation_gap_minutes": 30,
-            "max_block_messages": 50,
-        }
-
-        TeamsGene.normalize_config(config)
-
-        assert config == {
-            "conversation_ids": ["19:chat@example.test"],
-            "initial_history_days": 45,
-            "rolling_retention_days": None,
-        }
-
-    @pytest.mark.parametrize("selector", ["Payroll: General", "alice@example.com"])
-    def test_normalize_config_rejects_punctuation_that_is_not_provider_identity(
-        self,
-        selector: str,
+def test_normalize_config_rejects_display_name_selectors():
+    with pytest.raises(
+        ValueError,
+        match="teams_sync_requires_direct_conversation_ids",
     ):
-        with pytest.raises(
-            ValueError,
-            match="teams_sync_requires_direct_conversation_ids",
-        ):
-            TeamsGene.normalize_config({"conversation_ids": [selector]})
-
-    def test_internal_window_policy_is_versioned(self):
-        gene = TeamsGene(
-            config={"conversation_ids": ["19:chat@example.test"]},
-            source_id="test",
-        )
-        assert gene._gap_minutes == 60
-        assert gene._window_policy.version == "teams-window-v1"
-
-    def test_initial_history_defaults_to_two_weeks(self):
-        schema = TeamsGene.config_schema()
-        initial_history = next(f for f in schema.fields if f.key == "initial_history_days")
-        assert initial_history.default == "14"
-
-        gene = TeamsGene(
-            config={"conversation_ids": ["19:chat@example.test"]},
-            source_id="test",
-        )
-        assert gene._initial_history_days == 14
-
-    def test_local_agent_package_mode_does_not_require_remote_selectors(self, tmp_path):
-        gene = TeamsGene(
-            config={"local_agent_documents_dir": str(tmp_path)},
-            source_id="test",
-        )
-
-        assert gene._local_agent_documents_dir() == tmp_path
-
-    @pytest.mark.asyncio
-    async def test_authoritative_empty_manifest_does_not_fall_back_to_remote_teams(self):
-        gene = TeamsGene(
-            config={"local_agent_package_manifest": []},
-            source_id="test",
-        )
-
-        await gene.authenticate()
-        items = [item async for item in gene.discover(since=None)]
-
-        assert items == []
-
-    @pytest.mark.asyncio
-    async def test_discovers_local_agent_package_without_remote_selectors(self, tmp_path):
-        package = {
-            "package_kind": "teams_window_document",
-            "doc_id": "teams-doc-1",
-            "title": "PCC Agent Dev",
-            "source_url": "https://teams.microsoft.com/l/message/19:conversation/1",
-            "last_modified": NOW.isoformat(),
-            "space_or_project": "PCC Agent Dev",
-            "version": "sha256:revision-1",
-            "conversation_id": "19:conversation@thread.v2",
-            "root_message_id": "1",
-            "window_id": "teams-block:v1:opaque",
-            "window_type": "time_block",
-            "revision_hash": "sha256:revision-1",
-            "raw_payload": {
-                "conversation_type": "group_chat",
-                "messages": [{"id": "1", "from": "Ada", "content": "Ship it", "time": NOW.isoformat()}],
-            },
-        }
-        (tmp_path / "teams-doc-1.json").write_text(json.dumps(package), encoding="utf-8")
-        gene = TeamsGene(
-            config={"local_agent_documents_dir": str(tmp_path)},
-            source_id="test",
-        )
-
-        items = [item async for item in gene.discover(since=None)]
-
-        assert len(items) == 1
-        assert items[0].item_id == "teams-doc-1"
-        assert items[0].extra["window_id"] == "teams-block:v1:opaque"
-
-    @pytest.mark.asyncio
-    async def test_discovers_and_fetches_document_store_package_manifest(self):
-        window_id = build_teams_window_id(
-            source_id="test",
-            conversation_id="19:conversation@thread.v2",
-            root_or_anchor_message_id="1",
-            window_type="time_block",
-        )
-        doc_id = build_teams_doc_id(source_id="test", window_id=window_id)
-        raw_payload = {
-            "conversation_id": "19:conversation@thread.v2",
-            "window_id": window_id,
-            "conversation_type": "group_chat",
-            "messages": [
-                {
-                    "id": "1",
-                    "from": "Ada",
-                    "content": "Ship it",
-                    "time": NOW.isoformat(),
-                }
-            ],
-        }
-        semantic_hash = hashlib.sha256(
-            json.dumps(
-                raw_payload,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()
-        package = {
-            "package_kind": "teams_window_document",
-            "doc_id": doc_id,
-            "title": "PCC Agent Dev",
-            "source_url": "https://teams.microsoft.com/l/message/19:conversation/1",
-            "last_modified": NOW.isoformat(),
-            "space_or_project": "PCC Agent Dev",
-            "version": "sha256:revision-1",
-            "conversation_id": "19:conversation@thread.v2",
-            "root_message_id": "1",
-            "window_id": window_id,
-            "window_type": "time_block",
-            "revision_hash": "sha256:revision-1",
-            "raw_hash": semantic_hash,
-            "semantic_hash": semantic_hash,
-            "raw_payload": raw_payload,
-        }
-        store = FakeDocumentStore()
-        package_body = json.dumps(package).encode("utf-8")
-        package_uri = store.store_raw(
-            "PCC Agent Dev",
-            "teams-doc-1",
-            "teams-doc-1-package",
-            package_body,
-            "application/json",
-            extension=".teams-package.json",
-        )
-        gene = TeamsGene(
-            config={
-                "local_agent_package_manifest": [
-                    {
-                        "doc_id": doc_id,
-                        "title": "PCC Agent Dev",
-                        "source_url": package["source_url"],
-                        "last_modified": NOW.isoformat(),
-                        "space_or_project": "PCC Agent Dev",
-                        "version": "sha256:revision-1",
-                        "conversation_id": "19:conversation@thread.v2",
-                        "root_message_id": "1",
-                        "window_id": window_id,
-                        "window_type": "time_block",
-                        "revision_hash": "sha256:revision-1",
-                        "package_uri": package_uri,
-                        "package_sha256": hashlib.sha256(package_body).hexdigest(),
-                        "input_sha256": local_agent_semantic_input_sha256(doc_id, semantic_hash),
-                    }
-                ]
-            },
-            source_id="test",
-        )
-        gene.bind_document_store(store)
-
-        items = [item async for item in gene.discover(since=None)]
-        raw = await gene.fetch(items[0])
-        normalized = await gene.normalize(raw)
-
-        assert len(items) == 1
-        assert items[0].extra["package_uri"] == package_uri
-        assert b"teams_window_document" in raw.body
-        assert "Ship it" in normalized.markdown_body
-
-    @pytest.mark.asyncio
-    async def test_complete_poll_tombstone_package_normalizes_to_authoritative_empty(self):
-        conversation_id = "19:conversation@thread.v2"
-        window_id = build_teams_window_id(
-            source_id="test",
-            conversation_id=conversation_id,
-            root_or_anchor_message_id="1",
-            window_type="time_block",
-        )
-        doc_id = build_teams_doc_id(source_id="test", window_id=window_id)
-        raw_payload = {
-            "conversation_id": conversation_id,
-            "window_id": window_id,
-            "messages": [],
-            "_authoritative_snapshot": True,
-            "_tombstone": True,
-            "tombstone_reason": "not_returned_by_complete_conversation_poll",
-        }
-        semantic_hash = hashlib.sha256(
-            json.dumps(
-                raw_payload,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()
-        package = {
-            "package_kind": "teams_window_document",
-            "doc_id": doc_id,
-            "title": "Removed window",
-            "source_url": "https://teams.microsoft.com/l/message/removed",
-            "last_modified": NOW.isoformat(),
-            "version": semantic_hash,
-            "conversation_id": conversation_id,
-            "root_message_id": "1",
-            "window_id": window_id,
-            "window_type": "time_block",
-            "revision_hash": semantic_hash,
-            "raw_hash": semantic_hash,
-            "semantic_hash": semantic_hash,
-            "raw_payload": raw_payload,
-        }
-        package_body = json.dumps(package).encode("utf-8")
-        store = FakeDocumentStore()
-        package_uri = store.store_raw(
-            "test",
-            "removed-window",
-            "removed-window-package",
-            package_body,
-            "application/json",
-        )
-        gene = TeamsGene(
-            config={
-                "local_agent_package_manifest": [
-                    {
-                        "doc_id": doc_id,
-                        "title": package["title"],
-                        "source_url": package["source_url"],
-                        "last_modified": NOW.isoformat(),
-                        "version": semantic_hash,
-                        "conversation_id": conversation_id,
-                        "root_message_id": "1",
-                        "window_id": window_id,
-                        "window_type": "time_block",
-                        "revision_hash": semantic_hash,
-                        "package_uri": package_uri,
-                        "package_sha256": hashlib.sha256(package_body).hexdigest(),
-                        "input_sha256": local_agent_semantic_input_sha256(doc_id, semantic_hash),
-                    }
-                ]
-            },
-            source_id="test",
-        )
-        gene.bind_document_store(store)
-
-        items = [item async for item in gene.discover(since=None)]
-        raw = await gene.fetch(items[0])
-        normalized = await gene.normalize(raw)
-
-        assert raw.authoritative_empty is True
-        assert raw.empty_evidence == "teams_complete_conversation_poll_window_tombstone"
-        assert normalized.markdown_body == ""
-        assert normalized.source_semantics["tombstone_reason"] == raw_payload["tombstone_reason"]
-
-        # Stored input keeps the package bytes and an item without discovery
-        # metadata; the tombstone attests the empty window from the bytes alone.
-        stored_item = replace(items[0], extra={})
-        stored_raw = gene.raw_from_stored_input(stored_item, package_body, "application/json")
-        stored_normalized = await gene.normalize(stored_raw)
-        require_attested_content(stored_raw, stored_normalized)
-        assert (stored_raw.authoritative_empty, stored_raw.empty_evidence) == (
-            raw.authoritative_empty,
-            raw.empty_evidence,
-        )
-        assert stored_raw.artifacts == ()
-        assert stored_normalized.markdown_body == ""
-        # Bytes that are not a Teams window package attest nothing, even with a tombstone marker.
-        unpackaged = gene.raw_from_stored_input(stored_item, json.dumps(raw_payload).encode("utf-8"), "application/json")
-        assert (unpackaged.authoritative_empty, unpackaged.empty_evidence) == (False, None)
-
-    def test_numeric_fields_use_integer_type(self):
-        schema = TeamsGene.config_schema()
-        numeric_fields = {"initial_history_days"}
-        for f in schema.fields:
-            if f.key in numeric_fields:
-                assert f.field_type == ConfigFieldType.INTEGER, f"Field {f.key} should be INTEGER"
-
-    def test_config_validation_rejects_empty_scope(self):
-        with pytest.raises(ValueError, match="teams_sync_requires_direct_conversation_ids"):
-            TeamsGene(config={"region": "emea"}, source_id="test")
-
-    def test_config_accepts_channels_only(self):
-        gene = TeamsGene(
-            config={"channels": "19:channel@thread.tacv2"},
-            source_id="test",
-        )
-        assert gene.source_id == "test"
-
-    def test_config_accepts_direct_conversation_ids(self):
-        gene = TeamsGene(
-            config={"conversation_ids": "19:group@thread.v2"},
-            source_id="test",
-        )
-
-        assert gene.source_id == "test"
-
-    @pytest.mark.asyncio
-    async def test_direct_conversation_ids_infer_type_when_browse_metadata_is_missing(self):
-        gene = TeamsGene(
-            config={
-                "conversation_ids": [
-                    "19:channel@thread.tacv2",
-                    "19:dm@unq.gbl.spaces",
-                    "19:group@thread.v2",
-                ]
-            },
-            source_id="test",
-        )
-
-        resolved = await gene._resolve_configured_conversations({})
-
-        assert [metadata["type"] for _, metadata in resolved] == [
-            "channel",
-            "individual_chat",
-            "group_chat",
-        ]
+        TeamsGene.normalize_config({"channels": ["Team Name/General"]})
 
 
-# ---------------------------------------------------------------------------
-# Conversation block grouping
-# ---------------------------------------------------------------------------
+def test_legacy_max_age_migrates_to_initial_history_without_retention():
+    config = {
+        "conversation_ids": ["19:chat@example.test"],
+        "max_age_days": 45,
+        "conversation_gap_minutes": 30,
+        "max_block_messages": 50,
+    }
+
+    TeamsGene.normalize_config(config)
+
+    assert config == {
+        "conversation_ids": ["19:chat@example.test"],
+        "initial_history_days": 45,
+        "rolling_retention_days": None,
+    }
 
 
-class TestBlockGrouping:
-    def test_empty_messages(self):
-        assert _group_into_blocks([], gap_minutes=180) == []
-
-    def test_single_message(self):
-        msgs = [_msg("1", "Alice", "Hello", NOW)]
-        blocks = _group_into_blocks(msgs, gap_minutes=180)
-        assert len(blocks) == 1
-        assert len(blocks[0]) == 1
-
-    def test_messages_within_gap_form_one_block(self):
-        msgs = [
-            _msg("1", "Alice", "Hello", NOW),
-            _msg("2", "Bob", "Hi there", NOW + timedelta(minutes=5)),
-            _msg("3", "Alice", "How are you?", NOW + timedelta(minutes=10)),
-        ]
-        blocks = _group_into_blocks(msgs, gap_minutes=180)
-        assert len(blocks) == 1
-        assert len(blocks[0]) == 3
-
-    def test_gap_splits_into_two_blocks(self):
-        msgs = [
-            _msg("1", "Alice", "Morning discussion", NOW),
-            _msg("2", "Bob", "Agreed", NOW + timedelta(minutes=30)),
-            # 4-hour gap
-            _msg("3", "Alice", "Afternoon update", NOW + timedelta(hours=5)),
-            _msg("4", "Carol", "Got it", NOW + timedelta(hours=5, minutes=10)),
-        ]
-        blocks = _group_into_blocks(msgs, gap_minutes=180)
-        assert len(blocks) == 2
-        assert len(blocks[0]) == 2
-        assert len(blocks[1]) == 2
-
-    def test_context_budget_does_not_split_durable_window_identity(self):
-        msgs = [_msg(str(i), "Alice", f"Message {i}", NOW + timedelta(minutes=i)) for i in range(10)]
-        blocks = _group_into_blocks(msgs, gap_minutes=180)
-        assert len(blocks) == 1
-        assert len(blocks[0]) == 10
-
-    def test_messages_sorted_by_time(self):
-        msgs = [
-            _msg("3", "Carol", "Third", NOW + timedelta(minutes=20)),
-            _msg("1", "Alice", "First", NOW),
-            _msg("2", "Bob", "Second", NOW + timedelta(minutes=10)),
-        ]
-        blocks = _group_into_blocks(msgs, gap_minutes=180)
-        assert len(blocks) == 1
-        assert blocks[0][0]["id"] == "1"
-        assert blocks[0][1]["id"] == "2"
-        assert blocks[0][2]["id"] == "3"
-
-    def test_exact_gap_does_not_split_block(self):
-        msgs = [
-            _msg("1", "Alice", "First", NOW),
-            _msg("2", "Bob", "Exactly one hour later", NOW + timedelta(minutes=60)),
-        ]
-
-        blocks = _group_into_blocks(msgs, gap_minutes=60)
-
-        assert [[msg["id"] for msg in block] for block in blocks] == [["1", "2"]]
+@pytest.mark.parametrize("selector", ["Payroll: General", "alice@example.com"])
+def test_normalize_config_rejects_punctuation_that_is_not_provider_identity(
+    selector: str,
+):
+    with pytest.raises(
+        ValueError,
+        match="teams_sync_requires_direct_conversation_ids",
+    ):
+        TeamsGene.normalize_config({"conversation_ids": [selector]})
 
 
-class TestMessageParsing:
-    def test_parse_conversations_preserves_channel_team_identity(self):
-        client = _TeamsAPIClient(region="emea")
+def test_numeric_fields_use_integer_type():
+    schema = TeamsGene.config_schema()
+    numeric_fields = {"initial_history_days"}
+    for f in schema.fields:
+        if f.key in numeric_fields:
+            assert f.field_type == ConfigFieldType.INTEGER, f"Field {f.key} should be INTEGER"
 
-        [conversation] = client._parse_conversations(
-            {
-                "conversations": [
-                    {
-                        "id": "19:channel@thread.tacv2",
-                        "threadProperties": {
-                            "topic": "Architecture",
-                            "groupId": "team-1",
-                        },
-                        "lastActivity": "2026-04-15T12:00:00Z",
-                    }
-                ]
-            }
-        )
 
-        assert conversation["type"] == "channel"
-        assert conversation["team_id"] == "team-1"
+def test_config_validation_rejects_empty_scope():
+    with pytest.raises(ValueError, match="teams_sync_requires_direct_conversation_ids"):
+        TeamsGene(config={"region": "emea"}, source_id="test")
 
-    @pytest.mark.asyncio
-    async def test_request_raises_auth_error_without_retry_on_401(self):
-        client = _TeamsAPIClient(region="emea")
-        calls = 0
 
-        class FakeClient:
-            async def request(self, method: str, url: str, **kwargs):
-                nonlocal calls
-                calls += 1
-                request = httpx.Request(method, f"https://teams.cloud.microsoft{url}")
-                return httpx.Response(
-                    401,
-                    json={"errorCode": 911, "message": "Authentication failed."},
-                    request=request,
-                )
-
-        with pytest.raises(AuthenticationError, match="Teams session expired"):
-            await client._request(FakeClient(), "GET", "/conversations")
-
-        assert calls == 1
-
-    @pytest.mark.asyncio
-    async def test_request_retries_remote_protocol_error(self, monkeypatch):
-        client = _TeamsAPIClient(region="emea")
-        calls = 0
-
-        async def no_sleep(_delay: float) -> None:
-            return None
-
-        monkeypatch.setattr("memforge.pipeline.retry.asyncio.sleep", no_sleep)
-
-        class FakeClient:
-            async def request(self, method: str, url: str, **kwargs):
-                nonlocal calls
-                calls += 1
-                request = httpx.Request(method, f"https://teams.cloud.microsoft{url}")
-                if calls == 1:
-                    raise httpx.RemoteProtocolError(
-                        "Server disconnected without sending a response.",
-                        request=request,
-                    )
-                return httpx.Response(200, json={"conversations": []}, request=request)
-
-        response = await client._request(FakeClient(), "GET", "/conversations")
-
-        assert response.status_code == 200
-        assert calls == 2
-
-    @pytest.mark.asyncio
-    async def test_validate_uses_retrying_request(self):
-        client = _TeamsAPIClient(region="emea")
-        client._ensure_clients = AsyncMock()
-        client._chat_client = object()
-        client._request = AsyncMock(
-            return_value=httpx.Response(
-                200,
-                json={"conversations": []},
-                request=httpx.Request("GET", "https://teams.cloud.microsoft/conversations"),
-            )
-        )
-
-        await client.validate()
-
-        client._request.assert_awaited_once()
-
-    def test_parse_message_preserves_real_rest_root_message_id(self):
-        client = _TeamsAPIClient(region="emea")
-
-        parsed = client._parse_message(
-            {
-                "id": "reply-1",
-                "rootMessageId": "root-1",
-                "conversationid": "19:channel@example",
-                "imdisplayname": "Alice",
-                "content": "<p>Confirmed</p>",
-                "messagetype": "RichText/Html",
-                "composetime": "2026-04-15T12:00:00Z",
-            }
-        )
-
-        assert parsed is not None
-        assert parsed["id"] == "reply-1"
-        assert parsed["rootMessageId"] == "root-1"
-        assert parsed["conversationid"] == "19:channel@example"
-
-    def test_parse_message_preserves_only_official_hosted_content_ids(self):
-        client = _TeamsAPIClient(region="emea")
-
-        parsed = client._parse_message(
-            {
-                "id": "message-1",
-                "conversationid": "19:chat@example",
-                "imdisplayname": "Alice",
-                "content": (
-                    "<p>Architecture:</p>"
-                    '<img src="https://graph.microsoft.com/v1.0/chats/19:chat@example/'
-                    'messages/message-1/hostedContents/hosted-1/$value">'
-                    '<img src="../hostedContents/hosted-2/$value">'
-                    '<img src="https://example.test/unrelated.png">'
-                ),
-                "messagetype": "RichText/Html",
-                "composetime": "2026-04-15T12:00:00Z",
-            }
-        )
-
-        assert parsed is not None
-        assert parsed["hosted_content_ids"] == ["hosted-1", "hosted-2"]
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("conversation_type", "team_id", "root_message_id", "expected_path"),
-        [
-            (
-                "group_chat",
-                None,
-                None,
-                "/chats/19%3Achat%40example/messages/message-1/hostedContents/hosted-1/$value",
-            ),
-            (
-                "channel",
-                "team-1",
-                "message-1",
-                "/teams/team-1/channels/19%3Achannel%40example/messages/message-1/hostedContents/hosted-1/$value",
-            ),
-            (
-                "channel",
-                "team-1",
-                "root-1",
-                "/teams/team-1/channels/19%3Achannel%40example/messages/root-1/replies/message-1/"
-                "hostedContents/hosted-1/$value",
-            ),
-        ],
+def test_config_accepts_channels_only():
+    gene = TeamsGene(
+        config={"channels": "19:channel@thread.tacv2"},
+        source_id="test",
     )
-    async def test_get_hosted_content_uses_exact_graph_value_route(
-        self,
-        conversation_type,
-        team_id,
-        root_message_id,
-        expected_path,
-    ):
-        client = _TeamsAPIClient(region="emea")
-        client._ensure_clients = AsyncMock()
-        client._graph_client = object()
-        client._request_bytes = AsyncMock(
-            return_value=(
-                b"\x89PNG\r\n\x1a\nhosted",
-                {"content-type": "image/png", "content-length": "14"},
-            )
+    assert gene.source_id == "test"
+
+
+def test_config_accepts_direct_conversation_ids():
+    gene = TeamsGene(
+        config={"conversation_ids": "19:group@thread.v2"},
+        source_id="test",
+    )
+
+    assert gene.source_id == "test"
+
+
+def test_initial_history_cannot_reach_past_rolling_retention():
+    with pytest.raises(ValueError, match="cannot reach back further"):
+        TeamsGene.normalize_config(
+            {"conversation_ids": ["19:chat@example.test"], "initial_history_days": 400, "rolling_retention_days": 365}
         )
 
-        content, media_type = await client.get_hosted_content(
-            conversation_id=("19:channel@example" if conversation_type == "channel" else "19:chat@example"),
-            message_id="message-1",
-            hosted_content_id="hosted-1",
-            conversation_type=conversation_type,
-            team_id=team_id,
-            root_message_id=root_message_id,
-        )
 
-        assert content == b"\x89PNG\r\n\x1a\nhosted"
-        assert media_type == "image/png"
-        client._request_bytes.assert_awaited_once_with(
-            client._graph_client,
-            expected_path,
-            max_bytes=MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
-        )
+def test_the_selection_is_the_configured_conversations_and_time_scope():
+    gene = TeamsGene(
+        config={"conversation_ids": ["19:a@thread.v2", "19:b@thread.v2"], "rolling_retention_days": 365},
+        source_id="src",
+    )
 
-    @pytest.mark.asyncio
-    async def test_get_hosted_content_requires_graph_capability_before_network_request(
-        self,
-        monkeypatch,
-    ):
-        from memforge.auth.teams_auth import CHAT_API_AUDIENCE, TeamsAuthenticator
+    selection = gene.conversation_selection()
 
-        monkeypatch.setattr(
-            TeamsAuthenticator,
-            "load_tokens",
-            staticmethod(
-                lambda: {
-                    CHAT_API_AUDIENCE: {
-                        "token": "chat-token",
-                        "expiresAt": 4_102_444_800,
-                    }
-                }
-            ),
-        )
-        client = _TeamsAPIClient(region="emea")
-        client._request_bytes = AsyncMock(
-            side_effect=AssertionError(
-                "hosted-content retrieval must not send a Chat token to Microsoft Graph"
-            )
-        )
+    assert selection.conversation_ids == ("19:a@thread.v2", "19:b@thread.v2")
+    assert selection.initial_history_days == 14
+    assert selection.rolling_retention_days == 365
+    assert gene.selected_conversation_ids({"conversation_ids": ["19:a@thread.v2"]}) == ("19:a@thread.v2",)
 
-        with pytest.raises(
-            AuthenticationError,
-            match="requires Microsoft Graph access",
-        ):
-            await client.get_hosted_content(
-                conversation_id="19:chat@example",
-                message_id="message-1",
-                hosted_content_id="hosted-1",
-                conversation_type="group_chat",
-                team_id=None,
-            )
 
-        client._request_bytes.assert_not_awaited()
-        await client.close()
+def _window_package(window_id: str, messages: list[dict]) -> bytes:
+    """A window package as a local agent uploaded it before Teams joined the conversation layer."""
 
-    @pytest.mark.asyncio
-    async def test_graph_only_resolution_requires_graph_capability(
-        self,
-        monkeypatch,
-    ):
-        from memforge.auth.teams_auth import CHAT_API_AUDIENCE, TeamsAuthenticator
-
-        monkeypatch.setattr(
-            TeamsAuthenticator,
-            "load_tokens",
-            staticmethod(
-                lambda: {
-                    CHAT_API_AUDIENCE: {
-                        "token": "chat-token",
-                        "expiresAt": 4_102_444_800,
-                    }
-                }
-            ),
-        )
-        client = _TeamsAPIClient(region="emea")
-
-        with pytest.raises(
-            AuthenticationError,
-            match="Team resolution requires Microsoft Graph access",
-        ):
-            await client.get_joined_teams()
-
-        await client.close()
-
-    @pytest.mark.asyncio
-    async def test_request_bytes_stops_before_buffering_oversized_body(self):
-        client = _TeamsAPIClient(region="emea")
-        chunks_read = 0
-
-        class FakeResponse:
-            status_code = 200
-            headers = {"content-type": "image/png"}
-            request = httpx.Request("GET", "https://graph.microsoft.com/hosted")
-
-            async def aiter_bytes(self):
-                nonlocal chunks_read
-                for chunk in (b"1234", b"5678", b"not-read"):
-                    chunks_read += 1
-                    yield chunk
-
-            def raise_for_status(self):
-                return None
-
-        class FakeStream:
-            async def __aenter__(self):
-                return FakeResponse()
-
-            async def __aexit__(self, exc_type, exc, traceback):
-                return None
-
-        class FakeClient:
-            def stream(self, method: str, url: str):
-                assert method == "GET"
-                assert url == "/hosted"
-                return FakeStream()
-
-        with pytest.raises(SourceArtifactContractError, match="storage limit"):
-            await client._request_bytes(FakeClient(), "/hosted", max_bytes=6)
-
-        assert chunks_read == 2
-
-    @pytest.mark.asyncio
-    async def test_get_messages_until_keeps_newer_messages_after_old_row_in_same_page(self):
-        client = _TeamsAPIClient(region="emea")
-        client._ensure_clients = AsyncMock()
-        client._chat_client = object()
-
-        old_time = NOW - timedelta(days=2)
-        new_time = NOW
-        cutoff = NOW - timedelta(days=1)
-
-        response = MagicMock()
-        response.json.return_value = {
-            "_metadata": {
-                "backwardLink": "https://teams.cloud.microsoft/opaque/backward",
-            },
-            "messages": [
-                {
-                    "id": "old",
-                    "conversationid": "19:conversation@thread.tacv2",
-                    "content": "<p>too old</p>",
-                    "messagetype": "RichText/Html",
-                    "composetime": old_time.isoformat(),
-                },
-                {
-                    "id": "new",
-                    "conversationid": "19:conversation@thread.tacv2",
-                    "content": "<p>keep me</p>",
-                    "messagetype": "RichText/Html",
-                    "composetime": new_time.isoformat(),
-                },
-            ],
-        }
-        client._request = AsyncMock(return_value=response)
-
-        messages = await client.get_messages_until("19:conversation@thread.tacv2", cutoff)
-
-        assert [message["id"] for message in messages] == ["new"]
-        audits = client.get_poll_audits()
-        assert audits[0]["raw_messages_seen"] == 2
-        assert audits[0]["selected_message_keys_seen"] == 1
-        assert audits[0]["parse_filtered_messages"] == 1
-        assert audits[0]["stop_reason"] == "no_backward_link"
-        assert audits[0]["pagination_complete"] is True
-
-    @pytest.mark.asyncio
-    async def test_get_messages_until_uses_time_cursor_instead_of_backward_link(
-        self,
-        monkeypatch,
-    ):
-        client = _TeamsAPIClient(region="emea")
-        client._ensure_clients = AsyncMock()
-        client._chat_client = object()
-        monkeypatch.setattr("memforge.genes.teams_gene._MAX_PAGE_SIZE", 2)
-        monkeypatch.setattr("memforge.genes.teams_gene.asyncio.sleep", AsyncMock())
-
-        def response(messages: list[dict], backward_link: str) -> MagicMock:
-            value = MagicMock()
-            value.json.return_value = {
-                "_metadata": {"backwardLink": backward_link},
-                "messages": messages,
-            }
-            return value
-
-        def message(message_id: str, created_at: datetime) -> dict:
-            return {
-                "id": message_id,
-                "conversationid": "19:conversation@thread.v2",
-                "content": f"<p>{message_id}</p>",
-                "messagetype": "RichText/Html",
-                "composetime": created_at.isoformat(),
-            }
-
-        newest = NOW
-        older = NOW - timedelta(hours=1)
-        before_cutoff = NOW - timedelta(days=15)
-        client._request = AsyncMock(
-            side_effect=[
-                response(
-                    [message("newest", newest), message("older", older)],
-                    "https://teams.cloud.microsoft/repeated-page",
-                ),
-                response(
-                    [message("before-cutoff", before_cutoff)],
-                    "https://teams.cloud.microsoft/repeated-page",
-                ),
-            ]
-        )
-
-        messages = await client.get_messages_until(
-            "19:conversation@thread.v2",
-            NOW - timedelta(days=14),
-        )
-
-        assert [message["id"] for message in messages] == ["newest", "older"]
-        assert client._request.await_count == 2
-        second_request = client._request.await_args_list[1]
-        assert second_request.args[2] == "/conversations/19:conversation@thread.v2/messages"
-        assert second_request.kwargs["params"] == {
-            "pageSize": 2,
-            "view": "msnp24Equivalent",
-            "startTime": 0,
-            "endTime": int(older.timestamp() * 1000) - 1,
-        }
-        audits = client.get_poll_audits()
-        assert audits[0]["duplicate_raw_messages"] == 0
-        assert audits[0]["stop_reason"] == "cutoff_reached"
-        assert audits[0]["pagination_complete"] is False
-
-    @pytest.mark.asyncio
-    async def test_get_messages_until_fails_closed_when_time_cursor_does_not_advance(
-        self,
-        monkeypatch,
-    ):
-        client = _TeamsAPIClient(region="emea")
-        client._ensure_clients = AsyncMock()
-        client._chat_client = object()
-        monkeypatch.setattr("memforge.genes.teams_gene._MAX_PAGE_SIZE", 1)
-        monkeypatch.setattr("memforge.genes.teams_gene.asyncio.sleep", AsyncMock())
-
-        response = MagicMock()
-        response.json.return_value = {
-            "messages": [
-                {
-                    "id": "same-boundary",
-                    "conversationid": "19:conversation@thread.v2",
-                    "content": "<p>same boundary</p>",
-                    "messagetype": "RichText/Html",
-                    "composetime": NOW.isoformat(),
-                }
-            ]
-        }
-        client._request = AsyncMock(side_effect=[response, response])
-
-        with pytest.raises(TeamsMessagePaginationError, match="did not advance"):
-            await client.get_messages_until(
-                "19:conversation@thread.v2",
-                NOW - timedelta(days=14),
-            )
-
-        audit = client.get_poll_audits()[0]
-        assert audit["stop_reason"] == "non_advancing_time_cursor"
-        assert audit["pagination_complete"] is False
-
-    @pytest.mark.asyncio
-    async def test_message_page_schema_error_never_proves_empty_conversation(self):
-        client = _TeamsAPIClient(region="emea")
-        client._ensure_clients = AsyncMock()
-        client._chat_client = object()
-        response = MagicMock()
-        response.json.return_value = {"error": {"code": "TransientShapeDrift"}}
-        client._request = AsyncMock(return_value=response)
-
-        with pytest.raises(ValueError, match="explicit messages list"):
-            await client.get_messages("19:conversation@thread.v2")
-
-        audits = client.get_poll_audits()
-        assert audits[0]["pagination_complete"] is False
-        assert audits[0]["stop_reason"] == "invalid_message_page_schema"
-        assert audits[0]["raw_messages_seen"] == 0
-
-    @pytest.mark.asyncio
-    async def test_content_message_without_source_timestamp_never_proves_bounded_absence(
-        self,
-    ):
-        client = _TeamsAPIClient(region="emea")
-        client._ensure_clients = AsyncMock()
-        client._chat_client = object()
-        response = MagicMock()
-        response.json.return_value = {"messages": [{"id": "m1", "content": "still present"}]}
-        client._request = AsyncMock(return_value=response)
-
-        with pytest.raises(ValueError, match="stable id or source timestamp"):
-            await client.get_messages_until(
-                "19:conversation@thread.v2",
-                NOW - timedelta(days=14),
-            )
-
-        audit = client.get_poll_audits()[0]
-        assert audit["pagination_complete"] is False
-        assert audit["stop_reason"] == "invalid_message_record_schema"
-        assert "absence_covered_from" not in audit
-        assert "absence_covered_to" not in audit
-
-    @pytest.mark.asyncio
-    async def test_text_message_without_content_never_proves_complete_absence(self):
-        client = _TeamsAPIClient(region="emea")
-        client._ensure_clients = AsyncMock()
-        client._chat_client = object()
-        response = MagicMock()
-        response.json.return_value = {
-            "messages": [
-                {
-                    "id": "m1",
-                    "messagetype": "Text",
-                    "composetime": NOW.isoformat(),
-                }
-            ]
-        }
-        client._request = AsyncMock(return_value=response)
-
-        with pytest.raises(ValueError, match="missing content"):
-            await client.get_messages("19:conversation@thread.v2")
-
-        audit = client.get_poll_audits()[0]
-        assert audit["pagination_complete"] is False
-        assert audit["stop_reason"] == "invalid_message_record_schema"
-
-    def test_poll_audit_records_raw_page_counts_without_message_content(self):
-        client = _TeamsAPIClient(region="emea")
-
-        parsed_messages = [
-            {
-                "id": "1783500000001",
-                "conversationid": "19:conversation@thread.tacv2",
-                "rootMessageId": "1783500000000",
-                "content": "normalized content",
-                "time": NOW,
-            },
-            {
-                "id": "1783500000002",
-                "conversationid": "19:conversation@thread.tacv2",
-                "rootMessageId": "1783500000000",
-                "content": "second normalized content",
-                "time": NOW + timedelta(minutes=1),
-            },
-        ]
-        client._record_message_poll_page(
-            "19:conversation@thread.tacv2",
-            {
-                "_metadata": {"backwardLink": "https://teams.cloud.microsoft/opaque/backward"},
-                "messages": [
-                    {
-                        "id": "1783500000001",
-                        "conversationid": "19:conversation@thread.tacv2",
-                        "rootMessageId": "1783500000000",
-                        "content": "<p>normalized content</p>",
-                        "composetime": NOW.isoformat(),
-                    },
-                    {
-                        "id": "1783500000001",
-                        "conversationid": "19:conversation@thread.tacv2",
-                        "rootMessageId": "1783500000000",
-                        "content": "<p>duplicate page row</p>",
-                        "composetime": NOW.isoformat(),
-                    },
-                    {
-                        "id": "1783500000002",
-                        "conversationid": "19:conversation@thread.tacv2",
-                        "rootMessageId": "1783500000000",
-                        "content": "<p>second normalized content</p>",
-                        "composetime": (NOW + timedelta(minutes=1)).isoformat(),
-                    },
-                ],
-            },
-            parsed_messages,
-        )
-        client.record_poll_ledger_actions(
-            "19:conversation@thread.tacv2",
-            {"new": 1, "updated": 0, "unchanged": 1},
-        )
-        client.mark_poll_complete("19:conversation@thread.tacv2", stop_reason="gap_boundary")
-
-        audits = client.get_poll_audits()
-
-        assert len(audits) == 1
-        assert audits[0]["raw_conversation_id"] == "19:conversation@thread.tacv2"
-        assert audits[0]["raw_messages_seen"] == 3
-        assert audits[0]["unique_message_keys_seen"] == 2
-        assert audits[0]["duplicate_raw_messages"] == 1
-        assert audits[0]["page_count"] == 1
-        assert audits[0]["metadata_backward_link"] == "https://teams.cloud.microsoft/opaque/backward"
-        assert audits[0]["upsert_new"] == 1
-        assert audits[0]["upsert_unchanged"] == 1
-        assert "normalized content" not in json.dumps(audits[0])
-
-
-# ---------------------------------------------------------------------------
-# Discovery
-# ---------------------------------------------------------------------------
-
-
-class TestDiscover:
-    @pytest.fixture
-    def gene(self):
-        gene = TeamsGene(
-            config={"conversation_ids": ["19:abc@thread.tacv2"]},
-            source_id="teams-test",
-        )
-        gene._client = MagicMock(spec=_TeamsAPIClient)
-        return gene
-
-    @pytest.mark.asyncio
-    async def test_skips_inactive_conversations(self, gene):
-        """Conversations with no activity since last sync are skipped entirely."""
-        gene._client.list_conversations = AsyncMock(
-            return_value=[
-                {
-                    "id": "19:abc@thread.tacv2",
-                    "topic": "architecture",
-                    "lastActivity": NOW - timedelta(hours=2),
-                    "type": "channel",
-                }
-            ]
-        )
-        gene._resolve_channel = AsyncMock(return_value="19:abc@thread.tacv2")
-
-        since = NOW - timedelta(hours=1)
-        items = []
-        async for item in gene.discover(since=since):
-            items.append(item)
-
-        assert len(items) == 0
-
-    @pytest.mark.asyncio
-    async def test_discovers_threads_from_channel(self, gene):
-        """Messages with rootMessageId are grouped into threads."""
-        conv_id = "19:abc@thread.tacv2"
-        gene._client.list_conversations = AsyncMock(
-            return_value=[
-                {
-                    "id": conv_id,
-                    "topic": "architecture",
-                    "lastActivity": NOW,
-                    "type": "channel",
-                    "channel_name": "architecture",
-                    "team_name": "Engineering",
-                }
-            ]
-        )
-        gene._resolve_channel = AsyncMock(return_value=conv_id)
-
-        root = _msg("root1", "Alice", "Should we use gRPC?", NOW - timedelta(minutes=30))
-        root["rootMessageId"] = "root1"
-        reply1 = _msg("r1", "Bob", "Yes, gRPC fits well", NOW - timedelta(minutes=20))
-        reply1["rootMessageId"] = "root1"
-        reply2 = _msg("r2", "Alice", "Confirmed, going with gRPC", NOW - timedelta(minutes=10))
-        reply2["rootMessageId"] = "root1"
-
-        gene._fetch_with_context = AsyncMock(return_value=[root, reply1, reply2])
-
-        items = []
-        async for item in gene.discover(since=None):
-            items.append(item)
-
-        assert len(items) == 1
-        assert "root1" in items[0].item_id
-        assert items[0].extra["is_thread"] is True
-        assert items[0].extra["message_count"] == 3
-        gene._client.get_thread_messages = AsyncMock(
-            side_effect=AssertionError("fetch must reuse the complete paginated conversation corpus")
-        )
-        raw = await gene.fetch(items[0])
-        assert len(json.loads(raw.body)["messages"]) == 3
-        gene._client.get_thread_messages.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_discovers_blocks_from_flat_messages(self, gene):
-        """Unthreaded messages are grouped into conversation blocks."""
-        conv_id = "19:abc@thread.tacv2"
-        gene._client.list_conversations = AsyncMock(
-            return_value=[
-                {
-                    "id": conv_id,
-                    "topic": "architecture",
-                    "lastActivity": NOW,
-                    "type": "channel",
-                    "channel_name": "architecture",
-                    "team_name": "Engineering",
-                }
-            ]
-        )
-        gene._resolve_channel = AsyncMock(return_value=conv_id)
-
-        msgs = [
-            _msg("1", "Alice", "Morning standup notes", NOW - timedelta(hours=5)),
-            _msg("2", "Bob", "I'll take the migration task", NOW - timedelta(hours=5) + timedelta(minutes=5)),
-            # Gap of 4 hours
-            _msg("3", "Carol", "Afternoon: deploy looks good", NOW - timedelta(hours=1)),
-            _msg("4", "Alice", "Confirmed, merging", NOW - timedelta(minutes=30)),
-        ]
-        gene._fetch_with_context = AsyncMock(return_value=msgs)
-
-        items = []
-        async for item in gene.discover(since=None):
-            items.append(item)
-
-        assert len(items) == 2  # two blocks split by 4-hour gap
-        assert all(item.extra["is_thread"] is False for item in items)
-
-    @pytest.mark.asyncio
-    async def test_discover_times_out_stuck_conversation_fetch(self, gene):
-        conv_id = "19:abc@thread.tacv2"
-        gene.config = {"group_chats": [conv_id]}
-        gene._conversation_fetch_timeout_seconds = 0.05
-        gene._client.list_conversations = AsyncMock(
-            return_value=[
-                {
-                    "id": conv_id,
-                    "topic": "architecture",
-                    "lastActivity": NOW,
-                    "type": "group_chat",
-                }
-            ]
-        )
-        gene._client.mark_poll_incomplete = MagicMock()
-
-        async def never_returns(conv_id, since):
-            await asyncio.sleep(30)
-            return []
-
-        gene._fetch_with_context = never_returns
-
-        with pytest.raises(RuntimeError, match="Teams sync could not fetch any configured conversations"):
-            async for _ in gene.discover(since=None):
-                pass
-
-        gene._client.mark_poll_incomplete.assert_called_once_with(
-            conv_id,
-            stop_reason="fetch_timeout",
-        )
-
-    @pytest.mark.asyncio
-    async def test_discover_skips_one_timed_out_conversation_and_continues(self, gene):
-        stuck_id = "19:stuck@thread.v2"
-        ok_id = "19:ok@thread.v2"
-        gene.config = {"group_chats": [stuck_id, ok_id]}
-        gene._conversation_fetch_timeout_seconds = 0.05
-        gene._client.list_conversations = AsyncMock(
-            return_value=[
-                {
-                    "id": stuck_id,
-                    "topic": "stuck",
-                    "lastActivity": NOW,
-                    "type": "group_chat",
-                },
-                {
-                    "id": ok_id,
-                    "topic": "ok",
-                    "lastActivity": NOW,
-                    "type": "group_chat",
-                },
-            ]
-        )
-        gene._client.mark_poll_incomplete = MagicMock()
-
-        async def fetch(conv_id, since):
-            if conv_id == stuck_id:
-                await asyncio.sleep(30)
-                return []
-            return [_msg("m1", "Alice", "Ship the change", NOW)]
-
-        gene._fetch_with_context = fetch
-
-        items = []
-        async for item in gene.discover(since=None):
-            items.append(item)
-
-        assert len(items) == 1
-        assert items[0].extra["conversation_id"] == ok_id
-        gene._client.mark_poll_incomplete.assert_called_once_with(
-            stuck_id,
-            stop_reason="fetch_timeout",
-        )
-
-    @pytest.mark.asyncio
-    async def test_discovers_blocks_with_persisted_ledger_anchor_for_late_messages(self, tmp_path):
-        conv_id = "19:abc@thread.tacv2"
-        config = {
-            "group_chats": [conv_id],
-            "conversation_gap_minutes": 60,
-            "ledger_state_path": str(tmp_path / "teams-ledger.json"),
-        }
-        gene = TeamsGene(config=config, source_id="teams-test")
-        gene._client = MagicMock(spec=_TeamsAPIClient)
-        gene._client.list_conversations = AsyncMock(
-            return_value=[
-                {
-                    "id": conv_id,
-                    "topic": "architecture",
-                    "lastActivity": NOW,
-                    "type": "group_chat",
-                }
-            ]
-        )
-
-        first_messages = [
-            _msg("m2", "Alice", "Anchor", NOW),
-            _msg("m3", "Bob", "Follow-up", NOW + timedelta(minutes=30)),
-        ]
-        gene._fetch_with_context = AsyncMock(return_value=first_messages)
-        first_items = [item async for item in gene.discover(since=None)]
-        assert len(first_items) == 1
-        first_item = first_items[0]
-
-        second_messages = [
-            _msg("m1", "Carol", "Late earlier", NOW - timedelta(minutes=30)),
-            _msg("m2", "Alice", "Anchor", NOW),
-            _msg("m3", "Bob", "Follow-up", NOW + timedelta(minutes=30)),
-        ]
-        gene._fetch_with_context = AsyncMock(return_value=second_messages)
-        second_items = [item async for item in gene.discover(since=None)]
-
-        assert len(second_items) == 1
-        assert second_items[0].item_id == first_item.item_id
-        assert second_items[0].extra["window_id"] == first_item.extra["window_id"]
-        assert second_items[0].extra["root_message_id"] == "m2"
-        assert second_items[0].extra["block_start"] == (NOW - timedelta(minutes=30)).isoformat()
-
-
-# ---------------------------------------------------------------------------
-# Fetch
-# ---------------------------------------------------------------------------
-
-
-class TestFetch:
-    @pytest.mark.asyncio
-    async def test_fetch_thread_returns_json(self):
-        gene = TeamsGene(config={"conversation_ids": ["19:test@thread.tacv2"]}, source_id="test")
-        gene._client = MagicMock(spec=_TeamsAPIClient)
-
-        thread_msgs = [
-            _msg("root", "Alice", "Question about API", NOW - timedelta(minutes=10)),
-            _msg("r1", "Bob", "Here's the answer", NOW),
-        ]
-        thread_msgs[1]["parentMessageId"] = "root"
-        thread_msgs[1]["rootMessageId"] = "root"
-        gene._client.get_thread_messages = AsyncMock(return_value=thread_msgs)
-
-        from memforge.models import ContentItem
-
-        item = ContentItem(
-            item_id="teams-conv#root",
-            title="Test thread",
-            source_url="https://teams.microsoft.com/l/message/conv/root",
-            last_modified=NOW,
-            content_type="application/json",
-            extra={
-                "conversation_id": "conv",
-                "root_message_id": "root",
-                "conversation_type": "channel",
-                "is_thread": True,
-            },
-        )
-        gene._thread_message_cache[item.item_id] = thread_msgs
-
-        raw = await gene.fetch(item)
-        assert raw.content_type == "application/json"
-        data = json.loads(raw.body)
-        assert len(data["messages"]) == 2
-        assert "Alice" in data["participants"]
-        assert "Bob" in data["participants"]
-        assert data["messages"][1]["parentMessageId"] == "root"
-        assert data["messages"][1]["rootMessageId"] == "root"
-
-
-# ---------------------------------------------------------------------------
-# Normalize
-# ---------------------------------------------------------------------------
-
-
-class TestNormalize:
-    @pytest.mark.asyncio
-    async def test_normalize_markdown_format(self):
-        gene = TeamsGene(config={"conversation_ids": ["19:test@thread.tacv2"]}, source_id="test")
-        gene._client = MagicMock()
-
-        from memforge.models import ContentItem, RawContent
-
-        thread_data = {
-            "conversation_type": "channel",
-            "title": "#architecture: Should we use gRPC?",
-            "channel_name": "architecture",
-            "team_name": "Engineering",
-            "messages": [
-                {
-                    "id": "root",
-                    "from": "Alice",
-                    "content": "Should we use gRPC?",
-                    "time": "2026-03-15T10:23:00+00:00",
-                    "is_root": True,
-                    "mentions": [],
-                    "attachments": [],
-                },
-                {
-                    "id": "r1",
-                    "from": "Bob",
-                    "content": "Yes, gRPC fits our streaming needs",
-                    "time": "2026-03-15T10:45:00+00:00",
-                    "is_root": False,
-                    "mentions": [],
-                    "attachments": [],
-                },
-            ],
-            "participants": ["Alice", "Bob"],
-            "first_message_time": "2026-03-15T10:23:00+00:00",
-            "last_message_time": "2026-03-15T10:45:00+00:00",
-        }
-
-        item = ContentItem(
-            item_id="teams-conv#root",
-            title="#architecture: Should we use gRPC?",
-            source_url="",
-            last_modified=NOW,
-        )
-        raw = RawContent(
-            item=item,
-            body=json.dumps(thread_data).encode("utf-8"),
-            content_type="application/json",
-        )
-
-        result = await gene.normalize(raw)
-
-        # Check header
-        assert "# #architecture: Should we use gRPC?" in result.markdown_body
-        assert "**Channel**: architecture (Engineering)" in result.markdown_body
-        assert "**Participants**: Alice, Bob" in result.markdown_body
-        assert "**Messages**: 2" in result.markdown_body
-
-        # Check messages
-        assert "**Alice** (2026-03-15T10:23" in result.markdown_body
-        assert "Should we use gRPC?" in result.markdown_body
-        assert "> **Bob** (2026-03-15T10:45" in result.markdown_body
-        assert "gRPC fits our streaming needs" in result.markdown_body
-
-    @pytest.mark.asyncio
-    async def test_normalize_source_semantics(self):
-        gene = TeamsGene(config={"conversation_ids": ["19:test@thread.tacv2"]}, source_id="test")
-        gene._client = MagicMock()
-
-        from memforge.models import ContentItem, RawContent
-
-        thread_data = {
-            "conversation_type": "channel",
-            "title": "Test",
-            "channel_name": "general",
-            "team_name": "PAY",
-            "messages": [
-                {
-                    "id": "1",
-                    "from": "Alice",
-                    "content": "Hello https://example.com",
-                    "time": "2026-04-15T10:00:00+00:00",
-                    "is_root": True,
-                    "mentions": [],
-                    "attachments": [],
-                },
-            ],
-            "participants": ["Alice"],
-            "first_message_time": "2026-04-15T10:00:00+00:00",
-            "last_message_time": "2026-04-15T10:00:00+00:00",
-        }
-
-        item = ContentItem(item_id="test", title="Test", source_url="", last_modified=NOW)
-        raw = RawContent(item=item, body=json.dumps(thread_data).encode(), content_type="application/json")
-
-        result = await gene.normalize(raw)
-        sem = result.source_semantics
-
-        assert sem["conversation_type"] == "channel"
-        assert sem["channel_name"] == "general"
-        assert sem["team_name"] == "PAY"
-        assert sem["participants"] == ["Alice"]
-        assert sem["message_count"] == 1
-        assert sem["has_links"] is True
-        assert sem["has_code_blocks"] is False
-
-    @pytest.mark.asyncio
-    async def test_normalize_tolerates_loose_teams_rest_shapes(self):
-        gene = TeamsGene(config={"conversation_ids": ["19:test@thread.tacv2"]}, source_id="test")
-        gene._client = MagicMock()
-
-        from memforge.genes.teams_gene import LOCAL_AGENT_TEAMS_PACKAGE_KIND
-        from memforge.models import ContentItem, RawContent
-
-        package = {
-            "package_kind": LOCAL_AGENT_TEAMS_PACKAGE_KIND,
-            "conversation_id": "19:conversation@thread.v2",
-            "root_message_id": "1783500000000",
-            "window_id": "teams-block:v1:test",
-            "window_type": "time_block",
-            "revision_hash": "sha256:revision",
-            "raw_hash": "sha256:raw",
-            "submitted_at": "2026-07-09T00:00:00+00:00",
-            "submitted_by": "tester",
+    return json.dumps(
+        {
+            "package_kind": "teams_window_document",
+            "conversation_id": "19:chat@thread.v2",
+            "window_id": window_id,
             "raw_payload": {
                 "conversation_type": "group_chat",
-                "team_name": "PCC Agent Dev",
-                "messages": [
-                    {
-                        "id": "1783500000000",
-                        "from": "Alice",
-                        "content": "Here is the file",
-                        "time": "2026-07-09T01:02:00+00:00",
-                        "is_root": True,
-                        "attachments": ["raw-attachment-name", {"fileName": "design.md"}],
-                    },
-                    "unexpected raw item",
-                ],
-                "participants": [{"displayName": "Alice"}, "Bob"],
-                "first_message_time": "2026-07-09T01:02:00+00:00",
-                "last_message_time": "2026-07-09T01:02:00+00:00",
+                "conversation_name": "Payroll",
+                "channel_name": "Payroll",
+                "messages": messages,
             },
         }
-        item = ContentItem(item_id="test", title="Test", source_url="", last_modified=NOW)
-        raw = RawContent(item=item, body=json.dumps(package).encode(), content_type="application/json")
-
-        result = await gene.normalize(raw)
-
-        assert "**Participants**: Alice, Bob" in result.markdown_body
-        assert "- raw-attachment-name (shared by Alice)" in result.markdown_body
-        assert "- design.md (shared by Alice)" in result.markdown_body
-        assert result.source_semantics["participants"] == ["Alice", "Bob"]
-        assert result.source_semantics["message_count"] == 1
+    ).encode()
 
 
-# ---------------------------------------------------------------------------
-# Content hash (unchanged thread = same normalized markdown = same hash)
-# ---------------------------------------------------------------------------
+THREAD_KEY = (
+    "teams-thread:v1:eyJjb252ZXJzYXRpb25faWQiOiIxOTpjaGF0QHRocmVhZC52MiIsInJvb3Rfb3JfYW5jaG9yX21lc3NhZ2VfaWQiOiJyb290"
+    "Iiwic291cmNlX2lkIjoic3JjIiwid2luZG93X3R5cGUiOiJ0aHJlYWQifQ"
+)
 
 
-class TestContentHash:
-    @pytest.mark.asyncio
-    async def test_same_messages_produce_same_markdown(self):
-        gene = TeamsGene(config={"conversation_ids": ["19:test@thread.tacv2"]}, source_id="test")
-        gene._client = MagicMock()
+def test_a_stored_window_package_is_read_as_the_same_records():
+    gene = TeamsGene(config={"conversation_ids": ["19:chat@thread.v2"]}, source_id="src")
+    messages = [
+        {"id": "root", "from": "Ada", "content": "Question", "time": "2026-07-14T10:00:00+00:00", "is_root": True},
+        {
+            "id": "reply",
+            "from": "Ben",
+            "content": "Answer",
+            "time": "2026-07-14T10:05:00+00:00",
+            "edited_time": "2026-07-14T11:00:00+00:00",
+            "rootMessageId": "root",
+            "is_root": False,
+        },
+    ]
+    payload = gene.stored_unit_payload(_window_package(THREAD_KEY, messages))
 
-        from memforge.models import ContentItem, RawContent
+    assert payload is not None
+    assert payload["unit"] == {"kind": UnitKind.THREAD.value, "provider_key": THREAD_KEY, "thread_root_id": "root"}
+    # Each member is the record the window recorded, so its Observation revision stays the same.
+    assert [member["record"] for member in payload["members"]] == [
+        message_record(message, conversation_id="19:chat@thread.v2", conversation_name="Payroll") for message in messages
+    ]
+    item = ContentItem(item_id="doc-1", title="t", source_url="", last_modified=datetime(2026, 7, 14, tzinfo=timezone.utc))
+    projection = project_native(item=item, native=payload)
+    assert projection.unit_type == UnitKind.THREAD.value
+    assert projection.locator["thread_root_id"] == "root"
+    assert [value.semantic_value for value in projection.observations] == [
+        member["record"] for member in payload["members"]
+    ]
 
-        thread_data = {
-            "conversation_type": "channel",
-            "title": "Test",
-            "channel_name": "ch",
-            "team_name": "T",
-            "participants": ["A"],
-            "first_message_time": "2026-04-15T10:00:00+00:00",
-            "last_message_time": "2026-04-15T10:00:00+00:00",
-            "messages": [
-                {
-                    "id": "1",
-                    "from": "A",
-                    "content": "Hello",
-                    "time": "2026-04-15T10:00:00+00:00",
-                    "is_root": True,
-                    "mentions": [],
-                    "attachments": [],
-                }
-            ],
-        }
-        item = ContentItem(item_id="test", title="Test", source_url="", last_modified=NOW)
-        raw = RawContent(item=item, body=json.dumps(thread_data).encode(), content_type="application/json")
 
-        result1 = await gene.normalize(raw)
-        result2 = await gene.normalize(raw)
+def test_a_stored_conversation_unit_is_read_as_it_is():
+    gene = TeamsGene(config={"conversation_ids": ["19:chat@thread.v2"]}, source_id="src")
 
-        assert result1.markdown_body == result2.markdown_body
+    assert gene.stored_unit_payload(json.dumps({"payload_kind": "conversation_unit"}).encode()) is None
+
+
+def test_teams_unit_keys_name_their_kind_and_thread_root():
+    assert teams_unit_shape(THREAD_KEY) == (UnitKind.THREAD, "root")
+    assert teams_unit_shape("teams-block:v1:abc") == (UnitKind.WINDOW, None)
+    with pytest.raises(ValueError, match="not a Teams Unit key"):
+        teams_unit_shape("conv-window:v1:abc")
+
+
+def test_a_record_revision_is_its_canonical_json_hash():
+    record = {"content": "x", "time": "2026-07-14T10:00:00+00:00"}
+
+    assert record_revision(record) == record_revision(dict(reversed(list(record.items()))))

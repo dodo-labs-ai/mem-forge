@@ -67,6 +67,19 @@ describe("sourceAttention", () => {
     expect(sourceAttention({ source, readiness: null, activity: { state: "partial" }, now: NOW })).toBeNull();
   });
 
+  test("a partial sync that names its own reason asks the user to configure the source", () => {
+    const source = makeSource({ failed_items: { count: 0, retrying_after_upgrade: 0, items: [] } });
+    const reason = "1 conversation could not be read: Release crew. Their memories are kept. "
+      + "Restore access, or deselect a conversation that is no longer used.";
+    const attention = sourceAttention({
+      source, readiness: null, activity: { state: "partial", error: { message: reason } }, now: NOW,
+    });
+
+    expect(attention).toMatchObject({
+      reason: "partially_synced", title: "Last sync was partial", detail: reason, action: "configure",
+    });
+  });
+
   test("a scheduled run later than the grace period is overdue", () => {
     const late = new Date(NOW.getTime() - OVERDUE_GRACE_MS - 1).toISOString();
     const onTime = new Date(NOW.getTime() - OVERDUE_GRACE_MS + 1).toISOString();

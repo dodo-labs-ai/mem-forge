@@ -243,6 +243,7 @@ export function useSyncSource() {
       api.POST("/api/v1/sources/{source_id}/sync", {
         params: { path: { source_id: source.id } },
         body: {
+          dry_run: false,
           force_full_sync: false,
           retry_target: retryTarget?.execution_kind === "source_sync_run" ? retryTarget : undefined,
         },
