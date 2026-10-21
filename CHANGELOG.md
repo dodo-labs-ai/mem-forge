@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- A derivation evaluation case can pin a Document's later update: a seed request
+  names it with `derivation_id`, and the case also pins the projection of the
+  committed base revision the update was derived against, so replay plans the
+  same Evidence work as production. Without `derivation_id` the first derivation
+  is pinned. Seeding skips a named derivation that is not a completed derivation
+  of the Document (`derivation_not_found`) or whose base can no longer be read
+  (`base_unavailable`). A replayed derivation whose Evidence work cannot be
+  planned fails its case with the failure code
+  (`derivation_failed:<code>`) instead of erroring.
+  - Cloud: `get_source_unit_revision_projection` is part of the derivation case
+    store contract.
+
 - A Memory's source text is its Evidence excerpt only. `Memory.extraction_context`
   and `RawMemory.extraction_context` are removed, with the `memories` column
   (migration 121 drops it) and the field of `GET /api/v1/memories/{id}`.
