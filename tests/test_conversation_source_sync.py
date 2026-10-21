@@ -569,3 +569,44 @@ async def test_a_chat_the_recent_listing_leaves_out_keeps_its_name(workspace):
         SOURCE_ID, CHAT, NOW - timedelta(days=1), NOW + timedelta(days=1)
     )
     assert {member.record["conversation_name"] for member in unit.members} == {CHAT}
+
+
+async def _store_as_undated(workspace: TeamsWorkspace, message_id: str, text: str) -> None:
+    """Rewrite a stored message as a record of an earlier schema, which carries no creation time."""
+
+    record = json.dumps({"attachments": [], "content": text, "deleted": False}, sort_keys=True, separators=(",", ":"))
+    await workspace.db.db.execute(
+        "UPDATE source_observation_revisions SET content = ?, representation_schema_version = 1 "
+        "WHERE id IN (SELECT current_revision_id FROM source_observations WHERE provider_key = ?)",
+        (record, message_id),
+    )
+    await workspace.db.db.commit()
+
+
+async def _stored_records(workspace: TeamsWorkspace) -> dict[str, dict]:
+    reader = SourceProjectionUnitReader(workspace.db)
+    held = await reader.units_spanning(SOURCE_ID, CHAT, NOW - timedelta(days=3650), NOW + timedelta(days=1))
+    return {member.identity.message_id: dict(member.record) for unit in held for member in unit.members}
+
+
+async def test_a_message_stored_without_its_creation_time_is_carried_until_a_poll_returns_it(workspace):
+    teams = FakeTeams()
+    # The record stored before joining is not the one the provider later returns.
+    teams.post(CHAT, "m1", _ago(3), "as first stored")
+    await workspace.collect_and_sync(teams)
+    await _store_as_undated(workspace, "m1", "first")
+
+    teams.delete(CHAT, "m1")
+    teams.post(CHAT, "m2", _ago(2.5), "second")
+    state, _missing = await workspace.collect_and_sync(teams)
+
+    assert state.last_sync_status == "success"
+    assert await workspace.units() == {f"{UnitKind.WINDOW.value}:m1": ["m1", "m2"]}
+    assert "time" not in (await _stored_records(workspace))["m1"]
+
+    teams.post(CHAT, "m1", _ago(3), "first")
+    state, _missing = await workspace.collect_and_sync(teams)
+
+    assert state.last_sync_status == "success"
+    assert await workspace.units() == {f"{UnitKind.WINDOW.value}:m1": ["m1", "m2"]}
+    assert (await _stored_records(workspace))["m1"]["time"] == _ago(3).isoformat()

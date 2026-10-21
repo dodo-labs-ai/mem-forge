@@ -13,12 +13,8 @@ from collections.abc import Mapping
 from typing import Any
 
 from memforge.conversations.projection import PAYLOAD_VERSION, payload_label
-from memforge.conversations.records import (
-    MESSAGE_OBSERVATION_TYPE,
-    canonical_record_json,
-    record_created_at,
-    record_source_time,
-)
+from memforge.conversations.records import MESSAGE_OBSERVATION_TYPE, canonical_record_json
+from memforge.conversations.undated import payload_member_times
 from memforge.conversations.units import UnitKind
 from memforge.models import ContentItem
 from memforge.source_adapters.contracts import _NativeProjection, _ObservationInput, _unit_title
@@ -44,7 +40,8 @@ def project_native(*, item: ContentItem, native: Mapping[str, Any]) -> _NativePr
     for member in members:
         message_id = str(member["message_id"])
         record = member["record"]
-        times.append(record_created_at(record))
+        created_at, source_time, _shown = payload_member_times(native, member)
+        times.append(created_at)
         inputs.append(
             _ObservationInput(
                 MESSAGE_OBSERVATION_TYPE,
@@ -52,7 +49,7 @@ def project_native(*, item: ContentItem, native: Mapping[str, Any]) -> _NativePr
                 canonical_record_json(record),
                 record,
                 {"conversation_id": conversation_id},
-                record_source_time(record),
+                source_time,
                 {"claim_evidence_scope": "atomic"},
             )
         )

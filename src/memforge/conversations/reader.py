@@ -13,7 +13,8 @@ from collections.abc import Collection, Mapping
 from datetime import datetime
 from typing import Protocol
 
-from memforge.conversations.records import MESSAGE_OBSERVATION_TYPE, MessageIdentity, record_created_at, record_revision
+from memforge.conversations.records import MESSAGE_OBSERVATION_TYPE, MessageIdentity, record_revision
+from memforge.conversations.undated import stored_member_time
 from memforge.conversations.units import Member, MemberArtifact, StoredUnit, UnitKind, UnitRef
 from memforge.source_artifacts import source_artifact_revision_from_metadata, stored_source_artifact_from_observation
 from memforge.source_projection import (
@@ -208,7 +209,7 @@ def unit_ref(unit: SourceUnit) -> UnitRef:
 def _members(ref: UnitRef, revisions: Collection[SourceObservationRevision]) -> tuple[Member, ...]:
     """The message members of one Unit revision, each with the artifacts its revision holds for it."""
 
-    records: dict[str, tuple[str, Mapping[str, object]]] = {}
+    records: dict[str, tuple[str, Mapping[str, object], str | None]] = {}
     artifacts: dict[str, list[MemberArtifact]] = {}
     for revision in revisions:
         provider_key = str(revision.metadata.get("provider_key") or "")
@@ -241,15 +242,15 @@ def _members(ref: UnitRef, revisions: Collection[SourceObservationRevision]) -> 
         elif "source_artifact" in revision.metadata:
             raise ValueError(f"Source Artifact revision {revision.id} of Unit {ref.unit_id} cannot be read")
         elif provider_key and revision.evidence_profile is not None and revision.evidence_profile.schema_name:
-            records[revision.observation_id] = (provider_key, json.loads(revision.content))
+            records[revision.observation_id] = (provider_key, json.loads(revision.content), revision.observed_at)
     members = [
         Member(
             identity=MessageIdentity(ref.conversation_id, message_id),
-            created_at=record_created_at(record),
+            created_at=stored_member_time(record, observed_at=observed_at),
             record=record,
             revision=record_revision(record),
             artifacts=tuple(sorted(artifacts.get(observation_id, ()), key=lambda artifact: artifact.provider_key)),
         )
-        for observation_id, (message_id, record) in records.items()
+        for observation_id, (message_id, record, observed_at) in records.items()
     ]
     return tuple(sorted(members, key=lambda member: (member.created_at, member.identity.message_id)))
