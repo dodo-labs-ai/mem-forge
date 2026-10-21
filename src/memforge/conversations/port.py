@@ -43,10 +43,18 @@ class ConversationAccess(str, Enum):
 
 
 class PollOutcome(str, Enum):
-    """How a poll of one conversation ended, read newest first."""
+    """How a poll of one conversation ended, read newest first.
 
-    # A page showed a message created before the requested start, so the
-    # provider showed history at least that far back.
+    A page is complete from the time the provider holds every message up to
+    the page's end: what the provider certifies for the page, or the time of
+    its oldest message when the provider orders pages by creation time. A
+    provider that may place an older message on a newer page, such as Teams
+    placing a deleted message where it was deleted, takes that time from its
+    own certificate, never from the times of the messages it returned.
+    """
+
+    # The read was complete from before the requested start, so the provider
+    # showed history at least that far back.
     REACHED_START = "reached_start"
     # Paging finished without showing one: the provider has nothing older to
     # show, which may be hidden history as well as the conversation's start.
@@ -163,8 +171,8 @@ class ConversationPoll:
 
     messages: tuple[ProviderMessage, ...]
     outcome: PollOutcome
-    # When paging stopped early: the earliest message time on the last fully
-    # read page.
+    # When paging stopped early: the time the last fully read page is
+    # complete from (see PollOutcome).
     earliest_complete_page_time: datetime | None = None
     stop_reason: str = ""
 

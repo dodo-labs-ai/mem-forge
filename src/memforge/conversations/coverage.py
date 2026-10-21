@@ -16,9 +16,10 @@ raw evidence and never takes an executor's conclusion.
     visible history that far back, the certified start when it certifies a
     later one, and otherwise the earliest message returned, since the provider
     may hide older history;
-  - paging stopped early: just after the earliest message time on the last
-    fully read page, which covers what was read contiguously from the newest
-    message. A message at that same time may sit on the next, unread page.
+  - paging stopped early: just after the time the last fully read page is
+    complete from (:class:`~memforge.conversations.port.PollOutcome`), which
+    covers what was read contiguously from the newest message. A message at
+    that same time may sit on the next, unread page.
 
 "The earliest message returned" assumes visible history is a suffix: the
 provider hides only messages before some time, never a stretch in the middle.

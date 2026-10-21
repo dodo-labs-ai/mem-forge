@@ -12,6 +12,7 @@ from memforge.conversations.port import PollOutcome
 from memforge.genes.teams_client import (
     AuthenticationError,
     TeamsChatClient,
+    TeamsMessagePageSchemaError,
     TeamsMessagePaginationError,
 )
 from memforge.source_artifacts import MAX_SOURCE_ARTIFACT_STORAGE_BYTES, SourceArtifactContractError
@@ -30,10 +31,19 @@ def _message(message_id: str, created_at: datetime) -> dict:
     }
 
 
-def _page(*messages: dict) -> MagicMock:
+def _page(*messages: dict, complete_from: datetime | None = None) -> MagicMock:
+    """A Chatsvc page; ``complete_from`` is the segment start it certifies, epoch milliseconds on the wire."""
+
     response = MagicMock()
-    response.json.return_value = {"messages": list(messages)}
+    body: dict = {"messages": list(messages)}
+    if complete_from is not None:
+        body["_metadata"] = {"lastCompleteSegmentStartTime": _milliseconds(complete_from)}
+    response.json.return_value = body
     return response
+
+
+def _milliseconds(at: datetime) -> int:
+    return int(at.timestamp() * 1000)
 
 
 def _client(*pages: MagicMock) -> TeamsChatClient:
@@ -371,13 +381,19 @@ async def test_running_out_of_pages_before_the_start_is_history_exhausted(monkey
     assert poll.outcome is PollOutcome.HISTORY_EXHAUSTED
 
 
-async def test_pages_follow_the_time_cursor_and_repeat_the_boundary_millisecond(monkeypatch):
+async def test_pages_follow_the_certified_time_cursor_and_repeat_the_boundary_millisecond(monkeypatch):
     monkeypatch.setattr("memforge.genes.teams_client._MAX_PAGE_SIZE", 2)
     monkeypatch.setattr("memforge.genes.teams_client.asyncio.sleep", AsyncMock())
     older = NOW - timedelta(hours=1)
+    before = NOW - timedelta(days=15)
     client = _client(
-        _page(_message("newest", NOW), _message("older", older)),
-        _page(_message("older", older), _message("same-millisecond", older), _message("before", NOW - timedelta(days=15))),
+        _page(_message("newest", NOW), _message("older", older), complete_from=older),
+        _page(
+            _message("older", older),
+            _message("same-millisecond", older),
+            _message("before", before),
+            complete_from=before,
+        ),
     )
 
     poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
@@ -388,7 +404,7 @@ async def test_pages_follow_the_time_cursor_and_repeat_the_boundary_millisecond(
         "pageSize": 2,
         "view": "msnp24Equivalent",
         "startTime": 0,
-        "endTime": int(older.timestamp() * 1000),
+        "endTime": _milliseconds(older),
     }
 
 
@@ -417,7 +433,7 @@ async def test_a_backfill_ending_just_after_a_page_time_reads_that_millisecond()
 async def test_a_spent_time_budget_stops_early_after_the_last_complete_page(monkeypatch):
     monkeypatch.setattr("memforge.genes.teams_client._MAX_PAGE_SIZE", 1)
     monkeypatch.setattr("memforge.genes.teams_client.asyncio.sleep", AsyncMock())
-    client = _client(_page(_message("newest", NOW)), _page(_message("older", NOW - timedelta(hours=1))))
+    client = _client(_page(_message("newest", NOW), complete_from=NOW), _page(_message("older", NOW - timedelta(hours=1))))
 
     poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=0)
 
@@ -427,10 +443,56 @@ async def test_a_spent_time_budget_stops_early_after_the_last_complete_page(monk
     assert client._request.await_count == 1
 
 
+async def test_a_deleted_older_message_on_a_newer_page_does_not_move_the_cursor(monkeypatch):
+    monkeypatch.setattr("memforge.genes.teams_client._MAX_PAGE_SIZE", 3)
+    monkeypatch.setattr("memforge.genes.teams_client.asyncio.sleep", AsyncMock())
+    hour_ago = NOW - timedelta(hours=1)
+    deleted = {
+        **_message("deleted", NOW - timedelta(days=20)),
+        "content": "",
+        "properties": {"deletetime": _milliseconds(NOW - timedelta(minutes=5))},
+    }
+    client = _client(
+        _page(_message("newest", NOW), deleted, _message("hour-ago", hour_ago), complete_from=hour_ago),
+        _page(_message("hour-ago", hour_ago), _message("yesterday", NOW - timedelta(days=1))),
+    )
+
+    poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
+
+    assert {message["id"] for message in poll.messages} >= {"newest", "hour-ago", "yesterday"}
+    assert poll.outcome is PollOutcome.HISTORY_EXHAUSTED
+    assert client._request.await_args_list[1].kwargs["params"]["endTime"] == _milliseconds(hour_ago)
+
+
+async def test_a_full_page_that_certifies_no_complete_start_fails_the_poll(monkeypatch):
+    monkeypatch.setattr("memforge.genes.teams_client._MAX_PAGE_SIZE", 1)
+    client = _client(_page(_message("newest", NOW)))
+
+    with pytest.raises(TeamsMessagePageSchemaError, match="does not certify"):
+        await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
+
+
+async def test_a_full_page_certified_from_the_epoch_is_the_oldest_and_bounded_by_its_oldest_message(monkeypatch):
+    monkeypatch.setattr("memforge.genes.teams_client._MAX_PAGE_SIZE", 2)
+    client = _client(
+        _page(
+            _message("newest", NOW),
+            _message("first", NOW - timedelta(days=2)),
+            complete_from=datetime(1970, 1, 1, tzinfo=timezone.utc),
+        )
+    )
+
+    poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
+
+    assert [message["id"] for message in poll.messages] == ["newest", "first"]
+    assert poll.outcome is PollOutcome.HISTORY_EXHAUSTED
+    assert client._request.await_count == 1
+
+
 async def test_a_time_cursor_that_does_not_advance_fails_the_poll(monkeypatch):
     monkeypatch.setattr("memforge.genes.teams_client._MAX_PAGE_SIZE", 1)
     monkeypatch.setattr("memforge.genes.teams_client.asyncio.sleep", AsyncMock())
-    client = _client(_page(_message("same", NOW)), _page(_message("same", NOW)))
+    client = _client(_page(_message("same", NOW), complete_from=NOW), _page(_message("same", NOW), complete_from=NOW))
 
     with pytest.raises(TeamsMessagePaginationError, match="did not advance"):
         await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)

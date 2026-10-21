@@ -382,11 +382,12 @@ class TeamsChatClient:
     ) -> TeamsMessagePoll:
         """Read one conversation's messages created in ``[start, end)``, newest first.
 
-        Paging stops when a page shows a message created before ``start``,
-        when the conversation has nothing older, or when the time budget runs
-        out; the result says which, so the reader knows what the poll proved.
-        Pages overlap by one millisecond, so messages sharing a page boundary's
-        time are never skipped.
+        Paging stops when a page is complete from before ``start``, when the
+        conversation has nothing older, or when the time budget runs out; the
+        result says which, so the reader knows what the poll proved. Each page
+        is bounded by the time it is complete from (:class:`_TeamsMessagePage`),
+        and the next page ends at that time inclusively, so messages sharing
+        a page boundary's millisecond are never skipped.
         """
 
         await self._ensure_clients()
@@ -412,22 +413,21 @@ class TeamsChatClient:
                 await asyncio.sleep(1.0)
             response = await self._request(self._chat_client, "GET", url, params=params)
             pages += 1
-            page = _validated_teams_message_page(response.json())
-            for raw in page:
+            page = _validated_teams_message_page(response.json(), page_size=_MAX_PAGE_SIZE)
+            for raw in page.messages:
                 parsed = self._parse_message(raw)
                 if parsed is None or parsed["time"] < start or (end is not None and parsed["time"] >= end):
                     continue
                 messages.setdefault(parsed["id"], parsed)
-            if page:
-                earliest_complete_page_time = min(_teams_message_timestamp(raw) for raw in page)
-            if page and earliest_complete_page_time < start:
-                return TeamsMessagePoll(messages=tuple(messages.values()), outcome=PollOutcome.REACHED_START,
-                                        stop_reason="reached_start")
-            next_end_time = _next_teams_message_end_time(page, page_size=_MAX_PAGE_SIZE,
-                                                         previous_end_time=previous_end_time)
-            if next_end_time is None:
+            if page.complete_from is not None:
+                earliest_complete_page_time = page.complete_from
+                if page.complete_from < start:
+                    return TeamsMessagePoll(messages=tuple(messages.values()), outcome=PollOutcome.REACHED_START,
+                                            stop_reason="reached_start")
+            if page.oldest or page.complete_from is None:
                 return TeamsMessagePoll(messages=tuple(messages.values()), outcome=PollOutcome.HISTORY_EXHAUSTED,
                                         stop_reason="history_exhausted")
+            next_end_time = _next_teams_message_end_time(page.complete_from, previous_end_time=previous_end_time)
             previous_end_time = next_end_time
             params = _teams_message_page_params(page_size=_MAX_PAGE_SIZE, end_time=next_end_time)
 
@@ -607,16 +607,30 @@ def infer_conversation_type(conversation_id: str) -> str:
     return "group_chat"
 
 
-def _validated_teams_message_page(data: object) -> list[dict]:
+@dataclass(frozen=True, slots=True)
+class _TeamsMessagePage:
+    """One Chat Service message page, newest first, and the time it is complete from.
+
+    Chatsvc places a deleted message where it was deleted, so a page can hold
+    a message far older than the rest of it, and its oldest message bounds
+    nothing. A page is complete from the start Chatsvc certifies for it,
+    ``_metadata.lastCompleteSegmentStartTime``. The conversation's oldest page,
+    which is not full or certified from the epoch, holds every older message,
+    so it is complete from its oldest message. ``complete_from`` is ``None``
+    for an empty page.
+    """
+
+    messages: list[dict]
+    complete_from: datetime | None
+    oldest: bool
+
+
+def _validated_teams_message_page(data: object, *, page_size: int) -> _TeamsMessagePage:
     """Return one Chat Service message page, or fail before the page proves anything."""
 
-    messages: object
-    if isinstance(data, list):
-        messages = data
-    elif isinstance(data, dict) and "messages" in data:
-        messages = data["messages"]
-    else:
+    if not isinstance(data, dict) or "messages" not in data:
         raise TeamsMessagePageSchemaError("Teams message page is missing an explicit messages list")
+    messages = data["messages"]
     if not isinstance(messages, list) or any(not isinstance(message, dict) for message in messages):
         raise TeamsMessagePageSchemaError("Teams message page has an invalid messages list")
     for message in messages:
@@ -624,7 +638,30 @@ def _validated_teams_message_page(data: object) -> list[dict]:
             validate_teams_provider_message(message)
         except TeamsMessageEvidenceError as exc:
             raise TeamsMessageRecordSchemaError(str(exc)) from exc
-    return messages
+    if not messages:
+        return _TeamsMessagePage(messages=messages, complete_from=None, oldest=True)
+    metadata = data.get("_metadata")
+    certified = _certified_segment_start(
+        metadata.get("lastCompleteSegmentStartTime") if isinstance(metadata, dict) else None
+    )
+    if len(messages) < page_size or certified == _EPOCH:
+        oldest = min(_teams_message_timestamp(message) for message in messages)
+        return _TeamsMessagePage(messages=messages, complete_from=oldest, oldest=True)
+    if certified is None:
+        raise TeamsMessagePageSchemaError("Teams message page does not certify the time it is complete from")
+    return _TeamsMessagePage(messages=messages, complete_from=certified, oldest=False)
+
+
+def _certified_segment_start(value: object) -> datetime | None:
+    """The time a Chatsvc page certifies it is complete from, given in epoch milliseconds."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    try:
+        milliseconds = int(value)
+    except ValueError:
+        return None
+    return _EPOCH + timedelta(milliseconds=milliseconds) if milliseconds >= 0 else None
 
 
 def _teams_message_page_params(*, page_size: int, end_time: int | None = None) -> dict:
@@ -638,21 +675,14 @@ def _teams_message_page_params(*, page_size: int, end_time: int | None = None) -
     return params
 
 
-def _next_teams_message_end_time(
-    messages: list[dict],
-    *,
-    page_size: int,
-    previous_end_time: int | None,
-) -> int | None:
-    """The inclusive millisecond cursor of the next newest-first page; ``None`` when the conversation has no more.
+def _next_teams_message_end_time(complete_from: datetime, *, previous_end_time: int | None) -> int:
+    """The inclusive millisecond cursor of the next newest-first page.
 
-    The cursor is the time of the page's oldest message, so the next page
-    repeats the messages sharing that millisecond rather than skipping any.
+    The cursor is the time the page just read is complete from, so the next
+    page repeats the messages sharing that millisecond rather than skipping any.
     """
 
-    if len(messages) < page_size:
-        return None
-    end_time = int(min(_teams_message_timestamp(message) for message in messages).timestamp() * 1000)
+    end_time = (complete_from - _EPOCH) // timedelta(milliseconds=1)
     if previous_end_time is not None and end_time >= previous_end_time:
         raise TeamsMessagePaginationError("Teams message time cursor did not advance")
     return end_time
