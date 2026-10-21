@@ -286,7 +286,7 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
         "Applies: Workspace source scheduling in MemForge.\n"
         "Why: This lets overdue schedules run without waiting for UI traffic."
     )
-    assert "overdue source schedules" in (memory.extraction_context or "")
+    assert "overdue source schedules" in claim["claim_text"]
     assert collection.upserted[result.memory_id]["owner_user_id"] == "u-andrew"
 
     relation_runs = await _relation_runs_for_memory(db, result.memory_id)
@@ -1069,7 +1069,9 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
         "Source schedulers start on app startup, claim due schedules, and advance next_run_at after success.\n"
         "Applies: Agent-session memory extraction."
     )
-    assert "advance next_run_at" in (memory.extraction_context or "")
+    updated_claim = await db.get_agent_claim(updated.claim_id)
+    assert updated_claim is not None
+    assert "advance next_run_at" in updated_claim["claim_text"]
     assert collection.upserted[updated.memory_id]["content_hash"] == memory.content_hash
     assert created.memory_id in collection.deleted
 

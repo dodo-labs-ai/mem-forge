@@ -286,7 +286,6 @@ def _current_candidate(value: object, context: RevisionAssessmentContext) -> tup
         valid_from=_optional_text(value.get("valid_from")),
         valid_until=_optional_text(value.get("valid_until")),
         evidence_quote=primary.excerpt,
-        extraction_context=primary.excerpt or "",
         source_observation_id=primary.anchor.observation_id,
         required_source_observation_ids=list(dict.fromkeys(
             part.anchor.observation_id for part in selection.parts if part.role is EvidenceRole.REQUIRED

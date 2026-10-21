@@ -300,10 +300,6 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
     assert result.status == "inserted"
     assert stored is not None
     assert stored.content == "Use Status and FollowUpStepStatus when polling PayrollProcessingTriggerViews."
-    assert stored.extraction_context == (
-        "During the xall-004 smoke test, PayrollProcessingTriggerViews polling only "
-        "matched after using Status and FollowUpStepStatus."
-    )
     assert stored.visibility == Visibility.PRIVATE.value
     assert stored.owner_user_id == "owner@example.com"
     assert stored.project_key == "UNSORTED"
@@ -315,7 +311,6 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
         "During the xall-004 smoke test, PayrollProcessingTriggerViews polling only "
         "matched after using Status and FollowUpStepStatus."
     )
-    assert sources[0].excerpt == stored.extraction_context
     document = await db.get_document(f"user-memory-{result.memory_id}")
     assert document is not None
     assert document.source == "user_memory"
@@ -850,9 +845,6 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     assert stored_new.status == "active"
     assert await db.get_active_memory_support_unit_ids(result.replacement_memory_id)
     assert stored_new.content == "Invoke Claude Code with `claude`, not `claude-code`."
-    assert stored_new.extraction_context == (
-        "Invoke Claude Code with `claude`, not `claude-code`."
-    )
     assert claim is not None
     assert claim["memory_id"] == result.replacement_memory_id
     assert claim["claim_text"] == "Invoke Claude Code with `claude`, not `claude-code`."
@@ -862,7 +854,7 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     assert [(source.doc_id, source.source_type) for source in new_sources] == [
         ("concept-claude-cli", "agent_session")
     ]
-    assert new_sources[0].excerpt == stored_new.extraction_context
+    assert new_sources[0].excerpt == "Invoke Claude Code with `claude`, not `claude-code`."
 
     await db.delete_source_cascade("src-agent-sessions-codex")
 
@@ -1689,7 +1681,9 @@ async def test_create_search_get_memory_round_trip_keeps_provenance_out_of_searc
     assert stored.owner_user_id == "owner@example.com"
     assert stored.visibility == "private"
     assert stored.repo_identifier is None
-    assert stored.extraction_context == "User confirmed this after validating the payroll smoke flow."
+    assert [source.excerpt for source in await db.get_memory_sources(payload["memory_id"])] == [
+        "User confirmed this after validating the payroll smoke flow."
+    ]
     audit_rows = await db.list_memory_audit_events(
         memory_id=payload["memory_id"],
         event_type="memory_insert_committed",

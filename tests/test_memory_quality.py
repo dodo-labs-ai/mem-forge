@@ -84,7 +84,7 @@ def _raw(content: str, context: str) -> RawMemory:
         content=content,
         memory_type="fact",
         entity_refs=[],
-        extraction_context=context,
+        evidence_quote=context,
     )
 
 

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A Memory's source text is its Evidence excerpt only. `Memory.extraction_context`
+  and `RawMemory.extraction_context` are removed, with the `memories` column
+  (migration 121 drops it) and the field of `GET /api/v1/memories/{id}`.
+  Candidate quality checks read the candidate's `evidence_quote`.
+  - Cloud: `apply_authorized_memory_correction` takes the correction's
+    `provenance`, which becomes the `user_correction` source excerpt.
+
 - An image Evidence item's `artifact` in `GET /api/v1/memories/{id}` describes
   only the Artifact: `artifact_id`, `parent_observation_id`, `filename`,
   `content_type`, `size_bytes` and `url`. The item gives its Observation,
