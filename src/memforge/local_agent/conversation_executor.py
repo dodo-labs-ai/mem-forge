@@ -24,6 +24,7 @@ from memforge.conversations.collect import CollectedAttempt, collect
 from memforge.conversations.manifest import manifest_to_payload, request_from_payload
 from memforge.conversations.port import ConversationProvider, MessageArtifact
 from memforge.conversations.records import MESSAGE_OBSERVATION_TYPE, MessageIdentity
+from memforge.sync_progress import SyncProgressPhase
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,7 @@ async def run_device_collection(
     config_revision: str,
     dry_run: bool = False,
     force_full_sync: bool = False,
-    report: Callable[[str, int, int], None] = lambda phase, completed, total: None,
+    report: Callable[[SyncProgressPhase, int, int], None] = lambda phase, completed, total: None,
 ) -> DeviceCollectionResult:
     """Collect one job attempt of a conversation Source, upload it, and hand it over to the server."""
 
@@ -130,7 +131,7 @@ async def run_device_collection(
     answer = _checked("collection request", client.conversation_collection_request(source_id=source_id, **attempt))
     collection_attempt_id = str(answer["collection_attempt_id"])
     request = request_from_payload(answer["request"])
-    report("collecting", 0, len(request.conversations))
+    report("fetching", 0, len(request.conversations))
     collection = await collect(
         provider,
         request,

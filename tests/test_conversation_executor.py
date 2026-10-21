@@ -6,6 +6,7 @@ from datetime import timedelta
 
 import pytest
 
+from memforge.main import _sync_progress_snapshot
 from memforge import main
 from memforge.conversations.layer import ConversationLayer, ConversationSelection
 from memforge.conversations.manifest import request_to_payload
@@ -81,7 +82,7 @@ def _teams(count: int) -> FakeTeams:
     return teams
 
 
-async def _run(teams: FakeTeams, server: Server, *, dry_run: bool = False) -> DeviceCollectionResult:
+async def _run(teams: FakeTeams, server: Server, *, dry_run: bool = False, report=None) -> DeviceCollectionResult:
     return await run_device_collection(
         teams,
         server,
@@ -90,6 +91,7 @@ async def _run(teams: FakeTeams, server: Server, *, dry_run: bool = False) -> De
         local_agent_attempt_count=1,
         config_revision="cfg",
         dry_run=dry_run,
+        **({"report": report} if report is not None else {}),
     )
 
 
@@ -109,6 +111,19 @@ async def test_the_manifest_goes_first_and_only_missing_bodies_follow():
         bodies_uploaded=2,
         processing={"run_id": "run-1"},
     )
+
+
+async def test_every_progress_report_is_a_valid_sync_progress_snapshot():
+    snapshots = []
+
+    def report(phase, completed, total):
+        snapshots.append(_sync_progress_snapshot(phase=phase, completed=completed, total=total, unit="message"))
+
+    await _run(_teams(3), Server(), report=report)
+
+    phases = [snapshot["phase"] for snapshot in snapshots]
+    assert phases[0] == "fetching"
+    assert set(phases[1:]) == {"uploading"}
 
 
 async def test_a_dry_run_asks_for_the_plan_instead_of_processing():
