@@ -3,16 +3,19 @@
 A maintainer names the Documents of a workspace that a derivation cohort should
 hold, by id or by their title within a Source, each with a rubric: the number of
 Memories its extraction should give and terms those Memories must hold. A case
-pins the first derivation of the Document's Source Unit as it was staged,
-whether or not its lifecycle has been applied since: the projected revision, the
-Document context and the access and inference capability hashes its Evidence
-work was planned with. Replay therefore runs the current extraction planner and
-prompts over exactly the input production read, with no live source content.
+pins one derivation of the Document's Source Unit as it was staged, whether or
+not its lifecycle has been applied since: the projected revision, the Document
+context and the access and inference capability hashes its Evidence work was
+planned with. Replay therefore runs the current extraction planner and prompts
+over exactly the input production read, with no live source content.
 
-Only a first derivation is pinned. A later revision is derived against the
-committed base it updates, which a case does not pin, so replay could not plan
-its Evidence work. A Document that has none is counted by reason, as is one
-that was never synced and a title that names more than one Document.
+A Document's first derivation is pinned unless the request names another of its
+derivations. A later revision is derived against the committed base it updates,
+so its case also pins that base revision's projection, which replay plans the
+same Evidence work against. A Document that cannot be pinned is counted by
+reason: it was never synced, its title names more than one Document, it has no
+first derivation, the named derivation is not one of its completed
+derivations, or the named derivation's base revision can no longer be read.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ from memforge.source_derivation import (
     SourceDerivationAttempt,
     source_unit_derivation_context_to_payload,
 )
-from memforge.source_projection import SourceUnit, source_projection_to_payload
+from memforge.source_projection import SourceProjection, SourceUnit, source_projection_to_payload
 
 DERIVATION_CASE_POLICY_VERSION = "source-unit-derivation-cases-v1"
 DERIVATION_CASE_GROUP_KEY = "source_unit_derivation"
@@ -68,21 +71,32 @@ class DerivationCaseStore(Protocol):
         source_unit_id: str | None = None,
     ) -> tuple[SourceDerivationAttempt, ...]: ...
 
+    async def get_source_unit_revision_projection(
+        self, source_unit_id: str, revision_id: str | None,
+    ) -> SourceProjection | None: ...
+
 
 class DerivationCaseSkip(str, Enum):
     DOCUMENT_NOT_FOUND = "document_not_found"
     TITLE_NOT_UNIQUE = "title_not_unique"
     NO_FIRST_DERIVATION = "no_first_derivation"
+    DERIVATION_NOT_FOUND = "derivation_not_found"
+    BASE_UNAVAILABLE = "base_unavailable"
 
 
 @dataclass(frozen=True, slots=True)
 class DerivationCaseRequest:
-    """One Document to pin: ``doc_id``, or ``title`` within ``source_id``."""
+    """One Document to pin: ``doc_id``, or ``title`` within ``source_id``.
+
+    ``derivation_id`` names the derivation to pin; without it, the Document's
+    first derivation is pinned.
+    """
 
     rubric: Mapping[str, object]
     doc_id: str | None = None
     source_id: str | None = None
     title: str | None = None
+    derivation_id: str | None = None
     population: AgentEvaluationPopulation = AgentEvaluationPopulation.REPRESENTATIVE_CONTROL
 
     def __post_init__(self) -> None:
@@ -170,31 +184,43 @@ async def _pin_document_case(
     unit = await store.find_source_unit_by_document_id(document.source, document.doc_id)
     if unit is None:
         return DerivationCaseSkip.NO_FIRST_DERIVATION
-    first = [
+    planned = [
         attempt
         for attempt in await store.list_source_derivation_attempts(
             source_id=document.source,
             statuses=(SOURCE_DERIVATION_COMPLETED, SOURCE_DERIVATION_APPLIED),
             source_unit_id=unit.id,
         )
-        if attempt.base_unit_revision_id is None and attempt.authority_plan_identity is not None
+        if attempt.authority_plan_identity is not None
     ]
-    if not first:
-        return DerivationCaseSkip.NO_FIRST_DERIVATION
-    attempt = first[-1]
-    authority = attempt.authority_plan_identity
+    if request.derivation_id:
+        named = [attempt for attempt in planned if attempt.id == request.derivation_id]
+        if not named:
+            return DerivationCaseSkip.DERIVATION_NOT_FOUND
+        attempt = named[0]
+    else:
+        first = [attempt for attempt in planned if attempt.base_unit_revision_id is None]
+        if not first:
+            return DerivationCaseSkip.NO_FIRST_DERIVATION
+        attempt = first[-1]
+    manifest: dict[str, object] = {
+        "projection": source_projection_to_payload(attempt.projection),
+        "context": source_unit_derivation_context_to_payload(attempt.context),
+        "access_context_hash": str(attempt.authority_plan_identity.get("access_context_hash") or ""),
+        "inference_capability_hash": str(attempt.authority_plan_identity.get("inference_capability_hash") or ""),
+        "derivation_id": attempt.id,
+    }
+    if attempt.base_unit_revision_id is not None:
+        base = await store.get_source_unit_revision_projection(attempt.source_unit_id, attempt.base_unit_revision_id)
+        if base is None:
+            return DerivationCaseSkip.BASE_UNAVAILABLE
+        manifest["base_projection"] = source_projection_to_payload(base)
     case = await evaluation.curate_case(
         case_kind=AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION,
         source_id=attempt.source_id,
         doc_id=document.doc_id,
         source_unit_id=attempt.source_unit_id,
-        manifest={
-            "projection": source_projection_to_payload(attempt.projection),
-            "context": source_unit_derivation_context_to_payload(attempt.context),
-            "access_context_hash": str(authority.get("access_context_hash") or ""),
-            "inference_capability_hash": str(authority.get("inference_capability_hash") or ""),
-            "derivation_id": attempt.id,
-        },
+        manifest=manifest,
         promotion_policy_version=DERIVATION_CASE_POLICY_VERSION,
         created_by=actor,
     )

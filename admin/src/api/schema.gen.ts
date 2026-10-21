@@ -234,7 +234,7 @@ export interface paths {
         put?: never;
         /**
          * Seed Derivation Evaluation Cases
-         * @description Pin the first derivation of each named Document as a case and freeze their cohort.
+         * @description Pin a derivation of each named Document as a case and freeze their cohort.
          */
         post: operations["seed_derivation_evaluation_cases_api_v1_agent_evaluations_derivation_cases_seed_post"];
         delete?: never;
@@ -3058,9 +3058,12 @@ export interface components {
         /**
          * DerivationCaseRequest
          * @description One synced Document to pin as a derivation case, by ``doc_id`` or by ``title`` within ``source_id``,
-         *     with the rubric its extraction is checked against.
+         *     with the rubric its extraction is checked against. ``derivation_id`` names the derivation to pin;
+         *     without it, the Document's first derivation is pinned.
          */
         DerivationCaseRequest: {
+            /** Derivation Id */
+            derivation_id?: string | null;
             /** Doc Id */
             doc_id?: string | null;
             /**
