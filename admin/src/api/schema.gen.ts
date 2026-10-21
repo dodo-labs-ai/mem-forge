@@ -3964,8 +3964,6 @@ export interface components {
              * @default []
              */
             evidence: components["schemas"]["MemoryEvidenceGroupDetail"][];
-            /** Extraction Context */
-            extraction_context?: string | null;
             /** Id */
             id: string;
             /** Memory Type */
@@ -4250,8 +4248,6 @@ export interface components {
             corroboration_count: number;
             /** Created At */
             created_at?: string | null;
-            /** Extraction Context */
-            extraction_context?: string | null;
             /** Id */
             id: string;
             /** Memory Type */

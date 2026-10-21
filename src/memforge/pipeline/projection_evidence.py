@@ -274,7 +274,6 @@ def _materialize_claim_evidence(
     canonical = replace(
         raw,
         evidence_quote=primary.excerpt,
-        extraction_context=primary.excerpt,
         evidence_range_start=primary.anchor.range_start,
         evidence_range_end=primary.anchor.range_end,
         evidence_anchor="projection_fragment_catalog",

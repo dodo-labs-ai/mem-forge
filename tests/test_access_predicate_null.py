@@ -95,14 +95,14 @@ async def _insert_null_visibility_row(db: Database, mid: str, content: str) -> N
             corroboration_count,
             valid_from, valid_until, superseded_by, status,
             retirement_reason, retired_at, superseded_at,
-            replacement_reason, extraction_context,
+            replacement_reason,
             created_at, updated_at
         ) VALUES (?, ?, ?, ?,
                   NULL, NULL, ?,
                   1,
                   NULL, NULL, NULL, 'active',
                   NULL, NULL, NULL,
-                  NULL, NULL,
+                  NULL,
                   ?, ?)""",
         (mid, "fact", content, content_hash(content + mid), SHARED_PROJECT_KEY, now, now),
     )
