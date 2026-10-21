@@ -17,7 +17,13 @@ from typing import Any
 
 from memforge.conversations.membership import PlannedUnit
 from memforge.conversations.port import ConversationLabel
-from memforge.conversations.records import MESSAGE_OBSERVATION_TYPE, record_source_time
+from memforge.conversations.records import MESSAGE_OBSERVATION_TYPE
+from memforge.conversations.undated import (
+    UNDATED_MEMBER_TIMES_KEY,
+    member_source_time,
+    payload_member_times,
+    undated_member_times,
+)
 from memforge.conversations.units import UnitKind
 from memforge.models import ContentItem, NormalizedContent, RawContent, slugify
 from memforge.source_artifacts import RawSourceArtifact
@@ -39,6 +45,7 @@ def unit_payload(unit: PlannedUnit, *, record_schema: str) -> dict[str, Any]:
     """The stored input of one planned Unit."""
 
     conversation = unit.conversation
+    undated = undated_member_times((member.identity.message_id, member.record, member.created_at) for member in unit.members)
     return {
         "payload_kind": PAYLOAD_KIND,
         "payload_version": PAYLOAD_VERSION,
@@ -75,6 +82,7 @@ def unit_payload(unit: PlannedUnit, *, record_schema: str) -> dict[str, Any]:
             }
             for member in unit.members
         ],
+        **({UNDATED_MEMBER_TIMES_KEY: undated} if undated else {}),
     }
 
 
@@ -89,7 +97,9 @@ def unit_content_item(unit: PlannedUnit, *, source_id: str) -> ContentItem:
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    last_modified = parse_source_time(latest_source_time(record_source_time(member.record) for member in unit.members))
+    last_modified = parse_source_time(
+        latest_source_time(member_source_time(member.record, member.created_at) for member in unit.members)
+    )
     return ContentItem(
         item_id=document_id or conversation_document_id(source_id, unit.provider_key),
         title=_title_text(unit.conversation, unit.kind, span.earliest),
@@ -158,25 +168,29 @@ def normalize_unit(raw: RawContent) -> NormalizedContent:
 
     native = json.loads(raw.body.decode("utf-8"))
     conversation = payload_label(native)
-    records = [member["record"] for member in native.get("members") or []]
+    members = native.get("members") or []
+    records = [member["record"] for member in members]
+    member_times = [payload_member_times(native, member) for member in members]
     root_id = native["unit"].get("thread_root_id")
     participants = sorted({str(record["from"]) for record in records if record.get("from")})
-    times = [str(record.get("time") or "") for record in records]
+    by_time = sorted(member_times, key=lambda times: times[0])
     header = [f"# {raw.item.title}", ""]
     if conversation.name:
         header.append(f"**{conversation.title_kind}**: {conversation.name}")
     if participants:
         header.append(f"**Participants**: {', '.join(participants)}")
-    if times:
-        header.append(f"**Date range**: {min(times)[:16]} – {max(times)[:16]}")
+    if by_time:
+        header.append(f"**Date range**: {by_time[0][2][:16]} – {by_time[-1][2][:16]}")
     header.extend([f"**Messages**: {len(records)}", "", "---", ""])
     body: list[str] = []
-    for index, (member, record) in enumerate(zip(native.get("members") or [], records, strict=True)):
+    for index, (member, record, (_created_at, _source_time, shown)) in enumerate(
+        zip(members, records, member_times, strict=True)
+    ):
         content = str(record.get("content") or "").strip()
         if not content:
             continue
         author = str(record.get("from") or "Unknown")
-        heading = f"**{author}** ({str(record.get('time') or '')[:16]}):"
+        heading = f"**{author}** ({shown[:16]}):"
         leads = member["message_id"] == root_id if root_id else index == 0 or not record.get("reply_to_id")
         if leads:
             body.extend([heading, content, ""])
@@ -193,7 +207,7 @@ def normalize_unit(raw: RawContent) -> NormalizedContent:
             "participants": participants,
             "message_count": len(records),
             # The Unit's time is its latest message edit or post.
-            SOURCE_UPDATED_AT_KEY: latest_source_time(record_source_time(record) for record in records),
+            SOURCE_UPDATED_AT_KEY: latest_source_time(source_time for _created_at, source_time, _shown in member_times),
         },
     )
 

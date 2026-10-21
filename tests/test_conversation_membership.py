@@ -307,3 +307,51 @@ def test_a_message_seen_without_its_record_is_carried_and_never_proven_absent():
     )
 
     assert _members(plan) == {"w": ["a"]}
+
+
+def _undated(message_id: str, hhmm: str, text: str = "hello") -> Member:
+    """A member stored with a record of an earlier schema, placed by its Observation's source time."""
+
+    record = {"attachments": [], "content": text, "deleted": False}
+    return Member(
+        identity=MessageIdentity(CONVERSATION, message_id),
+        created_at=_at(hhmm),
+        record=record,
+        revision=record_revision(record),
+    )
+
+
+def test_an_undated_member_is_never_proven_absent():
+    window = _window("w", _undated("a", "10:00"), _member("b", "10:10"))
+
+    plan = _plan([], [window], coverage=_coverage("09:00"))
+
+    assert _members(plan) == {"w": ["a"]}
+    assert plan.removals == ()
+
+
+def test_a_returned_message_replaces_its_undated_record():
+    window = _window("w", _undated("a", "10:00", "old"))
+
+    plan = _plan([_returned("a", "10:00", "old")], [window], coverage=_coverage("09:00"))
+
+    (unit,) = plan.units
+    assert unit.members[0].record["time"] == _at("10:00").isoformat()
+
+
+def test_an_undated_root_joins_the_thread_its_reply_opens():
+    window = _window("w", _undated("r", "10:00"), _member("m", "10:10"))
+    thread_key = thread_unit_key(source_id=SOURCE, conversation_id=CONVERSATION, thread_root_id="r")
+
+    plan = _plan([_returned("m", "10:10"), _returned("x", "10:20", root="r")], [window], coverage=_coverage("09:00"))
+
+    assert _members(plan)[thread_key] == ["r", "x"]
+
+
+def test_an_undated_reply_is_never_proven_absent_from_its_thread():
+    thread = _thread("t", "r", _member("r", "10:00"), _undated("x", "10:20"))
+
+    plan = _plan([_returned("r", "10:00")], [thread], coverage=_coverage("09:00"))
+
+    assert plan.units == ()
+    assert plan.removals == ()

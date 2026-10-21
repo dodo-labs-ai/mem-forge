@@ -6,7 +6,9 @@ its own evidence removes it:
 
 - **proven absent**: the attempt did not return it although a proven
   interval covers its creation time
-  (:class:`~memforge.conversations.coverage.ConversationCoverage`);
+  (:class:`~memforge.conversations.coverage.ConversationCoverage`). A member
+  stored without its own creation time is never proven absent
+  (:mod:`~memforge.conversations.undated`);
 - **moved**: it is a window member and the root of a thread Unit that held
   it before this run. A root joins its thread Unit in one run and leaves its
   window in the next, once the thread holding it is current, so it is never
@@ -30,6 +32,7 @@ from dataclasses import dataclass, field
 from memforge.conversations.coverage import ConversationCoverage
 from memforge.conversations.port import ConversationLabel, ConversationRef, ThreadingModel
 from memforge.conversations.records import MessageIdentity
+from memforge.conversations.undated import is_undated
 from memforge.conversations.units import (
     Member,
     Span,
@@ -163,7 +166,11 @@ def plan_conversation(
                 members[key][root] = returned_by_identity[root].member
             elif holders.get(root):
                 held = members[holders[root][0]][root]
-                if root in seen_without_record or not coverage.proves_absent(held.created_at, is_reply=False):
+                if (
+                    root in seen_without_record
+                    or is_undated(held.record)
+                    or not coverage.proves_absent(held.created_at, is_reply=False)
+                ):
                     members[key][root] = held
         return key
 
@@ -191,7 +198,7 @@ def plan_conversation(
     proven_absent: set[str] = set()
     for key, unit in stored.items():
         for identity, member in list(members[key].items()):
-            if identity in returned_by_identity or identity in seen_without_record:
+            if identity in returned_by_identity or identity in seen_without_record or is_undated(member.record):
                 continue
             is_reply = unit.kind is UnitKind.THREAD and identity.message_id != unit.thread_root_id
             if coverage.proves_absent(member.created_at, is_reply=is_reply):
