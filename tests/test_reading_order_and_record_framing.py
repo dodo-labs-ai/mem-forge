@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import pytest
 
 from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
-from memforge.models import ContentItem, NormalizedContent, RawContent
+from memforge.models import ContentItem, NormalizedContent
 from memforge.pipeline.evidence_fragments import build_revision_fragment_index
 from memforge.pipeline.memory_extractor import ExtractionReading
 from memforge.pipeline.projection_context import (
@@ -20,6 +20,7 @@ from memforge.pipeline.projection_context import (
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.pipeline.support_reading import EvidenceCorrespondence, correspond_evidence
+from tests.conversation_fixture import teams_unit_raw
 from tests.test_confluence_native_evidence import projection as confluence_projection
 
 CONVERSATION = (
@@ -46,7 +47,7 @@ def _window(messages, base=None):
         last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc), version="1",
         extra={"conversation_id": "conv-1", "window_id": "window-1", "root_message_id": "msg-0"},
     )
-    raw = RawContent(item=item, body=json.dumps({"messages": messages}).encode(), content_type="application/json")
+    raw = teams_unit_raw(item, messages)
     prior = {} if base is None else {
         "prior_unit_revision": base.source_unit_revisions[0],
         "prior_observation_revisions": {r.observation_id: r for r in base.observation_revisions},

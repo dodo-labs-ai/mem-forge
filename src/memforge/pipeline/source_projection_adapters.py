@@ -12,6 +12,7 @@ import json
 from dataclasses import replace
 from typing import Mapping
 
+from memforge.conversations.projection import is_unit_payload
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.source_adapters.contracts import (
     _ObservationInput, _NativeProjection, _UnitEndpoint, _unit_title, _canonical_json,
@@ -22,13 +23,11 @@ from memforge.source_projection import (
     ProjectionCoverage,
     ProjectionEnvelope,
     ProjectionIdentityConflict,
-    ProjectionScopeAttestation,
     RevisionDelta,
     SourceAnchor,
     SourceObservation,
     SourceObservationRevision,
     SourceProjection,
-    ProjectionScopeTransition,
     SourceRelation,
     SourceUnit,
     SourceUnitRevision,
@@ -132,19 +131,7 @@ class GeneSourceProjectionAdapter:
             prior_unit_revision=envelope.prior_unit_revision,
             prior_observation_revisions=envelope.prior_observation_revisions,
             stored_observation_revisions=envelope.stored_observation_revisions,
-            scope_attestations=request.scope_attestations,
         )
-
-    def reconciliation_coverage(self, *, source_type: str, transition: ProjectionScopeTransition,
-        current_units: tuple[SourceUnit, ...], run_attestations: tuple[ProjectionScopeAttestation, ...] = (),
-    ) -> ProjectionCoverage | None:
-        """Dispatch scoped absence proof to its source owner."""
-        if source_type != "teams":
-            return None
-        from memforge.source_adapters.teams import reconciliation_coverage
-
-        return reconciliation_coverage(transition=transition, current_units=current_units,
-            run_attestations=run_attestations)
 
 
 DEFAULT_SOURCE_PROJECTION_ADAPTER = GeneSourceProjectionAdapter()
@@ -164,7 +151,6 @@ def project_source_item(
     prior_unit_revision: SourceUnitRevision | None = None,
     prior_observation_revisions: Mapping[str, SourceObservationRevision] | None = None,
     stored_observation_revisions: Mapping[str, SourceObservationRevision] | None = None,
-    scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
 ) -> SourceProjection:
     """Project one completely fetched Source Unit.
 
@@ -206,13 +192,6 @@ def project_source_item(
     relations_input = native_projection.relations
     coverage = native_projection.coverage
     locator = native_projection.locator
-    coverage = _provider_authoritative_unit_coverage(
-        source_type=source_type,
-        native=native,
-        coverage=coverage,
-        projected_scope=projected_scope,
-        scope_attestations=scope_attestations,
-    )
     persisted_unit_id = projected_scope.get("source_unit_id")
     persisted_provider_key = projected_scope.get("source_unit_provider_key")
     incarnation = projected_scope.get("source_unit_incarnation")
@@ -506,19 +485,6 @@ def project_source_unit_tombstone(
     )
 
 
-def _provider_authoritative_unit_coverage(
-    *, source_type: str, native: object, coverage: ProjectionCoverage,
-    projected_scope: Mapping[str, object], scope_attestations: tuple[ProjectionScopeAttestation, ...],
-) -> ProjectionCoverage:
-    """Dispatch source-owned collection completeness policy."""
-    if source_type == "teams":
-        from memforge.source_adapters.teams import authoritative_unit_coverage
-
-        return authoritative_unit_coverage(native=native, coverage=coverage,
-            projected_scope=projected_scope, scope_attestations=scope_attestations)
-    return coverage
-
-
 def _project_native(
     *,
     source_id: str,
@@ -527,6 +493,10 @@ def _project_native(
     native: object,
     normalized: NormalizedContent,
 ) -> _NativeProjection:
+    if is_unit_payload(native):
+        from memforge.source_adapters.conversation import project_native
+
+        return project_native(item=item, native=native)
     # The source time of a Unit whose body is one Observation, as the Gene reports it.
     body_time = normalized.source_semantics.get(SOURCE_UPDATED_AT_KEY)
     if source_type == "confluence":
@@ -547,10 +517,6 @@ def _project_native(
         return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
     if source_type == "local_markdown":
         from memforge.source_adapters.local_markdown import project_native
-
-        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
-    if source_type == "teams":
-        from memforge.source_adapters.teams import project_native
 
         return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
     if source_type == "agent_session":

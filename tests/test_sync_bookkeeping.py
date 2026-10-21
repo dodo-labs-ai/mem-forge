@@ -68,13 +68,11 @@ from memforge.models import (
 from memforge.pipeline.sync_memory import MemorySample, SyncMemoryObserver
 from memforge.pipeline.source_projection_adapters import project_source_item, project_source_unit_tombstone
 from memforge.source_projection import (
-    ProjectionScopeAttestation,
     ProjectionScopeTransition,
     ProjectionScopeTransitionStatus,
 )
 from memforge.source_projection_config import (
     canonical_projection_scope,
-    projection_scope_fingerprint,
     projection_scope_transition_id,
 )
 from memforge.pipeline.sync import (
@@ -2485,7 +2483,6 @@ def test_failed_document_summary_keeps_rate_limit_precedence_over_llm_timeout_te
     )
 
 
-
 def test_failed_document_summary_recognizes_each_rate_limit_wording():
     errors = [
         "Jira rate limit persisted after 5 attempts for https://jira.example.test/rest/api/2/issue/PAYR-1.",
@@ -2543,32 +2540,6 @@ class SinceRecordingEmptyGene(EmptyGene):
         self.seen_since = since
         if False:
             yield ContentItem(item_id="never", title="never", updated_at=datetime.now(timezone.utc))
-
-
-def teams_scope_attestations(
-    transition_id: str,
-    target_scope: dict[str, object],
-) -> tuple[ProjectionScopeAttestation, ...]:
-    conversations = sorted(str(value) for value in target_scope.get("conversation_ids", []))
-    return tuple(
-        ProjectionScopeAttestation(
-            subject_type="conversation",
-            subject_key=conversation_id,
-            collection_attempt_id="job-scope:attempt:1",
-            target_scope_fingerprint=projection_scope_fingerprint(target_scope),
-            transition_id=transition_id,
-            evidence={
-                "target_subject_keys": conversations,
-                "poll": {
-                    "raw_conversation_id": conversation_id,
-                    "access_probe_status": "ok",
-                    "pagination_complete": True,
-                    "stop_reason": "no_backward_link",
-                },
-            },
-        )
-        for conversation_id in conversations
-    )
 
 
 class IncrementalNewDocumentGene:
@@ -6035,154 +6006,6 @@ async def test_partial_conversation_scope_transition_preserves_old_membership(db
     assert transition.status is ProjectionScopeTransitionStatus.FAILED
     assert transition.coverage.value == "partial_projection"
     assert "complete successful snapshot" in (transition.error or "")
-
-
-@pytest.mark.asyncio
-async def test_teams_scope_transition_applies_after_removed_units_are_tombstoned(
-    db: Database,
-):
-    source_id = "src-scope-transition-reconciled"
-    await db.upsert_source(
-        id=source_id,
-        type="teams",
-        name="Teams",
-        config_json=json.dumps({"conversation_ids": ["19:retained-thread@example.test"]}),
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    await db.create_projection_scope_transition(
-        ProjectionScopeTransition(
-            id="scope-transition-reconciled",
-            source_id=source_id,
-            previous_scope={
-                "conversation_ids": [
-                    "19:retained-thread@example.test",
-                    "19:removed-thread@example.test",
-                ]
-            },
-            target_scope={"conversation_ids": ["19:retained-thread@example.test"]},
-        )
-    )
-    target_scope = {"conversation_ids": ["19:retained-thread@example.test"]}
-    gene = SinceRecordingEmptyGene()
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        memory_extractor=None,
-        memory_engine=NoopMemoryEngine(),
-        memory_store=None,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene,
-        "Teams",
-        source_id,
-        projection_scope_attestations=teams_scope_attestations(
-            "scope-transition-reconciled",
-            target_scope,
-        ),
-    )
-    transition = (await db.list_projection_scope_transitions(source_id))[0]
-
-    assert state.last_sync_status == "success"
-    assert transition.status is ProjectionScopeTransitionStatus.APPLIED
-    assert transition.coverage.value == "tombstoned_delta"
-    assert await db.list_indexed_doc_ids(source_id) == set()
-    assert await db.list_current_source_units(source_id) == ()
-
-
-@pytest.mark.asyncio
-async def test_teams_retention_transition_applies_only_with_target_attestation(
-    db: Database,
-):
-    source_id = "src-scope-transition-time"
-    target_scope = {
-        "conversation_ids": ["19:conversation-a@example.test"],
-        "rolling_retention_days": 365,
-    }
-    await db.upsert_source(
-        id=source_id,
-        type="teams",
-        name="Teams",
-        config_json=json.dumps(target_scope),
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    await db.create_projection_scope_transition(
-        ProjectionScopeTransition(
-            id="scope-transition-time",
-            source_id=source_id,
-            previous_scope={
-                "conversation_ids": ["19:conversation-a@example.test"],
-                "rolling_retention_days": None,
-            },
-            target_scope=target_scope,
-        )
-    )
-    item = ContentItem(
-        item_id="window-time",
-        title="Recent Teams window",
-        source_url="https://teams.example.test/window-time",
-        last_modified=datetime(2026, 7, 10, tzinfo=timezone.utc),
-        version="revision-time",
-        extra={
-            "conversation_id": "19:conversation-a@example.test",
-            "window_id": "window-time",
-            "root_message_id": "message-time",
-        },
-    )
-    payload = {
-        "_scope_coverage_from": "2026-07-01T00:00:00+00:00",
-        "_scope_coverage_to": "2026-07-16T00:00:00+00:00",
-        "messages": [
-            {
-                "id": "message-time",
-                "content": "Current scoped answer",
-                "time": "2026-07-10T09:00:00+00:00",
-            }
-        ],
-    }
-    await db.record_source_projection(
-        project_source_item(
-            source_id=source_id,
-            source_type="teams",
-            run_id="projection-time-scope",
-            item=item,
-            raw=RawContent(
-                item=item,
-                body=json.dumps(payload).encode(),
-                content_type="application/json",
-            ),
-            normalized=NormalizedContent(
-                item=item,
-                markdown_body="Current scoped answer",
-            ),
-            scope={"configured_scope": target_scope},
-        )
-    )
-    gene = SinceRecordingEmptyGene()
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        memory_extractor=None,
-        memory_engine=NoopMemoryEngine(),
-        memory_store=None,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene,
-        "Teams",
-        source_id,
-        projection_scope_attestations=teams_scope_attestations(
-            "scope-transition-time",
-            target_scope,
-        ),
-    )
-    transition = (await db.list_projection_scope_transitions(source_id))[0]
-
-    assert state.last_sync_status == "success"
-    assert transition.status is ProjectionScopeTransitionStatus.APPLIED
-    assert transition.coverage.value == "tombstoned_delta"
 
 
 @pytest.mark.asyncio

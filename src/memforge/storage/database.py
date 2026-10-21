@@ -278,7 +278,6 @@ from memforge.source_projection import (
     EvidenceRepresentationProfile,
     ProjectionCoverage,
     ProjectionIdentityConflict,
-    ProjectionScopeAttestation,
     ProjectionScopeTransition,
     ProjectionScopeTransitionStatus,
     SourceObservationRevision,
@@ -291,8 +290,6 @@ from memforge.source_projection import (
     SourceUnitRevision,
     source_projection_from_payload,
     source_projection_to_payload,
-    projection_scope_attestation_from_payload,
-    projection_scope_attestation_to_payload,
 )
 from memforge.source_representation import (
     EvidenceProfileBackfillReport,
@@ -1435,6 +1432,9 @@ CREATE TABLE IF NOT EXISTS source_observations (
     UNIQUE (source_unit_id, provider_key)
 );
 
+CREATE INDEX IF NOT EXISTS idx_source_observations_provider_key
+    ON source_observations(source_id, observation_type, provider_key);
+
 CREATE TABLE IF NOT EXISTS source_observation_revisions (
     id                            TEXT PRIMARY KEY,
     observation_id                TEXT NOT NULL REFERENCES source_observations(id) ON DELETE CASCADE,
@@ -1986,7 +1986,6 @@ CREATE TABLE IF NOT EXISTS source_sync_snapshot_manifests (
     local_agent_job_id  TEXT NOT NULL,
     local_agent_attempt_count INTEGER NOT NULL,
     source_config_revision TEXT NOT NULL,
-    scope_attestations_json TEXT NOT NULL DEFAULT '[]',
     created_at          TEXT NOT NULL,
     PRIMARY KEY (workspace_id, source_id, snapshot_id)
 );
@@ -2005,6 +2004,43 @@ CREATE INDEX IF NOT EXISTS idx_source_sync_manifest_item_attestation
     ON source_sync_snapshot_manifest_items(
         workspace_id, source_id, doc_id, revision, change_kind, snapshot_id
     );
+
+-- The collection request the server issued to each conversation collection
+-- attempt, the immutable Collection Manifest that answered it, and the message
+-- bodies that attempt collected which the Source did not hold.
+CREATE TABLE IF NOT EXISTS conversation_collection_requests (
+    workspace_id          TEXT NOT NULL,
+    source_id             TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    collection_attempt_id TEXT NOT NULL,
+    request_json          TEXT NOT NULL,
+    issued_at             TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, source_id, collection_attempt_id)
+);
+
+CREATE TABLE IF NOT EXISTS conversation_collection_manifests (
+    workspace_id          TEXT NOT NULL,
+    source_id             TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    collection_attempt_id TEXT NOT NULL,
+    manifest_json         TEXT NOT NULL,
+    manifest_sha256       TEXT NOT NULL,
+    received_at           TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, source_id, collection_attempt_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_collection_manifests_received
+    ON conversation_collection_manifests(workspace_id, source_id, received_at);
+
+CREATE TABLE IF NOT EXISTS conversation_collection_bodies (
+    workspace_id          TEXT NOT NULL,
+    source_id             TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    collection_attempt_id TEXT NOT NULL,
+    conversation_id       TEXT NOT NULL,
+    message_id            TEXT NOT NULL,
+    revision              TEXT NOT NULL,
+    record_json           TEXT NOT NULL,
+    artifacts_json        TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (workspace_id, source_id, collection_attempt_id, conversation_id, message_id)
+);
 
 CREATE TABLE IF NOT EXISTS local_agent_jobs (
     job_id TEXT PRIMARY KEY,
@@ -4895,6 +4931,56 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # counts them.
         ["ALTER TABLE sync_history ADD COLUMN skipped_reading_group_count INTEGER NOT NULL DEFAULT 0"],
     ),
+    (
+        121,
+        "Collect conversation Sources through the shared conversation layer",
+        # The layer finds a message's Unit by its Observation's provider key,
+        # keeps the request and Collection Manifest of each collection attempt, and names
+        # thread and window Units by conversation Unit Types. Teams Units keep
+        # their ids and keys; the data step renames their Unit Type by key
+        # prefix and records each thread's root in its locator.
+        [
+            "CREATE INDEX IF NOT EXISTS idx_source_observations_provider_key "
+            "ON source_observations(source_id, observation_type, provider_key)",
+            """CREATE TABLE IF NOT EXISTS conversation_collection_requests (
+                workspace_id          TEXT NOT NULL,
+                source_id             TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                collection_attempt_id TEXT NOT NULL,
+                request_json          TEXT NOT NULL,
+                issued_at             TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, source_id, collection_attempt_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS conversation_collection_manifests (
+                workspace_id          TEXT NOT NULL,
+                source_id             TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                collection_attempt_id TEXT NOT NULL,
+                manifest_json         TEXT NOT NULL,
+                manifest_sha256       TEXT NOT NULL,
+                received_at           TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, source_id, collection_attempt_id)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_conversation_collection_manifests_received "
+            "ON conversation_collection_manifests(workspace_id, source_id, received_at)",
+            """CREATE TABLE IF NOT EXISTS conversation_collection_bodies (
+                workspace_id          TEXT NOT NULL,
+                source_id             TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                collection_attempt_id TEXT NOT NULL,
+                conversation_id       TEXT NOT NULL,
+                message_id            TEXT NOT NULL,
+                revision              TEXT NOT NULL,
+                record_json           TEXT NOT NULL,
+                artifacts_json        TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY (workspace_id, source_id, collection_attempt_id, conversation_id, message_id)
+            )""",
+        ],
+    ),
+    (
+        122,
+        "Drop projection-scope attestations from document snapshot manifests",
+        # A conversation Source proves its removals with its Collection
+        # Manifest; no other Source attests a projection scope.
+        [],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -5190,6 +5276,28 @@ class Database:
             if await cursor.fetchone() is not None:
                 raise RuntimeError(REFERENCE_SCOPED_SUPPORT_UNSUPPORTED_MESSAGE)
 
+    async def _name_teams_units_as_conversation_units_unlocked(self) -> None:
+        """Give each Teams Unit its conversation Unit Type, and each thread its root.
+
+        Ids, provider keys and revisions stay, so no Unit is projected or
+        extracted again.
+        """
+
+        from memforge.source_adapters.teams import teams_unit_shape
+
+        rows = await self.db.execute_fetchall(
+            "SELECT id, provider_key, locator_json FROM source_units WHERE unit_type = 'teams_window'"
+        )
+        for row in rows:
+            kind, thread_root_id = teams_unit_shape(str(row["provider_key"]))
+            locator = json.loads(row["locator_json"] or "{}")
+            if thread_root_id is not None:
+                locator["thread_root_id"] = thread_root_id
+            await self.db.execute(
+                "UPDATE source_units SET unit_type = ?, locator_json = ? WHERE id = ?",
+                (kind.value, json.dumps(locator, sort_keys=True), row["id"]),
+            )
+
     async def _migrate_agent_runtime_event_v3_unlocked(self) -> None:
         """Relax extraction-only lineage and preserve v2 events and assessments."""
 
@@ -5380,6 +5488,8 @@ class Database:
                     await self._purge_memory_unlocked(memory_id)
         if version == 79:
             await self._migrate_agent_runtime_event_v3_unlocked()
+        if version == 121:
+            await self._name_teams_units_as_conversation_units_unlocked()
         for sql in statements:
             try:
                 await self.db.execute(sql)
@@ -5403,6 +5513,8 @@ class Database:
         if version == 105:
             superseded = await self._remove_source_activity_epoch_unlocked()
             logger.info("Superseded %d unapplied derivations staged with a Source activity epoch", superseded)
+        if version == 122:
+            await self._drop_columns_if_present_unlocked("source_sync_snapshot_manifests", "scope_attestations_json")
         if version == 107:
             await self._drop_columns_if_present_unlocked("memories", "confidence")
             await self._drop_columns_if_present_unlocked("agent_claims", "confidence")
@@ -6512,7 +6624,11 @@ class Database:
         now_iso: str,
         retry_job_id: str | None = None,
     ) -> tuple[str, bool]:
-        """Coalesce work inside the caller's source-write transaction."""
+        """Coalesce work inside the caller's source-write transaction.
+
+        A dry run coalesces only with another dry run, and a real collection
+        only with a real one, so neither takes the other's place.
+        """
         source_lock = await self.db.execute(
             "UPDATE sources SET status = status WHERE id = ?",
             (source_id,),
@@ -6553,10 +6669,14 @@ class Database:
             """SELECT * FROM local_agent_jobs
                WHERE workspace_id = ? AND source_id = ? AND operation = ?
                  AND execution_owner_user_id = ? AND status IN ('queued', 'leased')
-               ORDER BY created_at LIMIT 1""",
+               ORDER BY created_at""",
             (workspace_id, source_id, operation, execution_owner_user_id),
         ) as cursor:
-            existing = await cursor.fetchone()
+            existing = None
+            async for row in cursor:
+                if bool(json.loads(row["payload_json"] or "{}").get("dry_run")) == bool(payload.get("dry_run")):
+                    existing = row
+                    break
         if existing is not None:
             existing_payload = json.loads(existing["payload_json"] or "{}")
             if existing["status"] == "queued":
@@ -9174,6 +9294,52 @@ class Database:
             units=units,
             next_cursor=units[-1].id if has_more and units else None,
         )
+
+    async def list_current_observation_holders(
+        self,
+        source_id: str,
+        *,
+        observation_type: str,
+        provider_keys: Collection[str],
+        locator_equals: Mapping[str, str],
+    ) -> tuple[tuple[str, SourceUnit], ...]:
+        """The current Source Units holding a current Observation of this type under one of these provider keys.
+
+        Each answer pairs the Observation's provider key with the Unit that
+        holds it. ``locator_equals`` narrows the Observations by their
+        locator, such as a message's conversation.
+        """
+
+        keys = sorted(set(provider_keys))
+        locator_conditions = []
+        locator_params: list[object] = []
+        for key, value in sorted(locator_equals.items()):
+            if not key.replace("_", "").isalnum():
+                raise ValueError("source observation locator filter key is invalid")
+            locator_conditions.append(" AND json_extract(so.locator_json, ?) = ?")
+            locator_params.extend((f"$.{key}", value))
+        holders: dict[tuple[str, str], SourceUnit] = {}
+        for offset in range(0, len(keys), STORAGE_BIND_CHUNK_SIZE):
+            chunk = keys[offset:offset + STORAGE_BIND_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            for row in await self.db.execute_fetchall(
+                f"""SELECT so.provider_key AS observation_key, su.*
+                   FROM source_observations so
+                   JOIN source_units su ON su.id = so.source_unit_id
+                   WHERE so.source_id = ? AND so.observation_type = ?
+                     AND so.provider_key IN ({placeholders})
+                     AND so.current_revision_id IS NOT NULL
+                     AND su.current_revision_id IS NOT NULL{"".join(locator_conditions)}""",
+                (source_id, observation_type, *chunk, *locator_params),
+            ):
+                holders[(str(row["observation_key"]), str(row["id"]))] = SourceUnit(
+                    id=row["id"],
+                    source_id=row["source_id"],
+                    unit_type=row["unit_type"],
+                    provider_key=row["provider_key"],
+                    locator=json.loads(row["locator_json"] or "{}"),
+                )
+        return tuple((key, unit) for (key, _unit_id), unit in sorted(holders.items()))
 
     async def count_active_source_memories_without_support(self, source_id: str) -> int:
         """Count active Memories whose same-source support invariant is absent."""
@@ -18251,6 +18417,13 @@ class Database:
                     "DELETE FROM source_item_failures WHERE source_id = ?",
                     (source_id,),
                 )
+                # Collected message bodies hold message text; none outlives its Source.
+                for table in (
+                    "conversation_collection_bodies",
+                    "conversation_collection_manifests",
+                    "conversation_collection_requests",
+                ):
+                    await self.db.execute(f"DELETE FROM {table} WHERE source_id = ?", (source_id,))
                 await self.db.execute(
                     "DELETE FROM source_subscriptions WHERE source_id = ?",
                     (source_id,),
@@ -20057,7 +20230,6 @@ class Database:
         local_agent_job_id: str,
         local_agent_attempt_count: int,
         source_config_revision: str,
-        scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
     ) -> None:
         """Persist one fenced manifest and attach its reusable immutable inputs."""
         normalized_snapshot_id = _non_empty_string(snapshot_id)
@@ -20078,11 +20250,6 @@ class Database:
             raise ValueError("snapshot membership was not declared by the manifest")
         if len(manifest_sha256) != 64:
             raise ValueError("snapshot manifest digest is invalid")
-        scope_attestations_json = json.dumps(
-            [projection_scope_attestation_to_payload(item) for item in scope_attestations],
-            sort_keys=True,
-            separators=(",", ":"),
-        )
         now = _now_iso()
         async with self._write_lock:
             try:
@@ -20128,7 +20295,7 @@ class Database:
                 async with self.db.execute(
                     """SELECT coverage, item_count, manifest_sha256,
                               local_agent_job_id, local_agent_attempt_count,
-                              source_config_revision, scope_attestations_json
+                              source_config_revision
                        FROM source_sync_snapshot_manifests
                        WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
                     (workspace_id, source_id, normalized_snapshot_id),
@@ -20141,7 +20308,6 @@ class Database:
                     local_agent_job_id,
                     local_agent_attempt_count,
                     source_config_revision,
-                    scope_attestations_json,
                 )
                 if existing_manifest is not None:
                     actual_manifest = (
@@ -20151,7 +20317,6 @@ class Database:
                         str(existing_manifest["local_agent_job_id"]),
                         int(existing_manifest["local_agent_attempt_count"]),
                         str(existing_manifest["source_config_revision"]),
-                        str(existing_manifest["scope_attestations_json"]),
                     )
                     if actual_manifest != expected_manifest:
                         raise SourceActivityConflict("source snapshot manifest changed")
@@ -20181,8 +20346,8 @@ class Database:
                         """INSERT INTO source_sync_snapshot_manifests (
                         workspace_id, source_id, snapshot_id, coverage, item_count, manifest_sha256,
                         local_agent_job_id, local_agent_attempt_count,
-                        source_config_revision, scope_attestations_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        source_config_revision, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             workspace_id,
                             source_id,
@@ -20193,7 +20358,6 @@ class Database:
                             local_agent_job_id,
                             local_agent_attempt_count,
                             source_config_revision,
-                            scope_attestations_json,
                             now,
                         ),
                     )
@@ -20248,7 +20412,6 @@ class Database:
         async with self.db.execute(
             """SELECT m.coverage, m.item_count, m.local_agent_job_id,
                       m.local_agent_attempt_count, m.source_config_revision,
-                      m.scope_attestations_json,
                       COUNT(si.doc_id) AS materialized_count
                FROM source_sync_snapshot_manifests m
                LEFT JOIN source_sync_snapshot_items si
@@ -20257,8 +20420,7 @@ class Database:
                 AND si.snapshot_id = m.snapshot_id
                WHERE m.workspace_id = ? AND m.source_id = ? AND m.snapshot_id = ?
                GROUP BY m.coverage, m.item_count, m.local_agent_job_id,
-                        m.local_agent_attempt_count, m.source_config_revision,
-                        m.scope_attestations_json""",
+                        m.local_agent_attempt_count, m.source_config_revision""",
             (workspace_id, source_id, snapshot_id),
         ) as cursor:
             row = await cursor.fetchone()
@@ -20274,11 +20436,239 @@ class Database:
             "local_agent_job_id": str(row["local_agent_job_id"]),
             "local_agent_attempt_count": int(row["local_agent_attempt_count"]),
             "source_config_revision": str(row["source_config_revision"]),
-            "scope_attestations": tuple(
-                projection_scope_attestation_from_payload(item)
-                for item in json.loads(row["scope_attestations_json"] or "[]")
-            ),
         }
+
+    async def record_conversation_collection_request(
+        self,
+        *,
+        workspace_id: str,
+        source_id: str,
+        collection_attempt_id: str,
+        request_json: str,
+        issued_at: str,
+    ) -> str:
+        """Keep the request issued to one collection attempt and return the attempt's request.
+
+        An attempt keeps the first request issued to it, so asking again
+        returns the same request.
+        """
+
+        async with self._write_transaction():
+            await self.db.execute(
+                """INSERT OR IGNORE INTO conversation_collection_requests (
+                       workspace_id, source_id, collection_attempt_id, request_json, issued_at
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (workspace_id, source_id, collection_attempt_id, request_json, issued_at),
+            )
+            async with self.db.execute(
+                """SELECT request_json FROM conversation_collection_requests
+                   WHERE workspace_id = ? AND source_id = ? AND collection_attempt_id = ?""",
+                (workspace_id, source_id, collection_attempt_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            await self.db.commit()
+        if row is None:
+            raise RuntimeError(f"collection attempt {collection_attempt_id} kept no request")
+        return str(row["request_json"])
+
+    async def get_conversation_collection_request(
+        self,
+        *,
+        workspace_id: str,
+        source_id: str,
+        collection_attempt_id: str,
+    ) -> str | None:
+        """The request JSON issued to one collection attempt, if one was issued."""
+
+        async with self.db.execute(
+            """SELECT request_json FROM conversation_collection_requests
+               WHERE workspace_id = ? AND source_id = ? AND collection_attempt_id = ?""",
+            (workspace_id, source_id, collection_attempt_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return str(row["request_json"]) if row is not None else None
+
+    async def prune_conversation_collections(
+        self,
+        *,
+        workspace_id: str,
+        source_id: str,
+        processed_attempt_id: str,
+    ) -> None:
+        """Drop what the processing of one collection attempt leaves unneeded.
+
+        The bodies of that attempt and of every attempt received before it,
+        the requests issued until its receipt, and every manifest received
+        before it go. Its own manifest stays: the next request continues from
+        it. An attempt received later keeps everything.
+        """
+
+        async with self._write_transaction():
+            async with self.db.execute(
+                """SELECT received_at FROM conversation_collection_manifests
+                   WHERE workspace_id = ? AND source_id = ? AND collection_attempt_id = ?""",
+                (workspace_id, source_id, processed_attempt_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return
+            received_at = str(row["received_at"])
+            await self.db.execute(
+                """DELETE FROM conversation_collection_bodies
+                   WHERE workspace_id = ? AND source_id = ?
+                     AND collection_attempt_id NOT IN (
+                         SELECT collection_attempt_id FROM conversation_collection_manifests
+                         WHERE workspace_id = ? AND source_id = ? AND received_at > ?
+                     )""",
+                (workspace_id, source_id, workspace_id, source_id, received_at),
+            )
+            await self.db.execute(
+                """DELETE FROM conversation_collection_requests
+                   WHERE workspace_id = ? AND source_id = ? AND issued_at <= ?""",
+                (workspace_id, source_id, received_at),
+            )
+            await self.db.execute(
+                """DELETE FROM conversation_collection_manifests
+                   WHERE workspace_id = ? AND source_id = ? AND received_at < ?""",
+                (workspace_id, source_id, received_at),
+            )
+            await self.db.commit()
+
+    async def record_conversation_collection_manifest(
+        self,
+        *,
+        workspace_id: str,
+        source_id: str,
+        collection_attempt_id: str,
+        manifest_json: str,
+        received_at: str,
+    ) -> None:
+        """Keep one collection attempt's Collection Manifest; recording the same manifest again changes nothing.
+
+        A different manifest for an attempt that already has one is refused:
+        the manifest of an attempt is immutable.
+        """
+
+        manifest_sha256 = hashlib.sha256(manifest_json.encode("utf-8")).hexdigest()
+        async with self._write_transaction():
+            await self.db.execute(
+                """INSERT OR IGNORE INTO conversation_collection_manifests (
+                       workspace_id, source_id, collection_attempt_id,
+                       manifest_json, manifest_sha256, received_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (workspace_id, source_id, collection_attempt_id, manifest_json, manifest_sha256, received_at),
+            )
+            async with self.db.execute(
+                """SELECT manifest_sha256 FROM conversation_collection_manifests
+                   WHERE workspace_id = ? AND source_id = ? AND collection_attempt_id = ?""",
+                (workspace_id, source_id, collection_attempt_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None or str(row["manifest_sha256"]) != manifest_sha256:
+                raise ValueError(f"collection attempt {collection_attempt_id} already has another manifest")
+            await self.db.commit()
+
+    async def get_conversation_collection_manifest(
+        self,
+        *,
+        workspace_id: str,
+        source_id: str,
+        collection_attempt_id: str,
+    ) -> str | None:
+        """The manifest JSON of one collection attempt, if it recorded one."""
+
+        async with self.db.execute(
+            """SELECT manifest_json FROM conversation_collection_manifests
+               WHERE workspace_id = ? AND source_id = ? AND collection_attempt_id = ?""",
+            (workspace_id, source_id, collection_attempt_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return str(row["manifest_json"]) if row is not None else None
+
+    async def get_latest_conversation_collection_manifest(
+        self,
+        *,
+        workspace_id: str,
+        source_id: str,
+    ) -> str | None:
+        """The manifest JSON the Source received last, if any."""
+
+        async with self.db.execute(
+            """SELECT manifest_json FROM conversation_collection_manifests
+               WHERE workspace_id = ? AND source_id = ?
+               ORDER BY received_at DESC, collection_attempt_id DESC
+               LIMIT 1""",
+            (workspace_id, source_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return str(row["manifest_json"]) if row is not None else None
+
+    async def record_conversation_collection_bodies(
+        self,
+        *,
+        workspace_id: str,
+        source_id: str,
+        collection_attempt_id: str,
+        bodies: Sequence[tuple[str, str, str, str, str]],
+    ) -> None:
+        """Keep message bodies of one collection attempt.
+
+        Each body is ``(conversation, message, revision, record JSON,
+        artifacts JSON)``, the artifacts naming the inputs that hold the
+        message's binaries. Recording a body again unchanged changes nothing;
+        another body for the same message in the same attempt is refused.
+        """
+
+        async with self._write_transaction():
+            for conversation_id, message_id, revision, record_json, artifacts_json in bodies:
+                await self.db.execute(
+                    """INSERT OR IGNORE INTO conversation_collection_bodies (
+                           workspace_id, source_id, collection_attempt_id,
+                           conversation_id, message_id, revision, record_json, artifacts_json
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (workspace_id, source_id, collection_attempt_id, conversation_id, message_id, revision,
+                     record_json, artifacts_json),
+                )
+                async with self.db.execute(
+                    """SELECT revision, artifacts_json FROM conversation_collection_bodies
+                       WHERE workspace_id = ? AND source_id = ? AND collection_attempt_id = ?
+                         AND conversation_id = ? AND message_id = ?""",
+                    (workspace_id, source_id, collection_attempt_id, conversation_id, message_id),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if row is None or (str(row["revision"]), str(row["artifacts_json"])) != (revision, artifacts_json):
+                    raise ValueError(
+                        f"collection attempt {collection_attempt_id} already holds another body "
+                        f"for message {message_id}"
+                    )
+            await self.db.commit()
+
+    async def list_conversation_collection_bodies(
+        self,
+        *,
+        workspace_id: str,
+        source_id: str,
+        collection_attempt_id: str,
+    ) -> list[tuple[str, str, str, str, str]]:
+        """Every body one collection attempt holds, as ``(conversation, message, revision, record JSON, artifacts JSON)``."""
+
+        rows = await self.db.execute_fetchall(
+            """SELECT conversation_id, message_id, revision, record_json, artifacts_json
+               FROM conversation_collection_bodies
+               WHERE workspace_id = ? AND source_id = ? AND collection_attempt_id = ?
+               ORDER BY conversation_id, message_id""",
+            (workspace_id, source_id, collection_attempt_id),
+        )
+        return [
+            (
+                str(row["conversation_id"]),
+                str(row["message_id"]),
+                str(row["revision"]),
+                str(row["record_json"]),
+                str(row["artifacts_json"]),
+            )
+            for row in rows
+        ]
 
     async def attest_source_sync_input_artifact(
         self,

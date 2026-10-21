@@ -10,7 +10,6 @@ import pytest
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.source_projection_adapters import (
     BUILTIN_SPECIALIZED_SOURCE_TYPES,
-    GeneSourceProjectionAdapter,
     _canonical_hash,
     _stable_id,
     project_source_item,
@@ -22,18 +21,15 @@ from memforge.source_projection import (
     DeltaAxis,
     EvidenceCoordinateSpace,
     ProjectionCoverage,
-    ProjectionScopeAttestation,
-    ProjectionScopeTransition,
     SourceRelationType,
-    SourceUnit,
 )
-from memforge.source_projection_config import projection_scope_fingerprint
 from memforge.source_representation import (
     representation_contract_for_profile,
     representation_profile_for_observation_contract,
 )
 from memforge.source_artifacts import StoredSourceArtifact
 from memforge.storage.database import Database
+from tests.conversation_fixture import teams_unit_payload
 
 
 NOW = datetime(2026, 7, 15, tzinfo=timezone.utc)
@@ -53,6 +49,13 @@ def _item(**overrides) -> ContentItem:
 
 
 def _inputs(item: ContentItem, raw_value: object, markdown: str = "semantic body"):
+    if isinstance(raw_value, dict) and "messages" in raw_value:
+        # Teams messages arrive as one conversation Unit.
+        raw_value = teams_unit_payload(
+            raw_value["messages"],
+            conversation_id=str(item.extra.get("conversation_id") or "conv-1"),
+            provider_key=str(item.extra.get("window_id") or item.item_id),
+        )
     raw = RawContent(
         item=item,
         body=(raw_value if isinstance(raw_value, bytes) else json.dumps(raw_value).encode()),
@@ -110,31 +113,6 @@ def _jira_payload(
             "total": payload["_comments_total"],
         }
     return payload
-
-
-def _teams_run_attestations(
-    transition: ProjectionScopeTransition,
-) -> tuple[ProjectionScopeAttestation, ...]:
-    conversations = sorted(str(value) for value in transition.target_scope.get("conversation_ids", []))
-    return tuple(
-        ProjectionScopeAttestation(
-            subject_type="conversation",
-            subject_key=conversation_id,
-            transition_id=transition.id,
-            target_scope_fingerprint=projection_scope_fingerprint(transition.target_scope),
-            collection_attempt_id="job-a:attempt:1",
-            evidence={
-                "target_subject_keys": conversations,
-                "poll": {
-                    "raw_conversation_id": conversation_id,
-                    "access_probe_status": "ok",
-                    "pagination_complete": True,
-                    "stop_reason": "no_backward_link",
-                },
-            },
-        )
-        for conversation_id in conversations
-    )
 
 
 def test_confluence_page_id_is_unit_and_parent_is_location_only() -> None:
@@ -1344,7 +1322,7 @@ def test_unattested_github_previous_filename_keeps_path_identity() -> None:
     assert projection.relations == ()
 
 
-def test_teams_window_is_unit_and_native_messages_are_observations() -> None:
+def test_a_conversation_unit_is_a_unit_and_its_messages_are_observations() -> None:
     item = _item(
         item_id="window-1",
         extra={"conversation_id": "conv-1", "window_id": "window-1", "root_message_id": "msg-1"},
@@ -1367,441 +1345,14 @@ def test_teams_window_is_unit_and_native_messages_are_observations() -> None:
         normalized=normalized,
     )
 
+    assert projection.source_units[0].unit_type == "conversation_window"
     assert projection.source_units[0].provider_key == "window-1"
     assert projection.source_units[0].locator["observed_from"] == "2026-07-14T10:00:00+00:00"
     assert projection.source_units[0].locator["observed_to"] == "2026-07-14T10:01:00+00:00"
     assert [item.provider_key for item in projection.observations] == ["msg-1", "msg-2"]
-    assert projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION
-
-
-def test_teams_window_attestation_proves_only_unit_snapshot_completeness() -> None:
-    item = _item(
-        item_id="window-1",
-        extra={"conversation_id": "conv-1", "window_id": "window-1"},
-    )
-    raw, normalized = _inputs(
-        item,
-        {
-            "_authoritative_snapshot": True,
-                "messages": [
-                    {"id": "msg-1", "content": "Question", "time": "2026-07-14T10:00:00Z"},
-                    {"id": "msg-2", "content": "Answer", "time": "2026-07-14T10:01:00Z"},
-            ],
-        },
-    )
-
-    projection = project_source_item(
-        source_id="src-teams",
-        source_type="teams",
-        run_id="run-teams-complete-window",
-        item=item,
-        raw=raw,
-        normalized=normalized,
-    )
-
+    assert [item.locator for item in projection.observations] == [{"conversation_id": "conv-1"}] * 2
+    # The conversation layer decided every member, so the Unit is a complete snapshot of them.
     assert projection.coverage is ProjectionCoverage.COMPLETE_SNAPSHOT
-    assert (
-        source_run_projection_coverage(
-            authoritative_snapshot=False,
-            scope_transition=False,
-            discovery_complete=False,
-        )
-        is ProjectionCoverage.PARTIAL_PROJECTION
-    )
-
-
-def test_teams_complete_window_tombstone_removes_every_prior_observation() -> None:
-    item = _item(
-        item_id="window-1",
-        extra={"conversation_id": "conv-1", "window_id": "window-1"},
-    )
-    first_raw, first_normalized = _inputs(
-        item,
-        {
-            "_authoritative_snapshot": True,
-                "messages": [
-                    {"id": "msg-1", "content": "Question", "time": "2026-07-14T10:00:00Z"},
-                    {"id": "msg-2", "content": "Answer", "time": "2026-07-14T10:01:00Z"},
-            ],
-        },
-    )
-    first = project_source_item(
-        source_id="src-teams",
-        source_type="teams",
-        run_id="run-teams-before-tombstone",
-        item=item,
-        raw=first_raw,
-        normalized=first_normalized,
-    )
-    tombstone_raw, tombstone_normalized = _inputs(
-        item,
-        {
-            "_authoritative_snapshot": True,
-            "_tombstone": True,
-            "messages": [],
-        },
-        "",
-    )
-
-    tombstone = project_source_item(
-        source_id="src-teams",
-        source_type="teams",
-        run_id="run-teams-tombstone",
-        item=item,
-        raw=tombstone_raw,
-        normalized=tombstone_normalized,
-        prior_unit_revision=first.source_unit_revisions[0],
-        prior_observation_revisions={
-            observation.id: revision
-            for observation, revision in zip(
-                first.observations,
-                first.observation_revisions,
-                strict=True,
-            )
-        },
-    )
-
-    assert tombstone.coverage is ProjectionCoverage.COMPLETE_SNAPSHOT
-    assert tombstone.observations == ()
-    assert set(tombstone.deltas[0].removed_observation_ids) == {observation.id for observation in first.observations}
-    assert DeltaAxis.MEMBERSHIP in tombstone.deltas[0].axes
-
-
-@pytest.mark.parametrize("retention_days", [365, 730, 1095])
-def test_teams_rolling_retention_tombstone_requires_same_attempt_scope_attestation(
-    retention_days: int,
-) -> None:
-    conversation_id = "19:conv-a@example.test"
-    configured_scope = {
-        "conversation_ids": [conversation_id],
-        "rolling_retention_days": retention_days,
-    }
-    item = _item(
-        item_id="window-expired",
-        extra={"conversation_id": conversation_id, "window_id": "window-expired"},
-    )
-    first_raw, first_normalized = _inputs(
-        item,
-        {"messages": [{"id": "msg-1", "content": "Old", "time": "2024-01-01T00:00:00Z"}]},
-    )
-    first = project_source_item(
-        source_id="src-teams",
-        source_type="teams",
-        run_id="run-retention-before",
-        item=item,
-        raw=first_raw,
-        normalized=first_normalized,
-    )
-    raw, normalized = _inputs(
-        item,
-        {
-            "_authoritative_snapshot": True,
-            "_tombstone": True,
-            "tombstone_reason": "outside_rolling_retention",
-            "rolling_retention_cutoff": "2025-01-01T00:00:00Z",
-            "prior_observed_to": "2024-01-01T00:00:00Z",
-            "conversation_id": conversation_id,
-            "messages": [],
-        },
-        "",
-    )
-    kwargs = {
-        "source_id": "src-teams",
-        "source_type": "teams",
-        "run_id": "run-retention-tombstone",
-        "item": item,
-        "raw": raw,
-        "normalized": normalized,
-        "scope": {"configured_scope": configured_scope},
-        "prior_unit_revision": first.source_unit_revisions[0],
-        "prior_observation_revisions": {revision.observation_id: revision for revision in first.observation_revisions},
-    }
-    with pytest.raises(ValueError, match="run-scoped coverage evidence"):
-        project_source_item(**kwargs)
-
-    attestation = ProjectionScopeAttestation(
-        subject_type="conversation",
-        subject_key=conversation_id,
-        collection_attempt_id="job-1:attempt:1",
-        target_scope_fingerprint=projection_scope_fingerprint(configured_scope),
-        evidence={
-            "target_subject_keys": [conversation_id],
-            "rolling_retention_cutoff": "2025-01-01T00:00:00Z",
-            "poll": {
-                "raw_conversation_id": conversation_id,
-                "access_probe_status": "ok",
-                "pagination_complete": False,
-                "stop_reason": "cutoff_reached",
-                "absence_covered_from": "2025-01-01T00:00:00Z",
-                "absence_covered_to": "2026-01-01T00:00:00Z",
-            },
-        },
-    )
-    tombstone = project_source_item(**kwargs, scope_attestations=(attestation,))
-    assert set(tombstone.deltas[0].removed_observation_ids) == {item.id for item in first.observations}
-    assert tombstone.source_units[0].locator["observed_to"] == "2024-01-01T00:00:00+00:00"
-    assert tombstone.source_units[0].locator["tombstone_reason"] == "outside_rolling_retention"
-
-    threshold_raw, threshold_normalized = _inputs(
-        item,
-        {
-            "_authoritative_snapshot": True,
-            "_tombstone": True,
-            "tombstone_reason": "outside_rolling_retention",
-            "rolling_retention_cutoff": "2025-01-01T00:00:00Z",
-            "prior_observed_to": "2025-01-01T00:00:00Z",
-            "conversation_id": conversation_id,
-            "messages": [],
-        },
-        "",
-    )
-    with pytest.raises(ValueError, match="run-scoped coverage evidence"):
-        project_source_item(
-            **{**kwargs, "raw": threshold_raw, "normalized": threshold_normalized},
-            scope_attestations=(attestation,),
-        )
-
-    incomplete_scope = {
-        "conversation_ids": [conversation_id, "19:conv-b@example.test"],
-        "rolling_retention_days": 365,
-    }
-    incomplete_attestation = replace(
-        attestation,
-        target_scope_fingerprint=projection_scope_fingerprint(incomplete_scope),
-        evidence={**attestation.evidence, "target_subject_keys": sorted(incomplete_scope["conversation_ids"])},
-    )
-    with pytest.raises(ValueError, match="run-scoped coverage evidence"):
-        project_source_item(
-            **{**kwargs, "scope": {"configured_scope": incomplete_scope}},
-            scope_attestations=(incomplete_attestation,),
-        )
-
-
-def test_teams_selector_scope_transition_closes_after_removed_units_are_tombstoned() -> None:
-    adapter = GeneSourceProjectionAdapter()
-    transition = ProjectionScopeTransition(
-        id="transition-teams",
-        source_id="src-teams",
-        previous_scope={
-            "conversation_ids": [
-                "19:conv-a@example.test",
-                "19:conv-b@example.test",
-            ]
-        },
-        target_scope={"conversation_ids": ["19:conv-a@example.test"]},
-    )
-    retained = SourceUnit(
-        id="unit-a",
-        source_id="src-teams",
-        unit_type="teams_window",
-        provider_key="window-a",
-        locator={
-            "conversation_id": "19:conv-a@example.test",
-            "window_id": "window-a",
-        },
-    )
-
-    assert (
-        adapter.reconciliation_coverage(
-            source_type="teams",
-            transition=transition,
-            current_units=(retained,),
-            run_attestations=_teams_run_attestations(transition),
-        )
-        is ProjectionCoverage.TOMBSTONED_DELTA
-    )
-
-    stale_removed_scope = SourceUnit(
-        id="unit-b",
-        source_id="src-teams",
-        unit_type="teams_window",
-        provider_key="window-b",
-        locator={
-            "conversation_id": "19:conv-b@example.test",
-            "window_id": "window-b",
-        },
-    )
-    assert (
-        adapter.reconciliation_coverage(
-            source_type="teams",
-            transition=transition,
-            current_units=(retained, stale_removed_scope),
-            run_attestations=_teams_run_attestations(transition),
-        )
-        is None
-    )
-
-
-def test_teams_selector_scope_transition_rejects_unresolved_legacy_names() -> None:
-    adapter = GeneSourceProjectionAdapter()
-    transition = ProjectionScopeTransition(
-        id="transition-teams-unresolved-selector",
-        source_id="src-teams",
-        previous_scope={"channels": ["Old Team/General"]},
-        target_scope={"channels": ["New Team/General"]},
-    )
-
-    assert (
-        adapter.reconciliation_coverage(
-            source_type="teams",
-            transition=transition,
-            current_units=(),
-        )
-        is None
-    )
-
-
-def test_teams_empty_target_units_require_current_run_attestation() -> None:
-    adapter = GeneSourceProjectionAdapter()
-    transition = ProjectionScopeTransition(
-        id="transition-teams-empty",
-        source_id="src-teams",
-        previous_scope={"conversation_ids": ["19:old@example.test"]},
-        target_scope={"conversation_ids": ["19:empty@example.test"]},
-    )
-
-    assert (
-        adapter.reconciliation_coverage(
-            source_type="teams",
-            transition=transition,
-            current_units=(),
-        )
-        is None
-    )
-    assert (
-        adapter.reconciliation_coverage(
-            source_type="teams",
-            transition=transition,
-            current_units=(),
-            run_attestations=_teams_run_attestations(transition),
-        )
-        is ProjectionCoverage.TOMBSTONED_DELTA
-    )
-
-
-def test_teams_rolling_retention_transition_requires_target_attestation() -> None:
-    adapter = GeneSourceProjectionAdapter()
-    target_scope = {
-        "conversation_ids": ["19:conv-a@example.test"],
-        "rolling_retention_days": 365,
-    }
-    transition = ProjectionScopeTransition(
-        id="transition-teams-time",
-        source_id="src-teams",
-        previous_scope={
-            "conversation_ids": ["19:conv-a@example.test"],
-            "rolling_retention_days": None,
-        },
-        target_scope=target_scope,
-    )
-    attested = SourceUnit(
-        id="unit-a",
-        source_id="src-teams",
-        unit_type="teams_window",
-        provider_key="window-a",
-        locator={
-            "conversation_id": "19:conv-a@example.test",
-            "window_id": "window-a",
-        },
-    )
-
-    assert (
-        adapter.reconciliation_coverage(
-            source_type="teams",
-            transition=transition,
-            current_units=(attested,),
-            run_attestations=_teams_run_attestations(transition),
-        )
-        is ProjectionCoverage.TOMBSTONED_DELTA
-    )
-    assert (
-        adapter.reconciliation_coverage(
-            source_type="teams",
-            transition=transition,
-            current_units=(attested,),
-        )
-        is None
-    )
-
-
-def test_teams_internal_window_policy_is_not_projection_scope() -> None:
-    adapter = GeneSourceProjectionAdapter()
-    target_scope = {
-        "conversation_ids": ["19:conv-a@example.test"],
-        "conversation_gap_minutes": 30,
-        "max_block_messages": 50,
-    }
-    transition = ProjectionScopeTransition(
-        id="transition-teams-partition",
-        source_id="src-teams",
-        previous_scope={
-            "conversation_ids": ["19:conv-a@example.test"],
-            "conversation_gap_minutes": 60,
-            "max_block_messages": 100,
-        },
-        target_scope=target_scope,
-    )
-    complete = SourceUnit(
-        id="unit-a",
-        source_id="src-teams",
-        unit_type="teams_window",
-        provider_key="window-a",
-        locator={
-            "conversation_id": "19:conv-a@example.test",
-            "window_id": "window-a",
-        },
-    )
-
-    assert (
-        adapter.reconciliation_coverage(
-            source_type="teams",
-            transition=transition,
-            current_units=(complete,),
-            run_attestations=_teams_run_attestations(transition),
-        )
-        is None
-    )
-
-
-def test_teams_legacy_history_and_partition_fields_cannot_authorize_removal() -> None:
-    adapter = GeneSourceProjectionAdapter()
-    target_scope = {
-        "conversation_ids": ["19:conv-a@example.test"],
-        "max_age_days": 30,
-        "conversation_gap_minutes": 30,
-        "max_block_messages": 50,
-    }
-    transition = ProjectionScopeTransition(
-        id="transition-teams-mixed",
-        source_id="src-teams",
-        previous_scope={
-            "conversation_ids": ["19:conv-a@example.test"],
-            "max_age_days": 365,
-            "conversation_gap_minutes": 60,
-            "max_block_messages": 100,
-        },
-        target_scope=target_scope,
-    )
-    unit = SourceUnit(
-        id="unit-mixed",
-        source_id="src-teams",
-        unit_type="teams_window",
-        provider_key="window-mixed",
-        locator={
-            "conversation_id": "19:conv-a@example.test",
-            "window_id": "window-mixed",
-        },
-    )
-
-    assert (
-        adapter.reconciliation_coverage(
-            source_type="teams",
-            transition=transition,
-            current_units=(unit,),
-            run_attestations=_teams_run_attestations(transition),
-        )
-        is None
-    )
 
 
 @pytest.mark.parametrize(

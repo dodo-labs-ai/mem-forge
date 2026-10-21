@@ -54,12 +54,6 @@ def parse_teams_edit_time(message: Mapping[str, object]) -> datetime | None:
     return datetime.fromtimestamp(milliseconds / MILLISECONDS_PER_SECOND, timezone.utc)
 
 
-def teams_message_source_time(message: Mapping[str, object]) -> object:
-    """A canonical message's source time: its edit time, else its compose time."""
-
-    return message.get("edited_time") or message.get("time")
-
-
 def validate_teams_provider_message(message: Mapping[str, object]) -> bool:
     """Validate one raw Chatsvc record and return whether it has semantic text.
 
@@ -106,61 +100,3 @@ def validate_teams_canonical_messages(value: object) -> tuple[Mapping[str, objec
     return tuple(result)
 
 
-def validate_teams_window_payload(
-    payload: Mapping[str, object],
-    *,
-    conversation_id: str,
-    window_id: str,
-    source_id: str | None = None,
-    root_message_id: str | None = None,
-    window_type: str | None = None,
-    tombstone_reasons: frozenset[str],
-) -> str:
-    """Return ``snapshot`` or ``tombstone`` after exact identity validation."""
-
-    from memforge.local_agent.source_contract import is_direct_teams_conversation_id
-
-    if not is_direct_teams_conversation_id(conversation_id):
-        raise TeamsMessageEvidenceError("Teams conversation identity is invalid")
-    if str(payload.get("conversation_id") or "").strip() != conversation_id:
-        raise TeamsMessageEvidenceError("Teams payload conversation identity mismatch")
-    if str(payload.get("window_id") or "").strip() != window_id:
-        raise TeamsMessageEvidenceError("Teams payload window identity mismatch")
-    messages = payload.get("messages")
-    from memforge.local_agent.teams_ledger import (
-        build_teams_window_id,
-        decode_teams_window_id,
-    )
-
-    normalized_root_id = str(root_message_id or "").strip()
-    normalized_window_type = str(window_type or "").strip()
-    if not normalized_root_id or normalized_window_type not in {"thread", "time_block"}:
-        raise TeamsMessageEvidenceError("Teams window locator is incomplete")
-    try:
-        decoded = decode_teams_window_id(window_id)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise TeamsMessageEvidenceError("Teams window identity is invalid") from exc
-    if (
-        decoded["conversation_id"] != conversation_id
-        or decoded["root_or_anchor_message_id"] != normalized_root_id
-        or decoded["window_type"] != normalized_window_type
-        or (source_id is not None and decoded["source_id"] != source_id)
-        or build_teams_window_id(
-            source_id=decoded["source_id"],
-            conversation_id=conversation_id,
-            root_or_anchor_message_id=normalized_root_id,
-            window_type=normalized_window_type,
-        )
-        != window_id
-    ):
-        raise TeamsMessageEvidenceError("Teams window locator does not match the package")
-    if payload.get("_tombstone") is True:
-        if (
-            messages != []
-            or payload.get("_authoritative_snapshot") is not True
-            or str(payload.get("tombstone_reason") or "").strip() not in tombstone_reasons
-        ):
-            raise TeamsMessageEvidenceError("Teams tombstone evidence is invalid")
-        return "tombstone"
-    validate_teams_canonical_messages(messages)
-    return "snapshot"
