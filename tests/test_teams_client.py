@@ -19,6 +19,7 @@ from memforge.source_artifacts import MAX_SOURCE_ARTIFACT_STORAGE_BYTES, SourceA
 
 NOW = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
 CHAT = "19:conversation@thread.v2"
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def _message(message_id: str, created_at: datetime) -> dict:
@@ -31,8 +32,11 @@ def _message(message_id: str, created_at: datetime) -> dict:
     }
 
 
-def _page(*messages: dict, complete_from: datetime | None = None) -> MagicMock:
-    """A Chatsvc page; ``complete_from`` is the segment start it certifies, epoch milliseconds on the wire."""
+def _page(*messages: dict, complete_from: datetime | None = EPOCH) -> MagicMock:
+    """A Chatsvc page certifying the segment start it is complete from, by default the oldest page's epoch.
+
+    ``complete_from=None`` leaves the certificate out.
+    """
 
     response = MagicMock()
     body: dict = {"messages": list(messages)}
@@ -433,13 +437,17 @@ async def test_a_backfill_ending_just_after_a_page_time_reads_that_millisecond()
 async def test_a_spent_time_budget_stops_early_after_the_last_complete_page(monkeypatch):
     monkeypatch.setattr("memforge.genes.teams_client._MAX_PAGE_SIZE", 1)
     monkeypatch.setattr("memforge.genes.teams_client.asyncio.sleep", AsyncMock())
-    client = _client(_page(_message("newest", NOW), complete_from=NOW), _page(_message("older", NOW - timedelta(hours=1))))
+    certified = NOW - timedelta(hours=1)
+    client = _client(
+        _page(_message("newest", NOW), _message("deleted-later", NOW - timedelta(days=5)), complete_from=certified),
+        _page(_message("older", NOW - timedelta(hours=2))),
+    )
 
     poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=0)
 
-    assert [message["id"] for message in poll.messages] == ["newest"]
+    assert {message["id"] for message in poll.messages} == {"newest", "deleted-later"}
     assert poll.outcome is PollOutcome.STOPPED_EARLY
-    assert poll.earliest_complete_page_time == NOW
+    assert poll.earliest_complete_page_time == certified
     assert client._request.await_count == 1
 
 
@@ -464,29 +472,35 @@ async def test_a_deleted_older_message_on_a_newer_page_does_not_move_the_cursor(
     assert client._request.await_args_list[1].kwargs["params"]["endTime"] == _milliseconds(hour_ago)
 
 
-async def test_a_full_page_that_certifies_no_complete_start_fails_the_poll(monkeypatch):
-    monkeypatch.setattr("memforge.genes.teams_client._MAX_PAGE_SIZE", 1)
-    client = _client(_page(_message("newest", NOW)))
+async def test_a_page_that_certifies_no_complete_start_fails_the_poll():
+    client = _client(_page(_message("newest", NOW), complete_from=None))
 
     with pytest.raises(TeamsMessagePageSchemaError, match="does not certify"):
         await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
 
 
-async def test_a_full_page_certified_from_the_epoch_is_the_oldest_and_bounded_by_its_oldest_message(monkeypatch):
-    monkeypatch.setattr("memforge.genes.teams_client._MAX_PAGE_SIZE", 2)
-    client = _client(
-        _page(
-            _message("newest", NOW),
-            _message("first", NOW - timedelta(days=2)),
-            complete_from=datetime(1970, 1, 1, tzinfo=timezone.utc),
-        )
-    )
+async def test_a_page_certified_from_the_epoch_is_the_oldest_and_bounded_by_its_oldest_message():
+    client = _client(_page(_message("newest", NOW), _message("first", NOW - timedelta(days=2))))
 
     poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
 
     assert [message["id"] for message in poll.messages] == ["newest", "first"]
     assert poll.outcome is PollOutcome.HISTORY_EXHAUSTED
     assert client._request.await_count == 1
+
+
+async def test_a_short_page_certified_from_a_later_time_is_not_the_oldest(monkeypatch):
+    monkeypatch.setattr("memforge.genes.teams_client.asyncio.sleep", AsyncMock())
+    certified = NOW - timedelta(hours=1)
+    client = _client(
+        _page(_message("newest", NOW), _message("deleted-later", NOW - timedelta(days=20)), complete_from=certified),
+        _page(),
+    )
+
+    poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
+
+    assert poll.outcome is PollOutcome.HISTORY_EXHAUSTED
+    assert client._request.await_args_list[1].kwargs["params"]["endTime"] == _milliseconds(certified)
 
 
 async def test_a_time_cursor_that_does_not_advance_fails_the_poll(monkeypatch):
