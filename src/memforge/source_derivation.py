@@ -79,6 +79,8 @@ DERIVATION_INPUT_SUPERSEDED = "DERIVATION_INPUT_SUPERSEDED"
 DERIVATION_DETERMINISTIC_FAILURE = "DERIVATION_DETERMINISTIC_FAILURE"
 # Another release staged the derivation; this release derives the Unit again.
 DERIVATION_RELEASE_SUPERSEDED = "DERIVATION_RELEASE_SUPERSEDED"
+# The error of a derivation whose Evidence work cannot be planned.
+EVIDENCE_AUTHORITY_PLANNING_FAILED = "evidence_authority_planning_failed"
 
 SOURCE_DERIVATION_BATCH_PENDING = "pending"
 SOURCE_DERIVATION_BATCH_COMPLETED = "completed"
@@ -377,7 +379,7 @@ def _planning_failure_extraction(
     if offline_replay:
         metadata["offline_replay"] = True
     return MemoryExtractionResult(
-        error_type="evidence_authority_planning_failed",
+        error_type=EVIDENCE_AUTHORITY_PLANNING_FAILED,
         error=failure.diagnostic,
         metadata=metadata,
     )

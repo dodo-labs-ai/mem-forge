@@ -90,6 +90,7 @@ from memforge.source_artifacts import (
     RawSourceArtifact,
     SourceArtifactDownload,
 )
+from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot
 from memforge.source_derivation import (
     DERIVATION_INPUT_SUPERSEDED,
     SourceDerivationAttempt,
@@ -4591,7 +4592,10 @@ async def _stage_completed_v9_recovery_attempt(
     source_id: str,
     client=None,
     skipped_reading_group_count: int = 0,
+    body: str = "# Current rule\n\nUse the active extraction contract for recovery.\n",
+    base: SourceDerivationAttempt | None = None,
 ) -> SourceDerivationAttempt:
+    """Stage one completed derivation of the recovery Document, or of its next revision after ``base``."""
     await db.upsert_source(
         id=source_id,
         type="github_repo",
@@ -4600,7 +4604,7 @@ async def _stage_completed_v9_recovery_attempt(
         access_policy="workspace",
         owner_user_id="dev",
     )
-    body = "# Current rule\n\nUse the active extraction contract for recovery.\n"
+    version = "1" if base is None else str(int(base.context.document.version) + 1)
     now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
     item = ContentItem(
         item_id="doc-v9-recovery",
@@ -4608,12 +4612,18 @@ async def _stage_completed_v9_recovery_attempt(
         source_url="https://example.test/v9-recovery",
         last_modified=now,
         content_type="text/markdown",
-        version="1",
+        version=version,
     )
     projection = project_source_item(
         source_id=source_id,
         source_type="github_repo",
-        run_id="run-v9-stage",
+        run_id=f"run-v9-stage-{version}",
+        prior_unit_revision=None if base is None else base.projection.source_unit_revisions[0],
+        prior_observation_revisions=(
+            None
+            if base is None
+            else {revision.observation_id: revision for revision in base.projection.observation_revisions}
+        ),
         item=item,
         raw=RawContent(
             item=item,
@@ -4636,7 +4646,7 @@ async def _stage_completed_v9_recovery_attempt(
         author=None,
         last_modified=now,
         labels=[],
-        version="1",
+        version=version,
         content_hash=hashlib.sha256(body.encode()).hexdigest(),
         token_count=12,
         last_synced=now,
@@ -4673,6 +4683,14 @@ async def _stage_completed_v9_recovery_attempt(
             plan_requests=plan_requests,
             extract_request=extract,
             max_concurrent=1,
+            committed_base_snapshot=(
+                None
+                if base is None
+                else CommittedSourceUnitSnapshot(
+                    unit_revision=base.projection.source_unit_revisions[0],
+                    observation_revisions=base.projection.observation_revisions,
+                )
+            ),
             access_context_hash=lifecycle_access_context_hash(
                 visibility="workspace",
                 owner_user_id=None,
@@ -4685,8 +4703,11 @@ async def _stage_completed_v9_recovery_attempt(
         )
     )
 
-    [attempt] = await db.list_source_derivation_attempts(source_id=source_id)
-    assert attempt.id == staged.derivation.id
+    [attempt] = [
+        attempt
+        for attempt in await db.list_source_derivation_attempts(source_id=source_id)
+        if attempt.id == staged.derivation.id
+    ]
     assert attempt.extraction_contract_version == PROJECTION_EXTRACTION_CONTRACT_VERSION
     assert attempt.status == "completed"
     return attempt
