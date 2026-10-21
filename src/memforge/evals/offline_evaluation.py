@@ -38,10 +38,16 @@ from memforge.pipeline.reconciler import reconcile_memories
 from memforge.pipeline.support_relation_coordinator import UNRESOLVED_RESULTS, MemorySupport, SupportResult
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.extraction_requests import plan_extraction_requests
-from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionPlan, ExtractionRequest
+from memforge.pipeline.projection_context import (
+    CommittedSourceUnitSnapshot,
+    ExtractionAuthority,
+    ExtractionPlan,
+    ExtractionRequest,
+)
 from memforge.pipeline.projection_images import ProjectionImageLoadError, load_projection_images
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext, client_reads_images
 from memforge.source_derivation import (
+    EVIDENCE_AUTHORITY_PLANNING_FAILED,
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
     memory_extraction_output_payload,
@@ -146,12 +152,17 @@ class OfflineArtifactUnavailable(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ReplayedEvidenceWork:
-    """The pinned Source Unit target and Evidence work identity of one case."""
+    """The pinned Source Unit target, its committed base, and the Evidence work identity of one case.
+
+    ``base`` is the projection of the committed revision the derivation was
+    planned against, or ``None`` for a derivation planned against no base.
+    """
 
     projection: SourceProjection
     context: SourceUnitDerivationContext
     access_context_hash: str
     inference_capability_hash: str
+    base: SourceProjection | None = None
 
 
 class AgentEvaluationContentProfile(str, Enum):
@@ -854,8 +865,9 @@ class SourceUnitDerivationReplayExecutor:
     """Replay the production Source Unit derivation planner without staging.
 
     The case pins the access context and inference capability hashes of the
-    derivation it was curated from, so replay plans the same Evidence work.
-    ``reads_images`` is whether the replaying model sees images.
+    derivation it was curated from, and the committed base it was planned
+    against, so replay plans the same Evidence work. ``reads_images`` is whether
+    the replaying model sees images.
     """
 
     def __init__(
@@ -884,9 +896,15 @@ class SourceUnitDerivationReplayExecutor:
         context_payload = _mapping(case.manifest, "context")
         projection = source_projection_from_payload(projection_payload)
         context = source_unit_derivation_context_from_payload(context_payload)
+        base = (
+            source_projection_from_payload(_mapping(case.manifest, "base_projection"))
+            if case.manifest.get("base_projection") is not None
+            else None
+        )
         work = ReplayedEvidenceWork(
             projection=projection,
             context=context,
+            base=base,
             access_context_hash=_required(
                 "access_context_hash", str(case.manifest.get("access_context_hash") or "")
             ),
@@ -909,15 +927,33 @@ class SourceUnitDerivationReplayExecutor:
                 plan_requests=plan,
                 extract_request=extract,
                 max_concurrent=_positive_int(candidate_manifest.get("max_concurrent"), default=1),
+                committed_base_snapshot=(
+                    CommittedSourceUnitSnapshot(
+                        unit_revision=base.source_unit_revisions[0],
+                        observation_revisions=base.observation_revisions,
+                    )
+                    if base is not None
+                    else None
+                ),
                 access_context_hash=work.access_context_hash,
                 inference_capability_hash=work.inference_capability_hash,
                 reads_images=self._reads_images,
             )
         )
+        if result.error_type == EVIDENCE_AUTHORITY_PLANNING_FAILED:
+            # Planning depends only on the pinned input and the code, so a case
+            # whose Evidence work cannot be planned fails with the failure's code.
+            # Any other error is raised and recorded as an errored result.
+            return {
+                "case_kind": case.case_kind.value,
+                "extraction": {"memories": [], "evidence_telemetry": {}},
+                "error_type": result.error_type,
+                "safe_error_code": result.metadata["safe_error_code"],
+            }
         return {
             "case_kind": case.case_kind.value,
             "extraction": memory_extraction_output_payload(result),
-            "error_type": result.error_type,
+            "error_type": None,
         }
 
 
@@ -948,7 +984,8 @@ class ProductionSourceUnitDerivationReplayExecutor:
         def reading_context(work: ReplayedEvidenceWork) -> RevisionAssessmentContext:
             """The one reading context of this case, shared by its planning and extraction.
 
-            The pinned projection is read in the current representation.
+            The pinned projection is read in the current representation, against the
+            pinned base of a revision that updates one, as production reads it.
             """
 
             nonlocal context, read
@@ -956,7 +993,7 @@ class ProductionSourceUnitDerivationReplayExecutor:
                 read = work.projection
                 context = RevisionAssessmentContext(
                     projection=current_representation_of(work.projection),
-                    base=None,
+                    base=work.base if work.projection.deltas[0].previous_unit_revision_id else None,
                     access_context_hash=work.access_context_hash,
                     image_loader=pinned_image_loader(work.projection, self._document_store),
                     reads_images=client_reads_images(self._structured_llm_client),
@@ -2696,7 +2733,7 @@ def deterministic_checks(
                     else DeterministicCheckLabel.PASS
                 ),
                 reason_code=(
-                    "derivation_failed"
+                    f"derivation_failed:{output.get('safe_error_code') or output.get('error_type')}"
                     if output.get("error_type") is not None
                     else "derivation_completed"
                 ),
@@ -3046,6 +3083,8 @@ def _validate_case_manifest(
     elif case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION:
         _mapping(manifest, "projection")
         _mapping(manifest, "context")
+        if manifest.get("base_projection") is not None:
+            _mapping(manifest, "base_projection")
         for field in ("access_context_hash", "inference_capability_hash"):
             _required(field, str(manifest.get(field) or ""))
     else:

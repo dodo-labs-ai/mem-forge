@@ -1101,13 +1101,15 @@ class RelationGroupCasesSeedRequest(BaseModel):
 
 class DerivationCaseRequest(BaseModel):
     """One synced Document to pin as a derivation case, by ``doc_id`` or by ``title`` within ``source_id``,
-    with the rubric its extraction is checked against."""
+    with the rubric its extraction is checked against. ``derivation_id`` names the derivation to pin;
+    without it, the Document's first derivation is pinned."""
 
     model_config = ConfigDict(extra="forbid")
 
     doc_id: str | None = Field(default=None, min_length=1)
     source_id: str | None = Field(default=None, min_length=1)
     title: str | None = Field(default=None, min_length=1)
+    derivation_id: str | None = Field(default=None, min_length=1)
     rubric: dict[str, object] = Field(min_length=1)
     population: Literal["representative_control", "failure_regression"] = "representative_control"
 
@@ -7125,7 +7127,7 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
     ):
-        """Pin the first derivation of each named Document as a case and freeze their cohort."""
+        """Pin a derivation of each named Document as a case and freeze their cohort."""
 
         from memforge.evals.offline_evaluation import (
             AgentEvaluationPopulation,
@@ -7147,6 +7149,7 @@ def create_admin_app(
                         doc_id=case.doc_id,
                         source_id=case.source_id,
                         title=case.title,
+                        derivation_id=case.derivation_id,
                         rubric=case.rubric,
                         population=AgentEvaluationPopulation(case.population),
                     )

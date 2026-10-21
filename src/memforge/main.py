@@ -1200,7 +1200,9 @@ def eval_seed_derivation_cases(ctx: click.Context, spec_path: Path, workspace_id
     """Pin synced Documents as derivation cases with their rubrics and freeze their cohort.
 
     The spec names ``selection_policy_version``, an optional ``role`` and the
-    ``cases``, each a ``doc_id`` with its ``rubric``. Requires a maintenance operator.
+    ``cases``, each a ``doc_id`` with its ``rubric`` and, to pin a derivation
+    other than the Document's first, its ``derivation_id``. Requires a
+    maintenance operator.
     """
 
     _emit_tool_payload(

@@ -14,6 +14,8 @@ from memforge.evals.offline_evaluation import (
     AgentEvaluationPopulation,
     AgentEvaluationRole,
     OfflineAgentEvaluation,
+    SourceUnitDerivationReplayExecutor,
+    deterministic_checks,
     run_verdict,
 )
 from memforge.evals.offline_run import render_report_markdown, report_verdict, wait_for_report
@@ -21,11 +23,14 @@ from memforge.evals.source_unit_derivation_cases import (
     DerivationCaseRequest,
     seed_source_unit_derivation_cases,
 )
+from memforge.models import MemoryExtractionResult
+from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot, plan_projection_evidence_work
 from memforge.release import current_release
 from memforge.source_derivation import source_unit_derivation_context_to_payload
 from memforge.source_projection import source_projection_to_payload
 from memforge.storage.database import Database
-from tests.test_sync_bookkeeping import _stage_completed_v9_recovery_attempt
+from tests.llm_fixture import fixture_request_planner
+from tests.test_sync_bookkeeping import ProjectionFragmentRecordingExtractor, _stage_completed_v9_recovery_attempt
 
 SOURCE_ID = "src-quality"
 DOC_ID = "doc-v9-recovery"
@@ -81,6 +86,7 @@ async def test_seeding_pins_the_first_derivation_of_each_named_document_in_one_c
     assert again.cohort_id == report.cohort_id
     assert report.skipped == {
         "document_not_found": ("doc-never-synced",), "title_not_unique": (), "no_first_derivation": (),
+        "derivation_not_found": (), "base_unavailable": (),
     }
     assert (case.case_kind, case.doc_id, case.source_unit_id) == (
         AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION, DOC_ID, attempt.source_unit_id,
@@ -152,6 +158,130 @@ async def test_a_document_derived_only_against_a_committed_base_is_not_pinned(db
 
     assert (report.cohort_id, report.cases) == (None, ())
     assert report.skipped["no_first_derivation"] == (DOC_ID,)
+
+
+UPDATED_BODY = (
+    "# Current rule\n\nUse the active extraction contract for recovery.\n\nRetry a failed batch once.\n"
+)
+
+
+async def _updated_document(db: Database):
+    """The Document after a later sync: its first derivation and the derivation of the update."""
+
+    first = await _synced_document(db)
+    update = await _stage_completed_v9_recovery_attempt(db, source_id=SOURCE_ID, body=UPDATED_BODY, base=first)
+    await db.record_source_projection(update.projection)
+    return first, update
+
+
+async def _pin(db: Database, request: DerivationCaseRequest, store=None):
+    return await seed_source_unit_derivation_cases(
+        store or db, OfflineAgentEvaluation(db, executors={}), requests=[request],
+        role=AgentEvaluationRole.SENTINEL, selection_policy_version="quick-v1", actor=ACTOR,
+    )
+
+
+async def test_a_named_update_is_pinned_with_the_base_revision_it_was_derived_against(db) -> None:
+    first, update = await _updated_document(db)
+    assert update.base_unit_revision_id == first.projection.source_unit_revisions[0].id
+
+    report = await _pin(db, DerivationCaseRequest(doc_id=DOC_ID, derivation_id=update.id, rubric=RUBRIC))
+    by_default = await _pin(db, DerivationCaseRequest(doc_id=DOC_ID, rubric=RUBRIC))
+
+    case = await db.get_agent_evaluation_case(report.cases[0].case_id)
+    base = await db.get_source_unit_revision_projection(update.source_unit_id, update.base_unit_revision_id)
+    assert case.manifest["derivation_id"] == update.id
+    assert case.manifest["projection"] == source_projection_to_payload(update.projection)
+    assert case.manifest["base_projection"] == source_projection_to_payload(base)
+    first_case = await db.get_agent_evaluation_case(by_default.cases[0].case_id)
+    assert first_case.manifest["derivation_id"] == first.id
+    assert "base_projection" not in first_case.manifest
+
+
+async def test_a_named_derivation_must_be_the_documents_own_with_a_readable_base(db) -> None:
+    _first, update = await _updated_document(db)
+
+    class BaseGone:
+        get_document = db.get_document
+        find_source_unit_by_document_id = db.find_source_unit_by_document_id
+        list_source_derivation_attempts = db.list_source_derivation_attempts
+
+        async def get_source_unit_revision_projection(self, _unit_id, _revision_id):
+            return None
+
+    unknown = await _pin(db, DerivationCaseRequest(doc_id=DOC_ID, derivation_id="sdrv-elsewhere", rubric=RUBRIC))
+    gone = await _pin(db, DerivationCaseRequest(doc_id=DOC_ID, derivation_id=update.id, rubric=RUBRIC), BaseGone())
+
+    assert (unknown.cases, unknown.skipped["derivation_not_found"]) == ((), (DOC_ID,))
+    assert (gone.cases, gone.skipped["base_unavailable"]) == ((), (DOC_ID,))
+
+
+async def test_replay_plans_an_update_against_its_pinned_base_as_production_did(db) -> None:
+    first, update = await _updated_document(db)
+    report = await _pin(db, DerivationCaseRequest(doc_id=DOC_ID, derivation_id=update.id, rubric=RUBRIC))
+    case = await db.get_agent_evaluation_case(report.cases[0].case_id)
+    planned = []
+
+    async def plan(authority, work, _candidate):
+        planned.append((authority, work.base))
+        # The planner production staged the update with.
+        return await fixture_request_planner(
+            work.projection, access_context_hash=work.access_context_hash,
+            extractor=ProjectionFragmentRecordingExtractor(),
+        )(authority)
+
+    requested = []
+
+    async def extract(request, _work, _candidate):
+        requested.append(request.id)
+        return MemoryExtractionResult(memories=[])
+
+    executor = SourceUnitDerivationReplayExecutor(plan, extract)
+    output = await executor.execute(case, CANDIDATE)
+    replayed_requests = list(requested)
+    without_base = await executor.execute(
+        replace(case, manifest={key: value for key, value in case.manifest.items() if key != "base_projection"}),
+        CANDIDATE,
+    )
+
+    production_authority = plan_projection_evidence_work(
+        update.projection,
+        committed_base_snapshot=CommittedSourceUnitSnapshot(
+            unit_revision=first.projection.source_unit_revisions[0],
+            observation_revisions=first.projection.observation_revisions,
+        ),
+        reprocess_all_current_observations=False,
+    )
+    [(authority, base)] = planned
+    assert authority == production_authority
+    # Replay asks the same Claim Extraction requests production staged.
+    assert replayed_requests and replayed_requests == [batch.batch_id for batch in update.batches]
+    assert base.source_unit_revisions[0].id == update.base_unit_revision_id
+    assert output["error_type"] is None
+    # Without its base the update cannot be planned, and the case fails.
+    assert without_base["error_type"] == "evidence_authority_planning_failed"
+    ground_truth = await db.get_accepted_ground_truth_revision(report.cases[0].ground_truth_revision_id)
+    checks = {
+        check.criterion: (check.label.value, check.reason_code)
+        for check in deterministic_checks(case, ground_truth, without_base)
+    }
+    assert checks["derivation_terminal_state"] == ("fail", "derivation_failed:INCREMENTAL_BASE_UNAVAILABLE")
+
+
+async def test_an_extraction_error_is_raised_for_the_evaluator_to_record_as_an_error(db) -> None:
+    await _synced_document(db)
+    report = await _pin(db, DerivationCaseRequest(doc_id=DOC_ID, rubric=RUBRIC))
+    case = await db.get_agent_evaluation_case(report.cases[0].case_id)
+
+    async def plan(authority, work, _candidate):
+        return await fixture_request_planner(work.projection, access_context_hash=work.access_context_hash)(authority)
+
+    async def extract(_request, _work, _candidate):
+        return MemoryExtractionResult(memories=[], error_type="unexpected_error")
+
+    # Only a planning failure is a property of the pinned input; a provider fault is not cached as a result.
+    with pytest.raises(ValueError):
+        await SourceUnitDerivationReplayExecutor(plan, extract).execute(case, CANDIDATE)
 
 
 class _AnswerExecutor:
