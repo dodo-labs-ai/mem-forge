@@ -1623,8 +1623,20 @@
       },
       "DerivationCaseRequest": {
         "additionalProperties": false,
-        "description": "One synced Document to pin as a derivation case, by ``doc_id`` or by ``title`` within ``source_id``,\nwith the rubric its extraction is checked against.",
+        "description": "One synced Document to pin as a derivation case, by ``doc_id`` or by ``title`` within ``source_id``,\nwith the rubric its extraction is checked against. ``derivation_id`` names the derivation to pin;\nwithout it, the Document's first derivation is pinned.",
         "properties": {
+          "derivation_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Derivation Id"
+          },
           "doc_id": {
             "anyOf": [
               {
@@ -10652,7 +10664,7 @@
     },
     "/api/v1/agent-evaluations/derivation-cases/seed": {
       "post": {
-        "description": "Pin the first derivation of each named Document as a case and freeze their cohort.",
+        "description": "Pin a derivation of each named Document as a case and freeze their cohort.",
         "operationId": "seed_derivation_evaluation_cases_api_v1_agent_evaluations_derivation_cases_seed_post",
         "requestBody": {
           "content": {
