@@ -413,7 +413,7 @@ class TeamsChatClient:
                 await asyncio.sleep(1.0)
             response = await self._request(self._chat_client, "GET", url, params=params)
             pages += 1
-            page = _validated_teams_message_page(response.json(), page_size=_MAX_PAGE_SIZE)
+            page = _validated_teams_message_page(response.json())
             for raw in page.messages:
                 parsed = self._parse_message(raw)
                 if parsed is None or parsed["time"] < start or (end is not None and parsed["time"] >= end):
@@ -614,10 +614,10 @@ class _TeamsMessagePage:
     Chatsvc places a deleted message where it was deleted, so a page can hold
     a message far older than the rest of it, and its oldest message bounds
     nothing. A page is complete from the start Chatsvc certifies for it,
-    ``_metadata.lastCompleteSegmentStartTime``. The conversation's oldest page,
-    which is not full or certified from the epoch, holds every older message,
-    so it is complete from its oldest message. ``complete_from`` is ``None``
-    for an empty page.
+    ``_metadata.lastCompleteSegmentStartTime``. Chatsvc certifies the
+    conversation's oldest page from the epoch; that page holds every older
+    message, so it is complete from its oldest message. ``complete_from`` is
+    ``None`` for an empty page.
     """
 
     messages: list[dict]
@@ -625,7 +625,7 @@ class _TeamsMessagePage:
     oldest: bool
 
 
-def _validated_teams_message_page(data: object, *, page_size: int) -> _TeamsMessagePage:
+def _validated_teams_message_page(data: object) -> _TeamsMessagePage:
     """Return one Chat Service message page, or fail before the page proves anything."""
 
     if not isinstance(data, dict) or "messages" not in data:
@@ -644,11 +644,11 @@ def _validated_teams_message_page(data: object, *, page_size: int) -> _TeamsMess
     certified = _certified_segment_start(
         metadata.get("lastCompleteSegmentStartTime") if isinstance(metadata, dict) else None
     )
-    if len(messages) < page_size or certified == _EPOCH:
-        oldest = min(_teams_message_timestamp(message) for message in messages)
-        return _TeamsMessagePage(messages=messages, complete_from=oldest, oldest=True)
     if certified is None:
         raise TeamsMessagePageSchemaError("Teams message page does not certify the time it is complete from")
+    if certified == _EPOCH:
+        oldest = min(_teams_message_timestamp(message) for message in messages)
+        return _TeamsMessagePage(messages=messages, complete_from=oldest, oldest=True)
     return _TeamsMessagePage(messages=messages, complete_from=certified, oldest=False)
 
 
