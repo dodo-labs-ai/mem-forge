@@ -3910,7 +3910,7 @@ async def _collect_teams_on_device(
     from memforge.local_agent.conversation_executor import run_device_collection
 
     def report(phase: str, completed: int, total: int) -> None:
-        unit = "conversation" if phase == "collecting" else "message"
+        unit = "conversation" if phase == "fetching" else "message"
         _report_local_agent_progress(
             report_progress,
             _sync_progress_snapshot(phase=phase, completed=completed, total=total, unit=unit),
