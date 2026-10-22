@@ -128,3 +128,44 @@ def test_the_cli_syncs_only_sources_with_a_sync_run(monkeypatch, tmp_path) -> No
     assert synced == ["src-wiki"]
     assert "Skipping Captured" in result.output
     assert "Skipping Chat" in result.output
+
+
+class _PdfGene(FakeGene):
+    @classmethod
+    def metadata(cls):
+        return type(FakeGene.metadata())(**{**FakeGene.metadata().__dict__, "name": "pdf_test"})
+
+
+class _PdfStore:
+    def __init__(self, missing: int) -> None:
+        self.missing = missing
+        self.counted = 0
+
+    async def count_missing_pdf_uris(self, source_id: str) -> int:
+        self.counted += 1
+        return self.missing
+
+
+async def test_document_discovery_reads_from_the_cursor_unless_a_full_discovery_is_due(monkeypatch, tmp_path) -> None:
+    from datetime import datetime, timezone
+
+    from memforge.pipeline.collection_family import DEFAULT_INCREMENTAL_SYNC_OVERLAP
+    from tests.source_type_fixture import register_test_source_type
+
+    register_test_source_type(monkeypatch, "pdf_test", _PdfGene, exports_pdf=True)
+    cursor = datetime(2026, 10, 22, 8, 0, tzinfo=timezone.utc)
+    state = SimpleNamespace(last_sync_at=cursor)
+
+    async def since(store, *, indexed=frozenset({"page-1"}), full=False, existing=state):
+        family = collection_family(
+            _PdfGene(), db=store, doc_store=LocalDocumentStore(str(tmp_path / "docs")), source_id="src-1"
+        )
+        return await family.since(existing_state=existing, indexed_doc_ids=set(indexed), full_discovery=full)
+
+    assert await since(_PdfStore(0)) == cursor - DEFAULT_INCREMENTAL_SYNC_OVERLAP
+    assert await since(_PdfStore(2)) is None
+    assert await since(_PdfStore(0), indexed=frozenset()) is None
+    assert await since(_PdfStore(0), existing=None) is None
+    skipped = _PdfStore(2)
+    assert await since(skipped, full=True) is None
+    assert skipped.counted == 0

@@ -35,7 +35,7 @@ from memforge.evals.agent_evaluation import (
     publish_agent_assessments,
     publish_runtime_events,
 )
-from memforge.genes import source_rediscovers_documents
+from memforge.genes import gene_exports_pdf, source_rediscovers_documents
 from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.genes.base import SourceConfigurationError
 from memforge.llm.structured import (
@@ -136,7 +136,6 @@ from memforge.source_item_failures import (
 )
 from memforge.source_projection_config import canonical_projection_scope, source_access_context
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time, reported_source_time
-from memforge.source_types import source_type_descriptor
 
 if TYPE_CHECKING:
     from memforge.evals.agent_evaluation import RuntimeEventTraceSink
@@ -740,12 +739,6 @@ def _skipped_reading_group_count(extraction: MemoryExtractionResult) -> int:
     """The ReadingGroups a successful extraction left unread."""
 
     return int((extraction.metadata or {}).get("skipped_reading_group_count", 0) or 0)
-
-
-def _exports_pdf(gene: Gene) -> bool:
-    """Whether the Gene's source type renders a PDF of each Unit."""
-    descriptor = source_type_descriptor(gene.metadata().name)
-    return descriptor is not None and descriptor.exports_pdf
 
 
 # ---------------------------------------------------------------------------
@@ -1605,7 +1598,8 @@ class GeneSyncOrchestrator:
             # ----------------------------------------------------------
             # The family decides what the run proves absent. Deferred commits
             # blocked only by this run's Units converge first; a commit that
-            # fails for good counts as a failed document.
+            # fails for good counts as a failed document and keeps absence
+            # unproven.
             await self._converge_deferred_projected_lifecycle(effective_results)
             deferred_failures = sum(result.get("terminal_error") is not None for result in deferred_results)
             deleted_count = 0
@@ -1615,7 +1609,7 @@ class GeneSyncOrchestrator:
             absence = await family.absence(
                 reprocessing=reprocessing,
                 transition_open=scope_transition is not None,
-                snapshot_proves_absence=run_coverage.proves_absence,
+                coverage_proves_absence=run_coverage.proves_absence,
                 run_committed=run_committed,
                 indexed_doc_ids=indexed_doc_ids,
                 crawled_doc_ids=crawled_doc_ids,
@@ -2850,7 +2844,7 @@ class GeneSyncOrchestrator:
         source_metadata = gene.metadata()
         source_type = source_metadata.name
         source_shape = source_metadata.data_shape
-        exports_pdf = _exports_pdf(gene)
+        exports_pdf = gene_exports_pdf(gene)
         product_name = source_metadata.display_name
         diagnostics.stage = "normalize"
         if stored_document is not None:
