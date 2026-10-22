@@ -224,6 +224,18 @@ class SourceObservationRevision:
     evidence_profile: EvidenceRepresentationProfile | None = None
 
 
+class ProjectionScopeTransitionStale(ValueError):
+    """The Source's open transition is not the one a scope change expected to supersede.
+
+    The open transition changed after the caller read it: it completed, was
+    superseded, or another change opened one. Nothing was written; the caller
+    reads the Source again and decides with fresh facts.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("projection_scope_transition_stale")
+
+
 class ProjectionIdentityConflict(ValueError):
     """A projected immutable row has the id of a stored row with a different identity.
 
@@ -375,6 +387,8 @@ class ProjectionScopeTransition:
 
     ``predecessor_transition_id`` names the open transition this one
     superseded, or is ``None`` when the change found no open transition.
+    ``completed_at`` is when the transition closed, as ``applied`` or
+    ``superseded``.
     """
 
     id: str
