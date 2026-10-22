@@ -373,6 +373,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/agent-evaluations/support-cases/seed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Seed Support Evaluation Cases
+         * @description Pin an applied update of each named Document as a Support case and freeze their cohort.
+         */
+        post: operations["seed_support_evaluation_cases_api_v1_agent_evaluations_support_cases_seed_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/agent-sessions/completeness": {
         parameters: {
             query?: never;
@@ -6104,6 +6124,49 @@ export interface components {
             /** Total Sources */
             total_sources: number;
         };
+        /**
+         * SupportCaseRequest
+         * @description One synced Document whose applied update to pin as a Support case, by ``doc_id`` or by ``title``
+         *     within ``source_id``. ``derivation_id`` names the update; without it, the Document's latest applied
+         *     update whose Support the model judged is pinned. The rubric's ``expected_support`` maps Memory ids to
+         *     ``supported`` or ``unsupported``.
+         */
+        SupportCaseRequest: {
+            /** Derivation Id */
+            derivation_id?: string | null;
+            /** Doc Id */
+            doc_id?: string | null;
+            /**
+             * Population
+             * @default representative_control
+             * @enum {string}
+             */
+            population: "representative_control" | "failure_regression";
+            /** Rubric */
+            rubric: {
+                [key: string]: unknown;
+            };
+            /** Source Id */
+            source_id?: string | null;
+            /** Title */
+            title?: string | null;
+        };
+        /**
+         * SupportCasesSeedRequest
+         * @description Documents of the request's workspace whose updates to pin, and the cohort they form.
+         */
+        SupportCasesSeedRequest: {
+            /** Cases */
+            cases: components["schemas"]["SupportCaseRequest"][];
+            /**
+             * Role
+             * @default sentinel
+             * @enum {string}
+             */
+            role: "sentinel" | "development" | "release_holdout";
+            /** Selection Policy Version */
+            selection_policy_version: string;
+        };
         /** UnqueuedSource */
         UnqueuedSource: {
             /**
@@ -6855,6 +6918,39 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    seed_support_evaluation_cases_api_v1_agent_evaluations_support_cases_seed_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SupportCasesSeedRequest"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {

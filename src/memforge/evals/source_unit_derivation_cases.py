@@ -178,7 +178,7 @@ async def _pin_document_case(
     request: DerivationCaseRequest,
     actor: str,
 ) -> PinnedDerivationCase | DerivationCaseSkip:
-    document = await _find_document(store, request)
+    document = await find_case_document(store, request)
     if isinstance(document, DerivationCaseSkip):
         return document
     unit = await store.find_source_unit_by_document_id(document.source, document.doc_id)
@@ -237,10 +237,12 @@ async def _pin_document_case(
     )
 
 
-async def _find_document(
+async def find_case_document(
     store: DerivationCaseStore,
     request: DerivationCaseRequest,
 ) -> DocumentRecord | DerivationCaseSkip:
+    """The Document a case request names, or why it names none: by ``doc_id``, or by its title within a Source."""
+
     if request.doc_id:
         document = await store.get_document(request.doc_id)
         return document if document is not None else DerivationCaseSkip.DOCUMENT_NOT_FOUND
