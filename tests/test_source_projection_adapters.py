@@ -15,7 +15,6 @@ from memforge.pipeline.source_projection_adapters import (
     _stable_id,
     project_source_item,
     project_source_unit_tombstone,
-    source_run_projection_coverage,
 )
 from memforge.source_projection import (
     DeltaAxis,
@@ -1285,34 +1284,6 @@ def test_a_conversation_unit_is_a_unit_and_its_messages_are_observations() -> No
     assert [item.locator for item in projection.observations] == [{"conversation_id": "conv-1"}] * 2
     # The conversation layer decided every member, so the Unit is a complete snapshot of them.
     assert projection.coverage is ProjectionCoverage.COMPLETE_SNAPSHOT
-
-
-@pytest.mark.parametrize(
-    ("complete_snapshot", "scope_transition", "discovery_complete", "expected"),
-    [
-        (True, False, False, ProjectionCoverage.COMPLETE_SNAPSHOT),
-        (False, True, True, ProjectionCoverage.COMPLETE_SNAPSHOT),
-        (False, True, False, ProjectionCoverage.PARTIAL_PROJECTION),
-        # A complete discovery of an unchanged scope, first or force-full, is a
-        # query result; absence comes from the scope listing.
-        (False, False, True, ProjectionCoverage.PARTIAL_PROJECTION),
-        (False, False, False, ProjectionCoverage.PARTIAL_PROJECTION),
-    ],
-)
-def test_run_discovery_proves_absence_only_for_a_snapshot_or_a_new_scope(
-    complete_snapshot: bool,
-    scope_transition: bool,
-    discovery_complete: bool,
-    expected: ProjectionCoverage,
-) -> None:
-    assert (
-        source_run_projection_coverage(
-            complete_snapshot=complete_snapshot,
-            scope_transition=scope_transition,
-            discovery_complete=discovery_complete,
-        )
-        is expected
-    )
 
 
 def test_unit_tombstone_removes_all_prior_observations_with_explicit_coverage() -> None:

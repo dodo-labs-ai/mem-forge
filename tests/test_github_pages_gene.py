@@ -869,7 +869,6 @@ async def test_incremental_github_pat_subtree_lists_every_page_the_branch_holds(
     every_page = {item.item_id async for item in full.discover()}
     gene = GitHubPagesGene(config=dict(config), source_id="src-pages")
     await gene.authenticate()
-    gene.begin_discovery()
 
     changed = [item async for item in gene.discover(since=datetime(2100, 1, 1, tzinfo=timezone.utc))]
     listing = await gene.list_scope()

@@ -170,7 +170,6 @@ async def test_a_standalone_listing_equals_the_listing_after_discovery(source_ty
     fakes = fakes_for(source_type)
     config = fakes.listing_configs[config_name].config
     async with fakes.connect(config) as connection:
-        connection.gene.begin_discovery()
         changed = {item.item_id async for item in connection.gene.discover(CHANGED_SINCE)}
         after_discovery = await connection.gene.list_scope()
     async with fakes.connect(config) as connection:
@@ -188,7 +187,6 @@ async def test_a_standalone_listing_equals_the_listing_after_discovery(source_ty
 async def test_a_listing_reuses_the_discovery_walk(source_type, config_name) -> None:
     fakes = fakes_for(source_type)
     async with fakes.connect(fakes.listing_configs[config_name].config) as connection:
-        connection.gene.begin_discovery()
         _ = [item async for item in connection.gene.discover(CHANGED_SINCE)]
         walked = len(connection.requests)
         await connection.gene.list_scope()

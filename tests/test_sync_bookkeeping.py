@@ -2045,8 +2045,6 @@ async def test_source_sync_input_attestation_lookup_is_exact_and_history_bounded
 
 
 class EmptyGene(FakeGene):
-    discovery_complete = True
-
     def __init__(self) -> None:
         super().__init__()
         self.bound_document_store = None
@@ -2083,10 +2081,6 @@ class EmptyProviderGene(EmptyGene):
 
     async def list_scope(self):
         return ScopeListing(kind=ScopeListingKind.EXISTENCE, doc_ids=frozenset())
-
-
-class IncompleteEmptyGene(EmptyGene):
-    discovery_complete = False
 
 
 def test_failed_document_summary_identifies_embedding_provider_outage():
@@ -2556,6 +2550,10 @@ class SinceRecordingEmptyGene(EmptyGene):
             yield ContentItem(item_id="never", title="never", updated_at=datetime.now(timezone.utc))
 
 
+class SinceRecordingEmptyProviderGene(EmptyProviderGene, SinceRecordingEmptyGene):
+    """A provider whose complete listing holds nothing; it records the ``since`` discovery used."""
+
+
 class IncrementalNewDocumentGene(FakeGene):
     def __init__(self) -> None:
         super().__init__()
@@ -2801,6 +2799,7 @@ class NoopMemoryEngine:
             document=kwargs.get("document"),
             unit_input=kwargs.get("unit_input"),
             derivation_id=kwargs.get("derivation_id"),
+            scope_transition_id=kwargs.get("scope_transition_id"),
             derivation_context_identity_hash=(
                 source_derivation_context_identity_hash(
                     SourceUnitDerivationContext(
@@ -2933,6 +2932,12 @@ class NonRetryableProjectedMemoryEngine(NoopMemoryEngine):
 
 
 class DeferredOnceMemoryEngine(NoopMemoryEngine):
+    """Defers the first commit of ``deferred_doc_id`` once.
+
+    Its blocker is the first Unit this engine committed, ``unit-external``
+    with ``external_blocker``, or ``blocker_unit_id`` when one is set.
+    """
+
     def __init__(
         self,
         *,
@@ -2941,6 +2946,8 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
     ) -> None:
         self.external_blocker = external_blocker
         self.prepared_attempt_count = prepared_attempt_count
+        self.deferred_doc_id = "jira-1"
+        self.blocker_unit_id: str | None = None
         self.apply_doc_ids: list[str] = []
         self.committed_unit_ids: list[str] = []
         self.commit_only_attempts: list[int] = []
@@ -2951,14 +2958,16 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
         source_unit_id = projection.deltas[0].source_unit_id
         doc_id = kwargs["doc_id"]
         self.apply_doc_ids.append(doc_id)
-        if doc_id == "jira-1" and not self.deferred:
+        if doc_id == self.deferred_doc_id and not self.deferred:
             self.deferred = True
-            assert self.committed_unit_ids
-            blocker_unit_id = (
-                "unit-external"
-                if self.external_blocker
-                else self.committed_unit_ids[0]
-            )
+            blocker_unit_id = self.blocker_unit_id
+            if blocker_unit_id is None:
+                assert self.committed_unit_ids
+                blocker_unit_id = (
+                    "unit-external"
+                    if self.external_blocker
+                    else self.committed_unit_ids[0]
+                )
             bundle = bind_source_lifecycle_outcome(
                 source_id=projection.source_id,
                 source_type=projection.source_type,
@@ -3579,8 +3588,6 @@ class BlockingFetchGene(FakeGene):
     @classmethod
     def lists_scope(cls, config) -> bool:
         return True
-
-    discovery_complete = True
 
     def __init__(self, item_count: int, release: asyncio.Event):
         super().__init__()
@@ -4250,6 +4257,16 @@ class MovingGithubFileGene(UpdatingDocumentGene):
         )
 
 
+class PushedGithubFileGene(MovingGithubFileGene):
+    """A repository file pushed from a device, whose snapshot manifest lists the scope."""
+
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
+
+    @classmethod
+    def lists_scope(cls, config) -> bool:
+        return True
+
+
 class BlockingMemoryExtractor(NoopMemoryExtractor):
     def __init__(self, release: asyncio.Event, target_entries: int):
         self.release = release
@@ -4747,8 +4764,6 @@ async def _stage_completed_v9_recovery_attempt(
 class V9RecoveryReplayGene(FakeGene):
     """Rediscover the exact provider target retained by a recovery attempt."""
 
-    discovery_complete = False
-
     def __init__(
         self,
         attempt: SourceDerivationAttempt,
@@ -5167,7 +5182,7 @@ async def test_successful_recovery_is_counted_without_provider_rediscovery(
     )
 
     state = await recovery.sync_gene(
-        gene=IncompleteEmptyGene(),
+        gene=EmptyGene(),
         source_name="Recovery counts",
         source_id=source_id,
         lifecycle_cycle_id="run-recovery-counts",
@@ -5757,7 +5772,7 @@ async def test_full_discovery_without_completion_evidence_never_deletes_existing
     )
 
     state = await orchestrator.sync_gene(
-        gene=IncompleteEmptyGene(),
+        gene=EmptyGene(),
         source_name="Incomplete provider response",
         source_id=source_id,
         force_full_sync=True,
@@ -5905,7 +5920,9 @@ async def test_a_run_bound_to_an_input_snapshot_ignores_cursor_without_forcing_r
 
 
 @pytest.mark.asyncio
-async def test_complete_source_scope_transition_forces_snapshot_and_applies(db: Database):
+async def test_a_scope_transition_run_discovers_everything_and_completes_once_its_listing_is_committed(
+    db: Database,
+):
     source_id = "src-scope-transition-complete"
     await db.upsert_source(
         id=source_id,
@@ -5923,7 +5940,7 @@ async def test_complete_source_scope_transition_forces_snapshot_and_applies(db: 
             target_scope={"sync_mode": "space", "spaces": ["NEW"]},
         )
     )
-    gene = SinceRecordingEmptyGene()
+    gene = SinceRecordingEmptyProviderGene()
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=None,
@@ -5972,7 +5989,7 @@ async def test_scope_transition_reenters_same_durable_run_on_worker_retry(db: Da
     )
 
     state = await orchestrator.sync_gene(
-        SinceRecordingEmptyGene(),
+        SinceRecordingEmptyProviderGene(),
         "Architecture",
         source_id,
         lifecycle_cycle_id="source-sync-run:attempt:2",
@@ -5986,7 +6003,7 @@ async def test_scope_transition_reenters_same_durable_run_on_worker_retry(db: Da
 
 
 @pytest.mark.asyncio
-async def test_partial_conversation_scope_transition_preserves_old_membership(db: Database):
+async def test_a_scope_transition_whose_new_scope_cannot_be_listed_stays_open_and_keeps_old_units(db: Database):
     source_id = "src-scope-transition-partial"
     await db.upsert_source(
         id=source_id,
@@ -6043,7 +6060,6 @@ async def test_partial_conversation_scope_transition_preserves_old_membership(db
         )
     )
     gene = SinceRecordingEmptyGene()
-    gene.discovery_complete = False
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=None,
@@ -6057,8 +6073,8 @@ async def test_partial_conversation_scope_transition_preserves_old_membership(db
 
     assert state.last_sync_status == "success"
     assert transition.status is ProjectionScopeTransitionStatus.FAILED
-    assert "coverage=partial_projection" in (transition.error or "")
-    assert "complete successful snapshot" in (transition.error or "")
+    assert transition.error == "the new scope cannot be listed"
+    assert await db.list_indexed_doc_ids(source_id) == {"old-window"}
 
 
 @pytest.mark.asyncio
@@ -7783,15 +7799,29 @@ async def test_source_projection_reuse_requires_prior_manifest_and_current_linea
         ),
     )
     await db.db.commit()
-    assert (
-        await db.find_reusable_source_projection_memberships(
-            source_id=source_id,
-            workspace_id="default",
-            snapshot_id="snapshot-current",
-            expected_access_hash=access_hash,
+    # Every open transition, a failed one included, needs each listed
+    # Document to commit under it; a closed one no longer holds reuse back.
+    for status, reusable in (
+        ("pending", frozenset()),
+        ("running", frozenset()),
+        ("failed", frozenset()),
+        ("applied", frozenset({doc_id})),
+        ("superseded", frozenset({doc_id})),
+    ):
+        await db.db.execute(
+            "UPDATE projection_scope_transitions SET status = ? WHERE id = 'scope-transition-reuse-plan'",
+            (status,),
         )
-        == frozenset()
-    )
+        await db.db.commit()
+        assert (
+            await db.find_reusable_source_projection_memberships(
+                source_id=source_id,
+                workspace_id="default",
+                snapshot_id="snapshot-current",
+                expected_access_hash=access_hash,
+            )
+            == reusable
+        ), status
 
 
 @pytest.mark.asyncio
@@ -9750,7 +9780,7 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
     )
     await set_scope("ref-a", "ref-b")
     second = await orchestrator.sync_gene(
-        gene=MovingGithubFileGene(
+        gene=PushedGithubFileGene(
             item_id="github-ref-b",
             relative_path="docs/design.md",
             file_lineage_id=None,
@@ -9758,11 +9788,11 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
         ),
         source_name="Payroll Repo",
         source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset({"github-ref-b"})),
     )
     await set_scope("ref-b", "ref-a")
     third = await orchestrator.sync_gene(
-        gene=MovingGithubFileGene(
+        gene=PushedGithubFileGene(
             item_id="github-ref-a",
             relative_path="docs/design.md",
             file_lineage_id=None,
@@ -9770,7 +9800,7 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
         ),
         source_name="Payroll Repo",
         source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
+        input_snapshot=SnapshotBinding("snapshot-2", frozenset({"github-ref-a"})),
     )
 
     assert first.last_sync_status == "success"
@@ -9917,7 +9947,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         memory_store=memory_store,
         max_concurrent=1,
     )
-    gene = MovingGithubFileGene(
+    gene = PushedGithubFileGene(
         item_id="github-ref-a",
         relative_path="docs/design.md",
         file_lineage_id=None,
@@ -9928,7 +9958,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         gene=gene,
         source_name="Payroll Repo",
         source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset({"github-ref-a"})),
     )
     # A run bound to a complete snapshot records it in every projection's
     # scope, which is part of the projection's stored identity.
@@ -9941,10 +9971,10 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
 
     await set_scope(["docs"], ["other"])
     removed = await orchestrator.sync_gene(
-        gene=EmptyGene(),
+        gene=EmptyProviderGene(),
         source_name="Payroll Repo",
         source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
+        input_snapshot=SnapshotBinding("snapshot-2", frozenset()),
     )
     retired = await db.get_memory(memory.id)
     assert retired is not None and retired.status == "retired"
@@ -9954,7 +9984,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         gene=gene,
         source_name="Payroll Repo",
         source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
+        input_snapshot=SnapshotBinding("snapshot-3", frozenset({"github-ref-a"})),
     )
 
     original_after_reentry = await db.get_memory(memory.id)
@@ -9967,10 +9997,10 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
 
     await set_scope(["docs"], ["other"])
     repeated_removal = await orchestrator.sync_gene(
-        gene=EmptyGene(),
+        gene=EmptyProviderGene(),
         source_name="Payroll Repo",
         source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
+        input_snapshot=SnapshotBinding("snapshot-4", frozenset()),
     )
 
     assert first.last_sync_status == "success"
@@ -10790,7 +10820,7 @@ class _IssueGene(BlockingFetchGene):
 
 
 class _OrderRecordingMemoryEngine(DeferredOnceMemoryEngine):
-    """Records every committed Unit and removed Unit by document; ``jira-1`` may defer once."""
+    """Records every committed Unit and removed Unit by document; ``deferred_doc_id`` may defer once."""
 
     def __init__(self, *, defer: bool) -> None:
         super().__init__()

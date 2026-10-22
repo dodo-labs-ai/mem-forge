@@ -699,7 +699,6 @@ class JiraGene(DocumentGene):
             else:
                 item.extra["attest_materialized_revision"] = True
             yield item
-        self.attest_discovery_complete("jira_search_total_exhausted")
 
     async def _search_issues(
         self,

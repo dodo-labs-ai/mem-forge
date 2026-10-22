@@ -9,7 +9,7 @@ projection, extraction and the Memory lifecycle, the same way for both.
   since the incremental cursor, and takes one listing of the configured scope
   per run: a device's snapshot manifest, or the connector's own listing. That
   listing decides which failed Documents are retried and which held
-  Documents are gone.
+  Documents are gone, and when an open scope transition completes.
 - :class:`ConversationFamily` plans each run from the collection attempt it
   is bound to. Each Unit the conversation layer removes carries its own
   evidence.
@@ -21,8 +21,8 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, cast
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 from memforge.conversations.collections import StoredCollections
 from memforge.genes import gene_exports_pdf
@@ -132,8 +132,20 @@ def _absent(doc_ids: set[str], *, evidence: str) -> dict[str, SourceRemoval]:
     }
 
 
+def _opened_at(transition: ProjectionScopeTransition) -> datetime:
+    """When the user's scope change opened the transition."""
+
+    if transition.created_at is None:
+        raise ValueError(f"scope transition {transition.id} records no opening time")
+    opened = datetime.fromisoformat(transition.created_at)
+    return opened if opened.tzinfo is not None else opened.replace(tzinfo=timezone.utc)
+
+
 class CollectionFamily(ABC):
     """One sync run's family steps, bound to the run's Gene and Source."""
+
+    records_transition_members: ClassVar[bool] = False
+    """Whether a Document that commits during an open scope transition is recorded as one of its members."""
 
     def __init__(
         self,
@@ -216,24 +228,48 @@ class CollectionFamily(ABC):
         self,
         *,
         reprocessing: bool,
-        transition_open: bool,
-        coverage_proves_absence: bool,
-        run_committed: bool,
+        transition: ProjectionScopeTransition | None,
         indexed_doc_ids: set[str],
-        crawled_doc_ids: set[str],
         uncommitted: Sequence[ContentItem],
+        deferred_blockers: Mapping[str, frozenset[str]],
     ) -> AbsenceOutcome:
-        """The Documents this run proves the Source no longer has.
+        """The Documents this run removes from the Source, and why.
 
-        ``coverage_proves_absence`` and ``run_committed`` decide the run of an
-        open scope transition. ``uncommitted`` holds the item of every
-        Document of this run, and of every failure ledger row the run leaves
-        open, that has not committed.
+        ``transition`` is the open scope transition the run belongs to.
+        ``uncommitted`` holds the item of every Document of this run, and of
+        every failure ledger row the run leaves open, that has not committed.
+        ``deferred_blockers`` maps each Document whose commit is still
+        deferred to the Units that block it.
         """
 
-    async def completes_transition(self, *, docs_failed: int) -> bool:
-        """Whether this family completes the open transition, whatever the run's coverage proves."""
-        return False
+    @abstractmethod
+    async def transition_outstanding(self, *, docs_failed: int, removals_failed: int) -> str | None:
+        """What keeps the open scope transition from completing after this run; ``None`` completes it.
+
+        Called once the run's removals and the deferred commits they unblock
+        are done. ``removals_failed`` counts the removals that failed.
+        """
+
+    def cursor(
+        self,
+        *,
+        status: Literal["success", "partial", "failed"],
+        started_at: datetime,
+        previous: datetime | None,
+        transition: ProjectionScopeTransition | None,
+        transition_completed: bool,
+    ) -> datetime | None:
+        """The incremental cursor after this run, given the one it started from.
+
+        A run whose failures are all per-Document ones, or that failed none,
+        moves it to its start, which precedes its discovery, so an item the
+        provider changes after discovery read it is read again by the next
+        run. A partial run of an open transition and a failed run keep it.
+        """
+
+        if status == "success" or (status == "partial" and transition is None):
+            return started_at
+        return previous
 
     def unreadable_conversations(self, *, reprocessing: bool) -> tuple[str, ...]:
         """Selected conversations the Source cannot read; each makes the run partial."""
@@ -249,9 +285,17 @@ class DocumentFamily(CollectionFamily):
     walk when it rediscovers one Document, so listing again later could
     answer differently. A run bound to a device's input snapshot reads the
     snapshot manifest as its listing, with the Gene's single listing kind.
+
+    During an open scope transition, every Document that commits is recorded
+    as one of the transition's members, run after run, and each run fetches
+    only the listed Documents that are not members yet. The transition
+    completes once the listing of the new scope is complete and every listed
+    Document is a member; only then does it remove what the new scope leaves
+    out.
     """
 
     gene: DocumentGene
+    records_transition_members = True
 
     def __init__(
         self,
@@ -265,6 +309,8 @@ class DocumentFamily(CollectionFamily):
         self.scope_listing: ScopeListing | None = None
         self._listing_skipped_reason: AbsenceCheckSkippedReason | None = None
         self._unconfirmed_ledger_doc_ids: frozenset[str] = frozenset()
+        self._transition: ProjectionScopeTransition | None = None
+        self._transition_outstanding: str | None = None
 
     def prepare(
         self,
@@ -273,6 +319,10 @@ class DocumentFamily(CollectionFamily):
         input_snapshot: SnapshotBinding | None,
     ) -> None:
         self.input_snapshot = input_snapshot
+        self.gene.reset_scope_listing()
+
+    def begin_scope_transition(self, transition: ProjectionScopeTransition) -> None:
+        self._transition = transition
 
     async def take_scope_listing(self) -> None:
         """Take the run's listing: the bound snapshot manifest, or the connector's own listing.
@@ -385,20 +435,17 @@ class DocumentFamily(CollectionFamily):
         self,
         *,
         reprocessing: bool,
-        transition_open: bool,
-        coverage_proves_absence: bool,
-        run_committed: bool,
+        transition: ProjectionScopeTransition | None,
         indexed_doc_ids: set[str],
-        crawled_doc_ids: set[str],
         uncommitted: Sequence[ContentItem],
+        deferred_blockers: Mapping[str, frozenset[str]],
     ) -> AbsenceOutcome:
         """Remove the held Documents the run's scope listing shows gone.
 
         A reprocess removes nothing. A run of an open scope transition removes
-        what a complete discovery of the new scope did not return, once every
-        Document of the run committed. Any other run reads its listing: a
-        failed Document says nothing about one the listing left out, so item
-        failures do not hold absence back.
+        only when it completes the transition (:meth:`_transition_removals`).
+        Any other run reads its listing: a failed Document says nothing about
+        one the listing left out, so item failures do not hold absence back.
 
         - Without a listing, nothing is removed; a listing that failed
           records why.
@@ -413,10 +460,8 @@ class DocumentFamily(CollectionFamily):
 
         if reprocessing:
             return AbsenceOutcome()
-        if transition_open:
-            if coverage_proves_absence and run_committed:
-                return AbsenceOutcome(removals=_absent(indexed_doc_ids - crawled_doc_ids, evidence="complete snapshot"))
-            return AbsenceOutcome()
+        if transition is not None:
+            return await self._transition_removals(transition, indexed_doc_ids, deferred_blockers)
         if self._listing_skipped_reason is not None:
             return AbsenceOutcome(skipped_reason=self._listing_skipped_reason)
         listing = self.scope_listing
@@ -460,6 +505,131 @@ class DocumentFamily(CollectionFamily):
             removals=_absent(absent, evidence="scope listing"),
             unlisted_present_count=len(unlisted) - len(absent),
         )
+
+    async def _transition_removals(
+        self,
+        transition: ProjectionScopeTransition,
+        indexed_doc_ids: set[str],
+        deferred_blockers: Mapping[str, frozenset[str]],
+    ) -> AbsenceOutcome:
+        """What the run removes when it can complete the open transition; nothing otherwise.
+
+        The run can complete it when its listing of the new scope is complete
+        and every listed Document has committed under the transition, in this
+        run or an earlier one. A listed Document whose commit is still
+        deferred counts as committed when every Unit that blocks it is one this
+        completion removes: removing them is what lets it commit, and
+        :meth:`transition_outstanding` checks that it did.
+
+        Completion removes every held Document the new listing leaves out, as
+        ``removed_from_scope``. A run that cannot complete the transition
+        removes nothing: a Unit whose Document id changed with the scope, such
+        as a file under a new Git ref, carries over to its new Document only
+        when that Document commits.
+        """
+
+        if self._listing_skipped_reason is not None:
+            self._transition_outstanding = "the listing of the new scope failed"
+            return AbsenceOutcome(skipped_reason=self._listing_skipped_reason)
+        listing = self.scope_listing
+        if listing is None:
+            self._transition_outstanding = "the new scope cannot be listed"
+            return AbsenceOutcome()
+        removals = {
+            doc_id: SourceRemoval(reason=UnitRemovalReason.REMOVED_FROM_SCOPE, evidence="scope transition listing")
+            for doc_id in indexed_doc_ids - listing.doc_ids
+        }
+        waiting = listing.doc_ids - set(await self.db.list_projection_scope_transition_member_doc_ids(transition.id))
+        if waiting:
+            removed_unit_ids = await self._current_unit_ids(removals)
+            waiting = {
+                doc_id
+                for doc_id in waiting
+                if not deferred_blockers.get(doc_id) or not deferred_blockers[doc_id] <= removed_unit_ids
+            }
+        if waiting:
+            self._transition_outstanding = f"{len(waiting)} listed Documents have not committed under the transition"
+            logger.info(
+                "Scope transition %s of %s waits on %d listed Documents; nothing is removed",
+                transition.id,
+                self.source_id,
+                len(waiting),
+            )
+            return AbsenceOutcome()
+        logger.info(
+            "Scope transition %s of %s completes: %d Documents the new scope leaves out are removed",
+            transition.id,
+            self.source_id,
+            len(removals),
+        )
+        return AbsenceOutcome(removals=removals)
+
+    async def transition_outstanding(self, *, docs_failed: int, removals_failed: int) -> str | None:
+        """Complete once every listed Document is a member and every removal succeeded.
+
+        A Document failure does not hold the transition back once the
+        Document is a member: the failure ledger retries it, and the cursor
+        the completing run sets makes the next run discover it again. A
+        completion whose removals did not all succeed, or whose deferred
+        commits stayed blocked after them, leaves the transition open with
+        the removals that succeeded applied; the next run that can complete
+        it removes the rest.
+        """
+
+        if self._transition_outstanding is not None:
+            return self._transition_outstanding
+        if removals_failed:
+            return f"{removals_failed} Documents the new scope leaves out could not be removed"
+        transition = self._transition
+        assert transition is not None and self.scope_listing is not None
+        waiting = self.scope_listing.doc_ids - set(
+            await self.db.list_projection_scope_transition_member_doc_ids(transition.id)
+        )
+        if waiting:
+            return f"{len(waiting)} listed Documents did not commit once the Units blocking them were removed"
+        return None
+
+    def cursor(
+        self,
+        *,
+        status: Literal["success", "partial", "failed"],
+        started_at: datetime,
+        previous: datetime | None,
+        transition: ProjectionScopeTransition | None,
+        transition_completed: bool,
+    ) -> datetime | None:
+        """Outside a transition, the shared rule. A transition run moves the cursor only when it completes.
+
+        The completing run sets it to the time the transition opened, not to
+        its own start: transition runs fetch only the listed Documents that
+        are not members yet, so the next run discovers every change made while
+        the transition was open. Any other transition run keeps the cursor. A
+        successful one that finds none, as after a credential change cleared
+        it, records the opening time too, because a successful run always
+        records a cursor and no run reads it until the transition closes.
+        """
+
+        if transition is None:
+            return super().cursor(
+                status=status,
+                started_at=started_at,
+                previous=previous,
+                transition=transition,
+                transition_completed=transition_completed,
+            )
+        if transition_completed or (previous is None and status == "success"):
+            return _opened_at(transition)
+        return previous
+
+    async def _current_unit_ids(self, doc_ids: Collection[str]) -> set[str]:
+        """The current Unit of each Document."""
+
+        unit_ids: set[str] = set()
+        for doc_id in sorted(doc_ids):
+            unit = await self.db.find_source_unit_by_document_id(self.source_id, doc_id, current_only=True)
+            if unit is not None:
+                unit_ids.add(unit.id)
+        return unit_ids
 
     async def _held_by_renames(self, unlisted: set[str], uncommitted: Sequence[ContentItem]) -> set[str]:
         """The unlisted Documents of the current Unit of each Document an uncommitted item was renamed from.
@@ -579,12 +749,10 @@ class ConversationFamily(CollectionFamily):
         self,
         *,
         reprocessing: bool,
-        transition_open: bool,
-        coverage_proves_absence: bool,
-        run_committed: bool,
+        transition: ProjectionScopeTransition | None,
         indexed_doc_ids: set[str],
-        crawled_doc_ids: set[str],
         uncommitted: Sequence[ContentItem],
+        deferred_blockers: Mapping[str, frozenset[str]],
     ) -> AbsenceOutcome:
         """The removals the conversation layer planned for this attempt.
 
@@ -596,10 +764,12 @@ class ConversationFamily(CollectionFamily):
             return AbsenceOutcome()
         return AbsenceOutcome(removals=self.gene.removals())
 
-    async def completes_transition(self, *, docs_failed: int) -> bool:
+    async def transition_outstanding(self, *, docs_failed: int, removals_failed: int) -> str | None:
         """Complete once deselected conversations are removed and every readable target was polled."""
 
-        return docs_failed == 0 and await self.gene.completes_scope_transition()
+        if docs_failed == 0 and await self.gene.completes_scope_transition():
+            return None
+        return f"the collection attempt did not answer every target conversation (failed_docs={docs_failed})"
 
     def unreadable_conversations(self, *, reprocessing: bool) -> tuple[str, ...]:
         return () if reprocessing else self.gene.unreadable_conversations()

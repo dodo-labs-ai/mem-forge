@@ -68,7 +68,6 @@ from memforge.pipeline.document_update import (
 from memforge.pipeline.source_projection_adapters import (
     DEFAULT_SOURCE_PROJECTION_ADAPTER,
     project_source_unit_tombstone,
-    source_run_projection_coverage,
 )
 from memforge.memory.lifecycle_plan import (
     AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON,
@@ -81,7 +80,6 @@ from memforge.memory.lifecycle_planner import (
 )
 from memforge.memory.project_resolver import resolve_project_key
 from memforge.source_projection import (
-    ProjectionCoverage,
     ProjectionEnvelope,
     ProjectionRequest,
     ProjectionRunMode,
@@ -111,7 +109,6 @@ from memforge.pipeline.extraction_contract import (
 )
 from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot
 from memforge.pipeline.collection_family import (
-    LedgerPartition,
     SnapshotBinding,
     collection_family,
 )
@@ -1001,8 +998,13 @@ class GeneSyncOrchestrator:
             # Reuse is an ordinary incremental optimization only. Full syncs
             # and scope transitions require the full per-document path.
             reusable_projection_doc_ids = frozenset()
+        # Each Document that commits during an open transition of a document
+        # Source becomes one of the transition's members, in its commit.
+        member_transition_id = (
+            scope_transition.id if scope_transition is not None and family.records_transition_members else None
+        )
         transition_started = False
-        run_coverage = ProjectionCoverage.PARTIAL_PROJECTION
+        transition_completed = False
         reused_projection_count = 0
         total_item_count = 0
         failure_retryable = True
@@ -1011,7 +1013,6 @@ class GeneSyncOrchestrator:
         recovered_completed_results: tuple[dict[str, Any], ...] = ()
         recovered_deferred_results: tuple[dict[str, Any], ...] = ()
         recovered_failed_results: tuple[dict[str, Any], ...] = ()
-        transition_run = scope_transition is not None
         unreadable_conversations: tuple[str, ...] = ()
 
         def fail_document(failure: RunItemFailure, *, error: str | None = None) -> None:
@@ -1031,6 +1032,7 @@ class GeneSyncOrchestrator:
                 run_id=run_id,
                 lifecycle_execution_owner_id=durable_cycle_id,
                 progress_callback=progress_callback,
+                scope_transition_id=member_transition_id,
             )
             recovered_completed_results = recovered.completed_results
             recovered_deferred_results = recovered.deferred_results
@@ -1137,9 +1139,6 @@ class GeneSyncOrchestrator:
                         }
                     )
 
-                begin_discovery = getattr(gene, "begin_discovery", None)
-                if callable(begin_discovery):
-                    begin_discovery()
                 async for item in gene.discover(since=last_sync_time):
                     crawled_doc_ids.add(item.item_id)
                     if item.item_id in left_alone:
@@ -1161,12 +1160,6 @@ class GeneSyncOrchestrator:
                             }
                         )
 
-                run_coverage = source_run_projection_coverage(
-                    complete_snapshot=complete_snapshot,
-                    scope_transition=scope_transition is not None,
-                    discovery_complete=bool(getattr(gene, "discovery_complete", False)),
-                )
-
                 logger.info(
                     "Discovered %d content items from %s (since=%s)",
                     len(crawled_doc_ids),
@@ -1182,12 +1175,11 @@ class GeneSyncOrchestrator:
                     )
                 # The run's one scope listing, taken before any failed
                 # Document is retried, decides the ledger rows it does not
-                # name: settled when their item is gone, or kept untried.
-                ledger_partition = LedgerPartition()
-                if scope_transition is None:
-                    await family.take_scope_listing()
-                    ledger_partition = family.partition_ledger(ledger, rediscovering=rediscovering)
-                    settled_doc_ids.update(ledger_partition.settled)
+                # name: settled when their item is gone, or kept untried. In a
+                # scope transition it is the listing of the new scope.
+                await family.take_scope_listing()
+                ledger_partition = family.partition_ledger(ledger, rediscovering=rediscovering)
+                settled_doc_ids.update(ledger_partition.settled)
                 # A failed Document that discovery did not return is read the
                 # way a reprocess reads it.
                 for doc_id in sorted(
@@ -1230,6 +1222,20 @@ class GeneSyncOrchestrator:
                 reusable_projection_doc_ids = (reusable_projection_doc_ids & discovered_doc_ids) - (
                     retried_doc_ids | set(left_alone)
                 )
+                if member_transition_id is not None and not force_full_sync:
+                    # A Document already committed under the transition is not
+                    # fetched again; one that changed since is discovered by
+                    # the first run after the transition completes.
+                    members = set(await self.db.list_projection_scope_transition_member_doc_ids(member_transition_id))
+                    member_count = len(items)
+                    items = [item for item in items if item.item_id not in members]
+                    if member_count > len(items):
+                        logger.info(
+                            "Skipped %d Documents of %s already committed under scope transition %s",
+                            member_count - len(items),
+                            source_id,
+                            member_transition_id,
+                        )
                 total_item_count = len(items)
                 if reusable_projection_doc_ids:
                     items = [item for item in items if item.item_id not in reusable_projection_doc_ids]
@@ -1248,7 +1254,6 @@ class GeneSyncOrchestrator:
                     reused_projection_count=reused_projection_count,
                     indexed_doc_count=len(indexed_doc_ids),
                     full_sync=last_sync_time is None,
-                    projection_coverage=run_coverage.value,
                 )
 
             # A failed Document keeps the rename its ledger row recorded,
@@ -1371,6 +1376,7 @@ class GeneSyncOrchestrator:
                                 ),
                                 projection_access_context=configured_access_context,
                                 complete_snapshot=complete_snapshot,
+                                scope_transition_id=member_transition_id,
                                 source_activity=source_activity,
                                 lifecycle_execution_owner_id=durable_cycle_id,
                                 lifecycle_attempt_count=attempt,
@@ -1608,16 +1614,15 @@ class GeneSyncOrchestrator:
             # ----------------------------------------------------------
             # Step 5: Remove Documents the provider no longer has
             # ----------------------------------------------------------
-            # The family decides what the run proves absent. Deferred commits
+            # The family decides what the run removes. Deferred commits
             # blocked only by this run's Units converge first. A Document
             # that has not committed by then keeps the Unit its renamed item
-            # names; it holds back nothing else.
+            # names; it holds back nothing else. In a scope transition,
+            # removal waits for the run that completes it.
             await self._converge_deferred_projected_lifecycle(effective_results)
-            deferred_failures = sum(result.get("terminal_error") is not None for result in deferred_results)
             deleted_count = 0
+            removals_failed = 0
             tombstoned_source_unit_ids: set[str] = set()
-            run_committed = docs_failed + deferred_failures == 0
-            absence_is_authoritative = run_coverage.proves_absence and run_committed
             committed_doc_ids = {
                 str(result["doc_id"])
                 for result in effective_results
@@ -1629,11 +1634,13 @@ class GeneSyncOrchestrator:
             left_ledger_doc_ids = committed_doc_ids | settled_doc_ids
             absence = await family.absence(
                 reprocessing=reprocessing,
-                transition_open=scope_transition is not None,
-                coverage_proves_absence=run_coverage.proves_absence,
-                run_committed=run_committed,
+                transition=scope_transition,
                 indexed_doc_ids=indexed_doc_ids,
-                crawled_doc_ids=crawled_doc_ids,
+                deferred_blockers={
+                    str(result["doc_id"]): frozenset(result["deferred_lifecycle"].handle.blocking_source_unit_ids)
+                    for result in deferred_results
+                    if result.get("deferred_lifecycle") is not None
+                },
                 uncommitted=[
                     *(item for item in items if item.item_id not in committed_doc_ids),
                     *(
@@ -1674,7 +1681,8 @@ class GeneSyncOrchestrator:
                 )
                 for deletion_failure in deletion_failures:
                     fail_document(deletion_failure)
-                docs_failed += len(deletion_failures)
+                removals_failed = len(deletion_failures)
+                docs_failed += removals_failed
                 removed_doc_ids = set(removals) - {failure.document_id for failure in deletion_failures}
                 # A removed Document has nothing left to retry, whatever
                 # failed for it earlier in this run.
@@ -1733,20 +1741,22 @@ class GeneSyncOrchestrator:
                 skipped_reading_group_count += result["skipped_reading_group_count"]
 
             if scope_transition is not None:
-                family_completes_transition = await family.completes_transition(docs_failed=docs_failed)
-                if (absence_is_authoritative or family_completes_transition) and docs_failed == 0:
+                outstanding = await family.transition_outstanding(
+                    docs_failed=docs_failed,
+                    removals_failed=removals_failed,
+                )
+                if outstanding is None:
                     scope_transition = await self.db.complete_projection_scope_transition(
                         scope_transition.id,
                         run_id=transition_run_id,
                     )
+                    transition_completed = True
                 else:
+                    # The transition stays open; the next run continues it.
                     scope_transition = await self.db.fail_projection_scope_transition(
                         scope_transition.id,
                         run_id=transition_run_id,
-                        error=(
-                            "target scope did not produce a complete successful snapshot: "
-                            f"coverage={run_coverage.value}, failed_docs={docs_failed}"
-                        ),
+                        error=outstanding,
                     )
                 transition_started = False
 
@@ -1836,20 +1846,20 @@ class GeneSyncOrchestrator:
                 part for part in (error_message, summarize_unreadable_conversations(unreadable_conversations)) if part
             )
 
-        # Advance the incremental watermark after a sync whose failures, if
-        # any, are all recorded in the failure ledger, including no-change
-        # runs where discovery returns zero items. The watermark is the run's
-        # start, which precedes its discovery, so an item the provider changes
-        # after discovery read it is read again by the next run. A run with a
-        # Projection Scope transition advances it only when it succeeds. A
-        # reprocess discovers nothing, so the cursor stays where the last sync
-        # left it.
-        if not reprocessing and (status == "success" or (status == "partial" and not transition_run)):
-            sync_at = started_at
-        elif existing_state and existing_state.last_sync_at:
-            sync_at = existing_state.last_sync_at
+        # The family moves the incremental cursor (see
+        # CollectionFamily.cursor). A reprocess discovers nothing, so the
+        # cursor stays where the last sync left it.
+        previous_sync_at = existing_state.last_sync_at if existing_state else None
+        if reprocessing:
+            sync_at = previous_sync_at
         else:
-            sync_at = None
+            sync_at = family.cursor(
+                status=status,
+                started_at=started_at,
+                previous=previous_sync_at,
+                transition=scope_transition,
+                transition_completed=transition_completed,
+            )
 
         sync_state = SyncState(
             source=source_id,
@@ -2064,8 +2074,12 @@ class GeneSyncOrchestrator:
         lifecycle_execution_owner_id: str | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         source_activity: SourceActivityLease | None = None,
+        scope_transition_id: str | None = None,
     ) -> _SourceDerivationRecovery:
         """Resume durable Source Unit work before reading the provider.
+
+        ``scope_transition_id`` names the open scope transition whose members
+        the recovered commits record.
 
         A derivation another release staged is superseded, not resumed: the
         failure ledger records its Document, so the run derives it again with
@@ -2181,6 +2195,7 @@ class GeneSyncOrchestrator:
                             source_activity=source_activity,
                             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
                             diagnostics=diagnostics,
+                            scope_transition_id=scope_transition_id,
                         )
                         if lifecycle_stats is not None:
                             diagnostics.status = "committed"
@@ -2362,6 +2377,7 @@ class GeneSyncOrchestrator:
         lifecycle_execution_owner_id: str | None,
         diagnostics: _SourceUnitExecutionDiagnostics,
         source_activity: SourceActivityLease | None = None,
+        scope_transition_id: str | None = None,
     ) -> dict | None:
         """Resume one derivation inside the process document admission."""
 
@@ -2452,6 +2468,7 @@ class GeneSyncOrchestrator:
             source_activity=source_activity,
             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
             lifecycle_attempt_count=1,
+            scope_transition_id=scope_transition_id,
         )
 
     # ==================================================================
@@ -2512,6 +2529,7 @@ class GeneSyncOrchestrator:
         scope_transition: dict[str, object] | None = None,
         projection_access_context: dict[str, object] | None = None,
         complete_snapshot: bool = False,
+        scope_transition_id: str | None = None,
         source_activity: SourceActivityLease | None = None,
         lifecycle_execution_owner_id: str | None = None,
         lifecycle_attempt_count: int = 1,
@@ -2521,7 +2539,11 @@ class GeneSyncOrchestrator:
         stored_document: StoredSourceDocument | None = None,
         diagnostics: _SourceUnitExecutionDiagnostics | None = None,
     ) -> dict:
-        """Process one Document; ``diagnostics`` records its Source Unit and the step that ran last."""
+        """Process one Document; ``diagnostics`` records its Source Unit and the step that ran last.
+
+        ``scope_transition_id`` names the open scope transition whose member
+        the Document becomes when it commits.
+        """
 
         doc_id = item.item_id
         self._memory_sample("document_wait_start", source_id=source_id, run_id=run_id, doc_id=doc_id)
@@ -2555,6 +2577,7 @@ class GeneSyncOrchestrator:
                         scope_transition=scope_transition,
                         projection_access_context=projection_access_context,
                         complete_snapshot=complete_snapshot,
+                        scope_transition_id=scope_transition_id,
                         source_activity=source_activity,
                         lifecycle_execution_owner_id=lifecycle_execution_owner_id,
                         lifecycle_attempt_count=lifecycle_attempt_count,
@@ -2791,6 +2814,7 @@ class GeneSyncOrchestrator:
         scope_transition: dict[str, object] | None = None,
         projection_access_context: dict[str, object] | None = None,
         complete_snapshot: bool = False,
+        scope_transition_id: str | None = None,
         source_activity: SourceActivityLease | None = None,
         source_unit_id_callback: Callable[[str], None] | None = None,
         lifecycle_execution_owner_id: str | None = None,
@@ -3177,6 +3201,7 @@ class GeneSyncOrchestrator:
                     projection,
                     unit_input=unit_input,
                     source_activity=source_activity,
+                    scope_transition_id=scope_transition_id,
                 )
                 await self.db.upsert_document(
                     doc_record,
@@ -3244,6 +3269,7 @@ class GeneSyncOrchestrator:
                 source_activity=source_activity,
                 lifecycle_execution_owner_id=lifecycle_execution_owner_id,
                 lifecycle_attempt_count=lifecycle_attempt_count,
+                scope_transition_id=scope_transition_id,
             )
             stats["memories_extracted"] = memory_stats.get("added", 0)
             stats["memory_supports_removed"] = memory_stats.get("deleted", 0)
@@ -3374,6 +3400,7 @@ class GeneSyncOrchestrator:
             source_activity=source_activity,
             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
             lifecycle_attempt_count=lifecycle_attempt_count,
+            scope_transition_id=scope_transition_id,
         )
         stats["memories_extracted"] = memory_stats.get("added", 0)
 
