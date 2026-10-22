@@ -2501,7 +2501,13 @@ def test_local_agent_cloud_jira_noop_uses_inventory_without_hydrating_issues(mon
     assert payload["counts"] == {"selected": 2, "reused": 2, "pushed": 0, "failed": 0}
 
 
-def _confirming_jira_gene(events: list[str], *, confirm_error: Exception | None = None):
+def _confirming_jira_gene(
+    events: list[str],
+    *,
+    confirm_error: Exception | None = None,
+    rebuild_error: Exception | None = None,
+    authenticate_error: Exception | None = None,
+):
     """A Jira Gene whose inventory lists PAY-1, and which confirms what the server asks about."""
     from datetime import datetime, timezone
 
@@ -2518,7 +2524,8 @@ def _confirming_jira_gene(events: list[str], *, confirm_error: Exception | None 
             self._client = HttpClient()
 
         async def authenticate(self):
-            return None
+            if authenticate_error is not None:
+                raise authenticate_error
 
         async def discover_inventory(self):
             yield ContentItem(
@@ -2536,6 +2543,8 @@ def _confirming_jira_gene(events: list[str], *, confirm_error: Exception | None 
 
         @classmethod
         def confirmation_item(cls, document_id, provider_key):
+            if rebuild_error is not None:
+                raise rebuild_error
             return ContentItem(
                 item_id=document_id,
                 title=provider_key,
@@ -2638,6 +2647,40 @@ def test_local_agent_cloud_jira_reports_a_confirmation_it_could_not_make(monkeyp
     assert submitted["failure_cause"] == "RuntimeError: HTTP 401 from Jira"
     assert _call_names()[-1] == "start_source_processing"
     assert events == ["confirmed 100007, PAY-8", "closed"]
+
+
+def test_local_agent_cloud_jira_reports_an_issue_it_cannot_rebuild_as_a_failed_confirmation(monkeypatch):
+    events: list[str] = []
+    FakeToolClient.reset({})
+
+    payload = _run_confirming_jira_job(
+        monkeypatch,
+        _confirming_jira_gene(
+            events, rebuild_error=ValueError("Jira issue reference '1#x' is neither an issue id nor an issue key")
+        ),
+    )
+
+    assert payload.get("error") is None, payload
+    [(_name, submitted)] = [call for call in FakeToolClient.calls if call[0] == "submit_local_source_confirmations"]
+    assert submitted["answers"] == []
+    assert submitted["failure_cause"] == (
+        "ValueError: Jira issue reference '1#x' is neither an issue id nor an issue key"
+    )
+    assert _call_names()[-1] == "start_source_processing"
+    assert events == ["closed"]
+
+
+def test_local_agent_cloud_jira_closes_its_session_when_authentication_fails(monkeypatch):
+    events: list[str] = []
+    FakeToolClient.reset({})
+
+    payload = _run_confirming_jira_job(
+        monkeypatch, _confirming_jira_gene(events, authenticate_error=RuntimeError("session rejected"))
+    )
+
+    assert payload["error"] == "session rejected"
+    assert _call_names() == []
+    assert events == ["closed"]
 
 
 def test_local_agent_cloud_jira_does_not_process_when_its_answers_are_refused(monkeypatch):

@@ -694,6 +694,24 @@ async def test_a_device_answer_settles_or_keeps_the_failed_issues_its_manifest_l
 
 
 @pytest.mark.asyncio
+async def test_a_confirm_set_too_large_to_issue_removes_nothing(workspace):
+    device = DeviceJira(existing={0, 1, 2})
+    await workspace.sync(device, manifest={0, 1, 2})
+    workspace.engine.events.clear()
+
+    # The server issued no confirmations because the set was larger than a
+    # manifest, so the device answered nothing.
+    device.move_on(existing={0}, in_query={0})
+    state = await workspace.sync(device, manifest={0}, answers={})
+
+    assert state.last_sync_status == "success"
+    assert workspace.tombstoned() == []
+    assert await workspace.held() == {"jira-0", "jira-1", "jira-2"}
+    assert state.absence_check_skipped_reason == "absence_confirmation_missing"
+    assert await workspace.recorded_skip_reason() == "absence_confirmation_missing"
+
+
+@pytest.mark.asyncio
 async def test_a_failed_device_confirmation_removes_and_settles_nothing(workspace):
     device = DeviceJira(existing={0, 1, 2})
     device.broken[2] = ("fetch", ValueError("issue unreadable"))

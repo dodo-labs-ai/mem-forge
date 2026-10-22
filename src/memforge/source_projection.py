@@ -277,6 +277,25 @@ def require_stored_revision_identity(
             raise ProjectionIdentityConflict("source_observation_revisions", revision.id)
 
 
+UNIT_INCARNATION_SEPARATOR = "#incarnation:"
+
+
+def incarnated_provider_key(provider_key: str, incarnation: str) -> str:
+    """The provider key of a Unit that came back after its removal: the provider's key and its incarnation.
+
+    The removed Unit keeps the provider's key, so the one that comes back
+    takes a key of its own, such as ``"100007#incarnation:unit-1:2"``.
+    """
+
+    return f"{provider_key}{UNIT_INCARNATION_SEPARATOR}{incarnation}"
+
+
+def provider_item_key(provider_key: str) -> str:
+    """The provider's own key of a Unit's item, without the incarnation a Unit that came back carries."""
+
+    return provider_key.partition(UNIT_INCARNATION_SEPARATOR)[0]
+
+
 @dataclass(frozen=True, slots=True)
 class SourceUnit:
     """Stable identity for one provider item within a configured Source.

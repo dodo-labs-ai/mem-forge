@@ -4090,13 +4090,13 @@ async def _collect_jira_documents_from_cloud_job(
     config["jira_cookie"] = jira_cookie
 
     gene = JiraGene(config, source_id)
-    await gene.authenticate()
     documents: list[dict[str, Any]] = []
-    _report_local_agent_progress(
-        report_progress,
-        _sync_progress_snapshot(phase="discovering", completed=0, unit="issue"),
-    )
     try:
+        await gene.authenticate()
+        _report_local_agent_progress(
+            report_progress,
+            _sync_progress_snapshot(phase="discovering", completed=0, unit="issue"),
+        )
         inventory_items = []
         async for item in gene.discover_inventory():
             if limit and len(inventory_items) >= limit:
@@ -4258,13 +4258,14 @@ async def _confirm_unlisted_jira_issues(
 ) -> None:
     """Read each issue the manifest left out by its id, and post the answers bound to the manifest.
 
-    When ``confirm_absent`` raises, the agent posts its cause instead, so the
-    run removes nothing. A post the server refuses fails the collection.
+    When an issue cannot be rebuilt or ``confirm_absent`` raises, the agent
+    posts the cause instead, so the run removes nothing. A post the server
+    refuses fails the collection.
     """
-    items = [gene.confirmation_item(entry["doc_id"], entry["provider_key"]) for entry in manifest.confirm]
     answers: list[dict[str, str]] = []
     failure_cause: str | None = None
     try:
+        items = [gene.confirmation_item(entry["doc_id"], entry["provider_key"]) for entry in manifest.confirm]
         confirmed = await gene.confirm_absent(items)
         answers = [
             {"doc_id": entry["doc_id"], "provider_key": entry["provider_key"], "answer": confirmed[entry["doc_id"]].value}

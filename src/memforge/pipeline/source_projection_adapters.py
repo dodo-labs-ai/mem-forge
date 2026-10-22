@@ -31,6 +31,7 @@ from memforge.source_projection import (
     SourceRelation,
     SourceUnit,
     SourceUnitRevision,
+    incarnated_provider_key,
 )
 from memforge.source_time import (
     SOURCE_UPDATED_AT_KEY,
@@ -164,7 +165,7 @@ def project_source_item(
     if persisted_provider_key is not None:
         provider_key = str(persisted_provider_key)
     elif incarnation is not None:
-        provider_key = f"{provider_key}#incarnation:{incarnation}"
+        provider_key = incarnated_provider_key(provider_key, str(incarnation))
     unit_id = (
         str(persisted_unit_id)
         if persisted_unit_id is not None

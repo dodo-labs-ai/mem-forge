@@ -229,6 +229,7 @@ from memforge.source_secrets import (
 from memforge.source_projection import (
     ProjectionScopeTransition,
     ProjectionScopeTransitionStale,
+    provider_item_key,
 )
 from memforge.source_projection_config import (
     canonical_scope_transition,
@@ -2706,7 +2707,8 @@ async def _snapshot_confirm_set(
 
     Only a document Source whose device listing is a query asks, and only an
     agent that confirms is asked. It asks about every Document with a current
-    Unit the manifest does not list, by the Unit's provider key, and every
+    Unit the manifest does not list, by the provider's key of the Unit's item
+    (without the incarnation a Unit that came back carries), and every
     failed Document the manifest does not list that never became a Unit, by
     the provider key of its stored item. A replay of a stored manifest returns
     the set the manifest was issued, without asking again.
@@ -2735,8 +2737,8 @@ async def _snapshot_confirm_set(
             source_id=source_id, workspace_id=workspace_id, snapshot_id=snapshot_id
         )
         return tuple(SnapshotConfirmation(item.doc_id, item.provider_key) for item in issued)
-    held = await db.list_indexed_doc_ids(source_id)
-    unlisted_units = sorted(held - listed_doc_ids)
+    held = await db.list_current_document_provider_keys(source_id)
+    unlisted_units = sorted(set(held) - listed_doc_ids)
     unlisted_failures = sorted(
         (
             failure
@@ -2752,11 +2754,7 @@ async def _snapshot_confirm_set(
             len(unlisted_units) + len(unlisted_failures),
         )
         return ()
-    confirm: list[SnapshotConfirmation] = []
-    for doc_id in unlisted_units:
-        unit = await db.find_source_unit_by_document_id(source_id, doc_id, current_only=True)
-        if unit is not None:
-            confirm.append(SnapshotConfirmation(doc_id, unit.provider_key))
+    confirm = [SnapshotConfirmation(doc_id, provider_item_key(held[doc_id])) for doc_id in unlisted_units]
     confirm.extend(
         SnapshotConfirmation(failure.document_id, gene_cls.provider_key(failure.item))
         for failure in unlisted_failures
