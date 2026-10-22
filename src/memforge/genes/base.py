@@ -122,6 +122,10 @@ class Gene(ABC):
         """
         return False
 
+    def filter_summary(self, since: datetime | None) -> str | None:
+        """The filter this run's discovery applied, as source activity shows it."""
+        return f"updated >= {since.isoformat()}" if since else None
+
     def requires_pdf_artifact(
         self,
         *,

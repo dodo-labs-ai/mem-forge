@@ -384,20 +384,15 @@ class GitHubPagesGene(Gene):
     async def _content_item_for_url(
         self,
         url: str,
-        *,
-        metadata_headers: dict[str, str] | None = None,
     ) -> ContentItem:
         canonical_url = self._require_in_site(url)
         if self._auth_mode == AUTH_MODE_GITHUB_PAT:
             return await self._repo_file_item_for_url(canonical_url)
         # Build identity and revision from the same successful body response.
-        # ``metadata_headers`` remains accepted for compatibility, but cannot
-        # replace body-bound evidence.
         response = await self._client.get(canonical_url)
         response.raise_for_status()
         self._validate_http_response_identity(response, canonical_url)
-        headers = {**dict(response.headers), **dict(metadata_headers or {})}
-        return self._content_item_from_http_response(canonical_url, headers, response.content)
+        return self._content_item_from_http_response(canonical_url, dict(response.headers), response.content)
 
     def _content_item_from_http_response(
         self,
@@ -570,7 +565,7 @@ class GitHubPagesGene(Gene):
         for url in _limit_urls(scoped, _max_pages(self.config)):
             lastmod = _lastmod_for_url(response.text, url)
             if lastmod:
-                item = await self._content_item_for_url(url, metadata_headers={})
+                item = await self._content_item_for_url(url)
                 item.last_modified = lastmod
                 item.extra[CONTENT_UPDATED_AT_KEY] = lastmod.isoformat()
             else:

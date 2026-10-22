@@ -20,6 +20,7 @@ from memforge.source_activity import SourceActivityConflict
 from memforge.source_derivation import DERIVATION_DETERMINISTIC_FAILURE
 from memforge.source_item_failures import FailedItemRetry
 from memforge.storage.database import Database
+from tests.gene_fixture import FakeGene
 from tests.test_source_reprocess import RawKeepingDocumentStore
 from tests.test_sync_bookkeeping import (
     FailingMemoryExtractor,
@@ -48,7 +49,7 @@ def authored(history: dict, author: str) -> dict:
     return {**history, "author": {"displayName": author}}
 
 
-class JiraProvider:
+class JiraProvider(FakeGene):
     """A Jira provider whose issues carry changelog entries that never reach the markdown."""
 
     discovery_complete = True

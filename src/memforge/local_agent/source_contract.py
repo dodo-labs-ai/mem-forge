@@ -484,7 +484,7 @@ def validate_local_agent_replay_package(
     expected_input_sha256: str,
     expected_package_sha256: str,
 ) -> Mapping[str, Any]:
-    """Compatibility wrapper around the registered provider adapter."""
+    """Validate one local-agent package with its source type's replay adapter."""
     from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
 
     return get_local_source_replay_adapter(source_type).validate(

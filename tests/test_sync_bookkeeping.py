@@ -118,6 +118,7 @@ from memforge.scheduler import SOURCE_SCHEDULE_SCAN_JOB_ID, SyncScheduler
 from tests.llm_fixture import AdmittingClient, NoopMemoryExtractor, fixture_request_planner
 from tests.unit_support_fixture import active_support_evidence
 from tests.embedding_fixture import unconfigured_embedding
+from tests.gene_fixture import FakeGene
 
 
 @pytest.fixture
@@ -2039,7 +2040,7 @@ async def test_source_sync_input_attestation_lookup_is_exact_and_history_bounded
     assert [item.input_id for item in matched] == [inputs[0].input_id]
 
 
-class EmptyGene:
+class EmptyGene(FakeGene):
     discovery_complete = True
 
     def __init__(self) -> None:
@@ -2543,7 +2544,7 @@ class SinceRecordingEmptyGene(EmptyGene):
             yield ContentItem(item_id="never", title="never", updated_at=datetime.now(timezone.utc))
 
 
-class IncrementalNewDocumentGene:
+class IncrementalNewDocumentGene(FakeGene):
     def __init__(self) -> None:
         self.seen_since = None
 
@@ -2590,7 +2591,7 @@ class IncrementalNewDocumentGene:
         return NormalizedContent(item=raw.item, markdown_body="# New Session\n\nSummary")
 
 
-class FailingAuthGene:
+class FailingAuthGene(FakeGene):
     def requires_pdf_artifact(
         self,
         *,
@@ -3566,7 +3567,7 @@ def _confluence_raw_content(item: ContentItem, markdown: str) -> RawContent:
     return RawContent(item=item, body=MarkdownIt().render(markdown).encode(), content_type="text/html")
 
 
-class BlockingFetchGene:
+class BlockingFetchGene(FakeGene):
     discovery_complete = True
 
     def __init__(self, item_count: int, release: asyncio.Event):
@@ -3818,7 +3819,7 @@ async def test_jira_artifact_identity_survives_mutable_issue_key(db: Database) -
         doc_store=document_store,
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=RecordingDocumentDeleteMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -4048,7 +4049,7 @@ class UnexpectedPdfExportGene(PdfBackfillGene):
         raise AssertionError("unchanged document with a stored PDF must not export again")
 
 
-class UpdatingDocumentGene:
+class UpdatingDocumentGene(FakeGene):
     def __init__(
         self,
         markdown: str,
@@ -4713,7 +4714,7 @@ async def _stage_completed_v9_recovery_attempt(
     return attempt
 
 
-class V9RecoveryReplayGene:
+class V9RecoveryReplayGene(FakeGene):
     """Rediscover the exact provider target retained by a recovery attempt."""
 
     discovery_complete = False
@@ -9482,7 +9483,7 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
         doc_store=StubDocumentStore(),
         memory_extractor=extractor,
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=RecordingDocumentDeleteMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -9593,7 +9594,7 @@ async def test_exact_version_github_file_move_a_to_b_to_a_keeps_one_lineage(db: 
         doc_store=StubDocumentStore(),
         memory_extractor=extractor,
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=RecordingDocumentDeleteMemoryStore(db),
         max_concurrent=1,
     )
 

@@ -44,6 +44,9 @@ class FailingFtsDatabase:
     def db(self):
         return self
 
+    async def list_documents_missing_pdf(self, source_types):
+        return await self.wrapped.list_documents_missing_pdf(source_types)
+
     def execute(self, sql, *args, **kwargs):
         if "memories_fts" in sql:
             raise RuntimeError("fts unavailable")
@@ -314,7 +317,7 @@ async def test_health_reports_confluence_document_missing_pdf_uri(db: Database):
 
     report = await checker.check()
 
-    assert ("confluence_pdf_uri_missing", "confluence-123") in {
+    assert ("pdf_uri_missing", "confluence-123") in {
         (issue.kind, issue.memory_id) for issue in report.issues
     }
 
