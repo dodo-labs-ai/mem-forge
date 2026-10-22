@@ -182,6 +182,9 @@ def _durable_sync_payload(run: Any) -> dict[str, Any]:
         "progress_updated_at": (
             run.progress_updated_at.isoformat() if run.progress_updated_at else None
         ),
+        "stop_requested_at": (
+            run.stop_requested_at.isoformat() if run.stop_requested_at else None
+        ),
     }
 
 

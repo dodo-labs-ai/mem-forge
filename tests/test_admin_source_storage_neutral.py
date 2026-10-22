@@ -226,6 +226,7 @@ def test_source_list_projects_a_retried_sync_as_a_fresh_attempt(tmp_path):
         progress=None,
         progress_revision=7,
         progress_updated_at=None,
+        stop_requested_at=None,
         lease_expires_at=now.replace(year=now.year + 1),
     )
 

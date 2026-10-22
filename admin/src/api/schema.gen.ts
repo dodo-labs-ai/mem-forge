@@ -2477,6 +2477,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sources/{source_id}/sync/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stop Source Sync
+         * @description Stop the Source's sync in progress. The Source stays active and later syncs run as scheduled.
+         *
+         *     A person who manages the Source, or who runs its sync, can stop it.
+         *     A server run that has not started, and the collection jobs of the
+         *     Source's local daemon, end at once. A running server run ends at its
+         *     worker's next heartbeat: what it committed stays, and it removes
+         *     nothing and does not advance the sync cursor.
+         */
+        post: operations["stop_source_sync_api_v1_sources__source_id__sync_stop_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/stats": {
         parameters: {
             query?: never;
@@ -6048,7 +6074,9 @@ export interface components {
          *
          *     An active durable run carries the run fields (``run_id``, ``trigger``,
          *     ``force_full_sync``, ``created_at``, ``next_attempt_at``,
-         *     ``recovery_count``, ``progress_revision``, ``progress_updated_at``). A
+         *     ``recovery_count``, ``progress_revision``, ``progress_updated_at``, and
+         *     ``stop_requested_at`` once a person asked to stop it). A run a person
+         *     stopped ends ``failed`` with ``error_message`` ``cancelled_by_user``. A
          *     sync running in this process carries its live counters (``phase``,
          *     ``docs_*``, ``memories_*``, ``current_title``). The last recorded sync
          *     carries its totals, ``run_id``, ``failed_docs``,
@@ -6108,8 +6136,34 @@ export interface components {
              * @enum {string}
              */
             status: "pending" | "running" | "recovering" | "success" | "partial" | "failed";
+            /** Stop Requested At */
+            stop_requested_at?: string | null;
             /** Trigger */
             trigger?: string | null;
+        };
+        /**
+         * SourceSyncStopResponse
+         * @description What stopping a Source's sync reached.
+         *
+         *     ``outcome`` is ``stopping`` while the running server run ``run_id`` has
+         *     yet to see the request: its worker stops at its next heartbeat, within
+         *     about 30 seconds, and the run then fails with ``cancelled_by_user``.
+         *     ``stopped`` means everything found has ended: a pending run, and the local
+         *     daemon jobs in ``local_agent_job_ids``. ``not_running`` means the Source
+         *     had nothing to stop. Asking again is harmless.
+         */
+        SourceSyncStopResponse: {
+            /** Local Agent Job Ids */
+            local_agent_job_ids: string[];
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "stopping" | "stopped" | "not_running";
+            /** Run Id */
+            run_id: string | null;
+            /** Source Id */
+            source_id: string;
         };
         /** StatsResponse */
         StatsResponse: {
@@ -10524,6 +10578,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    stop_source_sync_api_v1_sources__source_id__sync_stop_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceSyncStopResponse"];
                 };
             };
             /** @description Validation Error */

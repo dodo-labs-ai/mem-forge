@@ -9475,7 +9475,7 @@
         "type": "object"
       },
       "SourceSyncStatusResponse": {
-        "description": "A Source's latest sync, read from one of three places.\n\nAn active durable run carries the run fields (``run_id``, ``trigger``,\n``force_full_sync``, ``created_at``, ``next_attempt_at``,\n``recovery_count``, ``progress_revision``, ``progress_updated_at``). A\nsync running in this process carries its live counters (``phase``,\n``docs_*``, ``memories_*``, ``current_title``). The last recorded sync\ncarries its totals, ``run_id``, ``failed_docs``,\n``absence_check_skipped_reason``, which names the step that kept that run\nfrom removing anything although its scope listing was due, and\n``skipped_reading_group_count``, the parts of its Documents the generation\nmodel could not read. Fields outside the chosen shape are absent.",
+        "description": "A Source's latest sync, read from one of three places.\n\nAn active durable run carries the run fields (``run_id``, ``trigger``,\n``force_full_sync``, ``created_at``, ``next_attempt_at``,\n``recovery_count``, ``progress_revision``, ``progress_updated_at``, and\n``stop_requested_at`` once a person asked to stop it). A run a person\nstopped ends ``failed`` with ``error_message`` ``cancelled_by_user``. A\nsync running in this process carries its live counters (``phase``,\n``docs_*``, ``memories_*``, ``current_title``). The last recorded sync\ncarries its totals, ``run_id``, ``failed_docs``,\n``absence_check_skipped_reason``, which names the step that kept that run\nfrom removing anything although its scope listing was due, and\n``skipped_reading_group_count``, the parts of its Documents the generation\nmodel could not read. Fields outside the chosen shape are absent.",
         "properties": {
           "absence_check_skipped_reason": {
             "anyOf": [
@@ -9748,6 +9748,17 @@
             "title": "Status",
             "type": "string"
           },
+          "stop_requested_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop Requested At"
+          },
           "trigger": {
             "anyOf": [
               {
@@ -9768,6 +9779,50 @@
           "progress"
         ],
         "title": "SourceSyncStatusResponse",
+        "type": "object"
+      },
+      "SourceSyncStopResponse": {
+        "description": "What stopping a Source's sync reached.\n\n``outcome`` is ``stopping`` while the running server run ``run_id`` has\nyet to see the request: its worker stops at its next heartbeat, within\nabout 30 seconds, and the run then fails with ``cancelled_by_user``.\n``stopped`` means everything found has ended: a pending run, and the local\ndaemon jobs in ``local_agent_job_ids``. ``not_running`` means the Source\nhad nothing to stop. Asking again is harmless.",
+        "properties": {
+          "local_agent_job_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Local Agent Job Ids",
+            "type": "array"
+          },
+          "outcome": {
+            "enum": [
+              "stopping",
+              "stopped",
+              "not_running"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "outcome",
+          "run_id",
+          "local_agent_job_ids"
+        ],
+        "title": "SourceSyncStopResponse",
         "type": "object"
       },
       "StatsResponse": {
@@ -16570,6 +16625,49 @@
           }
         },
         "summary": "Read Source Sync Run",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/api/v1/sources/{source_id}/sync/stop": {
+      "post": {
+        "description": "Stop the Source's sync in progress. The Source stays active and later syncs run as scheduled.\n\nA person who manages the Source, or who runs its sync, can stop it.\nA server run that has not started, and the collection jobs of the\nSource's local daemon, end at once. A running server run ends at its\nworker's next heartbeat: what it committed stays, and it removes\nnothing and does not advance the sync cursor.",
+        "operationId": "stop_source_sync_api_v1_sources__source_id__sync_stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceSyncStopResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Source Sync",
         "tags": [
           "sources"
         ]

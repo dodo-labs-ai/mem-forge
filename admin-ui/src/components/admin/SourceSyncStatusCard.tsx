@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
-import { AlertCircle, Check, Clock, Loader2, RotateCw } from "lucide-react";
+import { AlertCircle, Check, CircleStop, Clock, Loader2, RotateCw } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { SourceSyncActivity } from "@/views/sources/sourceSyncActivity";
 import {
   presentSourceSyncActivity,
   sourceSyncActivityIsVisible,
+  sourceSyncCanStop,
 } from "@/views/sources/sourceSyncActivity";
 
 export function SourceSyncStatusCard({
@@ -12,12 +13,15 @@ export function SourceSyncStatusCard({
   sourceName,
   itemLabel,
   onRetry,
+  onStop,
   onConfigureScope,
 }: {
   activity: SourceSyncActivity | undefined;
   sourceName: string;
   itemLabel: string;
   onRetry?: () => void;
+  /** Stops the sync in progress; offered while it can be stopped. */
+  onStop?: () => void;
   onConfigureScope?: () => void;
 }) {
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -34,7 +38,8 @@ export function SourceSyncStatusCard({
   const active = ["active", "recovering"].includes(activity.state);
   const queued = activity.state === "queued";
   const failed = activity.state === "failed" || activity.state === "partial";
-  const Icon = active ? Loader2 : queued ? Clock : failed ? AlertCircle : Check;
+  const stopped = activity.state === "stopped";
+  const Icon = active ? Loader2 : queued ? Clock : failed ? AlertCircle : stopped ? CircleStop : Check;
   const determinate = active && presentation.total != null && presentation.total > 0;
   const percentage = determinate
     ? Math.min(100, Math.round(((presentation.completed ?? 0) / presentation.total!) * 100))
@@ -60,6 +65,17 @@ export function SourceSyncStatusCard({
         {presentation.configureScope && onConfigureScope && (
           <button type="button" onClick={onConfigureScope} className="ml-auto shrink-0 underline underline-offset-2">
             Configure file scope
+          </button>
+        )}
+        {onStop && sourceSyncCanStop(activity) && (
+          <button
+            type="button"
+            onClick={onStop}
+            className="ml-auto flex shrink-0 items-center gap-1 text-foreground underline-offset-2 hover:underline"
+            aria-label={`Stop the sync of ${sourceName}`}
+          >
+            <CircleStop className="size-3.5" />
+            Stop sync
           </button>
         )}
         {(failed || (queued && activity.retryTarget)) && onRetry && (

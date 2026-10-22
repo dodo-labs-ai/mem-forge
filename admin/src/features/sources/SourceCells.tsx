@@ -80,6 +80,8 @@ export function LastSyncCell({ row }: { row: SourceRow }) {
         <StatusBadge tone="live">{retryingAfterUpgradeTitle(row.failedItems.retryingAfterUpgrade)}</StatusBadge>
       ) : presentation ? (
         <StatusBadge tone="live">{presentation.message}</StatusBadge>
+      ) : visibleActivity?.state === "stopped" ? (
+        <StatusBadge tone="idle">Stopped</StatusBadge>
       ) : (
         <div className="text-sm text-subtle-foreground">
           {source.last_sync ? formatRelative(source.last_sync) : "Never synced"}
