@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -16,9 +17,12 @@ from memforge.local_agent.snapshot_manifest import (
     snapshot_manifest_sha256,
 )
 from memforge.local_agent.source_contract import LOCAL_PACKAGE_CONTRACT_VERSION
-from memforge.models import ContentItem
+from memforge.config import AppConfig
+from memforge.models import ContentItem, NormalizedContent, RawContent, SyncState
+from memforge.pipeline.collection_family import SnapshotBinding
+from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.runtime import SourceSyncWorker
 from memforge.source_item_failures import SourceItemFailure
-from memforge.source_projection import SourceUnit
 from memforge.storage.database import Database
 from tests.test_local_adapter_api import (
     LeaseAwareTestClient,
@@ -42,22 +46,76 @@ class _Lease:
         return self.current
 
 
-class _HeldUnits:
-    """The current Units of the Source, by Document id, in place of a sync that committed them."""
+def _hold(database: Database, source_id: str, issues: dict[str, str], *, incarnation: str | None = None) -> None:
+    """Commit a current Unit for each issue key, as a sync of its device package would.
 
-    def __init__(self, database: Database, units: dict[str, str]) -> None:
-        self.units = dict(units)
-        database.list_indexed_doc_ids = self.list_indexed_doc_ids
-        database.find_source_unit_by_document_id = self.find_source_unit_by_document_id
+    With ``incarnation``, each Unit is one that came back after its removal,
+    so its provider key carries that incarnation.
+    """
 
-    async def list_indexed_doc_ids(self, source_id: str) -> set[str]:
-        return set(self.units)
+    async def commit() -> None:
+        for key, issue_id in issues.items():
+            payload = {
+                "id": issue_id,
+                "key": key,
+                "fields": {
+                    "summary": f"{key} summary",
+                    "description": "",
+                    "status": {"name": "Open"},
+                    "issuetype": {"name": "Task"},
+                    "priority": {"name": "Medium"},
+                    "assignee": None,
+                    "labels": [],
+                    "resolution": None,
+                    "updated": "2026-07-10T08:00:00+00:00",
+                    "issuelinks": [],
+                    "subtasks": [],
+                },
+                "_comments": [],
+                "_comments_included": True,
+                "_comments_total": 0,
+                "changelog": {"startAt": 0, "histories": [], "total": 0},
+            }
+            item = ContentItem(
+                item_id=_doc(source_id, key),
+                title=key,
+                source_url=f"https://jira.example.test/browse/{key}",
+                last_modified=datetime(2026, 7, 10, tzinfo=timezone.utc),
+                content_type="application/json",
+                version="v1",
+                extra={"issue_key": key, "issue_id": issue_id},
+            )
+            await database.record_source_projection(
+                project_source_item(
+                    source_id=source_id,
+                    source_type="jira",
+                    run_id=f"run-{key}",
+                    item=item,
+                    raw=RawContent(item=item, body=json.dumps(payload).encode(), content_type="application/json"),
+                    normalized=NormalizedContent(item=item, markdown_body=f"# {key}"),
+                    scope={"source_unit_incarnation": incarnation} if incarnation else None,
+                )
+            )
 
-    async def find_source_unit_by_document_id(self, source_id, document_id, *, current_only=False):
-        provider_key = self.units.get(document_id)
-        if provider_key is None:
-            return None
-        return SourceUnit(id=f"unit-{provider_key}", source_id=source_id, unit_type="jira_issue", provider_key=provider_key)
+    asyncio.run(commit())
+
+
+def _run_bound_snapshot(database: Database) -> SnapshotBinding | None:
+    """Lease the queued run as the worker does, and return the device snapshot it binds the sync to."""
+
+    class Capturing:
+        input_snapshot: SnapshotBinding | None = None
+
+        async def build_sync_runtime(self, db, config, **kwargs):
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            self.input_snapshot = kwargs["input_snapshot"]
+            return SyncState(source="", last_sync_at=datetime.now(timezone.utc), last_sync_status="success")
+
+    provider = Capturing()
+    asyncio.run(SourceSyncWorker(database, AppConfig(), runtime_provider=provider, worker_id="worker-test").run_once())
+    return provider.input_snapshot
 
 
 def _doc(source_id: str, key: str) -> str:
@@ -142,18 +200,21 @@ def jira(tmp_path):
 def test_a_query_manifest_asks_its_device_about_every_unlisted_unit_and_failed_issue(jira):
     client, database, source_id, _lease = jira
     listed, gone, failed_unit, failed_only = (_doc(source_id, key) for key in ("PAY-1", "PAY-2", "PAY-3", "PAY-5"))
-    held = _HeldUnits(database, {listed: "10001", gone: "10002", failed_unit: "10003"})
+    _hold(database, source_id, {"PAY-1": "10001", "PAY-3": "10003"})
+    # PAY-2 came back after an earlier removal; its Unit's key carries that incarnation.
+    _hold(database, source_id, {"PAY-2": "10002"}, incarnation="unit-pay-2-removed:2026-06-01")
     for doc_id, key in ((listed, "PAY-1"), (failed_unit, "PAY-3"), (failed_only, "PAY-5")):
         asyncio.run(_fail(database, source_id, doc_id, key))
 
     planned = _manifest(client, source_id, items=[listed])
     # A replay answers with the set the manifest was issued, even when the Source changed since.
-    held.units[_doc(source_id, "PAY-9")] = "10009"
+    _hold(database, source_id, {"PAY-9": "10009"})
     replayed = _manifest(client, source_id, items=[listed])
 
     assert planned.status_code == 200, planned.text
     assert planned.json()["manifest_sha256"] == snapshot_manifest_sha256([SnapshotManifestItem(listed, "r1")])
-    # A Unit by its provider key; a failed issue that never became a Unit by its stored issue key.
+    # A Unit by the issue id it records, without an incarnation; a failed issue
+    # that never became a Unit by its stored issue key.
     expected = sorted(
         [
             {"doc_id": gone, "provider_key": "10002"},
@@ -169,7 +230,7 @@ def test_a_query_manifest_asks_its_device_about_every_unlisted_unit_and_failed_i
 
 def test_processing_waits_for_the_answers_bound_to_the_manifest_and_its_attempt(jira):
     client, database, source_id, lease = jira
-    _HeldUnits(database, {_doc(source_id, "PAY-2"): "10002", _doc(source_id, "PAY-3"): "10003"})
+    _hold(database, source_id, {"PAY-2": "10002", "PAY-3": "10003"})
     confirm = _manifest(client, source_id).json()["confirm"]
     absent_exists = _answers(confirm, "absent", "exists")
 
@@ -227,7 +288,7 @@ def test_processing_waits_for_the_answers_bound_to_the_manifest_and_its_attempt(
 
 def test_a_device_that_could_not_confirm_sends_its_cause_and_processing_proceeds(jira):
     client, database, source_id, _lease = jira
-    _HeldUnits(database, {_doc(source_id, "PAY-2"): "10002", _doc(source_id, "PAY-3"): "10003"})
+    _hold(database, source_id, {"PAY-2": "10002", "PAY-3": "10003"})
     confirm = _manifest(client, source_id).json()["confirm"]
 
     failed = _confirmations(client, source_id, failure_cause="HTTP 401 from Jira")
@@ -254,7 +315,7 @@ def test_a_device_that_could_not_confirm_sends_its_cause_and_processing_proceeds
 @pytest.mark.parametrize("version", [None, 2])
 def test_an_agent_that_does_not_confirm_is_asked_nothing_and_not_held(jira, version):
     client, database, source_id, _lease = jira
-    _HeldUnits(database, {_doc(source_id, "PAY-2"): "10002"})
+    _hold(database, source_id, {"PAY-2": "10002"})
 
     planned = _manifest(client, source_id, version=version)
     processed = _process(client, source_id)
@@ -267,14 +328,18 @@ def test_an_agent_that_does_not_confirm_is_asked_nothing_and_not_held(jira, vers
 def test_a_confirm_set_larger_than_a_manifest_is_not_issued(jira, monkeypatch):
     client, database, source_id, _lease = jira
     monkeypatch.setattr(admin_api, "LOCAL_SOURCE_MANIFEST_MAX_ITEMS", 1)
-    _HeldUnits(database, {_doc(source_id, "PAY-2"): "10002", _doc(source_id, "PAY-3"): "10003"})
+    _hold(database, source_id, {"PAY-2": "10002", "PAY-3": "10003"})
 
     planned = _manifest(client, source_id)
     processed = _process(client, source_id)
+    bound = _run_bound_snapshot(database)
 
-    # The run then records absence_confirmation_missing and removes nothing.
     assert planned.json()["confirm"] == []
     assert processed.status_code == 202, processed.text
+    # The run is bound to the manifest with no answers, so it records
+    # absence_confirmation_missing and removes nothing
+    # (test_document_absence.py::test_a_confirm_set_too_large_to_issue_removes_nothing).
+    assert bound == SnapshotBinding(f"{JOB}:attempt:1", frozenset(), ())
 
 
 def test_an_existence_manifest_asks_nothing(tmp_path):
@@ -283,7 +348,6 @@ def test_an_existence_manifest_asks_nothing(tmp_path):
     try:
         with LeaseAwareTestClient(app) as client:
             source_id = _create_github_repo_source(client)["id"]
-            _HeldUnits(database, {"github-doc-gone": "repo:docs/gone.md"})
             planned = _manifest(client, source_id)
         assert planned.status_code == 200, planned.text
         assert planned.json()["confirm"] == []

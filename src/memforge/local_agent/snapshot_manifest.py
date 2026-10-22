@@ -71,8 +71,11 @@ class SnapshotConfirmation:
 
     The server issues it with the manifest: ``doc_id`` is the Document id and
     ``provider_key`` the provider's key of the item, by which the device
-    confirms it (for Jira, the issue key, such as ``PAY-7``). ``answer`` is
-    ``None`` until the device answers; ``cause`` accompanies only ``failed``.
+    confirms it. For Jira it is the issue id, such as ``10007``, which the
+    issue's Unit records; only a failed issue that never became a Unit is
+    named by its issue key, such as ``PAY-7``, when its stored item lacks the
+    id. ``answer`` is ``None`` until the device answers; ``cause`` accompanies
+    only ``failed``.
     """
 
     doc_id: str

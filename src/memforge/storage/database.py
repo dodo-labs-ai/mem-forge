@@ -7219,6 +7219,21 @@ class Database:
         ) as cursor:
             return {str(row[0]) async for row in cursor}
 
+    async def list_current_document_provider_keys(self, source_id: str) -> dict[str, str]:
+        """The provider key of the current Source Unit of each Document the Source holds."""
+        rows = await self.db.execute_fetchall(
+            """SELECT lineage.document_id, su.provider_key
+                 FROM source_unit_document_lineage_history lineage
+                 JOIN source_units su ON su.id = lineage.source_unit_id
+                WHERE lineage.source_id = ? AND lineage.is_current = 1
+                ORDER BY lineage.document_id, lineage.last_seen_at DESC, su.id""",
+            (source_id,),
+        )
+        keys: dict[str, str] = {}
+        for row in rows:
+            keys.setdefault(str(row["document_id"]), str(row["provider_key"]))
+        return keys
+
     async def count_missing_pdf_uris(self, source_id: str) -> int:
         """Count the Source's non-empty Units whose current stored input has no PDF.
 
