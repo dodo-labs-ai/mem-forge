@@ -6,12 +6,26 @@ from typing import Any
 
 from memforge.source_adapters import teams as adapter
 from memforge.source_adapters.contracts import canonical_record_profile
+from memforge.source_types.config import SourceConfigPolicy
 from memforge.source_types.descriptor import LocalAgentCollection, SourceTypeDescriptor
 
 
 def _job_config_defaults(config: dict[str, Any]) -> dict[str, Any]:
     config.setdefault("initial_history_days", config.get("max_age_days", 14))
     config.setdefault("rolling_retention_days", None)
+    return config
+
+
+def _public_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Expose the user's intent and keep the connector's partitioning internal."""
+
+    from memforge.local_agent.source_contract import TEAMS_ROLLING_RETENTION_PRESETS
+
+    config["initial_history_days"] = config.get("initial_history_days", config.get("max_age_days", 14))
+    retention = config.get("rolling_retention_days")
+    config["rolling_retention_days"] = retention if retention in TEAMS_ROLLING_RETENTION_PRESETS else None
+    for key in ("max_age_days", "conversation_gap_minutes", "max_block_messages"):
+        config.pop(key, None)
     return config
 
 
@@ -40,4 +54,5 @@ DESCRIPTOR = SourceTypeDescriptor(
         ),
         job_config_defaults=_job_config_defaults,
     ),
+    config=SourceConfigPolicy(public=_public_config),
 )

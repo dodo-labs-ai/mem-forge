@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib
 
+from memforge.source_types.config import SourceConfigPolicy
 from memforge.source_types.descriptor import (
     LocalAgentCollection,
     SourceTypeDescriptor,
@@ -21,6 +22,7 @@ from memforge.source_types.descriptor import (
 
 __all__ = [
     "LocalAgentCollection",
+    "SourceConfigPolicy",
     "SourceTypeDescriptor",
     "load_reference",
     "register_source_type",
