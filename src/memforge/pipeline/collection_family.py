@@ -56,6 +56,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_INCREMENTAL_SYNC_OVERLAP",
+    "SnapshotBinding",
     "AbsenceCheckSkipped",
     "AbsenceOutcome",
     "CollectionFamily",
@@ -77,6 +78,18 @@ class AbsenceCheckSkipped(Exception):
     def __init__(self, reason: AbsenceCheckSkippedReason) -> None:
         super().__init__(reason)
         self.reason: AbsenceCheckSkippedReason = reason
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotBinding:
+    """The complete input snapshot a device submitted for one document sync run.
+
+    ``doc_ids`` are the Documents its manifest names: everything the scope
+    holds, as the device read it.
+    """
+
+    snapshot_id: str
+    doc_ids: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,9 +127,15 @@ class CollectionFamily(ABC):
         self.db = db
         self.doc_store = doc_store
         self.source_id = source_id
+        self.input_snapshot: SnapshotBinding | None = None
 
     @abstractmethod
-    def prepare(self, collection_attempt: CollectionAttempt | None) -> None:
+    def prepare(
+        self,
+        *,
+        collection_attempt: CollectionAttempt | None,
+        input_snapshot: SnapshotBinding | None,
+    ) -> None:
         """Bind the run to what it collects, before anything else runs."""
 
     def begin_scope_transition(self, transition: ProjectionScopeTransition) -> None:
@@ -133,12 +152,12 @@ class CollectionFamily(ABC):
 
         It is the last cursor minus
         :data:`DEFAULT_INCREMENTAL_SYNC_OVERLAP`. A run that must discover
-        everything, a Source that never synced or holds no Document, and a
-        family-specific reason (:meth:`_requires_full_discovery`) read from
-        the start.
+        everything, a run bound to a complete input snapshot, a Source that
+        never synced or holds no Document, and a family-specific reason
+        (:meth:`_requires_full_discovery`) read from the start.
         """
 
-        if full_discovery:
+        if full_discovery or self.input_snapshot is not None:
             return None
         last_sync_time = existing_state.last_sync_at if existing_state else None
         if last_sync_time and await self._requires_full_discovery():
@@ -192,8 +211,13 @@ class DocumentFamily(CollectionFamily):
 
     gene: DocumentGene
 
-    def prepare(self, collection_attempt: CollectionAttempt | None) -> None:
-        return None
+    def prepare(
+        self,
+        *,
+        collection_attempt: CollectionAttempt | None,
+        input_snapshot: SnapshotBinding | None,
+    ) -> None:
+        self.input_snapshot = input_snapshot
 
     async def _requires_full_discovery(self) -> bool:
         if not gene_exports_pdf(self.gene):
@@ -342,7 +366,14 @@ class ConversationFamily(CollectionFamily):
 
     gene: ConversationGene
 
-    def prepare(self, collection_attempt: CollectionAttempt | None) -> None:
+    def prepare(
+        self,
+        *,
+        collection_attempt: CollectionAttempt | None,
+        input_snapshot: SnapshotBinding | None,
+    ) -> None:
+        if input_snapshot is not None:
+            raise ValueError("a conversation Source plans from its collection attempt, not an input snapshot")
         if collection_attempt is None:
             raise ValueError("a conversation Source syncs only within a collection attempt")
         self.gene.bind_conversation_run(

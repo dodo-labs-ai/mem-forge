@@ -585,7 +585,7 @@ def test_source_with_sync_inputs_respects_explicit_empty_snapshot() -> None:
             "config": {"documents_dir": "/server/inbox"},
         },
         [],
-        authoritative_snapshot=True,
+        input_snapshot_supplied=True,
     )
 
     assert projected["config"]["local_agent_package_manifest"] == []

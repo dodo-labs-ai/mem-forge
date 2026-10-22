@@ -31,9 +31,9 @@ from memforge.llm.embedding_profile import EmbeddingIdentity, EmbeddingProfile
 from memforge.llm.providers import ModelConfigError, ResolvedInvocation, provider_descriptor
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
 from memforge.local_agent.source_contract import (
-    local_agent_collection_is_authoritative,
     local_agent_source_config_revision,
     local_agent_sync_operation,
+    snapshot_document_ids,
     source_with_sync_inputs,
 )
 from memforge.source_projection_config import projection_access_fingerprint, source_access_context
@@ -45,6 +45,7 @@ from memforge.memory.store import MemoryStore
 from memforge.models import SourceSyncRun, SyncState
 from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.genes.family import CollectionFamilyKind
+from memforge.pipeline.collection_family import SnapshotBinding
 from memforge.source_types import source_type_descriptor
 from memforge.conversations.collections import StoredCollections
 from memforge.pipeline.memory_extractor import MemoryExtractor
@@ -284,7 +285,7 @@ class RuntimeProvider(Protocol):
         runtime: SyncRuntime | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
-        authoritative_snapshot: bool = False,
+        input_snapshot: SnapshotBinding | None = None,
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_cycle_id: str | None = None,
@@ -430,7 +431,7 @@ class DefaultRuntimeProvider:
         runtime: SyncRuntime | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
-        authoritative_snapshot: bool = False,
+        input_snapshot: SnapshotBinding | None = None,
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_cycle_id: str | None = None,
@@ -448,7 +449,7 @@ class DefaultRuntimeProvider:
             runtime=runtime,
             progress_callback=progress_callback,
             force_full_sync=force_full_sync,
-            authoritative_snapshot=authoritative_snapshot,
+            input_snapshot=input_snapshot,
             reprocess_doc_ids=reprocess_doc_ids,
             execution_mode=execution_mode,
             lifecycle_cycle_id=lifecycle_cycle_id,
@@ -942,7 +943,7 @@ async def run_source_sync(
     runtime: SyncRuntime | None = None,
     progress_callback: Callable[[dict], None] | None = None,
     force_full_sync: bool = False,
-    authoritative_snapshot: bool = False,
+    input_snapshot: SnapshotBinding | None = None,
     reprocess_doc_ids: frozenset[str] | None = None,
     execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
     lifecycle_cycle_id: str | None = None,
@@ -956,7 +957,8 @@ async def run_source_sync(
     """Run one Source sync under a Source activity lease.
 
     ``collection_attempt`` names the collection attempt a conversation Source
-    syncs within; a document Source ignores it.
+    syncs within; a document Source ignores it. ``input_snapshot`` binds a
+    document Source's run to the complete snapshot its device submitted.
     """
     activity_id = source_activity.id if source_activity is not None else None
     owns_activity = False
@@ -1006,7 +1008,7 @@ async def run_source_sync(
             "source_id": source["id"],
             "progress_callback": progress_callback,
             "force_full_sync": force_full_sync,
-            "authoritative_snapshot": authoritative_snapshot,
+            "input_snapshot": input_snapshot,
             "reprocess_doc_ids": reprocess_doc_ids,
             "execution_mode": execution_mode,
             "source_activity": activity_lease,
@@ -1452,7 +1454,7 @@ class SourceSyncWorker:
 
             # An operator reprocess reads the provider or stored Documents, not collected input.
             reprocessing = bool(run.reprocess_document_ids)
-            authoritative_collection = False
+            input_snapshot: SnapshotBinding | None = None
             reusable_projection_doc_ids: frozenset[str] = frozenset()
             if not reprocessing:
                 inputs = await self.db.list_source_sync_inputs(
@@ -1470,9 +1472,16 @@ class SourceSyncWorker:
                             for source_input in inputs
                             if source_input.input_generation <= run.input_generation_watermark
                         ]
-                authoritative_collection = run.input_snapshot_id is not None and local_agent_collection_is_authoritative(
-                    source["type"]
-                )
+                descriptor = source_type_descriptor(str(source.get("type") or ""))
+                if (
+                    run.input_snapshot_id is not None
+                    and descriptor is not None
+                    and descriptor.family is CollectionFamilyKind.DOCUMENT
+                ):
+                    input_snapshot = SnapshotBinding(
+                        snapshot_id=run.input_snapshot_id,
+                        doc_ids=snapshot_document_ids(inputs),
+                    )
                 if run.input_snapshot_id is not None and not run.force_full_sync:
                     reusable_projection_doc_ids = await self.db.find_reusable_source_projection_memberships(
                         source_id=run.source_id,
@@ -1484,7 +1493,6 @@ class SourceSyncWorker:
                     source,
                     inputs,
                     input_snapshot_supplied=run.input_snapshot_id is not None,
-                    authoritative_snapshot=authoritative_collection,
                 )
 
             runtime = await self._build_runtime()
@@ -1501,7 +1509,7 @@ class SourceSyncWorker:
                 runtime=runtime,
                 progress_callback=None,
                 force_full_sync=run.force_full_sync and not reprocessing,
-                authoritative_snapshot=authoritative_collection,
+                input_snapshot=input_snapshot,
                 reprocess_doc_ids=frozenset(run.reprocess_document_ids) or None,
                 execution_mode=(SourceSyncMode.REPROCESS if reprocessing else SourceSyncMode.NORMAL),
                 lifecycle_cycle_id=(f"{run.run_id}:attempt:{run.lease_attempt_count}"),

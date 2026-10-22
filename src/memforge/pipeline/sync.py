@@ -112,6 +112,7 @@ from memforge.pipeline.extraction_contract import (
 )
 from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot
 from memforge.pipeline.collection_family import (
+    SnapshotBinding,
     collection_family,
 )
 from memforge.pipeline.stored_document import (
@@ -884,7 +885,7 @@ class GeneSyncOrchestrator:
         source_id: str,
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
-        authoritative_snapshot: bool = False,
+        input_snapshot: SnapshotBinding | None = None,
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         source_activity: SourceActivityLease | None = None,
@@ -911,9 +912,11 @@ class GeneSyncOrchestrator:
         force_full_sync:
             When true, ignore the incremental cursor and reprocess discovered
             documents even when their content hash is unchanged.
-        authoritative_snapshot:
-            When true, discover the complete submitted snapshot so removals can
-            be reconciled, while still skipping documents whose content is unchanged.
+        input_snapshot:
+            The complete input snapshot a device submitted for a document
+            Source's run. The run discovers all of it, so removals can be
+            reconciled, while still skipping Documents whose content is
+            unchanged.
         reprocess_doc_ids:
             The Documents a REPROCESS run processes; required by and only
             accepted with that mode.
@@ -959,7 +962,8 @@ class GeneSyncOrchestrator:
         if callable(bind_document_store):
             bind_document_store(self.doc_store)
         family = collection_family(gene, db=self.db, doc_store=self.doc_store, source_id=source_id)
-        family.prepare(collection_attempt)
+        family.prepare(collection_attempt=collection_attempt, input_snapshot=input_snapshot)
+        complete_snapshot = family.input_snapshot is not None
 
         logger.info(
             "Sync started for %s (source_id=%s, run_id=%s)",
@@ -1114,7 +1118,7 @@ class GeneSyncOrchestrator:
                 last_sync_time = await family.since(
                     existing_state=existing_state,
                     indexed_doc_ids=indexed_doc_ids,
-                    full_discovery=force_full_sync or authoritative_snapshot or scope_transition is not None,
+                    full_discovery=force_full_sync or scope_transition is not None,
                 )
 
                 # ----------------------------------------------------------
@@ -1156,7 +1160,7 @@ class GeneSyncOrchestrator:
                         )
 
                 run_coverage = source_run_projection_coverage(
-                    authoritative_snapshot=authoritative_snapshot,
+                    complete_snapshot=complete_snapshot,
                     scope_transition=scope_transition is not None,
                     discovery_complete=bool(getattr(gene, "discovery_complete", False)),
                 )
@@ -1177,7 +1181,7 @@ class GeneSyncOrchestrator:
                 # A failed Document that discovery did not return is read the
                 # way a reprocess reads it. A complete snapshot is the whole
                 # scope: what it did not return is removed, not retried.
-                if not authoritative_snapshot:
+                if not complete_snapshot:
                     for doc_id in sorted(retried_doc_ids - crawled_doc_ids):
                         try:
                             item, stored = await family.document_input(
@@ -1208,7 +1212,7 @@ class GeneSyncOrchestrator:
                         items.append(item)
                 discovered_doc_ids = set(crawled_doc_ids)
                 unexpected_reuse_ids = reusable_projection_doc_ids - discovered_doc_ids
-                if unexpected_reuse_ids and authoritative_snapshot:
+                if unexpected_reuse_ids and complete_snapshot:
                     raise ValueError(
                         "reusable Source Projection membership is outside provider discovery: "
                         f"{sorted(unexpected_reuse_ids)[0]}"
@@ -1352,7 +1356,7 @@ class GeneSyncOrchestrator:
                                     else None
                                 ),
                                 projection_access_context=configured_access_context,
-                                authoritative_snapshot=authoritative_snapshot,
+                                complete_snapshot=complete_snapshot,
                                 source_activity=source_activity,
                                 lifecycle_execution_owner_id=durable_cycle_id,
                                 lifecycle_attempt_count=attempt,
@@ -2481,7 +2485,7 @@ class GeneSyncOrchestrator:
         projection_scope: dict[str, object] | None = None,
         scope_transition: dict[str, object] | None = None,
         projection_access_context: dict[str, object] | None = None,
-        authoritative_snapshot: bool = False,
+        complete_snapshot: bool = False,
         source_activity: SourceActivityLease | None = None,
         lifecycle_execution_owner_id: str | None = None,
         lifecycle_attempt_count: int = 1,
@@ -2524,7 +2528,7 @@ class GeneSyncOrchestrator:
                         projection_scope=projection_scope,
                         scope_transition=scope_transition,
                         projection_access_context=projection_access_context,
-                        authoritative_snapshot=authoritative_snapshot,
+                        complete_snapshot=complete_snapshot,
                         source_activity=source_activity,
                         lifecycle_execution_owner_id=lifecycle_execution_owner_id,
                         lifecycle_attempt_count=lifecycle_attempt_count,
@@ -2576,7 +2580,7 @@ class GeneSyncOrchestrator:
         projection_scope: dict[str, object] | None,
         scope_transition: dict[str, object] | None,
         projection_access_context: dict[str, object] | None,
-        authoritative_snapshot: bool,
+        complete_snapshot: bool,
     ) -> tuple[SourceProjection, tuple[StoredSourceArtifact, ...]]:
         """Project fetched content onto its Source Unit and store the Artifacts it returned.
 
@@ -2602,7 +2606,9 @@ class GeneSyncOrchestrator:
         probe_scope: dict[str, object] = {
             "configured_scope": dict(projection_scope or {}),
             "document_id": item.item_id,
-            "authoritative_snapshot": authoritative_snapshot,
+            # Part of every stored projection's identity: whether the item came
+            # from a complete input snapshot.
+            "authoritative_snapshot": complete_snapshot,
         }
         if persisted_source_unit is not None:
             # Document lineage is the durable identity bridge after an
@@ -2767,7 +2773,7 @@ class GeneSyncOrchestrator:
         projection_scope: dict[str, object] | None = None,
         scope_transition: dict[str, object] | None = None,
         projection_access_context: dict[str, object] | None = None,
-        authoritative_snapshot: bool = False,
+        complete_snapshot: bool = False,
         source_activity: SourceActivityLease | None = None,
         source_unit_id_callback: Callable[[str], None] | None = None,
         lifecycle_execution_owner_id: str | None = None,
@@ -2872,7 +2878,7 @@ class GeneSyncOrchestrator:
                 projection_scope=projection_scope,
                 scope_transition=scope_transition,
                 projection_access_context=projection_access_context,
-                authoritative_snapshot=authoritative_snapshot,
+                complete_snapshot=complete_snapshot,
             )
         source_unit = projection_probe.source_units[0]
         markdown_body = normalized.markdown_body
@@ -2938,7 +2944,8 @@ class GeneSyncOrchestrator:
                                 "configured_scope": dict(projection_scope or {}),
                                 "source_unit_id": source_unit.id,
                                 "source_unit_provider_key": source_unit.provider_key,
-                                "authoritative_snapshot": authoritative_snapshot,
+                                # Part of the projection identity; see the probe scope.
+                                "authoritative_snapshot": complete_snapshot,
                             },
                             run_mode=(
                                 ProjectionRunMode.FULL_SNAPSHOT

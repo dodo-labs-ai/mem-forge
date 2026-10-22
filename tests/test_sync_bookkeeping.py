@@ -16,6 +16,8 @@ from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
+
+from memforge.pipeline.collection_family import SnapshotBinding
 from PIL import Image
 from markdown_it import MarkdownIt
 from apscheduler.triggers.date import DateTrigger
@@ -5843,7 +5845,7 @@ async def test_force_full_sync_ignores_incremental_cursor(db: Database):
 
 
 @pytest.mark.asyncio
-async def test_authoritative_snapshot_ignores_cursor_without_forcing_reprocessing(db: Database):
+async def test_a_run_bound_to_an_input_snapshot_ignores_cursor_without_forcing_reprocessing(db: Database):
     source_id = "src-authoritative-snapshot"
     await _insert_held_source_and_doc(db, source_id)
     await db.upsert_sync_state(
@@ -5868,7 +5870,7 @@ async def test_authoritative_snapshot_ignores_cursor_without_forcing_reprocessin
         gene=gene,
         source_name="Architecture",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
     )
 
     assert gene.seen_since is None
@@ -7455,7 +7457,7 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
     class CapturingRuntimeProvider:
         def __init__(self) -> None:
             self.force_full_sync: bool | None = None
-            self.authoritative_snapshot: bool | None = None
+            self.input_snapshot: SnapshotBinding | None = None
             self.source: dict | None = None
             self.reusable_projection_doc_ids: frozenset[str] | None = None
 
@@ -7465,7 +7467,7 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
 
         async def run_source_sync(self, **kwargs):
             self.force_full_sync = kwargs["force_full_sync"]
-            self.authoritative_snapshot = kwargs["authoritative_snapshot"]
+            self.input_snapshot = kwargs["input_snapshot"]
             self.source = kwargs["source"]
             self.reusable_projection_doc_ids = kwargs["reusable_projection_doc_ids"]
             return SyncState(
@@ -7499,7 +7501,7 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
     await worker.run_once()
 
     assert provider.force_full_sync is False
-    assert provider.authoritative_snapshot is True
+    assert provider.input_snapshot == SnapshotBinding("laj-empty", frozenset())
     assert provider.source is not None
     assert provider.source["config"]["local_agent_package_manifest"] == []
     assert provider.reusable_projection_doc_ids == frozenset({"doc-reused"})
@@ -7527,7 +7529,7 @@ async def test_source_sync_worker_preserves_empty_incremental_local_snapshot(db:
     class CapturingRuntimeProvider:
         def __init__(self) -> None:
             self.source: dict | None = None
-            self.authoritative_snapshot: bool | None = None
+            self.input_snapshot: SnapshotBinding | None = None
             self.runtime_event_trace_sink = None
 
         async def build_sync_runtime(self, db, config, **kwargs):
@@ -7536,7 +7538,7 @@ async def test_source_sync_worker_preserves_empty_incremental_local_snapshot(db:
 
         async def run_source_sync(self, **kwargs):
             self.source = kwargs["source"]
-            self.authoritative_snapshot = kwargs["authoritative_snapshot"]
+            self.input_snapshot = kwargs["input_snapshot"]
             return SyncState(
                 source=source_id,
                 last_sync_at=datetime.now(timezone.utc),
@@ -7559,13 +7561,13 @@ async def test_source_sync_worker_preserves_empty_incremental_local_snapshot(db:
 
     await worker.run_once()
 
-    assert provider.authoritative_snapshot is False
+    assert provider.input_snapshot is None
     assert provider.source is not None
     assert provider.source["config"]["local_agent_package_manifest"] == []
 
 
 @pytest.mark.asyncio
-async def test_source_sync_worker_does_not_treat_direct_cloud_jira_as_authoritative_snapshot(
+async def test_source_sync_worker_binds_no_snapshot_for_direct_cloud_jira(
     db: Database,
 ):
     import memforge.runtime as runtime
@@ -7588,7 +7590,7 @@ async def test_source_sync_worker_does_not_treat_direct_cloud_jira_as_authoritat
 
     class CapturingRuntimeProvider:
         def __init__(self) -> None:
-            self.authoritative_snapshot: bool | None = None
+            self.input_snapshot: SnapshotBinding | None = None
             self.source: dict | None = None
 
         async def build_sync_runtime(self, db, config, **kwargs):
@@ -7596,7 +7598,7 @@ async def test_source_sync_worker_does_not_treat_direct_cloud_jira_as_authoritat
             return object()
 
         async def run_source_sync(self, **kwargs):
-            self.authoritative_snapshot = kwargs["authoritative_snapshot"]
+            self.input_snapshot = kwargs["input_snapshot"]
             self.source = kwargs["source"]
             return SyncState(
                 source=source_id,
@@ -7619,7 +7621,7 @@ async def test_source_sync_worker_does_not_treat_direct_cloud_jira_as_authoritat
 
     await worker.run_once()
 
-    assert provider.authoritative_snapshot is False
+    assert provider.input_snapshot is None
     assert provider.source is not None
     assert "local_agent_package_manifest" not in provider.source["config"]
 
@@ -9723,7 +9725,7 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
         ),
         source_name="Payroll Repo",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
     )
     await set_scope("ref-b", "ref-a")
     third = await orchestrator.sync_gene(
@@ -9735,7 +9737,7 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
         ),
         source_name="Payroll Repo",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
     )
 
     assert first.last_sync_status == "success"
@@ -9893,8 +9895,15 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         gene=gene,
         source_name="Payroll Repo",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
     )
+    # A run bound to a complete snapshot records it in every projection's
+    # scope, which is part of the projection's stored identity.
+    async with db.db.execute(
+        "SELECT scope_json FROM source_projection_runs WHERE source_id = ?", (source_id,)
+    ) as cursor:
+        scopes = [json.loads(row[0]) async for row in cursor]
+    assert scopes and all(scope["authoritative_snapshot"] is True for scope in scopes)
     [memory] = await db.list_memories(source=source_id, status="active")
 
     await set_scope(["docs"], ["other"])
@@ -9902,7 +9911,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         gene=EmptyGene(),
         source_name="Payroll Repo",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
     )
     retired = await db.get_memory(memory.id)
     assert retired is not None and retired.status == "retired"
@@ -9912,7 +9921,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         gene=gene,
         source_name="Payroll Repo",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
     )
 
     original_after_reentry = await db.get_memory(memory.id)
@@ -9928,7 +9937,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         gene=EmptyGene(),
         source_name="Payroll Repo",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
     )
 
     assert first.last_sync_status == "success"
@@ -11878,7 +11887,7 @@ async def test_reused_projection_remains_complete_snapshot_membership_for_deleti
         gene=UnexpectedFetchGene(item_count=1, release=release),
         source_name="Jira Board",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
         reusable_projection_doc_ids=frozenset({"jira-0"}),
     )
 

@@ -1354,7 +1354,7 @@ def test_a_conversation_unit_is_a_unit_and_its_messages_are_observations() -> No
 
 
 @pytest.mark.parametrize(
-    ("authoritative_snapshot", "scope_transition", "discovery_complete", "expected"),
+    ("complete_snapshot", "scope_transition", "discovery_complete", "expected"),
     [
         (True, False, False, ProjectionCoverage.COMPLETE_SNAPSHOT),
         (False, True, True, ProjectionCoverage.COMPLETE_SNAPSHOT),
@@ -1366,14 +1366,14 @@ def test_a_conversation_unit_is_a_unit_and_its_messages_are_observations() -> No
     ],
 )
 def test_run_discovery_proves_absence_only_for_a_snapshot_or_a_new_scope(
-    authoritative_snapshot: bool,
+    complete_snapshot: bool,
     scope_transition: bool,
     discovery_complete: bool,
     expected: ProjectionCoverage,
 ) -> None:
     assert (
         source_run_projection_coverage(
-            authoritative_snapshot=authoritative_snapshot,
+            complete_snapshot=complete_snapshot,
             scope_transition=scope_transition,
             discovery_complete=discovery_complete,
         )
