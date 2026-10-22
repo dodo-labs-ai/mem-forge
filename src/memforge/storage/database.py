@@ -21085,7 +21085,7 @@ class Database:
                     failure_cause=failure_cause,
                 )
                 now = _now_iso()
-                await self.db.executemany(
+                cursor = await self.db.executemany(
                     """UPDATE source_sync_snapshot_confirmations
                        SET answer = ?, cause = ?, answered_at = ?
                        WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ? AND doc_id = ?
@@ -21096,6 +21096,9 @@ class Database:
                         if item.answer is not None
                     ],
                 )
+                # After executemany, rowcount is the total of rows the batch changed.
+                if pending and cursor.rowcount != len(pending):
+                    raise SourceActivityConflict("snapshot confirmations were answered by another submission")
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
