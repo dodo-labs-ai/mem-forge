@@ -11,7 +11,9 @@ import httpx
 import pytest
 
 from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, ScopeListingKind
+import memforge.pipeline.collection_family as collection_family_module
 from memforge.pipeline.collection_family import SnapshotBinding
+from memforge.pipeline.stored_document import StoredDocumentUnavailable, StoredDocumentUnavailableReason
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
 from memforge.source_item_failures import FailedItemRetry
 from memforge.source_projection import ProjectionScopeTransition, ProjectionScopeTransitionStatus
@@ -66,7 +68,7 @@ class JiraProject(BlockingFetchGene):
         self.listings = 0
         # The step at which an issue's processing fails, and the error it raises.
         self.broken: dict[int, tuple[str, Exception]] = {}
-        # The provider key of the Unit each issue was renamed from, reported by the next discovery only.
+        # The Document each issue was renamed from, reported by the next discovery only.
         self.renamed: dict[int, str] = {}
         # Issues whose summary was edited, so processing them derives Memories again.
         self.edited: set[int] = set()
@@ -197,10 +199,10 @@ class Workspace:
     async def ledger(self) -> dict[str, ContentItem | None]:
         return {failure.document_id: failure.item for failure in await self.db.list_source_item_failures(source_id=SOURCE_ID)}
 
-    async def provider_key(self, doc_id: str) -> str:
+    async def unit_id(self, doc_id: str) -> str:
         unit = await self.db.find_source_unit_by_document_id(SOURCE_ID, doc_id, current_only=True)
         assert unit is not None
-        return unit.provider_key
+        return unit.id
 
     async def recorded_unlisted_present_count(self) -> int | None:
         latest = (await self.db.get_sync_history(source=SOURCE_ID, limit=1))[0]
@@ -695,7 +697,7 @@ async def _renamed_and_failed(workspace) -> JiraProject:
     repository = JiraProject(existing={0, 2, 3}, listing_kind=ScopeListingKind.EXISTENCE)
     await _synced(workspace, repository)
     repository.move_on(existing={0, 1}, changed={1})
-    repository.renamed[1] = await workspace.provider_key("jira-2")
+    repository.renamed[1] = "jira-2"
     repository.broken[1] = ("fetch", ValueError("fetch failed"))
     return repository
 
@@ -709,13 +711,14 @@ async def test_a_failed_renamed_item_keeps_its_predecessor_and_nothing_else(work
     assert state.last_sync_status == "partial"
     assert workspace.tombstoned() == ["jira-3"]
     assert await workspace.held() == {"jira-0", "jira-2"}
-    assert (await workspace.ledger())["jira-1"].renamed_from == await workspace.provider_key("jira-2")
+    assert (await workspace.ledger())["jira-1"].renamed_from == "jira-2"
 
 
 @pytest.mark.asyncio
 async def test_a_predecessor_is_kept_until_its_renamed_item_commits(workspace):
     repository = await _renamed_and_failed(workspace)
-    predecessor = await workspace.provider_key("jira-2")
+    predecessor = "jira-2"
+    predecessor_unit_id = await workspace.unit_id("jira-2")
     await workspace.sync(repository)
 
     # The provider reported the rename once: a fresh item of jira-1, which
@@ -733,13 +736,14 @@ async def test_a_predecessor_is_kept_until_its_renamed_item_commits(workspace):
     assert workspace.tombstoned() == ["jira-3"]
     assert await workspace.held() == {"jira-0", "jira-2"}
 
-    # Once jira-1 commits, nothing keeps jira-2.
+    # Once jira-1 commits, it continues jira-2's Unit.
     repository.broken.clear()
     repository.move_on(existing={0, 1}, changed={1})
     state = await workspace.sync(repository)
     assert state.last_sync_status == "success"
-    assert workspace.tombstoned() == ["jira-3", "jira-2"]
+    assert workspace.tombstoned() == ["jira-3"]
     assert await workspace.held() == {"jira-0", "jira-1"}
+    assert await workspace.unit_id("jira-1") == predecessor_unit_id
     assert await workspace.ledger() == {}
 
 
@@ -759,3 +763,87 @@ async def test_a_renamed_item_whose_commit_is_still_deferred_keeps_its_predecess
     assert ("tombstone", "jira-2") not in workspace.engine.events
     assert ("tombstone", "jira-3") in workspace.engine.events
     assert "jira-2" in await workspace.held()
+
+
+@pytest.mark.asyncio
+async def test_a_chained_rename_keeps_the_unit_its_last_name_holds(workspace):
+    repository = JiraProject(existing={0, 2}, listing_kind=ScopeListingKind.EXISTENCE)
+    await _synced(workspace, repository)
+    unit_id = await workspace.unit_id("jira-2")
+    # jira-2 was renamed to jira-1, which committed to jira-2's Unit.
+    repository.move_on(existing={0, 1}, changed={1})
+    repository.renamed[1] = "jira-2"
+    assert (await workspace.sync(repository)).last_sync_status == "success"
+    assert await workspace.unit_id("jira-1") == unit_id
+
+    # Then jira-1 was renamed to jira-3, whose fetch fails.
+    repository.move_on(existing={0, 3}, changed={3})
+    repository.renamed[3] = "jira-1"
+    repository.broken[3] = ("fetch", ValueError("fetch failed"))
+    state = await workspace.sync(repository)
+
+    assert state.last_sync_status == "partial"
+    assert workspace.tombstoned() == []
+    assert await workspace.held() == {"jira-0", "jira-1"}
+
+    repository.broken.clear()
+    repository.move_on(existing={0, 3}, changed={3})
+    state = await workspace.sync(repository)
+
+    assert state.last_sync_status == "success"
+    assert workspace.tombstoned() == []
+    assert await workspace.held() == {"jira-0", "jira-3"}
+    assert await workspace.unit_id("jira-3") == unit_id
+
+
+@pytest.mark.asyncio
+async def test_a_query_listing_keeps_a_predecessor_without_asking_the_provider_about_it(workspace):
+    project = JiraProject(existing={0, 2, 3})
+    await _synced(workspace, project)
+
+    # jira-2 was renamed to jira-1, whose fetch fails; jira-3 was deleted.
+    project.move_on(existing={0, 1}, changed={1})
+    project.renamed[1] = "jira-2"
+    project.broken[1] = ("fetch", ValueError("fetch failed"))
+    state = await workspace.sync(project)
+
+    assert project.confirmed == ["jira-3"]
+    assert workspace.tombstoned() == ["jira-3"]
+    assert await workspace.held() == {"jira-0", "jira-2"}
+    assert state.unlisted_present_count == 0
+
+
+@pytest.mark.asyncio
+async def test_an_unlisted_document_whose_item_cannot_be_rebuilt_is_kept_and_counted(workspace, monkeypatch):
+    project = JiraProject(existing={0, 1, 2})
+    await _synced(workspace, project)
+    rebuild = collection_family_module.stored_source_item
+
+    async def stored_source_item(db, *, source_id, document_id):
+        if document_id == "jira-1":
+            raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.SOURCE_UNIT_MISSING, document_id)
+        return await rebuild(db, source_id=source_id, document_id=document_id)
+
+    monkeypatch.setattr(collection_family_module, "stored_source_item", stored_source_item)
+    project.move_on(existing={0})
+    state = await workspace.sync(project)
+
+    assert project.confirmed == ["jira-2"]
+    assert workspace.tombstoned() == ["jira-2"]
+    assert await workspace.held() == {"jira-0", "jira-1"}
+    assert state.unlisted_present_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_snapshot_bound_configuration_that_cannot_list_removes_nothing(workspace):
+    project = UnlistedJiraProject(existing={0, 1}, listing_kind=ScopeListingKind.EXISTENCE)
+    await workspace.sync(project, manifest={0, 1})
+    workspace.engine.events.clear()
+
+    project.move_on(existing={0})
+    state = await workspace.sync(project, manifest={0})
+
+    assert state.last_sync_status == "success"
+    assert workspace.tombstoned() == []
+    assert await workspace.held() == {"jira-0", "jira-1"}
+    assert state.absence_check_skipped_reason is None

@@ -9516,36 +9516,6 @@ class Database:
             locator=json.loads(row["locator_json"] or "{}"),
         )
 
-    async def find_current_source_unit_by_provider_key(
-        self,
-        source_id: str,
-        provider_key: str,
-    ) -> SourceUnit | None:
-        """The Source's current Unit with this provider key, or ``None`` when it has none or it was removed.
-
-        A current Unit has a current revision holding at least one current
-        Observation, as in ``list_current_source_units_page``.
-        """
-        async with self.db.execute(
-            """SELECT su.* FROM source_units su
-               WHERE su.source_id = ? AND su.provider_key = ?
-                 AND su.current_revision_id IS NOT NULL
-                 AND EXISTS (SELECT 1 FROM source_observations so
-                             WHERE so.source_unit_id = su.id
-                               AND so.current_revision_id IS NOT NULL)""",
-            (source_id, provider_key),
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row is None:
-            return None
-        return SourceUnit(
-            id=row["id"],
-            source_id=row["source_id"],
-            unit_type=row["unit_type"],
-            provider_key=row["provider_key"],
-            locator=json.loads(row["locator_json"] or "{}"),
-        )
-
     async def list_source_unit_document_ids(
         self,
         source_unit_id: str,

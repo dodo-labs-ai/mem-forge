@@ -39,7 +39,6 @@ from memforge.github_repo_utils import (
     github_content_type_is_binary,
     github_exclude_paths,
     github_extension_allowed,
-    github_file_provider_key,
     github_include_extensions,
     github_include_paths,
     github_latest_commit_time,
@@ -93,23 +92,27 @@ LAST_COMMIT_AT_KEY = "last_commit_at"
 
 def github_renamed_from(
     *,
-    repository: str,
+    source_id: str,
+    repo_url: str,
+    repo_ref: str,
     previous_filename: object,
     rename_evidence_authoritative: object,
 ) -> str | None:
-    """The ``renamed_from`` of a discovered file: the provider key of the path it was renamed from.
+    """The ``renamed_from`` of a discovered file: the Document id of the path it was renamed from.
 
     Only authoritative evidence names a predecessor, such as a validated
     Compare API ``renamed`` record, which reports ``previous_filename`` once.
     A matching blob SHA is never read as a rename, because a copy followed by
-    a delete looks the same. ``repository`` is ``owner/repo``.
+    a delete looks the same.
     """
 
     if rename_evidence_authoritative is not True or not previous_filename:
         return None
-    return github_file_provider_key(
-        repository=repository,
-        lineage=normalize_github_relative_path(str(previous_filename)),
+    return build_github_repo_doc_id(
+        source_id=source_id,
+        repo_url=repo_url,
+        repo_ref=repo_ref,
+        relative_path=normalize_github_relative_path(str(previous_filename)),
     )
 
 

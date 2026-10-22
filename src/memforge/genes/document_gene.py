@@ -61,8 +61,8 @@ which settles it when the provider no longer yields it.
 
 Renames. A connector whose provider attests a rename sets
 :attr:`~memforge.models.ContentItem.renamed_from` on the discovered item to
-the provider key of the Unit it was renamed from. That Unit is kept, even
-unlisted, until the renamed item commits.
+the Document id it was renamed from. The item commits to that Document's
+Unit, which is kept, even unlisted, until the renamed item commits.
 
 Implementing a document connector
 ---------------------------------

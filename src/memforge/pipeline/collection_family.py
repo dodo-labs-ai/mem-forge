@@ -462,13 +462,18 @@ class DocumentFamily(CollectionFamily):
         )
 
     async def _held_by_renames(self, unlisted: set[str], uncommitted: Sequence[ContentItem]) -> set[str]:
-        """The unlisted Documents of each Unit an uncommitted item names as its ``renamed_from``."""
+        """The unlisted Documents of the current Unit of each Document an uncommitted item was renamed from.
+
+        The Unit is the one the renamed item commits to, found the same way.
+        """
 
         if not unlisted:
             return set()
         held: set[str] = set()
-        for provider_key in sorted({item.renamed_from for item in uncommitted if item.renamed_from}):
-            predecessor = await self.db.find_current_source_unit_by_provider_key(self.source_id, provider_key)
+        for document_id in sorted({item.renamed_from for item in uncommitted if item.renamed_from}):
+            predecessor = await self.db.find_source_unit_by_document_id(
+                self.source_id, document_id, current_only=True,
+            )
             if predecessor is not None:
                 held.update(set(await self.db.list_source_unit_document_ids(predecessor.id)) & unlisted)
         return held
