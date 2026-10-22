@@ -14,6 +14,7 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 from memforge.genes.base import Gene
+from memforge.genes.contract import validate_registered_source_types
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind, gene_family
 from memforge.models import GeneMetadata, SourceExecutionKind
@@ -94,7 +95,9 @@ def source_rediscovers_documents(source_type: str, config: Mapping[str, Any]) ->
     )
 
 
-# Every registered Gene loads with this package, so a connector that cannot
-# load fails startup instead of going missing.
+# Every registered Gene loads with this package, and every source type is
+# checked against its family's contract, so a connector that cannot load or
+# leaves out part of its contract fails startup instead of going missing.
 for _descriptor in registered_source_types():
     _descriptor.gene_class()
+validate_registered_source_types()
