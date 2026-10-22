@@ -34,7 +34,7 @@ const toggleStatus = sourceActionLayout.menu.find((action) => action.id === "tog
 assert.equal(toggleStatus?.tone, "neutral");
 assert.equal(
   toggleStatus?.description,
-  "Pause or resume source discovery without deleting configuration or extracted memories.",
+  "Pause stops any sync in progress and skips syncs until you resume. Configuration and memories stay.",
 );
 
 const forceResync = sourceActionLayout.menu.find((action) => action.id === "force-resync");

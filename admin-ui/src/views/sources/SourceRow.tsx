@@ -70,6 +70,7 @@ export function SourceRow({
   isSubscriptionPending,
   onConfigure,
   onSync,
+  onStopSync,
   onResume,
   onShowDetails,
   onShowEvaluation,
@@ -96,6 +97,8 @@ export function SourceRow({
   isSubscriptionPending: boolean;
   onConfigure: (step?: "content") => void;
   onSync: () => void;
+  /** Stops the sync in progress; absent when the viewer cannot sync the source. */
+  onStopSync?: () => void;
   onResume?: () => void;
   onShowDetails: () => void;
   onShowEvaluation: () => void;
@@ -335,6 +338,7 @@ export function SourceRow({
         sourceName={sourceLabel.name}
         itemLabel={itemLabel}
         onRetry={isPaused || !capabilities.can_sync ? undefined : onSync}
+        onStop={capabilities.can_sync ? onStopSync : undefined}
       />
     </div>
   );

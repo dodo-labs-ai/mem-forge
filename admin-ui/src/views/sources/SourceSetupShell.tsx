@@ -24,6 +24,13 @@ export interface SourceSetupSection {
   content: ReactNode;
 }
 
+/** A save refused because a sync of the Source runs, and the way out: stop that sync, then save. */
+export interface RunningSyncSave {
+  stopping: boolean;
+  error: string | null;
+  onStopAndSave: () => void;
+}
+
 export function SourceSetupShell({
   sourceType,
   sourceLabel,
@@ -34,6 +41,7 @@ export function SourceSetupShell({
   openSection,
   onOpenSectionChange,
   error,
+  runningSync,
   validationMessage,
   saving,
   saveDisabled,
@@ -49,6 +57,7 @@ export function SourceSetupShell({
   openSection: SourceSetupSectionId;
   onOpenSectionChange: (section: SourceSetupSectionId) => void;
   error?: string | null;
+  runningSync?: RunningSyncSave | null;
   validationMessage?: string | null;
   saving: boolean;
   saveDisabled?: boolean;
@@ -126,7 +135,24 @@ export function SourceSetupShell({
           })}
         </div>
 
-        {(error || validationMessage) && (
+        {runningSync ? (
+          <div role="alert" className="mt-3 space-y-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-900 dark:bg-amber-900/20 dark:text-amber-100">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="mt-0.5 size-4 shrink-0" />
+              <span>
+                A sync of this source is running, so this change cannot be saved yet. Stopping the sync keeps
+                what it has saved, and the next sync uses your new settings.
+              </span>
+            </div>
+            {runningSync.error && <p className="pl-6 text-destructive">{runningSync.error}</p>}
+            <div className="pl-6">
+              <Button type="button" size="sm" variant="outline" disabled={runningSync.stopping} onClick={runningSync.onStopAndSave}>
+                {runningSync.stopping && <Loader2 className="size-4 animate-spin" />}
+                {runningSync.stopping ? "Stopping the sync…" : "Stop the running sync and save"}
+              </Button>
+            </div>
+          </div>
+        ) : (error || validationMessage) && (
           <div className={`mt-3 flex items-start gap-2 rounded-lg p-3 text-sm ${error ? "bg-destructive/10 text-destructive" : "bg-muted/50 text-muted-foreground"}`}>
             <AlertCircle className="mt-0.5 size-4 shrink-0" />
             <span>{error || validationMessage}</span>
