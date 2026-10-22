@@ -23,7 +23,7 @@ import { useSharedWorkspace } from "@/state/sharedWorkspace";
 
 import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
-import { useStopRunningSyncAndSave } from "./runningSyncSave";
+import { useRunningSyncSave } from "./runningSyncSave";
 import { SourceSetupShell } from "./SourceSetupShell";
 import type { SourceSetupSection, SourceSetupSectionId } from "./SourceSetupShell";
 import {
@@ -52,6 +52,7 @@ export function TeamsSourceSetup({
   onOpenChange,
   onSaved,
   initialFocus,
+  activeSyncRunId,
   onRequestAccessChange,
 }: {
   source?: Source | null;
@@ -59,6 +60,8 @@ export function TeamsSourceSetup({
   onOpenChange: (open: boolean) => void;
   onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" };
+  /** The sync of `source` in progress, from the live Sources list; saving stops it first. */
+  activeSyncRunId?: string | null;
   onRequestAccessChange?: (source: Source) => void;
 }) {
   const queryClient = useQueryClient();
@@ -172,7 +175,12 @@ export function TeamsSourceSetup({
     },
   });
 
-  const runningSync = useStopRunningSyncAndSave(source?.id, saveSource.error, () => saveSource.mutate());
+  const runningSync = useRunningSyncSave<void>({
+    sourceId: source?.id,
+    activeRunId: activeSyncRunId,
+    saveError: saveSource.error,
+    save: () => saveSource.mutateAsync(),
+  });
 
   const handleSave = () => {
     if (!config.name.trim()) {
@@ -200,7 +208,7 @@ export function TeamsSourceSetup({
       setFocusSection("schedule");
       return;
     }
-    saveSource.mutate();
+    runningSync.save();
   };
 
   const sessionError = connectTeams.error ?? authQuery.error;
@@ -462,12 +470,15 @@ export function TeamsSourceSetup({
       sections={sharedWorkspace ? sections : sections.filter((section) => section.id !== "access")}
       openSection={focusSection}
       onOpenSectionChange={setFocusSection}
-      error={saveSource.isError ? errorMessage(saveSource.error) : null}
-      runningSync={runningSync.runId ? {
-        stopping: runningSync.pending,
+      error={saveSource.isError && !runningSync.refusedForRunningSync ? errorMessage(saveSource.error) : null}
+      runningSync={{
+        running: runningSync.running,
+        confirming: runningSync.confirming,
+        stopping: runningSync.stopping,
         error: runningSync.error ? errorMessage(runningSync.error) : null,
-        onStopAndSave: runningSync.run,
-      } : null}
+        onStopAndSave: runningSync.stopAndSave,
+        onWait: runningSync.wait,
+      }}
       validationMessage={validationMessage}
       saving={saveSource.isPending}
       saveDisabled={!isEdit && accessPolicy === null}

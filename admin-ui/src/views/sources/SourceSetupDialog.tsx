@@ -16,6 +16,7 @@ export function SourceSetupDialog({
   source,
   onSaved,
   initialFocus,
+  activeSyncRunId,
   onRequestAccessChange,
 }: {
   open: boolean;
@@ -24,6 +25,8 @@ export function SourceSetupDialog({
   source?: Source | null;
   onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" | "content" };
+  /** The sync of `source` in progress, from the live Sources list; saving stops it first. */
+  activeSyncRunId?: string | null;
   onRequestAccessChange?: (source: Source) => void;
 }) {
   if (!sourceType) return null;
@@ -35,6 +38,7 @@ export function SourceSetupDialog({
         source={source}
         onSaved={onSaved}
         initialFocus={initialFocus?.step === "project" ? { step: "project" } : undefined}
+        activeSyncRunId={activeSyncRunId}
         onRequestAccessChange={onRequestAccessChange}
       />
     );
@@ -50,6 +54,7 @@ export function SourceSetupDialog({
       source={source}
       onSaved={onSaved}
       initialFocus={initialFocus}
+      activeSyncRunId={activeSyncRunId}
       onRequestAccessChange={onRequestAccessChange}
     />
   );
@@ -61,6 +66,7 @@ function TeamsSetupDialog({
   source,
   onSaved,
   initialFocus,
+  activeSyncRunId,
   onRequestAccessChange,
 }: {
   open: boolean;
@@ -68,6 +74,7 @@ function TeamsSetupDialog({
   source?: Source | null;
   onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" };
+  activeSyncRunId?: string | null;
   onRequestAccessChange?: (source: Source) => void;
 }) {
   const canConfigure = source ? source.capabilities?.can_configure === true : true;
@@ -99,6 +106,7 @@ function TeamsSetupDialog({
             onOpenChange={onOpenChange}
             onSaved={onSaved}
             initialFocus={initialFocus}
+            activeSyncRunId={activeSyncRunId}
             onRequestAccessChange={onRequestAccessChange}
           />
         )}
