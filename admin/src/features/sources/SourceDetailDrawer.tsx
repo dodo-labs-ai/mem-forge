@@ -34,6 +34,8 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpe
   const { failedItems } = row;
   const unrecognizedLines = source.unrecognized_session_lines;
   const sync = actions.syncControl(source, activity);
+  const canStop = actions.canStopSync(source, activity);
+  const canSync = Boolean(source.capabilities?.can_sync) && source.status === "active";
 
   return (
     <DetailDrawer
@@ -47,10 +49,19 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpe
         </span>
       }
       actions={
-        source.capabilities?.can_sync && source.status === "active" ? (
-          <Button size="sm" variant="outline" disabled={!sync.enabled} onClick={() => actions.syncNow(source, sync.retryTarget)}>
-            {sync.label}
-          </Button>
+        canStop || canSync ? (
+          <>
+            {canStop ? (
+              <Button size="sm" variant="outline" onClick={() => actions.stopSync(source)}>
+                Stop sync
+              </Button>
+            ) : null}
+            {canSync ? (
+              <Button size="sm" variant="outline" disabled={!sync.enabled} onClick={() => actions.syncNow(source, sync.retryTarget)}>
+                {sync.label}
+              </Button>
+            ) : null}
+          </>
         ) : null
       }
     >
@@ -96,7 +107,17 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpe
             {
               label: "Status",
               value: presentation ? (
-                <StatusBadge tone={activity?.state === "failed" ? "danger" : activity?.state === "success" ? "ok" : "live"}>
+                <StatusBadge
+                  tone={
+                    activity?.state === "failed"
+                      ? "danger"
+                      : activity?.state === "success"
+                        ? "ok"
+                        : activity?.state === "stopped"
+                          ? "idle"
+                          : "live"
+                  }
+                >
                   {presentation.message}
                 </StatusBadge>
               ) : (

@@ -1,10 +1,15 @@
 import { toast } from "sonner";
 import { LOCAL_SYNC_START_COMMAND } from "@/features/local-sync";
 import { errorMessage } from "@/lib/errors";
-import { useSetPaused, useSetPinned, useSetUsedInSearches, useSyncSource } from "./api";
+import { useSetPaused, useSetPinned, useSetUsedInSearches, useStopSync, useSyncSource } from "./api";
 import { V1_SOURCES_PATH } from "./constants";
 import type { SourceAttentionAction } from "./model/sourceAttention";
-import { sourceSyncControl, type SourceSyncActivity, type SourceSyncRetryTarget } from "./model/sourceSyncActivity";
+import {
+  sourceSyncCanStop,
+  sourceSyncControl,
+  type SourceSyncActivity,
+  type SourceSyncRetryTarget,
+} from "./model/sourceSyncActivity";
 import type { Source } from "./model/types";
 import { useJiraSignIn } from "./useJiraSignIn";
 
@@ -14,6 +19,7 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
   const setPinned = useSetPinned();
   const setUsedInSearches = useSetUsedInSearches();
   const setPaused = useSetPaused();
+  const stopSync = useStopSync();
   const signIn = useJiraSignIn();
 
   function report(promise: Promise<unknown>, success: string, failure: string) {
@@ -40,6 +46,25 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
         sync.mutateAsync({ source, retryTarget }),
         retryTarget ? `Retry started for ${source.name}` : `Sync started for ${source.name}`,
         retryTarget ? `Could not start the retry for ${source.name}` : `Could not start a sync for ${source.name}`,
+      );
+    },
+    /** Whether the source's sync can be stopped from here, by someone who can sync or pause it. */
+    canStopSync(source: Source, activity: SourceSyncActivity | undefined) {
+      const capabilities = source.capabilities;
+      return Boolean(capabilities?.can_sync || capabilities?.can_configure) && sourceSyncCanStop(activity)
+        && !(stopSync.isPending && stopSync.variables === source.id);
+    },
+    stopSync(source: Source) {
+      stopSync.mutateAsync(source.id).then(
+        (stopped) =>
+          toast.success(
+            stopped.outcome === "stopping"
+              ? `Stopping the sync of ${source.name}`
+              : stopped.outcome === "stopped"
+                ? `Sync of ${source.name} stopped`
+                : `${source.name} was not syncing`,
+          ),
+        (error: unknown) => toast.error(`Could not stop the sync of ${source.name}`, { description: errorMessage(error) }),
       );
     },
     togglePinned(source: Source) {

@@ -23,6 +23,7 @@ import { useSharedWorkspace } from "@/state/sharedWorkspace";
 
 import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
+import { useStopRunningSyncAndSave } from "./runningSyncSave";
 import { SourceSetupShell } from "./SourceSetupShell";
 import type { SourceSetupSection, SourceSetupSectionId } from "./SourceSetupShell";
 import {
@@ -170,6 +171,8 @@ export function TeamsSourceSetup({
       onOpenChange(false);
     },
   });
+
+  const runningSync = useStopRunningSyncAndSave(source?.id, saveSource.error, () => saveSource.mutate());
 
   const handleSave = () => {
     if (!config.name.trim()) {
@@ -460,6 +463,11 @@ export function TeamsSourceSetup({
       openSection={focusSection}
       onOpenSectionChange={setFocusSection}
       error={saveSource.isError ? errorMessage(saveSource.error) : null}
+      runningSync={runningSync.runId ? {
+        stopping: runningSync.pending,
+        error: runningSync.error ? errorMessage(runningSync.error) : null,
+        onStopAndSave: runningSync.run,
+      } : null}
       validationMessage={validationMessage}
       saving={saveSource.isPending}
       saveDisabled={!isEdit && accessPolicy === null}

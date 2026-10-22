@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- A person can stop a Source's sync in progress: `POST
+  /api/v1/sources/{id}/sync/stop`, the Admin UI's "Stop sync" and `memforge
+  sources stop`. The Source stays active and later syncs run as scheduled. A
+  server run that has not started, and the local daemon's collection job, end
+  at once; a running server run ends at its worker's next heartbeat (about 30
+  seconds). The run fails with `cancelled_by_user`, is not retried, and is
+  shown as "Stopped". It ends like a run whose lease was lost: what it
+  committed stays, nothing is removed by absence detection, an open scope
+  transition stays open for the next run, and the sync cursor does not move.
+  Pausing a Source also stops its sync. A configuration change refused while a
+  sync runs answers 409 `source_sync_running` naming the run, and the Admin UI
+  offers "Stop the running sync and save". Migration 125 adds
+  `source_sync_runs.stop_requested_at`; `heartbeat_source_sync_run` returns a
+  `SourceSyncHeartbeat` instead of a boolean, and a run that fails for good
+  marks a scope transition it left running as failed.
+  - Cloud: HANA adds `SOURCE_SYNC_RUNS.STOP_REQUESTED_AT` and implements
+    `request_source_sync_stop`; the Cloud local-agent job store stops the
+    Source's device jobs and releases their collection activity.
 - Each source type declares its facts once, in a descriptor in
   `memforge.source_types`: its Gene, native projection, evidence profiles,
   namespace and scope fields, progress noun, local-agent collection, PDF
