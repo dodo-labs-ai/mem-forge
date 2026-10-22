@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { AxiosRequestConfig } from "axios";
 import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -7,6 +8,7 @@ import { createWorkspaceApiController, resourceClient } from "@/api/client";
 import { getCurrentLocalAgentJobs } from "@/api/localAgentJobs";
 import type { Source } from "@/api/types";
 import { SchemaSourceSetup } from "./SchemaSourceSetup";
+import { SourceSetupDialog } from "./SourceSetupDialog";
 import { SourcesPage } from "./SourcesPage";
 
 vi.mock("@/api/localAgentJobs", () => ({
@@ -54,6 +56,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   cleanup();
   queryClient?.clear();
   workspaceApi.setTarget(null);
@@ -100,7 +103,7 @@ it("asks before saving during a sync, then stops the sync, waits for it to end a
     expect.objectContaining({ name: "Renamed pages" }),
   ));
   expect(stopCalls()).toHaveLength(1);
-  expect(resourceClient.get).toHaveBeenCalledWith("/sources/src-pages/sync-runs/run-1");
+  expect(resourceClient.get).toHaveBeenCalledWith("/sources/src-pages/sync-runs/run-1", expect.anything());
   expect(vi.mocked(resourceClient.post).mock.invocationCallOrder[0])
     .toBeLessThan(vi.mocked(resourceClient.put).mock.invocationCallOrder[0]);
 });
@@ -121,6 +124,7 @@ it("waits for the sync to finish with the edits kept and the sync left running",
 
 it("asks the same way when the server refuses a save because a sync started meanwhile", async () => {
   vi.mocked(resourceClient.put).mockRejectedValueOnce(refusal).mockResolvedValueOnce({ data: {} });
+  vi.mocked(resourceClient.post).mockResolvedValue({ data: { outcome: "stopping", run_id: "run-2" } });
   mount(<SchemaSourceSetup open onOpenChange={() => {}} sourceType="github_pages" source={idleSource} />);
   await screen.findByPlaceholderText("Source name");
   expect(screen.queryByText("A sync is running. Saving will stop it first.")).toBeNull();
@@ -132,5 +136,82 @@ it("asks the same way when the server refuses a save because a sync started mean
 
   await waitFor(() => expect(resourceClient.put).toHaveBeenCalledTimes(2));
   expect(stopCalls()).toHaveLength(1);
-  expect(resourceClient.get).toHaveBeenCalledWith("/sources/src-pages/sync-runs/run-2");
+  expect(resourceClient.get).toHaveBeenCalledWith("/sources/src-pages/sync-runs/run-2", expect.anything());
+});
+
+async function askToStopAndSave() {
+  const name = await openConfigureDuringSync();
+  fireEvent.change(name, { target: { value: "Renamed pages" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save Changes" }));
+  const confirmation = await screen.findByRole("dialog", { name: "Stop the sync and save?" });
+  fireEvent.click(within(confirmation).getByRole("button", { name: "Stop sync and save" }));
+  return confirmation;
+}
+
+function nameField() {
+  return screen.getByPlaceholderText("Source name") as HTMLInputElement;
+}
+
+it("shows a failed stop inside the question, with the edits kept and nothing saved", async () => {
+  vi.mocked(resourceClient.post).mockRejectedValue(new Error("The stop request failed."));
+
+  const confirmation = await askToStopAndSave();
+
+  expect(await within(confirmation).findByText("The stop request failed.")).toBeTruthy();
+  expect(within(confirmation).getByRole("button", { name: "Stop sync and save" })).toBeTruthy();
+  expect(nameField().value).toBe("Renamed pages");
+  expect(resourceClient.put).not.toHaveBeenCalled();
+});
+
+it("shows a sync that has not stopped in time inside the question, with the edits kept", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const getSource = vi.mocked(resourceClient.get).getMockImplementation()!;
+  vi.mocked(resourceClient.get).mockImplementation(async (path: string, config?: AxiosRequestConfig) =>
+    path.startsWith("/sources/src-pages/sync-runs/") ? { data: { status: "running" } } : getSource(path, config));
+
+  const confirmation = await askToStopAndSave();
+  await waitFor(() => expect(resourceClient.get).toHaveBeenCalledWith("/sources/src-pages/sync-runs/run-1", expect.anything()));
+  await vi.advanceTimersByTimeAsync(7 * 60_000 + 5_000);
+
+  expect(await within(confirmation).findByText("The sync has not stopped yet. Wait a moment, then save again."))
+    .toBeTruthy();
+  expect(nameField().value).toBe("Renamed pages");
+  expect(resourceClient.put).not.toHaveBeenCalled();
+});
+
+it("lets the person wait for the sync while it is stopping, keeping the edits and saving nothing", async () => {
+  let answerRunRead: (status: string) => void = () => {};
+  const getSource = vi.mocked(resourceClient.get).getMockImplementation()!;
+  vi.mocked(resourceClient.get).mockImplementation((path: string, config?: AxiosRequestConfig) =>
+    path.startsWith("/sources/src-pages/sync-runs/")
+      ? new Promise((resolve) => { answerRunRead = (status) => resolve({ data: { status } }); })
+      : getSource(path, config));
+
+  const confirmation = await askToStopAndSave();
+  await within(confirmation).findByRole("button", { name: "Stopping the sync…" });
+  fireEvent.click(within(confirmation).getByRole("button", { name: "Wait for the sync to finish" }));
+
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: "Stop the sync and save?" })).toBeNull());
+  answerRunRead("failed");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(nameField().value).toBe("Renamed pages");
+  expect(stopCalls()).toHaveLength(1);
+  expect(resourceClient.put).not.toHaveBeenCalled();
+});
+
+it("asks before saving a Teams source during a sync", async () => {
+  const teams: Source = {
+    ...syncingSource, id: "src-teams", name: "Team chats", type: "teams",
+    config: { region: "emea", conversation_ids: "19:planning@thread.v2" },
+  };
+  vi.mocked(resourceClient.get).mockImplementation(async (path: string) => (
+    { data: path === "/genes/teams/config-schema" ? { groups: [], fields: [] } : [] }
+  ));
+  mount(<SourceSetupDialog open onOpenChange={() => {}} sourceType="teams" source={teams} activeSyncRunId="run-1" />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Save Changes" }));
+
+  expect(await screen.findByRole("dialog", { name: "Stop the sync and save?" })).toBeTruthy();
+  expect(screen.getByText("A sync is running. Saving will stop it first.")).toBeTruthy();
+  expect(resourceClient.put).not.toHaveBeenCalled();
 });
