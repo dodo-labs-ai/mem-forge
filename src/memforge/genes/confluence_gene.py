@@ -25,7 +25,7 @@ from memforge.genes.atlassian_auth import (
     stream_with_rate_limit_retry,
     tls_verify,
 )
-from memforge.genes.base import Gene
+from memforge.genes.document_gene import DocumentGene
 from memforge.genes.confluence_artifacts import resolve_current_confluence_artifacts
 from memforge.genes.confluence_pdf import export_confluence_page_pdf
 from memforge.source_time import SOURCE_UPDATED_AT_KEY
@@ -69,12 +69,14 @@ def _page_doc_id(page_id: str) -> str:
     return f"{_PAGE_DOC_ID_PREFIX}{page_id}"
 
 
-class ConfluenceGene(Gene):
+class ConfluenceGene(DocumentGene):
     """Confluence data source gene.
 
     Discovers and syncs wiki pages via Confluence REST API v1.
     Normalizes XHTML page content into comprehensive markdown.
     """
+
+    listing_kinds = frozenset({ScopeListingKind.QUERY})
 
     @classmethod
     def metadata(cls) -> GeneMetadata:

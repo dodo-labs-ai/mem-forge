@@ -18,7 +18,8 @@ import requests
 from bs4 import BeautifulSoup
 
 from memforge.genes.atlassian_auth import require_https_base_url, resolve_pat, tls_verify
-from memforge.genes.base import Gene, SourceConfigurationError
+from memforge.genes.base import SourceConfigurationError
+from memforge.genes.document_gene import DocumentGene
 from memforge.github_repo_utils import (
     decode_github_contents_payload,
     github_latest_commit_time,
@@ -65,8 +66,10 @@ class _RepoRef:
     page_path: str
 
 
-class GitHubPagesGene(Gene):
+class GitHubPagesGene(DocumentGene):
     """Rendered GitHub Pages documentation source."""
+
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
 
     @classmethod
     def metadata(cls) -> GeneMetadata:

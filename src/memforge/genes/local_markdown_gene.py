@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
 
-from memforge.genes.base import Gene
+from memforge.genes.document_gene import DocumentGene
 from memforge.genes.local_adapter_packages import (
     decode_package,
     has_package_manifest,
@@ -31,6 +31,7 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+    ScopeListingKind,
 )
 
 __all__ = ["LocalMarkdownGene"]
@@ -88,8 +89,10 @@ def _package_raw_content(item: ContentItem, body: bytes, package: dict) -> RawCo
     )
 
 
-class LocalMarkdownGene(Gene):
+class LocalMarkdownGene(DocumentGene):
     """Local markdown knowledge-base source uploaded by the local daemon."""
+
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
 
     @classmethod
     def metadata(cls) -> GeneMetadata:

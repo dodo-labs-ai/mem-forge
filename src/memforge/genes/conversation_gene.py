@@ -192,9 +192,6 @@ class ConversationGene(Gene):
                 return False
         return await run.reader.conversations_held(self.source_id) <= selected
 
-    async def list_scope(self) -> None:
-        return None
-
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         """Plan this attempt from its Collection Manifest and yield each Unit to project; ``since`` is unused."""
 

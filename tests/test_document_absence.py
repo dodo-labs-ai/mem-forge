@@ -79,6 +79,8 @@ class JiraProject(BlockingFetchGene):
         self.fetched.append(item.item_id)
         return await super().fetch(item)
 
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE, ScopeListingKind.QUERY})
+
     async def list_scope(self):
         if self.listing_error is not None:
             raise self.listing_error

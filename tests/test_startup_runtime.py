@@ -2034,7 +2034,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
 ):
     from memforge import runtime
     from tests.source_type_fixture import register_test_source_type
-    from memforge.genes.base import Gene
+    from memforge.genes.document_gene import DocumentGene
     from memforge.models import (
         ConfigField,
         ConfigFieldType,
@@ -2048,7 +2048,9 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
     )
     from memforge.source_secrets import prepare_source_config_for_storage
 
-    class ApiKeyGene(Gene):
+    class ApiKeyGene(DocumentGene):
+        listing_kinds = frozenset()
+
         @classmethod
         def metadata(cls) -> GeneMetadata:
             return GeneMetadata(
@@ -2163,7 +2165,7 @@ async def test_gene_discovery_preview_runs_configured_gene_without_saving_source
     from datetime import datetime, timezone
 
     from tests.source_type_fixture import register_test_source_type
-    from memforge.genes.base import Gene
+    from memforge.genes.document_gene import DocumentGene
     from memforge.models import (
         ConfigField,
         ConfigFieldType,
@@ -2176,7 +2178,9 @@ async def test_gene_discovery_preview_runs_configured_gene_without_saving_source
     )
     from memforge.server.admin_api import create_admin_app
 
-    class PreviewGene(Gene):
+    class PreviewGene(DocumentGene):
+        listing_kinds = frozenset()
+
         @classmethod
         def metadata(cls) -> GeneMetadata:
             return GeneMetadata(
@@ -2243,7 +2247,7 @@ async def test_gene_discovery_preview_runs_configured_gene_without_saving_source
 @pytest.mark.asyncio
 async def test_gene_discovery_preview_reuses_existing_source_secret(db, tmp_path, monkeypatch):
     from tests.source_type_fixture import register_test_source_type
-    from memforge.genes.base import Gene
+    from memforge.genes.document_gene import DocumentGene
     from memforge.models import (
         ConfigField,
         ConfigFieldType,
@@ -2256,7 +2260,9 @@ async def test_gene_discovery_preview_reuses_existing_source_secret(db, tmp_path
     )
     from memforge.server.admin_api import create_admin_app
 
-    class SecretPreviewGene(Gene):
+    class SecretPreviewGene(DocumentGene):
+        listing_kinds = frozenset()
+
         @classmethod
         def metadata(cls) -> GeneMetadata:
             return GeneMetadata(
