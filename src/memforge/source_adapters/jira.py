@@ -168,14 +168,15 @@ def _profile(schema_name: str, version: int) -> EvidenceRepresentationProfile:
 
 
 CURRENT_OBSERVATION_PROFILES = {
-    ("jira", observation_type): _profile(schema.name, schema.version)
+    observation_type: _profile(schema.name, schema.version)
     for observation_type, schema in (
         ("issue_core", ISSUE_SCHEMA), ("comment", COMMENT_SCHEMA),
         ("changelog", CHANGELOG_SCHEMA),
     )
 }
 LEGACY_OBSERVATION_PROFILES = {
-    key: replace(profile, schema_version=1) for key, profile in CURRENT_OBSERVATION_PROFILES.items()
+    observation_type: replace(profile, schema_version=1)
+    for observation_type, profile in CURRENT_OBSERVATION_PROFILES.items()
 }
 
 

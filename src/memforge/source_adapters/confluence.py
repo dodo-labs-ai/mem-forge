@@ -18,7 +18,7 @@ CANONICAL_RECORD_SCHEMAS = {(PAGE_SCHEMA.name, PAGE_SCHEMA.version): PAGE_SCHEMA
 # The pre-profile writer persisted normalized Markdown. NULL-profile backfill
 # may attest that historical contract, never the newly introduced native schema.
 LEGACY_OBSERVATION_PROFILES = {
-    ("confluence", "page_body"): EvidenceRepresentationProfile(
+    "page_body": EvidenceRepresentationProfile(
         "markdown-structural", 1, EvidenceCoordinateSpace.UNICODE_SCALAR,
     ),
 }
