@@ -168,7 +168,9 @@ DESCRIPTOR = SourceTypeDescriptor(
         ),
         collects=_read_by_local_agent,
         immutable_execution_fields=("sync_mode",),
+        package_submitter="memforge.local_adapter:submit_jira_request",
         replay_adapter="memforge.local_agent.replay_adapter:JiraReplayAdapter",
+        accepts_artifact_inputs=True,
     ),
     config=SourceConfigPolicy(
         extra_secret_fields=("jira_cookie",),
