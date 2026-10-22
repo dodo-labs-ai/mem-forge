@@ -16,7 +16,9 @@ attempt answers (:meth:`ConversationGene.issue_collection_request`).
 from __future__ import annotations
 
 import json
+import logging
 from abc import abstractmethod
+from collections import Counter
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -42,6 +44,8 @@ from memforge.genes.base import Gene
 from memforge.genes.local_adapter_packages import open_packaged_source_artifact
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.source_projection import SourceRemoval
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,12 +134,27 @@ class ConversationGene(Gene):
         )
 
     def removals(self) -> dict[str, SourceRemoval]:
-        """The Documents this attempt removes, each with its reason and the attempt that decided it."""
+        """The Documents this attempt removes, each with its reason and the attempt that decided it.
+
+        Each conversation's count of removed Units, by reason, is logged, so a
+        run that removes far more than its conversations changed stands out.
+        """
 
         evidence = f"collection attempt {self.collection_attempt_id}"
+        removals = self._require_plan().removals
+        counts = Counter((removal.unit.conversation_id, removal.reason.value) for removal in removals)
+        for (conversation_id, reason), units in sorted(counts.items()):
+            logger.info(
+                "conversation_units_removed source=%s attempt=%s conversation=%s reason=%s units=%d",
+                self.source_id,
+                self.collection_attempt_id,
+                conversation_id,
+                reason,
+                units,
+            )
         return {
             removal.unit.document_id: SourceRemoval(reason=removal.reason, evidence=evidence)
-            for removal in self._require_plan().removals
+            for removal in removals
         }
 
     def unreadable_conversations(self) -> tuple[str, ...]:
