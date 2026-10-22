@@ -31,6 +31,7 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRe
   const sync = actions.syncControl(source, activity);
   const canSync = Boolean(capabilities?.can_sync) && source.status === "active";
   const canStop = actions.canStopSync(source, activity);
+  const syncIsLive = activity !== undefined && ["queued", "active", "recovering"].includes(activity.state);
   // While a sync runs, the row's button stops it; a queued sync keeps its own button.
   const stopIsPrimary = canStop && (activity?.state === "active" || activity?.state === "recovering");
   const control = attention && actions.attentionControl(attention.action, source, attention.actionLabel);
@@ -102,7 +103,8 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRe
             <>
               <DropdownMenuItem
                 className="items-start"
-                disabled={!capabilities?.can_configure}
+                // Pausing stops a sync, so it stays available during one; resuming waits for the sync to end.
+                disabled={!capabilities?.can_configure || (source.status === "paused" && syncIsLive)}
                 onClick={() => actions.togglePaused(source)}
               >
                 {source.status === "paused" ? (

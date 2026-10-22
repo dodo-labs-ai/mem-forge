@@ -914,7 +914,8 @@ export function SourcesPage() {
                               }}
                               disableMutatingActions={isSourceBusy || isDeleting}
                               disableForceResync={isSourceBusy || isDeleting || source.status === "paused"}
-                              disableToggleStatus={isDeleting || isUpdatingStatus}
+                              // Pausing stops a sync, so it stays available during one; resuming waits for the sync to end.
+                              disableToggleStatus={isDeleting || isUpdatingStatus || (isSourceBusy && source.status === "paused")}
                               isUpdatingStatus={isUpdatingStatus}
                           />
                         }

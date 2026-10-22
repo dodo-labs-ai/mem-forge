@@ -309,7 +309,7 @@ export function SourceRow({
               variant="outline"
               size="sm"
               onClick={onResume}
-              disabled={isUpdatingStatus || isDeleting}
+              disabled={isUpdatingStatus || isDeleting || isSourceBusy}
               className="border-amber-300 bg-background text-amber-900 hover:bg-amber-100 dark:border-amber-800 dark:text-amber-100 dark:hover:bg-amber-900/40"
               aria-label={`Resume sync for ${source.name}`}
             >

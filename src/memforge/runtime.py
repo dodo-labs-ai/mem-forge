@@ -1333,8 +1333,9 @@ class SourceSyncWorker:
             )
             # A stop request ends the sync the way a lost lease does: the sync
             # task is cancelled, so it commits nothing further, removes nothing
-            # and records no result.
-            if (lease_lost.is_set() or stop_requested.is_set()) and (
+            # and records no result. A sync that has already finished keeps its
+            # result.
+            if (lease_lost.is_set() or (stop_requested.is_set() and sync_task not in done)) and (
                 heartbeat_task in done or progress_task in done
             ):
                 sync_task.cancel()

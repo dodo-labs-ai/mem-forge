@@ -20014,6 +20014,12 @@ class Database:
         failed_at: datetime | None = None,
         next_attempt_at: datetime | None = None,
     ) -> bool:
+        """End the worker's attempt of a run as failed, or as waiting for its retry.
+
+        A run a person asked to stop is not retried: a failure that would be
+        retried ends it, like the stop itself, with ``SOURCE_SYNC_CANCELLED_BY_USER``
+        and no final state.
+        """
         if retryable and next_attempt_at is None:
             raise ValueError("retryable source sync failure requires next_attempt_at")
         failed_iso = _utc_iso(failed_at)
@@ -20040,6 +20046,11 @@ class Database:
                 ):
                     await self.db.rollback()
                     return False
+                if retryable and leased_run["stop_requested_at"] is not None:
+                    retryable = False
+                    error_message = SOURCE_SYNC_CANCELLED_BY_USER
+                    final_state = None
+                    status, completed_at, next_attempt_iso = "failed", failed_iso, None
                 if final_state is not None:
                     if final_state.last_sync_status not in {"failed", "partial"}:
                         raise ValueError("fail_source_sync_run requires a failed or partial final state")
