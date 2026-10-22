@@ -5,8 +5,10 @@ import {
   sourceSyncActivityFromLocalJob,
   sourceSyncActivityFromStatus,
   sourceSyncActivityIsVisible,
+  sourceSyncCanStop,
   sourceSyncControl,
   COMPLETED_SYNC_VISIBLE_MS,
+  SYNC_CANCELLED_BY_USER,
 } from "./sourceSyncActivity";
 import { makeLocalAgentJob } from "@/test/sourceFixtures";
 import type { LocalAgentJob as LocalAgentJobStatusResponse, SyncStatus } from "./types";
@@ -447,4 +449,42 @@ test("notes the document parts a finished sync could not read", () => {
       undefined,
     );
   }
+});
+
+test("a sync a person stops reads Stopping until it ends, then Stopped, and is not a failure", () => {
+  const running: SyncStatus = {
+    status: "running",
+    run_id: "ssr-1",
+    started_at: "2026-10-23T08:00:00Z",
+    finished_at: null,
+    error_message: null,
+    progress: null,
+  };
+  const stopping = sourceSyncActivityFromStatus({ ...running, stop_requested_at: "2026-10-23T08:01:00Z" });
+  assert.equal(stopping.state, "active");
+  assert.equal(stopping.stopping, true);
+  assert.equal(sourceSyncCanStop(stopping), false);
+  assert.equal(sourceSyncCanStop(sourceSyncActivityFromStatus(running)), true);
+  assert.deepEqual(sourceSyncControl(stopping, false), { label: "Stopping", enabled: false });
+  assert.equal(presentSourceSyncActivity(stopping, "Confluence", "pages").message, "Stopping");
+
+  const stopped = sourceSyncActivityFromStatus({
+    ...running,
+    status: "failed",
+    finished_at: "2026-10-23T08:01:20Z",
+    error_message: SYNC_CANCELLED_BY_USER,
+  });
+  assert.equal(stopped.state, "stopped");
+  assert.equal(sourceSyncCanStop(stopped), false);
+  assert.deepEqual(sourceSyncControl(stopped, false), { label: "Sync now", enabled: true });
+  assert.equal(presentSourceSyncActivity(stopped, "Confluence", "pages").message, "Stopped");
+
+  const stoppedJob = sourceSyncActivityFromLocalJob(
+    makeLocalAgentJob({ status: "failed", last_error: SYNC_CANCELLED_BY_USER, finished_at: "2026-10-23T08:01:00Z" }),
+  );
+  assert.equal(stoppedJob.state, "stopped");
+  assert.equal(
+    sourceSyncActivityFromLocalJob(makeLocalAgentJob({ status: "failed", last_error: "boom" })).state,
+    "failed",
+  );
 });

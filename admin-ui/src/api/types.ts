@@ -163,6 +163,8 @@ export interface SyncStatus {
   force_full_sync?: boolean;
   next_attempt_at?: string | null;
   recovery_count?: number;
+  /** When a person asked to stop this run; it ends within about 30 seconds. */
+  stop_requested_at?: string | null;
   phase?: "discovering" | "processing" | "detecting_deletions" | "complete" | string | null;
   started_at: string | null;
   finished_at: string | null;

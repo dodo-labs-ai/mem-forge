@@ -30,6 +30,10 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRe
   const capabilities = source.capabilities;
   const sync = actions.syncControl(source, activity);
   const canSync = Boolean(capabilities?.can_sync) && source.status === "active";
+  const canStop = actions.canStopSync(source, activity);
+  const syncIsLive = activity !== undefined && ["queued", "active", "recovering"].includes(activity.state);
+  // While a sync runs, the row's button stops it; a queued sync keeps its own button.
+  const stopIsPrimary = canStop && (activity?.state === "active" || activity?.state === "recovering");
   const control = attention && actions.attentionControl(attention.action, source, attention.actionLabel);
 
   return (
@@ -37,6 +41,10 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRe
       {attention ? (
         <Button size="sm" disabled={!control?.enabled} onClick={() => actions.runAttention(attention.action, source)}>
           {control?.label}
+        </Button>
+      ) : stopIsPrimary ? (
+        <Button size="sm" variant="outline" onClick={() => actions.stopSync(source)}>
+          Stop sync
         </Button>
       ) : canSync ? (
         <Button size="sm" variant="outline" disabled={!sync.enabled} onClick={() => actions.syncNow(source, sync.retryTarget)}>
@@ -52,6 +60,16 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRe
           <DropdownMenuItem disabled={!canSync || !sync.enabled} onClick={() => actions.syncNow(source, sync.retryTarget)}>
             {sync.label}
           </DropdownMenuItem>
+          {canStop ? (
+            <DropdownMenuItem className="items-start" onClick={() => actions.stopSync(source)}>
+              <span className="flex flex-col gap-0.5">
+                <span>Stop sync</span>
+                <span className="text-xs text-muted-foreground">
+                  Stop this sync. What it saved stays, and the next sync runs as usual.
+                </span>
+              </span>
+            </DropdownMenuItem>
+          ) : null}
           <DropdownMenuItem
             className="items-start"
             disabled={!capabilities?.can_configure || source.status !== "active" || !sync.enabled}
@@ -83,8 +101,22 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRe
           </DropdownMenuItem>
           {canConfigureSourceType(source.type) ? (
             <>
-              <DropdownMenuItem disabled={!capabilities?.can_configure} onClick={() => actions.togglePaused(source)}>
-                {source.status === "paused" ? "Resume syncing" : "Pause syncing"}
+              <DropdownMenuItem
+                className="items-start"
+                // Pausing stops a sync, so it stays available during one; resuming waits for the sync to end.
+                disabled={!capabilities?.can_configure || (source.status === "paused" && syncIsLive)}
+                onClick={() => actions.togglePaused(source)}
+              >
+                {source.status === "paused" ? (
+                  "Resume syncing"
+                ) : (
+                  <span className="flex flex-col gap-0.5">
+                    <span>Pause syncing</span>
+                    <span className="text-xs text-muted-foreground">
+                      Stop any sync in progress and skip syncs until you resume.
+                    </span>
+                  </span>
+                )}
               </DropdownMenuItem>
               <DropdownMenuItem disabled={!capabilities?.can_configure} onClick={() => actions.openInV1()}>
                 Configure

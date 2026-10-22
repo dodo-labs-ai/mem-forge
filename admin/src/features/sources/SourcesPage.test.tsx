@@ -467,3 +467,61 @@ test.each([
   expect(await within(dialog).findByText(shown)).toBeInTheDocument();
   expect(within(dialog).getByRole("button", { name: "Re-read documents" })).toBeDisabled();
 });
+
+test("Stop sync stops the running sync of a source, from its row and from its drawer", async () => {
+  const running = makeSource({
+    sync: { status: "running", run_id: "ssr-run", started_at: "2026-10-23T08:00:00Z", finished_at: null, error_message: null, progress: null },
+  });
+  const { calls } = renderPage([running], {
+    "POST /api/v1/sources/src-wiki/sync/stop": () => ({
+      source_id: "src-wiki", outcome: "stopping", run_id: "ssr-run", local_agent_job_ids: [],
+    }),
+  });
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await userEvent.click(await within(table).findByRole("button", { name: "Stop sync" }));
+
+  await vi.waitFor(() => expect(toast.success).toHaveBeenCalledWith("Stopping the sync of Payroll wiki"));
+  const stopCall = calls.find((request) => request.method === "POST")!;
+  expect(new URL(stopCall.url).pathname).toBe("/api/v1/sources/src-wiki/sync/stop");
+
+  await userEvent.click(within(table).getByText("Payroll wiki"));
+  const drawer = await screen.findByRole("dialog", { name: "Payroll wiki" });
+  expect(within(drawer).getByRole("button", { name: "Stop sync" })).toBeEnabled();
+  expect(within(drawer).getByRole("button", { name: "Syncing" })).toBeDisabled();
+});
+
+test("someone who can pause a source but not sync it can still stop its sync", async () => {
+  const base = makeSource();
+  const running = makeSource({
+    capabilities: { ...base.capabilities!, can_sync: false, can_configure: true },
+    sync: { status: "running", run_id: "ssr-run", started_at: "2026-10-23T08:00:00Z", finished_at: null, error_message: null, progress: null },
+  });
+  renderPage([running], {});
+  const table = await screen.findByRole("table", { name: "Sources" });
+
+  expect(await within(table).findByRole("button", { name: "Stop sync" })).toBeEnabled();
+});
+
+test("a sync being stopped reads Stopping and a stopped one reads Stopped, not failed", async () => {
+  const stopping = makeSource({
+    sync: {
+      status: "running", run_id: "ssr-run", started_at: "2026-10-23T08:00:00Z", finished_at: null, error_message: null,
+      progress: null, stop_requested_at: "2026-10-23T08:01:00Z",
+    },
+  });
+  const stopped = makeSource({
+    id: "src-stopped",
+    name: "Stopped wiki",
+    sync: {
+      status: "failed", run_id: "ssr-old", started_at: "2026-10-23T07:00:00Z", finished_at: "2026-10-23T07:01:00Z",
+      error_message: "cancelled_by_user", progress: null,
+    },
+  });
+  renderPage([stopping, stopped]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  expect(await within(table).findByRole("button", { name: "Stopping" })).toBeDisabled();
+  expect(within(table).queryByRole("button", { name: "Stop sync" })).not.toBeInTheDocument();
+  expect(within(table).getByText("Stopped")).toBeInTheDocument();
+  expect(screen.queryByRole("region", { name: "Needs you" })).not.toBeInTheDocument();
+});
