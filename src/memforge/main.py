@@ -2457,6 +2457,21 @@ def sources_schedule_show(ctx, source_id: str, workspace_id: str | None):
     _emit_tool_payload(ctx, payload)
 
 
+@sources.command("stop")
+@click.argument("source_id")
+@_workspace_id_option
+@click.pass_context
+def sources_stop(ctx, source_id: str, workspace_id: str | None):
+    """Stop the sync in progress of one source over the active API target.
+
+    The source stays active and later scheduled syncs run. A running server
+    sync stops at its worker's next heartbeat, within about 30 seconds; what it
+    has committed stays. To also keep the source from syncing, pause it.
+    """
+    payload = _tool_client(ctx, workspace_id).stop_source_sync(source_id=source_id)
+    _emit_tool_payload(ctx, payload)
+
+
 @sources.command("reprocess")
 @click.argument("source_id")
 @click.option(
