@@ -8,6 +8,7 @@ new scope leaves out and sets the cursor to the time the transition opened.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 
@@ -16,6 +17,7 @@ import pytest
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.lifecycle_plan import ProjectedLifecycleBlocker, ProjectedLifecycleDeferredError
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
+from memforge import runtime
 from memforge.genes.jira_gene import JiraQueryRejected
 from memforge.models import ScopeListing, ScopeListingKind
 from memforge.pipeline.collection_family import DEFAULT_INCREMENTAL_SYNC_OVERLAP
@@ -386,7 +388,9 @@ async def test_a_jql_change_removes_only_what_the_old_query_lists_and_the_new_on
     assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
 
 
-async def _superseded(workspace, transition_id: str, target_jql: str, predecessor: str | None) -> None:
+async def _superseded(
+    workspace, transition_id: str, target_jql: str, predecessor: str | None, *, source_id: str = SOURCE_ID,
+) -> None:
     now = datetime.now(timezone.utc).isoformat()
     await workspace.db.db.execute(
         """INSERT INTO projection_scope_transitions (
@@ -395,7 +399,7 @@ async def _superseded(workspace, transition_id: str, target_jql: str, predecesso
            ) VALUES (?, ?, ?, ?, 'superseded', ?, ?, ?, ?)""",
         (
             transition_id,
-            SOURCE_ID,
+            source_id,
             json.dumps(canonical_projection_scope("jira", JIRA_CONFIG)),
             json.dumps({"query_mode": "advanced", "jql": target_jql}),
             predecessor,
@@ -505,6 +509,113 @@ async def test_a_query_completion_lists_the_excluded_scopes_before_judging_a_blo
     assert engine.events == [("tombstone", "jira-1"), ("commit", "jira-2")]
     assert await _removal_reason(workspace, "jira-1") == UnitRemovalReason.REMOVED_FROM_SCOPE.value
     assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
+
+
+@pytest.mark.asyncio
+async def test_an_excluded_scope_that_cannot_be_built_completes_the_transition_with_the_ordinary_rule(
+    workspace, monkeypatch,
+):
+    project = await _issues_that_left_the_query_before_the_change(workspace)
+    await _change_scope(workspace)
+
+    def unbuildable(*, name, config, source_id):
+        raise ValueError("Jira JQL is required in advanced mode")
+
+    monkeypatch.setattr(runtime, "create_gene", unbuildable)
+    project.move_on(existing={0, 1, 2}, in_query={0})
+    await workspace.sync(
+        project,
+        excluded_scope_gene=runtime.excluded_scope_gene_factory({"id": SOURCE_ID, "type": "jira"}, TARGET_CONFIG),
+    )
+
+    assert workspace.tombstoned() == ["jira-3"]
+    assert await workspace.held() == {"jira-0", "jira-1", "jira-2"}
+    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
+
+
+@pytest.mark.asyncio
+async def test_a_failed_confirmation_still_completes_with_the_excluded_scope_removals(workspace):
+    project = await _issues_that_left_the_query_before_the_change(workspace)
+    await _change_scope(workspace)
+
+    project.move_on(existing={0, 1, 2}, in_query={0})
+    project.confirm_error = RuntimeError("Jira answered 503")
+    state = await workspace.sync(project, excluded_scope_gene=ExcludedScopes({OLD_JQL: {0, 1}}))
+
+    # The later ordinary runs confirm jira-2 and jira-3 again.
+    assert workspace.tombstoned() == ["jira-1"]
+    assert await _removal_reason(workspace, "jira-1") == UnitRemovalReason.REMOVED_FROM_SCOPE.value
+    assert state.absence_check_skipped_reason == "absence_confirmation_failed"
+    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
+
+
+async def _open_transition_superseding(workspace, predecessor: str) -> None:
+    await workspace.db.upsert_source(
+        id=SOURCE_ID,
+        type="jira",
+        name="Jira",
+        config_json=json.dumps(TARGET_CONFIG),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await workspace.db.create_projection_scope_transition(
+        ProjectionScopeTransition(
+            id=TRANSITION_ID,
+            source_id=SOURCE_ID,
+            previous_scope=canonical_projection_scope("jira", JIRA_CONFIG),
+            target_scope=canonical_projection_scope("jira", TARGET_CONFIG),
+            predecessor_transition_id=predecessor,
+            created_at=OPENED_AT.isoformat(),
+        )
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chain", ["cycle", "missing", "other-source"])
+async def test_a_superseded_chain_that_cannot_be_walked_keeps_the_transition_open(workspace, chain):
+    project = JiraProject(existing={0, 1})
+    await _synced(workspace, project)
+    if chain == "cycle":
+        await _superseded(workspace, "superseded-a", "project = OPS", "superseded-b")
+        await _superseded(workspace, "superseded-b", "project = SEC", "superseded-a")
+    elif chain == "other-source":
+        await workspace.db.upsert_source(
+            id="src-other", type="jira", name="Other", config_json=json.dumps(JIRA_CONFIG),
+            access_policy="workspace", owner_user_id="dev",
+        )
+        await _superseded(workspace, "superseded-a", "project = OPS", None, source_id="src-other")
+    await _open_transition_superseding(workspace, "superseded-a")
+    excluded = ExcludedScopes({OLD_JQL: {0, 1}, "project = OPS": set(), "project = SEC": set()})
+
+    project.move_on(existing={0, 1}, in_query={0})
+    await asyncio.wait_for(workspace.sync(project, excluded_scope_gene=excluded), timeout=10)
+    transition = await _transition(workspace)
+
+    assert workspace.tombstoned() == []
+    assert excluded.listed == []
+    assert transition.status is ProjectionScopeTransitionStatus.FAILED
+    expected = "loop back to superseded-a" if chain == "cycle" else "superseded transition superseded-a is missing"
+    assert expected in (transition.error or "")
+
+
+@pytest.mark.asyncio
+async def test_a_document_blocked_by_a_unit_completion_cannot_remove_lists_no_excluded_scope(workspace):
+    project = JiraProject(existing={0, 1})
+    await _synced(workspace, project)
+    await _change_scope(workspace)
+    engine = _OrderRecordingMemoryEngine(defer=True)
+    engine.deferred_doc_id = "jira-2"
+    engine.blocker_unit_ids = ("unit-of-another-source",)
+    workspace.engine = engine
+    excluded = ExcludedScopes({OLD_JQL: {0, 1}})
+
+    project.move_on(existing={0, 1, 2}, in_query={0, 2})
+    await workspace.sync(project, excluded_scope_gene=excluded)
+
+    assert excluded.listed == []
+    assert project.confirmed == []
+    assert workspace.tombstoned() == []
+    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.FAILED
 
 
 @pytest.mark.asyncio

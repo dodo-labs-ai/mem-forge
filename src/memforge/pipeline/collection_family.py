@@ -141,6 +141,17 @@ class _TransitionStaysOpen(Exception):
     """The run cannot complete the open transition; the message says why."""
 
 
+def _require_unblocked(
+    blocked: Collection[str],
+    deferred_blockers: Mapping[str, frozenset[str]],
+    removable_unit_ids: Collection[str],
+) -> None:
+    """Raise ``_TransitionStaysOpen`` unless every blocked Document waits only on Units that can be removed."""
+
+    if still_blocked := {doc_id for doc_id in blocked if not deferred_blockers[doc_id] <= set(removable_unit_ids)}:
+        raise _TransitionStaysOpen(f"{len(still_blocked)} listed Documents have not committed under the transition")
+
+
 def _removed_from_scope(doc_ids: Collection[str]) -> dict[str, SourceRemoval]:
     """Documents the user's scope change left out of the Source."""
     return {
@@ -556,20 +567,20 @@ class DocumentFamily(CollectionFamily):
             return AbsenceOutcome()
         waiting = listing.doc_ids - set(await self.db.list_projection_scope_transition_member_doc_ids(transition.id))
         blocked = {doc_id for doc_id in waiting if deferred_blockers.get(doc_id)}
+        unlisted = indexed_doc_ids - listing.doc_ids
         try:
             if waiting - blocked:
                 raise _TransitionStaysOpen(
                     f"{len(waiting - blocked)} listed Documents have not committed under the transition"
                 )
-            outcome = await self._completion_removals(
-                transition, listing, indexed_doc_ids - listing.doc_ids, uncommitted,
-            )
             if blocked:
-                removed_unit_ids = await self._current_unit_ids(outcome.removals or {})
-                if still_blocked := {doc_id for doc_id in blocked if not deferred_blockers[doc_id] <= removed_unit_ids}:
-                    raise _TransitionStaysOpen(
-                        f"{len(still_blocked)} listed Documents have not committed under the transition"
-                    )
+                # Completion can remove only Units the new listing leaves out;
+                # a Document blocked by any other Unit cannot commit in this
+                # run, so nothing else is listed or confirmed for it.
+                _require_unblocked(blocked, deferred_blockers, await self._current_unit_ids(unlisted))
+            outcome = await self._completion_removals(transition, listing, unlisted, uncommitted)
+            if blocked:
+                _require_unblocked(blocked, deferred_blockers, await self._current_unit_ids(outcome.removals or {}))
         except _TransitionStaysOpen as exc:
             self._transition_outstanding = str(exc)
             logger.info(
@@ -684,7 +695,7 @@ class DocumentFamily(CollectionFamily):
                 raise _TransitionStaysOpen(f"the superseded transitions loop back to {predecessor_id}")
             walked.add(predecessor_id)
             predecessor = await self.db.get_projection_scope_transition(predecessor_id)
-            if predecessor is None:
+            if predecessor is None or predecessor.source_id != self.source_id:
                 raise _TransitionStaysOpen(f"the superseded transition {predecessor_id} is missing")
             chain.append(predecessor.target_scope)
             predecessor_id = predecessor.predecessor_transition_id

@@ -47,6 +47,7 @@ from memforge.memory.health import MemoryIndexHealthChecker, MemoryIndexHealthRe
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.store import MemoryStore
 from memforge.models import SourceSyncRun, SyncState
+from memforge.genes.base import SourceConfigurationError
 from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.genes.family import CollectionFamilyKind
 from memforge.pipeline.collection_family import ExcludedScopeGeneFactory, SnapshotBinding
@@ -953,16 +954,24 @@ def excluded_scope_gene_factory(source: Mapping[str, Any], source_config: Mappin
     decrypted, with any browser session cookie injected. Each Gene reads it
     with the excluded scope's fields in place of the current ones, so it
     reuses the current credential and never sees a current scope field.
+
+    An excluded scope whose configuration or Gene cannot be built, before
+    anything reaches the provider, raises ``SourceConfigurationError``: no
+    later run could build it either. ``authenticate`` failures stay as they
+    are, because a credential or a network can recover.
     """
 
     source_type = str(source["type"])
 
     async def excluded_scope_gene(scope: Mapping[str, object]):
-        gene = create_gene(
-            name=source_type,
-            config=excluded_scope_config(source_type, source_config, scope),
-            source_id=str(source["id"]),
-        )
+        try:
+            gene = create_gene(
+                name=source_type,
+                config=excluded_scope_config(source_type, source_config, scope),
+                source_id=str(source["id"]),
+            )
+        except ValueError as exc:
+            raise SourceConfigurationError(f"The excluded scope {dict(scope)} cannot be configured: {exc}") from exc
         await gene.authenticate()
         return gene
 
