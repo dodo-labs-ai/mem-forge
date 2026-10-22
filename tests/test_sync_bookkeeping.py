@@ -3345,17 +3345,16 @@ class MixedBudgetConvergenceMemoryEngine(NoopMemoryEngine):
 
 
 class FailingLifecycleOutboxMemoryStore(OrchestratorMemoryStore):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, db: Database) -> None:
+        super().__init__(db)
         self.drain_calls = 0
 
-    async def attempt_lifecycle_vector_delivery(self, *args, **kwargs):
+    async def attempt_lifecycle_vector_delivery(self, lifecycle_plan_id=None, *, source_id=None):
         from memforge.memory.lifecycle_plan import (
             LifecycleVectorDeliveryResult,
             LifecycleVectorDeliveryState,
         )
 
-        del args, kwargs
         self.drain_calls += 1
         return LifecycleVectorDeliveryResult(
             state=LifecycleVectorDeliveryState.PENDING,
@@ -3366,7 +3365,7 @@ class FailingLifecycleOutboxMemoryStore(OrchestratorMemoryStore):
 
 
 class RaisingLifecycleOutboxMemoryStore(OrchestratorMemoryStore):
-    async def attempt_lifecycle_vector_delivery(self, *, source_id: str) -> None:
+    async def attempt_lifecycle_vector_delivery(self, lifecycle_plan_id=None, *, source_id=None):
         raise RuntimeError(f"temporary vector failure for {source_id}")
 
 
@@ -5720,7 +5719,7 @@ async def test_full_discovery_without_completion_evidence_never_deletes_existing
         doc_store=StubDocumentStore(),
         memory_extractor=None,
         memory_engine=NoopMemoryEngine(),
-        memory_store=FailingDocumentDeleteMemoryStore(),
+        memory_store=FailingDocumentDeleteMemoryStore(db),
     )
 
     state = await orchestrator.sync_gene(
@@ -6234,7 +6233,7 @@ async def test_deletion_failure_fails_the_document_of_a_partial_sync(db: Databas
         doc_store=StubDocumentStore(),
         memory_extractor=None,
         memory_engine=NoopMemoryEngine(),
-        memory_store=FailingDocumentDeleteMemoryStore(),
+        memory_store=FailingDocumentDeleteMemoryStore(db),
     )
 
     state = await orchestrator.sync_gene(
@@ -11627,7 +11626,7 @@ async def test_unchanged_document_survives_pending_lifecycle_vector_delivery(
     )
     release = asyncio.Event()
     release.set()
-    memory_store = FailingLifecycleOutboxMemoryStore()
+    memory_store = FailingLifecycleOutboxMemoryStore(db)
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
@@ -11681,7 +11680,7 @@ async def test_sync_run_keeps_success_when_vector_delivery_raises(
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=RaisingLifecycleOutboxMemoryStore(),
+        memory_store=RaisingLifecycleOutboxMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -11714,7 +11713,7 @@ async def test_reused_projection_skips_per_document_work_and_drains_outbox_once(
         )
     release = asyncio.Event()
     release.set()
-    memory_store = FailingLifecycleOutboxMemoryStore()
+    memory_store = FailingLifecycleOutboxMemoryStore(db)
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
@@ -11761,7 +11760,7 @@ async def test_reused_projection_materializes_only_changed_member(
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=FailingLifecycleOutboxMemoryStore(),
+        memory_store=FailingLifecycleOutboxMemoryStore(db),
         max_concurrent=2,
     )
 
@@ -11797,7 +11796,7 @@ async def test_force_sync_ignores_reused_projection_plan(db: Database) -> None:
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=FailingLifecycleOutboxMemoryStore(),
+        memory_store=FailingLifecycleOutboxMemoryStore(db),
         max_concurrent=1,
     )
 
