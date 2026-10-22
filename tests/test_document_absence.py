@@ -37,6 +37,8 @@ def _issue_number(item: ContentItem) -> int:
 class JiraProject(BlockingFetchGene):
     """Issues as Jira holds them, the ones the configured query matches, and the ones changed since the last sync."""
 
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE, ScopeListingKind.QUERY})
+
     def __init__(
         self,
         *,
@@ -78,8 +80,6 @@ class JiraProject(BlockingFetchGene):
     async def fetch(self, item):
         self.fetched.append(item.item_id)
         return await super().fetch(item)
-
-    listing_kinds = frozenset({ScopeListingKind.EXISTENCE, ScopeListingKind.QUERY})
 
     async def list_scope(self):
         if self.listing_error is not None:
@@ -281,7 +281,11 @@ async def test_a_failed_confirmation_removes_nothing_and_the_run_still_succeeds(
 @pytest.mark.asyncio
 async def test_a_source_that_cannot_list_its_scope_skips_no_absence_check(workspace):
     project = JiraProject(existing={0, 1})
-    project.list_scope = None
+
+    async def cannot_list():
+        return None
+
+    project.list_scope = cannot_list
     await _synced(workspace, project)
 
     project.move_on(existing={0})

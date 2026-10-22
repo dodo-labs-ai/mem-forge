@@ -1986,6 +1986,7 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             reusable_projection_doc_ids=frozenset(),
             record_terminal_result=True,
             failed_item_retry=None,
+            collection_attempt=None,
         ):
             del (
                 failed_item_retry,
@@ -2112,6 +2113,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             reusable_projection_doc_ids=frozenset(),
             record_terminal_result=True,
             failed_item_retry=None,
+            collection_attempt=None,
         ):
             del (
                 failed_item_retry,

@@ -2046,9 +2046,9 @@ def sync(ctx, source: str | None):
 
     async def _run():
         config: AppConfig = ctx.obj["config"]
-        from memforge.genes.conversation_gene import ConversationGene
-        from memforge.genes import GENE_REGISTRY
+        from memforge.genes.family import CollectionFamilyKind
         from memforge.runtime import build_sync_runtime, run_source_sync
+        from memforge.source_types import source_type_descriptor
 
         db = await _get_db(config)
         try:
@@ -2072,12 +2072,19 @@ def sync(ctx, source: str | None):
                 continue
 
             source_type = src["type"]
-            gene_class = GENE_REGISTRY.get(source_type)
-            if gene_class is not None and issubclass(gene_class, ConversationGene):
+            descriptor = source_type_descriptor(source_type)
+            family = descriptor.family if descriptor is not None else None
+            if family is CollectionFamilyKind.CONVERSATION:
                 # Its local agent collects each attempt; the server processes what was uploaded.
                 console.print(
                     f"\n[yellow]Skipping {src['name']}[/] (type={source_type}): "
                     "a conversation Source is collected by its local agent; sync it from the Admin UI."
+                )
+                continue
+            if family is None:
+                console.print(
+                    f"\n[yellow]Skipping {src['name']}[/] (type={source_type}): "
+                    "it receives content as it is captured and has no sync run."
                 )
                 continue
 

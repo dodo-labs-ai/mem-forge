@@ -23,7 +23,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal, cast
 from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, Request
@@ -69,6 +69,7 @@ from memforge.genes import (
     source_type_supports_sync,
 )
 from memforge.genes.conversation_gene import ConversationGene
+from memforge.genes.family import CollectionFamilyKind
 from memforge.genes.atlassian_auth import (
     release_atlassian_request_limiter,
     require_https_base_url,
@@ -2559,10 +2560,13 @@ async def _require_ready_snapshot_manifest(
 def _conversation_gene(source: Mapping[str, Any]) -> ConversationGene | None:
     """The conversation Gene of a Source, or ``None`` for a Source of another family."""
 
-    gene_class = GENE_REGISTRY.get(str(source.get("type") or ""))
-    if gene_class is None or not issubclass(gene_class, ConversationGene):
+    descriptor = source_type_descriptor(str(source.get("type") or ""))
+    if descriptor is None or descriptor.family is not CollectionFamilyKind.CONVERSATION:
         return None
-    return create_gene(str(source["type"]), dict(source.get("config") or {}), str(source["id"]))
+    return cast(
+        ConversationGene,
+        create_gene(str(source["type"]), dict(source.get("config") or {}), str(source["id"])),
+    )
 
 
 @dataclass(frozen=True, slots=True)

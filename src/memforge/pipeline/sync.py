@@ -24,7 +24,7 @@ from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -36,7 +36,7 @@ from memforge.evals.agent_evaluation import (
     publish_runtime_events,
 )
 from memforge.genes import source_rediscovers_documents
-from memforge.genes.conversation_gene import ConversationGene
+from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.genes.base import SourceConfigurationError
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
@@ -54,7 +54,6 @@ from memforge.models import (
     MemoryExtractionResult,
     NormalizedContent,
     RawContent,
-    ScopeListingKind,
     SourceUnitInput,
     SyncState,
     content_hash as compute_content_hash,
@@ -90,7 +89,6 @@ from memforge.source_projection import (
     SourceProjectionAdapter,
     SourceRelationType,
     SourceRemoval,
-    UnitRemovalReason,
 )
 from memforge.source_artifacts import (
     StoredSourceArtifact,
@@ -113,15 +111,15 @@ from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
 )
 from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot
+from memforge.pipeline.collection_family import (
+    collection_family,
+)
 from memforge.pipeline.stored_document import (
     StoredDocumentUnavailable,
     StoredDocumentUnavailableReason,
     StoredSourceDocument,
     document_content_item,
-    load_stored_source_document,
     project_stored_input,
-    rediscover_source_document,
-    stored_source_item,
 )
 from memforge.pipeline.projection_images import (
     load_projection_images,
@@ -161,7 +159,6 @@ __all__ = [
     "get_process_document_lifecycle_admission",
 ]
 
-DEFAULT_INCREMENTAL_SYNC_OVERLAP = timedelta(minutes=10)
 
 
 class SourceSyncMode(str, Enum):
@@ -186,13 +183,6 @@ class SourceSyncMode(str, Enum):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _absent(doc_ids: set[str], *, evidence: str) -> dict[str, SourceRemoval]:
-    """Documents the provider no longer has, as the run's evidence shows."""
-    return {
-        doc_id: SourceRemoval(reason=UnitRemovalReason.ABSENT_FROM_SOURCE, evidence=evidence) for doc_id in doc_ids
-    }
 
 
 def _aggregate_extraction_metrics(
@@ -588,14 +578,6 @@ def summarize_failed_documents(docs_failed: int, failed_docs: list[FailedDoc]) -
 _MAX_RETAINED_DOCUMENT_ERROR_CHARS = 512
 
 
-class AbsenceCheckSkipped(Exception):
-    """A sync run's absence check did not complete; ``reason`` says which step failed."""
-
-    def __init__(self, reason: AbsenceCheckSkippedReason) -> None:
-        super().__init__(reason)
-        self.reason: AbsenceCheckSkippedReason = reason
-
-
 class MemoryExtractionFailure(RuntimeError):
     """Extraction exhausted its own retry policy; do not replay the document.
 
@@ -918,6 +900,7 @@ class GeneSyncOrchestrator:
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
         record_terminal_result: bool = True,
         failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
+        collection_attempt: CollectionAttempt | None = None,
     ) -> SyncState:
         """Run the full sync pipeline for a gene.
 
@@ -953,6 +936,9 @@ class GeneSyncOrchestrator:
             Which rows of the Source's failure ledger a NORMAL run retries:
             ``ALL`` for a sync a person requested, ``RETRYABLE`` for a
             scheduled one (see :mod:`memforge.source_item_failures`).
+        collection_attempt:
+            The collection attempt a conversation Source's run processes;
+            required for, and only read by, the conversation family.
 
         Every per-Document failure is recorded in the failure ledger, which
         owns its retry, so a run whose failures are all per-Document ones
@@ -979,6 +965,8 @@ class GeneSyncOrchestrator:
         bind_document_store = getattr(gene, "bind_document_store", None)
         if callable(bind_document_store):
             bind_document_store(self.doc_store)
+        family = collection_family(gene, db=self.db, doc_store=self.doc_store, source_id=source_id)
+        family.prepare(collection_attempt)
 
         logger.info(
             "Sync started for %s (source_id=%s, run_id=%s)",
@@ -1083,10 +1071,8 @@ class GeneSyncOrchestrator:
                 items = []
                 for doc_id in sorted(reprocess_doc_ids or ()):
                     try:
-                        item, stored = await self._document_input(
-                            gene,
-                            source_id=source_id,
-                            document_id=doc_id,
+                        item, stored = await family.document_input(
+                            doc_id,
                             rediscovering=rediscovering,
                             failure=ledger.get(doc_id),
                         )
@@ -1117,11 +1103,7 @@ class GeneSyncOrchestrator:
                         run_id=transition_run_id,
                     )
                     transition_started = True
-                    if isinstance(gene, ConversationGene):
-                        gene.begin_scope_transition(
-                            previous_scope=scope_transition.previous_scope,
-                            target_scope=scope_transition.target_scope,
-                        )
+                    family.begin_scope_transition(scope_transition)
 
                 # ----------------------------------------------------------
                 # Step 1: Get indexed doc_ids for deletion detection
@@ -1136,31 +1118,11 @@ class GeneSyncOrchestrator:
                 # ----------------------------------------------------------
                 # Step 2: Get last sync time for incremental discovery
                 # ----------------------------------------------------------
-                last_sync_time = (
-                    None
-                    if force_full_sync or authoritative_snapshot or scope_transition is not None
-                    else (existing_state.last_sync_at if existing_state else None)
+                last_sync_time = await family.since(
+                    existing_state=existing_state,
+                    indexed_doc_ids=indexed_doc_ids,
+                    full_discovery=force_full_sync or authoritative_snapshot or scope_transition is not None,
                 )
-                if last_sync_time and _exports_pdf(gene):
-                    missing_pdf_count = await self._count_missing_pdf_uris(source_id)
-                    if missing_pdf_count:
-                        logger.info(
-                            "Found %d documents missing required PDF provenance for %s; forcing full sync",
-                            missing_pdf_count,
-                            source_id,
-                        )
-                        last_sync_time = None
-
-                # If sync_state says "synced" but there are 0 indexed docs,
-                # force a full re-sync (handles previously broken sync stubs)
-                if last_sync_time and not indexed_doc_ids:
-                    logger.warning(
-                        "Sync state exists but 0 indexed docs for %s — forcing full re-sync",
-                        source_id,
-                    )
-                    last_sync_time = None
-                elif last_sync_time:
-                    last_sync_time = last_sync_time - DEFAULT_INCREMENTAL_SYNC_OVERLAP
 
                 # ----------------------------------------------------------
                 # Step 3: Discover content items
@@ -1225,10 +1187,8 @@ class GeneSyncOrchestrator:
                 if not authoritative_snapshot:
                     for doc_id in sorted(retried_doc_ids - crawled_doc_ids):
                         try:
-                            item, stored = await self._document_input(
-                                gene,
-                                source_id=source_id,
-                                document_id=doc_id,
+                            item, stored = await family.document_input(
+                                doc_id,
                                 rediscovering=rediscovering,
                                 failure=ledger.get(doc_id),
                             )
@@ -1643,53 +1603,25 @@ class GeneSyncOrchestrator:
             # ----------------------------------------------------------
             # Step 5: Remove Documents the provider no longer has
             # ----------------------------------------------------------
-            # Discovery narrowed by ``since`` returns changed items only, so a
-            # Document it did not return proves nothing. A submitted snapshot,
-            # or a complete discovery of a newly configured scope, is the whole
-            # scope: what it did not return is removed. Every other run lists
-            # the configured scope by identifier and removes only what that
-            # listing proves absent.
-            #
-            # Absence is proven only after every Unit of this run has committed,
-            # so deferred commits blocked only by this run's Units converge
-            # first; a commit that fails for good counts as a failed document
-            # and keeps absence unproven.
+            # The family decides what the run proves absent. Deferred commits
+            # blocked only by this run's Units converge first; a commit that
+            # fails for good counts as a failed document.
             await self._converge_deferred_projected_lifecycle(effective_results)
             deferred_failures = sum(result.get("terminal_error") is not None for result in deferred_results)
             deleted_count = 0
             tombstoned_source_unit_ids: set[str] = set()
             run_committed = docs_failed + deferred_failures == 0
             absence_is_authoritative = run_coverage.proves_absence and run_committed
-            removals: dict[str, SourceRemoval] | None = None
-            if isinstance(gene, ConversationGene):
-                # Each conversation Unit carries the evidence that removes it,
-                # so its removal does not wait on other Units of the run.
-                if not reprocessing:
-                    removals = gene.removals()
-            elif absence_is_authoritative:
-                removals = _absent(indexed_doc_ids - crawled_doc_ids, evidence="complete snapshot")
-            elif run_committed and not reprocessing and scope_transition is None:
-                try:
-                    absent_doc_ids = await self._absent_from_scope_listing(
-                        gene,
-                        source_id=source_id,
-                        indexed_doc_ids=indexed_doc_ids,
-                    )
-                    if absent_doc_ids is not None:
-                        removals = _absent(absent_doc_ids, evidence="scope listing")
-                except AbsenceCheckSkipped as exc:
-                    # The run's content is committed; only the absence proof is
-                    # missing, so every unlisted Document keeps its Support and
-                    # the next run lists again. The run records which step
-                    # failed, so its sync activity shows that nothing was
-                    # removed; the provider's error stays in the log.
-                    absence_check_skipped_reason = exc.reason
-                    logger.warning(
-                        "Absence check skipped for %s (%s): %s",
-                        source_id,
-                        exc.reason,
-                        exc.__cause__,
-                    )
+            absence = await family.absence(
+                reprocessing=reprocessing,
+                transition_open=scope_transition is not None,
+                snapshot_proves_absence=run_coverage.proves_absence,
+                run_committed=run_committed,
+                indexed_doc_ids=indexed_doc_ids,
+                crawled_doc_ids=crawled_doc_ids,
+            )
+            removals = absence.removals
+            absence_check_skipped_reason = absence.skipped_reason
 
             if removals is not None:
                 if progress_callback:
@@ -1775,11 +1707,7 @@ class GeneSyncOrchestrator:
                 skipped_reading_group_count += result["skipped_reading_group_count"]
 
             if scope_transition is not None:
-                scoped_reconciliation_coverage = None
-                if docs_failed == 0 and isinstance(gene, ConversationGene) and await gene.completes_scope_transition():
-                    # Deselected conversations are removed and every readable
-                    # target conversation was polled in this attempt.
-                    scoped_reconciliation_coverage = ProjectionCoverage.TOMBSTONED_DELTA
+                scoped_reconciliation_coverage = await family.transition_coverage(docs_failed=docs_failed)
                 if (absence_is_authoritative or scoped_reconciliation_coverage is not None) and docs_failed == 0:
                     scope_transition = await self.db.complete_projection_scope_transition(
                         scope_transition.id,
@@ -1819,8 +1747,7 @@ class GeneSyncOrchestrator:
             # A conversation the Source cannot read keeps its Support and
             # fails nothing; the run is partial until the user restores
             # access or deselects it.
-            if not reprocessing and isinstance(gene, ConversationGene):
-                unreadable_conversations = gene.unreadable_conversations()
+            unreadable_conversations = family.unreadable_conversations(reprocessing=reprocessing)
             status = "success" if docs_failed == 0 and not unreadable_conversations else "partial"
 
         except Exception as e:
@@ -1976,65 +1903,6 @@ class GeneSyncOrchestrator:
         )
 
         return sync_state
-
-    async def _document_input(
-        self,
-        gene: Gene,
-        *,
-        source_id: str,
-        document_id: str,
-        rediscovering: bool,
-        failure: SourceItemFailure | None,
-    ) -> tuple[ContentItem, StoredSourceDocument | None]:
-        """The input of a Document the run processes as a reprocess.
-
-        A Source that can ask its provider for one Document by id reads its
-        current item, asking with the item the Document's failure ledger row
-        kept when the Document never committed a Unit. A conversation Source
-        plans every run afresh from committed Units, so it reads the stored
-        input of the Unit's current revision; when the Unit never committed,
-        discovery plans it again while its content is in reach, so nothing is
-        left to retry. Any other Source fetches the item the failure ledger
-        row kept, as discovery returned it: it names the revision that failed,
-        which the Unit's stored input does not hold. A Document without such a
-        row reads the stored input of its Unit's current revision.
-        """
-
-        if isinstance(gene, ConversationGene):
-            try:
-                stored = await load_stored_source_document(
-                    self.db, self.doc_store, gene, source_id=source_id, document_id=document_id,
-                )
-            except StoredDocumentUnavailable as exc:
-                if exc.reason is StoredDocumentUnavailableReason.SOURCE_UNIT_MISSING:
-                    raise StoredDocumentUnavailable(
-                        StoredDocumentUnavailableReason.PROVIDER_DOCUMENT_MISSING, document_id
-                    ) from exc
-                raise
-            return stored.item, stored
-        if not rediscovering:
-            if failure is not None and failure.item is not None:
-                return failure.item, None
-            stored = await load_stored_source_document(
-                self.db, self.doc_store, gene, source_id=source_id, document_id=document_id,
-            )
-            return stored.item, stored
-        try:
-            return (
-                await rediscover_source_document(self.db, gene, source_id=source_id, document_id=document_id),
-                None,
-            )
-        except StoredDocumentUnavailable as exc:
-            if (
-                exc.reason is not StoredDocumentUnavailableReason.SOURCE_UNIT_MISSING
-                or failure is None
-                or failure.item is None
-            ):
-                raise
-        current = await gene.rediscover(failure.item)
-        if current is None or current.item_id != document_id:
-            raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.PROVIDER_DOCUMENT_MISSING, document_id)
-        return current, None
 
     async def _record_failed_items(
         self,
@@ -4019,54 +3887,6 @@ class GeneSyncOrchestrator:
     # Private: deletion detection
     # ==================================================================
 
-    async def _absent_from_scope_listing(
-        self,
-        gene: Any,
-        *,
-        source_id: str,
-        indexed_doc_ids: set[str],
-    ) -> set[str] | None:
-        """The held Documents this run's scope listing proves the provider no longer has.
-
-        ``None`` when the Gene cannot list its scope. A listing or confirmation
-        that fails raises ``AbsenceCheckSkipped`` naming the step, and the
-        caller removes nothing in this run. An unlisted
-        Document of an existence listing is absent. One of a query listing is
-        absent only when the provider reports it not found; one that still
-        exists keeps its Unit and Support and is not refreshed while it stays
-        outside the query.
-        """
-
-        list_scope = getattr(gene, "list_scope", None)
-        try:
-            listing = await list_scope() if callable(list_scope) else None
-        except Exception as exc:
-            raise AbsenceCheckSkipped("scope_listing_failed") from exc
-        if listing is None:
-            return None
-        unlisted = indexed_doc_ids - listing.doc_ids
-        if not unlisted or listing.kind is ScopeListingKind.EXISTENCE:
-            return unlisted
-        try:
-            items = []
-            for doc_id in sorted(unlisted):
-                try:
-                    items.append(await stored_source_item(self.db, source_id=source_id, document_id=doc_id))
-                except StoredDocumentUnavailable as exc:
-                    # Nothing identifies the Document to ask its provider for,
-                    # so its absence cannot be proven and it is kept.
-                    logger.warning("Cannot confirm whether unlisted Document %s still exists: %s", doc_id, exc)
-            absent = set(await gene.confirm_absent(items)) & unlisted
-        except Exception as exc:
-            raise AbsenceCheckSkipped("absence_confirmation_failed") from exc
-        logger.info(
-            "Scope listing of %s left %d held Documents unlisted; %d are absent at the provider",
-            source_id,
-            len(unlisted),
-            len(absent),
-        )
-        return absent
-
     async def _detect_deletions(
         self,
         source_id: str,
@@ -4233,10 +4053,6 @@ class GeneSyncOrchestrator:
     async def _get_indexed_doc_ids(self, source_id: str) -> set[str]:
         """The Documents the Source holds: those with a current Source Unit."""
         return await self.db.list_indexed_doc_ids(source_id)
-
-    async def _count_missing_pdf_uris(self, source_id: str) -> int:
-        """Count non-empty Units whose stored input still lacks PDF provenance."""
-        return await self.db.count_missing_pdf_uris(source_id)
 
     async def _stored_unit_input(self, source_id: str, doc_id: str) -> SourceUnitInput | None:
         """The stored input of the Source's current Unit for this Document, if it recorded one."""

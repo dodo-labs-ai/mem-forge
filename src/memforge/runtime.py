@@ -43,7 +43,9 @@ from memforge.memory.health import MemoryIndexHealthChecker, MemoryIndexHealthRe
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.store import MemoryStore
 from memforge.models import SourceSyncRun, SyncState
-from memforge.genes.conversation_gene import CollectionAttempt, ConversationGene
+from memforge.genes.conversation_gene import CollectionAttempt
+from memforge.genes.family import CollectionFamilyKind
+from memforge.source_types import source_type_descriptor
 from memforge.conversations.collections import StoredCollections
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.sync_memory import SyncMemoryObserver
@@ -998,14 +1000,6 @@ async def run_source_sync(
             config=source_config,
             source_id=source["id"],
         )
-        if isinstance(gene, ConversationGene):
-            if collection_attempt is None:
-                raise ValueError("a conversation Source syncs only within a collection attempt")
-            gene.bind_conversation_run(
-                projection_store=db,
-                collections=StoredCollections(db, workspace_id=collection_attempt.workspace_id),
-                collection_attempt_id=collection_attempt.collection_attempt_id,
-            )
         sync_kwargs: dict[str, Any] = {
             "gene": gene,
             "source_name": source["name"],
@@ -1021,6 +1015,7 @@ async def run_source_sync(
             "reusable_projection_doc_ids": reusable_projection_doc_ids,
             "record_terminal_result": record_terminal_result,
             "failed_item_retry": failed_item_retry,
+            "collection_attempt": collection_attempt,
         }
         sync_operation = runtime.orchestrator().sync_gene(**sync_kwargs)
         if heartbeat_task is None:
@@ -1617,8 +1612,12 @@ class SourceSyncWorker:
         older than itself.
         """
 
-        gene_class = GENE_REGISTRY.get(str(source.get("type") or ""))
-        if run.input_snapshot_id is None or gene_class is None or not issubclass(gene_class, ConversationGene):
+        descriptor = source_type_descriptor(str(source.get("type") or ""))
+        if (
+            run.input_snapshot_id is None
+            or descriptor is None
+            or descriptor.family is not CollectionFamilyKind.CONVERSATION
+        ):
             return
         try:
             await StoredCollections(self.db, workspace_id=run.workspace_id).prune(
