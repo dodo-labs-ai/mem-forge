@@ -93,6 +93,8 @@ _DEFAULT_ORDER_BY = "ORDER BY updated DESC"
 # keeps its place, so paging neither repeats nor skips it.
 _LISTING_ORDER_BY = "ORDER BY key ASC"
 _ORDER_BY_RE = re.compile(r"\border\s+by\b", re.IGNORECASE)
+# An issue id (digits) or an issue key (project key, hyphen, number).
+_ISSUE_REF_RE = re.compile(r"\d+|[A-Z][A-Z0-9_]*-\d+")
 
 
 def _delta_clause(since: datetime) -> str:
@@ -164,14 +166,22 @@ def _build_jql(config: dict, since: datetime | None, *, order_by: str | None = N
     return jql
 
 
+def _jql_issue_ref(issue_ref: str) -> str:
+    """An issue id or key, checked to be safe to place unquoted in JQL; anything else raises."""
+    if not _ISSUE_REF_RE.fullmatch(issue_ref):
+        raise ValueError(f"Jira issue reference {issue_ref!r} is neither an issue id nor an issue key")
+    return issue_ref
+
+
 def _single_issue_jql(config: Mapping[str, Any], issue_ref: str) -> str:
     """Search for one issue, by id or key, only within the configured scope.
 
     The scope's where clause is parenthesized, so a top-level OR in an
     advanced JQL cannot widen the search beyond the one issue.
     """
+    clause = f"issuekey = {_jql_issue_ref(issue_ref)}"
     where = _scope_where(config)
-    return f"issuekey = {issue_ref} AND ({where})" if where else f"issuekey = {issue_ref}"
+    return f"{clause} AND ({where})" if where else clause
 
 
 def _issue_doc_id(issue_key: str) -> str:
@@ -581,7 +591,9 @@ class JiraGene(DocumentGene):
         ]
         if not issues:
             return None
-        if len(issues) > 1 or issue_ref not in (str(issues[0]["id"]), str(issues[0]["key"])):
+        # The issuekey predicate binds the identity: Jira also resolves a key
+        # the issue had before it moved, and answers with its current key.
+        if len(issues) > 1 or (issue_ref.isdigit() and str(issues[0]["id"]) != issue_ref):
             raise RuntimeError(f"Jira search for issue {issue_ref} returned another issue")
         issue = issues[0]
         current = _issue_content_item(issue, self._base_url)
@@ -644,7 +656,7 @@ class JiraGene(DocumentGene):
         answers: dict[str, AbsenceAnswer] = {}
         for start in range(0, len(items), JIRA_INVENTORY_MAX_RESULTS):
             batch = items[start:start + JIRA_INVENTORY_MAX_RESULTS]
-            refs = {item.item_id: _issue_ref(item) for item in batch}
+            refs = {item.item_id: _jql_issue_ref(_issue_ref(item)) for item in batch}
             found: set[str] = set()
             async for issue in self._search_issues(
                 f"issuekey in ({', '.join(refs.values())})",

@@ -7,7 +7,8 @@ one ``project = PAY AND labels = payroll``. Issue 100009 is gone.
 The search answers a scope query only when it carries the configured where
 clause, filtered by an ``updated >=`` clause when present; ``issuekey in
 (...)`` by issue id or key; and ``issuekey = X AND (<where>)`` with issue X
-when it exists and is in scope.
+when it exists and is in scope; any other single-issue search is rejected,
+as Jira rejects an ORDER BY inside the parentheses.
 """
 
 from __future__ import annotations
@@ -110,7 +111,11 @@ class _Provider:
         where = next((where for where in _SCOPES if where in jql), None)
         if where is None:
             return httpx.Response(400, json={"errorMessages": [f"unexpected JQL: {jql}"]})
-        if (single := re.fullmatch(r"issuekey = (\S+) AND \((.*)\)", jql)) is not None:
+        if jql.startswith("issuekey = "):
+            # Jira rejects anything but a bare where clause inside the parentheses, such as an ORDER BY.
+            single = re.fullmatch(rf"issuekey = (\S+) AND \({re.escape(where)}\)", jql)
+            if single is None:
+                return httpx.Response(400, json={"errorMessages": [f"invalid JQL: {jql}"]})
             key = _by_ref(single.group(1))
             matched = [key] if key is not None and _SCOPES[where](key) else []
         else:
