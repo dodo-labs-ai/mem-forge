@@ -6081,9 +6081,12 @@ export interface components {
          *     ``docs_*``, ``memories_*``, ``current_title``). The last recorded sync
          *     carries its totals, ``run_id``, ``failed_docs``,
          *     ``absence_check_skipped_reason``, which names the step that kept that run
-         *     from removing anything although its scope listing was due, and
-         *     ``skipped_reading_group_count``, the parts of its Documents the generation
-         *     model could not read. Fields outside the chosen shape are absent.
+         *     from removing anything although its scope listing was due,
+         *     ``unlisted_present_count``, the Documents its scope listing left out that
+         *     the provider confirmed it still has or hides (``null`` when the run
+         *     confirmed none), and ``skipped_reading_group_count``, the parts of its
+         *     Documents the generation model could not read. Fields outside the chosen
+         *     shape are absent.
          */
         SourceSyncStatusResponse: {
             /** Absence Check Skipped Reason */
@@ -6140,6 +6143,8 @@ export interface components {
             stop_requested_at?: string | null;
             /** Trigger */
             trigger?: string | null;
+            /** Unlisted Present Count */
+            unlisted_present_count?: number | null;
         };
         /**
          * SourceSyncStopResponse

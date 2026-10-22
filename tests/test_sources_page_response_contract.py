@@ -89,6 +89,7 @@ HISTORY_SYNC_KEYS = {
     "error_message",
     "failed_docs",
     "absence_check_skipped_reason",
+    "unlisted_present_count",
     "skipped_reading_group_count",
     "progress",
 }
@@ -393,6 +394,7 @@ def test_source_list_validates_rows_shaped_like_the_hana_workspace_store(tmp_pat
                     "error_message": "auth expired",
                     "failed_docs": [],
                     "absence_check_skipped_reason": None,
+                    "unlisted_present_count": None,
                     "skipped_reading_group_count": 0,
                     "started_at": "2026-06-13T00:00:01+00:00",
                     "finished_at": "2026-06-13T00:00:02+00:00",

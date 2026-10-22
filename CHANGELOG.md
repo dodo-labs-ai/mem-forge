@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- A document sync run takes one listing of its scope after discovery, before
+  it retries failed Documents, and decides both absence and the failure
+  ledger from it. A device's snapshot manifest is that listing, with the
+  Gene's single listing kind.
+  - Item failures no longer suspend absence. A Document that failed to fetch,
+    normalize, project, derive or commit says nothing about one the listing
+    left out, so the unlisted one is removed in the same run. The exception
+    is a rename: `ContentItem.renamed_from` names the predecessor Unit's
+    provider key, and that Unit is kept until its successor commits, while
+    the successor is in the run or in an open ledger row. GitHub maps an
+    attested `previous_filename` to it at discovery; the adapter reads only
+    `renamed_from`, which is serialized only when set.
+  - An existence listing settles every failure ledger row it does not name,
+    including a row whose Document never became a Unit and a row a scheduled
+    run would leave alone. A server query listing retries an unlisted row
+    through `rediscover` (settled when the item is gone or left the query) or,
+    without one, keeps it untried. A listing that fails settles nothing.
+  - Local-agent Jira no longer removes an issue that dropped out of its
+    manifest. Until the device confirms by identifier, such a run removes
+    nothing and records `absence_confirmation_missing`.
+  - A server query listing records how many unlisted Documents the provider
+    confirmed it still has or hides as `unlisted_present_count` in the sync
+    history; Source health returns it with the latest sync and the Admin UI
+    names those kept items.
+
 - A document connector says whether and how it lists its scope. A
   `DocumentGene` must implement the class method `lists_scope(config)` and
   `list_scope()`, which returns a complete `ScopeListing` or raises; startup
