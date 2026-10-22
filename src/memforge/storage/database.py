@@ -7080,29 +7080,25 @@ class Database:
 
     async def insert_changelog(self, entry: ChangelogEntry) -> None:
         """Record one Document change in the changelog."""
-        async with self._write_lock:
-            try:
-                await self.db.execute(
-                    """INSERT INTO changelog (
-                        doc_id, change_type, previous_version, current_version,
-                        content_diff, ai_change_summary, detected_at, title, source
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        entry.doc_id,
-                        entry.change_type,
-                        entry.previous_version,
-                        entry.current_version,
-                        entry.content_diff,
-                        entry.ai_change_summary,
-                        entry.detected_at.isoformat(),
-                        entry.title,
-                        entry.source,
-                    ),
-                )
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
+        async with self._write_transaction():
+            await self.db.execute(
+                """INSERT INTO changelog (
+                    doc_id, change_type, previous_version, current_version,
+                    content_diff, ai_change_summary, detected_at, title, source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    entry.doc_id,
+                    entry.change_type,
+                    entry.previous_version,
+                    entry.current_version,
+                    entry.content_diff,
+                    entry.ai_change_summary,
+                    entry.detected_at.isoformat(),
+                    entry.title,
+                    entry.source,
+                ),
+            )
+            await self.db.commit()
 
     async def delete_projected_document(
         self,

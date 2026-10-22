@@ -1863,17 +1863,16 @@ class GeneSyncOrchestrator:
                         scope_transition.id,
                     )
 
-        if self.memory_store is not None:
-            try:
-                await self.memory_store.attempt_lifecycle_vector_delivery(source_id=source_id)
-            except Exception:
-                # Relational lifecycle state and its durable outbox are
-                # authoritative. Delivery is run-level and independent of
-                # whether later source work completed successfully.
-                logger.exception(
-                    "Source sync completed with lifecycle vector delivery still pending for source %s",
-                    source_id,
-                )
+        try:
+            await self.memory_store.attempt_lifecycle_vector_delivery(source_id=source_id)
+        except Exception:
+            # Relational lifecycle state and its durable outbox are
+            # authoritative. Delivery is run-level and independent of
+            # whether later source work completed successfully.
+            logger.exception(
+                "Source sync completed with lifecycle vector delivery still pending for source %s",
+                source_id,
+            )
 
         # ------------------------------------------------------------------
         # Step 7: Record SyncState and sync_history
@@ -3821,9 +3820,6 @@ class GeneSyncOrchestrator:
         current_hash: str,
     ) -> None:
         """Record how an updated document will be processed."""
-        if not self.memory_store or not hasattr(self.memory_store, "record_audit_event"):
-            return
-
         context = self._memory_store_context(
             run_id=run_id,
             source_id=source_id,
@@ -3867,9 +3863,6 @@ class GeneSyncOrchestrator:
         result: MemoryExtractionResult,
     ) -> None:
         """Record whether a memory extraction call produced usable candidates."""
-        if not self.memory_store or not hasattr(self.memory_store, "record_audit_event"):
-            return
-
         context = self._memory_store_context(
             run_id=run_id,
             source_id=source_id,
@@ -3950,11 +3943,6 @@ class GeneSyncOrchestrator:
             "source_unit_llm_summary %s",
             json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
-        if not self.memory_store or not hasattr(
-            self.memory_store,
-            "record_audit_event",
-        ):
-            return
         await self.memory_store.record_audit_event(
             "source_unit_llm_summary",
             outcome,
@@ -3987,13 +3975,11 @@ class GeneSyncOrchestrator:
         source_id: str,
         doc_id: str,
     ):
-        if self.memory_store and hasattr(self.memory_store, "operation_context"):
-            return self.memory_store.operation_context(
-                run_id=run_id,
-                source_id=source_id,
-                doc_id=doc_id,
-            )
-        return None
+        return self.memory_store.operation_context(
+            run_id=run_id,
+            source_id=source_id,
+            doc_id=doc_id,
+        )
 
     async def _finalize_projected_document_moves(
         self,

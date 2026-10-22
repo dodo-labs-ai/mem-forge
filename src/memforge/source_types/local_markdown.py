@@ -18,7 +18,7 @@ def _complete_config(config: dict[str, Any], source_id: str, existing_config: Ma
 
 
 def _store_config(config: dict[str, Any], local_inbox: LocalInbox) -> dict[str, Any]:
-    config["documents_dir"] = local_inbox("documents_dir")
+    config["documents_dir"] = local_inbox()
     return config
 
 

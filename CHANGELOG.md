@@ -16,7 +16,8 @@
   always go through the memory store. The memory health issue
   `confluence_pdf_uri_missing` is renamed `pdf_uri_missing`.
   - Cloud: HANA `count_missing_pdf_uris` drops its Confluence predicate, and
-    the Cloud runtime no longer overrides the changelog write.
+    the Cloud runtime no longer overrides the changelog write, so a failed
+    changelog write is logged instead of failing the Document, as in OSS.
 - A document Source's next run reads from the start of the previous run, not
   its end, so an item changed while a long run was still going is read again.
   "Last synced" shows that start time.

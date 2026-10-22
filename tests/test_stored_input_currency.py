@@ -20,6 +20,7 @@ from memforge.source_activity import SourceActivityConflict
 from memforge.source_derivation import DERIVATION_DETERMINISTIC_FAILURE
 from memforge.source_item_failures import FailedItemRetry
 from memforge.storage.database import Database
+from tests.memory_store_fixture import OrchestratorMemoryStore
 from tests.gene_fixture import FakeGene
 from tests.test_source_reprocess import RawKeepingDocumentStore
 from tests.test_sync_bookkeeping import (
@@ -135,7 +136,7 @@ class Harness:
     def orchestrator(self, extractor=None) -> GeneSyncOrchestrator:
         return GeneSyncOrchestrator(
             db=self.db, doc_store=self.store, memory_extractor=extractor or self.extractor,
-            memory_engine=self.engine, memory_store=None, max_concurrent=1, retry_sleep=_skip_retry_delay,
+            memory_engine=self.engine, memory_store=OrchestratorMemoryStore(self.db), max_concurrent=1, retry_sleep=_skip_retry_delay,
         )
 
     async def sync(self, extractor=None, *, retry: FailedItemRetry = FailedItemRetry.ALL):

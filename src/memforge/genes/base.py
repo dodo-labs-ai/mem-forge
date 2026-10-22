@@ -126,6 +126,14 @@ class Gene(ABC):
         """The filter this run's discovery applied, as source activity shows it."""
         return f"updated >= {since.isoformat()}" if since else None
 
+    async def fetch_pdf(self, item: ContentItem) -> bytes | None:
+        """Render a PDF of one item.
+
+        A Gene overrides this exactly when its source type's descriptor sets
+        ``exports_pdf``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not export PDFs")
+
     def requires_pdf_artifact(
         self,
         *,

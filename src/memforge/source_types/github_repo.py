@@ -44,7 +44,7 @@ def validate_config(config: dict[str, Any], existing_config: Mapping[str, Any] |
 
 def _store_config(config: dict[str, Any], local_inbox: LocalInbox) -> dict[str, Any]:
     if _pushed_by_local_agent(config):
-        config["documents_dir"] = local_inbox("documents_dir")
+        config["documents_dir"] = local_inbox()
     return config
 
 

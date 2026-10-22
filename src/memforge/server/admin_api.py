@@ -3034,7 +3034,7 @@ def _store_source_config(
     if policy.store is None:
         return config
 
-    def local_inbox(key: str) -> str:
+    def local_inbox() -> str:
         from memforge.local_adapter import default_local_adapter_inbox
 
         inbox = default_local_adapter_inbox(app_config, source_id)
