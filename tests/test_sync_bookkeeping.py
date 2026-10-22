@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from memforge.pipeline.collection_family import SnapshotBinding
 from memforge.pipeline.revision_assessment import revision_inference_capability_hash
 
 import asyncio
@@ -16,8 +17,6 @@ from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
-
-from memforge.pipeline.collection_family import SnapshotBinding
 from PIL import Image
 from markdown_it import MarkdownIt
 from apscheduler.triggers.date import DateTrigger
