@@ -314,7 +314,7 @@ def local_agent_sync_operation(
     config: Mapping[str, Any] | str | None,
 ) -> str | None:
     """Return the daemon sync operation for a canonical source configuration."""
-    descriptor = source_type_descriptor(source_type)
+    descriptor = source_type_descriptor(str(source_type or "").strip().lower())
     collection = descriptor.local_agent if descriptor is not None else None
     if collection is None or not collection.collects(_source_config(config)):
         return None
@@ -337,7 +337,7 @@ def source_execution_descriptor(
 ) -> dict[str, Any]:
     """Return the canonical execution contract exposed to source clients."""
     operation = local_agent_sync_operation(source_type, config)
-    descriptor = source_type_descriptor(source_type)
+    descriptor = source_type_descriptor(str(source_type or "").strip().lower())
     collection = descriptor.local_agent if descriptor is not None else None
     return {
         "kind": "local_agent" if operation is not None else "server",
@@ -356,7 +356,7 @@ def local_agent_job_config(
     config: Mapping[str, Any] | str | None,
 ) -> dict[str, Any]:
     """Return connector config safe and useful for the owner's daemon."""
-    descriptor = source_type_descriptor(source_type)
+    descriptor = source_type_descriptor(str(source_type or "").strip().lower())
     collection = descriptor.local_agent if descriptor is not None else None
     if collection is None:
         return {}

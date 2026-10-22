@@ -43,15 +43,16 @@ _BUILTIN_SOURCE_TYPES = (
 _DESCRIPTORS: dict[str, SourceTypeDescriptor] = {}
 
 
-def _key(source_type: object) -> str:
-    return str(source_type or "").strip().lower()
-
-
 def register_source_type(descriptor: SourceTypeDescriptor) -> SourceTypeDescriptor:
-    """Register one source type; a second descriptor for the same type is refused."""
+    """Register one source type; a second descriptor for the same type is refused.
 
-    key = _key(descriptor.source_type)
-    if not key or key != descriptor.source_type:
+    Registration belongs to import time: the evidence-representation and
+    local-agent tables are built from the registry when their modules load.
+    Built-in types register when this package loads.
+    """
+
+    key = descriptor.source_type
+    if not key or key != key.strip().lower():
         raise ValueError(f"source type must be a lowercase name: {descriptor.source_type!r}")
     existing = _DESCRIPTORS.get(key)
     if existing is not None and existing is not descriptor:
@@ -61,9 +62,12 @@ def register_source_type(descriptor: SourceTypeDescriptor) -> SourceTypeDescript
 
 
 def source_type_descriptor(source_type: object) -> SourceTypeDescriptor | None:
-    """The descriptor of a registered source type, or ``None`` for an unknown one."""
+    """The descriptor of a registered source type, or ``None`` for an unknown one.
 
-    return _DESCRIPTORS.get(_key(source_type))
+    The name must match exactly; a caller that accepts loose input normalizes it first.
+    """
+
+    return _DESCRIPTORS.get(source_type) if isinstance(source_type, str) else None
 
 
 def registered_source_types() -> tuple[SourceTypeDescriptor, ...]:

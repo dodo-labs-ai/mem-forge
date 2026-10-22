@@ -5,9 +5,8 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Mapping
 
-from memforge.source_adapters.contracts import CanonicalRecordField, CanonicalRecordSchema
+from memforge.source_adapters.contracts import CanonicalRecordField, CanonicalRecordSchema, canonical_record_profile
 from memforge.source_adapters.jira_html import LEGACY_RENDERED_HTML_FORMAT, RENDERED_HTML_FORMAT
-from memforge.source_projection import EvidenceCoordinateSpace, EvidenceRepresentationProfile
 from memforge.source_time import latest_source_time, reported_source_time
 
 
@@ -160,15 +159,8 @@ CANONICAL_RECORD_SCHEMAS = {**CANONICAL_RECORD_SCHEMAS,
     **{(schema.name, schema.version): schema for schema in (ISSUE_SCHEMA, COMMENT_SCHEMA)}}
 
 
-def _profile(schema_name: str, version: int) -> EvidenceRepresentationProfile:
-    return EvidenceRepresentationProfile(
-        "canonical-record", 1, EvidenceCoordinateSpace.UNICODE_SCALAR,
-        schema_name=schema_name, schema_version=version,
-    )
-
-
 CURRENT_OBSERVATION_PROFILES = {
-    observation_type: _profile(schema.name, schema.version)
+    observation_type: canonical_record_profile(schema.name, schema.version)
     for observation_type, schema in (
         ("issue_core", ISSUE_SCHEMA), ("comment", COMMENT_SCHEMA),
         ("changelog", CHANGELOG_SCHEMA),
