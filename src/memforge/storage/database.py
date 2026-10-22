@@ -18610,7 +18610,8 @@ class Database:
         The Source row, its Source Units with their stored input, its Evidence
         Units and their lineage stay as immutable history; its active Support
         is removed. Document rows stay: a row this Source wrote last names a
-        Source that still holds the Document, when one does.
+        Source that still holds the Document, when one does. Its Projection
+        Scope transitions and their member rows are deleted.
         """
 
         async with self._write_lock:
@@ -18771,6 +18772,12 @@ class Database:
                     "conversation_collection_requests",
                 ):
                     await self.db.execute(f"DELETE FROM {table} WHERE source_id = ?", (source_id,))
+                # A retired Source changes scope no more; its transitions and,
+                # by cascade, their member rows go with it.
+                await self.db.execute(
+                    "DELETE FROM projection_scope_transitions WHERE source_id = ?",
+                    (source_id,),
+                )
                 await self.db.execute(
                     "DELETE FROM source_subscriptions WHERE source_id = ?",
                     (source_id,),
