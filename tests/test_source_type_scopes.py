@@ -78,6 +78,8 @@ _CONFIGS = {
             "auth_mode": "github_pat",
             "max_pages": 50,
             "sitemap_authoritative": True,
+            # A single page names its page; the branch only chooses where it is read.
+            "branch": "gh-pages",
         },
         {
             "sync_mode": "explicit_list",

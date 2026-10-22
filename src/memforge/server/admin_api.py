@@ -2683,7 +2683,7 @@ async def _plan_scope_change(
     source_type = str(source["type"])
     open_transition = await db.get_open_projection_scope_transition(source_id)
     if open_transition is not None:
-        open_transition = canonical_scope_transition(source_type, open_transition)
+        open_transition = canonical_scope_transition(source_type, open_transition, current_scope)
     document = _is_document_source_type(source_type)
     if open_transition is not None and not document:
         raise HTTPException(status_code=409, detail="projection_scope_transition_active")
@@ -2725,6 +2725,43 @@ def _scope_change_requires_listing_http_error(source_type: str, config: Mapping[
                 f"A scope change needs a configuration that lists its whole scope, and the mode "
                 f"'{unlisted.mode}' cannot, so the change could never complete. "
                 f"{unlisted.suggestion} Or create a new Source for this scope."
+            ),
+        },
+    )
+
+
+async def _require_listing_while_a_transition_is_open(
+    db: Database,
+    source: Mapping[str, Any],
+    config: Mapping[str, Any],
+) -> None:
+    """Refuse a change that keeps the scope but leaves a document Source unable to finish its open transition.
+
+    A transition completes only by listing its new scope. A configuration
+    change outside the scope, such as GitHub Pages turning off its token or
+    its complete sitemap, can make a listing configuration one that cannot
+    list; while a transition is open that answers 409
+    ``transition_requires_listing``.
+    """
+
+    source_type = str(source["type"])
+    if (
+        not _is_document_source_type(source_type)
+        or not source_lists_scope(source_type, source["config"])
+        or source_lists_scope(source_type, config)
+        or await db.get_open_projection_scope_transition(str(source["id"])) is None
+    ):
+        return
+    unlisted = cast(type[DocumentGene], GENE_REGISTRY[source_type]).unlisted_scope_mode(config)
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "transition_requires_listing",
+            "mode": unlisted.mode,
+            "message": (
+                f"A scope change in progress completes only by listing its new scope, and the mode "
+                f"'{unlisted.mode}' cannot list it. {unlisted.suggestion} Keep a configuration that lists "
+                f"until the change completes, or return to the previous scope."
             ),
         },
     )
@@ -8001,11 +8038,14 @@ def create_admin_app(
                 status_code=409,
                 detail="source_provider_namespace_immutable",
             )
-        scope_change = (
-            await _plan_scope_change(db, existing, src_config, current_projection_scope, target_projection_scope)
-            if scope_changed
-            else _ScopeChange(transition=None)
-        )
+        if scope_changed:
+            scope_change = await _plan_scope_change(
+                db, existing, src_config, current_projection_scope, target_projection_scope
+            )
+        else:
+            scope_change = _ScopeChange(transition=None)
+            if req.config is not None:
+                await _require_listing_while_a_transition_is_open(db, existing, src_config)
         auth_secret_changed = req.config is not None and _source_credentials_changed(
             existing["type"],
             req.config,
@@ -8162,7 +8202,9 @@ def create_admin_app(
         )
         transition = await db.get_open_projection_scope_transition(source["id"])
         if transition is not None:
-            transition = canonical_scope_transition(source["type"], transition)
+            transition = canonical_scope_transition(
+                source["type"], transition, _sync_scope_config(source["type"], source.get("config") or {})
+            )
             payload["projection_scope_transition"] = {
                 "id": transition.id,
                 "previous_scope": dict(transition.previous_scope),
@@ -8884,7 +8926,10 @@ def create_admin_app(
         )
         transition = await db.get_open_projection_scope_transition(source_id)
         if transition is not None:
-            transition = canonical_scope_transition(upload.gene.metadata().name, transition)
+            source_type = upload.gene.metadata().name
+            transition = canonical_scope_transition(
+                source_type, transition, _sync_scope_config(source_type, upload.gene.config)
+            )
             upload.gene.begin_scope_transition(
                 previous_scope=transition.previous_scope, target_scope=transition.target_scope
             )

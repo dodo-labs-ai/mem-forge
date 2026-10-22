@@ -154,3 +154,21 @@ def test_scope_transition_ids_are_fixed() -> None:
         )
         == "scope-transition-26888432bc3895537414"
     )
+
+
+def test_a_stored_scope_reads_a_field_its_transition_target_predates_from_the_configuration() -> None:
+    from memforge.source_projection_config import canonical_stored_scope
+
+    configured = {"sync_mode": "subtree", "root_url": "https://pages.example/guide", "branch": "gh-pages"}
+    before_branch = {"sync_mode": "subtree", "root_url": "https://pages.example/guide"}
+    with_branch = {**before_branch, "branch": "main"}
+    superseded = {"sync_mode": "subtree", "root_url": "https://pages.example/docs"}
+
+    # The open transition's target predates ``branch``, so every older scope does too.
+    assert canonical_stored_scope(
+        "github_pages", superseded, stored_target=before_branch, configured_scope=configured
+    ) == {**superseded, "branch": "gh-pages"}
+    # A target that sets the field was stored after it existed: an older scope without it read the default branch.
+    assert canonical_stored_scope(
+        "github_pages", superseded, stored_target=with_branch, configured_scope=configured
+    ) == superseded

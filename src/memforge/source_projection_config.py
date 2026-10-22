@@ -56,20 +56,59 @@ def canonical_projection_scope(source_type: str, config: Mapping[str, Any]) -> d
     return descriptor.canonical_scope(scope) if descriptor.canonical_scope else scope
 
 
-def canonical_scope_transition(source_type: str, transition: ProjectionScopeTransition) -> ProjectionScopeTransition:
-    """The stored transition with its previous and target scopes canonicalized again.
+def canonical_stored_scope(
+    source_type: str,
+    scope: Mapping[str, object],
+    *,
+    stored_target: Mapping[str, object],
+    configured_scope: Mapping[str, object],
+) -> dict[str, object]:
+    """A scope stored with a transition, canonicalized again against the current configuration.
+
+    An absent field reads its descriptor default. A scope field that
+    ``stored_target``, the target of the Source's open transition as stored,
+    lacks and ``configured_scope`` sets reads the configured value: every
+    scope change writes the configuration and its transition together, and a
+    later change supersedes the transition, so only a target stored before
+    the field existed can lack it, and the field has not changed since. The
+    transition's previous scope and every target it superseded are older
+    still, so they read it too. For example, a GitHub Pages subtree pinned to
+    ``branch: gh-pages`` whose transition was stored before ``branch`` was a
+    scope field reads ``gh-pages`` in both scopes.
+    """
+
+    stored = canonical_projection_scope(source_type, stored_target)
+    predating = {field: value for field, value in configured_scope.items() if field not in stored}
+    canonical = canonical_projection_scope(source_type, scope)
+    return canonical_projection_scope(
+        source_type,
+        {**{field: value for field, value in predating.items() if field not in canonical}, **canonical},
+    )
+
+
+def canonical_scope_transition(
+    source_type: str,
+    transition: ProjectionScopeTransition,
+    configured_scope: Mapping[str, object],
+) -> ProjectionScopeTransition:
+    """The stored transition with both scopes canonicalized again (:func:`canonical_stored_scope`).
 
     Every reader that compares a stored scope with a configured one, or hands
-    it on, reads it through this: a transition opened before a scope field
-    was added then matches the configuration it targets. For example, a Jira
+    it on, reads it through this, so a transition opened before a scope field
+    was added matches the configuration it targets. For example, a Jira
     target stored as ``{"projects": ["PAY"]}`` reads
     ``{"projects": ["PAY"], "query_mode": "simple"}``.
     """
 
+    def canonical(scope: Mapping[str, object]) -> dict[str, object]:
+        return canonical_stored_scope(
+            source_type, scope, stored_target=transition.target_scope, configured_scope=configured_scope
+        )
+
     return replace(
         transition,
-        previous_scope=canonical_projection_scope(source_type, transition.previous_scope),
-        target_scope=canonical_projection_scope(source_type, transition.target_scope),
+        previous_scope=canonical(transition.previous_scope),
+        target_scope=canonical(transition.target_scope),
     )
 
 

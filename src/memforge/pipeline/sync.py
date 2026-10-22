@@ -1013,7 +1013,9 @@ class GeneSyncOrchestrator:
         # opened before a scope field was added matches the configured scope.
         scope_transition = await self.db.get_open_projection_scope_transition(source_id)
         if scope_transition is not None:
-            scope_transition = canonical_scope_transition(configured_source_type, scope_transition)
+            scope_transition = canonical_scope_transition(
+                configured_source_type, scope_transition, configured_projection_scope
+            )
         if force_full_sync or reprocessing or scope_transition is not None:
             # Reuse is an ordinary incremental optimization only. Full syncs
             # and scope transitions require the full per-document path.
@@ -1124,6 +1126,7 @@ class GeneSyncOrchestrator:
                             scope_transition.id,
                             run_id=transition_run_id,
                         ),
+                        configured_projection_scope,
                     )
                     transition_started = True
                     family.begin_scope_transition(scope_transition)

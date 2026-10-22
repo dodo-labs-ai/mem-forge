@@ -53,7 +53,7 @@ from memforge.source_projection import (
     SourceRemoval,
     UnitRemovalReason,
 )
-from memforge.source_projection_config import canonical_projection_scope
+from memforge.source_projection_config import canonical_projection_scope, canonical_stored_scope
 
 if TYPE_CHECKING:
     from memforge.genes.base import Gene
@@ -681,12 +681,23 @@ class DocumentFamily(CollectionFamily):
 
         The superseded chain is walked by ``predecessor_transition_id`` back
         to the last applied scope. A scope equal to the new target is not
-        excluded. Each scope is canonicalized again, so one stored before a
-        scope field was added reads that field's default.
+        excluded. Each scope is canonicalized again against the configured
+        one (:func:`canonical_stored_scope`), so one stored before a scope
+        field was added reads that field as the open transition does.
         """
 
         source_type = self.gene.metadata().name
         target = canonical_projection_scope(source_type, transition.target_scope)
+        stored = await self.db.get_projection_scope_transition(transition.id)
+        if stored is None:
+            raise _TransitionStaysOpen(f"the transition {transition.id} is missing")
+        configured = canonical_projection_scope(source_type, self.gene.config)
+
+        def canonical(scope: Mapping[str, object]) -> dict[str, object]:
+            return canonical_stored_scope(
+                source_type, scope, stored_target=stored.target_scope, configured_scope=configured
+            )
+
         chain = [transition.previous_scope]
         predecessor_id = transition.predecessor_transition_id
         walked: set[str] = set()
@@ -701,9 +712,9 @@ class DocumentFamily(CollectionFamily):
             predecessor_id = predecessor.predecessor_transition_id
         scopes: list[dict[str, object]] = []
         for scope in chain:
-            canonical = canonical_projection_scope(source_type, scope)
-            if canonical != target and canonical not in scopes:
-                scopes.append(canonical)
+            excluded = canonical(scope)
+            if excluded != target and excluded not in scopes:
+                scopes.append(excluded)
         return scopes
 
     async def transition_outstanding(self, *, docs_failed: int, removals_failed: int) -> str | None:

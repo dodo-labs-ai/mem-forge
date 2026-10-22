@@ -386,7 +386,8 @@ async def test_a_stale_expected_transition_changes_nothing(db: Database) -> None
 
     with pytest.raises(ProjectionScopeTransitionStale):
         await _change_scope(db, _transition("t2", "/c", predecessor="t0"), expected_open_transition_id="t0")
-    with pytest.raises(ValueError, match="projection_scope_transition_active"):
+    # A change that read no open transition read stale facts too.
+    with pytest.raises(ProjectionScopeTransitionStale):
         await _change_scope(db, _transition("t3", "/d"))
     with pytest.raises(ValueError, match="must name the superseded one") as misuse:
         await _change_scope(db, _transition("t4", "/e"), expected_open_transition_id="t1")
