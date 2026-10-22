@@ -4,9 +4,11 @@
 
 - A document Source's scope transition completes by accumulated commitment.
   Each Document that commits under an open transition, through an unchanged
-  item's projection, a lifecycle commit, deferred convergence or a recovered
-  derivation, is recorded as one of its members in the same transaction; a
-  deferred commit is recorded only when it commits, and a tombstone never.
+  item's projection, a lifecycle commit, deferred convergence or the
+  recovery of a derivation staged since the transition opened, is recorded as
+  one of its members in the same transaction; a deferred commit is recorded
+  only when it commits, and a tombstone never. An older recovered derivation
+  records no member, so its Document is fetched again.
   Each transition run discovers everything, lists the new scope and fetches
   only the listed Documents that are not members yet (`force_full_sync`
   fetches them all). The transition completes once that listing is complete
@@ -14,8 +16,9 @@
   whole run without failures. Only the completing run removes: every held
   Document the new listing leaves out, as `removed_from_scope` under the
   transition's lifecycle cycle. A listed Document whose commit waits only on
-  Units that completion removes counts as committed: the run removes them,
-  converges, and completes only if that Document then committed; otherwise
+  Units of this run and Units that completion removes counts as committed:
+  the run removes them, converges, and completes only if that Document then
+  committed; otherwise
   the transition stays open with those removals applied. A run that cannot
   complete removes nothing and records why in the transition's error.
   - The run that completes a transition sets the sync cursor to the time the

@@ -2935,7 +2935,7 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
     """Defers the first commit of ``deferred_doc_id`` once.
 
     Its blocker is the first Unit this engine committed, ``unit-external``
-    with ``external_blocker``, or ``blocker_unit_id`` when one is set.
+    with ``external_blocker``, or the ``blocker_unit_ids`` when they are set.
     """
 
     def __init__(
@@ -2947,7 +2947,7 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
         self.external_blocker = external_blocker
         self.prepared_attempt_count = prepared_attempt_count
         self.deferred_doc_id = "jira-1"
-        self.blocker_unit_id: str | None = None
+        self.blocker_unit_ids: tuple[str, ...] | None = None
         self.apply_doc_ids: list[str] = []
         self.committed_unit_ids: list[str] = []
         self.commit_only_attempts: list[int] = []
@@ -2960,13 +2960,13 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
         self.apply_doc_ids.append(doc_id)
         if doc_id == self.deferred_doc_id and not self.deferred:
             self.deferred = True
-            blocker_unit_id = self.blocker_unit_id
-            if blocker_unit_id is None:
+            blocker_unit_ids = self.blocker_unit_ids
+            if blocker_unit_ids is None:
                 assert self.committed_unit_ids
-                blocker_unit_id = (
+                blocker_unit_ids = (
                     "unit-external"
                     if self.external_blocker
-                    else self.committed_unit_ids[0]
+                    else self.committed_unit_ids[0],
                 )
             bundle = bind_source_lifecycle_outcome(
                 source_id=projection.source_id,
@@ -3004,7 +3004,7 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
             )
             handle = DeferredProjectedLifecycleHandle(
                 source_unit_id=source_unit_id,
-                blocking_source_unit_ids=(blocker_unit_id,),
+                blocking_source_unit_ids=blocker_unit_ids,
                 _prepared=prepared,
                 _runtime_bundle=bundle,
             )

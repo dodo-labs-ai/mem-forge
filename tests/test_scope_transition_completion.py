@@ -13,6 +13,9 @@ from datetime import datetime, timezone
 
 import pytest
 
+from memforge.memory.engine import MemoryEngine
+from memforge.memory.lifecycle_plan import ProjectedLifecycleBlocker, ProjectedLifecycleDeferredError
+from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.models import ScopeListingKind
 from memforge.pipeline.collection_family import DEFAULT_INCREMENTAL_SYNC_OVERLAP
 from memforge.source_projection import (
@@ -21,7 +24,10 @@ from memforge.source_projection import (
     UnitRemovalReason,
 )
 from memforge.source_projection_config import canonical_projection_scope
+from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
+from tests.llm_fixture import AdmittingClient
+from tests.memory_store_fixture import OrchestratorMemoryStore
 from tests.test_document_absence import (
     JIRA_CONFIG,
     SOURCE_ID,
@@ -57,7 +63,7 @@ async def workspace(tmp_path):
         await database.close()
 
 
-async def _change_scope(workspace) -> None:
+async def _change_scope(workspace, *, opened_at: datetime = OPENED_AT) -> None:
     """The user changes the Source's scope: the Source holds the new configuration and an open transition."""
     await workspace.db.upsert_source(
         id=SOURCE_ID,
@@ -73,7 +79,7 @@ async def _change_scope(workspace) -> None:
             source_id=SOURCE_ID,
             previous_scope=canonical_projection_scope("jira", JIRA_CONFIG),
             target_scope=canonical_projection_scope("jira", TARGET_CONFIG),
-            created_at=OPENED_AT.isoformat(),
+            created_at=opened_at.isoformat(),
         )
     )
 
@@ -207,7 +213,7 @@ async def test_a_listed_document_blocked_only_by_a_unit_completion_removes_commi
     await _change_scope(workspace)
     engine = _OrderRecordingMemoryEngine(defer=True)
     engine.deferred_doc_id = "jira-2"
-    engine.blocker_unit_id = await workspace.unit_id("jira-1")
+    engine.blocker_unit_ids = (await workspace.unit_id("jira-1"),)
     workspace.engine = engine
 
     # The new scope leaves jira-1 out; jira-2's commit waits on jira-1's Unit.
@@ -230,7 +236,7 @@ async def test_a_blocked_document_that_still_fails_after_the_removals_leaves_the
     await _change_scope(workspace)
     engine = _OrderRecordingMemoryEngine(defer=True)
     engine.deferred_doc_id = "jira-2"
-    engine.blocker_unit_id = await workspace.unit_id("jira-1")
+    engine.blocker_unit_ids = (await workspace.unit_id("jira-1"),)
     retry = engine.retry_deferred_projected_lifecycle
 
     async def failing_retry(handle, *, eligible_same_run_source_unit_ids):
@@ -353,4 +359,105 @@ async def test_a_device_manifest_completes_a_transition_and_removes_what_it_does
     assert state.last_sync_status == "success"
     assert workspace.tombstoned() == ["jira-1"]
     assert await _removal_reason(workspace, "jira-1") == UnitRemovalReason.REMOVED_FROM_SCOPE.value
+    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
+
+
+@pytest.mark.asyncio
+async def test_a_listed_document_blocked_by_a_unit_of_this_run_and_one_completion_removes_completes(workspace):
+    repository = JiraProject(existing={0, 1}, listing_kind=ScopeListingKind.EXISTENCE)
+    await _synced(workspace, repository)
+    await _change_scope(workspace)
+    engine = _OrderRecordingMemoryEngine(defer=True)
+    engine.deferred_doc_id = "jira-2"
+    # jira-0 is unchanged and recorded by this run; jira-1 is left out of the new scope.
+    engine.blocker_unit_ids = (await workspace.unit_id("jira-0"), await workspace.unit_id("jira-1"))
+    workspace.engine = engine
+
+    repository.move_on(existing={0, 2})
+    state = await workspace.sync(repository)
+
+    assert state.last_sync_status == "success"
+    assert engine.events == [("tombstone", "jira-1"), ("commit", "jira-2")]
+    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
+
+
+@pytest.mark.asyncio
+async def test_a_derivation_staged_before_the_transition_opened_is_fetched_again(workspace):
+    """An edit made before the transition opened is older than the cursor its completion sets."""
+    repository = JiraProject(existing={0}, listing_kind=ScopeListingKind.EXISTENCE)
+    await _synced(workspace, repository)
+    # jira-1's derivation is staged, but its commit fails for good in this run.
+    workspace.engine = _OrderRecordingMemoryEngine(defer=True)
+    workspace.engine.external_blocker = True
+    repository.move_on(existing={0, 1}, changed={0, 1})
+    repository.edited.add(0)
+    staged = await workspace.sync(repository)
+    assert {failed.doc_id for failed in staged.failed_docs} == {"jira-1"}
+    await _change_scope(workspace, opened_at=datetime.now(timezone.utc))
+
+    # The next run recovers jira-1's staged derivation, which records no
+    # member, so discovery fetches jira-1 again under the transition.
+    workspace.engine = _OrderRecordingMemoryEngine(defer=False)
+    repository.move_on(existing={0, 1})
+    state = await workspace.sync(repository)
+
+    assert ("commit", "jira-1") in workspace.engine.events, "the staged derivation was recovered"
+    assert "jira-1" in repository.fetched
+    assert state.last_sync_status == "success"
+    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
+
+
+@pytest.mark.asyncio
+async def test_a_real_lifecycle_commit_records_its_member_only_when_its_deferred_commit_converges(workspace):
+    repository = JiraProject(existing={0}, listing_kind=ScopeListingKind.EXISTENCE)
+    await _synced(workspace, repository)
+    await _change_scope(workspace)
+    jira_0_unit_id = await workspace.unit_id("jira-0")
+    apply = workspace.db.apply_source_projection_lifecycle
+    commits: list[tuple[str, str | None, tuple[str, ...]]] = []
+
+    async def deferring_apply(projection, plan, **kwargs):
+        doc_id = kwargs["unit_input"].document_id if kwargs.get("unit_input") is not None else None
+        members = await workspace.db.list_projection_scope_transition_member_doc_ids(TRANSITION_ID)
+        commits.append((doc_id, kwargs.get("scope_transition_id"), members))
+        if doc_id == "jira-1" and len(commits) == 1:
+            # jira-1's plan consumed Support of jira-0's Unit, which this run records afresh.
+            raise ProjectedLifecycleDeferredError(
+                "same-run cross-Unit Support is stale",
+                [
+                    ProjectedLifecycleBlocker(
+                        memory_id="mem-shared",
+                        source_unit_id=jira_0_unit_id,
+                        evidence_unit_id="evidence-shared",
+                        supported_unit_revision_id="revision-old",
+                        current_unit_revision_id="revision-new",
+                    )
+                ],
+            )
+        await apply(projection, plan, **kwargs)
+
+    workspace.db.apply_source_projection_lifecycle = deferring_apply
+    memory_store = OrchestratorMemoryStore(workspace.db)
+    adapters = build_sqlite_adapters(workspace.db, object())
+    workspace.engine = MemoryEngine(
+        cross_document_candidates=CrossDocumentCandidateRetriever(
+            relational=adapters.relational,
+            keyword=adapters.keyword,
+            vector=adapters.vector,
+        ),
+        db=workspace.db,
+        memory_store=memory_store,
+        structured_llm_client=AdmittingClient(),
+    )
+
+    repository.move_on(existing={0, 1})
+    state = await workspace.sync(repository)
+
+    assert state.last_sync_status == "success"
+    # The deferred commit wrote no member; its convergence carried the
+    # transition from the prepared commit and wrote it.
+    assert commits == [
+        ("jira-1", TRANSITION_ID, ("jira-0",)),
+        ("jira-1", TRANSITION_ID, ("jira-0",)),
+    ]
     assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED

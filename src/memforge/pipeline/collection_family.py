@@ -21,7 +21,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 from memforge.conversations.collections import StoredCollections
@@ -132,15 +132,6 @@ def _absent(doc_ids: set[str], *, evidence: str) -> dict[str, SourceRemoval]:
     }
 
 
-def _opened_at(transition: ProjectionScopeTransition) -> datetime:
-    """When the user's scope change opened the transition."""
-
-    if transition.created_at is None:
-        raise ValueError(f"scope transition {transition.id} records no opening time")
-    opened = datetime.fromisoformat(transition.created_at)
-    return opened if opened.tzinfo is not None else opened.replace(tzinfo=timezone.utc)
-
-
 class CollectionFamily(ABC):
     """One sync run's family steps, bound to the run's Gene and Source."""
 
@@ -239,7 +230,7 @@ class CollectionFamily(ABC):
         ``uncommitted`` holds the item of every Document of this run, and of
         every failure ledger row the run leaves open, that has not committed.
         ``deferred_blockers`` maps each Document whose commit is still
-        deferred to the Units that block it.
+        deferred to the Units outside this run that block it.
         """
 
     @abstractmethod
@@ -517,9 +508,9 @@ class DocumentFamily(CollectionFamily):
         The run can complete it when its listing of the new scope is complete
         and every listed Document has committed under the transition, in this
         run or an earlier one. A listed Document whose commit is still
-        deferred counts as committed when every Unit that blocks it is one this
-        completion removes: removing them is what lets it commit, and
-        :meth:`transition_outstanding` checks that it did.
+        deferred counts as committed when every Unit outside this run that
+        blocks it is one this completion removes: removing them is what lets
+        it commit, and :meth:`transition_outstanding` checks that it did.
 
         Completion removes every held Document the new listing leaves out, as
         ``removed_from_scope``. A run that cannot complete the transition
@@ -618,7 +609,7 @@ class DocumentFamily(CollectionFamily):
                 transition_completed=transition_completed,
             )
         if transition_completed or (previous is None and status == "success"):
-            return _opened_at(transition)
+            return transition.opened_at
         return previous
 
     async def _current_unit_ids(self, doc_ids: Collection[str]) -> set[str]:
