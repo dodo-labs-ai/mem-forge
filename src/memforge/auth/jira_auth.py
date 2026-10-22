@@ -109,6 +109,16 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _refresh_instruction(origin: str) -> str:
+    """The command that captures a fresh browser session for ``origin``."""
+
+    return (
+        "Sign in to Jira in your browser, then run "
+        f"`memforge adapter auth jira refresh --base-url {origin}` "
+        "(add `--workspace-id` when your account can select more than one workspace)."
+    )
+
+
 def _principal_id(principal: dict[str, Any]) -> str | None:
     value = principal.get("accountId") or principal.get("key") or principal.get("name")
     return str(value) if value else None
@@ -231,8 +241,7 @@ class JiraAuthSessionService:
         stored = await self.db.get_auth_session(JIRA_AUTH_PROVIDER, origin)
         if not stored:
             raise JiraAuthSessionMissingError(
-                f"No Jira browser session is available for {origin}. "
-                "Sign in to Jira in your browser, then run `memforge adapter auth jira refresh`."
+                f"No Jira browser session is available for {origin}. {_refresh_instruction(origin)}"
             )
 
         try:
@@ -246,8 +255,7 @@ class JiraAuthSessionService:
                 last_error=str(exc),
             )
             raise JiraAuthSessionMissingError(
-                f"Jira browser session expired for {origin}. "
-                "Sign in to Jira in your browser, then run `memforge adapter auth jira refresh`."
+                f"Jira browser session expired for {origin}. {_refresh_instruction(origin)}"
             ) from exc
 
         if stored.get("principal_id") and _principal_id(principal) != stored.get("principal_id"):
