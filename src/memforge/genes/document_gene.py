@@ -228,6 +228,11 @@ class DocumentGene(Gene):
         tree. Implemented exactly when :meth:`rediscovers_documents` can answer
         ``True``.
 
+        Answer ``None`` only when the provider's answer shows it. Raise on
+        authentication, rate-limit, transport and server errors, and on an
+        answer that is incomplete or names another item: the Document then
+        keeps its state and is tried again on a later run.
+
         Checked by ``test_rediscover_keeps_the_predicates_of_discover``.
         """
         raise NotImplementedError(f"{type(self).__name__} cannot rediscover one Document")

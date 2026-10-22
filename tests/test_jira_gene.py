@@ -1918,3 +1918,42 @@ async def test_rediscovery_raises_when_the_search_fails_or_answers_inconsistentl
             await gene.rediscover(_stored_issue("PAY-1", "100001"))
     finally:
         await gene._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rediscovery_by_an_old_key_accepts_the_issue_under_its_new_key():
+    # Jira resolves the key an issue had before it moved, and answers with its current key.
+    searches: list[dict] = []
+    moved = _jira_issue("OPS-7", issue_id="100001")
+    gene = _transport_gene(_rediscovery_handler(searches, {"PAY-1": moved}), {"projects": ["PAY", "OPS"]})
+    stored = ContentItem(
+        item_id="jira-PAY-1",
+        title="PAY-1",
+        source_url="https://jira.example.test/browse/PAY-1",
+        last_modified=datetime(2026, 5, 21, tzinfo=timezone.utc),
+        extra={"issue_key": "PAY-1"},
+    )
+    try:
+        current = await gene.rediscover(stored)
+    finally:
+        await gene._client.aclose()
+
+    assert [body["jql"].split(" AND ", 1)[0] for body in searches] == ["issuekey = PAY-1"]
+    assert (current.item_id, current.extra["issue_id"]) == ("jira-OPS-7", "100001")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("issue_ref", ["PAY-1) OR (project = HR", "pay-1", "PAY-", "1 OR 2"])
+async def test_an_issue_reference_that_is_not_an_id_or_key_never_reaches_jql(issue_ref):
+    searches: list[dict] = []
+    gene = _transport_gene(_rediscovery_handler(searches, {}), {"projects": ["PAY"]})
+    stored = _stored_issue("PAY-1", issue_ref)
+    try:
+        with pytest.raises(ValueError, match="neither an issue id nor an issue key"):
+            await gene.rediscover(stored)
+        with pytest.raises(ValueError, match="neither an issue id nor an issue key"):
+            await gene.confirm_absent([stored])
+    finally:
+        await gene._client.aclose()
+
+    assert searches == []

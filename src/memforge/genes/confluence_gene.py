@@ -341,9 +341,12 @@ class ConfluenceGene(DocumentGene):
         """Every page the configured page tree or spaces hold, as the walk of this run visited them.
 
         Discovery walks the whole scope whatever ``since`` is, so a run that
-        discovered returns that walk; otherwise the scope is walked here.
-        Either walk visits a page below an excluded label's page too, so a
-        page leaves the listing only when it leaves the tree or space.
+        discovered returns that walk; otherwise the scope is walked here. A
+        page carrying an excluded label is listed, though never yielded. A
+        space walk lists every page of the space. A page tree walk does not
+        descend below a page with an excluded label, so a page below one
+        leaves the listing; being a query listing, it is kept unless
+        :meth:`confirm_absent` answers ``absent``.
         """
 
         if self._preview_discovery_limit() is not None:
