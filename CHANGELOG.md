@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- A document connector says whether and how it lists its scope. A
+  `DocumentGene` must implement the class method `lists_scope(config)` and
+  `list_scope()`, which returns a complete `ScopeListing` or raises; startup
+  refuses a Gene, including one outside this repository, that leaves either
+  out. `confirm_absent` returns an `AbsenceAnswer` (`absent`, `exists` or
+  `hidden`) per Document id instead of the set of absent ids, and
+  `atlassian_record_state` replaces `atlassian_record_is_gone`. A GitHub Pages
+  Source whose authoritative sitemap cannot be read, so that discovery falls
+  back to the link crawl, now records `scope_listing_failed` for its absence
+  check; it still removes nothing. `tests/contracts/document_fakes` holds the
+  fakes each registered document type needs for the connector contract suite.
 - Jira looks one issue up again, when a failed issue is retried or a Document
   is reprocessed at its current revision, by searching within the Source's
   JQL: `issuekey = <id> AND (<where clause>)`, without the incremental
