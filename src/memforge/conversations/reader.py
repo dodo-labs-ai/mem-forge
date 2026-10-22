@@ -207,7 +207,12 @@ def unit_ref(unit: SourceUnit) -> UnitRef:
 
 
 def _members(ref: UnitRef, revisions: Collection[SourceObservationRevision]) -> tuple[Member, ...]:
-    """The message members of one Unit revision, each with the artifacts its revision holds for it."""
+    """The message members of one Unit revision, each with the artifacts its revision holds for it.
+
+    Every revision is a message record or a Source Artifact of one. Any other
+    revision fails the read: a member left out of it would silently leave its
+    Unit at the next projection.
+    """
 
     records: dict[str, tuple[str, Mapping[str, object], str | None]] = {}
     artifacts: dict[str, list[MemberArtifact]] = {}
@@ -243,6 +248,8 @@ def _members(ref: UnitRef, revisions: Collection[SourceObservationRevision]) -> 
             raise ValueError(f"Source Artifact revision {revision.id} of Unit {ref.unit_id} cannot be read")
         elif provider_key and revision.evidence_profile is not None and revision.evidence_profile.schema_name:
             records[revision.observation_id] = (provider_key, json.loads(revision.content), revision.observed_at)
+        else:
+            raise ValueError(f"Observation revision {revision.id} of Unit {ref.unit_id} is not a message record")
     members = [
         Member(
             identity=MessageIdentity(ref.conversation_id, message_id),

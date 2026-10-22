@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -76,7 +77,12 @@ def _readable(conversation_id: str, *intervals: Interval) -> ConversationEvidenc
             poll_includes_replies=True,
         ),
         polls=tuple(
-            PollEvidence(requested=interval, outcome=PollOutcome.REACHED_START, started_at=NOW)
+            PollEvidence(
+                requested=interval,
+                outcome=PollOutcome.REACHED_START,
+                started_at=NOW,
+                earliest_complete_page_time=interval.start - timedelta(minutes=1),
+            )
             for interval in intervals
         ),
     )
@@ -152,6 +158,42 @@ async def test_a_readable_conversation_must_be_polled_over_exactly_the_requested
 
     with pytest.raises(CollectionRejected, match="requested intervals"):
         await _receive(database, _payload(_readable("c1", wider), _readable("c2", *c2.intervals)))
+
+
+def _with_polls(evidence: ConversationEvidence, **changes) -> ConversationEvidence:
+    return replace(evidence, polls=tuple(replace(poll, **changes) for poll in evidence.polls))
+
+
+@pytest.mark.parametrize(
+    "complete_from",
+    [None, "at_start"],
+    ids=["without a complete time", "complete only from the start itself"],
+)
+async def test_a_poll_that_reached_its_start_must_be_complete_from_before_it(database, complete_from):
+    request = await _issue(database)
+    (c1, c2) = request.conversations
+    start = c1.intervals[0].start
+    claimed = _with_polls(
+        _readable("c1", *c1.intervals), earliest_complete_page_time=start if complete_from == "at_start" else None
+    )
+
+    with pytest.raises(CollectionRejected, match="reached its start without a complete time before it; upgrade"):
+        await _receive(database, _payload(claimed, _readable("c2", *c2.intervals)))
+
+
+@pytest.mark.parametrize("listed_at", ["unlisted", "before the interval"])
+async def test_a_poll_names_as_its_earliest_message_only_one_it_could_have_returned(database, listed_at):
+    request = await _issue(database)
+    (c1, c2) = request.conversations
+    before = c1.intervals[0].start - timedelta(days=1)
+    listed = _message("m1", NOW - timedelta(hours=1) if listed_at == "unlisted" else before)
+    claimed = _with_polls(
+        _readable("c1", *c1.intervals),
+        earliest_returned_at=NOW - timedelta(hours=3) if listed_at == "unlisted" else before,
+    )
+
+    with pytest.raises(CollectionRejected, match="earliest message the manifest does not list inside its interval"):
+        await _receive(database, _payload(claimed, _readable("c2", *c2.intervals), messages=(listed,)))
 
 
 async def test_an_attempt_keeps_its_first_manifest_and_refuses_another(database):

@@ -1897,11 +1897,14 @@ class GeneSyncOrchestrator:
 
         # Advance the incremental watermark after a sync whose failures, if
         # any, are all recorded in the failure ledger, including no-change
-        # runs where discovery returns zero items. A run with a Projection
-        # Scope transition advances it only when it succeeds. A reprocess discovers
-        # nothing, so the cursor stays where the last sync left it.
+        # runs where discovery returns zero items. The watermark is the run's
+        # start, which precedes its discovery, so an item the provider changes
+        # after discovery read it is read again by the next run. A run with a
+        # Projection Scope transition advances it only when it succeeds. A
+        # reprocess discovers nothing, so the cursor stays where the last sync
+        # left it.
         if not reprocessing and (status == "success" or (status == "partial" and not transition_run)):
-            sync_at = finished_at
+            sync_at = started_at
         elif existing_state and existing_state.last_sync_at:
             sync_at = existing_state.last_sync_at
         else:

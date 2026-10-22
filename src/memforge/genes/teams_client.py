@@ -423,6 +423,7 @@ class TeamsChatClient:
                 earliest_complete_page_time = page.complete_from
                 if page.complete_from < start:
                     return TeamsMessagePoll(messages=tuple(messages.values()), outcome=PollOutcome.REACHED_START,
+                                            earliest_complete_page_time=earliest_complete_page_time,
                                             stop_reason="reached_start")
             if page.oldest or page.complete_from is None:
                 return TeamsMessagePoll(messages=tuple(messages.values()), outcome=PollOutcome.HISTORY_EXHAUSTED,
