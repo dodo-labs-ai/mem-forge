@@ -56,12 +56,12 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_INCREMENTAL_SYNC_OVERLAP",
-    "SnapshotBinding",
     "AbsenceCheckSkipped",
     "AbsenceOutcome",
     "CollectionFamily",
     "ConversationFamily",
     "DocumentFamily",
+    "SnapshotBinding",
     "collection_family",
 ]
 

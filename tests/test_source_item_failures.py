@@ -9,9 +9,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from memforge.pipeline.collection_family import SnapshotBinding
-
 from memforge.config import AppConfig, SyncConfig
+from memforge.pipeline.collection_family import SnapshotBinding
 from memforge.models import SyncState
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.release import current_release

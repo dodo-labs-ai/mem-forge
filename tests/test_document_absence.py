@@ -348,3 +348,15 @@ async def test_removing_a_project_from_the_jql_is_a_scope_transition_that_remove
     assert workspace.tombstoned() == ["jira-1"]
     assert transition.status is ProjectionScopeTransitionStatus.APPLIED
     assert await workspace.held() == {"jira-0"}
+
+
+@pytest.mark.asyncio
+async def test_a_run_without_an_input_snapshot_records_no_complete_snapshot_in_its_projections(workspace):
+    await _synced(workspace, JiraProject(existing={0, 1}))
+
+    async with workspace.db.db.execute(
+        "SELECT scope_json FROM source_projection_runs WHERE source_id = ?", (SOURCE_ID,)
+    ) as cursor:
+        scopes = [json.loads(row[0]) async for row in cursor]
+
+    assert scopes and all(scope["authoritative_snapshot"] is False for scope in scopes)
