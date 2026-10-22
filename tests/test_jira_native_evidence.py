@@ -453,11 +453,11 @@ def test_jira_underline_is_not_an_insertion_event_and_legacy_format_remains_pinn
 
 
 def test_jira_format_upgrade_preserves_historical_text_views():
-    from memforge.source_adapters.jira import _profile
+    from memforge.source_adapters.contracts import canonical_record_profile
 
     projected = projection('+Keep the condition.+', '<p><ins>Keep the condition.</ins></p>')
     revision = projected.observation_revisions[0]
-    historical = replace(revision, id='historical-v4', evidence_profile=_profile('jira-issue-core', 4))
+    historical = replace(revision, id='historical-v4', evidence_profile=canonical_record_profile('jira-issue-core', 4))
     old_index = build_revision_fragment_index(historical)
     assert not old_index.errors
     old_fragment = next(f for f in old_index.fragments if '[inserted: Keep the condition.]' in f.presentation_text)

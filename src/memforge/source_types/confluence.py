@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from typing import Any
 
 from memforge.source_adapters import confluence as adapter
-from memforge.source_adapters.contracts import canonical_record_profile
 from memforge.source_types.config import SourceConfigPolicy, list_has_value
 from memforge.source_types.descriptor import SourceTypeDescriptor
 
@@ -52,7 +51,7 @@ DESCRIPTOR = SourceTypeDescriptor(
     scope_fields=("sync_mode", "spaces", "page_tree_root", "exclude_labels", "include_children"),
     canonical_scope=_canonical_scope,
     project_native=adapter.project_native,
-    evidence_profiles={"page_body": canonical_record_profile("confluence-page-storage")},
+    evidence_profiles=adapter.CURRENT_OBSERVATION_PROFILES,
     legacy_evidence_profiles=adapter.LEGACY_OBSERVATION_PROFILES,
     record_schemas=adapter.CANONICAL_RECORD_SCHEMAS,
     exports_pdf=True,

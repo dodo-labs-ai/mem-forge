@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 from memforge.source_adapters import teams as adapter
-from memforge.source_adapters.contracts import canonical_record_profile
 from memforge.source_types.config import SourceConfigPolicy
 from memforge.source_types.descriptor import LocalAgentCollection, SourceTypeDescriptor
 
@@ -36,8 +35,8 @@ DESCRIPTOR = SourceTypeDescriptor(
     # Initial history changes collection breadth but never removes established
     # lineage. Only an explicit rolling-retention policy changes membership.
     scope_fields=("conversation_ids", "channels", "group_chats", "individual_chats", "rolling_retention_days"),
-    evidence_profiles={"message": canonical_record_profile("teams-message", 2)},
-    legacy_evidence_profiles={"message": canonical_record_profile("teams-message", 1)},
+    evidence_profiles=adapter.CURRENT_OBSERVATION_PROFILES,
+    legacy_evidence_profiles=adapter.LEGACY_OBSERVATION_PROFILES,
     record_schemas=adapter.CANONICAL_RECORD_SCHEMAS,
     local_agent=LocalAgentCollection(
         operation="teams_sync",

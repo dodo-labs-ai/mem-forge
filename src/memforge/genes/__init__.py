@@ -1,7 +1,7 @@
 """Gene lookup and construction by source type.
 
 Every source type registers one descriptor in :mod:`memforge.source_types`,
-and the descriptor names its Gene. ``GENE_REGISTRY`` is a read-only view of
+and the descriptor names its Gene, which loads with this package. ``GENE_REGISTRY`` is a read-only view of
 those descriptors keyed by source type; the sync orchestrator uses
 ``create_gene()`` to instantiate a Gene and ``list_available_genes()`` to
 populate the UI.
@@ -85,3 +85,9 @@ def source_rediscovers_documents(source_type: str, config: Mapping[str, Any]) ->
     """Whether a configured Source can ask its provider for one Document by id."""
     gene_cls = GENE_REGISTRY.get(str(source_type or "").strip())
     return gene_cls is not None and gene_cls.rediscovers_documents(config)
+
+
+# Every registered Gene loads with this package, so a connector that cannot
+# load fails startup instead of going missing.
+for _descriptor in registered_source_types():
+    _descriptor.gene_class()
