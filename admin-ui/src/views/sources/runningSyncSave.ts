@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { resourceClient } from "@/api/client";
 import type { Source } from "@/api/types";
@@ -40,22 +40,43 @@ export function runningSyncOfRefusedSave(error: unknown): string | null {
 /**
  * Stops the Source's sync and resolves once the run has ended. A running
  * server sync ends at its worker's next heartbeat, within about 30 seconds.
+ * It waits for the run the stop reached, which is `runId` unless another sync
+ * started meanwhile. Aborting `signal` stops the waiting, not the sync.
  */
 export async function stopSyncAndWaitForRunEnd(
   sourceId: string,
   runId: string,
-  { pollMs = RUN_END_POLL_MS, timeoutMs = RUN_END_TIMEOUT_MS }: { pollMs?: number; timeoutMs?: number } = {},
+  {
+    pollMs = RUN_END_POLL_MS,
+    timeoutMs = RUN_END_TIMEOUT_MS,
+    signal,
+  }: { pollMs?: number; timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<void> {
-  await resourceClient.post(`/sources/${sourceId}/sync/stop`);
+  const stopped = await resourceClient.post<{ run_id?: string | null }>(`/sources/${sourceId}/sync/stop`);
+  const stoppedRunId = stopped.data?.run_id ?? runId;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const run = await resourceClient.get<{ status: string }>(`/sources/${sourceId}/sync-runs/${runId}`);
+    signal?.throwIfAborted();
+    const run = await resourceClient.get<{ status: string }>(
+      `/sources/${sourceId}/sync-runs/${stoppedRunId}`,
+      { signal },
+    );
     if (!ACTIVE_RUN_STATUSES.has(run.data.status)) return;
     if (Date.now() >= deadline) {
       throw new Error("The sync has not stopped yet. Wait a moment, then save again.");
     }
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    await delay(pollMs, signal);
   }
+}
+
+function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    }, { once: true });
+  });
 }
 
 /**
@@ -80,18 +101,30 @@ export function useRunningSyncSave<Payload>({
 }) {
   const queryClient = useQueryClient();
   const [pendingSave, setPendingSave] = useState<{ runId: string; payload: Payload } | null>(null);
+  // The wait of a stop in progress. Waiting for the sync, or leaving the dialog,
+  // aborts it, so the save it waited for never happens.
+  const stopWait = useRef<AbortController | null>(null);
+
+  useEffect(() => () => stopWait.current?.abort(), []);
 
   const stopAndSave = useMutation({
-    mutationFn: ({ source, run }: { source: string; run: string; payload: Payload }) =>
-      stopSyncAndWaitForRunEnd(source, run),
-    onSuccess: (_, { payload }) => {
+    mutationFn: ({ source, run, signal }: { source: string; run: string; payload: Payload; signal: AbortSignal }) =>
+      stopSyncAndWaitForRunEnd(source, run, { signal }),
+    onSuccess: (_, { payload, signal }) => {
+      if (signal.aborted) return;
       setPendingSave(null);
       attemptSave(payload);
     },
   });
 
-  function confirm(runId: string, payload: Payload) {
+  function abandonStopWait() {
+    stopWait.current?.abort();
+    stopWait.current = null;
     stopAndSave.reset();
+  }
+
+  function confirm(runId: string, payload: Payload) {
+    abandonStopWait();
     setPendingSave({ runId, payload });
   }
 
@@ -122,13 +155,15 @@ export function useRunningSyncSave<Payload>({
       attemptSave(payload);
     },
     stopAndSave() {
-      if (sourceId && pendingSave) {
-        stopAndSave.mutate({ source: sourceId, run: pendingSave.runId, payload: pendingSave.payload });
-      }
+      if (!sourceId || !pendingSave) return;
+      abandonStopWait();
+      const controller = new AbortController();
+      stopWait.current = controller;
+      stopAndSave.mutate({ source: sourceId, run: pendingSave.runId, payload: pendingSave.payload, signal: controller.signal });
     },
+    /** Saves nothing and keeps the edits. A stop already requested still stops the sync. */
     wait() {
-      if (stopAndSave.isPending) return;
-      stopAndSave.reset();
+      abandonStopWait();
       setPendingSave(null);
     },
   };

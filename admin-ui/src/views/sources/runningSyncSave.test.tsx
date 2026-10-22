@@ -34,7 +34,17 @@ it("stops the sync and waits until its run has ended", async () => {
 
   expect(resourceClient.post).toHaveBeenCalledWith("/sources/src-1/sync/stop");
   expect(resourceClient.get).toHaveBeenCalledTimes(2);
-  expect(resourceClient.get).toHaveBeenLastCalledWith("/sources/src-1/sync-runs/ssr-1");
+  expect(resourceClient.get).toHaveBeenLastCalledWith("/sources/src-1/sync-runs/ssr-1", { signal: undefined });
+});
+
+it("waits for the run the stop reached when another sync started meanwhile", async () => {
+  vi.mocked(resourceClient.post).mockResolvedValue({ data: { outcome: "stopping", run_id: "ssr-new" } });
+  vi.mocked(resourceClient.get).mockResolvedValue({ data: { run_id: "ssr-new", status: "failed" } });
+
+  await stopSyncAndWaitForRunEnd("src-1", "ssr-1", { pollMs: 1 });
+
+  expect(resourceClient.get).toHaveBeenCalledWith("/sources/src-1/sync-runs/ssr-new", { signal: undefined });
+  expect(resourceClient.get).not.toHaveBeenCalledWith("/sources/src-1/sync-runs/ssr-1", expect.anything());
 });
 
 it("gives up waiting with a message to save again later", async () => {
@@ -93,4 +103,47 @@ it("asks when the server refuses a save because a sync started meanwhile", async
   act(() => result.current.wait());
   expect(result.current.confirming).toBe(false);
   expect(resourceClient.post).not.toHaveBeenCalled();
+});
+
+/** A run read that answers only when the test says so, while the hook waits. */
+function holdRunRead() {
+  let answer: (status: string) => void = () => {};
+  vi.mocked(resourceClient.post).mockResolvedValue({ data: { outcome: "stopping", run_id: "ssr-1" } });
+  vi.mocked(resourceClient.get).mockImplementation(() => new Promise((resolve) => {
+    answer = (status) => resolve({ data: { run_id: "ssr-1", status } });
+  }));
+  return {
+    answer: (status: string) => answer(status),
+    signal: () => (vi.mocked(resourceClient.get).mock.calls[0][1] as { signal: AbortSignal }).signal,
+  };
+}
+
+it.each([
+  ["the dialog closes", "unmount"],
+  ["the person waits for the sync instead", "wait"],
+])("saves nothing when %s while the sync is stopping", async (_, leave) => {
+  const runRead = holdRunRead();
+  const save = vi.fn().mockResolvedValue(undefined);
+  const { result, unmount } = renderHook(
+    () => useRunningSyncSave<string>({ sourceId: "src-1", activeRunId: "ssr-1", saveError: null, save }),
+    { wrapper },
+  );
+  act(() => result.current.save("edits"));
+  act(() => result.current.stopAndSave());
+  await waitFor(() => expect(resourceClient.get).toHaveBeenCalledOnce());
+
+  if (leave === "unmount") {
+    unmount();
+  } else {
+    act(() => result.current.wait());
+    expect(result.current.confirming).toBe(false);
+    expect(result.current.stopping).toBe(false);
+  }
+  expect(runRead.signal().aborted).toBe(true);
+  runRead.answer("failed");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  expect(save).not.toHaveBeenCalled();
+  expect(resourceClient.get).toHaveBeenCalledOnce();
+  expect(resourceClient.post).toHaveBeenCalledWith("/sources/src-1/sync/stop");
 });

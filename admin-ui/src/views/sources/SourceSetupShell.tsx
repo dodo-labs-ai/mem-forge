@@ -43,7 +43,7 @@ export interface RunningSyncSave {
   stopping: boolean;
   error: string | null;
   onStopAndSave: () => void;
-  /** Keeps the dialog open with its edits and saves nothing. */
+  /** Keeps the dialog open with its edits and saves nothing, also while the sync is stopping. */
   onWait: () => void;
 }
 
@@ -187,7 +187,7 @@ function RunningSyncConfirmation({ runningSync }: { runningSync: RunningSyncSave
         if (!open) runningSync.onWait();
       }}
     >
-      <DialogContent className="sm:max-w-md" showCloseButton={!runningSync.stopping}>
+      <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Stop the sync and save?</DialogTitle>
           <DialogDescription>
@@ -195,6 +195,12 @@ function RunningSyncConfirmation({ runningSync }: { runningSync: RunningSyncSave
             keeps what it has saved, and the next sync uses your new settings.
           </DialogDescription>
         </DialogHeader>
+        {runningSync.stopping && (
+          <p className="text-sm text-muted-foreground">
+            The sync usually stops within a minute. Waiting instead keeps your edits unsaved, and the sync still
+            stops.
+          </p>
+        )}
         {runningSync.error && (
           <div className="flex items-start gap-2 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
             <AlertCircle className="mt-0.5 size-4 shrink-0" />
@@ -202,7 +208,7 @@ function RunningSyncConfirmation({ runningSync }: { runningSync: RunningSyncSave
           </div>
         )}
         <DialogFooter>
-          <Button type="button" variant="outline" disabled={runningSync.stopping} onClick={runningSync.onWait}>
+          <Button type="button" variant="outline" onClick={runningSync.onWait}>
             Wait for the sync to finish
           </Button>
           <Button type="button" disabled={runningSync.stopping} onClick={runningSync.onStopAndSave}>
