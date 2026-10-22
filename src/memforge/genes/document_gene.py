@@ -21,6 +21,10 @@ and the run decides what to do with it from the listing's kind. Discovery
 still decides what to fetch: ``discover(since)`` yields the items that changed,
 and the listing only names identifiers.
 
+A Source collected on a user's device, such as local markdown, submits a
+complete snapshot of its scope instead. The run reads that snapshot as the
+existence listing of the scope and does not call :meth:`DocumentGene.list_scope`.
+
 Choosing the listing kind
 -------------------------
 
