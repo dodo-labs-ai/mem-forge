@@ -14,6 +14,7 @@ from memforge.evals.offline_evaluation import (
     OfflineEvaluationStore,
     ProductionSourceUnitDerivationReplayExecutor,
     SourceUnitReconciliationReplayExecutor,
+    SourceUnitSupportReplayExecutor,
     StructuredOfflineSemanticJudge,
 )
 from memforge.runtime import RuntimeProvider, resolve_models
@@ -30,7 +31,7 @@ async def build_offline_evaluation_for_run(
 ) -> OfflineAgentEvaluation:
     """Build candidate and judge adapters from one pinned Run manifest.
 
-    ``document_store`` holds the image Artifacts the pinned derivations read.
+    ``document_store`` holds the image Artifacts the pinned derivations and Supports read.
     """
 
     models = await resolve_models(store, config)
@@ -57,6 +58,9 @@ async def build_offline_evaluation_for_run(
         executors={
             AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION: (
                 ProductionSourceUnitDerivationReplayExecutor(structured_client, document_store)
+            ),
+            AgentEvaluationCaseKind.SOURCE_UNIT_SUPPORT: (
+                SourceUnitSupportReplayExecutor(structured_client, document_store)
             ),
             AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION: (
                 SourceUnitReconciliationReplayExecutor(structured_client)

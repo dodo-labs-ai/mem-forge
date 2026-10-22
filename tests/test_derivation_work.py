@@ -95,6 +95,11 @@ async def test_durable_work_reuses_completed_result_after_reopen_and_checks_depe
         changed_model = DerivationWork.create("support_scan", {**scan.manifest, "model": "different-model"})
         assert changed_model.id != scan.id
         assert (await db.stage_derivation_work(derivation_id=root.id, work=changed_model)).status == "pending"
+        # A derivation's journal reads back whole, verified and in work id order.
+        assert await db.list_source_derivation_work(root.id) == tuple(
+            sorted((completed, child, changed_model), key=lambda work: work.id)
+        )
+        assert await db.list_source_derivation_work("another-root") == ()
     finally:
         await db.close()
 
