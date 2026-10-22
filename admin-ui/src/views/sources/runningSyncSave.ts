@@ -1,9 +1,13 @@
 import { useMutation } from "@tanstack/react-query";
 import { resourceClient } from "@/api/client";
 
-/** How often, and for how long, a save that stopped a sync waits for that sync to end. */
+/**
+ * How often, and for how long, a save that stopped a sync waits for that sync
+ * to end. A worker stops within a heartbeat; when its worker died, the run
+ * ends only after its five-minute lease expires and another worker claims it.
+ */
 const RUN_END_POLL_MS = 2_000;
-const RUN_END_TIMEOUT_MS = 3 * 60_000;
+const RUN_END_TIMEOUT_MS = 7 * 60_000;
 
 const ACTIVE_RUN_STATUSES = new Set(["pending", "running"]);
 

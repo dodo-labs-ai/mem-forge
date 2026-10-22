@@ -16632,7 +16632,7 @@
     },
     "/api/v1/sources/{source_id}/sync/stop": {
       "post": {
-        "description": "Stop the Source's sync in progress. The Source stays active and later syncs run as scheduled.\n\nA server run that has not started, and the collection jobs of the\nSource's local daemon, end at once. A running server run ends at its\nworker's next heartbeat: what it committed stays, and it removes\nnothing and does not advance the sync cursor.",
+        "description": "Stop the Source's sync in progress. The Source stays active and later syncs run as scheduled.\n\nA person who manages the Source, or who runs its sync, can stop it.\nA server run that has not started, and the collection jobs of the\nSource's local daemon, end at once. A running server run ends at its\nworker's next heartbeat: what it committed stays, and it removes\nnothing and does not advance the sync cursor.",
         "operationId": "stop_source_sync_api_v1_sources__source_id__sync_stop_post",
         "parameters": [
           {

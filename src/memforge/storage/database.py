@@ -19552,6 +19552,14 @@ class Database:
                     ),
                 )
                 if pending:
+                    # A run that started a scope transition and went back to
+                    # pending releases it, so a later run can start it again.
+                    await self.db.execute(
+                        """UPDATE projection_scope_transitions
+                           SET status = 'failed', error = ?, updated_at = ?
+                           WHERE run_id = ? AND status = 'running'""",
+                        (SOURCE_SYNC_CANCELLED_BY_USER, requested_at, active["run_id"]),
+                    )
                     await self._insert_terminal_sync_history_unlocked(
                         run_id=str(active["run_id"]),
                         state=SyncState(

@@ -8177,7 +8177,8 @@ def create_admin_app(
     ):
         """Stop the Source's sync in progress. The Source stays active and later syncs run as scheduled.
 
-        A person who manages the Source, or who runs its sync, can stop it. A server run that has not started, and the collection jobs of the
+        A person who manages the Source, or who runs its sync, can stop it.
+        A server run that has not started, and the collection jobs of the
         Source's local daemon, end at once. A running server run ends at its
         worker's next heartbeat: what it committed stays, and it removes
         nothing and does not advance the sync cursor.

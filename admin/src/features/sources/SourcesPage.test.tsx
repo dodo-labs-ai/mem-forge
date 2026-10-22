@@ -490,6 +490,18 @@ test("Stop sync stops the running sync of a source, from its row and from its dr
   expect(within(drawer).getByRole("button", { name: "Syncing" })).toBeDisabled();
 });
 
+test("someone who can pause a source but not sync it can still stop its sync", async () => {
+  const base = makeSource();
+  const running = makeSource({
+    capabilities: { ...base.capabilities!, can_sync: false, can_configure: true },
+    sync: { status: "running", run_id: "ssr-run", started_at: "2026-10-23T08:00:00Z", finished_at: null, error_message: null, progress: null },
+  });
+  renderPage([running], {});
+  const table = await screen.findByRole("table", { name: "Sources" });
+
+  expect(await within(table).findByRole("button", { name: "Stop sync" })).toBeEnabled();
+});
+
 test("a sync being stopped reads Stopping and a stopped one reads Stopped, not failed", async () => {
   const stopping = makeSource({
     sync: {

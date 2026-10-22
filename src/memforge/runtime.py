@@ -1580,8 +1580,13 @@ class SourceSyncWorker:
                 )
                 if not failed:
                     raise SourceSyncLeaseLost(f"source sync lease lost before failure update for run {run.run_id}")
-                _publish_terminal_runtime_bundles(runtime, final_state)
-                if next_attempt_at is None:
+                # A failure that would be retried ends a run someone asked to
+                # stop, and the store then keeps none of its final state.
+                ended = await self.db.get_source_sync_run(run.run_id)
+                stopped = next_attempt_at is not None and ended is not None and ended.status != "pending"
+                if not stopped:
+                    _publish_terminal_runtime_bundles(runtime, final_state)
+                if next_attempt_at is None or stopped:
                     await self._release_collection(run, source)
                 return run
             completed = await self.db.complete_source_sync_run(
