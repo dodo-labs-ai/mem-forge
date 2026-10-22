@@ -1407,6 +1407,9 @@ CREATE TABLE IF NOT EXISTS projection_scope_transitions (
     predecessor_transition_id TEXT,
     run_id                    TEXT,
     error                     TEXT,
+    -- Whether the latest run reached the step that lists the excluded scopes,
+    -- so the next device job carries them.
+    excluded_scopes_due       INTEGER NOT NULL DEFAULT 0 CHECK (excluded_scopes_due IN (0, 1)),
     created_at                TEXT NOT NULL,
     updated_at                TEXT NOT NULL,
     completed_at              TEXT
@@ -5134,6 +5137,18 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE sync_history ADD COLUMN unlisted_present_count INTEGER",
         ],
     ),
+    (
+        128,
+        "Record on a scope transition that its next device job carries the excluded scopes",
+        # A device lists the excluded scopes only when its job carries them; a
+        # run that reached the step that lists them marks the transition so
+        # the next job does, even when deferred commits keep listed Documents
+        # from being members.
+        [
+            "ALTER TABLE projection_scope_transitions ADD COLUMN excluded_scopes_due INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (excluded_scopes_due IN (0, 1))",
+        ],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -7125,7 +7140,7 @@ class Database:
         due_at = _utc_iso(claim_time)
         enqueued = 0
         # Each job's payload is read before the write transaction; the schedule
-        # update below claims a Source only while its due time is unchanged.
+        # update below claims a Source only while its due time and configuration are unchanged.
         async with self.db.execute(
             """SELECT * FROM sources s WHERE status = 'active'
                AND sync_schedule_enabled = 1
@@ -7173,17 +7188,21 @@ class Database:
                             f"memforge:{workspace_id}:{row['id']}:{expected_due}",
                         ).hex
                     )
+                    # A configuration saved since the payload was read leaves
+                    # the Source due, for the next pass to read it again.
                     cursor = await self.db.execute(
                         """UPDATE sources SET sync_schedule_next_at = ?,
                            sync_schedule_updated_at = ?
                            WHERE id = ? AND status = 'active'
                              AND sync_schedule_enabled = 1
-                             AND sync_schedule_next_at = ?""",
+                             AND sync_schedule_next_at = ?
+                             AND config = ?""",
                         (
                             _utc_iso(claim_time + timedelta(minutes=interval)),
                             due_at,
                             row["id"],
                             expected_due,
+                            row["config"],
                         ),
                     )
                     if cursor.rowcount:
@@ -8723,7 +8742,7 @@ class Database:
             try:
                 cursor = await self.db.execute(
                     """UPDATE projection_scope_transitions
-                       SET status = 'applied', error = NULL,
+                       SET status = 'applied', error = NULL, excluded_scopes_due = 0,
                            updated_at = ?, completed_at = ?
                        WHERE id = ? AND status = 'running' AND run_id = ?""",
                     (now, now, transition_id, run_id),
@@ -8748,15 +8767,20 @@ class Database:
         *,
         run_id: str,
         error: str,
+        excluded_scopes_due: bool = False,
     ) -> ProjectionScopeTransition:
-        """Mark the transition the run holds failed; it stays open and keeps its member rows."""
+        """Mark the transition the run holds failed; it stays open and keeps its member rows.
+
+        ``excluded_scopes_due`` records whether the run reached the step that
+        lists the excluded scopes, so the next device job carries them.
+        """
         now = _now_iso()
         async with self._write_lock:
             cursor = await self.db.execute(
                 """UPDATE projection_scope_transitions
-                   SET status = 'failed', error = ?, updated_at = ?
+                   SET status = 'failed', error = ?, excluded_scopes_due = ?, updated_at = ?
                    WHERE id = ? AND status = 'running' AND run_id = ?""",
-                (error, now, transition_id, run_id),
+                (error, int(excluded_scopes_due), now, transition_id, run_id),
             )
             if cursor.rowcount != 1:
                 await self.db.rollback()
@@ -8783,7 +8807,7 @@ class Database:
         now = _now_iso()
         cursor = await self.db.execute(
             """UPDATE projection_scope_transitions
-               SET status = 'superseded', updated_at = ?, completed_at = ?
+               SET status = 'superseded', excluded_scopes_due = 0, updated_at = ?, completed_at = ?
                WHERE id = ? AND status IN ('pending', 'running', 'failed')""",
             (now, now, transition_id),
         )
@@ -24563,6 +24587,7 @@ class Database:
             predecessor_transition_id=d.get("predecessor_transition_id"),
             run_id=d.get("run_id"),
             error=d.get("error"),
+            excluded_scopes_due=bool(d.get("excluded_scopes_due")),
             created_at=d.get("created_at"),
             updated_at=d.get("updated_at"),
             completed_at=d.get("completed_at"),

@@ -270,3 +270,31 @@ def test_every_builder_enqueues_the_same_payload_for_the_same_source(tmp_path):
     assert LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD in expected
     shared = {key: value for key, value in expected.items() if key not in LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS}
     assert payloads == {"manual": shared, "explicit": shared, "scheduled": shared}
+
+
+async def test_a_configuration_saved_while_the_scheduler_reads_leaves_the_source_due(db, monkeypatch):
+    import memforge.storage.database as database_module
+
+    await _source(db)
+    due = datetime.now(timezone.utc) - timedelta(minutes=1)
+    await db.set_source_sync_schedule(SOURCE, enabled=True, interval_minutes=60, next_run_at=due)
+    read = database_module.local_agent_sync_job_payload
+
+    async def read_then_save(store, row, *args):
+        payload = await read(store, row, *args)
+        # The owner saves a new JQL after the scheduler read the payload.
+        await store.db.execute(
+            "UPDATE sources SET config = ? WHERE id = ?",
+            (json.dumps({**BASE_CONFIG, "jql": "project = OPS"}), SOURCE),
+        )
+        await store.db.commit()
+        return payload
+
+    monkeypatch.setattr(database_module, "local_agent_sync_job_payload", read_then_save)
+    raced = await db.enqueue_due_local_agent_jobs()
+    monkeypatch.setattr(database_module, "local_agent_sync_job_payload", read)
+    retried = await db.enqueue_due_local_agent_jobs()
+
+    [row] = await db.db.execute_fetchall("SELECT payload_json FROM local_agent_jobs WHERE source_id = ?", (SOURCE,))
+    assert (raced, retried) == (0, 1)
+    assert json.loads(row["payload_json"])["jql"] == "project = OPS"

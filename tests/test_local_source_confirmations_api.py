@@ -412,3 +412,26 @@ def test_a_manifest_answers_only_the_excluded_scopes_its_job_carried(jira):
         409,
         "source snapshot manifest changed",
     )
+
+
+@pytest.mark.parametrize("rejected", [False, True], ids=["listed", "rejected"])
+def test_a_manifest_with_excluded_listings_asks_only_about_what_they_leave_out(jira, rejected):
+    client, database, source_id, lease = jira
+    lease.payload = {"excluded_scopes": [{"scope_key": "scope-old", "config": {}}]}
+    _hold(database, source_id, {"PAY-1": "10001", "PAY-2": "10002", "PAY-3": "10003"})
+    listing = (
+        {"scope_key": "scope-old", "rejection": "JiraQueryRejected: project 'OPS' does not exist"}
+        if rejected
+        else {"scope_key": "scope-old", "doc_ids": [_doc(source_id, "PAY-1"), _doc(source_id, "PAY-2")]}
+    )
+
+    planned = _manifest(client, source_id, items=[_doc(source_id, "PAY-1")], excluded=[listing])
+
+    # PAY-2 is removed from scope on its listing, so only PAY-3 needs the device;
+    # a rejected scope says nothing, so both are asked about.
+    expected = ["PAY-2", "PAY-3"] if rejected else ["PAY-3"]
+    assert planned.status_code == 200, planned.text
+    assert planned.json()["confirm"] == sorted(
+        ({"doc_id": _doc(source_id, key), "provider_key": f"1000{key[-1]}"} for key in expected),
+        key=lambda entry: entry["doc_id"],
+    )

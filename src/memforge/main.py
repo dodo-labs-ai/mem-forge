@@ -67,6 +67,7 @@ from memforge.local_agent.document_identity import (
     build_jira_doc_id,
     build_local_markdown_doc_id,
 )
+from memforge.local_agent.snapshot_manifest import SNAPSHOT_MANIFEST_MAX_ITEMS
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
     LOCAL_AGENT_TRANSITION_PAYLOAD_FIELDS,
@@ -4262,7 +4263,8 @@ async def _list_excluded_jira_scopes(
 
     Each scope runs its own JQL with this session, and its issues are named by
     this Source's device Document ids. A scope whose configuration cannot be
-    built, or whose JQL Jira rejects, is reported rejected with the cause. A
+    built, whose JQL Jira rejects, or which lists more issues than a manifest
+    holds, is reported rejected with the cause. A
     scope that fails for any other reason, such as the network, is left out,
     so the transition stays open until a later collection lists it.
     """
@@ -4289,6 +4291,19 @@ async def _list_excluded_jira_scopes(
             http_client = getattr(gene, "_client", None)
             if http_client is not None:
                 await http_client.aclose()
+        if len(listing.doc_ids) > SNAPSHOT_MANIFEST_MAX_ITEMS:
+            # The scope can never be listed within a manifest, so it is as
+            # definitive as a JQL Jira refuses.
+            listings.append(
+                {
+                    "scope_key": scope_key,
+                    "rejection": (
+                        f"The excluded scope lists {len(listing.doc_ids)} issues, more than the "
+                        f"{SNAPSHOT_MANIFEST_MAX_ITEMS} a manifest holds"
+                    ),
+                }
+            )
+            continue
         listings.append(
             {
                 "scope_key": scope_key,

@@ -12,6 +12,8 @@ from typing import Any
 from memforge.source_activity import SourceActivityConflict
 from memforge.source_time import SOURCE_UPDATED_AT_KEY
 
+SNAPSHOT_MANIFEST_MAX_ITEMS = 10_000
+"""The most items one device manifest, and each of its excluded listings, may name."""
 COMPLETE_SNAPSHOT = "complete_snapshot"
 """The coverage every device manifest declares: the complete item set of its scope (ADR 0011)."""
 UPSERT = "upsert"

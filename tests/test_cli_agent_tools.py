@@ -2650,6 +2650,8 @@ def test_local_agent_cloud_jira_lists_each_excluded_scope_with_its_own_jql(monke
     [(_name, planned)] = [call for call in FakeToolClient.calls if call[0] == "prepare_local_source_snapshot"]
     # Each issue under this Source's device Document id; a rejected JQL is
     # reported; a scope that could not be reached is left out.
+    # PAY-1 is in the collection and in the excluded scope under the same Document id.
+    assert build_jira_doc_id(source_id="src-jira", issue_key="PAY-1") in {item["doc_id"] for item in planned["items"]}
     assert planned["excluded_listings"] == [
         {
             "scope_key": "scope-old",
@@ -2671,6 +2673,26 @@ def test_local_agent_cloud_jira_lists_each_excluded_scope_with_its_own_jql(monke
     )
     # Every session, the collection's and each excluded scope's, is closed.
     assert events.count("closed") == 4
+
+
+def test_local_agent_cloud_jira_reports_an_excluded_scope_over_the_manifest_bound_as_rejected(monkeypatch):
+    events: list[str] = []
+    FakeToolClient.reset({})
+    # The fake scope lists two issues; a manifest here holds one.
+    monkeypatch.setattr(main, "SNAPSHOT_MANIFEST_MAX_ITEMS", 1)
+    scope = {"base_url": "https://jira.example.test", "auth_mode": "browser_cookie", "query_mode": "advanced"}
+
+    payload = _run_confirming_jira_job(
+        monkeypatch,
+        _confirming_jira_gene(events),
+        excluded_scopes=[{"scope_key": "scope-old", "config": {**scope, "jql": "project in (PAY, OPS)"}}],
+    )
+
+    assert payload.get("error") is None, payload
+    [(_name, planned)] = [call for call in FakeToolClient.calls if call[0] == "prepare_local_source_snapshot"]
+    assert planned["excluded_listings"] == [
+        {"scope_key": "scope-old", "rejection": "The excluded scope lists 2 issues, more than the 1 a manifest holds"}
+    ]
 
 
 def test_local_agent_cloud_jira_confirms_what_its_manifest_left_out_before_processing(monkeypatch):
