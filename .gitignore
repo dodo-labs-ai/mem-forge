@@ -38,7 +38,8 @@ data/
 # Local agent/editor config
 docs/local/
 .codex/
-.claude/
+.claude/*
+!.claude/skills/
 .superpowers/
 .agents/
 !.agents/
