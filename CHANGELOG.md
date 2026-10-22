@@ -9,9 +9,9 @@
   scope to the new target, with the superseded transition as its
   predecessor. A return to the last applied scope is one more such change
   (A→A), which removes at completion what the superseded target added. When
-  the open transition changed after the change read it, the save answers 409
-  `projection_scope_transition_stale`; two identical concurrent saves open
-  one transition. A conversation Source keeps the 409 while its transition is
+  the open transition changed after the change read it, or one opened, the
+  save answers 409 `projection_scope_transition_stale`; two identical
+  concurrent saves open one transition. A conversation Source keeps the 409 while its transition is
   open, and every Source keeps `source_sync_running` while a sync runs.
   - A document scope change into a configuration that cannot list its whole
     scope, such as a GitHub Pages subtree read by link crawl or by a sitemap
@@ -19,14 +19,19 @@
     which names the mode and suggests a listing mode or a new Source. A change
     from such a mode into one that lists is allowed, and so is a return to
     exactly the last applied scope: it supersedes the open transition, opens
-    none, removes nothing and clears the sync cursor.
-  - GitHub Pages `branch` is a scope field, so changing it opens a transition;
-    a Source without a branch keeps its scope fingerprint.
+    none, removes nothing and clears the sync cursor. While a transition is
+    open, a change outside the scope that leaves a listing configuration
+    unable to list, such as turning off a GitHub Pages token or complete
+    sitemap, is refused with 409 `transition_requires_listing`.
+  - GitHub Pages `branch` is a scope field of a subtree, so changing it opens
+    a transition; a Source without a branch, and a single-page or
+    explicit-list Source, keeps its scope fingerprint.
     `sitemap_authoritative`, `auth_mode` and `max_pages` are not scope fields.
   - Source type descriptors declare `scope_defaults` (Jira's `query_mode` is
     `simple`), and a stored transition's scopes are canonicalized again when
     sync, the scope-change route and the device job read them, so a target
-    stored before a field was added still matches. `DocumentGene` gains
+    stored before a field was added still matches: a field it lacks and the
+    configuration sets reads the configured value, in both of its scopes. `DocumentGene` gains
     `unlisted_scope_mode`, and `projection_scope_transition_id` takes
     `previous_cycle_transition_id`; identities are unchanged.
 

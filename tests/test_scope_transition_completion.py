@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -888,5 +889,43 @@ async def test_a_transition_stored_before_a_scope_field_was_added_matches_its_co
     state = await workspace.sync(project)
 
     assert canonical_projection_scope("jira", simple_config) == {"projects": ["PAY"], "query_mode": "simple"}
+    assert state.last_sync_status == "success"
+    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
+
+
+class SitePages(JiraProject):
+    """The pages of a GitHub Pages subtree, listed as the repository's branch tree holds them."""
+
+    @classmethod
+    def metadata(cls):
+        return replace(JiraProject.metadata(), name="github_pages", display_name="GitHub Pages")
+
+
+@pytest.mark.asyncio
+async def test_a_branch_pinned_transition_stored_before_branch_was_a_scope_field_runs_and_completes(workspace):
+    """The stored target has no ``branch``; it reads the configured one, in both scopes."""
+    site = "https://pages.example.test/org/site"
+    pinned = {"sync_mode": "subtree", "root_url": f"{site}/guide", "auth_mode": "github_pat", "branch": "gh-pages"}
+    await workspace.db.upsert_source(
+        id=SOURCE_ID,
+        type="github_pages",
+        name="Pages",
+        config_json=json.dumps(pinned),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await workspace.db.create_projection_scope_transition(
+        ProjectionScopeTransition(
+            id=TRANSITION_ID,
+            source_id=SOURCE_ID,
+            previous_scope={"sync_mode": "subtree", "root_url": f"{site}/docs"},
+            target_scope={"sync_mode": "subtree", "root_url": f"{site}/guide"},
+            created_at=OPENED_AT.isoformat(),
+        )
+    )
+    site_pages = SitePages(existing={0, 1}, listing_kind=ScopeListingKind.EXISTENCE)
+
+    state = await workspace.sync(site_pages)
+
     assert state.last_sync_status == "success"
     assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED

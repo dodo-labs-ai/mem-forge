@@ -297,3 +297,105 @@ async def test_a_scope_change_waits_for_a_running_sync(db, tmp_path, open_before
     assert (detail["code"], detail["run_id"]) == ("source_sync_running", run.run_id)
     assert await _statuses(db) == before
     assert (await db.get_source_sync_run(run.run_id)).status == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("open_before", [False, True], ids=["opening", "superseding"])
+async def test_of_two_different_concurrent_changes_one_is_saved_and_the_other_is_stale(db, tmp_path, open_before):
+    await _source(db, "confluence", {**_confluence("root-a"), "pat": "secret"})
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    upsert_source = db.upsert_source
+    both_read = asyncio.Barrier(2)
+
+    async def after_both_read(**kwargs):
+        await both_read.wait()
+        return await upsert_source(**kwargs)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        if open_before:
+            await client.put(f"/api/v1/sources/{SOURCE_ID}", json={"config": _confluence("root-b")})
+        before = await _statuses(db)
+        db.upsert_source = after_both_read
+        responses = await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    client.put(f"/api/v1/sources/{SOURCE_ID}", json={"config": _confluence(root)})
+                    for root in ("root-c", "root-d")
+                )
+            ),
+            timeout=10,
+        )
+        db.upsert_source = upsert_source
+
+    saved = [response for response in responses if response.status_code == 200]
+    refused = [response for response in responses if response.status_code == 409]
+    assert (len(saved), len(refused)) == (1, 1)
+    assert refused[0].json()["detail"] == "projection_scope_transition_stale"
+    transition = await _open(db)
+    root = (await db.get_source(SOURCE_ID))["config"]["page_tree_root"]
+    assert transition.target_scope["page_tree_root"] == root
+    assert transition.predecessor_transition_id == (next(iter(before)) if open_before else None)
+    assert len(await _statuses(db)) == len(before) + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("listing", "unlisting"),
+    [
+        ({"auth_mode": "github_pat"}, {"auth_mode": "none"}),
+        ({"sitemap_authoritative": True}, {"sitemap_authoritative": False}),
+    ],
+    ids=["token-off", "complete-sitemap-off"],
+)
+async def test_a_change_that_stops_listing_while_a_transition_is_open_is_refused(db, tmp_path, listing, unlisting):
+    await _source(db, "github_pages", {**_pages("docs", **listing), "pat": "secret"})
+    _save(tmp_path, db, _pages("guide", **listing))
+    to_guide = await _open(db)
+
+    response = _save(tmp_path, db, _pages("guide", **unlisting))
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "transition_requires_listing"
+    assert detail["mode"] == "subtree read by link crawl or by a sitemap not declared complete"
+    stored = (await db.get_source(SOURCE_ID))["config"]
+    assert {field: stored.get(field) for field in listing} == listing
+    assert await _statuses(db) == {to_guide.id: ProjectionScopeTransitionStatus.PENDING}
+
+
+@pytest.mark.asyncio
+async def test_a_change_that_stops_listing_without_an_open_transition_is_saved(db, tmp_path):
+    await _source(db, "github_pages", {**_pages("docs", auth_mode="github_pat"), "pat": "secret"})
+
+    response = _save(tmp_path, db, _pages("docs"))
+
+    assert response.status_code == 200, response.text
+    assert await _open(db) is None
+
+
+@pytest.mark.asyncio
+async def test_a_branch_pinned_transition_stored_before_branch_was_a_scope_field_reads_the_configured_branch(
+    db, tmp_path
+):
+    pinned = _pages("guide", auth_mode="github_pat", branch="gh-pages")
+    await _source(db, "github_pages", {**pinned, "pat": "secret"})
+    await db.create_projection_scope_transition(
+        ProjectionScopeTransition(
+            id="scope-transition-before-branch",
+            source_id=SOURCE_ID,
+            previous_scope={"sync_mode": "subtree", "root_url": f"{PAGES_SITE}/docs"},
+            target_scope={"sync_mode": "subtree", "root_url": f"{PAGES_SITE}/guide"},
+            created_at="2026-10-20T09:00:00+00:00",
+        )
+    )
+
+    response = _save(tmp_path, db, _pages("other", auth_mode="github_pat", branch="gh-pages"))
+    superseding = await _open(db)
+
+    assert response.status_code == 200, response.text
+    assert superseding.predecessor_transition_id == "scope-transition-before-branch"
+    assert superseding.previous_scope == {
+        "sync_mode": "subtree",
+        "root_url": f"{PAGES_SITE}/docs",
+        "branch": "gh-pages",
+    }

@@ -17285,9 +17285,9 @@ class Database:
         superseded and its member rows are deleted. A new transition must
         name it as its predecessor; without one, the Source returns to the
         superseded transition's previous scope and no transition is open.
-        When the open transition is not the one the caller expected, the
-        update raises `ProjectionScopeTransitionStale` and nothing is
-        written, so the caller can read the Source again.
+        When the open transition is not the one the caller expected (``None``
+        expects none), the update raises `ProjectionScopeTransitionStale`
+        and nothing is written, so the caller can read the Source again.
         """
         from memforge.source_access import memory_visibility_for_source
 
@@ -17422,12 +17422,9 @@ class Database:
                     open_transition_id = open_transition["id"] if open_transition is not None else None
                     retried = projection_scope_transition is not None and open_transition_id == projection_scope_transition.id
                     if not retried:
-                        if expected_open_transition_id is None:
-                            if open_transition_id is not None:
-                                raise ValueError("projection_scope_transition_active")
-                        elif open_transition_id != expected_open_transition_id:
+                        if open_transition_id != expected_open_transition_id:
                             raise ProjectionScopeTransitionStale()
-                        else:
+                        if open_transition_id is not None:
                             await self._supersede_projection_scope_transition_unlocked(open_transition_id)
                     if projection_scope_transition is not None:
                         await self._insert_projection_scope_transition_unlocked(projection_scope_transition)
