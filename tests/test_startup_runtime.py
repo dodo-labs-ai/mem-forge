@@ -2482,7 +2482,9 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
 
 
 @pytest.mark.asyncio
-async def test_source_config_update_resets_incremental_sync_cursor(db, tmp_path, monkeypatch):
+async def test_a_document_scope_change_opens_a_transition_and_keeps_the_sync_cursor_and_history(
+    db, tmp_path, monkeypatch
+):
     from datetime import datetime, timezone
 
     from memforge.models import SyncState
@@ -2508,10 +2510,11 @@ async def test_source_config_update_resets_incremental_sync_cursor(db, tmp_path,
         access_policy="workspace",
         owner_user_id="dev",
     )
+    last_sync_at = datetime.now(timezone.utc)
     await db.upsert_sync_state(
         SyncState(
             source=source_id,
-            last_sync_at=datetime.now(timezone.utc),
+            last_sync_at=last_sync_at,
             last_sync_status="success",
             docs_processed=10,
             docs_updated=10,
@@ -2545,11 +2548,15 @@ async def test_source_config_update_resets_incremental_sync_cursor(db, tmp_path,
         sources_response = client.get("/api/v1/sources")
 
     assert response.status_code == 200
-    assert await db.get_sync_state(source_id) is None
+    # The transition runs discover the whole new scope; the run that
+    # completes the transition moves the cursor.
+    state = await db.get_sync_state(source_id)
+    assert state is not None and state.last_sync_at == last_sync_at
+    assert len(await db.get_sync_history(source_id)) == 1
     updated = await db.get_source(source_id)
-    assert updated["last_sync"] is None
+    assert updated["last_sync"] == last_sync_at.isoformat()
     source_payload = next(s for s in sources_response.json()["data"] if s["id"] == source_id)
-    assert source_payload["sync"] is None
+    assert source_payload["sync"] is not None
     transition = await db.get_open_projection_scope_transition(source_id)
     assert transition is not None
     assert transition.previous_scope["jql_filter"] == "updated >= -180d"
@@ -2557,7 +2564,7 @@ async def test_source_config_update_resets_incremental_sync_cursor(db, tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path, monkeypatch):
+async def test_source_scope_update_cancels_active_sync(db, tmp_path, monkeypatch):
     from datetime import datetime, timezone
 
     from memforge.models import SyncState
@@ -2632,7 +2639,6 @@ async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path
 
     assert response.status_code == 200
     assert fake_sync_service.cancelled == [source_id]
-    assert await db.get_sync_state(source_id) is None
     transition = await db.get_open_projection_scope_transition(source_id)
     assert transition is not None
     assert transition.previous_scope["page_tree_root"] == "5695886009"
