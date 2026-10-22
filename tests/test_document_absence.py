@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
-from memforge.models import ContentItem, ScopeListing, ScopeListingKind
+from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, ScopeListingKind
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.source_projection import ProjectionScopeTransition, ProjectionScopeTransitionStatus
 from memforge.source_projection_config import canonical_projection_scope
@@ -90,7 +90,10 @@ class JiraProject(BlockingFetchGene):
         if self.confirm_error is not None:
             raise self.confirm_error
         self.confirmed.extend(item.item_id for item in items)
-        return frozenset(item.item_id for item in items if _issue_number(item) not in self.existing)
+        return {
+            item.item_id: AbsenceAnswer.EXISTS if _issue_number(item) in self.existing else AbsenceAnswer.ABSENT
+            for item in items
+        }
 
     def move_on(self, *, existing: set[int], in_query: set[int] | None = None, changed: set[int] = frozenset()) -> None:
         self.existing = set(existing)
@@ -98,6 +101,17 @@ class JiraProject(BlockingFetchGene):
         self.changed = set(changed)
         self.fetched.clear()
         self.confirmed.clear()
+
+
+class UnlistedJiraProject(JiraProject):
+    """A configuration that cannot list its scope, so its listing is never asked for."""
+
+    @classmethod
+    def lists_scope(cls, config) -> bool:
+        return False
+
+    async def list_scope(self):
+        raise AssertionError("a configuration that cannot list is never listed")
 
 
 class Workspace:
@@ -280,12 +294,7 @@ async def test_a_failed_confirmation_removes_nothing_and_the_run_still_succeeds(
 
 @pytest.mark.asyncio
 async def test_a_source_that_cannot_list_its_scope_skips_no_absence_check(workspace):
-    project = JiraProject(existing={0, 1})
-
-    async def cannot_list():
-        return None
-
-    project.list_scope = cannot_list
+    project = UnlistedJiraProject(existing={0, 1})
     await _synced(workspace, project)
 
     project.move_on(existing={0})

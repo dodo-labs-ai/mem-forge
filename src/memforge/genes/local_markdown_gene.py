@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.local_adapter_packages import (
@@ -31,6 +32,7 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+    ScopeListing,
     ScopeListingKind,
 )
 
@@ -153,6 +155,15 @@ class LocalMarkdownGene(DocumentGene):
                 ),
             ],
         )
+
+    @classmethod
+    def lists_scope(cls, config: Mapping[str, Any]) -> bool:
+        """The device's snapshot manifest lists the whole folder."""
+        return True
+
+    async def list_scope(self) -> ScopeListing:
+        """A local folder is listed by its device's snapshot manifest, which the run reads instead."""
+        raise ValueError("A local folder Source is listed by its device's snapshot manifest, not by the server")
 
     async def authenticate(self) -> None:
         if has_package_manifest(self.config):

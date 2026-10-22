@@ -17,7 +17,7 @@ import httpx
 
 from memforge.genes.atlassian_auth import (
     ATLASSIAN_ABSENT_STATUS_CODES,
-    atlassian_record_is_gone,
+    atlassian_record_state,
     atlassian_request_limiter,
     bearer_headers,
     get_with_rate_limit_retry,
@@ -30,6 +30,7 @@ from memforge.genes.confluence_artifacts import resolve_current_confluence_artif
 from memforge.genes.confluence_pdf import export_confluence_page_pdf
 from memforge.source_time import SOURCE_UPDATED_AT_KEY
 from memforge.models import (
+    AbsenceAnswer,
     ConfigField,
     ConfigFieldType,
     ConfigGroup,
@@ -38,6 +39,7 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+    ScopeListing,
     ScopeListingKind,
     SourceUnitInput,
 )
@@ -318,8 +320,43 @@ class ConfluenceGene(DocumentGene):
             return exc.response.status_code == 404
         return isinstance(exc, RuntimeError) and "non-JSON response" in str(exc)
 
+    @classmethod
+    def lists_scope(cls, config: Mapping[str, Any]) -> bool:
+        """A page tree and a space are both walked completely, so every configuration lists."""
+        return True
+
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         """Discover wiki pages from configured spaces or page tree root."""
+        async for item in self._walk_scope(since):
+            yield item
+        if self._preview_discovery_limit() is None:
+            self.attest_discovery_complete(
+                "confluence_page_tree_exhausted"
+                if self._effective_sync_mode(self.config) == "page_tree"
+                else "confluence_spaces_exhausted"
+            )
+            self._record_walked_pages()
+
+    async def list_scope(self) -> ScopeListing:
+        """Every page the configured page tree or spaces hold, as the walk of this run visited them.
+
+        Discovery walks the whole scope whatever ``since`` is, so a run that
+        discovered returns that walk; otherwise the scope is walked here.
+        Either walk visits a page below an excluded label's page too, so a
+        page leaves the listing only when it leaves the tree or space.
+        """
+
+        if self._preview_discovery_limit() is not None:
+            raise RuntimeError("A preview of a Confluence Source stops its walk early, so it cannot list the scope")
+        if self._discovered_scope is not None:
+            return self._discovered_scope
+        async for _item in self._walk_scope(None):
+            pass
+        self._record_walked_pages()
+        return self._discovered_scope
+
+    async def _walk_scope(self, since: datetime | None) -> AsyncIterator[ContentItem]:
+        """Visit every page of the configured page tree or spaces, yielding those changed since ``since``."""
         self.normalize_config(self.config)
         self._discovered_page_ids: set[str] = set()
         sync_mode = self._effective_sync_mode(self.config)
@@ -331,9 +368,6 @@ class ConfluenceGene(DocumentGene):
                 raise ValueError("Confluence Page Tree Root is required when syncing a page tree")
             async for item in self._discover_page_tree(page_tree_root, include_children, since):
                 yield item
-            if self._preview_discovery_limit() is None:
-                self.attest_discovery_complete("confluence_page_tree_exhausted")
-                self._record_walked_pages()
             return
 
         spaces = self._space_keys(self.config.get("spaces"))
@@ -342,12 +376,9 @@ class ConfluenceGene(DocumentGene):
         for space_key in spaces:
             async for item in self._discover_space(space_key, since):
                 yield item
-        if self._preview_discovery_limit() is None:
-            self.attest_discovery_complete("confluence_spaces_exhausted")
-            self._record_walked_pages()
 
     def _record_walked_pages(self) -> None:
-        """Record every page discovery walked, whatever ``since`` it yielded by.
+        """Record every page the walk visited, whatever ``since`` it yielded by.
 
         A page tree or a space is a query: a page that was moved elsewhere, or
         below a page with an excluded label, still exists, so an unlisted page
@@ -359,19 +390,22 @@ class ConfluenceGene(DocumentGene):
             {_page_doc_id(page_id) for page_id in self._discovered_page_ids},
         )
 
-    async def confirm_absent(self, items: Sequence[ContentItem]) -> frozenset[str]:
+    async def confirm_absent(self, items: Sequence[ContentItem]) -> Mapping[str, AbsenceAnswer]:
         """Read each unlisted page by id; a page Confluence no longer returns is absent.
 
         A page in the trash is not returned without asking for trashed content,
-        so a trashed page is absent as a deleted one is.
+        so a trashed page is absent as a deleted one is. A page moved to
+        another tree or space still exists, and one this credential may not
+        read is hidden.
         """
 
-        absent: set[str] = set()
+        answers: dict[str, AbsenceAnswer] = {}
         for item in items:
             page_id = str(item.extra.get("page_id") or item.item_id.removeprefix(_PAGE_DOC_ID_PREFIX))
-            if await atlassian_record_is_gone(self._get(f"{self._api_prefix}/rest/api/content/{page_id}")):
-                absent.add(item.item_id)
-        return frozenset(absent)
+            answers[item.item_id] = await atlassian_record_state(
+                self._get(f"{self._api_prefix}/rest/api/content/{page_id}")
+            )
+        return answers
 
     @classmethod
     def rediscovers_documents(cls, config: Mapping[str, Any]) -> bool:

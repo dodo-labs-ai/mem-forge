@@ -12,11 +12,14 @@ What each family requires:
   collection) has a Gene of exactly one family, and the Gene implements every
   abstract method. Only a type without a collection, which is managed capture,
   has a Gene of neither family.
-- **A document Gene** declares ``listing_kinds``. A Gene that can produce a
-  query listing implements ``confirm_absent``; one that answers
-  ``rediscovers_documents`` implements ``rediscover``. A document type
-  collected on a device produces exactly one listing kind, which its device
-  snapshot takes.
+- **A document Gene** declares ``listing_kinds`` and answers ``lists_scope``
+  as a class method, because a scope change asks it before any Gene exists.
+  Python lets an abstract class method be called on its class, so the
+  abstract-method check above is what refuses a Gene that leaves it out. A
+  Gene that can produce a query listing implements ``confirm_absent``; one
+  that answers ``rediscovers_documents`` implements ``rediscover``. A
+  document type collected on a device produces exactly one listing kind,
+  which its device snapshot takes.
 - **A conversation type** names its provider in its descriptor
   (``conversation_provider``), and the provider class defines every member of
   the conversation provider port; a provider whose polls can omit replies
@@ -24,6 +27,8 @@ What each family requires:
 """
 
 from __future__ import annotations
+
+import inspect
 
 from memforge.conversations.port import REQUIRED_PROVIDER_MEMBERS, THREAD_PROVIDER_MEMBERS
 from memforge.genes.conversation_gene import ConversationGene
@@ -76,6 +81,8 @@ def _validate_document_gene(descriptor: SourceTypeDescriptor, gene_cls: type[Doc
         raise SourceTypeContractError(
             f"{name}: {gene_cls.__name__}.listing_kinds must be a frozenset of ScopeListingKind values"
         )
+    if not isinstance(inspect.getattr_static(gene_cls, "lists_scope"), classmethod):
+        raise SourceTypeContractError(f"{name}: {gene_cls.__name__}.lists_scope must be a class method")
     if ScopeListingKind.QUERY in kinds and not _overrides(gene_cls, "confirm_absent"):
         raise SourceTypeContractError(
             f"{name}: {gene_cls.__name__} can produce a query listing, so it must implement confirm_absent"

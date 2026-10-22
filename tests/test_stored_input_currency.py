@@ -13,7 +13,15 @@ import pytest
 
 from memforge.llm.structured import StructuredLlmError, failure_retryable
 from memforge.memory.engine import SourceUnitLifecycleExecutionError
-from memforge.models import ContentItem, GeneMetadata, NormalizedContent, RawContent, ScopeListing, ScopeListingKind
+from memforge.models import (
+    AbsenceAnswer,
+    ContentItem,
+    GeneMetadata,
+    NormalizedContent,
+    RawContent,
+    ScopeListing,
+    ScopeListingKind,
+)
 from memforge.source_adapters.jira import changelog_semantic_class as jira_changelog_semantic_class
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
 from memforge.source_activity import SourceActivityConflict
@@ -58,6 +66,7 @@ class JiraProvider(FakeGene):
     discovery_complete = True
 
     def __init__(self) -> None:
+        super().__init__()
         self.histories: dict[str, list[dict]] = {key: [authored(DOMAIN_HISTORY, "Ann")] for key in ISSUES}
         self.removed: set[str] = set()
         self.rediscovered: list[str] = []
@@ -97,6 +106,10 @@ class JiraProvider(FakeGene):
         self.rediscovered.append(issue_key)
         return None if issue_key in self.removed else self._item(issue_key)
 
+    @classmethod
+    def lists_scope(cls, config) -> bool:
+        return True
+
     async def list_scope(self):
         return ScopeListing(
             kind=ScopeListingKind.QUERY,
@@ -104,7 +117,10 @@ class JiraProvider(FakeGene):
         )
 
     async def confirm_absent(self, items):
-        return frozenset(item.item_id for item in items if item.extra["issue_key"] in self.removed)
+        return {
+            item.item_id: AbsenceAnswer.ABSENT if item.extra["issue_key"] in self.removed else AbsenceAnswer.EXISTS
+            for item in items
+        }
 
     def payload(self, issue_key: str) -> bytes:
         histories = self.histories[issue_key]

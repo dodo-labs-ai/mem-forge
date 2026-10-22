@@ -49,7 +49,7 @@ class QueryGene(FakeGene):
     listing_kinds = frozenset({ScopeListingKind.QUERY})
 
     async def confirm_absent(self, items):
-        return frozenset()
+        return {}
 
 
 class CapturedGene(AgentSessionGene):
@@ -108,7 +108,31 @@ def test_a_gene_with_unimplemented_steps_is_refused() -> None:
         def config_schema(cls) -> GeneConfigSchema:
             return FakeGene.config_schema()
 
-    _refused(Partial, "does not implement authenticate, discover, fetch, normalize")
+    _refused(Partial, "does not implement authenticate, discover, fetch, list_scope, lists_scope, normalize")
+
+
+def test_a_gene_that_does_not_say_whether_it_lists_is_refused() -> None:
+    # Python lets an abstract class method be called on its class, so only
+    # the abstract-method check stops a Gene that leaves lists_scope out.
+    steps = {name: value for name, value in vars(FakeGene).items() if name != "lists_scope"}
+    Unanswered = type("Unanswered", (DocumentGene,), steps)
+
+    assert Unanswered.lists_scope({}) is None
+    _refused(Unanswered, "does not implement lists_scope")
+
+
+def test_lists_scope_must_be_a_class_method() -> None:
+    class InstanceAnswer(FakeGene):
+        def lists_scope(self, config) -> bool:
+            return False
+
+    class StaticAnswer(FakeGene):
+        @staticmethod
+        def lists_scope(config) -> bool:
+            return False
+
+    _refused(InstanceAnswer, "lists_scope must be a class method")
+    _refused(StaticAnswer, "lists_scope must be a class method")
 
 
 def test_a_document_gene_must_declare_its_listing_kinds() -> None:
@@ -158,7 +182,7 @@ def test_an_override_counts_however_it_is_written() -> None:
 
         @classmethod
         async def confirm_absent(cls, items):
-            return frozenset()
+            return {}
 
     _refused(PlainRediscovery, "must implement rediscover")
     _refused(StaticRediscovery, "must implement rediscover")
@@ -178,7 +202,10 @@ def test_a_gene_missing_its_metadata_is_named_as_unimplemented() -> None:
     class Nameless(DocumentGene):
         listing_kinds = frozenset()
 
-    _refused(Nameless, "does not implement authenticate, config_schema, discover, fetch, metadata, normalize")
+    _refused(
+        Nameless,
+        "does not implement authenticate, config_schema, discover, fetch, list_scope, lists_scope, metadata, normalize",
+    )
 
 
 def test_a_device_collected_gene_declares_one_listing_kind() -> None:

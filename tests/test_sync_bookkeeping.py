@@ -2046,6 +2046,7 @@ class EmptyGene(FakeGene):
     discovery_complete = True
 
     def __init__(self) -> None:
+        super().__init__()
         self.bound_document_store = None
 
     def bind_document_store(self, document_store) -> None:
@@ -2073,6 +2074,10 @@ class EmptyProviderGene(EmptyGene):
     """A provider whose complete listing holds nothing."""
 
     listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
+
+    @classmethod
+    def lists_scope(cls, config) -> bool:
+        return True
 
     async def list_scope(self):
         return ScopeListing(kind=ScopeListingKind.EXISTENCE, doc_ids=frozenset())
@@ -2540,6 +2545,7 @@ def test_failed_document_summary_preserves_mixed_failure_guidance():
 
 class SinceRecordingEmptyGene(EmptyGene):
     def __init__(self) -> None:
+        super().__init__()
         self.seen_since = None
 
     async def discover(self, since=None):
@@ -2550,6 +2556,7 @@ class SinceRecordingEmptyGene(EmptyGene):
 
 class IncrementalNewDocumentGene(FakeGene):
     def __init__(self) -> None:
+        super().__init__()
         self.seen_since = None
 
     def requires_pdf_artifact(
@@ -3567,9 +3574,14 @@ def _confluence_raw_content(item: ContentItem, markdown: str) -> RawContent:
 class BlockingFetchGene(FakeGene):
     listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
 
+    @classmethod
+    def lists_scope(cls, config) -> bool:
+        return True
+
     discovery_complete = True
 
     def __init__(self, item_count: int, release: asyncio.Event):
+        super().__init__()
         self.item_count = item_count
         self.release = release
         self.active_fetches = 0
@@ -4057,6 +4069,7 @@ class UpdatingDocumentGene(FakeGene):
         last_modified: datetime | None = None,
         source_updated_at: str | None = None,
     ) -> None:
+        super().__init__()
         self.markdown = markdown
         self.version = version
         self.last_modified = last_modified or datetime.now(timezone.utc)
@@ -4728,6 +4741,7 @@ class V9RecoveryReplayGene(FakeGene):
         document_content: str | None = None,
         version: str | None = None,
     ) -> None:
+        super().__init__()
         self.attempt = attempt
         self.document_content = (
             document_content

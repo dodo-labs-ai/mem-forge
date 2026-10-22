@@ -27,7 +27,9 @@ from memforge.genes import gene_exports_pdf
 from memforge.genes.conversation_gene import CollectionAttempt, ConversationGene
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind, gene_family
+from memforge.local_agent.source_contract import local_agent_sync_operation
 from memforge.models import (
+    AbsenceAnswer,
     AbsenceCheckSkippedReason,
     ContentItem,
     ScopeListingKind,
@@ -321,21 +323,22 @@ class DocumentFamily(CollectionFamily):
     async def _absent_from_scope_listing(self, indexed_doc_ids: set[str]) -> set[str] | None:
         """The held Documents this run's scope listing proves the provider no longer has.
 
-        ``None`` when the Gene cannot list its scope. A listing or confirmation
-        that fails raises ``AbsenceCheckSkipped`` naming the step, and the
-        caller removes nothing in this run. An unlisted Document of an
-        existence listing is absent. One of a query listing is absent only
-        when the provider reports it not found; one that still exists keeps
-        its Unit and Support and is not refreshed while it stays outside the
-        query.
+        ``None`` when the run has no listing to read: the configuration cannot
+        list its scope, or its listing is a device's snapshot manifest this
+        run is not bound to. A listing or confirmation that fails raises
+        ``AbsenceCheckSkipped`` naming the step, and the caller removes
+        nothing in this run. An unlisted Document of an existence listing is
+        absent. One of a query listing is absent only when the provider
+        answers ``absent`` for it; one that exists or is hidden keeps its Unit
+        and Support and is not refreshed while it stays outside the query.
         """
 
+        if self._collected_on_device() or not self.gene.lists_scope(self.gene.config):
+            return None
         try:
             listing = await self.gene.list_scope()
         except Exception as exc:
             raise AbsenceCheckSkipped("scope_listing_failed") from exc
-        if listing is None:
-            return None
         unlisted = indexed_doc_ids - listing.doc_ids
         if not unlisted or listing.kind is ScopeListingKind.EXISTENCE:
             return unlisted
@@ -348,9 +351,10 @@ class DocumentFamily(CollectionFamily):
                     # Nothing identifies the Document to ask its provider for,
                     # so its absence cannot be proven and it is kept.
                     logger.warning("Cannot confirm whether unlisted Document %s still exists: %s", doc_id, exc)
-            absent = set(await self.gene.confirm_absent(items)) & unlisted
+            answers = await self.gene.confirm_absent(items)
         except Exception as exc:
             raise AbsenceCheckSkipped("absence_confirmation_failed") from exc
+        absent = {doc_id for doc_id, answer in answers.items() if answer == AbsenceAnswer.ABSENT} & unlisted
         logger.info(
             "Scope listing of %s left %d held Documents unlisted; %d are absent at the provider",
             self.source_id,
@@ -358,6 +362,10 @@ class DocumentFamily(CollectionFamily):
             len(absent),
         )
         return absent
+
+    def _collected_on_device(self) -> bool:
+        """Whether the owner's device collects this Source, so its listing is the device's snapshot manifest."""
+        return local_agent_sync_operation(self.gene.metadata().name, self.gene.config) is not None
 
 
 class ConversationFamily(CollectionFamily):
