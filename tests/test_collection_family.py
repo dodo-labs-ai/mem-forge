@@ -17,6 +17,7 @@ from memforge.main import cli
 from memforge.pipeline.collection_family import (
     ConversationFamily,
     DocumentFamily,
+    SnapshotBinding,
     collection_family,
 )
 from memforge.storage.database import Database
@@ -55,13 +56,37 @@ async def test_a_conversation_run_needs_its_collection_attempt(db, tmp_path) -> 
     family = _family(TeamsGene(dict(TEAMS_CONFIG), "src-1"), db, tmp_path)
 
     with pytest.raises(ValueError, match="collection attempt"):
-        family.prepare(None)
-    family.prepare(CollectionAttempt("default", "src-1:attempt:1"))
+        family.prepare(collection_attempt=None, input_snapshot=None)
+    with pytest.raises(ValueError, match="not an input snapshot"):
+        family.prepare(
+            collection_attempt=CollectionAttempt("default", "src-1:attempt:1"),
+            input_snapshot=SnapshotBinding("src-1:attempt:1", frozenset()),
+        )
+    family.prepare(collection_attempt=CollectionAttempt("default", "src-1:attempt:1"), input_snapshot=None)
     assert family.gene.collection_attempt_id == "src-1:attempt:1"
 
 
 async def test_a_document_run_needs_no_collection_attempt(db, tmp_path) -> None:
-    _family(FakeGene(), db, tmp_path).prepare(None)
+    family = _family(FakeGene(), db, tmp_path)
+    family.prepare(collection_attempt=None, input_snapshot=None)
+    assert family.input_snapshot is None
+
+
+async def test_a_document_run_bound_to_a_snapshot_discovers_everything(db, tmp_path) -> None:
+    from datetime import datetime, timezone
+
+    family = _family(FakeGene(), db, tmp_path)
+    binding = SnapshotBinding("laj-1:attempt:1", frozenset({"doc-1"}))
+    family.prepare(collection_attempt=None, input_snapshot=binding)
+
+    since = await family.since(
+        existing_state=SimpleNamespace(last_sync_at=datetime(2026, 10, 22, tzinfo=timezone.utc)),
+        indexed_doc_ids={"doc-1"},
+        full_discovery=False,
+    )
+
+    assert family.input_snapshot == binding
+    assert since is None
 
 
 def test_only_the_family_module_asks_a_gene_class_for_its_family() -> None:

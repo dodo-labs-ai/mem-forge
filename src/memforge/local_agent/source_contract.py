@@ -219,17 +219,6 @@ def local_agent_collection_attempt_id(
     return canonical
 
 
-def local_agent_collection_is_authoritative(source_type: object) -> bool:
-    """Return whether one attempt proves the complete source collection."""
-
-    from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
-
-    try:
-        return get_local_source_replay_adapter(str(source_type or "").strip().lower()).authoritative_collection
-    except ValueError:
-        return False
-
-
 def local_agent_input_sha256(doc_id: object, document_hash: object) -> str:
     """Hash stable document identity and semantic content version."""
     normalized_doc_id = str(doc_id or "").strip()
@@ -433,32 +422,48 @@ def source_sync_input_metadata_with_artifact_attestation(
     return result
 
 
+def _manifest_entry(source_input: Any) -> tuple[str, Mapping[str, Any]] | None:
+    """The Document id and manifest entry one raw input carries, if it names both."""
+
+    metadata = getattr(source_input, "metadata", {})
+    entry = metadata.get("manifest_entry") if isinstance(metadata, Mapping) else None
+    if not isinstance(entry, Mapping):
+        return None
+    doc_id = str(entry.get("doc_id") or "").strip()
+    raw_uri = str(getattr(source_input, "raw_uri", "") or "").strip()
+    if not doc_id or not raw_uri:
+        return None
+    return doc_id, entry
+
+
+def snapshot_document_ids(inputs: list[Any]) -> frozenset[str]:
+    """The Documents a complete input snapshot names."""
+
+    return frozenset(named[0] for source_input in inputs if (named := _manifest_entry(source_input)) is not None)
+
+
 def source_with_sync_inputs(
     source: Mapping[str, Any],
     inputs: list[Any],
     *,
     input_snapshot_supplied: bool = False,
-    authoritative_snapshot: bool = False,
 ) -> dict[str, Any]:
     """Project immutable raw inputs into the connector's runtime manifest.
 
-    Snapshot presence and snapshot authority are separate facts.  In
-    particular, an incremental local collection may legitimately supply an
-    empty snapshot without claiming complete provider coverage.
+    A run bound to an input snapshot gets a manifest even when the snapshot
+    is empty, because an empty complete snapshot says the scope holds nothing.
     """
     latest_entries: dict[str, dict[str, Any]] = {}
     for source_input in sorted(
         inputs,
         key=lambda item: int(getattr(item, "input_generation", 0)),
     ):
+        named = _manifest_entry(source_input)
+        if named is None:
+            continue
+        doc_id, entry = named
         metadata = getattr(source_input, "metadata", {})
-        entry = metadata.get("manifest_entry") if isinstance(metadata, Mapping) else None
-        if not isinstance(entry, Mapping):
-            continue
-        doc_id = str(entry.get("doc_id") or "").strip()
         raw_uri = str(getattr(source_input, "raw_uri", "") or "").strip()
-        if not doc_id or not raw_uri:
-            continue
         package_sha256 = str(metadata.get("package_sha256") or "").strip()
         projected_entry = {
             **entry,
@@ -468,7 +473,7 @@ def source_with_sync_inputs(
         }
         latest_entries[doc_id] = projected_entry
     projected = dict(source)
-    if latest_entries or input_snapshot_supplied or authoritative_snapshot:
+    if latest_entries or input_snapshot_supplied:
         config = dict(_source_config(source.get("config")))
         config["local_agent_package_manifest"] = list(latest_entries.values())
         projected["config"] = config

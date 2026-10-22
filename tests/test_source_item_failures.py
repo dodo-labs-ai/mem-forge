@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from memforge.pipeline.collection_family import SnapshotBinding
+
 from memforge.config import AppConfig, SyncConfig
 from memforge.models import SyncState
 from memforge.pipeline.sync import GeneSyncOrchestrator
@@ -522,7 +524,7 @@ async def test_a_source_that_cannot_ask_for_one_document_retries_the_revision_th
 
 
 @pytest.mark.asyncio
-async def test_an_authoritative_snapshot_settles_a_failed_document_that_never_committed_and_is_gone(db):
+async def test_a_complete_input_snapshot_settles_a_failed_document_that_never_committed_and_is_gone(db):
     await _jira_source(db)
     harness = Harness(db)
     harness.provider = BreakableProvider()
@@ -536,7 +538,7 @@ async def test_an_authoritative_snapshot_settles_a_failed_document_that_never_co
 
     state = await harness.orchestrator().sync_gene(
         gene=harness.provider, source_name="Jira", source_id=SOURCE_ID,
-        failed_item_retry=SCHEDULED, authoritative_snapshot=True,
+        failed_item_retry=SCHEDULED, input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
     )
 
     assert state.last_sync_status == "success"

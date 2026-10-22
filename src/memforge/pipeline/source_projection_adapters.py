@@ -54,13 +54,13 @@ from memforge.source_artifacts import (
 
 def source_run_projection_coverage(
     *,
-    authoritative_snapshot: bool,
+    complete_snapshot: bool,
     scope_transition: bool,
     discovery_complete: bool,
 ) -> ProjectionCoverage:
     """What a run's discovery alone proves about the Documents it did not return.
 
-    A submitted authoritative snapshot is the whole Source. A complete discovery
+    A complete input snapshot a device submitted is the whole Source. A complete discovery
     of a newly configured scope is the whole new scope: the user changed the
     scope, so a Unit outside it is removed. Any other discovery is
     partial, whether or not ``since`` narrowed it, because a query result is
@@ -68,7 +68,7 @@ def source_run_projection_coverage(
     what its scope listing proves absent.
     """
 
-    if authoritative_snapshot:
+    if complete_snapshot:
         return ProjectionCoverage.COMPLETE_SNAPSHOT
     if scope_transition and discovery_complete:
         return ProjectionCoverage.COMPLETE_SNAPSHOT

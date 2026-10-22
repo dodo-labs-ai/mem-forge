@@ -269,7 +269,6 @@ from memforge.local_agent.source_contract import (
     execution_owner_user_id,
     is_local_agent_backed_source,
     local_agent_collection_attempt_id,
-    local_agent_collection_is_authoritative,
     local_agent_semantic_input_sha256,
     local_agent_completion_status,
     local_agent_source_config_revision,
@@ -2550,10 +2549,7 @@ async def _require_ready_snapshot_manifest(
         raise HTTPException(status_code=409, detail="source_snapshot_manifest_stale")
     if not manifest_status["ready"]:
         raise HTTPException(status_code=409, detail="source_snapshot_materialization_incomplete")
-    if (
-        local_agent_collection_is_authoritative(source.get("type"))
-        and manifest_status["coverage"] != "complete_snapshot"
-    ):
+    if manifest_status["coverage"] != "complete_snapshot":
         raise HTTPException(status_code=409, detail="authoritative_snapshot_coverage_required")
 
 
@@ -8799,10 +8795,7 @@ def create_admin_app(
         coverage = CollectionCoverage(req.coverage)
         if coverage is CollectionCoverage.PARTIAL:
             raise HTTPException(status_code=400, detail="partial collection cannot be planned")
-        if (
-            local_agent_collection_is_authoritative(source.get("type"))
-            and coverage is not CollectionCoverage.COMPLETE_SNAPSHOT
-        ):
+        if coverage is not CollectionCoverage.COMPLETE_SNAPSHOT:
             raise HTTPException(
                 status_code=409,
                 detail="authoritative collection requires complete_snapshot coverage",

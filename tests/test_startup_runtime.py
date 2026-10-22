@@ -1977,7 +1977,7 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             source_id,
             progress_callback=None,
             force_full_sync=False,
-            authoritative_snapshot=False,
+            input_snapshot=None,
             reprocess_doc_ids=None,
             execution_mode=None,
             source_activity=None,
@@ -1990,7 +1990,7 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
         ):
             del (
                 failed_item_retry,
-                authoritative_snapshot,
+                input_snapshot,
                 reprocess_doc_ids,
                 execution_mode,
                 source_activity,
@@ -2104,7 +2104,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             source_id,
             progress_callback=None,
             force_full_sync=False,
-            authoritative_snapshot=False,
+            input_snapshot=None,
             reprocess_doc_ids=None,
             execution_mode=None,
             source_activity=None,
@@ -2117,7 +2117,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
         ):
             del (
                 failed_item_retry,
-                authoritative_snapshot,
+                input_snapshot,
                 reprocess_doc_ids,
                 execution_mode,
                 source_activity,

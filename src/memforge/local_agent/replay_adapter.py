@@ -50,7 +50,6 @@ class LocalSourceReplayAdapter(ABC):
 
     source_type: str
     package_kind: str
-    authoritative_collection: bool = False
     # A file package carries the file's source time beside its content.
     package_source_time: bool = False
 
@@ -141,7 +140,6 @@ class _MarkdownPackageAdapter(LocalSourceReplayAdapter):
 class GitHubRepoReplayAdapter(_MarkdownPackageAdapter):
     source_type = "github_repo"
     package_kind = "github_repo_document"
-    authoritative_collection = True
 
     def derive_document_id(
         self,
@@ -186,7 +184,6 @@ class GitHubRepoReplayAdapter(_MarkdownPackageAdapter):
 class LocalMarkdownReplayAdapter(_MarkdownPackageAdapter):
     source_type = "local_markdown"
     package_kind = "local_markdown_document"
-    authoritative_collection = True
 
     def derive_document_id(
         self,
@@ -212,7 +209,6 @@ class LocalMarkdownReplayAdapter(_MarkdownPackageAdapter):
 class JiraReplayAdapter(LocalSourceReplayAdapter):
     source_type = "jira"
     package_kind = "jira_document"
-    authoritative_collection = True
 
     def derive_document_id(
         self,
