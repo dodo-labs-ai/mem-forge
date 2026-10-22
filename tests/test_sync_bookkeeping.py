@@ -6028,7 +6028,7 @@ async def test_partial_conversation_scope_transition_preserves_old_membership(db
 
     assert state.last_sync_status == "success"
     assert transition.status is ProjectionScopeTransitionStatus.FAILED
-    assert transition.coverage.value == "partial_projection"
+    assert "coverage=partial_projection" in (transition.error or "")
     assert "complete successful snapshot" in (transition.error or "")
 
 

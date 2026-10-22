@@ -63,12 +63,19 @@ class SourceRemoval:
 
 
 class ProjectionScopeTransitionStatus(str, Enum):
-    """Durable state of one configured-source membership transition."""
+    """Durable state of one configured-source membership transition.
+
+    ``pending``, ``running`` and ``failed`` are open: a Source has at most one
+    open transition. ``applied`` and ``superseded`` are closed: an applied
+    transition completed, and a superseded one was replaced by a later scope
+    change before it could complete.
+    """
 
     PENDING = "pending"
     RUNNING = "running"
     APPLIED = "applied"
     FAILED = "failed"
+    SUPERSEDED = "superseded"
 
 
 class DeltaAxis(str, Enum):
@@ -364,15 +371,19 @@ class ProjectionRequest:
 
 @dataclass(frozen=True, slots=True)
 class ProjectionScopeTransition:
-    """Old and target Projection Scope plus its complete-snapshot proof state."""
+    """One change of a Source's Projection Scope, from its last applied scope to a target.
+
+    ``predecessor_transition_id`` names the open transition this one
+    superseded, or is ``None`` when the change found no open transition.
+    """
 
     id: str
     source_id: str
     previous_scope: Mapping[str, object]
     target_scope: Mapping[str, object]
     status: ProjectionScopeTransitionStatus = ProjectionScopeTransitionStatus.PENDING
+    predecessor_transition_id: str | None = None
     run_id: str | None = None
-    coverage: ProjectionCoverage | None = None
     error: str | None = None
     created_at: str | None = None
     updated_at: str | None = None

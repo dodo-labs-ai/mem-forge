@@ -1705,18 +1705,16 @@ class GeneSyncOrchestrator:
                 skipped_reading_group_count += result["skipped_reading_group_count"]
 
             if scope_transition is not None:
-                scoped_reconciliation_coverage = await family.transition_coverage(docs_failed=docs_failed)
-                if (absence_is_authoritative or scoped_reconciliation_coverage is not None) and docs_failed == 0:
+                family_completes_transition = await family.completes_transition(docs_failed=docs_failed)
+                if (absence_is_authoritative or family_completes_transition) and docs_failed == 0:
                     scope_transition = await self.db.complete_projection_scope_transition(
                         scope_transition.id,
                         run_id=transition_run_id,
-                        coverage=scoped_reconciliation_coverage or run_coverage,
                     )
                 else:
                     scope_transition = await self.db.fail_projection_scope_transition(
                         scope_transition.id,
                         run_id=transition_run_id,
-                        coverage=run_coverage,
                         error=(
                             "target scope did not produce a complete successful snapshot: "
                             f"coverage={run_coverage.value}, failed_docs={docs_failed}"
@@ -1779,7 +1777,6 @@ class GeneSyncOrchestrator:
                     await self.db.fail_projection_scope_transition(
                         scope_transition.id,
                         run_id=transition_run_id,
-                        coverage=run_coverage,
                         error=error_message,
                     )
                 except Exception:
