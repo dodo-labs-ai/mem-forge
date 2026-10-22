@@ -108,6 +108,7 @@ async def _confirmations(db: Database, snapshot_id: str = "snap-1") -> tuple[Sna
 
 
 async def test_issued_confirmations_hold_the_manifest_until_answered(db: Database) -> None:
+    """Answering three items in one batch also shows the batch's rowcount totals its rows."""
     await _attach(db, confirm=ISSUED, excluded_listings=LISTINGS)
     issued = await _confirmations(db)
     awaiting = await _status(db)
@@ -139,6 +140,7 @@ async def test_a_failed_confirmation_is_stored_on_every_issued_item(db: Database
     await _attach(db, confirm=ISSUED)
 
     await _answer(db, failure_cause="HTTP 401 from Jira")
+    await _answer(db, failure_cause="HTTP 401 from Jira")
 
     assert await _confirmations(db) == tuple(
         SnapshotConfirmation(item.doc_id, item.provider_key, FAILED, "HTTP 401 from Jira") for item in ISSUED
@@ -153,6 +155,7 @@ async def test_a_failed_confirmation_is_stored_on_every_issued_item(db: Database
         ({"failure_cause": "timeout"}, "already answered differently"),
         ({"manifest_sha256": "b" * 64, "answers": _answers(ABSENT, EXISTS, HIDDEN)}, "another manifest digest"),
         ({"local_agent_attempt_count": 2, "answers": _answers(ABSENT, EXISTS, HIDDEN)}, "another collection attempt"),
+        ({"local_agent_job_id": "job-2", "answers": _answers(ABSENT, EXISTS, HIDDEN)}, "another collection attempt"),
     ],
 )
 async def test_a_differing_resubmission_is_refused(db: Database, submission, refusal) -> None:
@@ -178,6 +181,7 @@ async def test_a_differing_resubmission_is_refused(db: Database, submission, ref
         ),
         (_answers(ABSENT, EXISTS), "must answer every issued item"),
         ((*_answers(ABSENT, EXISTS), SnapshotConfirmation("jira-PAY-3", "PAY-3", FAILED, "x")), "absent, exists or hidden"),
+        ((*_answers(ABSENT, EXISTS, HIDDEN), _answers(EXISTS)[0]), "answer an item twice"),
     ],
 )
 async def test_an_unissued_or_incomplete_answer_is_refused(db: Database, answers, refusal) -> None:
@@ -291,3 +295,44 @@ async def test_migration_adds_the_confirmation_tables_and_count(tmp_path) -> Non
 
     assert {"source_sync_snapshot_confirmations", "source_sync_snapshot_excluded_listings"} <= tables
     assert [(row["run_id"], row["unlisted_present_count"]) for row in history] == [("run-old", None)]
+
+
+async def test_failure_and_answers_together_are_refused(db: Database) -> None:
+    await _attach(db, confirm=ISSUED)
+
+    with pytest.raises(ValueError, match="carries its cause and no answers"):
+        await _answer(db, answers=_answers(ABSENT, EXISTS, HIDDEN), failure_cause="timeout")
+
+
+async def test_a_manifest_replay_after_answers_is_accepted(db: Database) -> None:
+    await _attach(db, confirm=ISSUED, excluded_listings=LISTINGS)
+    await _answer(db, answers=_answers(ABSENT, EXISTS, HIDDEN))
+
+    await _attach(db, confirm=ISSUED, excluded_listings=LISTINGS)
+
+    assert await _confirmations(db) == _answers(ABSENT, EXISTS, HIDDEN)
+
+
+async def test_answers_to_one_snapshot_leave_another_untouched(db: Database) -> None:
+    await _attach(db, "snap-a", confirm=ISSUED)
+    await _attach(db, "snap-b", confirm=ISSUED)
+
+    await _answer(db, "snap-b", answers=_answers(ABSENT, EXISTS, HIDDEN))
+
+    assert await _confirmations(db, "snap-a") == ISSUED
+    assert await _status(db, "snap-a") == (True, False)
+
+
+async def test_answers_stored_meanwhile_by_another_writer_refuse_the_submission(db: Database, monkeypatch) -> None:
+    await _attach(db, confirm=ISSUED)
+    await _answer(db, answers=_answers(ABSENT, ABSENT, ABSENT))
+
+    async def read_before_the_other_writer_committed(*_args):
+        return ISSUED
+
+    with monkeypatch.context() as patch:
+        patch.setattr(db, "_list_source_sync_snapshot_confirmations_unlocked", read_before_the_other_writer_committed)
+        with pytest.raises(SourceActivityConflict, match="answered by another submission"):
+            await _answer(db, answers=_answers(EXISTS, EXISTS, EXISTS))
+
+    assert await _confirmations(db) == _answers(ABSENT, ABSENT, ABSENT)
