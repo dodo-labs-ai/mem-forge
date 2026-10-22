@@ -10,6 +10,7 @@ export type AbsenceCheckSkippedReason = NonNullable<SyncStatus["absence_check_sk
 const ABSENCE_CHECK_SKIPPED_NOTICES: Record<AbsenceCheckSkippedReason, string> = {
   scope_listing_failed: "the list of items in scope could not be read in full",
   absence_confirmation_failed: "the source could not confirm which missing items were deleted",
+  absence_confirmation_missing: "the local agent did not confirm which missing items were deleted",
 };
 
 export type SourceSyncActivityState =

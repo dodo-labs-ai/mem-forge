@@ -9482,7 +9482,8 @@
               {
                 "enum": [
                   "scope_listing_failed",
-                  "absence_confirmation_failed"
+                  "absence_confirmation_failed",
+                  "absence_confirmation_missing"
                 ],
                 "type": "string"
               },
