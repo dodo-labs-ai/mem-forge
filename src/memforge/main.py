@@ -1213,6 +1213,33 @@ def eval_seed_derivation_cases(ctx: click.Context, spec_path: Path, workspace_id
     )
 
 
+@eval_group.command("seed-support-cases")
+@click.option(
+    "--spec",
+    "spec_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@_workspace_id_option
+@click.pass_context
+def eval_seed_support_cases(ctx: click.Context, spec_path: Path, workspace_id: str | None) -> None:
+    """Pin applied updates of synced Documents as Support cases and freeze their cohort.
+
+    The spec names ``selection_policy_version``, an optional ``role`` and the
+    ``cases``, each a ``doc_id`` with its ``rubric`` (``expected_support``:
+    Memory id to ``supported`` or ``unsupported``) and, to pin an update other
+    than the latest one the model judged Support in, its ``derivation_id``.
+    Requires a maintenance operator.
+    """
+
+    _emit_tool_payload(
+        ctx,
+        _tool_client(ctx, workspace_id).seed_support_evaluation_cases(
+            _read_json_object(spec_path, "Support case spec")
+        ),
+    )
+
+
 @eval_group.command("langfuse-policy-approve")
 @click.option("--source-id", required=True)
 @click.option("--policy-version", required=True)

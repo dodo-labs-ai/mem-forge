@@ -1124,6 +1124,32 @@ class DerivationCasesSeedRequest(BaseModel):
     selection_policy_version: str = Field(min_length=1)
 
 
+class SupportCaseRequest(BaseModel):
+    """One synced Document whose applied update to pin as a Support case, by ``doc_id`` or by ``title``
+    within ``source_id``. ``derivation_id`` names the update; without it, the Document's latest applied
+    update whose Support the model judged is pinned. The rubric's ``expected_support`` maps Memory ids to
+    ``supported`` or ``unsupported``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    doc_id: str | None = Field(default=None, min_length=1)
+    source_id: str | None = Field(default=None, min_length=1)
+    title: str | None = Field(default=None, min_length=1)
+    derivation_id: str | None = Field(default=None, min_length=1)
+    rubric: dict[str, object] = Field(min_length=1)
+    population: Literal["representative_control", "failure_regression"] = "representative_control"
+
+
+class SupportCasesSeedRequest(BaseModel):
+    """Documents of the request's workspace whose updates to pin, and the cohort they form."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cases: list[SupportCaseRequest] = Field(min_length=1)
+    role: Literal["sentinel", "development", "release_holdout"] = "sentinel"
+    selection_policy_version: str = Field(min_length=1)
+
+
 class CrossSourceReviewConversionReportResponse(BaseModel):
     report_id: str
     review_count: int
@@ -7175,6 +7201,63 @@ def create_admin_app(
                 for case in report.cases
             ],
             "skipped": {reason: list(doc_ids) for reason, doc_ids in report.skipped.items()},
+        }
+
+    @evaluation_router.post("/support-cases/seed")
+    async def seed_support_evaluation_cases(
+        body: SupportCasesSeedRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Pin an applied update of each named Document as a Support case and freeze their cohort."""
+
+        from memforge.evals.offline_evaluation import (
+            AgentEvaluationPopulation,
+            AgentEvaluationRole,
+            OfflineAgentEvaluation,
+        )
+        from memforge.evals.source_unit_support_cases import (
+            SupportCaseRequest as PinRequest,
+            seed_source_unit_support_cases,
+        )
+
+        actor = _require_maintenance_operator(request)
+        try:
+            report = await seed_source_unit_support_cases(
+                db,
+                OfflineAgentEvaluation(db, executors={}),
+                requests=[
+                    PinRequest(
+                        doc_id=case.doc_id,
+                        source_id=case.source_id,
+                        title=case.title,
+                        derivation_id=case.derivation_id,
+                        rubric=case.rubric,
+                        population=AgentEvaluationPopulation(case.population),
+                    )
+                    for case in body.cases
+                ],
+                role=AgentEvaluationRole(body.role),
+                selection_policy_version=body.selection_policy_version,
+                actor=actor,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "cohort_id": report.cohort_id,
+            "cases": [
+                {
+                    "doc_id": case.doc_id,
+                    "derivation_id": case.derivation_id,
+                    "case_id": case.case_id,
+                    "ground_truth_revision_id": case.ground_truth_revision_id,
+                    "population": case.population.value,
+                }
+                for case in report.cases
+            ],
+            "skipped": {reason: list(labels) for reason, labels in report.skipped.items()},
         }
 
     @evaluation_router.post("/runs", status_code=202)
