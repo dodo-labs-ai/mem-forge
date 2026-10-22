@@ -48,9 +48,10 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
         retryTarget ? `Could not start the retry for ${source.name}` : `Could not start a sync for ${source.name}`,
       );
     },
-    /** Whether the source's sync can be stopped from here, by someone who can sync it. */
+    /** Whether the source's sync can be stopped from here, by someone who can sync or pause it. */
     canStopSync(source: Source, activity: SourceSyncActivity | undefined) {
-      return Boolean(source.capabilities?.can_sync) && sourceSyncCanStop(activity)
+      const capabilities = source.capabilities;
+      return Boolean(capabilities?.can_sync || capabilities?.can_configure) && sourceSyncCanStop(activity)
         && !(stopSync.isPending && stopSync.variables === source.id);
     },
     stopSync(source: Source) {

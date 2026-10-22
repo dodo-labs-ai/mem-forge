@@ -13,10 +13,10 @@ from fastapi.testclient import TestClient
 import memforge.runtime as runtime
 from memforge.config import AppConfig
 from memforge.local_agent.runner import CloudJobLeaseLost, _CloudJobLeaseHeartbeat
-from memforge.models import ContentItem, ScopeListingKind
+from memforge.models import ContentItem, ScopeListingKind, SyncState
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.source_activity import SOURCE_SYNC_CANCELLED_BY_USER, SourceSyncHeartbeat, SourceSyncRunActive
-from memforge.source_projection import ProjectionScopeTransition
+from memforge.source_projection import ProjectionScopeTransition, ProjectionScopeTransitionStatus
 from memforge.storage.database import Database
 from tests.test_document_absence import JIRA_CONFIG, SOURCE_ID, JiraProject, Workspace
 from tests.test_source_authority_api import _app, _confluence_payload, _connect_database, _jira_payload
@@ -179,6 +179,42 @@ async def test_a_stopped_run_leaves_its_scope_transition_open_for_the_next_run(d
 
 
 @pytest.mark.asyncio
+async def test_stopping_a_run_waiting_to_retry_releases_the_transition_it_started(db: Database):
+    source_id = await _source(db)
+    transition = ProjectionScopeTransition(
+        id="pst-retry-stop",
+        source_id=source_id,
+        previous_scope={"jql": "project = PAY"},
+        target_scope={"jql": "project in (PAY, OPS)"},
+        created_at=NOW.isoformat(),
+    )
+    await db.create_projection_scope_transition(transition)
+    queued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    leased = await db.lease_next_source_sync_run(worker_id="worker-a", lease_seconds=60)
+    await db.start_projection_scope_transition(transition.id, run_id=queued.run_id)
+    assert await db.fail_source_sync_run(
+        queued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        error_message="provider timeout",
+        retryable=True,
+        next_attempt_at=NOW + timedelta(minutes=15),
+    )
+    assert (await db.get_source_sync_run(queued.run_id)).status == "pending"
+
+    await db.request_source_sync_stop(source_id=source_id)
+
+    released = await db.get_open_projection_scope_transition(source_id)
+    assert (released.status, released.error) == (
+        ProjectionScopeTransitionStatus.FAILED,
+        SOURCE_SYNC_CANCELLED_BY_USER,
+    )
+    next_run = await db.enqueue_source_sync_run(source_id=source_id, trigger="schedule")
+    restarted = await db.start_projection_scope_transition(transition.id, run_id=next_run.run_id)
+    assert restarted.run_id == next_run.run_id
+
+
+@pytest.mark.asyncio
 async def test_a_source_change_names_the_run_it_waits_for(db: Database):
     source_id = await _source(db)
     queued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
@@ -334,6 +370,41 @@ async def test_a_run_its_worker_was_stopping_when_it_died_is_failed_without_runn
     stopped = await db.get_source_sync_run(queued.run_id)
     assert (stopped.status, stopped.error_message) == ("failed", SOURCE_SYNC_CANCELLED_BY_USER)
     assert await _activity(db, source_id) == []
+
+
+@pytest.mark.asyncio
+async def test_a_worker_whose_retryable_failure_became_a_stop_ends_the_run(db: Database, monkeypatch):
+    source_id = await _source(db)
+    queued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    published: list[object] = []
+    released: list[str] = []
+
+    class StoppedWhileFailing:
+        async def build_sync_runtime(self, *args, **kwargs):
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            await db.request_source_sync_stop(source_id=source_id)
+            return SyncState(
+                source=source_id,
+                last_sync_status="failed",
+                error_message="provider timeout",
+                failure_retryable=True,
+            )
+
+    async def record_release(run, source):
+        released.append(run.run_id)
+
+    monkeypatch.setattr(runtime, "_publish_terminal_runtime_bundles", lambda rt, state: published.append(state))
+    worker = runtime.SourceSyncWorker(db, AppConfig(), runtime_provider=StoppedWhileFailing(), worker_id="worker-a")
+    monkeypatch.setattr(worker, "_release_collection", record_release)
+
+    assert (await worker.run_once()).run_id == queued.run_id
+
+    ended = await db.get_source_sync_run(queued.run_id)
+    assert (ended.status, ended.error_message) == ("failed", SOURCE_SYNC_CANCELLED_BY_USER)
+    assert published == []
+    assert released == [queued.run_id]
 
 
 def test_the_stop_route_answers_what_it_stopped(tmp_path: Path):
