@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, cast
 
 from memforge.conversations.collections import StoredCollections
+from memforge.genes import gene_exports_pdf
 from memforge.genes.conversation_gene import CollectionAttempt, ConversationGene
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind, gene_family
@@ -47,7 +48,6 @@ from memforge.source_projection import (
     SourceRemoval,
     UnitRemovalReason,
 )
-from memforge.source_types import source_type_descriptor
 
 if TYPE_CHECKING:
     from memforge.genes.base import Gene
@@ -131,7 +131,8 @@ class CollectionFamily(ABC):
     ) -> datetime | None:
         """The time discovery reads changes from; ``None`` discovers everything.
 
-        It is the last cursor minus :data:`DEFAULT_INCREMENTAL_SYNC_OVERLAP`. A run that must discover
+        It is the last cursor minus
+        :data:`DEFAULT_INCREMENTAL_SYNC_OVERLAP`. A run that must discover
         everything, a Source that never synced or holds no Document, and a
         family-specific reason (:meth:`_requires_full_discovery`) read from
         the start.
@@ -170,7 +171,7 @@ class CollectionFamily(ABC):
         *,
         reprocessing: bool,
         transition_open: bool,
-        snapshot_proves_absence: bool,
+        coverage_proves_absence: bool,
         run_committed: bool,
         indexed_doc_ids: set[str],
         crawled_doc_ids: set[str],
@@ -195,8 +196,7 @@ class DocumentFamily(CollectionFamily):
         return None
 
     async def _requires_full_discovery(self) -> bool:
-        descriptor = source_type_descriptor(self.gene.metadata().name)
-        if descriptor is None or not descriptor.exports_pdf:
+        if not gene_exports_pdf(self.gene):
             return False
         missing_pdf_count = await self.db.count_missing_pdf_uris(self.source_id)
         if missing_pdf_count:
@@ -256,7 +256,7 @@ class DocumentFamily(CollectionFamily):
         *,
         reprocessing: bool,
         transition_open: bool,
-        snapshot_proves_absence: bool,
+        coverage_proves_absence: bool,
         run_committed: bool,
         indexed_doc_ids: set[str],
         crawled_doc_ids: set[str],
@@ -272,7 +272,7 @@ class DocumentFamily(CollectionFamily):
         committed.
         """
 
-        if snapshot_proves_absence and run_committed:
+        if coverage_proves_absence and run_committed:
             return AbsenceOutcome(removals=_absent(indexed_doc_ids - crawled_doc_ids, evidence="complete snapshot"))
         if not run_committed or reprocessing or transition_open:
             return AbsenceOutcome()
@@ -388,7 +388,7 @@ class ConversationFamily(CollectionFamily):
         *,
         reprocessing: bool,
         transition_open: bool,
-        snapshot_proves_absence: bool,
+        coverage_proves_absence: bool,
         run_committed: bool,
         indexed_doc_ids: set[str],
         crawled_doc_ids: set[str],

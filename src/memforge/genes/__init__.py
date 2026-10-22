@@ -24,6 +24,7 @@ __all__ = [
     "GENE_REGISTRY",
     "DocumentGene",
     "create_gene",
+    "gene_exports_pdf",
     "list_available_genes",
     "source_rediscovers_documents",
     "source_type_execution_kinds",
@@ -83,6 +84,12 @@ def source_type_execution_kinds(source_type: str) -> tuple[SourceExecutionKind, 
 def source_type_supports_sync(source_type: str) -> bool:
     """Whether the source type participates in the ordinary sync lifecycle."""
     return bool(source_type_execution_kinds(source_type))
+
+
+def gene_exports_pdf(gene: Gene) -> bool:
+    """Whether the Gene's source type renders a PDF of each Unit."""
+    descriptor = source_type_descriptor(gene.metadata().name)
+    return descriptor is not None and descriptor.exports_pdf
 
 
 def source_rediscovers_documents(source_type: str, config: Mapping[str, Any]) -> bool:

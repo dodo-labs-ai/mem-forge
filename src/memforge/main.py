@@ -2081,7 +2081,7 @@ def sync(ctx, source: str | None):
                     "a conversation Source is collected by its local agent; sync it from the Admin UI."
                 )
                 continue
-            if family is None:
+            if descriptor is not None and family is None:
                 console.print(
                     f"\n[yellow]Skipping {src['name']}[/] (type={source_type}): "
                     "it receives content as it is captured and has no sync run."
