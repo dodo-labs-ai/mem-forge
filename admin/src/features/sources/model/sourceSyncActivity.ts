@@ -18,10 +18,18 @@ export type SourceSyncActivityState =
   | "recovering"
   | "success"
   | "partial"
-  | "failed";
+  | "failed"
+  | "stopped";
+
+/** The error a sync run or local sync job a person stopped ends with. */
+export const SYNC_CANCELLED_BY_USER = "cancelled_by_user";
+
+const LIVE_SYNC_STATES: ReadonlySet<SourceSyncActivityState> = new Set(["queued", "active", "recovering"]);
 
 export interface SourceSyncActivity {
   state: SourceSyncActivityState;
+  /** A person asked to stop this live sync; it ends within about 30 seconds. */
+  stopping?: boolean;
   progress?: SyncProgressSnapshot;
   error?: {
     message?: string | null;
@@ -65,7 +73,9 @@ export function sourceSyncActivityFromLocalJob(job: LocalAgentJob): SourceSyncAc
       ? "queued"
       : job.status === "leased"
         ? leaseExpired ? "recovering" : "active"
-        : job.status === "succeeded" ? "success" : "failed",
+        : job.status === "succeeded"
+          ? "success"
+          : job.last_error === SYNC_CANCELLED_BY_USER ? "stopped" : "failed",
     progress: job.result?.progress,
     error: { message: job.result?.error || job.last_error },
     startedAt: job.created_at,
@@ -83,7 +93,10 @@ export function sourceSyncActivityFromStatus(sync: SyncStatus): SourceSyncActivi
       ? "queued"
       : sync.status === "running"
         ? "active"
-        : sync.status,
+        : sync.status === "failed" && sync.error_message === SYNC_CANCELLED_BY_USER
+          ? "stopped"
+          : sync.status,
+    stopping: Boolean(sync.stop_requested_at) && ["pending", "running", "recovering"].includes(sync.status),
     progress: sync.progress ?? undefined,
     error: { message: sync.error_message, items: sync.failed_docs ?? undefined },
     startedAt: sync.started_at,
@@ -169,6 +182,7 @@ function activityTime(activity: SourceSyncActivity): number {
  */
 export function sourceSyncControl(activity: SourceSyncActivity | undefined, starting: boolean): SourceSyncControl {
   if (starting) return { label: "Starting", enabled: false };
+  if (activity?.stopping) return { label: "Stopping", enabled: false };
   switch (activity?.state) {
     case "queued":
       return isWaitingForRetry(activity) && activity.retryTarget
@@ -181,6 +195,14 @@ export function sourceSyncControl(activity: SourceSyncActivity | undefined, star
     default:
       return { label: "Sync now", enabled: true };
   }
+}
+
+/**
+ * Whether a person can stop the source's sync: it is queued, running or
+ * recovering, and nobody has asked to stop it yet. The source stays active.
+ */
+export function sourceSyncCanStop(activity: SourceSyncActivity | undefined): boolean {
+  return activity !== undefined && LIVE_SYNC_STATES.has(activity.state) && !activity.stopping;
 }
 
 function isWaitingForRetry(activity: SourceSyncActivity): boolean {
@@ -205,6 +227,12 @@ export function presentSourceSyncActivity(
   sourceName: string,
   fallbackItems: string,
 ): SourceSyncPresentation {
+  if (activity.stopping) {
+    return { message: "Stopping", detail: "The sync stops within about 30 seconds. What it saved stays." };
+  }
+  if (activity.state === "stopped") {
+    return { message: "Stopped", detail: "You stopped this sync. What it saved stays, and the next sync runs as usual." };
+  }
   if (activity.state === "queued") {
     if (isWaitingForRetry(activity)) {
       return {

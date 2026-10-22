@@ -743,6 +743,13 @@ class ToolClient:
             {"document_ids": document_ids, "all_documents": all_documents, "dry_run": dry_run},
         )
 
+    def stop_source_sync(self, *, source_id: str) -> dict[str, Any]:
+        """Stop the source's sync in progress; the source stays active."""
+        source_id = source_id.strip()
+        if not source_id:
+            return {"error": "source_id is required"}
+        return self._resource_json("POST", f"/sources/{quote(source_id, safe='')}/sync/stop", None)
+
     def update_source_schedule(
         self,
         *,

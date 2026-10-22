@@ -497,6 +497,17 @@ export function SourcesPage() {
     },
   });
 
+  const stopSourceSync = useMutation({
+    mutationFn: (sourceId: string) => resourceClient.post(`/sources/${sourceId}/sync/stop`),
+    onError: (error) => handleAuthorityError(error, "Failed to stop the sync."),
+    onSettled: () => {
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["sources"] }),
+        queryClient.invalidateQueries({ queryKey: ["currentLocalAgentJobs"] }),
+      ]);
+    },
+  });
+
   const setSourceStatus = useMutation({
     mutationFn: ({ sourceId, status }: { sourceId: string; status: Source["status"] }) =>
       resourceClient.put(`/sources/${sourceId}`, { status }),
@@ -847,6 +858,10 @@ export function SourcesPage() {
                           if (!capabilities.can_sync || source.status === "paused") return;
                           syncSource.mutate({ source, retryTarget: syncActivity?.retryTarget });
                         }}
+                        onStopSync={() => {
+                          if (stopSourceSync.isPending && stopSourceSync.variables === source.id) return;
+                          stopSourceSync.mutate(source.id);
+                        }}
                         onSignIn={
                           source.type === "jira"
                           && source.connection_status?.reason === "authentication"
@@ -899,7 +914,8 @@ export function SourcesPage() {
                               }}
                               disableMutatingActions={isSourceBusy || isDeleting}
                               disableForceResync={isSourceBusy || isDeleting || source.status === "paused"}
-                              disableToggleStatus={isSourceBusy || isDeleting || isUpdatingStatus}
+                              // Pausing stops a sync, so it stays available during one; resuming waits for the sync to end.
+                              disableToggleStatus={isDeleting || isUpdatingStatus || (isSourceBusy && source.status === "paused")}
                               isUpdatingStatus={isUpdatingStatus}
                           />
                         }

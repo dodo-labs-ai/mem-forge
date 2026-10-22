@@ -19,7 +19,7 @@ export const sourceActionLayout = {
       id: "toggle-status",
       label: "Pause source",
       description:
-        "Pause or resume source discovery without deleting configuration or extracted memories.",
+        "Pause stops any sync in progress and skips syncs until you resume. Configuration and memories stay.",
       tone: "neutral",
     },
     {

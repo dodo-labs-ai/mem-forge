@@ -252,6 +252,23 @@ export function useSyncSource() {
   });
 }
 
+/**
+ * Stops the source's sync in progress: a server run, or the local sync job of
+ * its device. The source stays active, and its next sync runs as usual.
+ */
+export function useStopSync() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (sourceId: string) =>
+      unwrap(api.POST("/api/v1/sources/{source_id}/sync/stop", { params: { path: { source_id: sourceId } } })),
+    onSettled: () => Promise.all([
+      queryClient.invalidateQueries({ queryKey: sourceKeys.all }),
+      queryClient.invalidateQueries({ queryKey: localSyncKeys.jobs }),
+    ]),
+  });
+}
+
 export function useDeleteSource() {
   const api = useApi();
   return useSourceMutation((sourceId: string) =>

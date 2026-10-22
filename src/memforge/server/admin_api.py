@@ -233,7 +233,7 @@ from memforge.source_types import (
     source_type_descriptor,
 )
 from memforge.source_types.jira import jira_auth_mode
-from memforge.source_activity import SourceActivityConflict, SourceActivityKind
+from memforge.source_activity import SourceActivityConflict, SourceActivityKind, SourceSyncRunActive
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.recovery_points import RecoveryPoints, UpgradeError
 from memforge.storage.source_cleanup import SourceArtifactCleanupService
@@ -1848,7 +1848,9 @@ class SourceSyncStatusResponse(BaseModel):
 
     An active durable run carries the run fields (``run_id``, ``trigger``,
     ``force_full_sync``, ``created_at``, ``next_attempt_at``,
-    ``recovery_count``, ``progress_revision``, ``progress_updated_at``). A
+    ``recovery_count``, ``progress_revision``, ``progress_updated_at``, and
+    ``stop_requested_at`` once a person asked to stop it). A run a person
+    stopped ends ``failed`` with ``error_message`` ``cancelled_by_user``. A
     sync running in this process carries its live counters (``phase``,
     ``docs_*``, ``memories_*``, ``current_title``). The last recorded sync
     carries its totals, ``run_id``, ``failed_docs``,
@@ -1871,6 +1873,7 @@ class SourceSyncStatusResponse(BaseModel):
     recovery_count: int | None = None
     progress_revision: int | None = None
     progress_updated_at: str | None = None
+    stop_requested_at: str | None = None
     phase: str | None = None
     current_title: str | None = None
     docs_processed: int | None = None
@@ -2006,6 +2009,23 @@ class SourceSyncRunReceiptResponse(BaseModel):
     status: SourceSyncRunStatus
     created_at: str
     coalesced: bool
+
+
+class SourceSyncStopResponse(BaseModel):
+    """What stopping a Source's sync reached.
+
+    ``outcome`` is ``stopping`` while the running server run ``run_id`` has
+    yet to see the request: its worker stops at its next heartbeat, within
+    about 30 seconds, and the run then fails with ``cancelled_by_user``.
+    ``stopped`` means everything found has ended: a pending run, and the local
+    daemon jobs in ``local_agent_job_ids``. ``not_running`` means the Source
+    had nothing to stop. Asking again is harmless.
+    """
+
+    source_id: str
+    outcome: Literal["stopping", "stopped", "not_running"]
+    run_id: str | None
+    local_agent_job_ids: list[str]
 
 
 class LocalCollectionReceiptResponse(BaseModel):
@@ -2357,6 +2377,57 @@ def _validate_source_status(status: str | None) -> None:
             status_code=400,
             detail=(f"Invalid source status: {status}. Expected one of {', '.join(sorted(SOURCE_STATUSES))}"),
         )
+
+
+def _source_sync_running_http_error(source_id: str, run_id: str) -> HTTPException:
+    """The answer to a Source change that waits for the Source's sync run to end."""
+
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "source_sync_running",
+            "run_id": run_id,
+            "message": (
+                "A sync of this Source is running. Stop it with "
+                f"POST /api/v1/sources/{source_id}/sync/stop, wait for it to end, and save again."
+            ),
+        },
+    )
+
+
+async def _stop_source_sync(
+    request: Request,
+    db: Database,
+    sync_service: SyncService,
+    source: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Stop the collection jobs of the Source's local daemon, then its sync run.
+
+    The jobs go first, so that a job that completes meanwhile hands over a run
+    that the run's stop then reaches.
+    """
+
+    source_id = str(source["id"])
+    job_ids: list[str] = []
+    if local_agent_sync_operation(source["type"], source.get("config")) is not None:
+        stopper = getattr(request.app.state, "local_agent_job_stopper", None)
+        if stopper is not None:
+            job_ids = await stopper(source_id)
+        else:
+            job_ids = await db.stop_local_agent_source_jobs(source_id=source_id)
+    run = await sync_service.stop_source(source_id)
+    if run is not None and run.status == "running":
+        outcome = "stopping"
+    elif run is not None or job_ids:
+        outcome = "stopped"
+    else:
+        outcome = "not_running"
+    return {
+        "source_id": source_id,
+        "outcome": outcome,
+        "run_id": run.run_id if run is not None else None,
+        "local_agent_job_ids": job_ids,
+    }
 
 
 def _source_paused_http_error() -> HTTPException:
@@ -4244,6 +4315,7 @@ def create_admin_app(
     document_store: DocumentArtifactStore | None = None,
     local_agent_lease_validator: Callable[[Request, str, str, int, str], Awaitable[bool]] | None = None,
     local_agent_job_enqueuer: Callable[..., Awaitable[tuple[str, bool]]] | None = None,
+    local_agent_job_stopper: Callable[[str], Awaitable[list[str]]] | None = None,
     langfuse_annotation_adapter: object | None = None,
     workspace_id: str = "local",
 ) -> FastAPI:
@@ -4311,6 +4383,7 @@ def create_admin_app(
         app.state.maintenance_operator_resolver = maintenance_operator_resolver
         app.state.local_agent_lease_validator = local_agent_lease_validator
         app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
+        app.state.local_agent_job_stopper = local_agent_job_stopper
         app.state.langfuse_annotation_adapter = langfuse_annotation_adapter
         app.state.sync_service = SyncService(
             app.state.db,
@@ -4438,6 +4511,7 @@ def create_admin_app(
     app.state.maintenance_operator_resolver = maintenance_operator_resolver
     app.state.local_agent_lease_validator = local_agent_lease_validator
     app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
+    app.state.local_agent_job_stopper = local_agent_job_stopper
     app.state.langfuse_annotation_adapter = langfuse_annotation_adapter
 
     @app.middleware("http")
@@ -7887,8 +7961,13 @@ def create_admin_app(
                 ),
                 projection_scope_transition=scope_transition,
             )
+        except SourceSyncRunActive as exc:
+            raise _source_sync_running_http_error(source_id, exc.run_id) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if _request_includes_field(req, "status") and req.status == SOURCE_PAUSED_STATUS:
+            # A pause also stops the sync in progress; the Source syncs again once resumed.
+            await _stop_source_sync(request, db, sync_service, existing)
         if _request_includes_field(req, "sync_schedule"):
             schedule = req.sync_schedule or SourceSyncScheduleRequest()
             await db.set_source_sync_schedule(
@@ -8088,6 +8167,35 @@ def create_admin_app(
             "created_at": run.created_at.isoformat(),
             "coalesced": run.coalesced,
         }
+
+    @source_router.post("/{source_id}/sync/stop", response_model=SourceSyncStopResponse)
+    async def stop_source_sync(
+        request: Request,
+        source_id: str,
+        db: Database = Depends(get_db),
+        sync_service: SyncService = Depends(get_sync_service),
+    ):
+        """Stop the Source's sync in progress. The Source stays active and later syncs run as scheduled.
+
+        A person who manages the Source, or who runs its sync, can stop it.
+        A server run that has not started, and the collection jobs of the
+        Source's local daemon, end at once. A running server run ends at its
+        worker's next heartbeat: what it committed stays, and it removes
+        nothing and does not advance the sync cursor.
+        """
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
+        # Whoever can pause the Source can stop its sync, as can whoever runs it.
+        if not can_manage_source(
+            source,
+            viewer_id=resolve_request_principal(request),
+            viewer_role=resolve_request_workspace_role(request),
+        ):
+            _require_source_sync_execution(request, source)
+        _require_source_sync_support(source)
+        return await _stop_source_sync(request, db, sync_service, source)
 
     @source_router.post("/{source_id}/process", status_code=202)
     async def process_collected_local_source(

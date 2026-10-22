@@ -1,7 +1,14 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { SourceSyncStatusCard } from "@/components/admin/SourceSyncStatusCard";
-import { sourceSyncActivityFromLocalJob, presentSourceSyncActivity, sourceSyncActivityPolicy } from "./sourceSyncActivity";
+import {
+  SYNC_CANCELLED_BY_USER,
+  presentSourceSyncActivity,
+  sourceSyncActivityFromLocalJob,
+  sourceSyncActivityFromStatus,
+  sourceSyncActivityPolicy,
+  sourceSyncCanStop,
+} from "./sourceSyncActivity";
 
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
@@ -66,4 +73,38 @@ it("recognizes an HTTP Too Many Requests failure as a rate limit", () => {
     message: "Client error '429 Too Many Requests' for url 'https://teams.example.test/messages'",
   } }} sourceName="Teams" itemLabel="messages" />);
   expect(screen.getByText("The source is temporarily rate limited. Wait a few minutes, then retry.")).toBeTruthy();
+});
+
+it("offers Stop sync while a sync runs, reads Stopping once asked, and Stopped once it ended", () => {
+  const onStop = vi.fn();
+  const running = sourceSyncActivityFromStatus({
+    status: "running", run_id: "ssr-1", started_at: "2026-10-23T08:00:00Z", finished_at: null, error_message: null,
+  });
+  render(<SourceSyncStatusCard activity={running} sourceName="Wiki" itemLabel="pages" onStop={onStop} />);
+  fireEvent.click(screen.getByRole("button", { name: "Stop the sync of Wiki" }));
+  expect(onStop).toHaveBeenCalledOnce();
+  cleanup();
+
+  const stopping = sourceSyncActivityFromStatus({
+    status: "running", run_id: "ssr-1", started_at: "2026-10-23T08:00:00Z", finished_at: null, error_message: null,
+    stop_requested_at: "2026-10-23T08:01:00Z",
+  });
+  render(<SourceSyncStatusCard activity={stopping} sourceName="Wiki" itemLabel="pages" onStop={onStop} />);
+  expect(screen.getByText("Stopping")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Stop the sync of Wiki" })).toBeNull();
+  expect(sourceSyncActivityPolicy(stopping).busyActionLabel).toBe("Stopping");
+  cleanup();
+
+  const stopped = sourceSyncActivityFromStatus({
+    status: "failed", run_id: "ssr-1", started_at: "2026-10-23T08:00:00Z", finished_at: "2026-10-23T08:01:20Z",
+    error_message: SYNC_CANCELLED_BY_USER,
+  });
+  expect(stopped.state).toBe("stopped");
+  expect(sourceSyncCanStop(stopped)).toBe(false);
+  render(<SourceSyncStatusCard activity={stopped} sourceName="Wiki" itemLabel="pages" onRetry={() => {}} />);
+  expect(screen.getByText("Stopped")).toBeTruthy();
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(sourceSyncActivityFromLocalJob({
+    job_id: "laj-1", status: "failed", result: null, last_error: SYNC_CANCELLED_BY_USER,
+  }).state).toBe("stopped");
 });
