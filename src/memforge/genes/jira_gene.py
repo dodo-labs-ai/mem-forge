@@ -648,6 +648,24 @@ class JiraGene(DocumentGene):
         }
         return ScopeListing(kind=ScopeListingKind.QUERY, doc_ids=frozenset(doc_ids))
 
+    @classmethod
+    def provider_key(cls, item: ContentItem) -> str:
+        """The issue id, as an issue's Unit records it, or the issue key when the item does not record the id."""
+        return _issue_ref(item)
+
+    @classmethod
+    def confirmation_item(cls, document_id: str, provider_key: str) -> ContentItem:
+        """An issue to read by its id or key, answered under ``document_id``."""
+        issue_ref = _jql_issue_ref(provider_key.strip())
+        return ContentItem(
+            item_id=document_id,
+            title=issue_ref,
+            source_url="",
+            last_modified=datetime.fromtimestamp(0, tz=timezone.utc),
+            content_type="application/json",
+            extra={"issue_id": issue_ref} if issue_ref.isdigit() else {"issue_key": issue_ref},
+        )
+
     async def confirm_absent(self, items: Sequence[ContentItem]) -> Mapping[str, AbsenceAnswer]:
         """Search the unlisted issues by id in batches; read each one the search does not return.
 

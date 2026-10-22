@@ -404,6 +404,41 @@ class ToolClient:
             body,
         )
 
+    def submit_local_source_confirmations(
+        self,
+        *,
+        source_id: str,
+        manifest_sha256: str,
+        sync_snapshot_id: str,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+        answers: list[dict[str, str]] | None = None,
+        failure_cause: str | None = None,
+    ) -> dict[str, Any]:
+        """Answer the items a manifest response asked this agent to confirm, bound to that manifest.
+
+        ``answers`` holds one ``{"doc_id", "provider_key", "answer"}`` per item,
+        each answer ``absent``, ``exists`` or ``hidden``. When the agent could
+        not confirm them, it sends ``failure_cause`` instead.
+        """
+        source_id = source_id.strip()
+        if not source_id:
+            return {"error": "source_id is required"}
+        body: dict[str, Any] = {
+            "manifest_sha256": manifest_sha256,
+            "sync_snapshot_id": sync_snapshot_id,
+            "local_agent_job_id": local_agent_job_id,
+            "local_agent_attempt_count": local_agent_attempt_count,
+            "answers": list(answers or []),
+        }
+        if failure_cause is not None:
+            body["failure_cause"] = failure_cause
+        return self._resource_json(
+            "POST",
+            f"/sources/{quote(source_id, safe='')}/adapter/manifest/confirmations",
+            body,
+        )
+
     def push_jira_package(
         self,
         *,

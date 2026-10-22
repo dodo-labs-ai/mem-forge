@@ -31,7 +31,7 @@ LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS = frozenset(
 )
 LOCAL_AGENT_JOB_MAX_ATTEMPTS = 5
 LOCAL_AGENT_SEMANTIC_INPUT_VERSION = "canonical-v1"
-LOCAL_PACKAGE_CONTRACT_VERSION = 2
+LOCAL_PACKAGE_CONTRACT_VERSION = 3
 """The package contract this local agent collects under, declared in its manifest.
 
 An agent that declares no version predates the numbered contract.
@@ -42,6 +42,12 @@ LOCAL_PACKAGE_SOURCE_TIME_CONTRACT_VERSION = 2
 A collection under this contract or a later one does not reuse a retained file
 package without a source time, so the agent uploads that file once more with
 its time (design ``source-sync-to-memory.md`` 0.9).
+"""
+LOCAL_PACKAGE_CONFIRMATION_CONTRACT_VERSION = 3
+"""The first contract under which an agent confirms by identifier what its query manifest leaves out.
+
+The manifest response then names the items to confirm, and the agent posts
+its answers before it asks for processing.
 """
 TEAMS_ROLLING_RETENTION_PRESETS = (365, 730, 1095)
 # Every sync polls the whole Initial History, so it is bounded, and by the
@@ -284,6 +290,14 @@ def local_package_requires_source_time(
     except ValueError:
         return False
     return adapter.package_source_time
+
+
+def local_package_confirms_absence(package_contract_version: int | None) -> bool:
+    """Whether an agent collecting under this package contract confirms unlisted items by identifier."""
+
+    return package_contract_version is not None and (
+        package_contract_version >= LOCAL_PACKAGE_CONFIRMATION_CONTRACT_VERSION
+    )
 
 
 def _source_config(value: object) -> Mapping[str, Any]:

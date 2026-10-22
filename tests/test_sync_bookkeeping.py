@@ -7552,6 +7552,72 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
 
 
 @pytest.mark.asyncio
+async def test_source_sync_worker_binds_a_device_run_to_the_answers_its_manifest_stored(db: Database):
+    import memforge.runtime as runtime
+    from memforge.local_agent.snapshot_manifest import SnapshotConfirmation, SnapshotConfirmationAnswer
+
+    source_id = "src-device-jira"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Device Jira",
+        config_json='{"base_url":"https://jira.example.test","sync_mode":"local_agent"}',
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    issued = (SnapshotConfirmation("jira-doc-7", "100007"), SnapshotConfirmation("jira-doc-8", "PAY-8"))
+    await db.attach_source_sync_inputs_to_snapshot(
+        source_id=source_id,
+        workspace_id="default",
+        snapshot_id="laj-jira:attempt:1",
+        memberships=[],
+        coverage="complete_snapshot",
+        manifest_count=0,
+        manifest_sha256="d" * 64,
+        manifest_items=[],
+        local_agent_job_id="laj-jira",
+        local_agent_attempt_count=1,
+        source_config_revision="rev-1",
+        confirm=issued,
+    )
+    answered = (
+        SnapshotConfirmation("jira-doc-7", "100007", SnapshotConfirmationAnswer.ABSENT),
+        SnapshotConfirmation("jira-doc-8", "PAY-8", SnapshotConfirmationAnswer.EXISTS),
+    )
+    await db.write_source_sync_snapshot_confirmations(
+        source_id=source_id,
+        workspace_id="default",
+        snapshot_id="laj-jira:attempt:1",
+        manifest_sha256="d" * 64,
+        local_agent_job_id="laj-jira",
+        local_agent_attempt_count=1,
+        answers=answered,
+    )
+
+    class CapturingRuntimeProvider:
+        input_snapshot: SnapshotBinding | None = None
+
+        async def build_sync_runtime(self, db, config, **kwargs):
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            self.input_snapshot = kwargs["input_snapshot"]
+            return SyncState(source=source_id, last_sync_at=datetime.now(timezone.utc), last_sync_status="success")
+
+    provider = CapturingRuntimeProvider()
+    await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="local_agent",
+        force_full_sync=False,
+        input_snapshot_id="laj-jira:attempt:1",
+    )
+
+    await runtime.SourceSyncWorker(db, AppConfig(), runtime_provider=provider, worker_id="worker-jira").run_once()
+
+    assert provider.input_snapshot == SnapshotBinding("laj-jira:attempt:1", frozenset(), answered)
+
+
+@pytest.mark.asyncio
 async def test_source_sync_worker_preserves_empty_incremental_local_snapshot(db: Database):
     import memforge.runtime as runtime
 

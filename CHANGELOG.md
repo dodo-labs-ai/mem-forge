@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Local-agent Jira removes an issue only when the device confirms it is gone.
+  For an agent that declares package contract 3
+  (`LOCAL_PACKAGE_CONTRACT_VERSION`), the manifest response returns
+  `manifest_sha256` and `confirm`: every held issue and every failed issue
+  the manifest does not list, by Document id and provider key, stored with
+  the manifest (a replay returns the stored set). The agent reads them with
+  its own session through `JiraGene.confirm_absent` and posts the answers
+  (`absent`, `exists` or `hidden`), or a single `failure_cause`, to the new
+  `POST /sources/{id}/adapter/manifest/confirmations`, bound to the job
+  attempt and the manifest digest; an unissued item, another digest and a
+  differing resubmission answer 409, an identical replay is accepted, and
+  the job lease must be current. Until the answers are stored, processing
+  answers 409 `source_snapshot_confirmations_pending`. The run removes only
+  issues answered `absent`, settles failed issues answered `absent`, keeps
+  the others untried until a manifest lists them again, and counts `exists`
+  and `hidden` as `unlisted_present_count`. A failed confirmation records
+  `absence_confirmation_failed`; an older agent, or a confirm set larger
+  than a manifest, records `absence_confirmation_missing`. Both remove
+  nothing. A document Gene whose device listing is a query implements
+  `DocumentGene.provider_key` and `DocumentGene.confirmation_item`; startup
+  refuses one that does not.
+
 - The device manifest route `POST /sources/{id}/adapter/manifest` accepts
   only `coverage: complete_snapshot` and items with `change_kind: upsert`;
   `bounded_delta`, `partial` and `tombstone` answer 422, and both stores

@@ -39,6 +39,7 @@ class FakeToolClient:
     response: dict = {}
     list_response: dict = {"data": []}
     snapshot_plan_response: dict | None = None
+    confirmations_response: dict | None = None
     def __init__(
         self,
         *,
@@ -59,6 +60,7 @@ class FakeToolClient:
         cls.response = response
         cls.list_response = {"data": []} if list_response is None else list_response
         cls.snapshot_plan_response = None
+        cls.confirmations_response = None
     def list_sources(self):
         self.calls.append(("list_sources", {"api_url": self.api_url, "api_token": self.api_token}))
         return self.list_response
@@ -142,6 +144,16 @@ class FakeToolClient:
             "required_doc_ids": [str(item["doc_id"]) for item in kwargs.get("items", [])],
             "reused_count": 0,
         }
+    def submit_local_source_confirmations(self, **kwargs):
+        self.calls.append(
+            (
+                "submit_local_source_confirmations",
+                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+            )
+        )
+        if self.confirmations_response is not None:
+            return self.confirmations_response
+        return {"answered_count": len(kwargs.get("answers") or []), "failed": kwargs.get("failure_cause") is not None}
     def push_jira_package(self, **kwargs):
         self.calls.append(
             (
@@ -2487,6 +2499,162 @@ def test_local_agent_cloud_jira_noop_uses_inventory_without_hydrating_issues(mon
     assert len(plan_call[1]["items"]) == 2
     assert not [call for call in FakeToolClient.calls if call[0] == "push_jira_package"]
     assert payload["counts"] == {"selected": 2, "reused": 2, "pushed": 0, "failed": 0}
+
+
+def _confirming_jira_gene(events: list[str], *, confirm_error: Exception | None = None):
+    """A Jira Gene whose inventory lists PAY-1, and which confirms what the server asks about."""
+    from datetime import datetime, timezone
+
+    from memforge.models import AbsenceAnswer, ContentItem
+
+    class HttpClient:
+        async def aclose(self):
+            events.append("closed")
+
+    class ConfirmingJiraGene:
+        def __init__(self, config, source_id):
+            self.config = config
+            self.source_id = source_id
+            self._client = HttpClient()
+
+        async def authenticate(self):
+            return None
+
+        async def discover_inventory(self):
+            yield ContentItem(
+                item_id="jira-PAY-1",
+                title="PAY-1 title",
+                source_url="https://jira.example.test/browse/PAY-1",
+                last_modified=datetime(2026, 7, 7, tzinfo=timezone.utc),
+                content_type="application/json",
+                version="revision-PAY-1",
+                extra={"issue_key": "PAY-1"},
+            )
+
+        async def fetch(self, item):
+            raise AssertionError("an unchanged issue is not hydrated")
+
+        @classmethod
+        def confirmation_item(cls, document_id, provider_key):
+            return ContentItem(
+                item_id=document_id,
+                title=provider_key,
+                source_url="",
+                last_modified=datetime(1970, 1, 1, tzinfo=timezone.utc),
+                extra={"issue_ref": provider_key},
+            )
+
+        async def confirm_absent(self, items):
+            events.append("confirmed " + ", ".join(item.extra["issue_ref"] for item in items))
+            if confirm_error is not None:
+                raise confirm_error
+            return {
+                item.item_id: AbsenceAnswer.ABSENT if item.extra["issue_ref"] == "100007" else AbsenceAnswer.EXISTS
+                for item in items
+            }
+
+    return ConfirmingJiraGene
+
+
+def _run_confirming_jira_job(monkeypatch, gene_cls) -> dict:
+    from memforge.auth import jira_capture
+    import memforge.genes.jira_gene as jira_gene
+
+    async def fake_capture(base_url, *, browser=None, tls_config=None):
+        return jira_capture.JiraCaptureResult(
+            origin=base_url, cookie_header="JSESSIONID=local", browser=browser, principal={"name": "tester"}
+        )
+
+    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
+    monkeypatch.setattr(jira_gene, "JiraGene", gene_cls)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.snapshot_plan_response = {
+        "required_doc_ids": [],
+        "reused_count": 1,
+        "manifest_sha256": "d" * 64,
+        "confirm": [
+            {"doc_id": "jira-src-pay-7", "provider_key": "100007"},
+            {"doc_id": "jira-src-pay-8", "provider_key": "PAY-8"},
+        ],
+    }
+    return main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-jira-confirm",
+            "attempt_count": 2,
+            "workspace_id": "ws-from-cloud",
+            "operation": "jira_sync",
+            "source_id": "src-jira",
+            "payload": {"base_url": "https://jira.example.test", "auth_mode": "browser_cookie", "projects": ["PAY"]},
+        },
+        _cloud_test_client(),
+        browser="chrome",
+    )
+
+
+def _call_names() -> list[str]:
+    return [
+        name
+        for name, _kwargs in FakeToolClient.calls
+        if name in {"prepare_local_source_snapshot", "submit_local_source_confirmations", "start_source_processing"}
+    ]
+
+
+def test_local_agent_cloud_jira_confirms_what_its_manifest_left_out_before_processing(monkeypatch):
+    events: list[str] = []
+    FakeToolClient.reset({})
+
+    payload = _run_confirming_jira_job(monkeypatch, _confirming_jira_gene(events))
+
+    assert payload.get("error") is None, payload
+    assert _call_names() == [
+        "prepare_local_source_snapshot",
+        "submit_local_source_confirmations",
+        "start_source_processing",
+    ]
+    [(_name, submitted)] = [call for call in FakeToolClient.calls if call[0] == "submit_local_source_confirmations"]
+    assert submitted["manifest_sha256"] == "d" * 64
+    assert submitted["sync_snapshot_id"] == "laj-jira-confirm:attempt:2"
+    assert (submitted["local_agent_job_id"], submitted["local_agent_attempt_count"]) == ("laj-jira-confirm", 2)
+    assert submitted["answers"] == [
+        {"doc_id": "jira-src-pay-7", "provider_key": "100007", "answer": "absent"},
+        {"doc_id": "jira-src-pay-8", "provider_key": "PAY-8", "answer": "exists"},
+    ]
+    assert submitted["failure_cause"] is None
+    # The Gene confirms with its own session, and closes it only afterwards.
+    assert events == ["confirmed 100007, PAY-8", "closed"]
+
+
+def test_local_agent_cloud_jira_reports_a_confirmation_it_could_not_make(monkeypatch):
+    events: list[str] = []
+    FakeToolClient.reset({})
+
+    payload = _run_confirming_jira_job(
+        monkeypatch, _confirming_jira_gene(events, confirm_error=RuntimeError("HTTP 401 from Jira"))
+    )
+
+    assert payload.get("error") is None, payload
+    [(_name, submitted)] = [call for call in FakeToolClient.calls if call[0] == "submit_local_source_confirmations"]
+    assert submitted["answers"] == []
+    assert submitted["failure_cause"] == "RuntimeError: HTTP 401 from Jira"
+    assert _call_names()[-1] == "start_source_processing"
+    assert events == ["confirmed 100007, PAY-8", "closed"]
+
+
+def test_local_agent_cloud_jira_does_not_process_when_its_answers_are_refused(monkeypatch):
+    events: list[str] = []
+    FakeToolClient.reset({})
+    FakeToolClient.confirmations_response = {
+        "error": "MemForge API request failed",
+        "status_code": 409,
+        "detail": "snapshot confirmations answer another manifest digest",
+    }
+
+    payload = _run_confirming_jira_job(monkeypatch, _confirming_jira_gene(events))
+
+    assert payload["error"] == "snapshot confirmations answer another manifest digest"
+    assert payload["retryable"] is True
+    assert "start_source_processing" not in _call_names()
+    assert events == ["confirmed 100007, PAY-8", "closed"]
 
 
 def test_local_agent_cloud_jira_sync_stops_on_principal_change(monkeypatch):

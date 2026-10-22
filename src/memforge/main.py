@@ -21,7 +21,7 @@ from http import HTTPStatus
 from importlib import metadata
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import quote
 
 try:
@@ -92,6 +92,9 @@ from memforge.workspace_bindings import (
     WorkspaceBindingError,
     resolve_workspace_binding,
 )
+
+if TYPE_CHECKING:
+    from memforge.genes.jira_gene import JiraGene
 
 console = Console()
 log_console = Console(stderr=True)
@@ -3185,7 +3188,7 @@ def _push_github_profile_to_source(
         and local_agent_attempt_count is not None
     ):
         try:
-            required_doc_ids = _required_local_source_doc_ids(
+            required_doc_ids = _plan_local_source_manifest(
                 client,
                 source_id=source_id,
                 items=manifest_items,
@@ -3194,7 +3197,7 @@ def _push_github_profile_to_source(
                 sync_snapshot_id=sync_snapshot_id,
                 local_agent_job_id=local_agent_job_id,
                 local_agent_attempt_count=local_agent_attempt_count,
-            )
+            ).required_doc_ids
         except RuntimeError as exc:
             return {
                 "profile": name,
@@ -3439,7 +3442,22 @@ def _raise_if_local_agent_lease_not_current(response: object) -> None:
     raise CloudJobLeaseLost(LOCAL_AGENT_LEASE_NOT_CURRENT)
 
 
-def _required_local_source_doc_ids(
+@dataclass(frozen=True)
+class _LocalSourceManifestPlan:
+    """The server's answer to one fenced manifest.
+
+    ``required_doc_ids`` are the items whose bodies the agent uploads.
+    ``confirm`` names the unlisted items, as ``{"doc_id", "provider_key"}``,
+    that the agent confirms by identifier before it asks for processing,
+    bound to the manifest by ``manifest_sha256``.
+    """
+
+    required_doc_ids: set[str]
+    manifest_sha256: str
+    confirm: tuple[dict[str, str], ...]
+
+
+def _plan_local_source_manifest(
     client: ToolClient,
     *,
     source_id: str,
@@ -3449,8 +3467,8 @@ def _required_local_source_doc_ids(
     sync_snapshot_id: str,
     local_agent_job_id: str,
     local_agent_attempt_count: int,
-) -> set[str]:
-    """Plan one fenced collection and validate the returned materialization set."""
+) -> _LocalSourceManifestPlan:
+    """Plan one fenced collection and validate the returned materialization and confirmation sets."""
     plan = client.prepare_local_source_snapshot(
         source_id=source_id,
         items=items,
@@ -3469,7 +3487,20 @@ def _required_local_source_doc_ids(
     }
     if required_doc_ids - known_doc_ids:
         raise RuntimeError("source manifest comparison returned unknown document identities")
-    return required_doc_ids
+    confirm = tuple(
+        {"doc_id": str(entry.get("doc_id") or ""), "provider_key": str(entry.get("provider_key") or "")}
+        for entry in plan.get("confirm") or []
+        if isinstance(entry, dict)
+    )
+    if any(not entry["doc_id"] or not entry["provider_key"] for entry in confirm):
+        raise RuntimeError("source manifest comparison returned an incomplete confirmation")
+    if {entry["doc_id"] for entry in confirm} & known_doc_ids:
+        raise RuntimeError("source manifest comparison asked to confirm a listed document")
+    return _LocalSourceManifestPlan(
+        required_doc_ids=required_doc_ids,
+        manifest_sha256=str(plan.get("manifest_sha256") or ""),
+        confirm=confirm,
+    )
 
 
 def _run_cloud_github_preview_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -4091,25 +4122,34 @@ async def _collect_jira_documents_from_cloud_job(
             ): item
             for item in inventory_items
         }
-        required_doc_ids = set(items_by_doc_id)
-        if not limit:
-            required_doc_ids = _required_local_source_doc_ids(
-                client,
+        manifest = _plan_local_source_manifest(
+            client,
+            source_id=source_id,
+            items=[
+                {
+                    "doc_id": doc_id,
+                    "revision": str(item.version),
+                    "change_kind": "upsert",
+                }
+                for doc_id, item in items_by_doc_id.items()
+            ],
+            coverage="complete_snapshot",
+            known_doc_ids=set(items_by_doc_id),
+            sync_snapshot_id=sync_snapshot_id,
+            local_agent_job_id=local_agent_job_id,
+            local_agent_attempt_count=local_agent_attempt_count,
+        )
+        if manifest.confirm:
+            await _confirm_unlisted_jira_issues(
+                gene,
+                manifest,
+                client=client,
                 source_id=source_id,
-                items=[
-                    {
-                        "doc_id": doc_id,
-                        "revision": str(item.version),
-                        "change_kind": "upsert",
-                    }
-                    for doc_id, item in items_by_doc_id.items()
-                ],
-                coverage="complete_snapshot",
-                known_doc_ids=set(items_by_doc_id),
                 sync_snapshot_id=sync_snapshot_id,
                 local_agent_job_id=local_agent_job_id,
                 local_agent_attempt_count=local_agent_attempt_count,
             )
+        required_doc_ids = manifest.required_doc_ids
         items_to_fetch = [
             item
             for doc_id, item in items_by_doc_id.items()
@@ -4195,14 +4235,58 @@ async def _collect_jira_documents_from_cloud_job(
                 ),
             )
     finally:
-        client = getattr(gene, "_client", None)
-        if client is not None:
-            await client.aclose()
+        http_client = getattr(gene, "_client", None)
+        if http_client is not None:
+            await http_client.aclose()
     return {
         "documents": documents,
         "inventory_count": len(inventory_items),
         "reused_count": len(inventory_items) - len(items_to_fetch),
+        "confirmed_count": len(manifest.confirm),
     }
+
+
+async def _confirm_unlisted_jira_issues(
+    gene: JiraGene,
+    manifest: _LocalSourceManifestPlan,
+    *,
+    client: ToolClient,
+    source_id: str,
+    sync_snapshot_id: str,
+    local_agent_job_id: str,
+    local_agent_attempt_count: int,
+) -> None:
+    """Read each issue the manifest left out by its id, and post the answers bound to the manifest.
+
+    When ``confirm_absent`` raises, the agent posts its cause instead, so the
+    run removes nothing. A post the server refuses fails the collection.
+    """
+    items = [gene.confirmation_item(entry["doc_id"], entry["provider_key"]) for entry in manifest.confirm]
+    answers: list[dict[str, str]] = []
+    failure_cause: str | None = None
+    try:
+        confirmed = await gene.confirm_absent(items)
+        answers = [
+            {"doc_id": entry["doc_id"], "provider_key": entry["provider_key"], "answer": confirmed[entry["doc_id"]].value}
+            for entry in manifest.confirm
+        ]
+    except Exception as exc:
+        logger.warning("Confirming the unlisted Jira issues of %s failed: %s", source_id, exc)
+        failure_cause = f"{type(exc).__name__}: {exc}"[:2_000]
+    response = client.submit_local_source_confirmations(
+        source_id=source_id,
+        manifest_sha256=manifest.manifest_sha256,
+        sync_snapshot_id=sync_snapshot_id,
+        local_agent_job_id=local_agent_job_id,
+        local_agent_attempt_count=local_agent_attempt_count,
+        answers=answers,
+        failure_cause=failure_cause,
+    )
+    _raise_if_local_agent_lease_not_current(response)
+    if response.get("error"):
+        raise RuntimeError(
+            str(response.get("detail") or response.get("error") or "Jira confirmation upload failed")
+        )
 
 
 def _jira_cloud_config_from_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -4371,7 +4455,7 @@ def _push_kb_profile_to_source(
     fallback_reason: str | None = None
     if not limit and sync_snapshot_id and local_agent_job_id and local_agent_attempt_count is not None:
         try:
-            required_doc_ids = _required_local_source_doc_ids(
+            required_doc_ids = _plan_local_source_manifest(
                 client,
                 source_id=source_id,
                 items=manifest_items,
@@ -4380,7 +4464,7 @@ def _push_kb_profile_to_source(
                 sync_snapshot_id=sync_snapshot_id,
                 local_agent_job_id=local_agent_job_id,
                 local_agent_attempt_count=local_agent_attempt_count,
-            )
+            ).required_doc_ids
         except RuntimeError as exc:
             return {
                 "profile": name,

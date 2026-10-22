@@ -1809,6 +1809,42 @@ async def test_confirming_unlisted_issues_fails_when_jira_rejects_the_credential
 
 
 @pytest.mark.asyncio
+async def test_a_device_confirms_an_issue_by_the_key_the_server_names_it_by():
+    searched: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        searched.append(json.loads(request.content)["jql"])
+        return httpx.Response(200, json=_search_page([_jira_issue("PAY-1"), _jira_issue("PAY-5")]))
+
+    # A device names its Documents by Source and issue key, not by the server's ``jira-KEY``.
+    stored_with_id = _stored_issue("PAY-1", "100001")
+    stored_by_key = ContentItem(
+        item_id="jira-src-pay-5-abc",
+        title="PAY-5",
+        source_url="https://jira.example.test/browse/PAY-5",
+        last_modified=datetime(2026, 10, 23, tzinfo=timezone.utc),
+        extra={"issue_key": "PAY-5"},
+    )
+    assert JiraGene.provider_key(stored_with_id) == "100001"
+    assert JiraGene.provider_key(stored_by_key) == "PAY-5"
+
+    gene = _transport_gene(handler)
+    items = [
+        JiraGene.confirmation_item("jira-src-pay-1-abc", "100001"),
+        JiraGene.confirmation_item("jira-src-pay-5-abc", "PAY-5"),
+    ]
+    try:
+        answers = await gene.confirm_absent(items)
+    finally:
+        await gene._client.aclose()
+
+    assert answers == {"jira-src-pay-1-abc": AbsenceAnswer.EXISTS, "jira-src-pay-5-abc": AbsenceAnswer.EXISTS}
+    assert searched == ["issuekey in (100001, PAY-5)"]
+    with pytest.raises(ValueError, match="neither an issue id nor an issue key"):
+        JiraGene.confirmation_item("jira-src-x", "PAY-1) OR (project = SECRET")
+
+
+@pytest.mark.asyncio
 async def test_complete_hydrated_comments_without_rendering_fetch_attested_comment_snapshot():
     issue = _jira_issue("PAY-123", comments=[{"id": "c1", "body": "*Require approval.*"}])
     rendered = {**issue["fields"]["comment"]["comments"][0], "renderedBody": "<p><strong>Require approval.</strong></p>"}
