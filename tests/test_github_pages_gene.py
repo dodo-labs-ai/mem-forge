@@ -747,7 +747,6 @@ async def test_normalize_extracts_main_article_and_removes_page_chrome():
     gene._client = RecordingAsyncClient()
     item = await gene._content_item_for_url(
         "https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking/",
-        metadata_headers={},
     )
     raw = RawContent(
         item=item,
