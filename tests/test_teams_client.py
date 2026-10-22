@@ -373,6 +373,7 @@ async def test_a_page_reaching_back_past_the_start_keeps_newer_messages_and_prov
 
     assert [message["id"] for message in poll.messages] == ["new"]
     assert poll.outcome is PollOutcome.REACHED_START
+    assert poll.earliest_complete_page_time == NOW - timedelta(days=2)
 
 
 async def test_running_out_of_pages_before_the_start_is_history_exhausted(monkeypatch):

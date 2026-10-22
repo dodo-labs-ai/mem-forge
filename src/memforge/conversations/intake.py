@@ -14,7 +14,7 @@ named again by the next attempt.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Set
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
@@ -24,9 +24,10 @@ from memforge.conversations.manifest import (
     CollectionManifest,
     CollectionRequest,
     ManifestMessage,
+    PollEvidence,
     manifest_from_payload,
 )
-from memforge.conversations.port import ConversationAccess, MessageArtifact
+from memforge.conversations.port import ConversationAccess, MessageArtifact, PollOutcome
 from memforge.conversations.reader import ConversationUnitReader
 from memforge.conversations.records import MessageIdentity, record_created_at, record_revision
 
@@ -176,7 +177,8 @@ def _require_answer(manifest: CollectionManifest, request: CollectionRequest) ->
 
     It records every requested conversation and no other, a conversation it
     could read was polled over exactly the requested intervals, and one it
-    could not read keeps the label the request carried.
+    could not read keeps the label the request carried. Each poll's evidence
+    is consistent with itself (:func:`_require_consistent_poll`).
     """
 
     requested = {conversation.conversation_id: conversation for conversation in request.conversations}
@@ -189,3 +191,35 @@ def _require_answer(manifest: CollectionManifest, request: CollectionRequest) ->
             raise CollectionRejected(f"conversation {conversation_id} was not polled over the requested intervals")
         if evidence.ref is None and evidence.last_known != requested[conversation_id].last_known:
             raise CollectionRejected(f"conversation {conversation_id} does not keep the label its request carried")
+        returned = {message.created_at for message in manifest.messages_of(conversation_id)}
+        for poll in evidence.polls:
+            _require_consistent_poll(conversation_id, poll, returned)
+
+
+def _require_consistent_poll(conversation_id: str, poll: PollEvidence, returned: Set[datetime]) -> None:
+    """Refuse poll evidence that does not support what it claims.
+
+    A poll that reached the requested start names the time its read is
+    complete from, earlier than that start, as the provider certified it; an
+    agent that names none predates that evidence and must be upgraded. The
+    earliest returned time is the creation time of a message the manifest
+    lists for the conversation, inside the poll's requested interval.
+    """
+
+    if poll.outcome is PollOutcome.REACHED_START and (
+        poll.earliest_complete_page_time is None or poll.earliest_complete_page_time >= poll.requested.start
+    ):
+        raise CollectionRejected(
+            f"a poll of conversation {conversation_id} reached its start without a complete time before it; "
+            "upgrade the MemForge agent that collected it"
+        )
+    earliest = poll.earliest_returned_at
+    if earliest is not None and (
+        earliest not in returned
+        or earliest < poll.requested.start
+        or (poll.requested.end is not None and earliest >= poll.requested.end)
+    ):
+        raise CollectionRejected(
+            f"a poll of conversation {conversation_id} names an earliest message the manifest does not list "
+            "inside its interval"
+        )

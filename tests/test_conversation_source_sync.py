@@ -10,6 +10,9 @@ layer's. The device's upload protocol is covered in
 
 from __future__ import annotations
 
+import logging
+import re
+
 import hashlib
 import io
 import json
@@ -124,10 +127,11 @@ class FakeTeams:
                 earliest_complete_page_time=read[-1]["time"],
                 stop_reason="budget",
             )
-        reached = any(m["time"] < interval.start for m in everything)
+        before = [m["time"] for m in everything if m["time"] < interval.start]
         return ConversationPoll(
             messages=tuple(teams_provider_message(message, conversation) for message in inside),
-            outcome=PollOutcome.REACHED_START if reached else PollOutcome.HISTORY_EXHAUSTED,
+            outcome=PollOutcome.REACHED_START if before else PollOutcome.HISTORY_EXHAUSTED,
+            earliest_complete_page_time=max(before) if before else None,
         )
 
     async def read_artifact(self, conversation, message, artifact):
@@ -308,7 +312,7 @@ async def test_messages_become_windows_and_unchanged_messages_upload_nothing_aga
     assert workspace.engine.events == []
 
 
-async def test_a_deleted_window_is_removed_and_an_edit_revises_its_window(workspace):
+async def test_a_deleted_window_is_removed_and_an_edit_revises_its_window(workspace, caplog):
     teams = FakeTeams()
     # History older than the requested range shows the poll read its whole range.
     teams.post(CHAT, "ancient", NOW - timedelta(days=60), "long ago")
@@ -318,12 +322,18 @@ async def test_a_deleted_window_is_removed_and_an_edit_revises_its_window(worksp
 
     teams.delete(CHAT, "m1")
     teams.post(CHAT, "m3", _ago(5), "later, edited")
-    state, missing = await workspace.collect_and_sync(teams)
+    with caplog.at_level(logging.INFO, logger="memforge.genes.conversation_gene"):
+        state, missing = await workspace.collect_and_sync(teams)
 
     assert state.last_sync_status == "success"
     assert [item.identity.message_id for item in missing] == ["m3"]
     assert await workspace.units() == {f"{UnitKind.WINDOW.value}:m3": ["m3"]}
     assert sorted(event for event, _doc in workspace.engine.events) == ["commit", "tombstone"]
+    assert [
+        re.sub(r" (source|attempt)=\S+", "", record.getMessage())
+        for record in caplog.records
+        if record.getMessage().startswith("conversation_units_removed")
+    ] == [f"conversation_units_removed conversation={CHAT} reason=absent_from_source units=1"]
 
 
 async def test_a_message_older_than_the_poll_is_kept_when_history_runs_out(workspace):
@@ -490,12 +500,15 @@ async def test_a_dry_run_reports_the_plan_and_changes_nothing(workspace):
     assert set(await workspace.units()) == {f"{UnitKind.WINDOW.value}:m1", f"{UnitKind.WINDOW.value}:m3"}
 
 
-async def test_rolling_retention_removes_a_window_once_its_latest_message_ages_out(workspace):
+async def test_rolling_retention_removes_a_window_once_its_latest_message_ages_out(workspace, monkeypatch):
     teams = FakeTeams()
     teams.post(CHAT, "old", NOW - timedelta(days=400), "old")
     teams.post(CHAT, "new", _ago(2), "new")
+    # The old window stands for one collected while it was still within Initial History.
+    monkeypatch.setattr("memforge.genes.teams_gene.TEAMS_MAX_INITIAL_HISTORY_DAYS", 500)
     workspace.config = {"conversation_ids": [CHAT], "initial_history_days": 500}
     await workspace.collect_and_sync(teams)
+    monkeypatch.undo()
 
     workspace.config = {"conversation_ids": [CHAT], "initial_history_days": 365, "rolling_retention_days": 365}
     report, _missing = await workspace.collect_and_sync(teams, dry_run=True)

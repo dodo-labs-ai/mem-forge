@@ -59,6 +59,14 @@ def test_normalize_config_accepts_product_retention_presets(retention_days: int)
     assert config["rolling_retention_days"] == retention_days
 
 
+@pytest.mark.parametrize("initial_history_days", [0, 366])
+def test_normalize_config_bounds_initial_history_to_a_year(initial_history_days: int):
+    config = {"conversation_ids": ["19:chat@example.test"], "initial_history_days": initial_history_days}
+
+    with pytest.raises(ValueError, match="between 1 and 365 days"):
+        TeamsGene.normalize_config(config)
+
+
 def test_normalize_config_collapses_legacy_direct_selectors():
     config = {
         "conversation_ids": ["19:chat@example.test"],
@@ -144,13 +152,6 @@ def test_config_accepts_direct_conversation_ids():
     )
 
     assert gene.source_id == "test"
-
-
-def test_initial_history_cannot_reach_past_rolling_retention():
-    with pytest.raises(ValueError, match="cannot reach back further"):
-        TeamsGene.normalize_config(
-            {"conversation_ids": ["19:chat@example.test"], "initial_history_days": 400, "rolling_retention_days": 365}
-        )
 
 
 def test_the_selection_is_the_configured_conversations_and_time_scope():

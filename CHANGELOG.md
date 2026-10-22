@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- A document Source's next run reads from the start of the previous run, not
+  its end, so an item changed while a long run was still going is read again.
+  "Last synced" shows that start time.
+- A Teams poll that reached its requested start names the time Chatsvc
+  certified its read complete from, and the server refuses a manifest whose
+  poll evidence does not support its claim. Agents installed before this
+  release are refused for Teams until they are upgraded.
+- A conversation run logs how many Units it removes per conversation and
+  reason (`conversation_units_removed`).
+- Reading a conversation Unit fails on an Observation revision that is neither
+  a message record nor a Source Artifact, instead of leaving it out.
+- Teams Initial History is bounded to 365 days; migration 124 cuts any stored
+  longer value to the bound.
+  - Cloud: the HANA migration `teams-initial-history-bound-v1` does the same.
+
 - Conversation Sources collect through one server-owned conversation layer
   (`memforge.conversations`), and Teams is its first Source. A connector
   implements only the provider port; the layer decides thread and window
