@@ -27,6 +27,7 @@ from memforge.source_artifacts import (
     source_artifact_semantic_refs,
 )
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, source_time_iso
+from memforge.source_types import registered_source_types, source_type_descriptor
 
 
 INVALID_REPLAY_ARTIFACT = "source_lifecycle_local_replay_artifact_invalid"
@@ -265,37 +266,21 @@ class JiraReplayAdapter(LocalSourceReplayAdapter):
         return semantic_hash
 
 
-_ADAPTERS: dict[str, LocalSourceReplayAdapter] = {}
-
-
-def register_local_source_replay_adapter(
-    adapter: LocalSourceReplayAdapter,
-    *,
-    replace: bool = False,
-) -> None:
-    source_type = str(adapter.source_type or "").strip().lower()
-    if not source_type:
-        raise ValueError("local source replay adapter source_type is required")
-    if source_type in _ADAPTERS and not replace:
-        raise ValueError(f"local source replay adapter already registered: {source_type}")
-    _ADAPTERS[source_type] = adapter
-
-
-for _builtin_adapter in (
-    GitHubRepoReplayAdapter(),
-    JiraReplayAdapter(),
-    LocalMarkdownReplayAdapter(),
-):
-    register_local_source_replay_adapter(_builtin_adapter)
-
-
 def get_local_source_replay_adapter(source_type: str) -> LocalSourceReplayAdapter:
+    """The replay adapter a source type's descriptor names for its local-agent packages."""
+
     normalized = str(source_type or "").strip().lower()
-    adapter = _ADAPTERS.get(normalized)
+    descriptor = source_type_descriptor(normalized)
+    collection = descriptor.local_agent if descriptor is not None else None
+    adapter = collection.replay_adapter_instance() if collection is not None else None
     if adapter is None:
         raise ValueError(f"local source replay adapter is not registered: {normalized}")
     return adapter
 
 
 def registered_local_source_types() -> frozenset[str]:
-    return frozenset(_ADAPTERS)
+    return frozenset(
+        descriptor.source_type
+        for descriptor in registered_source_types()
+        if descriptor.local_agent is not None and descriptor.local_agent.replay_adapter is not None
+    )

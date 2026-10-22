@@ -9,14 +9,12 @@ import pytest
 
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.source_projection_adapters import (
-    BUILTIN_SPECIALIZED_SOURCE_TYPES,
     _canonical_hash,
     _stable_id,
     project_source_item,
     project_source_unit_tombstone,
     source_run_projection_coverage,
 )
-from memforge.genes import GENE_REGISTRY
 from memforge.source_projection import (
     DeltaAxis,
     EvidenceCoordinateSpace,
@@ -1416,10 +1414,6 @@ def test_unit_tombstone_removes_all_prior_observations_with_explicit_coverage() 
     assert tombstone.deltas[0].removed_observation_ids == tuple(
         sorted(observation.id for observation in initial.observations)
     )
-
-
-def test_every_builtin_gene_has_an_explicit_projection_contract() -> None:
-    assert set(GENE_REGISTRY) == set(BUILTIN_SPECIALIZED_SOURCE_TYPES)
 
 
 @pytest.mark.parametrize(

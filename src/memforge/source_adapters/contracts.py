@@ -7,7 +7,13 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
-from memforge.source_projection import EvidenceRepresentationProfile, ProjectionCoverage, SourceRelationType, UnitTitle
+from memforge.source_projection import (
+    EvidenceCoordinateSpace,
+    EvidenceRepresentationProfile,
+    ProjectionCoverage,
+    SourceRelationType,
+    UnitTitle,
+)
 from memforge.source_time import reported_source_time
 
 
@@ -183,3 +189,39 @@ def _normalized_utc_timestamp(value: object) -> str | None:
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+MARKDOWN_STRUCTURAL_PROFILE = EvidenceRepresentationProfile(
+    name="markdown-structural",
+    version=1,
+    coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
+)
+BINARY_ARTIFACT_PROFILE = EvidenceRepresentationProfile(
+    name="binary-artifact",
+    version=1,
+    coordinate_space=EvidenceCoordinateSpace.WHOLE_ARTIFACT,
+)
+PLAIN_TEXT_PROFILE = EvidenceRepresentationProfile(
+    name="plain-text",
+    version=1,
+    coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
+)
+# A Unit Title stored as the Unit's first Observation. No adapter projects it:
+# the projection carries the Unit Title, and every reading shows it.
+UNIT_TITLE_OBSERVATION_PROFILE = EvidenceRepresentationProfile(
+    name="unit-identity",
+    version=1,
+    coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
+)
+
+
+def canonical_record_profile(schema_name: str, schema_version: int = 1) -> EvidenceRepresentationProfile:
+    """The profile of an Observation stored as one canonical record of a schema."""
+
+    return EvidenceRepresentationProfile(
+        name="canonical-record",
+        version=1,
+        coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
+        schema_name=schema_name,
+        schema_version=schema_version,
+    )

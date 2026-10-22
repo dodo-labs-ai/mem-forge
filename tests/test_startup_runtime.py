@@ -2033,7 +2033,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
     tmp_path,
 ):
     from memforge import runtime
-    from memforge.genes import GENE_REGISTRY
+    from tests.source_type_fixture import register_test_source_type
     from memforge.genes.base import Gene
     from memforge.models import (
         ConfigField,
@@ -2126,7 +2126,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             return SyncState(source=source_id, last_sync_status="success")
 
     monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
-    monkeypatch.setitem(GENE_REGISTRY, "api_key_gene", ApiKeyGene)
+    register_test_source_type(monkeypatch, "api_key_gene", ApiKeyGene)
     source_config = prepare_source_config_for_storage(
         {"api_key": "runtime-secret"},
         secret_fields=("api_key",),
@@ -2162,7 +2162,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
 async def test_gene_discovery_preview_runs_configured_gene_without_saving_source(db, tmp_path, monkeypatch):
     from datetime import datetime, timezone
 
-    from memforge.genes import GENE_REGISTRY
+    from tests.source_type_fixture import register_test_source_type
     from memforge.genes.base import Gene
     from memforge.models import (
         ConfigField,
@@ -2220,7 +2220,7 @@ async def test_gene_discovery_preview_runs_configured_gene_without_saving_source
         async def normalize(self, raw: RawContent) -> NormalizedContent:
             raise NotImplementedError
 
-    monkeypatch.setitem(GENE_REGISTRY, "preview_gene", PreviewGene)
+    register_test_source_type(monkeypatch, "preview_gene", PreviewGene)
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
@@ -2242,7 +2242,7 @@ async def test_gene_discovery_preview_runs_configured_gene_without_saving_source
 
 @pytest.mark.asyncio
 async def test_gene_discovery_preview_reuses_existing_source_secret(db, tmp_path, monkeypatch):
-    from memforge.genes import GENE_REGISTRY
+    from tests.source_type_fixture import register_test_source_type
     from memforge.genes.base import Gene
     from memforge.models import (
         ConfigField,
@@ -2307,7 +2307,7 @@ async def test_gene_discovery_preview_reuses_existing_source_secret(db, tmp_path
             raise NotImplementedError
 
     monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
-    monkeypatch.setitem(GENE_REGISTRY, "secret_preview_gene", SecretPreviewGene)
+    register_test_source_type(monkeypatch, "secret_preview_gene", SecretPreviewGene)
     app = create_admin_app(db=db, config=_config(tmp_path))
 
     with TestClient(app) as client:

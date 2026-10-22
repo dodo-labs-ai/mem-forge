@@ -2,8 +2,8 @@
 
 A gene encapsulates the complete lifecycle for syncing data from a single
 external source (Confluence, Jira, Teams, Outlook, ...) into MemForge's
-memory layer.  Concrete genes override the five abstract methods and register
-themselves via the ``@register_gene`` decorator in ``genes/__init__.py``.
+memory layer.  Concrete genes override the five abstract methods; each source
+type names its Gene in its descriptor in :mod:`memforge.source_types`.
 
 All gene-related dataclasses (GeneMetadata, GeneConfigSchema, ConfigField,
 ConfigGroup, ConfigFieldType, ContentItem, RawContent, NormalizedContent) live

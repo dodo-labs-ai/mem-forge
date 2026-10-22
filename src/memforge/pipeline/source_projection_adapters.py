@@ -43,6 +43,7 @@ from memforge.source_representation import (
 from memforge.source_projection_config import (
     projection_access_fingerprint,
 )
+from memforge.source_types import source_type_descriptor
 from memforge.source_artifacts import (
     SOURCE_ARTIFACT_OBSERVATION_TYPE,
     StoredSourceArtifact,
@@ -50,18 +51,6 @@ from memforge.source_artifacts import (
     source_artifact_observation_provider_key,
 )
 
-
-BUILTIN_SPECIALIZED_SOURCE_TYPES = frozenset(
-    {
-        "confluence",
-        "jira",
-        "github_repo",
-        "github_pages",
-        "local_markdown",
-        "teams",
-        "agent_session",
-    }
-)
 
 def source_run_projection_coverage(
     *,
@@ -497,36 +486,13 @@ def _project_native(
         from memforge.source_adapters.conversation import project_native
 
         return project_native(item=item, native=native)
-    # The source time of a Unit whose body is one Observation, as the Gene reports it.
+    descriptor = source_type_descriptor(source_type)
+    if descriptor is not None and descriptor.project_native is not None:
+        return descriptor.project_native(source_id=source_id, item=item, native=native, normalized=normalized)
+    # A source type without its own projection is projected as one document.
+    # It claims only partial coverage, so it can drive semantic change
+    # detection but never proves that an omitted Observation or Unit was deleted.
     body_time = normalized.source_semantics.get(SOURCE_UPDATED_AT_KEY)
-    if source_type == "confluence":
-        from memforge.source_adapters.confluence import project_native
-
-        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
-    if source_type == "jira":
-        from memforge.source_adapters.jira import project_native
-
-        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
-    if source_type == "github_repo":
-        from memforge.source_adapters.github_repo import project_native
-
-        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
-    if source_type == "github_pages":
-        from memforge.source_adapters.github_pages import project_native
-
-        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
-    if source_type == "local_markdown":
-        from memforge.source_adapters.local_markdown import project_native
-
-        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
-    if source_type == "agent_session":
-        from memforge.source_adapters.agent_session import project_native
-
-        return project_native(source_id=source_id, item=item, native=native, normalized=normalized)
-    # Extension-safe fallback for document-like genes that have not yet opted
-    # into a richer native projection.  It deliberately claims only partial
-    # coverage, so it can drive semantic change detection but can never prove
-    # that an omitted observation or source unit was deleted.
     body = normalized.markdown_body
     return _NativeProjection(
         unit_type="generic_document",
@@ -542,8 +508,6 @@ def _project_native(
         },
         title=_unit_title("Document", ("Title", item.title), ("Source type", source_type)),
     )
-
-
 
 
 def _native_payload(raw: RawContent) -> object:

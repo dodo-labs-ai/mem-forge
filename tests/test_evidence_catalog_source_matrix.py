@@ -14,10 +14,8 @@ from memforge.pipeline.projection_context import (
     plan_projection_evidence_work,
 )
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-from memforge.pipeline.source_projection_adapters import (
-    BUILTIN_SPECIALIZED_SOURCE_TYPES,
-    project_source_item,
-)
+from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.source_types import registered_source_types
 from tests.llm_fixture import NoopMemoryExtractor
 from tests.conversation_fixture import teams_unit_payload
 
@@ -37,7 +35,7 @@ TEXTUAL_BUILTIN_SOURCE_TYPES = (
 
 
 def test_source_matrix_covers_every_builtin_textual_source_type() -> None:
-    assert set(TEXTUAL_BUILTIN_SOURCE_TYPES) == set(BUILTIN_SPECIALIZED_SOURCE_TYPES)
+    assert set(TEXTUAL_BUILTIN_SOURCE_TYPES) == {descriptor.source_type for descriptor in registered_source_types()}
 
 
 @pytest.mark.parametrize(
