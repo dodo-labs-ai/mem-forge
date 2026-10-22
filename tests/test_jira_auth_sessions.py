@@ -181,7 +181,7 @@ async def test_cookie_header_for_sync_marks_expired_without_rescrape(db, monkeyp
         raise JiraAuthSessionMissingError("expired")
 
     expiring = JiraAuthSessionService(db, session_validator=dead_validator)
-    with pytest.raises(JiraAuthSessionMissingError):
+    with pytest.raises(JiraAuthSessionMissingError, match=r"jira refresh --base-url https://jira\.example\.test"):
         await expiring.cookie_header_for_sync("https://jira.example.test")
     status = await expiring.get_status("https://jira.example.test")
     assert status["status"] == "expired"
@@ -194,7 +194,7 @@ async def test_cookie_header_for_sync_without_stored_session_raises_missing(db):
     # Sync runs on the server, which never scrapes a browser; with no stored
     # session there is simply nothing to use.
     service = JiraAuthSessionService(db)
-    with pytest.raises(JiraAuthSessionMissingError):
+    with pytest.raises(JiraAuthSessionMissingError, match=r"jira refresh --base-url https://jira\.example\.test"):
         await service.cookie_header_for_sync("https://jira.example.test")
 
 
