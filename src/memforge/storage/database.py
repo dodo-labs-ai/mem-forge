@@ -282,6 +282,7 @@ from memforge.source_projection import (
     ProjectionCoverage,
     ProjectionIdentityConflict,
     ProjectionScopeTransition,
+    ProjectionScopeTransitionStale,
     ProjectionScopeTransitionStatus,
     SourceObservationRevision,
     SourceObservation,
@@ -8682,14 +8683,15 @@ class Database:
 
     async def _supersede_projection_scope_transition_unlocked(self, transition_id: str) -> None:
         """Close the open transition as superseded and delete its member rows."""
+        now = _now_iso()
         cursor = await self.db.execute(
             """UPDATE projection_scope_transitions
-               SET status = 'superseded', updated_at = ?
+               SET status = 'superseded', updated_at = ?, completed_at = ?
                WHERE id = ? AND status IN ('pending', 'running', 'failed')""",
-            (_now_iso(), transition_id),
+            (now, now, transition_id),
         )
         if cursor.rowcount != 1:
-            raise ValueError("projection_scope_transition_stale")
+            raise ProjectionScopeTransitionStale()
         await self.db.execute(
             "DELETE FROM projection_scope_transition_members WHERE transition_id = ?",
             (transition_id,),
@@ -8715,16 +8717,14 @@ class Database:
     ) -> None:
         """Record the projection's Document as a member of the open transition.
 
-        A tombstone commits no listed Document and records no member. The
-        transition must belong to the projection's Source and be open
+        The transition must belong to the projection's Source and be open
         (``pending``, ``running`` or ``failed``); otherwise the commit is
-        refused. A member committed again keeps one row, holding the latest
+        refused, a tombstone's included. A tombstone commits no listed
+        Document and records no member. A replayed run whose Unit has a later
+        current revision records none either, so a member's revision never
+        goes back. A member committed again keeps one row, holding the latest
         Unit revision.
         """
-        if projection.coverage is ProjectionCoverage.TOMBSTONED_DELTA:
-            return
-        if unit_input is None:
-            raise ValueError("a scope transition member requires the committed Unit's stored input")
         async with self.db.execute(
             """SELECT status FROM projection_scope_transitions
                WHERE id = ? AND source_id = ?""",
@@ -8733,6 +8733,17 @@ class Database:
             transition = await cursor.fetchone()
         if transition is None or transition["status"] not in _OPEN_SCOPE_TRANSITION_STATUSES:
             raise ValueError("projection scope transition is not open")
+        if projection.coverage is ProjectionCoverage.TOMBSTONED_DELTA:
+            return
+        if unit_input is None:
+            raise ValueError("a scope transition member requires the committed Unit's stored input")
+        async with self.db.execute(
+            "SELECT current_revision_id FROM source_units WHERE id = ?",
+            (unit_input.source_unit_id,),
+        ) as cursor:
+            unit = await cursor.fetchone()
+        if unit is None or unit["current_revision_id"] != unit_input.unit_revision_id:
+            return
         await self.db.execute(
             """INSERT INTO projection_scope_transition_members (
                 transition_id, doc_id, unit_revision_id
@@ -17228,8 +17239,8 @@ class Database:
         `expected_open_transition_id` names it: that transition is then
         superseded and its member rows are deleted, and the new transition
         must name it as its predecessor. When the open transition is not the
-        one the caller expected, the update fails with
-        ``projection_scope_transition_stale`` and nothing is written, so the
+        one the caller expected, the update raises
+        `ProjectionScopeTransitionStale` and nothing is written, so the
         caller can read the Source again.
         """
         from memforge.source_access import memory_visibility_for_source
@@ -17367,7 +17378,7 @@ class Database:
                             if open_transition_id is not None:
                                 raise ValueError("projection_scope_transition_active")
                         elif open_transition_id != expected_open_transition_id:
-                            raise ValueError("projection_scope_transition_stale")
+                            raise ProjectionScopeTransitionStale()
                         else:
                             await self._supersede_projection_scope_transition_unlocked(open_transition_id)
                     await self._insert_projection_scope_transition_unlocked(projection_scope_transition)

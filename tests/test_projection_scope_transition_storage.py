@@ -22,6 +22,7 @@ from memforge.models import ContentItem, NormalizedContent, RawContent, SourceUn
 from memforge.pipeline.source_projection_adapters import project_source_item, project_source_unit_tombstone
 from memforge.source_projection import (
     ProjectionScopeTransition,
+    ProjectionScopeTransitionStale,
     ProjectionScopeTransitionStatus,
     SourceProjection,
 )
@@ -370,6 +371,7 @@ async def test_supersession_closes_the_expected_transition_and_fences_its_member
 
     transitions = {transition.id: transition for transition in await db.list_projection_scope_transitions(SOURCE)}
     assert transitions["t1"].status is ProjectionScopeTransitionStatus.SUPERSEDED
+    assert transitions["t1"].completed_at is not None
     assert transitions["t2"].status is ProjectionScopeTransitionStatus.PENDING
     assert transitions["t2"].predecessor_transition_id == "t1"
     assert (await db.get_open_projection_scope_transition(SOURCE)).id == "t2"
@@ -382,12 +384,13 @@ async def test_supersession_closes_the_expected_transition_and_fences_its_member
 async def test_a_stale_expected_transition_changes_nothing(db: Database) -> None:
     await _change_scope(db, _transition("t1", "/b"))
 
-    with pytest.raises(ValueError, match="projection_scope_transition_stale"):
+    with pytest.raises(ProjectionScopeTransitionStale):
         await _change_scope(db, _transition("t2", "/c", predecessor="t0"), expected_open_transition_id="t0")
     with pytest.raises(ValueError, match="projection_scope_transition_active"):
         await _change_scope(db, _transition("t3", "/d"))
-    with pytest.raises(ValueError, match="must name the superseded one"):
+    with pytest.raises(ValueError, match="must name the superseded one") as misuse:
         await _change_scope(db, _transition("t4", "/e"), expected_open_transition_id="t1")
+    assert not isinstance(misuse.value, ProjectionScopeTransitionStale)
 
     source = await db.get_source(SOURCE)
     assert source is not None
@@ -401,7 +404,7 @@ async def test_an_expected_transition_that_closed_meanwhile_is_stale(db: Databas
     await db.start_projection_scope_transition("t1", run_id="run-1")
     await db.complete_projection_scope_transition("t1", run_id="run-1")
 
-    with pytest.raises(ValueError, match="projection_scope_transition_stale"):
+    with pytest.raises(ProjectionScopeTransitionStale):
         await _change_scope(db, _transition("t2", "/c", predecessor="t1"), expected_open_transition_id="t1")
 
     assert await db.get_open_projection_scope_transition(SOURCE) is None
@@ -428,3 +431,52 @@ async def test_a_current_unit_is_found_by_its_provider_key(db: Database) -> None
 
     assert found == replace(unit, locator=dict(unit.locator))
     assert (elsewhere, unknown, removed) == (None, None, None)
+
+
+async def test_a_tombstone_under_a_closed_transition_is_refused(db: Database) -> None:
+    await db.create_projection_scope_transition(_transition("t1", "/new"))
+    await db.start_projection_scope_transition("t1", run_id="run-1")
+    await db.complete_projection_scope_transition("t1", run_id="run-1")
+    projection, unit_input = _document("a.md", "body")
+    await db.record_source_projection(projection, unit_input=unit_input)
+    tombstone = project_source_unit_tombstone(
+        source_type="local_markdown",
+        run_id="run-tombstone",
+        source_unit=projection.source_units[0],
+        prior_unit_revision=projection.source_unit_revisions[0],
+        prior_observation_revisions={revision.observation_id: revision for revision in projection.observation_revisions},
+        reason="removed_from_scope",
+    )
+
+    with pytest.raises(ValueError, match="not open"):
+        await db.record_source_projection(tombstone, scope_transition_id="t1")
+
+    assert await db.get_source_projection(tombstone.run_id) is None
+
+
+async def test_a_replayed_older_revision_leaves_the_member_at_the_current_one(db: Database) -> None:
+    await db.create_projection_scope_transition(_transition("t1", "/new"))
+    first, first_input = _document("a.md", "first")
+    second, second_input = _document("a.md", "second")
+    await db.record_source_projection(first, unit_input=first_input)
+    await db.record_source_projection(second, unit_input=second_input, scope_transition_id="t1")
+
+    await db.record_source_projection(first, unit_input=first_input, scope_transition_id="t1")
+
+    assert await _member_revisions(db, "t1") == {"a.md": second_input.unit_revision_id}
+
+
+async def test_a_transition_of_another_source_is_refused(db: Database) -> None:
+    await db.create_projection_scope_transition(replace(_transition("t-other", "/x"), source_id=OTHER_SOURCE))
+    projection, unit_input = _document("a.md", "body")
+
+    with pytest.raises(ValueError, match="not open"):
+        await db.record_source_projection(projection, unit_input=unit_input, scope_transition_id="t-other")
+    with pytest.raises(ProjectionScopeTransitionStale):
+        await _change_scope(
+            db, _transition("t2", "/c", predecessor="t-other"), expected_open_transition_id="t-other"
+        )
+
+    assert await db.get_source_projection(projection.run_id) is None
+    assert await db.get_open_projection_scope_transition(SOURCE) is None
+    assert (await db.get_open_projection_scope_transition(OTHER_SOURCE)).id == "t-other"
