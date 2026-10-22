@@ -170,6 +170,7 @@ class Workspace:
         retry: FailedItemRetry = FailedItemRetry.ALL,
         manifest: set[int] | None = None,
         extractor=None,
+        excluded_scope_gene=None,
     ):
         """Sync as a person requests it; ``manifest`` binds the run to a device snapshot listing those issues."""
         return await self.orchestrator(extractor).sync_gene(
@@ -183,6 +184,7 @@ class Workspace:
                 if manifest is not None
                 else None
             ),
+            excluded_scope_gene=excluded_scope_gene,
         )
 
     async def reprocess(self, gene: JiraProject, *numbers: int):

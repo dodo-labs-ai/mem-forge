@@ -111,6 +111,7 @@ from memforge.pipeline.extraction_contract import (
 )
 from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot
 from memforge.pipeline.collection_family import (
+    ExcludedScopeGeneFactory,
     SnapshotBinding,
     collection_family,
 )
@@ -895,6 +896,7 @@ class GeneSyncOrchestrator:
         record_terminal_result: bool = True,
         failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
         collection_attempt: CollectionAttempt | None = None,
+        excluded_scope_gene: ExcludedScopeGeneFactory | None = None,
     ) -> SyncState:
         """Run the full sync pipeline for a gene.
 
@@ -935,6 +937,10 @@ class GeneSyncOrchestrator:
         collection_attempt:
             The collection attempt a conversation Source's run processes;
             required for, and only read by, the conversation family.
+        excluded_scope_gene:
+            Builds an authenticated Gene for a scope the Source's open
+            transition excluded, so a document Source with a query listing
+            can list it to complete the transition.
 
         Every per-Document failure is recorded in the failure ledger, which
         owns its retry, so a run whose failures are all per-Document ones
@@ -962,7 +968,11 @@ class GeneSyncOrchestrator:
         if callable(bind_document_store):
             bind_document_store(self.doc_store)
         family = collection_family(gene, db=self.db, doc_store=self.doc_store, source_id=source_id)
-        family.prepare(collection_attempt=collection_attempt, input_snapshot=input_snapshot)
+        family.prepare(
+            collection_attempt=collection_attempt,
+            input_snapshot=input_snapshot,
+            excluded_scope_gene=excluded_scope_gene,
+        )
         complete_snapshot = family.input_snapshot is not None
 
         logger.info(

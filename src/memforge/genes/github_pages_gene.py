@@ -230,55 +230,66 @@ class GitHubPagesGene(DocumentGene):
 
     @classmethod
     def lists_scope(cls, config: Mapping[str, Any]) -> bool:
-        """A subtree lists when it is read from the repository's branch tree or from a sitemap the site declares complete.
+        """The configured pages list; a subtree lists from the repository's branch tree or a sitemap declared complete.
 
-        A link crawl reaches only the pages currently linked, and a sitemap the
-        site does not declare complete may leave pages out, so neither lists.
-        A single page or an explicit list of pages does not list either.
+        A single page or an explicit list of pages is the scope the user
+        declared. A link crawl reaches only the pages currently linked, and a
+        sitemap the site does not declare complete may leave pages out, so
+        neither lists.
         """
+        if _sync_mode(config) in {SYNC_MODE_SINGLE_PAGE, SYNC_MODE_EXPLICIT_LIST}:
+            return True
         if _sync_mode(config) != SYNC_MODE_SUBTREE:
             return False
         return _auth_mode(config) == AUTH_MODE_GITHUB_PAT or _bool_config(config, "sitemap_authoritative", False)
 
     async def list_scope(self) -> ScopeListing:
-        """Every page of the subtree, by Document id, from the branch tree or the authoritative sitemap.
+        """Every configured page, or every page of the subtree from the branch tree or the authoritative sitemap.
 
-        Either inventory is everything the site publishes in the subtree, so
-        this is an existence listing. Discovery reads the same inventory on
-        every run, so a run that discovered returns its listing. A sitemap
-        that cannot be read as a urlset fails the listing.
+        Each is everything the Source holds by definition, so this is an
+        existence listing. Discovery reads the same pages on every run, so a
+        run that discovered returns its listing. A configured page that
+        cannot be read, and a sitemap that cannot be read as a urlset, fail
+        the listing.
         """
         if not self.lists_scope(self.config):
             raise ValueError("This GitHub Pages configuration does not list its scope")
         if self._discovered_scope is not None:
             return self._discovered_scope
+        if _sync_mode(self.config) in {SYNC_MODE_SINGLE_PAGE, SYNC_MODE_EXPLICIT_LIST}:
+            return ScopeListing(
+                kind=ScopeListingKind.EXISTENCE,
+                doc_ids=frozenset(
+                    [(await self._content_item_for_url(url)).item_id for url in self._configured_page_urls()]
+                ),
+            )
         if _auth_mode(self.config) == AUTH_MODE_GITHUB_PAT:
             _ref, _branch, scoped_entries = await self._repo_subtree_scope()
             page_urls = [page_url for page_url, _repo_path, _blob_sha in scoped_entries]
         else:
-            sitemap = await self._sitemap_scope()
-            if sitemap is None:
-                raise RuntimeError("The GitHub Pages sitemap could not be read as a urlset, so the scope cannot be listed")
-            _text, page_urls = sitemap
+            _text, page_urls = await self._authoritative_sitemap_scope()
         return ScopeListing(
             kind=ScopeListingKind.EXISTENCE,
             doc_ids=frozenset(_page_doc_id(page_url) for page_url in page_urls),
         )
 
+    def _configured_page_urls(self) -> list[str]:
+        """The page of a single-page Source, or the pages of an explicit list."""
+        if _sync_mode(self.config) == SYNC_MODE_SINGLE_PAGE:
+            return [str(self.config.get("page_url") or "").strip()]
+        return _list_config(self.config.get("pages"))
+
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         mode = _sync_mode(self.config)
-        if mode == SYNC_MODE_SINGLE_PAGE:
-            url = str(self.config.get("page_url") or "").strip()
-            item = await self._content_item_for_url(url)
-            if _is_modified_since(item.last_modified, since):
-                yield item
-            return
-
-        if mode == SYNC_MODE_EXPLICIT_LIST:
-            for url in _list_config(self.config.get("pages")):
+        if mode in {SYNC_MODE_SINGLE_PAGE, SYNC_MODE_EXPLICIT_LIST}:
+            listed: set[str] = set()
+            for url in self._configured_page_urls():
                 item = await self._content_item_for_url(url)
+                listed.add(item.item_id)
                 if _is_modified_since(item.last_modified, since):
                     yield item
+            # Every configured page was read: the configured pages are the scope.
+            self.record_scope_listing(ScopeListingKind.EXISTENCE, listed)
             return
 
         if mode != SYNC_MODE_SUBTREE:
@@ -289,15 +300,22 @@ class GitHubPagesGene(DocumentGene):
                 yield item
             return
 
-        sitemap_items = await self._sitemap_items()
-        if sitemap_items is not None:
+        if _bool_config(self.config, "sitemap_authoritative", False):
+            # The site declares its sitemap exhaustive: a page it no longer
+            # lists is no longer published. A sitemap that cannot be read
+            # fails discovery; the link crawl would list less.
+            sitemap_items = await self._sitemap_items(await self._authoritative_sitemap_scope())
             for item in sitemap_items:
                 if _is_modified_since(item.last_modified, since):
                     yield item
-            if _bool_config(self.config, "sitemap_authoritative", False):
-                # The site declares its sitemap exhaustive: a page it no
-                # longer lists is no longer published.
-                self.record_scope_listing(ScopeListingKind.EXISTENCE, {item.item_id for item in sitemap_items})
+            self.record_scope_listing(ScopeListingKind.EXISTENCE, {item.item_id for item in sitemap_items})
+            return
+
+        sitemap = await self._sitemap_scope()
+        if sitemap is not None:
+            for item in await self._sitemap_items(sitemap):
+                if _is_modified_since(item.last_modified, since):
+                    yield item
             return
 
         async for item in self._discover_bfs(since):
@@ -573,9 +591,24 @@ class GitHubPagesGene(DocumentGene):
             return None
         return parse_source_time(github_latest_commit_time(response.json()))
 
+    async def _authoritative_sitemap_scope(self) -> tuple[str, list[str]]:
+        """The sitemap a site declares complete, read as :meth:`_sitemap_scope` reads it, or raise.
+
+        A missing sitemap, one that cannot be fetched or parsed, and one that
+        is not a urlset each raise, so a run never lists less than the site
+        publishes.
+        """
+        sitemap_url = self._sitemap_url()
+        response = await self._client.get(sitemap_url)
+        response.raise_for_status()
+        sitemap_kind, urls = _urls_from_sitemap(response.text)
+        if sitemap_kind != "urlset":
+            raise RuntimeError(f"The GitHub Pages sitemap at {sitemap_url} is a {sitemap_kind}, not a urlset")
+        return response.text, self._scoped_sitemap_urls(urls)
+
     async def _sitemap_scope(self) -> tuple[str, list[str]] | None:
         """The sitemap's text and its page URLs in scope; ``None`` when the site has no urlset sitemap."""
-        sitemap_url = urljoin(self._base_url.rstrip("/") + "/", "sitemap.xml")
+        sitemap_url = self._sitemap_url()
         try:
             response = await self._client.get(sitemap_url)
             if response.status_code >= 400:
@@ -591,17 +624,20 @@ class GitHubPagesGene(DocumentGene):
                 sitemap_url,
             )
             return None
+        return response.text, self._scoped_sitemap_urls(urls)
 
+    def _sitemap_url(self) -> str:
+        return urljoin(self._base_url.rstrip("/") + "/", "sitemap.xml")
+
+    def _scoped_sitemap_urls(self, urls: list[str]) -> list[str]:
+        """The sitemap's page URLs in scope, canonical and bounded by Max Pages."""
         canonical_urls = [_canonicalize_url(url) for url in urls]
         if len(canonical_urls) != len(set(canonical_urls)):
             raise RuntimeError("GitHub Pages sitemap contains duplicate canonical URLs")
         scoped = sorted(url for url in canonical_urls if self._url_is_in_scope(url))
-        return response.text, _limit_urls(scoped, _max_pages(self.config))
+        return _limit_urls(scoped, _max_pages(self.config))
 
-    async def _sitemap_items(self) -> list[ContentItem] | None:
-        sitemap = await self._sitemap_scope()
-        if sitemap is None:
-            return None
+    async def _sitemap_items(self, sitemap: tuple[str, list[str]]) -> list[ContentItem]:
         sitemap_text, page_urls = sitemap
         items: list[ContentItem] = []
         for url in page_urls:

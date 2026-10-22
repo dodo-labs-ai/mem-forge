@@ -8685,7 +8685,7 @@ class Database:
                 await self.db.rollback()
                 raise ValueError("projection scope transition is not startable")
             await self.db.commit()
-        stored = await self._get_projection_scope_transition(transition_id)
+        stored = await self.get_projection_scope_transition(transition_id)
         assert stored is not None
         return stored
 
@@ -8716,7 +8716,7 @@ class Database:
             except Exception:
                 await self.db.rollback()
                 raise
-        stored = await self._get_projection_scope_transition(transition_id)
+        stored = await self.get_projection_scope_transition(transition_id)
         assert stored is not None
         return stored
 
@@ -8740,14 +8740,15 @@ class Database:
                 await self.db.rollback()
                 raise ValueError("projection scope transition failure stale guard failed")
             await self.db.commit()
-        stored = await self._get_projection_scope_transition(transition_id)
+        stored = await self.get_projection_scope_transition(transition_id)
         assert stored is not None
         return stored
 
-    async def _get_projection_scope_transition(
+    async def get_projection_scope_transition(
         self,
         transition_id: str,
     ) -> ProjectionScopeTransition | None:
+        """The transition with this id, whatever its status."""
         async with self.db.execute(
             "SELECT * FROM projection_scope_transitions WHERE id = ?",
             (transition_id,),

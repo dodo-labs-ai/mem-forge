@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- A query listing's scope transition, such as a JQL or Confluence space
+  change, removes only what the user's change excluded. The run that can
+  complete it lists each distinct excluded scope once (the last applied scope
+  and the targets of every transition it superseded) with the current
+  credential and only that scope's fields (`excluded_scope_config`), and
+  removes the held Documents an excluded scope lists and the new one does not
+  as `removed_from_scope`. Every other unlisted Document had left the query
+  before the change and follows the ordinary rule: confirmed absent is
+  `absent_from_source`, still present is kept. A transient failure listing an
+  excluded scope keeps the transition open; an excluded scope the provider
+  rejects (`SourceConfigurationError`) completes it with the ordinary rule.
+  Until a device lists its excluded scopes, a local-agent Jira transition
+  stays open. `sync_gene` takes `excluded_scope_gene`, which `run_source_sync`
+  builds, and both stores gain `get_projection_scope_transition`.
+  - A Confluence Page Tree Root that answers 404 and a JQL Jira refuses (HTTP
+    400, `JiraQueryRejected`) are configuration errors: the run fails without
+    a retry.
+  - GitHub Pages single-page and explicit-list Sources list their configured
+    pages, so a page dropped from the configuration is removed and a page that
+    cannot be read fails the run's listing. A sitemap declared complete that
+    is missing, unreadable or not a urlset fails discovery; it no longer falls
+    back to the link crawl.
+
 - A document Source's scope transition completes by accumulated commitment.
   Each Document that commits under an open transition, through an unchanged
   item's projection, a lifecycle commit, deferred convergence or the
@@ -33,8 +56,6 @@
     `discovery_completion_reason` and `begin_discovery` are removed, with
     `source_run_projection_coverage`: the listing is the only evidence.
     `DocumentGene.reset_scope_listing()` forgets a recorded listing.
-  - Until excluded scopes are listed, a query listing's transition also
-    removes every held Document its new listing leaves out, as before.
   - Cloud: the HANA reuse predicate also excludes `failed` transitions.
 
 - A document sync run takes one listing of its scope after discovery, before
@@ -70,11 +91,9 @@
   refuses a Gene, including one outside this repository, that leaves either
   out. `confirm_absent` returns an `AbsenceAnswer` (`absent`, `exists` or
   `hidden`) per Document id instead of the set of absent ids, and
-  `atlassian_record_state` replaces `atlassian_record_is_gone`. A GitHub Pages
-  Source whose authoritative sitemap cannot be read, so that discovery falls
-  back to the link crawl, now records `scope_listing_failed` for its absence
-  check; it still removes nothing. `tests/contracts/document_fakes` holds the
-  fakes each registered document type needs for the connector contract suite.
+  `atlassian_record_state` replaces `atlassian_record_is_gone`.
+  `tests/contracts/document_fakes` holds the fakes each registered document
+  type needs for the connector contract suite.
 - Jira looks one issue up again, when a failed issue is retried or a Document
   is reprocessed at its current revision, by searching within the Source's
   JQL: `issuekey = <id> AND (<where clause>)`, without the incremental

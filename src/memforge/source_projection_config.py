@@ -49,6 +49,31 @@ def canonical_projection_scope(source_type: str, config: Mapping[str, Any]) -> d
     return descriptor.canonical_scope(scope) if descriptor.canonical_scope else scope
 
 
+def excluded_scope_config(
+    source_type: str,
+    current_config: Mapping[str, Any],
+    excluded_scope: Mapping[str, object],
+) -> dict[str, Any]:
+    """The configuration that lists a scope the user's change excluded, built from the current one.
+
+    Every field that is not a scope field, credentials and connection
+    settings included, is kept as it is. The scope fields are those of the
+    excluded scope, canonicalized again so a stored scope from before a field
+    was added still reads its default, and a current scope field the excluded
+    scope leaves out is removed. For example, a Jira Source changed from
+    ``{"query_mode": "simple", "projects": ["PAY", "OPS"]}`` to
+    ``{"query_mode": "advanced", "jql": "project = PAY"}`` lists its excluded
+    scope with ``projects`` and without ``jql``, and with the current token.
+    """
+
+    descriptor = source_type_descriptor(source_type)
+    if descriptor is None:
+        raise ValueError(f"Unknown source type {source_type!r}")
+    config = {key: value for key, value in current_config.items() if key not in descriptor.scope_fields}
+    config.update(canonical_projection_scope(source_type, excluded_scope))
+    return config
+
+
 def projection_scope_fingerprint(scope: Mapping[str, object]) -> str:
     """Return the stable identity of one canonical Projection Scope."""
 

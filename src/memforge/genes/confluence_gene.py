@@ -25,6 +25,7 @@ from memforge.genes.atlassian_auth import (
     stream_with_rate_limit_retry,
     tls_verify,
 )
+from memforge.genes.base import SourceConfigurationError
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.confluence_artifacts import resolve_current_confluence_artifacts
 from memforge.genes.confluence_pdf import export_confluence_page_pdf
@@ -498,8 +499,17 @@ class ConfluenceGene(DocumentGene):
         preview_limit = self._preview_discovery_limit()
         emitted = 0
 
-        # Get the root page first
-        root_item = await self._get_page_as_content_item(root_id, since, exclude_labels)
+        # Get the root page first; a root Confluence does not return is a
+        # configuration error, not a transient one.
+        try:
+            root_item = await self._get_page_as_content_item(root_id, since, exclude_labels)
+        except RuntimeError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, httpx.HTTPStatusError) and cause.response.status_code == 404:
+                raise SourceConfigurationError(
+                    f"Confluence Page Tree Root {root_id} does not exist or this credential cannot read it"
+                ) from exc
+            raise
         if root_item:
             yield root_item
             emitted += 1

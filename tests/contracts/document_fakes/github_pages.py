@@ -3,7 +3,9 @@
 Both read a handbook whose subtree ``guides`` holds the pages ``setup``, changed
 long ago, and ``deploy``, changed recently; ``other/faq`` is outside the
 subtree. The repository-backed site answers the GitHub REST API, and the
-public site answers ``sitemap.xml`` and each page.
+public site answers ``sitemap.xml`` and each page. A truncated listing serves
+the sitemap index instead of the urlset, and ``deploy`` no longer exists; a
+failed one answers 500.
 """
 
 from __future__ import annotations
@@ -65,7 +67,9 @@ class _Provider:
         if url == f"{PUBLIC_SITE}/sitemap.xml":
             return self._sitemap(url)
         page_path = url.removeprefix(f"{PUBLIC_SITE}/")
-        if page_path in PAGES:
+        if self.listing is ProviderListing.FAILED:
+            return _Response(url, text="error", status_code=500)
+        if page_path in PAGES and not (self.listing is ProviderListing.TRUNCATED and page_path == "guides/deploy"):
             return _Response(url, text=f"<main><h1>{page_path}</h1><p>Body</p></main>")
         return _Response(url, text="missing", status_code=404)
 
@@ -131,14 +135,26 @@ class GitHubPagesFakes(DocumentConnectorFakes):
             },
             walks_scope=True,
         ),
+        "single-page": ListingConfig(
+            {
+                "base_url": f"{PUBLIC_SITE}/",
+                "auth_mode": "none",
+                "sync_mode": "single_page",
+                "page_url": f"{PUBLIC_SITE}/guides/deploy",
+            },
+            walks_scope=True,
+        ),
+        "explicit-list": ListingConfig(
+            {
+                "base_url": f"{PUBLIC_SITE}/",
+                "auth_mode": "none",
+                "sync_mode": "explicit_list",
+                "pages": [f"{PUBLIC_SITE}/guides/setup", f"{PUBLIC_SITE}/guides/deploy"],
+            },
+            walks_scope=True,
+        ),
     }
     non_listing_configs = {
-        "single-page": {"auth_mode": "none", "sync_mode": "single_page", "page_url": f"{PUBLIC_SITE}/guides/setup"},
-        "explicit-list": {
-            "auth_mode": "none",
-            "sync_mode": "explicit_list",
-            "pages": [f"{PUBLIC_SITE}/guides/setup", f"{PUBLIC_SITE}/guides/deploy"],
-        },
         "crawl-or-sitemap": {
             "base_url": f"{PUBLIC_SITE}/",
             "auth_mode": "none",

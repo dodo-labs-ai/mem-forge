@@ -882,8 +882,8 @@ async def test_incremental_github_pat_subtree_lists_every_page_the_branch_holds(
 @pytest.mark.parametrize(
     ("config", "lists"),
     [
-        ({"sync_mode": "single_page"}, False),
-        ({"sync_mode": "explicit_list", "auth_mode": "none"}, False),
+        ({"sync_mode": "single_page"}, True),
+        ({"sync_mode": "explicit_list", "auth_mode": "none"}, True),
         ({"sync_mode": "subtree"}, True),
         ({"sync_mode": "subtree", "auth_mode": "github_pat"}, True),
         ({"sync_mode": "subtree", "auth_mode": "none"}, False),
@@ -900,29 +900,105 @@ async def test_incremental_github_pat_subtree_lists_every_page_the_branch_holds(
         "subtree-authoritative-sitemap",
     ],
 )
-def test_a_subtree_lists_from_its_branch_tree_or_an_authoritative_sitemap(config, lists):
+def test_configured_pages_and_a_subtree_read_from_a_complete_inventory_list_their_scope(config, lists):
     assert GitHubPagesGene.lists_scope(config) is lists
 
 
-@pytest.mark.asyncio
-async def test_an_authoritative_sitemap_that_cannot_be_read_fails_the_listing(monkeypatch):
-    class MissingSitemapClient(RecordingAsyncClient):
-        async def get(self, url: str, **_kwargs):
-            self.calls.append(("GET", url))
-            return HtmlResponse("missing", status_code=404, url=url)
+SITE = "https://github-pages.example.test/pages/org/repo/"
 
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", MissingSitemapClient)
+
+class FailingSitemapClient(RecordingAsyncClient):
+    """Answers the sitemap with ``failure``; any other request is the link crawl, which must never run."""
+
+    failure = "missing"
+
+    async def get(self, url: str, **_kwargs):
+        self.calls.append(("GET", url))
+        if not url.endswith("/sitemap.xml"):
+            raise AssertionError(f"the link crawl read {url}")
+        if self.failure == "missing":
+            return HtmlResponse("missing", status_code=404, url=url)
+        if self.failure == "transport":
+            raise requests.ConnectionError("connection reset")
+        return HtmlResponse(
+            '<?xml version="1.0"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            f"<sitemap><loc>{SITE}sitemap-1.xml</loc></sitemap></sitemapindex>",
+            url=url,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["missing", "transport", "not-a-urlset"])
+@pytest.mark.parametrize("step", ["list_scope", "discover"])
+async def test_an_authoritative_sitemap_that_cannot_be_read_fails_and_never_falls_back_to_the_crawl(
+    monkeypatch, failure, step,
+):
+    client = type("Client", (FailingSitemapClient,), {"failure": failure})
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", client)
     gene = GitHubPagesGene(
         config={
-            "base_url": "https://github-pages.example.test/pages/org/repo/",
+            "base_url": SITE,
             "auth_mode": "none",
             "sync_mode": "subtree",
-            "root_url": "https://github-pages.example.test/pages/org/repo/",
+            "root_url": SITE,
             "sitemap_authoritative": True,
         },
         source_id="src-pages",
     )
-
     await gene.authenticate()
-    with pytest.raises(RuntimeError, match="sitemap"):
+
+    with pytest.raises(Exception) as raised:
+        if step == "list_scope":
+            await gene.list_scope()
+        else:
+            _ = [item async for item in gene.discover()]
+
+    assert not isinstance(raised.value, AssertionError)
+    assert gene._client.calls == [("GET", f"{SITE}sitemap.xml")]
+
+
+class ConfiguredPagesClient(RecordingAsyncClient):
+    """Serves every configured page except ``missing``."""
+
+    async def get(self, url: str, **_kwargs):
+        self.calls.append(("GET", url))
+        if url.rstrip("/").endswith("missing"):
+            return HtmlResponse("missing", status_code=404, url=url)
+        return HtmlResponse("<html><body><h1>Page</h1></body></html>", url=url)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"sync_mode": "single_page", "page_url": f"{SITE}a/"},
+        {"sync_mode": "explicit_list", "pages": [f"{SITE}a/", f"{SITE}b/"]},
+    ],
+    ids=["single-page", "explicit-list"],
+)
+async def test_configured_pages_are_an_existence_listing_with_or_without_discovery(monkeypatch, config):
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", ConfiguredPagesClient)
+    config = {"base_url": SITE, "auth_mode": "none", **config}
+    discovered = GitHubPagesGene(config=dict(config), source_id="src-pages")
+    await discovered.authenticate()
+    every_page = {item.item_id async for item in discovered.discover()}
+    after_discovery = await discovered.list_scope()
+    standalone = GitHubPagesGene(config=dict(config), source_id="src-pages")
+    await standalone.authenticate()
+
+    assert after_discovery.kind.value == "existence"
+    assert after_discovery.doc_ids == every_page
+    assert await standalone.list_scope() == after_discovery
+
+
+@pytest.mark.asyncio
+async def test_a_configured_page_that_cannot_be_read_fails_the_listing(monkeypatch):
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", ConfiguredPagesClient)
+    gene = GitHubPagesGene(
+        config={"base_url": SITE, "auth_mode": "none", "sync_mode": "explicit_list", "pages": [f"{SITE}a/", f"{SITE}missing/"]},
+        source_id="src-pages",
+    )
+    await gene.authenticate()
+
+    with pytest.raises(requests.HTTPError):
         await gene.list_scope()

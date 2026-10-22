@@ -16,7 +16,8 @@ import pytest
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.lifecycle_plan import ProjectedLifecycleBlocker, ProjectedLifecycleDeferredError
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
-from memforge.models import ScopeListingKind
+from memforge.genes.jira_gene import JiraQueryRejected
+from memforge.models import ScopeListing, ScopeListingKind
 from memforge.pipeline.collection_family import DEFAULT_INCREMENTAL_SYNC_OVERLAP
 from memforge.source_projection import (
     ProjectionScopeTransition,
@@ -31,6 +32,7 @@ from tests.memory_store_fixture import OrchestratorMemoryStore
 from tests.test_document_absence import (
     JIRA_CONFIG,
     SOURCE_ID,
+    DeviceJira,
     DeviceManifest,
     JiraProject,
     Workspace,
@@ -85,7 +87,8 @@ async def _change_scope(workspace, *, opened_at: datetime = OPENED_AT) -> None:
 
 
 async def _transition(workspace) -> ProjectionScopeTransition:
-    [transition] = await workspace.db.list_projection_scope_transitions(SOURCE_ID)
+    transition = await workspace.db.get_projection_scope_transition(TRANSITION_ID)
+    assert transition is not None
     return transition
 
 
@@ -324,25 +327,201 @@ async def test_a_successful_run_that_cannot_complete_records_the_opening_time_wh
     assert await _cursor(workspace) == OPENED_AT
 
 
-@pytest.mark.asyncio
-async def test_a_jql_change_completes_by_its_listing_and_removes_what_the_new_query_leaves_out(workspace):
-    project = JiraProject(existing={0, 1})
-    await _synced(workspace, project)
-    await _change_scope(workspace)
+class ExcludedScopes:
+    """Lists each scope a transition excluded, by its JQL, as Jira holds it; records every scope it lists."""
 
-    # jira-1 is in the removed project; it still exists, but the user no
-    # longer asks for it.
-    project.move_on(existing={0, 1}, in_query={0})
-    state = await workspace.sync(project)
+    def __init__(self, listings: dict[str, set[int] | Exception]) -> None:
+        self.listings = listings
+        self.listed: list[dict[str, object]] = []
+
+    async def __call__(self, scope):
+        self.listed.append(dict(scope))
+        return _ExcludedGene(self.listings[str(scope["jql"])])
+
+
+class _ExcludedGene:
+    def __init__(self, listing: set[int] | Exception) -> None:
+        self.listing = listing
+
+    async def list_scope(self):
+        if isinstance(self.listing, Exception):
+            raise self.listing
+        return ScopeListing(kind=ScopeListingKind.QUERY, doc_ids=frozenset(f"jira-{n}" for n in self.listing))
+
+
+OLD_JQL = JIRA_CONFIG["jql"]
+NEW_JQL = TARGET_CONFIG["jql"]
+
+
+async def _issues_that_left_the_query_before_the_change(workspace) -> JiraProject:
+    """jira-0 and jira-1 match the old JQL; jira-2 and jira-3 left it before the user changed it, and still exist."""
+    project = JiraProject(existing={0, 1, 2, 3})
+    await _synced(workspace, project)
+    project.move_on(existing={0, 1, 2, 3}, in_query={0, 1})
+    await workspace.sync(project)
+    assert workspace.tombstoned() == []
+    return project
+
+
+@pytest.mark.asyncio
+async def test_a_jql_change_removes_only_what_the_old_query_lists_and_the_new_one_does_not(workspace):
+    project = await _issues_that_left_the_query_before_the_change(workspace)
+    await _change_scope(workspace)
+    excluded = ExcludedScopes({OLD_JQL: {0, 1}})
+
+    # The new JQL drops jira-1; jira-3 has since been deleted.
+    project.move_on(existing={0, 1, 2}, in_query={0})
+    state = await workspace.sync(project, excluded_scope_gene=excluded)
 
     assert state.last_sync_status == "success"
     assert project.seen_since[-1] is None
-    assert project.listings == 2, "one listing per run"
+    assert excluded.listed == [canonical_projection_scope("jira", JIRA_CONFIG)]
+    assert sorted(workspace.tombstoned()) == ["jira-1", "jira-3"]
+    assert await _removal_reason(workspace, "jira-1") == UnitRemovalReason.REMOVED_FROM_SCOPE.value
+    assert await _removal_reason(workspace, "jira-3") == UnitRemovalReason.ABSENT_FROM_SOURCE.value
+    # jira-2 had left the old query before the change and still exists.
+    assert await workspace.held() == {"jira-0", "jira-2"}
+    assert sorted(project.confirmed) == ["jira-2", "jira-3"]
+    assert state.unlisted_present_count == 1
+    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
+
+
+async def _superseded(workspace, transition_id: str, target_jql: str, predecessor: str | None) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    await workspace.db.db.execute(
+        """INSERT INTO projection_scope_transitions (
+               id, source_id, previous_scope_json, target_scope_json, status,
+               predecessor_transition_id, created_at, updated_at, completed_at
+           ) VALUES (?, ?, ?, ?, 'superseded', ?, ?, ?, ?)""",
+        (
+            transition_id,
+            SOURCE_ID,
+            json.dumps(canonical_projection_scope("jira", JIRA_CONFIG)),
+            json.dumps({"query_mode": "advanced", "jql": target_jql}),
+            predecessor,
+            now,
+            now,
+            now,
+        ),
+    )
+    await workspace.db.db.commit()
+
+
+@pytest.mark.asyncio
+async def test_excluded_scopes_are_listed_once_each_and_only_by_the_run_that_can_complete(workspace):
+    project = JiraProject(existing={0, 1, 2, 3})
+    await _synced(workspace, project)
+    # The open change supersedes one to "project = OPS", which superseded one
+    # to the new JQL, which superseded another to "project = OPS".
+    await _superseded(workspace, "superseded-0", "project = OPS", None)
+    await _superseded(workspace, "superseded-1", NEW_JQL, "superseded-0")
+    await _superseded(workspace, "superseded-2", "project = OPS", "superseded-1")
+    await workspace.db.upsert_source(
+        id=SOURCE_ID,
+        type="jira",
+        name="Jira",
+        config_json=json.dumps(TARGET_CONFIG),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await workspace.db.create_projection_scope_transition(
+        ProjectionScopeTransition(
+            id=TRANSITION_ID,
+            source_id=SOURCE_ID,
+            previous_scope=canonical_projection_scope("jira", JIRA_CONFIG),
+            target_scope=canonical_projection_scope("jira", TARGET_CONFIG),
+            predecessor_transition_id="superseded-2",
+            created_at=OPENED_AT.isoformat(),
+        )
+    )
+    excluded = ExcludedScopes({OLD_JQL: {0, 1}, "project = OPS": {2}})
+
+    project.move_on(existing={0, 1, 2, 3}, in_query={0, 3})
+    project.broken[3] = ("fetch", ValueError("fetch failed"))
+    await workspace.sync(project, excluded_scope_gene=excluded)
+    assert excluded.listed == []
+    assert workspace.tombstoned() == []
+
+    project.broken.clear()
+    project.move_on(existing={0, 1, 2, 3}, in_query={0, 3})
+    await workspace.sync(project, excluded_scope_gene=excluded)
+
+    assert [scope["jql"] for scope in excluded.listed] == [OLD_JQL, "project = OPS"]
+    assert sorted(workspace.tombstoned()) == ["jira-1", "jira-2"]
+    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
+
+
+@pytest.mark.asyncio
+async def test_a_transient_failure_listing_an_excluded_scope_keeps_the_transition_open(workspace):
+    project = await _issues_that_left_the_query_before_the_change(workspace)
+    await _change_scope(workspace)
+    excluded = ExcludedScopes({OLD_JQL: RuntimeError("Jira answered 503")})
+
+    project.move_on(existing={0, 1, 2}, in_query={0})
+    state = await workspace.sync(project, excluded_scope_gene=excluded)
+    transition = await _transition(workspace)
+
+    assert state.last_sync_status == "success"
+    assert workspace.tombstoned() == []
     assert project.confirmed == []
-    assert workspace.tombstoned() == ["jira-1"]
+    assert transition.status is ProjectionScopeTransitionStatus.FAILED
+    assert transition.error == "listing a scope the change excluded failed"
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_excluded_jql_completes_the_transition_with_the_ordinary_rule(workspace):
+    project = await _issues_that_left_the_query_before_the_change(workspace)
+    await _change_scope(workspace)
+    excluded = ExcludedScopes({OLD_JQL: JiraQueryRejected("Jira rejected the JQL")})
+
+    project.move_on(existing={0, 1, 2}, in_query={0})
+    state = await workspace.sync(project, excluded_scope_gene=excluded)
+
+    # Nothing is known to have left with the change: what still exists is kept.
+    assert state.last_sync_status == "success"
+    assert workspace.tombstoned() == ["jira-3"]
+    assert await _removal_reason(workspace, "jira-3") == UnitRemovalReason.ABSENT_FROM_SOURCE.value
+    assert await workspace.held() == {"jira-0", "jira-1", "jira-2"}
+    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
+
+
+@pytest.mark.asyncio
+async def test_a_query_completion_lists_the_excluded_scopes_before_judging_a_blocked_document(workspace):
+    project = JiraProject(existing={0, 1})
+    await _synced(workspace, project)
+    await _change_scope(workspace)
+    engine = _OrderRecordingMemoryEngine(defer=True)
+    engine.deferred_doc_id = "jira-2"
+    engine.blocker_unit_ids = (await workspace.unit_id("jira-1"),)
+    workspace.engine = engine
+    excluded = ExcludedScopes({OLD_JQL: {0, 1}})
+
+    # The new JQL drops jira-1, still in Jira, and adds jira-2, whose commit waits on jira-1's Unit.
+    project.move_on(existing={0, 1, 2}, in_query={0, 2})
+    state = await workspace.sync(project, excluded_scope_gene=excluded)
+
+    assert state.last_sync_status == "success"
+    assert len(excluded.listed) == 1
+    assert engine.events == [("tombstone", "jira-1"), ("commit", "jira-2")]
     assert await _removal_reason(workspace, "jira-1") == UnitRemovalReason.REMOVED_FROM_SCOPE.value
     assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
-    assert await workspace.held() == {"jira-0"}
+
+
+@pytest.mark.asyncio
+async def test_a_device_query_transition_stays_open_until_the_device_lists_its_excluded_scopes(workspace):
+    project = DeviceJira(existing={0, 1})
+    first = await workspace.sync(project, manifest={0, 1})
+    assert first.last_sync_status == "success"
+    workspace.engine.events.clear()
+    await _change_scope(workspace)
+
+    project.move_on(existing={0, 1}, in_query={0})
+    await workspace.sync(project, manifest={0})
+    transition = await _transition(workspace)
+
+    assert workspace.tombstoned() == []
+    assert transition.status is ProjectionScopeTransitionStatus.FAILED
+    assert transition.error == "the device has not listed the scopes the change excluded"
 
 
 @pytest.mark.asyncio

@@ -498,6 +498,16 @@ class RelationalStore(Protocol):
         *,
         limit: int = 20,
     ) -> list[ProjectionScopeTransition]: ...
+    async def get_projection_scope_transition(
+        self,
+        transition_id: str,
+    ) -> ProjectionScopeTransition | None:
+        """The transition with this id, whatever its status; ``None`` when there is none.
+
+        A transition that superseded another names it in
+        ``predecessor_transition_id``, so the chain is walked one id at a time.
+        """
+        ...
     async def start_projection_scope_transition(
         self,
         transition_id: str,
