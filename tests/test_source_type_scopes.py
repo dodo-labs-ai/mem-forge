@@ -53,6 +53,7 @@ _CONFIGS = {
             "issue_types": ["Bug"],
             "jql": "x",
         },
+        {"base_url": "https://jira.example", "projects": ["PAY"], "query_mode": ""},
     ],
     "github_repo": [
         {
@@ -68,7 +69,23 @@ _CONFIGS = {
             "root_url": "https://pages.example/x/",
             "max_depth": 3,
             "exclude_url_patterns": ["b", "a"],
-        }
+        },
+        # How the pages are read is not part of the scope.
+        {
+            "base_url": "https://pages.example/x",
+            "sync_mode": "single_page",
+            "page_url": "https://pages.example/x/a/ ",
+            "auth_mode": "github_pat",
+            "max_pages": 50,
+            "sitemap_authoritative": True,
+        },
+        {
+            "sync_mode": "explicit_list",
+            "pages": "https://pages.example/x/b, https://pages.example/x/a",
+            "branch": "",
+            "auth_mode": "none",
+        },
+        {"sync_mode": "subtree", "root_url": "https://pages.example/x/", "branch": " gh-pages "},
     ],
     "local_markdown": [{"vault_id": "v", "include": "docs/**, *.md", "exclude": []}],
     "teams": [{"conversation_ids": ["b", "a"], "rolling_retention_days": 365, "channels": "c1"}],
@@ -99,7 +116,22 @@ _EXPECTED = {
                 "sync_mode": "subtree",
             },
             "0058d19fcd003ec009b08d061aac3ce6ea21e7c20f9f9b4eeeef4f1555baa03a",
-        ]
+        ],
+        [
+            {},
+            {"page_url": "https://pages.example/x/a", "sync_mode": "single_page"},
+            "dd1dc7bd874266b8add3dd8b113a35b809ae1e99d52c4fd992fc186ebc239e67",
+        ],
+        [
+            {},
+            {"pages": ["https://pages.example/x/a", "https://pages.example/x/b"], "sync_mode": "explicit_list"},
+            "138e2e7529e46d0c35f3a5e15f80f5dbda276a802c48f4d0a2bce1b849c404b3",
+        ],
+        [
+            {},
+            {"branch": "gh-pages", "root_url": "https://pages.example/x", "sync_mode": "subtree"},
+            "bb0a4f06115cc580f100efa91bd7dd5a66a0c00f2a53c5203d7e560eefd2d492",
+        ],
     ],
     "github_repo": [
         [
@@ -118,6 +150,11 @@ _EXPECTED = {
             {"base_url": "https://jira.example"},
             {"issue_types": ["Bug"], "jql_filter": "status != Done", "projects": ["HR", "PAY"], "query_mode": "simple"},
             "e7d53081af440de59f1ac89404a3133847e1be10eeb9e3b250ad0e54739c5848",
+        ],
+        [
+            {"base_url": "https://jira.example"},
+            {"projects": ["PAY"], "query_mode": "simple"},
+            "82ec6b18956f787310aa5aa20e4b4cb8f95fb513526801751488f581c003707a",
         ],
     ],
     "local_markdown": [
@@ -189,3 +226,15 @@ import memforge.genes
 
     assert result.returncode != 0
     assert "broken connector" in result.stderr
+
+
+def test_a_scope_default_names_a_scope_field() -> None:
+    from memforge.source_types.descriptor import SourceTypeDescriptor
+
+    with pytest.raises(ValueError, match="not a scope field"):
+        SourceTypeDescriptor(
+            source_type="example",
+            gene="memforge.genes.jira_gene:JiraGene",
+            scope_fields=("projects",),
+            scope_defaults={"query_mode": "simple"},
+        )

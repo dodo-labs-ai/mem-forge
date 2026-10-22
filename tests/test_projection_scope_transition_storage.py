@@ -399,6 +399,28 @@ async def test_a_stale_expected_transition_changes_nothing(db: Database) -> None
     assert (await db.get_open_projection_scope_transition(SOURCE)).status is ProjectionScopeTransitionStatus.PENDING
 
 
+async def test_a_return_to_the_last_applied_scope_supersedes_the_open_transition_and_opens_none(db: Database) -> None:
+    await _change_scope(db, _transition("t1", "/b"))
+    projection, unit_input = _document("a.md", "body")
+    await db.record_source_projection(projection, unit_input=unit_input, scope_transition_id="t1")
+
+    with pytest.raises(ProjectionScopeTransitionStale):
+        await db.upsert_source(
+            id=SOURCE, type="local_markdown", name=SOURCE, config_json=json.dumps({"path": "/docs"}),
+            access_policy="workspace", owner_user_id="dev", expected_open_transition_id="t0",
+        )
+    await db.upsert_source(
+        id=SOURCE, type="local_markdown", name=SOURCE, config_json=json.dumps({"path": "/docs"}),
+        access_policy="workspace", owner_user_id="dev", expected_open_transition_id="t1",
+    )
+
+    [superseded] = await db.list_projection_scope_transitions(SOURCE)
+    assert (superseded.id, superseded.status) == ("t1", ProjectionScopeTransitionStatus.SUPERSEDED)
+    assert await db.get_open_projection_scope_transition(SOURCE) is None
+    assert await db.list_projection_scope_transition_member_doc_ids("t1") == ()
+    assert (await db.get_source(SOURCE))["config"] == {"path": "/docs"}
+
+
 async def test_an_expected_transition_that_closed_meanwhile_is_stale(db: Database) -> None:
     await _change_scope(db, _transition("t1", "/b"))
     await db.start_projection_scope_transition("t1", run_id="run-1")

@@ -536,6 +536,20 @@ class ScopeListing:
     doc_ids: frozenset[str]
 
 
+@dataclass(frozen=True, slots=True)
+class UnlistedScopeMode:
+    """The mode of a configuration that cannot list its whole scope, and what would list it.
+
+    A scope change into such a configuration is refused, because its
+    transition could never complete; the refusal names ``mode`` and offers
+    ``suggestion``. For example, GitHub Pages names a subtree read by link
+    crawl and suggests reading it from the repository with a token.
+    """
+
+    mode: str
+    suggestion: str
+
+
 class AbsenceAnswer(str, Enum):
     """What the provider answers when one item a query listing left out is read by its identifier."""
 

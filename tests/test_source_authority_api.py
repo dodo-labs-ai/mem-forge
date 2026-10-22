@@ -1083,6 +1083,45 @@ def test_teams_scope_transition_is_attached_to_collection_job(tmp_path):
         asyncio.run(database.close())
 
 
+def test_a_collection_job_carries_a_stored_transition_with_its_scopes_canonicalized_again(tmp_path):
+    """A transition stored before Jira's ``query_mode`` existed reaches the device with the field's default."""
+    from memforge.source_projection import ProjectionScopeTransition
+
+    database = _connect_database(tmp_path)
+    try:
+        headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
+        with TestClient(_app(tmp_path, database)) as client:
+            source_id = client.post(
+                "/api/v1/sources", headers=headers, json=_jira_payload(sync_mode="local_agent")
+            ).json()["id"]
+            asyncio.run(
+                database.create_projection_scope_transition(
+                    ProjectionScopeTransition(
+                        id="scope-transition-stored-before-query-mode",
+                        source_id=source_id,
+                        previous_scope={"projects": ["OPS"]},
+                        target_scope={"projects": ["PAY"]},
+                        created_at="2026-10-20T09:00:00+00:00",
+                    )
+                )
+            )
+            triggered = client.post(f"/api/v1/sources/{source_id}/sync", headers=headers)
+            leased = client.post(
+                "/api/cloud/local-agent/jobs/lease",
+                headers=headers,
+                json={"limit": 1, "lease_seconds": 60},
+            )
+
+        assert triggered.status_code == 202, triggered.text
+        assert leased.json()["jobs"][0]["payload"]["projection_scope_transition"] == {
+            "id": "scope-transition-stored-before-query-mode",
+            "previous_scope": {"projects": ["OPS"], "query_mode": "simple"},
+            "target_scope": {"projects": ["PAY"], "query_mode": "simple"},
+        }
+    finally:
+        asyncio.run(database.close())
+
+
 def test_teams_initial_history_change_does_not_create_destructive_scope_transition(tmp_path):
     database = _connect_database(tmp_path)
     try:

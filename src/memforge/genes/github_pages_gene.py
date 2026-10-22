@@ -38,6 +38,7 @@ from memforge.models import (
     RawContent,
     ScopeListing,
     ScopeListingKind,
+    UnlistedScopeMode,
 )
 from memforge.pipeline.normalizer_utils import annotate_code_blocks, html_to_markdown, strip_boilerplate
 from memforge.repo_identity import normalize_repo_identifier
@@ -242,6 +243,18 @@ class GitHubPagesGene(DocumentGene):
         if _sync_mode(config) != SYNC_MODE_SUBTREE:
             return False
         return _auth_mode(config) == AUTH_MODE_GITHUB_PAT or _bool_config(config, "sitemap_authoritative", False)
+
+    @classmethod
+    def unlisted_scope_mode(cls, config: Mapping[str, Any]) -> UnlistedScopeMode:
+        """A subtree without a token or a complete sitemap is read by link crawl or by a partial sitemap."""
+
+        return UnlistedScopeMode(
+            mode="subtree read by link crawl or by a sitemap not declared complete",
+            suggestion=(
+                "Read the subtree from the repository's branch tree with a GitHub personal access token, "
+                "declare the site's sitemap complete, or list the pages explicitly."
+            ),
+        )
 
     async def list_scope(self) -> ScopeListing:
         """Every configured page, or every page of the subtree from the branch tree or the authoritative sitemap.

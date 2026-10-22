@@ -26,6 +26,7 @@ __all__ = [
     "create_gene",
     "gene_exports_pdf",
     "list_available_genes",
+    "source_lists_scope",
     "source_rediscovers_documents",
     "source_type_execution_kinds",
     "source_type_supports_sync",
@@ -99,6 +100,16 @@ def source_rediscovers_documents(source_type: str, config: Mapping[str, Any]) ->
         gene_cls is not None
         and gene_family(gene_cls) is CollectionFamilyKind.DOCUMENT
         and gene_cls.rediscovers_documents(config)
+    )
+
+
+def source_lists_scope(source_type: str, config: Mapping[str, Any]) -> bool:
+    """Whether a configured document Source can list its whole scope (``DocumentGene.lists_scope``)."""
+    gene_cls = GENE_REGISTRY.get(str(source_type or "").strip())
+    return (
+        gene_cls is not None
+        and gene_family(gene_cls) is CollectionFamilyKind.DOCUMENT
+        and gene_cls.lists_scope(config)
     )
 
 

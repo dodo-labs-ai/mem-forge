@@ -388,8 +388,10 @@ class ProjectionScopeTransition:
 
     ``predecessor_transition_id`` names the open transition this one
     superseded, or is ``None`` when the change found no open transition.
-    ``completed_at`` is when the transition closed, as ``applied`` or
-    ``superseded``.
+    The two scopes differ, except in a transition that supersedes another to
+    return to the last applied scope: it lists that scope again, so Units the
+    superseded target added are removed when it completes. ``completed_at``
+    is when the transition closed, as ``applied`` or ``superseded``.
     """
 
     id: str
@@ -407,7 +409,7 @@ class ProjectionScopeTransition:
     def __post_init__(self) -> None:
         if not self.id or not self.source_id:
             raise ValueError("scope transition requires id and source_id")
-        if dict(self.previous_scope) == dict(self.target_scope):
+        if self.predecessor_transition_id is None and dict(self.previous_scope) == dict(self.target_scope):
             raise ValueError("scope transition requires distinct old and target scopes")
 
     @property

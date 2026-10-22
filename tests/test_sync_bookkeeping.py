@@ -9859,7 +9859,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
                         "github_repo",
                         target_config,
                     ),
-                    predecessor_transition_id=(previous_transitions[0].id if previous_transitions else None),
+                    previous_cycle_transition_id=(previous_transitions[0].id if previous_transitions else None),
                 ),
                 source_id=source_id,
                 previous_scope=canonical_projection_scope(
