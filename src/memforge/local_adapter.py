@@ -43,6 +43,7 @@ from memforge.local_agent.document_identity import (
     build_jira_doc_id,
     build_local_markdown_doc_id,
 )
+from memforge.local_agent.snapshot_manifest import UPSERT
 from memforge.local_agent.source_contract import local_file_package_semantic_hash
 from memforge.models import content_hash, slugify
 from memforge.storage.database import Database
@@ -224,7 +225,6 @@ def _package_manifest_entry(
     package_path: str | None,
     submitted_at: str,
     submitted_by: str | None,
-    change_kind: str = "upsert",
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     entry = {
@@ -237,7 +237,7 @@ def _package_manifest_entry(
         "package_uri": package_uri,
         "submitted_at": submitted_at,
         "submitted_by": submitted_by,
-        "change_kind": change_kind,
+        "change_kind": UPSERT,
     }
     if package_path:
         entry["package_path"] = package_path

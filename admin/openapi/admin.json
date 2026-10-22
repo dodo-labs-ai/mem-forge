@@ -3149,12 +3149,10 @@
         "type": "object"
       },
       "LocalSourceManifestItemRequest": {
+        "description": "One item of a device manifest: the item as the device read it.",
         "properties": {
           "change_kind": {
-            "enum": [
-              "upsert",
-              "tombstone"
-            ],
+            "const": "upsert",
             "title": "Change Kind",
             "type": "string"
           },
@@ -3180,14 +3178,10 @@
         "type": "object"
       },
       "LocalSourceManifestRequest": {
-        "description": "One covered local collection, planned against the retained packages.\n\n``package_contract_version`` is the package contract the local agent\ncollects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates\nthe numbered contract sends none.",
+        "description": "One complete local collection, planned against the retained packages.\n\nA device manifest lists the complete item set of its scope, so it declares\n``complete_snapshot`` coverage and every item an ``upsert``.\n``package_contract_version`` is the package contract the local agent\ncollects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates\nthe numbered contract sends none.",
         "properties": {
           "coverage": {
-            "enum": [
-              "complete_snapshot",
-              "bounded_delta",
-              "partial"
-            ],
+            "const": "complete_snapshot",
             "title": "Coverage",
             "type": "string"
           },
@@ -15455,7 +15449,7 @@
     },
     "/api/v1/sources/{source_id}/adapter/manifest": {
       "post": {
-        "description": "Reuse unchanged immutable packages in one covered, fenced collection.",
+        "description": "Reuse unchanged immutable packages in one complete, fenced collection.",
         "operationId": "prepare_local_source_manifest_api_v1_sources__source_id__adapter_manifest_post",
         "parameters": [
           {

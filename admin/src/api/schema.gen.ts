@@ -2016,7 +2016,7 @@ export interface paths {
         put?: never;
         /**
          * Prepare Local Source Manifest
-         * @description Reuse unchanged immutable packages in one covered, fenced collection.
+         * @description Reuse unchanged immutable packages in one complete, fenced collection.
          */
         post: operations["prepare_local_source_manifest_api_v1_sources__source_id__adapter_manifest_post"];
         delete?: never;
@@ -3798,13 +3798,16 @@ export interface components {
              */
             status: "queued";
         };
-        /** LocalSourceManifestItemRequest */
+        /**
+         * LocalSourceManifestItemRequest
+         * @description One item of a device manifest: the item as the device read it.
+         */
         LocalSourceManifestItemRequest: {
             /**
              * Change Kind
-             * @enum {string}
+             * @constant
              */
-            change_kind: "upsert" | "tombstone";
+            change_kind: "upsert";
             /** Doc Id */
             doc_id: string;
             /** Revision */
@@ -3812,8 +3815,10 @@ export interface components {
         };
         /**
          * LocalSourceManifestRequest
-         * @description One covered local collection, planned against the retained packages.
+         * @description One complete local collection, planned against the retained packages.
          *
+         *     A device manifest lists the complete item set of its scope, so it declares
+         *     ``complete_snapshot`` coverage and every item an ``upsert``.
          *     ``package_contract_version`` is the package contract the local agent
          *     collects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates
          *     the numbered contract sends none.
@@ -3821,9 +3826,9 @@ export interface components {
         LocalSourceManifestRequest: {
             /**
              * Coverage
-             * @enum {string}
+             * @constant
              */
-            coverage: "complete_snapshot" | "bounded_delta" | "partial";
+            coverage: "complete_snapshot";
             /** Items */
             items: components["schemas"]["LocalSourceManifestItemRequest"][];
             /** Local Agent Attempt Count */

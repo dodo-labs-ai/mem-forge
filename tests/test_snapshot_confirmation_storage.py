@@ -224,6 +224,73 @@ async def test_confirmations_name_only_unlisted_items(db: Database) -> None:
     ) is None
 
 
+@pytest.mark.parametrize(
+    ("coverage", "change_kind", "refusal"),
+    [
+        ("bounded_delta", "upsert", "coverage is invalid"),
+        ("partial", "upsert", "coverage is invalid"),
+        ("complete_snapshot", "tombstone", "change_kind is invalid"),
+    ],
+)
+async def test_a_manifest_is_a_complete_snapshot_of_upserts(db: Database, coverage, change_kind, refusal) -> None:
+    with pytest.raises(ValueError, match=refusal):
+        await _attach(
+            db,
+            coverage=coverage,
+            manifest_count=1,
+            manifest_items=[("jira-PAY-1", "rev-1", change_kind)],
+        )
+
+    assert await db.get_source_sync_snapshot_manifest_status(
+        source_id=SOURCE, workspace_id=WORKSPACE, snapshot_id="snap-1"
+    ) is None
+
+
+async def test_a_stored_legacy_manifest_still_reads_and_reports_its_status(db: Database) -> None:
+    # Manifests written before only complete snapshots of upserts were accepted.
+    await db.db.execute(
+        """INSERT INTO source_sync_snapshot_manifests (
+               workspace_id, source_id, snapshot_id, coverage, item_count, manifest_sha256,
+               local_agent_job_id, local_agent_attempt_count, source_config_revision, created_at
+           ) VALUES (?, ?, 'snap-legacy', 'bounded_delta', 2, ?, 'job-legacy', 1, 'rev-1', '2026-06-01T00:00:00+00:00')""",
+        (WORKSPACE, SOURCE, DIGEST),
+    )
+    await db.db.executemany(
+        """INSERT INTO source_sync_snapshot_manifest_items (
+               workspace_id, source_id, snapshot_id, doc_id, revision, change_kind
+           ) VALUES (?, ?, 'snap-legacy', ?, ?, ?)""",
+        [(WORKSPACE, SOURCE, "doc-kept", "rev-1", "upsert"), (WORKSPACE, SOURCE, "doc-gone", "rev-2", "tombstone")],
+    )
+    await db.db.commit()
+
+    status = await db.get_source_sync_snapshot_manifest_status(
+        source_id=SOURCE, workspace_id=WORKSPACE, snapshot_id="snap-legacy"
+    )
+    confirmations = await _confirmations(db, "snap-legacy")
+    attested = await db.find_source_sync_input_attestations(
+        source_id=SOURCE, workspace_id=WORKSPACE, manifest_items=[("doc-kept", "rev-1", "upsert")]
+    )
+
+    assert status is not None
+    assert (status["coverage"], status["item_count"], status["materialized_count"]) == ("bounded_delta", 2, 0)
+    assert (status["awaiting_confirmations"], status["ready"]) == (False, False)
+    assert confirmations == ()
+    assert attested == []
+    # A replay of the legacy manifest is refused as a write, and leaves it stored.
+    with pytest.raises(ValueError, match="coverage is invalid"):
+        await _attach(
+            db,
+            "snap-legacy",
+            coverage="bounded_delta",
+            manifest_count=2,
+            manifest_items=[("doc-kept", "rev-1", "upsert"), ("doc-gone", "rev-2", "tombstone")],
+            local_agent_job_id="job-legacy",
+        )
+    assert await db.get_source_sync_snapshot_manifest_status(
+        source_id=SOURCE, workspace_id=WORKSPACE, snapshot_id="snap-legacy"
+    ) == status
+
+
 async def test_the_confirmation_count_round_trips_through_sync_history(db: Database) -> None:
     started_at = datetime(2026, 10, 23, 8, 0, tzinfo=timezone.utc)
     for run_id, count, offset in (("run-counted", 4, 0), ("run-unconfirmed", None, 1)):
