@@ -609,7 +609,11 @@ class FailedDoc:
 # Why a sync run removed nothing although its scope listing was due: the
 # Gene's scope listing did not complete, or the provider could not confirm
 # which unlisted Documents are gone.
-AbsenceCheckSkippedReason = Literal["scope_listing_failed", "absence_confirmation_failed"]
+AbsenceCheckSkippedReason = Literal[
+    "scope_listing_failed",
+    "absence_confirmation_failed",
+    "absence_confirmation_missing",
+]
 
 
 @dataclass
@@ -628,6 +632,10 @@ class SyncState:
     failed_docs: list[FailedDoc] = field(default_factory=list)
     failure_retryable: bool = True
     absence_check_skipped_reason: AbsenceCheckSkippedReason | None = None
+    # Unlisted Units of a query listing confirmed still present (``exists`` or
+    # ``hidden``); each is confirmed again every run. ``None`` when the run
+    # confirmed nothing.
+    unlisted_present_count: int | None = None
     runtime_bundles: tuple[AgentRuntimeBundle, ...] = field(
         default=(),
         repr=False,

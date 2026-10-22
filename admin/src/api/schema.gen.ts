@@ -6087,7 +6087,7 @@ export interface components {
          */
         SourceSyncStatusResponse: {
             /** Absence Check Skipped Reason */
-            absence_check_skipped_reason?: ("scope_listing_failed" | "absence_confirmation_failed") | null;
+            absence_check_skipped_reason?: ("scope_listing_failed" | "absence_confirmation_failed" | "absence_confirmation_missing") | null;
             /** Created At */
             created_at?: string | null;
             /** Current Title */
