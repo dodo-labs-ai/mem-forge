@@ -138,6 +138,7 @@ from memforge.source_item_failures import (
 )
 from memforge.source_projection_config import canonical_projection_scope, source_access_context
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time, reported_source_time
+from memforge.source_types import source_type_descriptor
 
 if TYPE_CHECKING:
     from memforge.evals.agent_evaluation import RuntimeEventTraceSink
@@ -759,19 +760,10 @@ def _skipped_reading_group_count(extraction: MemoryExtractionResult) -> int:
     return int((extraction.metadata or {}).get("skipped_reading_group_count", 0) or 0)
 
 
-def _source_filter_summary(gene: Gene, since: datetime | None) -> str | None:
-    config = getattr(gene, "config", None)
-    parts: list[str] = []
-
-    if isinstance(config, dict):
-        jql_filter = config.get("jql_filter")
-        if isinstance(jql_filter, str) and jql_filter.strip():
-            parts.append(jql_filter.strip())
-
-    if since:
-        parts.append(f"updated >= {since.isoformat()}")
-
-    return " AND ".join(parts) or None
+def _exports_pdf(gene: Gene) -> bool:
+    """Whether the Gene's source type renders a PDF of each Unit."""
+    descriptor = source_type_descriptor(gene.metadata().name)
+    return descriptor is not None and descriptor.exports_pdf
 
 
 # ---------------------------------------------------------------------------
@@ -1149,7 +1141,7 @@ class GeneSyncOrchestrator:
                     if force_full_sync or authoritative_snapshot or scope_transition is not None
                     else (existing_state.last_sync_at if existing_state else None)
                 )
-                if last_sync_time and hasattr(gene, "fetch_pdf"):
+                if last_sync_time and _exports_pdf(gene):
                     missing_pdf_count = await self._count_missing_pdf_uris(source_id)
                     if missing_pdf_count:
                         logger.info(
@@ -1721,7 +1713,7 @@ class GeneSyncOrchestrator:
                     run_id=run_id,
                     lifecycle_cycle_id=(scope_transition.id if scope_transition is not None else durable_cycle_id),
                     removals=removals,
-                    source_filter_summary=_source_filter_summary(gene, last_sync_time),
+                    source_filter_summary=gene.filter_summary(last_sync_time),
                     source_activity=source_activity,
                 )
                 for deletion_failure in deletion_failures:
@@ -1871,17 +1863,16 @@ class GeneSyncOrchestrator:
                         scope_transition.id,
                     )
 
-        if self.memory_store is not None:
-            try:
-                await self.memory_store.attempt_lifecycle_vector_delivery(source_id=source_id)
-            except Exception:
-                # Relational lifecycle state and its durable outbox are
-                # authoritative. Delivery is run-level and independent of
-                # whether later source work completed successfully.
-                logger.exception(
-                    "Source sync completed with lifecycle vector delivery still pending for source %s",
-                    source_id,
-                )
+        try:
+            await self.memory_store.attempt_lifecycle_vector_delivery(source_id=source_id)
+        except Exception:
+            # Relational lifecycle state and its durable outbox are
+            # authoritative. Delivery is run-level and independent of
+            # whether later source work completed successfully.
+            logger.exception(
+                "Source sync completed with lifecycle vector delivery still pending for source %s",
+                source_id,
+            )
 
         # ------------------------------------------------------------------
         # Step 7: Record SyncState and sync_history
@@ -2991,6 +2982,8 @@ class GeneSyncOrchestrator:
         source_metadata = gene.metadata()
         source_type = source_metadata.name
         source_shape = source_metadata.data_shape
+        exports_pdf = _exports_pdf(gene)
+        product_name = source_metadata.display_name
         diagnostics.stage = "normalize"
         if stored_document is not None:
             stored_projection = await project_stored_input(
@@ -3220,7 +3213,7 @@ class GeneSyncOrchestrator:
         should_fetch_pdf = (
             stored_document is None
             and not raw.authoritative_empty
-            and hasattr(gene, "fetch_pdf")
+            and exports_pdf
             and (force_reprocess or requires_pdf_uri or not pdf_uri)
         )
         if should_fetch_pdf:
@@ -3228,7 +3221,7 @@ class GeneSyncOrchestrator:
                 pdf_bytes = await gene.fetch_pdf(item)
             except Exception as e:
                 if requires_pdf_uri:
-                    raise RuntimeError(f"Confluence PDF export failed for {item.title}: {e}") from e
+                    raise RuntimeError(f"{product_name} PDF export failed for {item.title}: {e}") from e
                 logger.warning("PDF export failed for %s: %s", item.title, e)
                 pdf_bytes = None
             if pdf_bytes and len(pdf_bytes) > 100:
@@ -3242,7 +3235,7 @@ class GeneSyncOrchestrator:
                 )
                 logger.info("Stored PDF for %s (%d bytes)", item.title, len(pdf_bytes))
             elif requires_pdf_uri:
-                raise RuntimeError(f"Confluence PDF export did not produce a PDF for {item.title}")
+                raise RuntimeError(f"{product_name} PDF export did not produce a PDF for {item.title}")
             self._memory_sample(
                 "after_pdf_export",
                 source_id=source_id,
@@ -3827,9 +3820,6 @@ class GeneSyncOrchestrator:
         current_hash: str,
     ) -> None:
         """Record how an updated document will be processed."""
-        if not self.memory_store or not hasattr(self.memory_store, "record_audit_event"):
-            return
-
         context = self._memory_store_context(
             run_id=run_id,
             source_id=source_id,
@@ -3873,9 +3863,6 @@ class GeneSyncOrchestrator:
         result: MemoryExtractionResult,
     ) -> None:
         """Record whether a memory extraction call produced usable candidates."""
-        if not self.memory_store or not hasattr(self.memory_store, "record_audit_event"):
-            return
-
         context = self._memory_store_context(
             run_id=run_id,
             source_id=source_id,
@@ -3956,11 +3943,6 @@ class GeneSyncOrchestrator:
             "source_unit_llm_summary %s",
             json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
-        if not self.memory_store or not hasattr(
-            self.memory_store,
-            "record_audit_event",
-        ):
-            return
         await self.memory_store.record_audit_event(
             "source_unit_llm_summary",
             outcome,
@@ -3993,13 +3975,11 @@ class GeneSyncOrchestrator:
         source_id: str,
         doc_id: str,
     ):
-        if self.memory_store and hasattr(self.memory_store, "operation_context"):
-            return self.memory_store.operation_context(
-                run_id=run_id,
-                source_id=source_id,
-                doc_id=doc_id,
-            )
-        return None
+        return self.memory_store.operation_context(
+            run_id=run_id,
+            source_id=source_id,
+            doc_id=doc_id,
+        )
 
     async def _finalize_projected_document_moves(
         self,
@@ -4028,19 +4008,12 @@ class GeneSyncOrchestrator:
                 "source_unit_id": source_unit_id,
                 "successor_doc_id": current_doc_id,
             }
-            if self.memory_store is not None:
-                await self.memory_store.delete_projected_document(
-                    predecessor.doc_id,
-                    source_id=source_id,
-                    deletion_context=deletion_context,
-                    source_activity=source_activity,
-                )
-            else:
-                await self.db.delete_projected_document(
-                    predecessor.doc_id,
-                    source_id=source_id,
-                    source_activity=source_activity,
-                )
+            await self.memory_store.delete_projected_document(
+                predecessor.doc_id,
+                source_id=source_id,
+                deletion_context=deletion_context,
+                source_activity=source_activity,
+            )
 
     # ==================================================================
     # Private: deletion detection
@@ -4262,7 +4235,7 @@ class GeneSyncOrchestrator:
         return await self.db.list_indexed_doc_ids(source_id)
 
     async def _count_missing_pdf_uris(self, source_id: str) -> int:
-        """Count non-empty Confluence Units whose stored input still lacks PDF provenance."""
+        """Count non-empty Units whose stored input still lacks PDF provenance."""
         return await self.db.count_missing_pdf_uris(source_id)
 
     async def _stored_unit_input(self, source_id: str, doc_id: str) -> SourceUnitInput | None:
@@ -4271,30 +4244,9 @@ class GeneSyncOrchestrator:
         return await self.db.get_source_unit_input(source_unit.id) if source_unit is not None else None
 
     async def _insert_changelog(self, entry: ChangelogEntry) -> None:
-        """Insert a changelog entry into the database.
-
-        The DB class does not expose an add_changelog method, so we write
-        directly to the changelog table.
-        """
+        """Record a Document change; the changelog is an audit trail, so a failure does not fail the sync."""
         try:
-            await self.db.db.execute(
-                """INSERT INTO changelog (
-                    doc_id, change_type, previous_version, current_version,
-                    content_diff, ai_change_summary, detected_at, title, source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    entry.doc_id,
-                    entry.change_type,
-                    entry.previous_version,
-                    entry.current_version,
-                    entry.content_diff,
-                    entry.ai_change_summary,
-                    entry.detected_at.isoformat(),
-                    entry.title,
-                    entry.source,
-                ),
-            )
-            await self.db.db.commit()
+            await self.db.insert_changelog(entry)
         except Exception as e:
             logger.error(
                 "Failed to insert changelog for %s: %s",

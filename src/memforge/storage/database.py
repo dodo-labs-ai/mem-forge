@@ -68,6 +68,7 @@ from memforge.memory.project_resolver import released_project_bindings
 from memforge.models import (
     AgentHookReceipt,
     AgentSessionReceipt,
+    ChangelogEntry,
     ContentItem,
     DocumentRecord,
     Entity,
@@ -7037,16 +7038,17 @@ class Database:
             return {str(row[0]) async for row in cursor}
 
     async def count_missing_pdf_uris(self, source_id: str) -> int:
-        """Count the Source's non-empty Confluence Units whose current stored input has no PDF."""
+        """Count the Source's non-empty Units whose current stored input has no PDF.
+
+        The caller asks only for a Source whose type exports a PDF of each Unit.
+        """
         async with self.db.execute(
             """SELECT COUNT(*)
                  FROM source_unit_inputs input
                  JOIN source_units unit
                    ON unit.id = input.source_unit_id
                   AND unit.current_revision_id = input.unit_revision_id
-                 JOIN sources s ON s.id = input.source_id
                 WHERE input.source_id = ?
-                  AND s.type = 'confluence'
                   AND input.normalized_content_uri IS NOT NULL
                   AND input.normalized_content_uri <> ''
                   AND (input.normalized_content_hash IS NULL OR input.normalized_content_hash <> ?)
@@ -7055,6 +7057,48 @@ class Database:
         ) as cursor:
             row = await cursor.fetchone()
             return int(row[0] if row else 0)
+
+    async def list_documents_missing_pdf(self, source_types: Sequence[str]) -> set[str]:
+        """The Documents whose current non-empty stored input has no PDF, among Sources of these types."""
+        if not source_types:
+            return set()
+        placeholders = ", ".join("?" for _ in source_types)
+        async with self.db.execute(
+            f"""SELECT DISTINCT input.document_id
+                  FROM source_unit_inputs input
+                  JOIN source_units unit
+                    ON unit.id = input.source_unit_id
+                   AND unit.current_revision_id = input.unit_revision_id
+                  JOIN sources s ON s.id = input.source_id
+                 WHERE s.type IN ({placeholders})
+                   AND input.normalized_content_uri IS NOT NULL
+                   AND input.normalized_content_uri <> ''
+                   AND (input.pdf_content_uri IS NULL OR input.pdf_content_uri = '')""",
+            tuple(source_types),
+        ) as cursor:
+            return {str(row[0]) async for row in cursor}
+
+    async def insert_changelog(self, entry: ChangelogEntry) -> None:
+        """Record one Document change in the changelog."""
+        async with self._write_transaction():
+            await self.db.execute(
+                """INSERT INTO changelog (
+                    doc_id, change_type, previous_version, current_version,
+                    content_diff, ai_change_summary, detected_at, title, source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    entry.doc_id,
+                    entry.change_type,
+                    entry.previous_version,
+                    entry.current_version,
+                    entry.content_diff,
+                    entry.ai_change_summary,
+                    entry.detected_at.isoformat(),
+                    entry.title,
+                    entry.source,
+                ),
+            )
+            await self.db.commit()
 
     async def delete_projected_document(
         self,

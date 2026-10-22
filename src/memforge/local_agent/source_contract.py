@@ -9,63 +9,14 @@ from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any
 
+from memforge.source_types import registered_source_types, source_type_descriptor
+
 
 LOCAL_AGENT_SYNC_OPERATIONS = frozenset(
-    {
-        "github_repo_sync",
-        "jira_sync",
-        "local_markdown_sync",
-        "teams_sync",
-    }
+    descriptor.local_agent.operation
+    for descriptor in registered_source_types()
+    if descriptor.local_agent is not None
 )
-_IMMUTABLE_EXECUTION_MODE_FIELDS = {
-    "github_repo": ("connection_mode",),
-    "jira": ("sync_mode",),
-}
-
-_LOCAL_AGENT_JOB_CONFIG_FIELDS_BY_SOURCE_TYPE = {
-    "github_repo": frozenset(
-        {
-            "repo_url",
-            "ref",
-            "include_paths",
-            "exclude_paths",
-            "include_extensions",
-        }
-    ),
-    "jira": frozenset(
-        {
-            "base_url",
-            "auth_mode",
-            "sync_mode",
-            "projects",
-            "issue_types",
-            "include_comments",
-            "query_mode",
-            "jql",
-            "jql_filter",
-        }
-    ),
-    "local_markdown": frozenset(
-        {
-            "root",
-            "vault_id",
-            "include",
-            "exclude",
-        }
-    ),
-    "teams": frozenset(
-        {
-            "region",
-            "conversation_ids",
-            "channels",
-            "group_chats",
-            "individual_chats",
-            "initial_history_days",
-            "rolling_retention_days",
-        }
-    ),
-}
 # ``retry_failed_items`` marks a job a person requested: the sync its snapshot
 # starts retries every failed Document of the Source. ``dry_run`` asks a
 # conversation Source's job to report what its attempt would change instead of
@@ -259,7 +210,8 @@ def local_agent_collection_attempt_id(
 
     normalized_source_type = str(source_type or "").strip().lower()
     requested = str(requested_snapshot_id or "").strip()
-    if normalized_source_type not in _LOCAL_AGENT_JOB_CONFIG_FIELDS_BY_SOURCE_TYPE:
+    descriptor = source_type_descriptor(normalized_source_type)
+    if descriptor is None or descriptor.local_agent is None:
         raise ValueError(f"{normalized_source_type or 'unknown'} sources are not collected by a local agent")
     canonical = local_agent_sync_snapshot_id(job_id, attempt_count)
     if requested and requested != canonical:
@@ -362,20 +314,11 @@ def local_agent_sync_operation(
     config: Mapping[str, Any] | str | None,
 ) -> str | None:
     """Return the daemon sync operation for a canonical source configuration."""
-    normalized_type = str(source_type or "").strip().lower()
-    normalized_config = _source_config(config)
-    if normalized_type == "teams":
-        return "teams_sync"
-    if normalized_type == "jira" and str(normalized_config.get("sync_mode") or "").strip().lower() == "local_agent":
-        return "jira_sync"
-    if normalized_type == "local_markdown":
-        return "local_markdown_sync"
-    if (
-        normalized_type == "github_repo"
-        and str(normalized_config.get("connection_mode") or "").strip().lower() == "local_push"
-    ):
-        return "github_repo_sync"
-    return None
+    descriptor = source_type_descriptor(str(source_type or "").strip().lower())
+    collection = descriptor.local_agent if descriptor is not None else None
+    if collection is None or not collection.collects(_source_config(config)):
+        return None
+    return collection.operation
 
 
 def is_local_agent_backed_source(source: Mapping[str, Any]) -> bool:
@@ -393,12 +336,13 @@ def source_execution_descriptor(
     config: Mapping[str, Any] | str | None,
 ) -> dict[str, Any]:
     """Return the canonical execution contract exposed to source clients."""
-    normalized_type = str(source_type or "").strip().lower()
-    operation = local_agent_sync_operation(normalized_type, config)
+    operation = local_agent_sync_operation(source_type, config)
+    descriptor = source_type_descriptor(str(source_type or "").strip().lower())
+    collection = descriptor.local_agent if descriptor is not None else None
     return {
         "kind": "local_agent" if operation is not None else "server",
         "operation": operation,
-        "immutable_config_fields": list(_IMMUTABLE_EXECUTION_MODE_FIELDS.get(normalized_type, ())),
+        "immutable_config_fields": list(collection.immutable_execution_fields if collection else ()),
     }
 
 
@@ -412,17 +356,14 @@ def local_agent_job_config(
     config: Mapping[str, Any] | str | None,
 ) -> dict[str, Any]:
     """Return connector config safe and useful for the owner's daemon."""
-    normalized_type = str(source_type or "").strip().lower()
-    allowed = _LOCAL_AGENT_JOB_CONFIG_FIELDS_BY_SOURCE_TYPE.get(
-        normalized_type,
-        frozenset(),
-    )
+    descriptor = source_type_descriptor(str(source_type or "").strip().lower())
+    collection = descriptor.local_agent if descriptor is not None else None
+    if collection is None:
+        return {}
     source_config = dict(_source_config(config))
-    if normalized_type == "teams":
-        if "initial_history_days" not in source_config:
-            source_config["initial_history_days"] = source_config.get("max_age_days", 14)
-        source_config.setdefault("rolling_retention_days", None)
-    return {key: value for key, value in source_config.items() if key in allowed}
+    if collection.job_config_defaults is not None:
+        source_config = collection.job_config_defaults(source_config)
+    return {key: value for key, value in source_config.items() if key in collection.job_config_fields}
 
 
 def local_agent_sync_job_payload(
@@ -543,7 +484,7 @@ def validate_local_agent_replay_package(
     expected_input_sha256: str,
     expected_package_sha256: str,
 ) -> Mapping[str, Any]:
-    """Compatibility wrapper around the registered provider adapter."""
+    """Validate one local-agent package with its source type's replay adapter."""
     from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
 
     return get_local_source_replay_adapter(source_type).validate(

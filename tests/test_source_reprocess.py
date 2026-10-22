@@ -29,6 +29,8 @@ from memforge.source_projection import ProjectionScopeTransition
 from memforge.source_projection_config import canonical_projection_scope, source_access_context
 from memforge.storage.database import Database
 from memforge.storage.document_store import StoredDocumentArtifact
+from tests.memory_store_fixture import OrchestratorMemoryStore
+from tests.gene_fixture import FakeGene
 from tests.test_sync_bookkeeping import (
     NoopMemoryEngine,
     ProjectionFragmentRecordingExtractor,
@@ -66,7 +68,7 @@ class RawKeepingDocumentStore(StubDocumentStore):
         return StoredDocumentArtifact(uri=uri, filename=uri.rsplit("/", 1)[-1], media_type=media_type)
 
 
-class JiraGene:
+class JiraGene(FakeGene):
     """Serves the provider until it is closed; a reprocess must never reach it."""
 
     discovery_complete = True
@@ -159,7 +161,7 @@ class Harness:
     def orchestrator(self) -> GeneSyncOrchestrator:
         return GeneSyncOrchestrator(
             db=self.db, doc_store=self.store, memory_extractor=self.extractor,
-            memory_engine=self.engine, memory_store=None, max_concurrent=1,
+            memory_engine=self.engine, memory_store=OrchestratorMemoryStore(self.db), max_concurrent=1,
         )
 
     async def unit(self, issue_key: str):
@@ -372,10 +374,13 @@ async def test_stored_input_whose_raw_object_is_not_its_own_has_no_stored_raw_co
     assert harness.extractor.fragment_calls == []
 
 
-class ConfluenceGene:
+class ConfluenceGene(FakeGene):
     """Places a child page under its parent only from the item metadata fetched with it."""
 
     discovery_complete = True
+
+    async def fetch_pdf(self, item):
+        return None
 
     @classmethod
     def metadata(cls):

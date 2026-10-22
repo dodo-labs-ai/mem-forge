@@ -7,50 +7,23 @@ from typing import Mapping
 
 from memforge.source_artifacts import SOURCE_ARTIFACT_OBSERVATION_TYPE
 from memforge.source_adapters.contracts import (
+    BINARY_ARTIFACT_PROFILE,
+    MARKDOWN_STRUCTURAL_PROFILE,
+    PLAIN_TEXT_PROFILE,
+    UNIT_TITLE_OBSERVATION_PROFILE,
     CanonicalRecordField,
     CanonicalRecordSchema,
     EvidenceRepresentationContract,
-)
-from memforge.source_adapters.jira import (
-    CANONICAL_RECORD_SCHEMAS as JIRA_RECORD_SCHEMAS,
-    CURRENT_OBSERVATION_PROFILES as JIRA_OBSERVATION_PROFILES,
-    LEGACY_OBSERVATION_PROFILES as JIRA_LEGACY_PROFILES,
-)
-from memforge.source_adapters.teams import CANONICAL_RECORD_SCHEMAS as TEAMS_RECORD_SCHEMAS
-from memforge.source_adapters.confluence import (
-    CANONICAL_RECORD_SCHEMAS as CONFLUENCE_RECORD_SCHEMAS,
-    LEGACY_OBSERVATION_PROFILES as CONFLUENCE_LEGACY_PROFILES,
+    canonical_record_profile,
 )
 from memforge.source_projection import (
-    EvidenceCoordinateSpace,
     EvidenceRepresentationProfile,
     SourceObservationRevision,
     SourceProjection,
 )
+from memforge.source_types import registered_source_types
 
 
-MARKDOWN_STRUCTURAL_PROFILE = EvidenceRepresentationProfile(
-    name="markdown-structural",
-    version=1,
-    coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
-)
-BINARY_ARTIFACT_PROFILE = EvidenceRepresentationProfile(
-    name="binary-artifact",
-    version=1,
-    coordinate_space=EvidenceCoordinateSpace.WHOLE_ARTIFACT,
-)
-PLAIN_TEXT_PROFILE = EvidenceRepresentationProfile(
-    name="plain-text",
-    version=1,
-    coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
-)
-# A Unit Title stored as the Unit's first Observation. No adapter projects it:
-# the projection carries the Unit Title, and every reading shows it.
-UNIT_TITLE_OBSERVATION_PROFILE = EvidenceRepresentationProfile(
-    name="unit-identity",
-    version=1,
-    coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
-)
 # Profiles outside the current representation whose content every reading still
 # shows. ``shown_as_reading_context`` says why a profile has to be named here.
 _PROFILES_SHOWN_AS_READING_CONTEXT = frozenset({UNIT_TITLE_OBSERVATION_PROFILE})
@@ -65,37 +38,22 @@ class EvidenceProfileBackfillReport:
     unresolved_revision_ids: tuple[str, ...]
 
 
-def _canonical_record_profile(schema_name: str, schema_version: int = 1) -> EvidenceRepresentationProfile:
-    return EvidenceRepresentationProfile(
-        name="canonical-record",
-        version=1,
-        coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
-        schema_name=schema_name,
-        schema_version=schema_version,
-    )
-
-
 _REPRESENTATION_CONTRACTS: Mapping[tuple[str, str], EvidenceRepresentationProfile] = {
-    ("confluence", "page_body"): _canonical_record_profile("confluence-page-storage"),
-    **JIRA_OBSERVATION_PROFILES,
-    ("github_repo", "file_content"): MARKDOWN_STRUCTURAL_PROFILE,
-    ("github_pages", "page_content"): MARKDOWN_STRUCTURAL_PROFILE,
-    ("local_markdown", "file_content"): MARKDOWN_STRUCTURAL_PROFILE,
-    ("teams", "message"): _canonical_record_profile("teams-message", 2),
-    ("agent_session", "session_summary"): MARKDOWN_STRUCTURAL_PROFILE,
-    ("agent_session", "agent_concept"): MARKDOWN_STRUCTURAL_PROFILE,
+    (descriptor.source_type, observation_type): profile
+    for descriptor in registered_source_types()
+    for observation_type, profile in descriptor.evidence_profiles.items()
 }
 
 _CANONICAL_RECORD_SCHEMAS: Mapping[tuple[str, int], CanonicalRecordSchema] = {
-    **JIRA_RECORD_SCHEMAS,
-    **TEAMS_RECORD_SCHEMAS,
-    **CONFLUENCE_RECORD_SCHEMAS,
+    key: schema
+    for descriptor in registered_source_types()
+    for key, schema in descriptor.record_schemas.items()
 }
 
-_LEGACY_OBSERVATION_PROFILES = {
-    **CONFLUENCE_LEGACY_PROFILES,
-    **JIRA_LEGACY_PROFILES,
-    ("teams", "message"): _canonical_record_profile("teams-message", 1),
+_LEGACY_OBSERVATION_PROFILES: Mapping[tuple[str, str], EvidenceRepresentationProfile] = {
+    (descriptor.source_type, observation_type): profile
+    for descriptor in registered_source_types()
+    for observation_type, profile in descriptor.legacy_evidence_profiles.items()
 }
 
 
@@ -133,7 +91,7 @@ _SUPPORTED_REPRESENTATION_CONTRACTS: Mapping[
         BINARY_ARTIFACT_PROFILE,
         PLAIN_TEXT_PROFILE,
         *_REPRESENTATION_CONTRACTS.values(),
-        *(_canonical_record_profile(name, version) for name, version in _CANONICAL_RECORD_SCHEMAS),
+        *(canonical_record_profile(name, version) for name, version in _CANONICAL_RECORD_SCHEMAS),
     }
 }
 

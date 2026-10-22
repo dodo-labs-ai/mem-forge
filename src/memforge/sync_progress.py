@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Literal, get_args
 
+from memforge.source_types import source_type_descriptor
+
 
 SyncProgressPhase = Literal[
     "waiting_for_device",
@@ -19,18 +21,11 @@ SyncProgressPhase = Literal[
 SyncProgressUnit = Literal["item", "page", "file", "issue", "message", "conversation"]
 SYNC_PROGRESS_PHASES = frozenset(get_args(SyncProgressPhase))
 SYNC_PROGRESS_UNITS = frozenset(get_args(SyncProgressUnit))
-_SOURCE_PROGRESS_UNITS = {
-    "confluence": "page",
-    "github_pages": "page",
-    "github_repo": "file",
-    "jira": "issue",
-    "local_markdown": "file",
-    "teams": "message",
-}
 
 
 def source_progress_unit(source_type: str) -> str:
-    return _SOURCE_PROGRESS_UNITS.get(source_type, "item")
+    descriptor = source_type_descriptor(source_type)
+    return descriptor.unit_noun if descriptor else "item"
 
 
 def source_sync_progress_from_pipeline(

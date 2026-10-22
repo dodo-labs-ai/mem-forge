@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from memforge.source_adapters.contracts import CanonicalRecordField, CanonicalRecordSchema
+from memforge.source_adapters.contracts import CanonicalRecordField, CanonicalRecordSchema, canonical_record_profile
 from memforge.source_adapters.confluence_storage import STORAGE_FORMAT
 from memforge.source_projection import EvidenceCoordinateSpace, EvidenceRepresentationProfile
 
@@ -15,10 +15,11 @@ PAGE_SCHEMA = CanonicalRecordSchema(
     ),
 )
 CANONICAL_RECORD_SCHEMAS = {(PAGE_SCHEMA.name, PAGE_SCHEMA.version): PAGE_SCHEMA}
+CURRENT_OBSERVATION_PROFILES = {"page_body": canonical_record_profile(PAGE_SCHEMA.name, PAGE_SCHEMA.version)}
 # The pre-profile writer persisted normalized Markdown. NULL-profile backfill
 # may attest that historical contract, never the newly introduced native schema.
 LEGACY_OBSERVATION_PROFILES = {
-    ("confluence", "page_body"): EvidenceRepresentationProfile(
+    "page_body": EvidenceRepresentationProfile(
         "markdown-structural", 1, EvidenceCoordinateSpace.UNICODE_SCALAR,
     ),
 }

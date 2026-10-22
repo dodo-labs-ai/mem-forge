@@ -2,8 +2,8 @@
 
 A gene encapsulates the complete lifecycle for syncing data from a single
 external source (Confluence, Jira, Teams, Outlook, ...) into MemForge's
-memory layer.  Concrete genes override the five abstract methods and register
-themselves via the ``@register_gene`` decorator in ``genes/__init__.py``.
+memory layer.  Concrete genes override the five abstract methods; each source
+type names its Gene in its descriptor in :mod:`memforge.source_types`.
 
 All gene-related dataclasses (GeneMetadata, GeneConfigSchema, ConfigField,
 ConfigGroup, ConfigFieldType, ContentItem, RawContent, NormalizedContent) live
@@ -121,6 +121,18 @@ class Gene(ABC):
         the stored input.
         """
         return False
+
+    def filter_summary(self, since: datetime | None) -> str | None:
+        """The filter this run's discovery applied, as source activity shows it."""
+        return f"updated >= {since.isoformat()}" if since else None
+
+    async def fetch_pdf(self, item: ContentItem) -> bytes | None:
+        """Render a PDF of one item.
+
+        A Gene overrides this exactly when its source type's descriptor sets
+        ``exports_pdf``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not export PDFs")
 
     def requires_pdf_artifact(
         self,

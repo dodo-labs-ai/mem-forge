@@ -11,6 +11,7 @@ from memforge.memory.index_payloads import (
     memory_embedding_text,
 )
 from memforge.memory.lifecycle import allowed_search_statuses
+from memforge.source_types import registered_source_types
 
 __all__ = ["MemoryIndexHealthChecker", "MemoryIndexHealthIssue", "MemoryIndexHealthReport"]
 
@@ -62,7 +63,9 @@ class MemoryIndexHealthChecker:
             issue_prefix="memory",
         )
         chroma_ids = set(chroma_records)
-        confluence_documents_missing_pdf = await self._confluence_documents_missing_pdf()
+        documents_missing_pdf = await self.db.list_documents_missing_pdf(
+            [descriptor.source_type for descriptor in registered_source_types() if descriptor.exports_pdf]
+        )
         search_visible_statuses = set(allowed_search_statuses())
 
         issues: list[MemoryIndexHealthIssue] = []
@@ -218,12 +221,12 @@ class MemoryIndexHealthChecker:
                 detail="FTS5 contains a memory ID missing from SQLite",
             ))
 
-        for doc_id in sorted(confluence_documents_missing_pdf):
+        for doc_id in sorted(documents_missing_pdf):
             issues.append(MemoryIndexHealthIssue(
-                kind="confluence_pdf_uri_missing",
+                kind="pdf_uri_missing",
                 severity="P1",
                 memory_id=doc_id,
-                detail="Confluence document is missing its PDF provenance URI",
+                detail="Document is missing its PDF provenance URI",
             ))
 
         return MemoryIndexHealthReport(issues=issues)
@@ -249,24 +252,6 @@ class MemoryIndexHealthChecker:
                     "entities_text": row[2],
                 }
         return records, duplicate_ids
-
-    async def _confluence_documents_missing_pdf(self) -> set[str]:
-        doc_ids: set[str] = set()
-        async with self.db.db.execute(
-            """SELECT DISTINCT input.document_id
-               FROM source_unit_inputs input
-               JOIN source_units unit
-                 ON unit.id = input.source_unit_id
-                AND unit.current_revision_id = input.unit_revision_id
-               JOIN sources s ON s.id = input.source_id
-               WHERE s.type = 'confluence'
-                 AND input.normalized_content_uri IS NOT NULL
-                 AND input.normalized_content_uri <> ''
-                 AND (input.pdf_content_uri IS NULL OR input.pdf_content_uri = '')"""
-        ) as cursor:
-            async for row in cursor:
-                doc_ids.add(row[0])
-        return doc_ids
 
     async def _memory_content_hash(self, memory_id: str) -> str | None:
         async with self.db.db.execute(

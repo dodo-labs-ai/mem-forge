@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Each source type declares its facts once, in a descriptor in
+  `memforge.source_types`: its Gene, native projection, evidence profiles,
+  namespace and scope fields, progress noun, local-agent collection, PDF
+  export and configuration rules. Shared sync, projection, local-agent and
+  admin code reads the descriptor instead of branching on the type, so a new
+  source type is one connector plus one descriptor. `GENE_REGISTRY` is a
+  read-only view of the descriptors, and `@register_gene` is removed: register
+  a `SourceTypeDescriptor` with `register_source_type`. A built-in source type
+  that fails to load now fails startup instead of being skipped.
+- The changelog is written through the store's `insert_changelog`, missing
+  PDFs are counted without naming a source type, and projected document moves
+  always go through the memory store. The memory health issue
+  `confluence_pdf_uri_missing` is renamed `pdf_uri_missing`.
+  - Cloud: HANA `count_missing_pdf_uris` drops its Confluence predicate, and
+    the Cloud runtime no longer overrides the changelog write, so a failed
+    changelog write is logged instead of failing the Document, as in OSS.
 - A document Source's next run reads from the start of the previous run, not
   its end, so an item changed while a long run was still going is read again.
   "Last synced" shows that start time.

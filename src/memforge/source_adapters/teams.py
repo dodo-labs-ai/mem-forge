@@ -8,7 +8,7 @@ from dataclasses import replace
 from typing import Mapping
 
 from memforge.conversations.units import UnitKind
-from memforge.source_adapters.contracts import CanonicalRecordField, CanonicalRecordSchema
+from memforge.source_adapters.contracts import CanonicalRecordField, CanonicalRecordSchema, canonical_record_profile
 
 
 CANONICAL_RECORD_SCHEMAS: Mapping[tuple[str, int], CanonicalRecordSchema] = {
@@ -32,6 +32,8 @@ MESSAGE_SCHEMA = replace(
     model_interpretation="Sender and message times are supplied source framing. Missing sender or a reported Unknown sender does not establish identity. Message time is not a rule effective date. An authenticated reply referent establishes a relationship; chronological adjacency alone does not.",
 )
 CANONICAL_RECORD_SCHEMAS = {**CANONICAL_RECORD_SCHEMAS, (MESSAGE_SCHEMA.name, MESSAGE_SCHEMA.version): MESSAGE_SCHEMA}
+CURRENT_OBSERVATION_PROFILES = {"message": canonical_record_profile(MESSAGE_SCHEMA.name, MESSAGE_SCHEMA.version)}
+LEGACY_OBSERVATION_PROFILES = {"message": canonical_record_profile(MESSAGE_SCHEMA.name, 1)}
 
 
 def teams_unit_shape(provider_key: str) -> tuple[UnitKind, str | None]:

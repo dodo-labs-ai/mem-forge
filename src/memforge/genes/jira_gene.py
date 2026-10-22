@@ -519,6 +519,11 @@ class JiraGene(Gene):
     def rediscovers_documents(cls, config: Mapping[str, Any]) -> bool:
         return str(config.get("sync_mode") or "cloud").strip().lower() != "local_agent"
 
+    def filter_summary(self, since: datetime | None) -> str | None:
+        jql_filter = str(self.config.get("jql_filter") or "").strip()
+        parts = [part for part in (jql_filter, super().filter_summary(since)) if part]
+        return " AND ".join(parts) or None
+
     async def rediscover(self, item: ContentItem) -> ContentItem | None:
         """Read one issue as discovery does, by its stable id when the stored item has it."""
         issue_ref = _issue_ref(item)
