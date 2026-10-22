@@ -389,6 +389,43 @@ test("notes a finished sync that skipped its deletion check", () => {
   );
 });
 
+test("notes a missing device confirmation and the unlisted items a finished sync kept", () => {
+  const finishedSync: SyncStatus = {
+    status: "success",
+    run_id: "ssr-5",
+    started_at: "2026-07-08T10:00:00Z",
+    finished_at: "2026-07-08T10:01:00Z",
+    error_message: null,
+    progress: { schema_version: 1, phase: "processing", progress: { completed: 3, unit: "issue" } },
+    absence_check_skipped_reason: "absence_confirmation_missing",
+  };
+  assert.equal(
+    presentSourceSyncActivity(sourceSyncActivityFromStatus(finishedSync), "Jira", "issues").notice,
+    "Deletion check skipped: the local agent did not confirm which missing items were deleted. Nothing was removed; the next sync checks again.",
+  );
+  const confirmed = { ...finishedSync, absence_check_skipped_reason: null };
+  assert.equal(
+    presentSourceSyncActivity(sourceSyncActivityFromStatus({ ...confirmed, unlisted_present_count: 1 }), "Jira", "issues")
+      .notice,
+    "1 item is outside the sync scope but still in the source, so it is kept and checked again each sync.",
+  );
+  assert.equal(
+    presentSourceSyncActivity(sourceSyncActivityFromStatus({ ...confirmed, unlisted_present_count: 4 }), "Jira", "issues")
+      .notice,
+    "4 items are outside the sync scope but still in the source, so they are kept and checked again each sync.",
+  );
+  for (const count of [0, null, undefined]) {
+    assert.equal(
+      presentSourceSyncActivity(
+        sourceSyncActivityFromStatus({ ...confirmed, unlisted_present_count: count }),
+        "Jira",
+        "issues",
+      ).notice,
+      undefined,
+    );
+  }
+});
+
 test("a partial sync shows the reason the server gave", () => {
   const reason = "1 conversation could not be read: Release crew. Their memories are kept. "
     + "Restore access, or deselect a conversation that is no longer used.";

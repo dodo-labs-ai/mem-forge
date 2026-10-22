@@ -43,6 +43,8 @@ export interface SourceSyncActivity {
   retryTarget?: SourceSyncRetryTarget;
   /** Why a finished run removed nothing although it was due to check for deleted items. */
   absenceCheckSkippedReason?: AbsenceCheckSkippedReason | null;
+  /** Items a finished run found outside its scope that the source confirmed it still has; they are kept. */
+  unlistedPresentCount?: number | null;
   /** Parts of a finished run's documents the generation model could not read. */
   skippedReadingGroupCount?: number | null;
 }
@@ -107,6 +109,7 @@ export function sourceSyncActivityFromStatus(sync: SyncStatus): SourceSyncActivi
     retryTarget: sync.status === "pending" && sync.run_id
       ? { execution_kind: "source_sync_run", execution_id: sync.run_id } : undefined,
     absenceCheckSkippedReason: sync.absence_check_skipped_reason,
+    unlistedPresentCount: sync.unlisted_present_count,
     skippedReadingGroupCount: sync.skipped_reading_group_count,
   };
 }
@@ -270,6 +273,7 @@ export function presentSourceSyncActivity(
       reason
         ? `Deletion check skipped: ${ABSENCE_CHECK_SKIPPED_NOTICES[reason]}. Nothing was removed; the next sync checks again.`
         : "",
+      unlistedPresentNotice(activity.unlistedPresentCount ?? 0),
       unreadPartsNotice(activity.skippedReadingGroupCount ?? 0),
       activity.state === "partial" ? activity.error?.message?.trim() ?? "" : "",
     ].filter(Boolean);
@@ -311,6 +315,13 @@ export function presentSourceSyncActivity(
     case "reconciling":
       return withProgress(`Checking removed ${label}`, snapshot, fallbackItems);
   }
+}
+
+function unlistedPresentNotice(count: number): string {
+  if (count <= 0) return "";
+  return count === 1
+    ? "1 item is outside the sync scope but still in the source, so it is kept and checked again each sync."
+    : `${count} items are outside the sync scope but still in the source, so they are kept and checked again each sync.`;
 }
 
 function unreadPartsNotice(count: number): string {

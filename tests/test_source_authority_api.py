@@ -482,13 +482,17 @@ def test_agent_session_rejects_ordinary_sync_and_hides_historical_sync_failure(t
 
 
 @pytest.mark.parametrize(
-    ("recorded", "reported"),
+    ("recorded", "reported", "unlisted_present_count"),
     [
-        ("absence_confirmation_failed", "absence_confirmation_failed"),
-        ("Jira search total changed during pagination", "scope_listing_failed"),
+        ("absence_confirmation_failed", "absence_confirmation_failed", None),
+        ("absence_confirmation_missing", "absence_confirmation_missing", None),
+        ("Jira search total changed during pagination", "scope_listing_failed", None),
+        (None, None, 1),
     ],
 )
-def test_source_list_returns_why_the_latest_sync_skipped_its_absence_check(tmp_path, recorded, reported):
+def test_source_list_returns_the_absence_check_of_the_latest_sync(
+    tmp_path, recorded, reported, unlisted_present_count,
+):
     database = _connect_database(tmp_path)
     source_id = "src-absence-check-skipped"
     owner_headers = {"x-test-user": "owner-user", "x-test-workspace-role": "member"}
@@ -512,6 +516,7 @@ def test_source_list_returns_why_the_latest_sync_skipped_its_absence_check(tmp_p
                     last_sync_at=finished_at,
                     last_sync_status="success",
                     absence_check_skipped_reason=recorded,
+                    unlisted_present_count=unlisted_present_count,
                 ),
                 started_at=started_at,
                 finished_at=finished_at,
@@ -526,6 +531,7 @@ def test_source_list_returns_why_the_latest_sync_skipped_its_absence_check(tmp_p
         source = next(row for row in listed.json()["data"] if row["id"] == source_id)
         assert source["sync"]["status"] == "success"
         assert source["sync"]["absence_check_skipped_reason"] == reported
+        assert source["sync"]["unlisted_present_count"] == unlisted_present_count
     finally:
         asyncio.run(database.close())
 
