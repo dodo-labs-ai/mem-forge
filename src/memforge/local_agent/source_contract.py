@@ -370,13 +370,44 @@ def local_agent_job_config(
     return {key: value for key, value in source_config.items() if key in collection.job_config_fields}
 
 
-def local_agent_sync_job_payload(
+LOCAL_AGENT_TRANSITION_PAYLOAD_FIELD = "projection_scope_transition"
+"""The job payload field naming the Source's open scope transition and its canonical scopes."""
+LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD = "excluded_scopes"
+"""The job payload field carrying the configuration of each scope an open transition excludes.
+
+Each entry is ``{"scope_key": ..., "config": ...}``: the scope's fingerprint,
+which the device's manifest names its listing by, and the job configuration
+that lists that scope. A device collector removes both transition fields
+before it configures its Gene.
+"""
+LOCAL_AGENT_TRANSITION_PAYLOAD_FIELDS = frozenset(
+    {LOCAL_AGENT_TRANSITION_PAYLOAD_FIELD, LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD}
+)
+"""The job payload fields about the open scope transition, which never reach a device Gene's configuration."""
+
+
+async def local_agent_sync_job_payload(
+    db: Any,
     source: Mapping[str, Any],
     request_payload: Mapping[str, Any] | str | None = None,
 ) -> dict[str, Any]:
-    """Return the canonical daemon sync-job payload for a saved source."""
+    """The daemon sync-job payload for a saved Source, as of the moment the job is enqueued.
+
+    Every place that enqueues a local-agent sync job builds its payload here:
+    the saved collection configuration, the request's control fields, and,
+    while a document scope transition is open, that transition. Once the
+    transition's previous run left no listed Document that is not yet a member,
+    the next run can complete it, so the payload also carries the configuration
+    of every distinct scope the transition excludes, for the device to list
+    (:data:`LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD`). Only a query listing
+    needs them; an existence listing completes from the new listing alone.
+    """
+
+    from memforge.source_projection_config import canonical_projection_scope, canonical_scope_transition
+
     source_type = str(source.get("type") or "").strip()
-    payload = local_agent_job_config(source_type, source.get("config"))
+    config = _source_config(source.get("config"))
+    payload = local_agent_job_config(source_type, config)
     payload.update(
         {
             key: value
@@ -387,7 +418,71 @@ def local_agent_sync_job_payload(
     payload["source_id"] = str(source.get("id") or "").strip()
     payload["source_type"] = source_type
     payload["source_config_revision"] = local_agent_source_config_revision(source)
+    transition = await db.get_open_projection_scope_transition(payload["source_id"])
+    if transition is None:
+        return payload
+    transition = canonical_scope_transition(source_type, transition, canonical_projection_scope(source_type, config))
+    payload[LOCAL_AGENT_TRANSITION_PAYLOAD_FIELD] = {
+        "id": transition.id,
+        "previous_scope": dict(transition.previous_scope),
+        "target_scope": dict(transition.target_scope),
+    }
+    excluded_scopes = await _excluded_scope_job_configs(db, source_type, config, transition)
+    if excluded_scopes:
+        payload[LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD] = excluded_scopes
     return payload
+
+
+async def _excluded_scope_job_configs(
+    db: Any,
+    source_type: str,
+    config: Mapping[str, Any],
+    transition: Any,
+) -> list[dict[str, Any]]:
+    """The job configuration of each scope the transition excludes, once its next run can complete it.
+
+    The next run can complete it when the transition's previous run, bound to
+    a device snapshot, listed only Documents that are already members. Before
+    any such run, and while a listed Document waits, none is carried.
+    """
+
+    from memforge.models import ScopeListingKind
+    from memforge.source_projection_config import (
+        ExcludedScopesUnavailable,
+        excluded_projection_scopes,
+        excluded_scope_config,
+        projection_scope_fingerprint,
+    )
+
+    descriptor = source_type_descriptor(source_type)
+    if descriptor is None or descriptor.local_agent is None:
+        return []
+    listing_kinds = getattr(descriptor.gene_class(), "listing_kinds", frozenset())
+    if ScopeListingKind.QUERY not in listing_kinds or transition.run_id is None:
+        return []
+    run = await db.get_source_sync_run(transition.run_id)
+    if run is None or run.input_snapshot_id is None:
+        return []
+    listed = snapshot_document_ids(
+        await db.list_source_sync_inputs(
+            source_id=transition.source_id,
+            workspace_id=run.workspace_id,
+            input_snapshot_id=run.input_snapshot_id,
+        )
+    )
+    if listed - set(await db.list_projection_scope_transition_member_doc_ids(transition.id)):
+        return []
+    try:
+        scopes = await excluded_projection_scopes(db, transition, source_type=source_type, config=config)
+    except ExcludedScopesUnavailable:
+        return []
+    return [
+        {
+            "scope_key": projection_scope_fingerprint(scope),
+            "config": local_agent_job_config(source_type, excluded_scope_config(source_type, config, scope)),
+        }
+        for scope in scopes
+    ]
 
 
 def local_agent_source_config_revision(source: Mapping[str, Any]) -> str:

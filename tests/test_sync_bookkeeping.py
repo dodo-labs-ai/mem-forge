@@ -7552,9 +7552,13 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
 
 
 @pytest.mark.asyncio
-async def test_source_sync_worker_binds_a_device_run_to_the_answers_its_manifest_stored(db: Database):
+async def test_source_sync_worker_binds_a_device_run_to_the_answers_and_listings_its_manifest_stored(db: Database):
     import memforge.runtime as runtime
-    from memforge.local_agent.snapshot_manifest import SnapshotConfirmation, SnapshotConfirmationAnswer
+    from memforge.local_agent.snapshot_manifest import (
+        ExcludedScopeListing,
+        SnapshotConfirmation,
+        SnapshotConfirmationAnswer,
+    )
 
     source_id = "src-device-jira"
     await db.upsert_source(
@@ -7566,6 +7570,7 @@ async def test_source_sync_worker_binds_a_device_run_to_the_answers_its_manifest
         owner_user_id="dev",
     )
     issued = (SnapshotConfirmation("jira-doc-7", "100007"), SnapshotConfirmation("jira-doc-8", "PAY-8"))
+    listings = (ExcludedScopeListing("scope-old", frozenset({"jira-doc-7"})),)
     await db.attach_source_sync_inputs_to_snapshot(
         source_id=source_id,
         workspace_id="default",
@@ -7579,6 +7584,7 @@ async def test_source_sync_worker_binds_a_device_run_to_the_answers_its_manifest
         local_agent_attempt_count=1,
         source_config_revision="rev-1",
         confirm=issued,
+        excluded_listings=listings,
     )
     answered = (
         SnapshotConfirmation("jira-doc-7", "100007", SnapshotConfirmationAnswer.ABSENT),
@@ -7614,7 +7620,7 @@ async def test_source_sync_worker_binds_a_device_run_to_the_answers_its_manifest
 
     await runtime.SourceSyncWorker(db, AppConfig(), runtime_provider=provider, worker_id="worker-jira").run_once()
 
-    assert provider.input_snapshot == SnapshotBinding("laj-jira:attempt:1", frozenset(), answered)
+    assert provider.input_snapshot == SnapshotBinding("laj-jira:attempt:1", frozenset(), answered, listings)
 
 
 @pytest.mark.asyncio

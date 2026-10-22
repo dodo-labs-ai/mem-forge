@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import timedelta
@@ -114,6 +115,13 @@ def test_local_agent_retry_delay_uses_long_bounded_schedule() -> None:
     assert local_agent_retry_delay("succeeded", retryable=True, attempt_count=1) is None
 
 
+class _NoTransitions:
+    """A store holding no open scope transition."""
+
+    async def get_open_projection_scope_transition(self, source_id):
+        return None
+
+
 def test_local_agent_job_payload_preserves_complete_collection_scope() -> None:
     jira_source = {
         "id": "src-jira",
@@ -135,8 +143,8 @@ def test_local_agent_job_payload_preserves_complete_collection_scope() -> None:
         },
     }
 
-    jira = local_agent_sync_job_payload(jira_source)
-    teams = local_agent_sync_job_payload(teams_source)
+    jira = asyncio.run(local_agent_sync_job_payload(_NoTransitions(), jira_source))
+    teams = asyncio.run(local_agent_sync_job_payload(_NoTransitions(), teams_source))
 
     assert jira["query_mode"] == "advanced"
     assert jira["jql_filter"] == "updated >= -90d"
@@ -553,7 +561,8 @@ def test_local_agent_sync_job_payload_uses_saved_config_and_request_controls_onl
         },
     }
 
-    payload = local_agent_sync_job_payload(
+    payload = asyncio.run(local_agent_sync_job_payload(
+        _NoTransitions(),
         source,
         {
             "conversation_ids": ["19:spoofed@example.test"],
@@ -564,7 +573,7 @@ def test_local_agent_sync_job_payload_uses_saved_config_and_request_controls_onl
             "force_full_sync": True,
             "limit": 25,
         },
-    )
+    ))
 
     revision = payload.pop("source_config_revision")
     assert revision

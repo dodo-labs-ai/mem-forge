@@ -1547,6 +1547,11 @@ class SourceSyncWorker:
                             workspace_id=run.workspace_id,
                             snapshot_id=run.input_snapshot_id,
                         ),
+                        excluded_listings=await self.db.list_source_sync_snapshot_excluded_listings(
+                            source_id=run.source_id,
+                            workspace_id=run.workspace_id,
+                            snapshot_id=run.input_snapshot_id,
+                        ),
                     )
                 if run.input_snapshot_id is not None and not run.force_full_sync:
                     reusable_projection_doc_ids = await self.db.find_reusable_source_projection_memberships(

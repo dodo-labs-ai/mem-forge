@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 import hashlib
 import json
-from typing import Any
+from typing import Any, Protocol
 
 from memforge.source_projection import ProjectionScopeTransition
 from memforge.source_types import source_type_descriptor
@@ -135,6 +135,61 @@ def excluded_scope_config(
     config = {key: value for key, value in current_config.items() if key not in descriptor.scope_fields}
     config.update(canonical_projection_scope(source_type, excluded_scope))
     return config
+
+
+class ExcludedScopesUnavailable(ValueError):
+    """The superseded chain of an open transition cannot be read, so its excluded scopes are unknown."""
+
+
+class _TransitionReader(Protocol):
+    async def get_projection_scope_transition(self, transition_id: str) -> ProjectionScopeTransition | None: ...
+
+
+async def excluded_projection_scopes(
+    db: _TransitionReader,
+    transition: ProjectionScopeTransition,
+    *,
+    source_type: str,
+    config: Mapping[str, Any],
+) -> list[dict[str, object]]:
+    """The distinct canonical scopes an open transition excludes: the last applied scope and every superseded target.
+
+    The superseded chain is walked by ``predecessor_transition_id`` back to the
+    last applied scope. A scope equal to the new target is not excluded. Each
+    scope is canonicalized again against the configured one
+    (:func:`canonical_stored_scope`), so one stored before a scope field was
+    added reads that field as the open transition does. ``config`` is the
+    Source's current configuration. Raises ``ExcludedScopesUnavailable`` when
+    a transition of the chain is missing, belongs to another Source or loops.
+    """
+
+    target = canonical_projection_scope(source_type, transition.target_scope)
+    stored = await db.get_projection_scope_transition(transition.id)
+    if stored is None:
+        raise ExcludedScopesUnavailable(f"the transition {transition.id} is missing")
+    configured = canonical_projection_scope(source_type, config)
+
+    def canonical(scope: Mapping[str, object]) -> dict[str, object]:
+        return canonical_stored_scope(source_type, scope, stored_target=stored.target_scope, configured_scope=configured)
+
+    chain = [transition.previous_scope]
+    predecessor_id = transition.predecessor_transition_id
+    walked: set[str] = set()
+    while predecessor_id is not None:
+        if predecessor_id in walked:
+            raise ExcludedScopesUnavailable(f"the superseded transitions loop back to {predecessor_id}")
+        walked.add(predecessor_id)
+        predecessor = await db.get_projection_scope_transition(predecessor_id)
+        if predecessor is None or predecessor.source_id != transition.source_id:
+            raise ExcludedScopesUnavailable(f"the superseded transition {predecessor_id} is missing")
+        chain.append(predecessor.target_scope)
+        predecessor_id = predecessor.predecessor_transition_id
+    scopes: list[dict[str, object]] = []
+    for scope in chain:
+        excluded = canonical(scope)
+        if excluded != target and excluded not in scopes:
+            scopes.append(excluded)
+    return scopes
 
 
 def projection_scope_fingerprint(scope: Mapping[str, object]) -> str:

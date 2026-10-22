@@ -10,7 +10,11 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
-from memforge.local_agent.snapshot_manifest import SnapshotConfirmation, SnapshotConfirmationAnswer
+from memforge.local_agent.snapshot_manifest import (
+    ExcludedScopeListing,
+    SnapshotConfirmation,
+    SnapshotConfirmationAnswer,
+)
 from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, ScopeListingKind
 import memforge.pipeline.collection_family as collection_family_module
 from memforge.pipeline.collection_family import SnapshotBinding
@@ -172,6 +176,7 @@ class Workspace:
         manifest: set[int] | None = None,
         answers: dict[int, SnapshotConfirmationAnswer] | None = None,
         confirmation_failure: str | None = None,
+        excluded_listings: tuple[ExcludedScopeListing, ...] = (),
         extractor=None,
         excluded_scope_gene=None,
     ):
@@ -179,6 +184,7 @@ class Workspace:
 
         ``answers`` are the device's answers for the issues the manifest left
         out; ``confirmation_failure`` is the cause it gave instead.
+        ``excluded_listings`` are what the device listed in the excluded scopes.
         """
         confirmations = tuple(
             SnapshotConfirmation(
@@ -196,7 +202,9 @@ class Workspace:
             force_full_sync=force_full_sync,
             failed_item_retry=retry,
             input_snapshot=(
-                SnapshotBinding("snapshot-1", frozenset(f"jira-{number}" for number in manifest), confirmations)
+                SnapshotBinding(
+                    "snapshot-1", frozenset(f"jira-{number}" for number in manifest), confirmations, excluded_listings
+                )
                 if manifest is not None
                 else None
             ),
