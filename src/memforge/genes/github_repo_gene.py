@@ -39,6 +39,7 @@ from memforge.github_repo_utils import (
     github_content_type_is_binary,
     github_exclude_paths,
     github_extension_allowed,
+    github_file_provider_key,
     github_include_extensions,
     github_include_paths,
     github_latest_commit_time,
@@ -78,7 +79,7 @@ logger = logging.getLogger(__name__)
 # Why a selected binary file, an image or a PDF, has no text body: its content is its Artifact.
 _BINARY_FILE_EMPTY_EVIDENCE = "github_binary_file_has_no_text_body"
 
-__all__ = ["GitHubRepoGene"]
+__all__ = ["GitHubRepoGene", "github_renamed_from"]
 
 CONNECTION_MODE_CLOUD_PULL = "cloud_pull"
 CONNECTION_MODE_LOCAL_PUSH = "local_push"
@@ -88,6 +89,28 @@ GITHUB_REPO_SOURCE_TYPE = "github_repo"
 DEFAULT_MAX_FILES = 500
 # ``ContentItem.extra`` key for the file's latest commit time at the collection commit.
 LAST_COMMIT_AT_KEY = "last_commit_at"
+
+
+def github_renamed_from(
+    *,
+    repository: str,
+    previous_filename: object,
+    rename_evidence_authoritative: object,
+) -> str | None:
+    """The ``renamed_from`` of a discovered file: the provider key of the path it was renamed from.
+
+    Only authoritative evidence names a predecessor, such as a validated
+    Compare API ``renamed`` record, which reports ``previous_filename`` once.
+    A matching blob SHA is never read as a rename, because a copy followed by
+    a delete looks the same. ``repository`` is ``owner/repo``.
+    """
+
+    if rename_evidence_authoritative is not True or not previous_filename:
+        return None
+    return github_file_provider_key(
+        repository=repository,
+        lineage=normalize_github_relative_path(str(previous_filename)),
+    )
 
 
 @dataclass(frozen=True)

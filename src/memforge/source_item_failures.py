@@ -22,7 +22,7 @@ the item that failed, the run leaves it alone.
 from __future__ import annotations
 
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from typing import Protocol
@@ -40,9 +40,9 @@ MAX_SOURCE_ITEM_FAILURE_MESSAGE_CHARS = 512
 # staged before derivations recorded their release.
 UNRECORDED_RELEASE = "unrecorded"
 
-# The stage of a Document whose removal failed. The next run whose discovery
-# or listing proves the Document absent removes it again, so such a row is not
-# retried by processing the Document.
+# The stage of a Document whose removal failed. The next run whose listing
+# proves the Document absent removes it again, so such a row is not retried by
+# processing the Document.
 REMOVAL_STAGE = "removal"
 
 
@@ -114,7 +114,10 @@ class SourceItemFailure:
 
         ``failures_in_release`` counts the consecutive failures of this release
         at the same stage with the same error class; a failure of another
-        release, stage or class starts the count again.
+        release, stage or class starts the count again. The row keeps the
+        rename its earlier item attested, because a provider may report a
+        rename only once: the predecessor's Unit is kept until this Document
+        commits.
         """
 
         repeats = (
@@ -136,7 +139,11 @@ class SourceItemFailure:
             title=failure.title or (previous.title if previous is not None else None),
             error_code=failure.error_code,
             source_unit_id=failure.source_unit_id or (previous.source_unit_id if previous is not None else None),
-            item=failure.item or (previous.item if previous is not None else None),
+            item=(
+                with_inherited_rename(failure.item, previous)
+                if failure.item is not None
+                else (previous.item if previous is not None else None)
+            ),
         )
 
     @property
@@ -154,6 +161,18 @@ class SourceItemFailure:
         if retry is FailedItemRetry.ALL or self.recorded_by_another_release(release):
             return True
         return self.retryable and not self.budget_exhausted
+
+
+def with_inherited_rename(item: ContentItem, row: SourceItemFailure | None) -> ContentItem:
+    """``item``, naming the predecessor its Document's ledger ``row`` recorded when ``item`` names none.
+
+    A provider may report a rename only once, so a fresh item discovered for
+    a failed Document keeps the rename its earlier, failed item attested.
+    """
+
+    if item.renamed_from is not None or row is None or row.item is None or row.item.renamed_from is None:
+        return item
+    return replace(item, renamed_from=row.item.renamed_from)
 
 
 class SourceItemFailureStore(Protocol):
@@ -199,4 +218,5 @@ __all__ = [
     "SourceItemFailure",
     "SourceItemFailureStore",
     "UNRECORDED_RELEASE",
+    "with_inherited_rename",
 ]

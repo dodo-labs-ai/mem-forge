@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from memforge.genes.github_repo_gene import github_renamed_from
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.source_projection_adapters import (
     _canonical_hash,
@@ -1212,7 +1213,19 @@ def test_file_move_with_provider_lineage_preserves_observation_identity(source_t
     assert moved.unit_title != first.unit_title
 
 
-def test_attested_github_compare_previous_filename_preserves_unit_without_daemon_lineage() -> None:
+def test_github_names_a_predecessor_only_for_an_attested_rename() -> None:
+    assert github_renamed_from(
+        repository="acme/pay", previous_filename="/old/design.md", rename_evidence_authoritative=True,
+    ) == "acme/pay:old/design.md"
+    assert github_renamed_from(
+        repository="acme/pay", previous_filename="old/design.md", rename_evidence_authoritative=False,
+    ) is None
+    assert github_renamed_from(
+        repository="acme/pay", previous_filename=None, rename_evidence_authoritative=True,
+    ) is None
+
+
+def test_attested_github_rename_preserves_unit_without_daemon_lineage() -> None:
     first_item = _item(
         item_id="file-old",
         extra={
@@ -1233,10 +1246,11 @@ def test_attested_github_compare_previous_filename_preserves_unit_without_daemon
     )
     moved_item = _item(
         item_id="file-new",
+        renamed_from=github_renamed_from(
+            repository="acme/pay", previous_filename="old/design.md", rename_evidence_authoritative=True,
+        ),
         extra={
             "relative_path": "new/design.md",
-            "previous_filename": "old/design.md",
-            "rename_evidence_authoritative": True,
             "repo_owner": "acme",
             "repo_name": "pay",
             "repo_ref": "main",
@@ -1294,12 +1308,13 @@ def test_attested_github_compare_previous_filename_preserves_unit_without_daemon
     assert ordinary.deltas[0].axes == frozenset()
 
 
-def test_unattested_github_previous_filename_keeps_path_identity() -> None:
+def test_github_rename_evidence_outside_renamed_from_keeps_path_identity() -> None:
     item = _item(
         item_id="file-new",
         extra={
             "relative_path": "new/design.md",
             "previous_filename": "old/design.md",
+            "rename_evidence_authoritative": True,
             "repo_owner": "acme",
             "repo_name": "pay",
             "repo_ref": "main",
