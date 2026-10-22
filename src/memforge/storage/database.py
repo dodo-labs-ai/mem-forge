@@ -17282,11 +17282,12 @@ class Database:
         same transaction; a retry with the same transition is accepted. The
         Source may hold no other open transition, unless
         `expected_open_transition_id` names it: that transition is then
-        superseded and its member rows are deleted, and the new transition
-        must name it as its predecessor. When the open transition is not the
-        one the caller expected, the update raises
-        `ProjectionScopeTransitionStale` and nothing is written, so the
-        caller can read the Source again.
+        superseded and its member rows are deleted. A new transition must
+        name it as its predecessor; without one, the Source returns to the
+        superseded transition's previous scope and no transition is open.
+        When the open transition is not the one the caller expected, the
+        update raises `ProjectionScopeTransitionStale` and nothing is
+        written, so the caller can read the Source again.
         """
         from memforge.source_access import memory_visibility_for_source
 
@@ -17305,9 +17306,10 @@ class Database:
             and projection_scope_transition.status is not ProjectionScopeTransitionStatus.PENDING
         ):
             raise ValueError("new projection scope transition must be pending")
-        if expected_open_transition_id is not None and (
-            projection_scope_transition is None
-            or projection_scope_transition.predecessor_transition_id != expected_open_transition_id
+        if (
+            expected_open_transition_id is not None
+            and projection_scope_transition is not None
+            and projection_scope_transition.predecessor_transition_id != expected_open_transition_id
         ):
             raise ValueError("a superseding projection scope transition must name the superseded one")
         async with self._write_lock:
@@ -17408,7 +17410,7 @@ class Database:
                         status,
                     ),
                 )
-                if projection_scope_transition is not None:
+                if projection_scope_transition is not None or expected_open_transition_id is not None:
                     async with self.db.execute(
                         """SELECT id FROM projection_scope_transitions
                            WHERE source_id = ?
@@ -17418,7 +17420,8 @@ class Database:
                     ) as cursor:
                         open_transition = await cursor.fetchone()
                     open_transition_id = open_transition["id"] if open_transition is not None else None
-                    if open_transition_id != projection_scope_transition.id:
+                    retried = projection_scope_transition is not None and open_transition_id == projection_scope_transition.id
+                    if not retried:
                         if expected_open_transition_id is None:
                             if open_transition_id is not None:
                                 raise ValueError("projection_scope_transition_active")
@@ -17426,7 +17429,8 @@ class Database:
                             raise ProjectionScopeTransitionStale()
                         else:
                             await self._supersede_projection_scope_transition_unlocked(open_transition_id)
-                    await self._insert_projection_scope_transition_unlocked(projection_scope_transition)
+                    if projection_scope_transition is not None:
+                        await self._insert_projection_scope_transition_unlocked(projection_scope_transition)
                 stale_metadata_rows = await self.db.execute_fetchall(
                     """SELECT 1
                      FROM memory_search_metadata_fts

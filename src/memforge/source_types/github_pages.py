@@ -112,7 +112,11 @@ DESCRIPTOR = SourceTypeDescriptor(
     source_type="github_pages",
     gene="memforge.genes.github_pages_gene:GitHubPagesGene",
     unit_noun="page",
-    scope_fields=("sync_mode", "page_url", "root_url", "pages", "max_depth", "exclude_url_patterns"),
+    # ``branch`` selects the repository tree a subtree lists, and has no
+    # default: without it the run reads the repository's default branch.
+    # ``sitemap_authoritative``, ``auth_mode`` and ``max_pages`` only choose
+    # how the same pages are listed, so they are not scope fields.
+    scope_fields=("sync_mode", "page_url", "root_url", "pages", "max_depth", "exclude_url_patterns", "branch"),
     project_native=adapter.project_native,
     evidence_profiles={"page_content": MARKDOWN_STRUCTURAL_PROFILE},
     config=SourceConfigPolicy(validate_input=_validate_config),

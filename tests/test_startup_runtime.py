@@ -2549,9 +2549,22 @@ async def test_a_document_scope_change_opens_a_transition_and_keeps_the_sync_cur
                 },
             },
         )
+        first_transition = await db.get_open_projection_scope_transition(source_id)
+        # A second change while the first is open supersedes it.
+        superseding = client.put(
+            f"/api/v1/sources/{source_id}",
+            json={
+                "name": "Delivery Board",
+                "config": {
+                    **old_config,
+                    "jql_filter": "updated >= -30d",
+                },
+            },
+        )
         sources_response = client.get("/api/v1/sources")
 
     assert response.status_code == 200
+    assert superseding.status_code == 200, superseding.text
     # The transition runs discover the whole new scope; the run that
     # completes the transition moves the cursor.
     state = await db.get_sync_state(source_id)
@@ -2561,10 +2574,14 @@ async def test_a_document_scope_change_opens_a_transition_and_keeps_the_sync_cur
     assert updated["last_sync"] == last_sync_at.isoformat()
     source_payload = next(s for s in sources_response.json()["data"] if s["id"] == source_id)
     assert source_payload["sync"] is not None
+    assert first_transition is not None
+    assert first_transition.previous_scope["jql_filter"] == "updated >= -180d"
+    assert first_transition.target_scope["jql_filter"] == "updated >= -90d"
     transition = await db.get_open_projection_scope_transition(source_id)
     assert transition is not None
     assert transition.previous_scope["jql_filter"] == "updated >= -180d"
-    assert transition.target_scope["jql_filter"] == "updated >= -90d"
+    assert transition.target_scope["jql_filter"] == "updated >= -30d"
+    assert transition.predecessor_transition_id == first_transition.id
 
 
 @pytest.mark.asyncio

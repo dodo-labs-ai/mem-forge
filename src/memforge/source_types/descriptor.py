@@ -92,8 +92,12 @@ class SourceTypeDescriptor:
 
     ``gene`` is the Gene class, or a ``"module:Class"`` reference imported on
     first use. ``scope_fields`` are the configuration fields that change which
-    Units the Source projects; ``canonical_scope`` drops those a configured
-    mode leaves unused. ``project_native`` turns one fetched item into Units and
+    Units the Source projects. ``scope_defaults`` gives the value an absent
+    scope field means, so a scope stored before the field existed reads the
+    same as one that sets the default: declare a default only for a field
+    whose absence and default already canonicalize alike, or every stored
+    scope without it changes. ``canonical_scope`` drops the fields a
+    configured mode leaves unused. ``project_native`` turns one fetched item into Units and
     Observations; a type without one is projected generically, with partial
     coverage. ``exports_pdf`` says the Gene renders a PDF of each Unit, which
     a Unit's stored input must then hold. ``config`` checks and prepares the
@@ -106,6 +110,7 @@ class SourceTypeDescriptor:
     unit_noun: str = "item"
     namespace_fields: tuple[str, ...] = ()
     scope_fields: tuple[str, ...] = ()
+    scope_defaults: Mapping[str, object] = field(default_factory=dict)
     canonical_scope: Callable[[dict[str, object]], dict[str, object]] | None = None
     project_native: Callable[..., Any] | None = None
     evidence_profiles: Mapping[str, EvidenceRepresentationProfile] = field(default_factory=dict)
@@ -117,6 +122,9 @@ class SourceTypeDescriptor:
     conversation_provider: ConversationProviderReference | None = None
 
     def __post_init__(self) -> None:
+        if set(self.scope_defaults) - set(self.scope_fields):
+            raise ValueError(f"{self.source_type} declares a default for a field that is not a scope field")
+        object.__setattr__(self, "scope_defaults", _frozen(self.scope_defaults))
         object.__setattr__(self, "evidence_profiles", _frozen(self.evidence_profiles))
         object.__setattr__(self, "legacy_evidence_profiles", _frozen(self.legacy_evidence_profiles))
         object.__setattr__(self, "record_schemas", _frozen(self.record_schemas))

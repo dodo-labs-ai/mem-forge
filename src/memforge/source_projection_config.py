@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 import hashlib
 import json
 from typing import Any
 
+from memforge.source_projection import ProjectionScopeTransition
 from memforge.source_types import source_type_descriptor
 
 
@@ -40,13 +42,35 @@ def canonical_provider_namespace(source_type: str, config: Mapping[str, Any]) ->
 
 
 def canonical_projection_scope(source_type: str, config: Mapping[str, Any]) -> dict[str, object]:
-    """Return only fields that can change projected unit/observation membership."""
+    """Return only fields that can change projected unit/observation membership.
+
+    An absent or empty scope field reads its descriptor default, so a scope
+    stored before the field was added equals one that sets the default. The
+    same function canonicalizes a configuration and a stored scope.
+    """
 
     descriptor = source_type_descriptor(source_type)
     if descriptor is None:
         return {}
-    scope = _canonical_fields(config, descriptor.scope_fields)
+    scope = {**descriptor.scope_defaults, **_canonical_fields(config, descriptor.scope_fields)}
     return descriptor.canonical_scope(scope) if descriptor.canonical_scope else scope
+
+
+def canonical_scope_transition(source_type: str, transition: ProjectionScopeTransition) -> ProjectionScopeTransition:
+    """The stored transition with its previous and target scopes canonicalized again.
+
+    Every reader that compares a stored scope with a configured one, or hands
+    it on, reads it through this: a transition opened before a scope field
+    was added then matches the configuration it targets. For example, a Jira
+    target stored as ``{"projects": ["PAY"]}`` reads
+    ``{"projects": ["PAY"], "query_mode": "simple"}``.
+    """
+
+    return replace(
+        transition,
+        previous_scope=canonical_projection_scope(source_type, transition.previous_scope),
+        target_scope=canonical_projection_scope(source_type, transition.target_scope),
+    )
 
 
 def excluded_scope_config(
@@ -113,16 +137,25 @@ def projection_scope_transition_id(
     previous_scope: Mapping[str, object],
     target_scope: Mapping[str, object],
     *,
-    predecessor_transition_id: str | None = None,
+    previous_cycle_transition_id: str | None = None,
 ) -> str:
-    """Return a retry-stable identity for one scope-transition cycle."""
+    """Return a retry-stable identity for one scope-transition cycle.
+
+    ``previous_cycle_transition_id`` is the Source's latest transition of any
+    status, or ``None`` for its first. Each cycle therefore has its own
+    identity, also when it repeats the scopes of an earlier one (ADR 0005),
+    while two identical concurrent changes compute the same one. It is not
+    the superseded transition a transition records as its predecessor, though
+    a superseding change reads the same id for both. Its hash key keeps the
+    spelling every stored identity was computed with.
+    """
 
     payload = json.dumps(
         {
             "source_id": source_id,
             "previous_scope": dict(previous_scope),
             "target_scope": dict(target_scope),
-            "predecessor_transition_id": predecessor_transition_id,
+            "predecessor_transition_id": previous_cycle_transition_id,
         },
         sort_keys=True,
         separators=(",", ":"),

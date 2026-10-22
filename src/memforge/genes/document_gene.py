@@ -105,7 +105,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
 from memforge.genes.base import Gene
-from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, ScopeListingKind
+from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, ScopeListingKind, UnlistedScopeMode
 
 __all__ = ["AbsenceAnswer", "DocumentGene"]
 
@@ -158,6 +158,21 @@ class DocumentGene(Gene):
 
         Checked by ``test_lists_scope_matches_each_fake_configuration``.
         """
+
+    @classmethod
+    def unlisted_scope_mode(cls, config: Mapping[str, Any]) -> UnlistedScopeMode:
+        """Name the mode of a configuration :meth:`lists_scope` refuses, and suggest one that lists.
+
+        A scope change into such a configuration is refused with this mode
+        and suggestion, so the user can pick a listing mode or create a new
+        Source instead. A connector with a configuration that cannot list
+        overrides it; the default names only the connector.
+        """
+
+        return UnlistedScopeMode(
+            mode=cls.metadata().display_name,
+            suggestion="Choose a configuration that lists the whole scope.",
+        )
 
     @abstractmethod
     async def list_scope(self) -> ScopeListing:

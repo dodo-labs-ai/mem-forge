@@ -751,3 +751,142 @@ async def test_a_real_lifecycle_commit_records_its_member_only_when_its_deferred
         ("jira-1", TRANSITION_ID, ("jira-0",)),
     ]
     assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
+
+
+SUPERSEDED_CONFIG = {"query_mode": "advanced", "jql": "project = OPS"}
+SUPERSEDED_ID = "scope-transition-to-ops"
+
+
+async def _open_change(workspace, transition_id: str, target_config, *, superseding: str | None = None) -> None:
+    """The user saves a scope change from the last applied scope, superseding the open transition when one is named."""
+    await workspace.db.upsert_source(
+        id=SOURCE_ID,
+        type="jira",
+        name="Jira",
+        config_json=json.dumps(target_config),
+        access_policy="workspace",
+        owner_user_id="dev",
+        projection_scope_transition=ProjectionScopeTransition(
+            id=transition_id,
+            source_id=SOURCE_ID,
+            previous_scope=canonical_projection_scope("jira", JIRA_CONFIG),
+            target_scope=canonical_projection_scope("jira", target_config),
+            predecessor_transition_id=superseding,
+            created_at=OPENED_AT.isoformat(),
+        ),
+        expected_open_transition_id=superseding,
+    )
+
+
+async def _a_superseded_change_that_added_jira_2(workspace, listing_kind: ScopeListingKind) -> JiraProject:
+    """The change to OPS commits jira-2, which only OPS selects, and stays open because jira-1 fails."""
+    project = JiraProject(existing={0, 1}, listing_kind=listing_kind)
+    await _synced(workspace, project)
+    await _open_change(workspace, SUPERSEDED_ID, SUPERSEDED_CONFIG)
+    project.move_on(existing={0, 1, 2}, in_query={0, 1, 2})
+    project.broken[1] = ("fetch", ValueError("fetch failed"))
+    await workspace.sync(project)
+    assert await workspace.held() == {"jira-0", "jira-1", "jira-2"}
+    assert await workspace.db.list_projection_scope_transition_member_doc_ids(SUPERSEDED_ID) == ("jira-0", "jira-2")
+
+    await _open_change(workspace, TRANSITION_ID, TARGET_CONFIG, superseding=SUPERSEDED_ID)
+    project.broken.clear()
+    return project
+
+
+@pytest.mark.asyncio
+async def test_a_superseding_existence_change_removes_at_completion_what_only_the_superseded_target_added(workspace):
+    project = await _a_superseded_change_that_added_jira_2(workspace, ScopeListingKind.EXISTENCE)
+    superseded = await workspace.db.get_projection_scope_transition(SUPERSEDED_ID)
+    transition = await _transition(workspace)
+
+    assert superseded.status is ProjectionScopeTransitionStatus.SUPERSEDED
+    assert await workspace.db.list_projection_scope_transition_member_doc_ids(SUPERSEDED_ID) == ()
+    assert transition.predecessor_transition_id == SUPERSEDED_ID
+    assert transition.previous_scope == canonical_projection_scope("jira", JIRA_CONFIG)
+
+    # The new scope holds jira-0, jira-1 and jira-3; the superseding transition counts its own members.
+    project.move_on(existing={0, 1, 3})
+    state = await workspace.sync(project)
+
+    assert state.last_sync_status == "success"
+    assert workspace.tombstoned() == ["jira-2"]
+    assert await _removal_reason(workspace, "jira-2") == UnitRemovalReason.REMOVED_FROM_SCOPE.value
+    assert await workspace.held() == {"jira-0", "jira-1", "jira-3"}
+    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
+
+
+@pytest.mark.asyncio
+async def test_a_superseding_query_change_removes_at_completion_what_only_the_superseded_target_added(workspace):
+    project = await _a_superseded_change_that_added_jira_2(workspace, ScopeListingKind.QUERY)
+    excluded = ExcludedScopes({OLD_JQL: {0, 1}, SUPERSEDED_CONFIG["jql"]: {0, 1, 2}})
+
+    # The new JQL selects jira-0, jira-1 and jira-3; jira-2 still exists in Jira.
+    project.move_on(existing={0, 1, 2, 3}, in_query={0, 1, 3})
+    state = await workspace.sync(project, excluded_scope_gene=excluded)
+
+    assert state.last_sync_status == "success"
+    assert [scope["jql"] for scope in excluded.listed] == [OLD_JQL, SUPERSEDED_CONFIG["jql"]]
+    assert workspace.tombstoned() == ["jira-2"]
+    assert await _removal_reason(workspace, "jira-2") == UnitRemovalReason.REMOVED_FROM_SCOPE.value
+    assert await workspace.held() == {"jira-0", "jira-1", "jira-3"}
+    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
+
+
+@pytest.mark.asyncio
+async def test_a_return_to_the_last_applied_scope_removes_at_completion_what_the_superseded_target_added(workspace):
+    project = await _a_superseded_change_that_added_jira_2_then_reverts(workspace)
+
+    project.move_on(existing={0, 1})
+    state = await workspace.sync(project)
+
+    assert state.last_sync_status == "success"
+    assert workspace.tombstoned() == ["jira-2"]
+    assert await workspace.held() == {"jira-0", "jira-1"}
+    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
+
+
+async def _a_superseded_change_that_added_jira_2_then_reverts(workspace) -> JiraProject:
+    project = JiraProject(existing={0, 1}, listing_kind=ScopeListingKind.EXISTENCE)
+    await _synced(workspace, project)
+    await _open_change(workspace, SUPERSEDED_ID, SUPERSEDED_CONFIG)
+    project.move_on(existing={0, 1, 2})
+    project.broken[1] = ("fetch", ValueError("fetch failed"))
+    await workspace.sync(project)
+    project.broken.clear()
+    # Back to the last applied scope: A→A, after the change to OPS.
+    await _open_change(workspace, TRANSITION_ID, JIRA_CONFIG, superseding=SUPERSEDED_ID)
+    transition = await _transition(workspace)
+    assert transition.previous_scope == transition.target_scope
+    assert transition.predecessor_transition_id == SUPERSEDED_ID
+    return project
+
+
+@pytest.mark.asyncio
+async def test_a_transition_stored_before_a_scope_field_was_added_matches_its_configured_target(workspace):
+    """A Jira target stored without ``query_mode`` reads the field's default, as the configuration does."""
+    simple_config = {"projects": ["PAY"]}
+    await workspace.db.upsert_source(
+        id=SOURCE_ID,
+        type="jira",
+        name="Jira",
+        config_json=json.dumps(simple_config),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await workspace.db.create_projection_scope_transition(
+        ProjectionScopeTransition(
+            id=TRANSITION_ID,
+            source_id=SOURCE_ID,
+            previous_scope={"projects": ["OPS"]},
+            target_scope={"projects": ["PAY"]},
+            created_at=OPENED_AT.isoformat(),
+        )
+    )
+    project = JiraProject(existing={0, 1}, listing_kind=ScopeListingKind.EXISTENCE)
+
+    state = await workspace.sync(project)
+
+    assert canonical_projection_scope("jira", simple_config) == {"projects": ["PAY"], "query_mode": "simple"}
+    assert state.last_sync_status == "success"
+    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED

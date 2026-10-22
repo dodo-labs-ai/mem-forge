@@ -63,8 +63,10 @@ from memforge.conversations.report import plan_report
 from memforge.source_artifact_inputs import retain_artifact_input
 from memforge.genes import (
     GENE_REGISTRY,
+    DocumentGene,
     create_gene,
     list_available_genes,
+    source_lists_scope,
     source_rediscovers_documents,
     source_type_supports_sync,
 )
@@ -225,8 +227,13 @@ from memforge.source_secrets import (
 )
 from memforge.source_projection import (
     ProjectionScopeTransition,
+    ProjectionScopeTransitionStale,
 )
-from memforge.source_projection_config import projection_scope_transition_id, source_access_context
+from memforge.source_projection_config import (
+    canonical_scope_transition,
+    projection_scope_transition_id,
+    source_access_context,
+)
 from memforge.source_types import (
     LocalAgentCollection,
     SourceConfigPolicy,
@@ -2633,6 +2640,94 @@ def _is_document_source_type(source_type: str) -> bool:
 
     descriptor = source_type_descriptor(source_type)
     return descriptor is not None and descriptor.family is CollectionFamilyKind.DOCUMENT
+
+
+@dataclass(frozen=True)
+class _ScopeChange:
+    """What a scope change writes with the Source: the transition it opens and the one it supersedes.
+
+    A change while no transition is open supersedes nothing. A return to the
+    last applied scope of a configuration that cannot list supersedes the
+    open transition and opens none.
+    """
+
+    transition: ProjectionScopeTransition | None
+    superseded_transition_id: str | None = None
+
+
+async def _plan_scope_change(
+    db: Database,
+    source: Mapping[str, Any],
+    config: Mapping[str, Any],
+    current_scope: dict[str, object],
+    target_scope: dict[str, object],
+) -> _ScopeChange:
+    """Plan the transition of one scope change from the Source's last applied scope to ``target_scope``.
+
+    The last applied scope is the open transition's previous scope, or the
+    current scope when no transition is open. The new transition runs from
+    it to the target, and supersedes the open transition of a document
+    Source, which becomes its predecessor. For example, A→B open and a change
+    to C opens A→C after A→B; a change back to A opens A→A, which removes
+    what B added when it completes. A conversation Source cannot supersede
+    its open transition (409 ``projection_scope_transition_active``).
+
+    A document change into a configuration that cannot list is refused (409
+    ``scope_change_requires_listing``), because its transition could never
+    complete. Returning to exactly the last applied scope is the exception:
+    the open transition is superseded and none opens, since that scope has no
+    listing to remove anything by.
+    """
+
+    source_id = str(source["id"])
+    source_type = str(source["type"])
+    open_transition = await db.get_open_projection_scope_transition(source_id)
+    if open_transition is not None:
+        open_transition = canonical_scope_transition(source_type, open_transition)
+    document = _is_document_source_type(source_type)
+    if open_transition is not None and not document:
+        raise HTTPException(status_code=409, detail="projection_scope_transition_active")
+    last_applied_scope = dict(open_transition.previous_scope) if open_transition is not None else current_scope
+    superseded_transition_id = open_transition.id if open_transition is not None else None
+    if document and not source_lists_scope(source_type, config):
+        if open_transition is not None and target_scope == last_applied_scope:
+            return _ScopeChange(transition=None, superseded_transition_id=superseded_transition_id)
+        raise _scope_change_requires_listing_http_error(source_type, config)
+    latest_transitions = await db.list_projection_scope_transitions(source_id, limit=1)
+    return _ScopeChange(
+        transition=ProjectionScopeTransition(
+            id=projection_scope_transition_id(
+                source_id,
+                last_applied_scope,
+                target_scope,
+                previous_cycle_transition_id=latest_transitions[0].id if latest_transitions else None,
+            ),
+            source_id=source_id,
+            previous_scope=last_applied_scope,
+            target_scope=target_scope,
+            predecessor_transition_id=superseded_transition_id,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        ),
+        superseded_transition_id=superseded_transition_id,
+    )
+
+
+def _scope_change_requires_listing_http_error(source_type: str, config: Mapping[str, Any]) -> HTTPException:
+    """The answer to a document scope change into a configuration that cannot list its whole scope."""
+
+    unlisted = cast(type[DocumentGene], GENE_REGISTRY[source_type]).unlisted_scope_mode(config)
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "scope_change_requires_listing",
+            "mode": unlisted.mode,
+            "message": (
+                f"A scope change needs a configuration that lists its whole scope, and the mode "
+                f"'{unlisted.mode}' cannot, so the change could never complete. "
+                f"{unlisted.suggestion} Or create a new Source for this scope."
+            ),
+        },
+    )
 
 
 def _conversation_gene(source: Mapping[str, Any]) -> ConversationGene | None:
@@ -7894,9 +7989,9 @@ def create_admin_app(
                 )
         else:
             src_config = existing["config"]
-        previous_projection_scope = _sync_scope_config(existing["type"], existing["config"])
+        current_projection_scope = _sync_scope_config(existing["type"], existing["config"])
         target_projection_scope = _sync_scope_config(existing["type"], src_config)
-        scope_changed = req.config is not None and (target_projection_scope != previous_projection_scope)
+        scope_changed = req.config is not None and (target_projection_scope != current_projection_scope)
         namespace_changed = req.config is not None and (
             _provider_namespace_config(existing["type"], src_config)
             != _provider_namespace_config(existing["type"], existing["config"])
@@ -7906,24 +8001,11 @@ def create_admin_app(
                 status_code=409,
                 detail="source_provider_namespace_immutable",
             )
-        if scope_changed:
-            open_scope_transition = await db.get_open_projection_scope_transition(source_id)
-            if (
-                open_scope_transition is not None
-                and dict(open_scope_transition.target_scope) != target_projection_scope
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="projection_scope_transition_active",
-                )
-        predecessor_scope_transition_id = None
-        if scope_changed:
-            previous_scope_transitions = await db.list_projection_scope_transitions(
-                source_id,
-                limit=1,
-            )
-            if previous_scope_transitions:
-                predecessor_scope_transition_id = previous_scope_transitions[0].id
+        scope_change = (
+            await _plan_scope_change(db, existing, src_config, current_projection_scope, target_projection_scope)
+            if scope_changed
+            else _ScopeChange(transition=None)
+        )
         auth_secret_changed = req.config is not None and _source_credentials_changed(
             existing["type"],
             req.config,
@@ -7938,22 +8020,6 @@ def create_admin_app(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        scope_transition = (
-            ProjectionScopeTransition(
-                id=projection_scope_transition_id(
-                    source_id,
-                    previous_projection_scope,
-                    target_projection_scope,
-                    predecessor_transition_id=predecessor_scope_transition_id,
-                ),
-                source_id=source_id,
-                previous_scope=previous_projection_scope,
-                target_scope=target_projection_scope,
-                created_at=datetime.now(timezone.utc).isoformat(),
-            )
-            if scope_changed
-            else None
-        )
         try:
             await db.upsert_source(
                 id=source_id,
@@ -7969,10 +8035,15 @@ def create_admin_app(
                     if _request_includes_field(req, "project_binding")
                     else existing.get("project_binding")
                 ),
-                projection_scope_transition=scope_transition,
+                projection_scope_transition=scope_change.transition,
+                expected_open_transition_id=scope_change.superseded_transition_id,
             )
         except SourceSyncRunActive as exc:
             raise _source_sync_running_http_error(source_id, exc.run_id) from exc
+        except ProjectionScopeTransitionStale as exc:
+            # The open transition changed after this change read it: read
+            # the Source again and decide with fresh facts.
+            raise HTTPException(status_code=409, detail="projection_scope_transition_stale") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if _request_includes_field(req, "status") and req.status == SOURCE_PAUSED_STATUS:
@@ -7985,11 +8056,21 @@ def create_admin_app(
                 enabled=schedule.enabled,
                 interval_minutes=schedule.interval_minutes,
             )
-        if auth_secret_changed or (scope_changed and not _is_document_source_type(existing["type"])):
-            # A new credential may read what the old one could not, so the
-            # next run reads everything. A document Source keeps its cursor
-            # through a scope change: its transition runs discover the whole
-            # new scope, and the run that completes it moves the cursor.
+        reverted_to_last_applied_scope = scope_change.superseded_transition_id is not None and (
+            scope_change.transition is None
+        )
+        if (
+            auth_secret_changed
+            or reverted_to_last_applied_scope
+            or (scope_changed and not _is_document_source_type(existing["type"]))
+        ):
+            # The next run reads everything. A new credential may read what
+            # the old one could not. A return to the last applied scope opens
+            # no transition, while the superseded transition's runs may have
+            # moved the cursor and settled failed Documents of that scope. A
+            # document Source otherwise keeps its cursor through a scope
+            # change: its transition runs discover the whole new scope, and
+            # the run that completes it moves the cursor.
             await db.reset_source_sync_cursor(source_id)
         return {"ok": True, "id": source_id}
 
@@ -8081,6 +8162,7 @@ def create_admin_app(
         )
         transition = await db.get_open_projection_scope_transition(source["id"])
         if transition is not None:
+            transition = canonical_scope_transition(source["type"], transition)
             payload["projection_scope_transition"] = {
                 "id": transition.id,
                 "previous_scope": dict(transition.previous_scope),
@@ -8802,6 +8884,7 @@ def create_admin_app(
         )
         transition = await db.get_open_projection_scope_transition(source_id)
         if transition is not None:
+            transition = canonical_scope_transition(upload.gene.metadata().name, transition)
             upload.gene.begin_scope_transition(
                 previous_scope=transition.previous_scope, target_scope=transition.target_scope
             )

@@ -136,7 +136,11 @@ from memforge.source_item_failures import (
     SourceItemFailure,
     with_inherited_rename,
 )
-from memforge.source_projection_config import canonical_projection_scope, source_access_context
+from memforge.source_projection_config import (
+    canonical_projection_scope,
+    canonical_scope_transition,
+    source_access_context,
+)
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time, reported_source_time
 
 if TYPE_CHECKING:
@@ -1005,7 +1009,11 @@ class GeneSyncOrchestrator:
             (configured_source or {}).get("config") or {},
         )
         configured_access_context = source_access_context(configured_source or {})
+        # A stored transition's scopes are read canonicalized again, so one
+        # opened before a scope field was added matches the configured scope.
         scope_transition = await self.db.get_open_projection_scope_transition(source_id)
+        if scope_transition is not None:
+            scope_transition = canonical_scope_transition(configured_source_type, scope_transition)
         if force_full_sync or reprocessing or scope_transition is not None:
             # Reuse is an ordinary incremental optimization only. Full syncs
             # and scope transitions require the full per-document path.
@@ -1110,9 +1118,12 @@ class GeneSyncOrchestrator:
                 if scope_transition is not None:
                     if dict(scope_transition.target_scope) != configured_projection_scope:
                         raise RuntimeError("open Projection Scope transition does not match configured target scope")
-                    scope_transition = await self.db.start_projection_scope_transition(
-                        scope_transition.id,
-                        run_id=transition_run_id,
+                    scope_transition = canonical_scope_transition(
+                        configured_source_type,
+                        await self.db.start_projection_scope_transition(
+                            scope_transition.id,
+                            run_id=transition_run_id,
+                        ),
                     )
                     transition_started = True
                     family.begin_scope_transition(scope_transition)

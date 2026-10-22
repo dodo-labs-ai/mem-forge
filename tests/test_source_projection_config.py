@@ -113,26 +113,44 @@ def test_scope_transition_id_distinguishes_a_repeated_transition_cycle() -> None
         "src-1",
         {"include_paths": ["docs"]},
         {"include_paths": ["other"]},
-        predecessor_transition_id=None,
+        previous_cycle_transition_id=None,
     )
     b_to_a = projection_scope_transition_id(
         "src-1",
         {"include_paths": ["other"]},
         {"include_paths": ["docs"]},
-        predecessor_transition_id=first_a_to_b,
+        previous_cycle_transition_id=first_a_to_b,
     )
     second_a_to_b = projection_scope_transition_id(
         "src-1",
         {"include_paths": ["docs"]},
         {"include_paths": ["other"]},
-        predecessor_transition_id=b_to_a,
+        previous_cycle_transition_id=b_to_a,
     )
     retry = projection_scope_transition_id(
         "src-1",
         {"include_paths": ["docs"]},
         {"include_paths": ["other"]},
-        predecessor_transition_id=b_to_a,
+        previous_cycle_transition_id=b_to_a,
     )
 
     assert second_a_to_b != first_a_to_b
     assert retry == second_a_to_b
+
+
+def test_scope_transition_ids_are_fixed() -> None:
+    # Every stored transition id was computed this way; the same inputs keep
+    # naming the same cycle.
+    previous = {"include_paths": ["docs"]}
+    target = {"include_paths": ["other"]}
+
+    assert projection_scope_transition_id("src-1", previous, target) == "scope-transition-4db4114b521b37dab028"
+    assert (
+        projection_scope_transition_id(
+            "src-1",
+            previous,
+            target,
+            previous_cycle_transition_id="scope-transition-0123456789abcdef0123",
+        )
+        == "scope-transition-26888432bc3895537414"
+    )
