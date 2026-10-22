@@ -39,6 +39,7 @@ from memforge.local_agent.snapshot_manifest import (
     snapshot_confirmation_updates,
     validate_snapshot_confirmation_submission,
     validate_snapshot_manifest_extras,
+    validate_snapshot_manifest_values,
 )
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_SYNC_OPERATIONS,
@@ -20758,20 +20759,20 @@ class Database:
     ) -> None:
         """Persist one fenced manifest and attach its reusable immutable inputs.
 
-        ``confirm`` is the set of unlisted items the server asks the device to
+        The manifest declares ``complete_snapshot`` coverage and every item an
+        ``upsert``; any other value is refused. ``confirm`` is the set of unlisted items the server asks the device to
         confirm, issued unanswered in the manifest's transaction.
         ``excluded_listings`` is what the device listed in each excluded scope
         of an open transition. Both belong to the manifest: a replay must
         carry the same ones, as it must carry the same items.
         """
+        validate_snapshot_manifest_values(coverage, manifest_items)
         validate_snapshot_manifest_extras(manifest_items, confirm, excluded_listings)
         normalized_snapshot_id = _non_empty_string(snapshot_id)
         if normalized_snapshot_id is None:
             raise ValueError("snapshot_id is required")
         if len({doc_id for doc_id, _input_id in memberships}) != len(memberships):
             raise ValueError("snapshot memberships contain duplicate doc_id")
-        if coverage not in {"complete_snapshot", "bounded_delta"}:
-            raise ValueError("snapshot manifest coverage is invalid")
         if manifest_count < 0 or len(memberships) > manifest_count:
             raise ValueError("snapshot manifest count is invalid")
         if manifest_count != len(manifest_items):

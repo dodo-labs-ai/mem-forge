@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any
 
+from memforge.local_agent.snapshot_manifest import UPSERT
 from memforge.source_types import registered_source_types, source_type_descriptor
 
 
@@ -437,14 +438,18 @@ def _manifest_entry(source_input: Any) -> tuple[str, Mapping[str, Any]] | None:
 
 
 def snapshot_document_ids(inputs: list[Any]) -> frozenset[str]:
-    """The Documents a complete input snapshot holds: every item it names except a tombstone."""
+    """The Documents a complete input snapshot holds: every item it names.
+
+    An item stored as a tombstone, which only a manifest written before every
+    item was an upsert can hold, names a Document the snapshot does not hold.
+    """
 
     return frozenset(
         doc_id
         for source_input in inputs
         if (named := _manifest_entry(source_input)) is not None
         for doc_id, entry in (named,)
-        if entry.get("change_kind") != "tombstone"
+        if str(entry.get("change_kind") or UPSERT) == UPSERT
     )
 
 

@@ -271,6 +271,13 @@ from memforge.local_agent.readiness import (
     SourceConnectionState,
     connection_status_from_browser_session,
 )
+from memforge.local_agent.snapshot_manifest import (
+    COMPLETE_SNAPSHOT,
+    UPSERT,
+    SnapshotManifestItem,
+    plan_snapshot_manifest,
+    snapshot_manifest_sha256,
+)
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_SYNC_OPERATIONS,
     execution_owner_user_id,
@@ -2536,21 +2543,28 @@ async def _resolve_local_source_artifact_inputs(
 
 
 class LocalSourceManifestItemRequest(BaseModel):
+    """One item of a device manifest: the item as the device read it."""
+
     doc_id: str = Field(min_length=1, max_length=512)
     revision: str = Field(min_length=1, max_length=512)
-    change_kind: Literal["upsert", "tombstone"]
+    change_kind: Literal["upsert"]
+
+
+LOCAL_SOURCE_MANIFEST_MAX_ITEMS = 10_000
 
 
 class LocalSourceManifestRequest(BaseModel):
-    """One covered local collection, planned against the retained packages.
+    """One complete local collection, planned against the retained packages.
 
+    A device manifest lists the complete item set of its scope, so it declares
+    ``complete_snapshot`` coverage and every item an ``upsert``.
     ``package_contract_version`` is the package contract the local agent
     collects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates
     the numbered contract sends none.
     """
 
-    items: list[LocalSourceManifestItemRequest] = Field(max_length=10_000)
-    coverage: Literal["complete_snapshot", "bounded_delta", "partial"]
+    items: list[LocalSourceManifestItemRequest] = Field(max_length=LOCAL_SOURCE_MANIFEST_MAX_ITEMS)
+    coverage: Literal["complete_snapshot"]
     sync_snapshot_id: str
     local_agent_job_id: str
     local_agent_attempt_count: int = Field(ge=1)
@@ -2631,7 +2645,7 @@ async def _require_ready_snapshot_manifest(
         raise HTTPException(status_code=409, detail="source_snapshot_manifest_stale")
     if not manifest_status["ready"]:
         raise HTTPException(status_code=409, detail="source_snapshot_materialization_incomplete")
-    if manifest_status["coverage"] != "complete_snapshot":
+    if manifest_status["coverage"] != COMPLETE_SNAPSHOT:
         raise HTTPException(status_code=409, detail="authoritative_snapshot_coverage_required")
 
 
@@ -9026,13 +9040,7 @@ def create_admin_app(
         db: Database = Depends(get_db),
         workspace_id: str = Depends(get_workspace_id),
     ):
-        """Reuse unchanged immutable packages in one covered, fenced collection."""
-        from memforge.local_agent.snapshot_manifest import (
-            CollectionChangeKind,
-            CollectionCoverage,
-            SnapshotManifestItem,
-            plan_snapshot_manifest,
-        )
+        """Reuse unchanged immutable packages in one complete, fenced collection."""
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
@@ -9042,14 +9050,6 @@ def create_admin_app(
             raise HTTPException(status_code=409, detail="local_agent_upgrade_required")
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
-        coverage = CollectionCoverage(req.coverage)
-        if coverage is CollectionCoverage.PARTIAL:
-            raise HTTPException(status_code=400, detail="partial collection cannot be planned")
-        if coverage is not CollectionCoverage.COMPLETE_SNAPSHOT:
-            raise HTTPException(
-                status_code=409,
-                detail="authoritative collection requires complete_snapshot coverage",
-            )
         lease_payload = await _require_current_local_agent_lease(
             request,
             db,
@@ -9064,47 +9064,28 @@ def create_admin_app(
                 req.local_agent_attempt_count,
                 req.sync_snapshot_id,
             )
-            manifest_items = [(item.doc_id, item.revision, item.change_kind) for item in req.items]
+            items = [SnapshotManifestItem(doc_id=item.doc_id, revision=item.revision) for item in req.items]
+            manifest_items = [(item.doc_id, item.revision, UPSERT) for item in items]
             retained_inputs = await db.find_source_sync_input_attestations(
                 source_id=source_id,
                 workspace_id=workspace_id,
                 manifest_items=manifest_items,
             )
             plan = plan_snapshot_manifest(
-                [
-                    SnapshotManifestItem(
-                        doc_id=item.doc_id,
-                        revision=item.revision,
-                        change_kind=CollectionChangeKind(item.change_kind),
-                    )
-                    for item in req.items
-                ],
+                items,
                 retained_inputs,
-                coverage=coverage,
                 require_source_time=local_package_requires_source_time(
                     source.get("type"),
                     req.package_contract_version,
                 ),
             )
-            manifest_sha256 = hashlib.sha256(
-                json.dumps(
-                    {
-                        "coverage": req.coverage,
-                        "items": sorted(
-                            (item.model_dump() for item in req.items),
-                            key=lambda item: item["doc_id"],
-                        ),
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
+            manifest_sha256 = snapshot_manifest_sha256(items)
             await db.attach_source_sync_inputs_to_snapshot(
                 source_id=source_id,
                 workspace_id=workspace_id,
                 snapshot_id=snapshot_id,
                 memberships=list(plan.reused_memberships),
-                coverage=req.coverage,
+                coverage=COMPLETE_SNAPSHOT,
                 manifest_count=len(req.items),
                 manifest_sha256=manifest_sha256,
                 manifest_items=manifest_items,
@@ -9117,7 +9098,7 @@ def create_admin_app(
         return {
             "source_id": source_id,
             "snapshot_id": snapshot_id,
-            "coverage": req.coverage,
+            "coverage": COMPLETE_SNAPSHOT,
             "manifest_count": len(req.items),
             "reused_count": len(plan.reused_memberships),
             "required_doc_ids": list(plan.required_doc_ids),

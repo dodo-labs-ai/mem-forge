@@ -1226,7 +1226,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
             outdated_agent = client.post(
                 f"/api/v1/sources/{source_id}/adapter/manifest",
                 headers=headers,
-                json={**context, "sync_snapshot_id": attempt_id, "coverage": "bounded_delta", "items": []},
+                json={**context, "sync_snapshot_id": attempt_id, "coverage": "complete_snapshot", "items": []},
             )
             incomplete_process = client.post(
                 f"/api/v1/sources/{source_id}/process", headers=headers, json=context

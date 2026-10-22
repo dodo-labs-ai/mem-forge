@@ -693,7 +693,7 @@ def test_server_source_admin_retains_existing_execution_capabilities() -> None:
     assert capabilities["can_force_resync"] is True
 
 
-def test_a_complete_snapshot_holds_every_document_it_names_except_tombstones() -> None:
+def test_a_complete_snapshot_holds_every_stored_document_it_names_except_legacy_tombstones() -> None:
     def source_input(doc_id, generation, *, raw_uri="file:///package", change_kind="upsert"):
         return SimpleNamespace(
             input_generation=generation,
@@ -707,6 +707,7 @@ def test_a_complete_snapshot_holds_every_document_it_names_except_tombstones() -
         source_input("doc-a", 2),
         source_input("doc-b", 1),
         source_input("doc-unstored", 1, raw_uri=""),
+        # A manifest stored before every item was an upsert.
         source_input("doc-gone", 1, change_kind="tombstone"),
         SimpleNamespace(input_generation=1, raw_uri="file:///x", raw_sha256="sha", metadata={}),
     ]

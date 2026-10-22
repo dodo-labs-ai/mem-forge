@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- The device manifest route `POST /sources/{id}/adapter/manifest` accepts
+  only `coverage: complete_snapshot` and items with `change_kind: upsert`;
+  `bounded_delta`, `partial` and `tombstone` answer 422, and both stores
+  refuse them on write. Every released agent already sends these values, and
+  the manifest digest is unchanged. Stored manifests keep the values they
+  were written with: a stored `bounded_delta` manifest or `tombstone` item
+  still reads and reports its status, and is never processed as a complete
+  snapshot. `plan_snapshot_manifest` no longer takes a
+  coverage, and `snapshot_manifest_sha256` computes the digest.
+
 - A scope change saved while a document Source's transition is open
   supersedes it, instead of answering 409 `projection_scope_transition_active`.
   The open transition becomes `superseded` and its member rows are deleted in
