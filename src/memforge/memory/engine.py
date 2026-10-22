@@ -72,7 +72,7 @@ from memforge.pipeline.projection_fragments import (
     SupportRevalidationLimitation,
     SupportRevalidationLimitationCode,
 )
-from memforge.pipeline.revision_assessment import RevisionAssessmentContext, SupportAssessment, client_reads_images
+from memforge.pipeline.revision_assessment import SupportAssessment, client_reads_images
 from memforge.pipeline.revision_work import CHANGE_IMPACT_TASK
 from memforge.pipeline.support_relation_coordinator import (
     MemorySupport,
@@ -1050,20 +1050,20 @@ class MemoryEngine:
             )
         else:
             from memforge.pipeline.reconciler import (
-                ReconciliationContractError,
                 ReconciliationResult,
                 assess_relations,
                 join_support_and_relation,
             )
             from memforge.pipeline.revision_work import RevisionWorkExecutor, SupportRecheck
             from memforge.pipeline.support_reading import SupportWorkItem, evidence_digests
+            from memforge.pipeline.support_work import plan_support_work
 
             model_incumbents = [memory for memory in incumbents if memory.id not in derivation_protected_ids]
             model_incumbent_count = len(model_incumbents)
             if model_incumbents and not self.structured_llm_client:
                 raise RuntimeError("complete lifecycle reconciliation requires an LLM client")
-            work_items: list[SupportWorkItem] = []
-            work_by_memory: dict[str, list[SupportWorkItem]] = {}
+            work_items: tuple[SupportWorkItem, ...] = ()
+            work_by_memory: Mapping[str, tuple[SupportWorkItem, ...]] = {}
             evaluator = RevisionWorkExecutor(client=self.structured_llm_client, model=self.llm_model,
                                              store=self.db, derivation_id=derivation_id)
             assessment_context = None
@@ -1071,84 +1071,20 @@ class MemoryEngine:
                 base = await self.db.get_current_source_unit_projection(scope.source_unit_id)
                 if base is not None and base.source_unit_revisions[0].id not in {scope.base_unit_revision_id, scope.target_unit_revision_id}:
                     raise AuthorityPlanStaleError("revision assessment base changed")
-                evidence_by_memory = await self.db.get_active_memory_support_evidence_many(
-                    tuple(memory.id for memory in model_incumbents), source_id=projection.source_id,
+                support_work = await plan_support_work(
+                    self.db, projection=projection, base=base, incumbents=model_incumbents,
+                    evidence_by_memory=await self.db.get_active_memory_support_evidence_many(
+                        tuple(memory.id for memory in model_incumbents), source_id=projection.source_id,
+                    ),
+                    unit_support=unit_support, access_context_hash=access_context_hash,
+                    image_loader=evidence_image_loader, reads_images=reads_images,
+                    # An operator reprocess reads the whole Unit for every Support.
+                    without_baseline=derivation_support_without_baseline,
                 )
-                # Each part is classified by the revision it names, whichever baseline its Support has.
-                evidence_revisions = tuple((await self.db.get_source_observation_revisions({
-                    item.anchor.observation_revision_id
-                    for items in evidence_by_memory.values() for item in items
-                } - {revision.id for revision in projection.observation_revisions})).values())
-                assessment_context = RevisionAssessmentContext(
-                    projection=projection, base=base, access_context_hash=access_context_hash,
-                    image_loader=evidence_image_loader, evidence_revisions=evidence_revisions,
-                    reads_images=reads_images,
-                )
-
-                def assessment_context_for(baseline):
-                    """Assess against another baseline, sharing this operation's Fragment indexes.
-
-                    The committed revision still describes carried Observations the baseline may predate.
-                    """
-                    return RevisionAssessmentContext(
-                        projection=projection, base=baseline, access_context_hash=access_context_hash,
-                        image_loader=evidence_image_loader, indexes=assessment_context.indexes,
-                        known_observations=base.observations if base is not None else (),
-                        evidence_revisions=tuple(assessment_context.revisions.values()),
-                        reads_images=reads_images,
-                    )
-                contexts_by_revision = {base.source_unit_revisions[0].id: assessment_context} if base else {}
-                for memory in model_incumbents:
-                    groups: dict[str, list] = {}
-                    for item in evidence_by_memory.get(memory.id, ()):
-                        if item.evidence_unit_id in unit_support.get(memory.id, ()):
-                            groups.setdefault(item.evidence_unit_id, []).append(item)
-                    if not groups:
-                        raise ReconciliationContractError("revision_support_missing", "incumbent has no complete scoped support")
-                    work_by_memory[memory.id] = []
-                    for evidence_unit_id, support in groups.items():
-                        if derivation_support_without_baseline:
-                            # An operator reprocess reads the whole Unit for every Support.
-                            baseline_id, unusable = None, None
-                            stats["support_revalidation_reprocess_count"] += 1
-                        else:
-                            baseline_id, unusable = _support_validation_baseline(support)
-                        context = contexts_by_revision.get(baseline_id) if unusable is None else None
-                        if context is None and baseline_id is not None:
-                            historical = await self.db.get_source_unit_revision_projection(
-                                scope.source_unit_id, baseline_id
-                            )
-                            if (
-                                historical is None
-                                or historical.source_id != projection.source_id
-                                or len(historical.source_unit_revisions) != 1
-                                or historical.source_unit_revisions[0].source_unit_id != scope.source_unit_id
-                                or historical.source_unit_revisions[0].id != baseline_id
-                            ):
-                                unusable = "validation snapshot is unavailable or inconsistent"
-                            else:
-                                context = assessment_context_for(historical)
-                                contexts_by_revision[baseline_id] = context
-                        if context is None:
-                            # No usable baseline: the whole current revision is read without
-                            # assuming the old Support is still valid. A named but unusable
-                            # baseline is a data defect worth a diagnostic, not a failure.
-                            if unusable is not None:
-                                logger.warning(
-                                    "support_baseline_unusable memory_id=%s evidence_unit_id=%s "
-                                    "baseline_unit_revision_ids=%s reason=%s",
-                                    memory.id, evidence_unit_id,
-                                    ",".join(sorted({str(item.validation_unit_revision_id) for item in support})),
-                                    unusable,
-                                )
-                                stats["support_revalidation_unusable_baseline_count"] += 1
-                            context = contexts_by_revision.get(None)
-                            if context is None:
-                                context = assessment_context_for(None)
-                                contexts_by_revision[None] = context
-                        work_item = SupportWorkItem(f"w{len(work_items):06d}", memory, tuple(support), context)
-                        work_items.append(work_item)
-                        work_by_memory[memory.id].append(work_item)
+                work_items, work_by_memory = support_work.items, support_work.by_memory
+                assessment_context, assessment_context_for = support_work.context, support_work.context_for
+                stats["support_revalidation_reprocess_count"] += support_work.reprocess_count
+                stats["support_revalidation_unusable_baseline_count"] += support_work.unusable_baseline_count
             stats["support_revalidation_work_item_count"] += len(work_items)
             assessed: dict[str, SupportAssessment] = {}
 
@@ -1835,21 +1771,6 @@ def _empty_revision_support(projection: SourceProjection, observation_ids: froze
             unresolved="partial_coverage",
         ),
     ))
-
-
-def _support_validation_baseline(support) -> tuple[str | None, str | None]:
-    """Return one Evidence Unit's recorded baseline Source Unit revision, or why it is unusable.
-
-    ``(None, None)`` means no baseline was ever recorded for this Support.
-    """
-    plan_ids = {item.validation_plan_id for item in support}
-    baseline_ids = {item.validation_unit_revision_id for item in support}
-    if len(plan_ids) != 1 or len(baseline_ids) != 1:
-        return None, "validation association is inconsistent"
-    baseline_id = next(iter(baseline_ids))
-    if next(iter(plan_ids)) is not None and baseline_id is None:
-        return None, "validation Plan is not applied to this Source Unit"
-    return baseline_id, None
 
 
 def _projection_evidence_image_loader(projection: SourceProjection, document_store):

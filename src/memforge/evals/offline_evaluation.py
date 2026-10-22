@@ -11,7 +11,7 @@ import hashlib
 import json
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import Enum
 from time import perf_counter
 from typing import Protocol
@@ -33,9 +33,18 @@ from memforge.memory.cross_document_relation import (
     RelationSubject,
     StructuredCrossDocumentRelationClassifier,
 )
-from memforge.models import Memory, MemoryExtractionResult, RawMemory, ReconcileOperation
+from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
+from memforge.memory.text_view import TextEvidenceView
+from memforge.models import Memory, MemoryExtractionResult, RawMemory, ReconcileOperation, content_hash
 from memforge.pipeline.reconciler import reconcile_memories
-from memforge.pipeline.support_relation_coordinator import UNRESOLVED_RESULTS, MemorySupport, SupportResult
+from memforge.pipeline.revision_work import RevisionWorkExecutor
+from memforge.pipeline.support_relation_coordinator import (
+    UNRESOLVED_RESULTS,
+    MemorySupport,
+    SupportResult,
+    memory_support,
+)
+from memforge.pipeline.support_work import plan_support_work
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.extraction_requests import plan_extraction_requests
 from memforge.pipeline.projection_context import (
@@ -54,7 +63,16 @@ from memforge.source_derivation import (
     replay_source_unit_derivation,
     source_unit_derivation_context_from_payload,
 )
-from memforge.source_projection import SourceProjection, source_projection_from_payload
+from memforge.source_projection import (
+    AnchorKind,
+    SourceAnchor,
+    SourceObservationRevision,
+    SourceProjection,
+    source_observation_revision_from_payload,
+    source_observation_revision_to_payload,
+    source_projection_from_payload,
+    source_projection_to_payload,
+)
 from memforge.storage.document_store import DocumentStore
 from memforge.source_representation import current_representation_of
 
@@ -97,10 +115,17 @@ REQUIRED_TERMS_CRITERION = "required_terms"
 # "none:equivalent/mem-1" for one candidate of a relation group.
 CHECK_ITEM_SEPARATOR = "/"
 _RELATION_LABELS = frozenset(label.value for label in CrossDocumentRelationLabel)
+# What a maintainer expects of one pinned Memory's Support in the new revision.
+SUPPORT_LABELS = frozenset({"supported", "unsupported"})
+SUPPORT_LABEL_CRITERION = "support_label"
+UNLABELLED_UNSUPPORTED_CRITERION = "unlabelled_unsupported"
+IMAGE_READING_CRITERION = "image_reading"
+_SUPPORT_RESULTS = frozenset(result.value for result in SupportResult)
 
 
 class AgentEvaluationCaseKind(str, Enum):
     SOURCE_UNIT_DERIVATION = "source_unit_derivation_v1"
+    SOURCE_UNIT_SUPPORT = "source_unit_support_v1"
     SOURCE_UNIT_RECONCILIATION = "source_unit_reconciliation_v1"
     CROSS_DOCUMENT_RELATION = "cross_document_relation_v1"
     CROSS_DOCUMENT_RELATION_GROUP = "cross_document_relation_group_v1"
@@ -1100,6 +1125,250 @@ class SourceUnitReconciliationReplayExecutor:
                 "revision_proof_failure_count": result.metrics.revision_proof_failure_count,
             },
         }
+
+
+@dataclass(frozen=True)
+class PinnedSupportWorkItem:
+    """One Support work item the model judged: the claim as it saw it, its Evidence parts, and what it decided.
+
+    ``observed`` is the recorded result: ``supported``, ``unsupported``,
+    ``unaffected`` (Change Impact found no change touching it) or ``unjudged``.
+    """
+
+    recorded_work_id: str
+    memory: Memory
+    support: tuple[ActiveSupportEvidence, ...]
+    observed: str
+
+    @property
+    def evidence_unit_id(self) -> str:
+        return self.support[0].evidence_unit_id
+
+
+@dataclass(frozen=True)
+class PinnedSupportInput:
+    """Everything one Support Assessment case reads, as a store the shared Support work planner reads.
+
+    ``base`` is the committed revision the derivation updated; ``baselines``
+    are the other validation baselines its Supports named; ``evidence_revisions``
+    are the stored Observation revisions prior Evidence names. ``reads_images``
+    is whether the model that judged them saw images, when that changed what
+    it read, and ``None`` otherwise.
+    """
+
+    derivation_id: str
+    access_context_hash: str
+    without_baseline: bool
+    reads_images: bool | None
+    projection: SourceProjection
+    base: SourceProjection | None
+    baselines: tuple[SourceProjection, ...]
+    evidence_revisions: tuple[SourceObservationRevision, ...]
+    work_items: tuple[PinnedSupportWorkItem, ...]
+
+    async def get_source_unit_revision_projection(
+        self, source_unit_id: str, revision_id: str | None,
+    ) -> SourceProjection | None:
+        return next(
+            (
+                projection
+                for projection in (*((self.base,) if self.base is not None else ()), *self.baselines)
+                if projection.source_unit_revisions[0].id == revision_id
+                and projection.source_unit_revisions[0].source_unit_id == source_unit_id
+            ),
+            None,
+        )
+
+    async def get_source_observation_revisions(
+        self, revision_ids: Collection[str],
+    ) -> Mapping[str, SourceObservationRevision]:
+        wanted = set(revision_ids)
+        return {revision.id: revision for revision in self.evidence_revisions if revision.id in wanted}
+
+    async def plan(self, *, projection: SourceProjection, image_loader=None, reads_images: bool = True):
+        """Plan the pinned work items, in pinned order, as production planned them."""
+
+        incumbents = list({item.memory.id: item.memory for item in self.work_items}.values())
+        evidence_by_memory: dict[str, list[ActiveSupportEvidence]] = {}
+        unit_support: dict[str, set[str]] = {}
+        for item in self.work_items:
+            evidence_by_memory.setdefault(item.memory.id, []).extend(item.support)
+            unit_support.setdefault(item.memory.id, set()).add(item.evidence_unit_id)
+        work = await plan_support_work(
+            self, projection=projection, base=self.base, incumbents=incumbents,
+            evidence_by_memory=evidence_by_memory, unit_support=unit_support,
+            access_context_hash=self.access_context_hash, image_loader=image_loader,
+            reads_images=reads_images, without_baseline=self.without_baseline,
+        )
+        planned = [(item.memory.id, item.support[0].evidence_unit_id) for item in work.items]
+        if planned != [(item.memory.id, item.evidence_unit_id) for item in self.work_items]:
+            raise ValueError("pinned Support work items must list each Memory's Evidence Units together")
+        return work
+
+    def to_manifest(self) -> dict[str, object]:
+        return {
+            "derivation_id": self.derivation_id,
+            "access_context_hash": self.access_context_hash,
+            "without_baseline": self.without_baseline,
+            "reads_images": self.reads_images,
+            "projection": source_projection_to_payload(self.projection),
+            "base_projection": source_projection_to_payload(self.base) if self.base is not None else None,
+            "baseline_projections": [source_projection_to_payload(item) for item in self.baselines],
+            "evidence_revisions": [source_observation_revision_to_payload(item) for item in self.evidence_revisions],
+            "work_items": [
+                {
+                    "recorded_work_id": item.recorded_work_id,
+                    "memory": {
+                        "id": item.memory.id,
+                        "content": item.memory.content,
+                        "memory_type": item.memory.memory_type,
+                        "valid_from": item.memory.valid_from.isoformat() if item.memory.valid_from else None,
+                        "valid_until": item.memory.valid_until.isoformat() if item.memory.valid_until else None,
+                    },
+                    "support": [_support_part_payload(part) for part in item.support],
+                    "observed": item.observed,
+                }
+                for item in self.work_items
+            ],
+        }
+
+    @classmethod
+    def from_manifest(cls, manifest: Mapping[str, object]) -> PinnedSupportInput:
+        work_items = []
+        for item in _mapping_list(manifest, "work_items"):
+            memory = _mapping(item, "memory")
+            content = str(memory.get("content") or "")
+            support = tuple(_support_part_from_payload(part) for part in _mapping_list(item, "support"))
+            if not support or len({part.evidence_unit_id for part in support}) != 1:
+                raise ValueError("a pinned Support work item names the parts of one Evidence Unit")
+            work_items.append(PinnedSupportWorkItem(
+                recorded_work_id=_required("recorded_work_id", str(item.get("recorded_work_id") or "")),
+                memory=Memory(
+                    id=_required("memory id", str(memory.get("id") or "")),
+                    memory_type=str(memory.get("memory_type") or "fact"),
+                    content=content,
+                    content_hash=content_hash(content),
+                    valid_from=_optional_date(memory.get("valid_from")),
+                    valid_until=_optional_date(memory.get("valid_until")),
+                ),
+                support=support,
+                observed=str(item.get("observed") or "unjudged"),
+            ))
+        if not work_items:
+            raise ValueError("a Support case pins at least one work item")
+        base = manifest.get("base_projection")
+        return cls(
+            derivation_id=_required("derivation_id", str(manifest.get("derivation_id") or "")),
+            access_context_hash=_required("access_context_hash", str(manifest.get("access_context_hash") or "")),
+            without_baseline=bool(manifest.get("without_baseline", False)),
+            reads_images=manifest.get("reads_images") if isinstance(manifest.get("reads_images"), bool) else None,
+            projection=source_projection_from_payload(_mapping(manifest, "projection")),
+            base=source_projection_from_payload(_mapping(manifest, "base_projection")) if base is not None else None,
+            baselines=tuple(
+                source_projection_from_payload(item) for item in _mapping_list(manifest, "baseline_projections")
+            ),
+            evidence_revisions=tuple(
+                source_observation_revision_from_payload(item) for item in _mapping_list(manifest, "evidence_revisions")
+            ),
+            work_items=tuple(work_items),
+        )
+
+
+class SourceUnitSupportReplayExecutor:
+    """Replay production Support Assessment over one pinned case, with no work journal and no writes.
+
+    The shared Support work planner rebuilds the case's work items in their
+    pinned order, each against its validation baseline, over the pinned target
+    read in the current representation. Image Artifacts load from
+    ``document_store`` by hash, as derivation replay loads them. The output is
+    each pinned Support's result and whether the replaying model sees images.
+    A Memory's other Supports never reached the model and are not pinned, so
+    no Memory-level result is combined from the pinned ones alone.
+    """
+
+    def __init__(self, structured_llm_client: object, document_store: DocumentStore) -> None:
+        self._structured_llm_client = structured_llm_client
+        self._document_store = document_store
+
+    async def execute(
+        self,
+        case: AgentEvaluationCase,
+        candidate_manifest: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        pinned = PinnedSupportInput.from_manifest(case.manifest)
+        reads_images = client_reads_images(self._structured_llm_client)
+        work = await pinned.plan(
+            projection=current_representation_of(pinned.projection),
+            image_loader=pinned_image_loader(pinned.projection, self._document_store),
+            reads_images=reads_images,
+        )
+        assessed = await RevisionWorkExecutor(
+            client=self._structured_llm_client, model=str(candidate_manifest["model"]),
+        ).assess_many(list(work.items))
+        return {
+            "case_kind": case.case_kind.value,
+            "reads_images": reads_images,
+            "supports": [
+                {
+                    "memory_id": item.memory.id,
+                    "evidence_unit_id": item.support[0].evidence_unit_id,
+                    "result": memory_support([assessed[item.id]]).result.value,
+                    "complete_read": assessed[item.id].complete_read,
+                }
+                for item in work.items
+            ],
+        }
+
+
+def _support_part_payload(part: ActiveSupportEvidence) -> dict[str, object]:
+    return {
+        "memory_id": part.memory_id,
+        "source_id": part.source_id,
+        "reference_id": part.reference_id,
+        "evidence_unit_id": part.evidence_unit_id,
+        "role": part.role.value,
+        "anchor": {
+            "kind": part.anchor.kind.value,
+            "observation_id": part.anchor.observation_id,
+            "observation_revision_id": part.anchor.observation_revision_id,
+            "fragment_id": part.anchor.fragment_id,
+            "range_start": part.anchor.range_start,
+            "range_end": part.anchor.range_end,
+        },
+        "excerpt": part.excerpt,
+        "raw_content_sha256": part.raw_content_sha256,
+        "presentation_sha256": part.presentation_sha256,
+        "text_view": part.text_view.payload() if part.text_view is not None else None,
+        "validation_plan_id": part.validation_plan_id,
+        "validation_unit_revision_id": part.validation_unit_revision_id,
+        "display_text": part.display_text,
+    }
+
+
+def _support_part_from_payload(payload: Mapping[str, object]) -> ActiveSupportEvidence:
+    anchor = _mapping(payload, "anchor")
+    return ActiveSupportEvidence(
+        memory_id=_required("memory_id", str(payload.get("memory_id") or "")),
+        source_id=_required("source_id", str(payload.get("source_id") or "")),
+        reference_id=_required("reference_id", str(payload.get("reference_id") or "")),
+        evidence_unit_id=_required("evidence_unit_id", str(payload.get("evidence_unit_id") or "")),
+        role=EvidenceRole(str(payload.get("role"))),
+        anchor=SourceAnchor(
+            kind=AnchorKind(str(anchor.get("kind"))),
+            observation_id=str(anchor.get("observation_id") or ""),
+            observation_revision_id=str(anchor.get("observation_revision_id") or ""),
+            fragment_id=_optional_str(anchor.get("fragment_id")),
+            range_start=_optional_int(anchor.get("range_start")),
+            range_end=_optional_int(anchor.get("range_end")),
+        ),
+        excerpt=_optional_str(payload.get("excerpt")),
+        raw_content_sha256=_optional_str(payload.get("raw_content_sha256")),
+        presentation_sha256=_optional_str(payload.get("presentation_sha256")),
+        text_view=TextEvidenceView.from_payload(payload.get("text_view")),
+        validation_plan_id=_optional_str(payload.get("validation_plan_id")),
+        validation_unit_revision_id=_optional_str(payload.get("validation_unit_revision_id")),
+        display_text=_optional_str(payload.get("display_text")),
+    )
 
 
 class CrossDocumentRelationReplayExecutor:
@@ -2741,6 +3010,25 @@ def deterministic_checks(
         )
         checks.append(_reading_group_coverage_check(extraction))
         checks.extend(_derivation_rubric_checks(ground_truth.rubric, memories))
+    elif case.case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_SUPPORT:
+        results = _support_results(output)
+        if results is None:
+            return (
+                DeterministicCheck(
+                    criterion="typed_output",
+                    label=DeterministicCheckLabel.FAIL,
+                    reason_code="support_output_invalid",
+                ),
+            )
+        checks.extend(_support_label_checks(ground_truth.rubric, results))
+        pinned_reading = case.manifest.get("reads_images")
+        if isinstance(pinned_reading, bool) and output.get("reads_images") is not pinned_reading:
+            # A model that reads images differently reads other content than the judged one.
+            checks.append(DeterministicCheck(
+                criterion=IMAGE_READING_CRITERION,
+                label=DeterministicCheckLabel.UNKNOWN,
+                reason_code=f"pinned_reads_images:{str(pinned_reading).lower()}",
+            ))
     else:
         operations = output.get("operations")
         expected_ids = {
@@ -2888,6 +3176,62 @@ def run_verdict(
     if check_counts.get(DeterministicCheckLabel.UNKNOWN.value, 0):
         return "unknown"
     return "pass"
+
+
+def _support_results(output: Mapping[str, object]) -> list[tuple[str, str, str]] | None:
+    """Each replayed Support's Memory, Evidence Unit and result, or None when the output lacks one."""
+
+    supports = output.get("supports")
+    if not isinstance(supports, list):
+        return None
+    results = []
+    for item in supports:
+        if not isinstance(item, Mapping) or item.get("result") not in _SUPPORT_RESULTS:
+            return None
+        results.append((str(item.get("memory_id")), str(item.get("evidence_unit_id")), str(item["result"])))
+    return results
+
+
+def _support_label_checks(
+    rubric: Mapping[str, object], results: Sequence[tuple[str, str, str]],
+) -> list[DeterministicCheck]:
+    """Check each pinned Support of a labelled Memory; an unlabelled one found unsupported needs review.
+
+    A Memory's label applies to each of its pinned Supports. A Support that
+    holds is ``supported`` whether it was read or bound unchanged; one left
+    unresolved cannot be judged against its label.
+    """
+
+    expected = rubric.get("expected_support")
+    expected = expected if isinstance(expected, Mapping) else {}
+    checks = []
+    for memory_id, evidence_unit_id, result in results:
+        item_id = f"{memory_id}:{evidence_unit_id}"
+        actual = (
+            "supported" if result in {SupportResult.SUPPORTED.value, SupportResult.UNAFFECTED.value}
+            else "unsupported" if result == SupportResult.UNSUPPORTED.value
+            else None
+        )
+        if memory_id in expected:
+            label = str(expected[memory_id])
+            checks.append(DeterministicCheck(
+                criterion=SUPPORT_LABEL_CRITERION,
+                label=(
+                    DeterministicCheckLabel.UNKNOWN if actual is None
+                    else DeterministicCheckLabel.PASS if actual == label
+                    else DeterministicCheckLabel.FAIL
+                ),
+                reason_code=f"{label}:{result}",
+                item_id=item_id,
+            ))
+        elif actual == "unsupported":
+            checks.append(DeterministicCheck(
+                criterion=UNLABELLED_UNSUPPORTED_CRITERION,
+                label=DeterministicCheckLabel.UNKNOWN,
+                reason_code=result,
+                item_id=item_id,
+            ))
+    return checks
 
 
 def _reading_group_coverage_check(extraction: Mapping[str, object]) -> DeterministicCheck:
@@ -3087,6 +3431,8 @@ def _validate_case_manifest(
             _mapping(manifest, "base_projection")
         for field in ("access_context_hash", "inference_capability_hash"):
             _required(field, str(manifest.get(field) or ""))
+    elif case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_SUPPORT:
+        PinnedSupportInput.from_manifest(manifest)
     else:
         _mapping_list(manifest, "new_extractions")
         incumbents = _mapping_list(manifest, "incumbents")
@@ -3170,6 +3516,15 @@ def _validate_rubric(
             raise ValueError("relation group expected_labels must be one of " + ", ".join(sorted(_RELATION_LABELS)))
     if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION:
         _validate_derivation_rubric(rubric)
+    if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_SUPPORT:
+        expected = rubric.get("expected_support")
+        if not isinstance(expected, Mapping):
+            raise ValueError("Support rubric requires expected_support, a mapping of Memory id to label")
+        memory_ids = {str(_mapping(item, "memory").get("id")) for item in _mapping_list(case.manifest, "work_items")}
+        if not set(expected) <= memory_ids:
+            raise ValueError("expected_support names only pinned Memories")
+        if any(label not in SUPPORT_LABELS for label in expected.values()):
+            raise ValueError("expected_support labels must be one of " + ", ".join(sorted(SUPPORT_LABELS)))
     if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION:
         forbidden = rubric.get("forbidden_destructive_memory_ids", [])
         if not isinstance(forbidden, list):
@@ -3688,6 +4043,10 @@ def _positive_int(value: object, *, default: int) -> int:
 
 def _optional_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _optional_date(value: object) -> date | None:
+    return date.fromisoformat(str(value)) if value else None
 
 
 def _optional_int(value: object) -> int | None:

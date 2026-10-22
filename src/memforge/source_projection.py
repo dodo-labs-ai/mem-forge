@@ -608,26 +608,7 @@ def source_projection_to_payload(projection: SourceProjection) -> dict[str, obje
             for item in projection.observations
         ],
         "observation_revisions": [
-            {
-                "id": item.id,
-                "observation_id": item.observation_id,
-                "semantic_hash": item.semantic_hash,
-                "content": item.content,
-                "observed_at": item.observed_at,
-                "metadata": dict(item.metadata),
-                "evidence_profile": (
-                    {
-                        "name": item.evidence_profile.name,
-                        "version": item.evidence_profile.version,
-                        "coordinate_space": item.evidence_profile.coordinate_space.value,
-                        "schema_name": item.evidence_profile.schema_name,
-                        "schema_version": item.evidence_profile.schema_version,
-                    }
-                    if item.evidence_profile is not None
-                    else None
-                ),
-            }
-            for item in projection.observation_revisions
+            source_observation_revision_to_payload(item) for item in projection.observation_revisions
         ],
         "source_units": [
             {
@@ -701,6 +682,43 @@ def source_projection_to_payload(projection: SourceProjection) -> dict[str, obje
     }
 
 
+def source_observation_revision_to_payload(revision: SourceObservationRevision) -> dict[str, object]:
+    """Canonical JSON-compatible payload of one Observation Revision, as projections carry it."""
+
+    profile = revision.evidence_profile
+    return {
+        "id": revision.id,
+        "observation_id": revision.observation_id,
+        "semantic_hash": revision.semantic_hash,
+        "content": revision.content,
+        "observed_at": revision.observed_at,
+        "metadata": dict(revision.metadata),
+        "evidence_profile": (
+            {
+                "name": profile.name,
+                "version": profile.version,
+                "coordinate_space": profile.coordinate_space.value,
+                "schema_name": profile.schema_name,
+                "schema_version": profile.schema_version,
+            }
+            if profile is not None
+            else None
+        ),
+    }
+
+
+def source_observation_revision_from_payload(payload: Mapping[str, object]) -> SourceObservationRevision:
+    return SourceObservationRevision(
+        id=str(payload["id"]),
+        observation_id=str(payload["observation_id"]),
+        semantic_hash=str(payload["semantic_hash"]),
+        content=str(payload["content"]),
+        observed_at=_optional_str(payload.get("observed_at")),
+        metadata=_mapping(payload.get("metadata")),
+        evidence_profile=_evidence_profile_from_payload(payload.get("evidence_profile")),
+    )
+
+
 def source_projection_from_payload(payload: Mapping[str, object]) -> SourceProjection:
     """Rehydrate the canonical shared payload returned by a ProjectionStore."""
 
@@ -738,16 +756,7 @@ def source_projection_from_payload(payload: Mapping[str, object]) -> SourceProje
             for item in mappings("observations")
         ),
         observation_revisions=tuple(
-            SourceObservationRevision(
-                id=str(item["id"]),
-                observation_id=str(item["observation_id"]),
-                semantic_hash=str(item["semantic_hash"]),
-                content=str(item["content"]),
-                observed_at=_optional_str(item.get("observed_at")),
-                metadata=_mapping(item.get("metadata")),
-                evidence_profile=_evidence_profile_from_payload(item.get("evidence_profile")),
-            )
-            for item in mappings("observation_revisions")
+            source_observation_revision_from_payload(item) for item in mappings("observation_revisions")
         ),
         source_units=tuple(
             SourceUnit(

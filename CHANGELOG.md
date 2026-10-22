@@ -32,6 +32,22 @@
   (`derivation_failed:<code>`) instead of erroring.
   - Cloud: `get_source_unit_revision_projection` is part of the derivation case
     store contract.
+- Support Assessment evaluation cases (`source_unit_support_v1`) replay whether
+  an old Memory's Support still holds in a new revision. A case pins one applied
+  update of a Document from the receipts its Support reads left in the
+  derivation work journal: the revision as synced, its committed base and
+  validation baselines, every work item the model judged with the claim it saw
+  and its Evidence, and the recorded result. Seed with
+  `POST /api/v1/agent-evaluations/support-cases/seed` or
+  `memforge eval seed-support-cases`. Results are per Support: the rubric's
+  `expected_support` labels Memories `supported` or `unsupported`, each label
+  applies to the Memory's pinned Supports, and an unlabelled Support the replay
+  finds unsupported is `unknown`. Lifecycle and replay plan Support work
+  through one shared planner.
+  - Cloud: a store implements `list_source_derivation_work` and
+    `get_evidence_references`, which returns each stored column as stored;
+    `get_source_observation_revisions` is part of the Support case store
+    contract.
 
 - A Memory's source text is its Evidence excerpt only. `Memory.extraction_context`
   and `RawMemory.extraction_context` are removed, with the `memories` column

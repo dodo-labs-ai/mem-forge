@@ -7648,6 +7648,15 @@ class Database:
     async def record_derivation_work(self, *, derivation_id: str, work: DerivationWork) -> DerivationWork:
         return await self._persist_derivation_work(derivation_id, work, stage=False)
 
+    async def list_source_derivation_work(self, derivation_id: str) -> tuple[DerivationWork, ...]:
+        """Every work recorded under one derivation, verified, in work id order."""
+
+        rows = await self.db.execute_fetchall(
+            "SELECT payload_json FROM source_derivation_work WHERE derivation_id = ? ORDER BY work_id",
+            (derivation_id,),
+        )
+        return tuple(DerivationWork.from_payload(json.loads(row["payload_json"])) for row in rows)
+
     async def _persist_derivation_work(self, derivation_id, work, *, stage):
 
         DerivationWork.from_payload(work.to_payload())
@@ -10053,6 +10062,42 @@ class Database:
                     )
                 )
         return {memory_id: tuple(grouped[memory_id]) for memory_id in ids}
+
+    async def get_evidence_references(self, reference_ids: Collection[str]) -> Mapping[str, EvidenceReference]:
+        """The stored Evidence references among these ids, keyed by id, each column as stored."""
+
+        ids = sorted(set(reference_ids))
+        references: dict[str, EvidenceReference] = {}
+        for offset in range(0, len(ids), STORAGE_BIND_CHUNK_SIZE):
+            chunk = ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+            rows = await self.db.execute_fetchall(
+                f"SELECT * FROM evidence_references WHERE id IN ({', '.join('?' for _ in chunk)})",
+                tuple(chunk),
+            )
+            for row in rows:
+                references[str(row["id"])] = EvidenceReference(
+                    id=str(row["id"]),
+                    evidence_unit_id=row["evidence_unit_id"],
+                    role=EvidenceRole(str(row["role"])),
+                    kind=EvidencePartKind(str(row["part_kind"])) if row["part_kind"] is not None else None,
+                    anchor=SourceAnchor(
+                        kind=AnchorKind(str(row["anchor_kind"])),
+                        observation_id=str(row["observation_id"]),
+                        observation_revision_id=str(row["observation_revision_id"]),
+                        fragment_id=row["fragment_id"],
+                        range_start=int(row["range_start"]) if row["range_start"] is not None else None,
+                        range_end=int(row["range_end"]) if row["range_end"] is not None else None,
+                    ),
+                    raw_content_sha256=row["raw_content_sha256"],
+                    presentation_sha256=row["presentation_sha256"],
+                    excerpt=row["excerpt"],
+                    artifact_metadata=json.loads(row["artifact_metadata_json"] or "{}"),
+                    text_view=TextEvidenceView.from_payload(
+                        json.loads(row["text_view_json"]) if row["text_view_json"] else None
+                    ),
+                    display_text=row["display_text"],
+                )
+        return references
 
     async def get_active_memory_support_observation_ids_many(
         self,
