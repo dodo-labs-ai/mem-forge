@@ -705,7 +705,9 @@ async def test_the_migration_supersedes_unapplied_derivations_staged_with_a_sour
 def _jira_gene(handler):
     from memforge.genes.jira_gene import JiraGene
 
-    gene = JiraGene(config={"base_url": "https://jira.example.test", "pat": "token"}, source_id=SOURCE_ID)
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "pat": "token", "projects": ["PAY"]}, source_id=SOURCE_ID,
+    )
     gene._client = httpx.AsyncClient(base_url="https://jira.example.test", transport=httpx.MockTransport(handler))
     gene._request_limiter = None
     gene._auth_mode = "pat"
@@ -716,21 +718,23 @@ def _jira_gene(handler):
 
 @pytest.mark.asyncio
 async def test_jira_rediscovers_one_issue_by_its_id_and_fetches_it_as_discovered():
-    requests: list[str] = []
+    searches: list[dict] = []
+    pay_1 = {
+        "id": ISSUES["PAY-1"], "key": "PAY-1",
+        "fields": {
+            "summary": "Payroll run", "description": "Body", "status": None, "priority": None,
+            "assignee": None, "resolution": None, "updated": "2026-09-21T08:00:00.000+0000",
+            "project": {"key": "PAY"}, "labels": [], "comment": {"startAt": 0, "total": 0, "comments": []},
+        },
+        "changelog": {"startAt": 0, "total": 1, "histories": [DOMAIN_HISTORY]},
+    }
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request.url.path)
-        if request.url.path != f"/rest/api/2/issue/{ISSUES['PAY-1']}":
-            return httpx.Response(httpx.codes.NOT_FOUND, json={"errorMessages": ["Issue does not exist"]})
-        return httpx.Response(httpx.codes.OK, json={
-            "id": ISSUES["PAY-1"], "key": "PAY-1",
-            "fields": {
-                "summary": "Payroll run", "description": "Body", "status": None, "priority": None,
-                "assignee": None, "resolution": None, "updated": "2026-09-21T08:00:00.000+0000",
-                "project": {"key": "PAY"}, "labels": [], "comment": {"startAt": 0, "total": 0, "comments": []},
-            },
-            "changelog": {"startAt": 0, "total": 1, "histories": [DOMAIN_HISTORY]},
-        })
+        assert request.url.path == "/rest/api/2/search"
+        body = json.loads(request.content)
+        searches.append(body)
+        issues = [pay_1] if body["jql"].startswith(f"issuekey = {ISSUES['PAY-1']} ") else []
+        return httpx.Response(httpx.codes.OK, json={"startAt": 0, "total": len(issues), "issues": issues})
 
     gene = _jira_gene(handler)
     stored = ContentItem(
@@ -753,7 +757,11 @@ async def test_jira_rediscovers_one_issue_by_its_id_and_fetches_it_as_discovered
     )
     assert [history["id"] for history in json.loads(raw.body)["changelog"]["histories"]] == ["9001"]
     # The fetch reads the issue rediscovery returned; the provider is asked once per Document.
-    assert requests == [f"/rest/api/2/issue/{ISSUES['PAY-1']}", f"/rest/api/2/issue/{ISSUES['PAY-2']}"]
+    assert [body["jql"] for body in searches] == [
+        f"issuekey = {issue_id} AND (project in (PAY) AND issuetype in (Epic,Story,Bug,Task))"
+        for issue_id in (ISSUES["PAY-1"], ISSUES["PAY-2"])
+    ]
+    assert all(body["validateQuery"] is False for body in searches)
 
 
 def _confluence_page(page_id: str, **fields) -> dict:
@@ -809,11 +817,12 @@ async def test_confluence_rediscovers_the_current_pages_of_its_spaces():
             "43": _confluence_page("43", status="archived"),
             "44": _confluence_page("44", space={"key": "HR"}),
             "45": _confluence_page("45", metadata={"labels": {"results": [{"name": "draft"}]}}),
+            "47": _confluence_page("47", type="blogpost"),
         },
     )
 
     assert (found["42"].item_id, found["42"].version, found["42"].space_or_project) == ("confluence-42", "4", "PAY")
-    assert {page_id for page_id, item in found.items() if item is None} == {"43", "44", "45", "404"}
+    assert {page_id for page_id, item in found.items() if item is None} == {"43", "44", "45", "47", "404"}
 
 
 @pytest.mark.asyncio
@@ -828,6 +837,7 @@ async def test_confluence_rediscovers_the_pages_its_tree_discovery_reaches():
             "44": _confluence_page("44", ancestors=[_labelled(root), _labelled("9", "draft")]),
             "45": _confluence_page("45", ancestors=[_labelled(root), {**_labelled("10"), "status": "archived"}]),
             "46": _confluence_page("46", status="trashed", ancestors=[_labelled(root)]),
+            "47": _confluence_page("47", type="blogpost", ancestors=[_labelled(root)]),
         },
     )
 

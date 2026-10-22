@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Jira looks one issue up again, when a failed issue is retried or a Document
+  is reprocessed at its current revision, by searching within the Source's
+  JQL: `issuekey = <id> AND (<where clause>)`, without the incremental
+  `updated >=` filter or ORDER BY. Before, it read the issue by id whether or
+  not the JQL still matched it. An issue the JQL no longer matches, or the
+  credential can no longer see, now fails with `provider_document_missing`,
+  as a Confluence page outside its page tree or space already does, instead
+  of being refreshed from outside the Source's scope. Confluence's lookup also
+  skips content that is not a page, such as a blog post.
 - A person can stop a Source's sync in progress: `POST
   /api/v1/sources/{id}/sync/stop`, the Admin UI's "Stop sync" and `memforge
   sources stop`. The Source stays active and later syncs run as scheduled. A

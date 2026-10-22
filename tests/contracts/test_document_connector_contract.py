@@ -65,21 +65,15 @@ def _fakes_or_none(source_type: str) -> DocumentConnectorFakes | None:
         return None
 
 
-def _cases(configs_of, *, gaps: dict[str, str] | None = None) -> list:
-    """One case per source type with fakes and per configuration ``configs_of(source_type, fakes)`` names.
-
-    ``gaps`` names source types known to break the check, with the reason;
-    their cases must fail.
-    """
+def _cases(configs_of) -> list:
+    """One case per source type with fakes and per configuration ``configs_of(source_type, fakes)`` names."""
     cases = []
     for source_type in DOCUMENT_TYPES:
         fakes = _fakes_or_none(source_type)
         if fakes is None:
             continue
-        reason = (gaps or {}).get(source_type)
-        marks = [pytest.mark.xfail(strict=True, reason=reason)] if reason else []
         for name in configs_of(source_type, fakes):
-            cases.append(pytest.param(source_type, name, id=f"{source_type}-{name}", marks=marks))
+            cases.append(pytest.param(source_type, name, id=f"{source_type}-{name}"))
     return cases
 
 
@@ -93,8 +87,7 @@ REDISCOVER_CASES = _cases(
         name
         for name, listing in fakes.listing_configs.items()
         if _gene_class(source_type).rediscovers_documents(listing.config)
-    ],
-    gaps={"jira": "Jira rediscover reads an issue by id without applying the JQL"},
+    ]
 )
 QUERY_TYPES = [
     source_type

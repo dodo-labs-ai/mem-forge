@@ -613,7 +613,7 @@ async def _read_per_issue(gene: JiraGene):
     ("read_issue", "expected_calls"),
     [
         (_read_hydrated_by_search, [("POST", "/rest/api/2/search")]),
-        (_read_rediscovered, [("GET", "/rest/api/2/issue/100007")]),
+        (_read_rediscovered, [("POST", "/rest/api/2/search")]),
         (
             _read_per_issue,
             [("GET", "/rest/api/2/issue/PAY-7"), ("GET", "/rest/api/2/issue/PAY-7/comment")],
@@ -1827,3 +1827,94 @@ async def test_complete_hydrated_comments_without_rendering_fetch_attested_comme
     raw = await gene.fetch(item)
     assert json.loads(raw.body)["_comments"] == [rendered]
     assert len(gene._client.calls) == 1
+
+
+def _rediscovery_handler(searches: list[dict], issues_by_id: dict[str, dict]):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/rest/api/2/search"
+        body = json.loads(request.content)
+        searches.append(body)
+        issue_ref = body["jql"].removeprefix("issuekey = ").split(" ", 1)[0]
+        issues = [issues_by_id[issue_ref]] if issue_ref in issues_by_id else []
+        return httpx.Response(200, json=_search_page(issues))
+
+    return handler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "expected_jql"),
+    [
+        (
+            {"projects": ["PAY"], "issue_types": ["Story"], "jql_filter": "labels = important"},
+            "issuekey = 100001 AND (project in (PAY) AND issuetype in (Story) AND (labels = important))",
+        ),
+        (
+            {"query_mode": "advanced", "jql": "project = PAY OR labels = payroll ORDER BY Rank ASC"},
+            "issuekey = 100001 AND (project = PAY OR labels = payroll)",
+        ),
+        ({"query_mode": "advanced", "jql": "ORDER BY created DESC"}, "issuekey = 100001"),
+        ({"query_mode": "advanced", "jql": ""}, "issuekey = 100001"),
+    ],
+    ids=["simple-with-filter", "advanced-with-order-and-top-level-or", "advanced-order-only", "advanced-empty"],
+)
+async def test_rediscovery_searches_for_the_issue_within_the_configured_jql(config, expected_jql):
+    searches: list[dict] = []
+    gene = _transport_gene(_rediscovery_handler(searches, {"100001": _jira_issue("PAY-1", issue_id="100001")}), config)
+    try:
+        current = await gene.rediscover(_stored_issue("PAY-1", "100001"))
+    finally:
+        await gene._client.aclose()
+
+    assert current.item_id == "jira-PAY-1"
+    assert [body["jql"] for body in searches] == [expected_jql]
+    assert searches[0]["validateQuery"] is False
+    # Fetch reads the issue the search returned instead of asking again.
+    assert set(gene._hydrated_issues) == {"PAY-1"}
+
+
+@pytest.mark.asyncio
+async def test_rediscovery_finds_an_issue_whose_key_changed_by_its_id():
+    searches: list[dict] = []
+    moved = _jira_issue("OPS-7", issue_id="100001")
+    gene = _transport_gene(_rediscovery_handler(searches, {"100001": moved}), {"projects": ["PAY", "OPS"]})
+    try:
+        current = await gene.rediscover(_stored_issue("PAY-1", "100001"))
+    finally:
+        await gene._client.aclose()
+
+    assert (current.item_id, current.extra["issue_id"]) == ("jira-OPS-7", "100001")
+
+
+@pytest.mark.asyncio
+async def test_rediscovery_gives_nothing_for_an_issue_outside_the_jql():
+    searches: list[dict] = []
+    gene = _transport_gene(_rediscovery_handler(searches, {}), {"projects": ["PAY"]})
+    try:
+        assert await gene.rediscover(_stored_issue("PAY-2", "100002")) is None
+    finally:
+        await gene._client.aclose()
+
+    assert len(searches) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(500, json={"errorMessages": ["Internal server error"]}),
+        httpx.Response(200, json=_search_page([], total=1)),
+        httpx.Response(200, json=_search_page([_jira_issue("PAY-5", issue_id="100005")])),
+    ],
+    ids=["search-error", "ends-before-total", "another-issue"],
+)
+async def test_rediscovery_raises_when_the_search_fails_or_answers_inconsistently(response):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return response
+
+    gene = _transport_gene(handler, {"projects": ["PAY"]})
+    try:
+        with pytest.raises(RuntimeError):
+            await gene.rediscover(_stored_issue("PAY-1", "100001"))
+    finally:
+        await gene._client.aclose()
