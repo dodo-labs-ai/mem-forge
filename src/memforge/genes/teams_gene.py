@@ -20,7 +20,7 @@ from memforge.conversations.records import MessageIdentity, record_created_at, r
 from memforge.conversations.units import Member
 from memforge.genes.conversation_gene import ConversationGene
 from memforge.genes.teams_provider import teams_conversation_label
-from memforge.local_agent.source_contract import TEAMS_ROLLING_RETENTION_PRESETS
+from memforge.local_agent.source_contract import TEAMS_MAX_INITIAL_HISTORY_DAYS, TEAMS_ROLLING_RETENTION_PRESETS
 from memforge.local_agent.teams_contract import validate_teams_canonical_messages
 from memforge.models import (
     ConfigField,
@@ -127,12 +127,13 @@ class TeamsGene(ConversationGene):
         config["conversation_ids"] = list(conversation_ids)
         if "initial_history_days" not in config:
             config["initial_history_days"] = config.get("max_age_days", 14)
+        history_rule = f"Teams initial history must be between 1 and {TEAMS_MAX_INITIAL_HISTORY_DAYS} days"
         try:
             initial_history_days = int(config["initial_history_days"])
         except (TypeError, ValueError) as exc:
-            raise ValueError("Teams initial history must be a positive number of days") from exc
-        if initial_history_days < 1:
-            raise ValueError("Teams initial history must be a positive number of days")
+            raise ValueError(history_rule) from exc
+        if not 1 <= initial_history_days <= TEAMS_MAX_INITIAL_HISTORY_DAYS:
+            raise ValueError(history_rule)
         config["initial_history_days"] = initial_history_days
         retention = config.get("rolling_retention_days")
         if retention in (None, "", "forever", "none"):
@@ -145,8 +146,6 @@ class TeamsGene(ConversationGene):
             if retention_days not in TEAMS_ROLLING_RETENTION_PRESETS:
                 raise ValueError("Teams rolling retention must be Forever, 1 year, 2 years, or 3 years")
             config["rolling_retention_days"] = retention_days
-            if initial_history_days > retention_days:
-                raise ValueError("Teams initial history cannot reach back further than its rolling retention")
         config.pop("max_age_days", None)
         config.pop("conversation_gap_minutes", None)
         config.pop("max_block_messages", None)

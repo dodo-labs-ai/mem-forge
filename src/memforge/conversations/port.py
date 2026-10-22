@@ -171,8 +171,9 @@ class ConversationPoll:
 
     messages: tuple[ProviderMessage, ...]
     outcome: PollOutcome
-    # When paging stopped early: the time the last fully read page is
-    # complete from (see PollOutcome).
+    # The time the read is complete from (see PollOutcome): earlier than the
+    # requested start when paging reached it; when paging stopped early, the
+    # time the last fully read page is complete from.
     earliest_complete_page_time: datetime | None = None
     stop_reason: str = ""
 

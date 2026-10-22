@@ -4987,6 +4987,12 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # Manifest; no other Source attests a projection scope.
         [],
     ),
+    (
+        124,
+        "Bound each Teams Source's Initial History",
+        # Every Teams sync polls the whole Initial History.
+        [],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -5304,6 +5310,21 @@ class Database:
                 (kind.value, json.dumps(locator, sort_keys=True), row["id"]),
             )
 
+    async def _bound_teams_initial_history_unlocked(self) -> None:
+        """Cut each stored Teams configuration's Initial History to the bound the Teams Gene accepts."""
+
+        from memforge.local_agent.source_contract import teams_config_within_history_bound
+
+        rows = await self.db.execute_fetchall("SELECT id, config FROM sources WHERE type = 'teams'")
+        for row in rows:
+            try:
+                config = json.loads(row["config"] or "{}")
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Teams source {row['id']} has invalid JSON config") from exc
+            bounded = teams_config_within_history_bound(config) if isinstance(config, dict) else None
+            if bounded is not None:
+                await self.db.execute("UPDATE sources SET config = ? WHERE id = ?", (json.dumps(bounded), row["id"]))
+
     async def _migrate_agent_runtime_event_v3_unlocked(self) -> None:
         """Relax extraction-only lineage and preserve v2 events and assessments."""
 
@@ -5496,6 +5517,8 @@ class Database:
             await self._migrate_agent_runtime_event_v3_unlocked()
         if version == 122:
             await self._name_teams_units_as_conversation_units_unlocked()
+        if version == 124:
+            await self._bound_teams_initial_history_unlocked()
         for sql in statements:
             try:
                 await self.db.execute(sql)
