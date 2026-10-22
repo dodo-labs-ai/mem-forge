@@ -2025,6 +2025,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sources/{source_id}/adapter/manifest/confirmations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit Local Source Confirmations
+         * @description Store a device's answers for the items its manifest response asked it to confirm.
+         *
+         *     The answers bind to the job attempt and the digest of the manifest. An
+         *     identical replay is accepted; an item the manifest did not ask about,
+         *     another digest or attempt, and answers that differ from the stored
+         *     ones are refused with 409.
+         */
+        post: operations["submit_local_source_confirmations_api_v1_sources__source_id__adapter_manifest_confirmations_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sources/{source_id}/adapter/packages": {
         parameters: {
             query?: never;
@@ -3797,6 +3822,44 @@ export interface components {
              * @constant
              */
             status: "queued";
+        };
+        /**
+         * LocalSourceConfirmationAnswerRequest
+         * @description The device's answer for one item its manifest response asked it to confirm.
+         */
+        LocalSourceConfirmationAnswerRequest: {
+            /**
+             * Answer
+             * @enum {string}
+             */
+            answer: "absent" | "exists" | "hidden";
+            /** Doc Id */
+            doc_id: string;
+            /** Provider Key */
+            provider_key: string;
+        };
+        /**
+         * LocalSourceConfirmationsRequest
+         * @description A device's answers for the items its query manifest left out, bound to that manifest.
+         *
+         *     ``manifest_sha256`` is the digest the manifest response returned, and the
+         *     job attempt is the one that submitted the manifest. The request answers
+         *     every item the response named in ``confirm``, or, when the device could
+         *     not confirm them, gives ``failure_cause`` and no answers.
+         */
+        LocalSourceConfirmationsRequest: {
+            /** Answers */
+            answers?: components["schemas"]["LocalSourceConfirmationAnswerRequest"][];
+            /** Failure Cause */
+            failure_cause?: string | null;
+            /** Local Agent Attempt Count */
+            local_agent_attempt_count: number;
+            /** Local Agent Job Id */
+            local_agent_job_id: string;
+            /** Manifest Sha256 */
+            manifest_sha256: string;
+            /** Sync Snapshot Id */
+            sync_snapshot_id: string;
         };
         /**
          * LocalSourceManifestItemRequest
@@ -9803,6 +9866,41 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["LocalSourceManifestRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_local_source_confirmations_api_v1_sources__source_id__adapter_manifest_confirmations_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LocalSourceConfirmationsRequest"];
             };
         };
         responses: {

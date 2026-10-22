@@ -156,6 +156,7 @@ from memforge.memory.store import MemoryStore
 from memforge.models import (
     AbsenceCheckSkippedReason,
     ConfigField,
+    ScopeListingKind,
     ConfigFieldType,
     Entity,
     Memory,
@@ -274,6 +275,8 @@ from memforge.local_agent.readiness import (
 from memforge.local_agent.snapshot_manifest import (
     COMPLETE_SNAPSHOT,
     UPSERT,
+    SnapshotConfirmation,
+    SnapshotConfirmationAnswer,
     SnapshotManifestItem,
     plan_snapshot_manifest,
     snapshot_manifest_sha256,
@@ -289,6 +292,7 @@ from memforge.local_agent.source_contract import (
     local_agent_sync_job_payload,
     local_agent_sync_operation,
     local_agent_sync_snapshot_id,
+    local_package_confirms_absence,
     local_package_requires_source_time,
     validate_local_agent_replay_package,
 )
@@ -2571,6 +2575,33 @@ class LocalSourceManifestRequest(BaseModel):
     package_contract_version: int | None = Field(default=None, ge=1)
 
 
+class LocalSourceConfirmationAnswerRequest(BaseModel):
+    """The device's answer for one item its manifest response asked it to confirm."""
+
+    doc_id: str = Field(min_length=1, max_length=512)
+    provider_key: str = Field(min_length=1, max_length=512)
+    answer: Literal["absent", "exists", "hidden"]
+
+
+class LocalSourceConfirmationsRequest(BaseModel):
+    """A device's answers for the items its query manifest left out, bound to that manifest.
+
+    ``manifest_sha256`` is the digest the manifest response returned, and the
+    job attempt is the one that submitted the manifest. The request answers
+    every item the response named in ``confirm``, or, when the device could
+    not confirm them, gives ``failure_cause`` and no answers.
+    """
+
+    sync_snapshot_id: str
+    local_agent_job_id: str
+    local_agent_attempt_count: int = Field(ge=1)
+    manifest_sha256: str = Field(min_length=64, max_length=64)
+    answers: list[LocalSourceConfirmationAnswerRequest] = Field(
+        default_factory=list, max_length=LOCAL_SOURCE_MANIFEST_MAX_ITEMS
+    )
+    failure_cause: str | None = Field(default=None, min_length=1, max_length=2_000)
+
+
 CONVERSATION_MANIFEST_MAX_MESSAGES = 200_000
 CONVERSATION_RECORD_MAX_BYTES = 1_000_000
 
@@ -2628,7 +2659,11 @@ async def _require_ready_snapshot_manifest(
     req: Any,
     lease_payload: Mapping[str, Any],
 ) -> None:
-    """Require the document snapshot manifest of this job attempt, with every declared item materialized."""
+    """Require the document snapshot manifest of this job attempt, materialized and answered.
+
+    Every declared item must be materialized, and every item the manifest
+    asked its device to confirm must be answered.
+    """
 
     manifest_status = await db.get_source_sync_snapshot_manifest_status(
         source_id=source_id,
@@ -2643,8 +2678,10 @@ async def _require_ready_snapshot_manifest(
         or manifest_status["source_config_revision"] != str(lease_payload["source_config_revision"])
     ):
         raise HTTPException(status_code=409, detail="source_snapshot_manifest_stale")
-    if not manifest_status["ready"]:
+    if manifest_status["materialized_count"] != manifest_status["item_count"]:
         raise HTTPException(status_code=409, detail="source_snapshot_materialization_incomplete")
+    if manifest_status["awaiting_confirmations"]:
+        raise HTTPException(status_code=409, detail="source_snapshot_confirmations_pending")
     if manifest_status["coverage"] != COMPLETE_SNAPSHOT:
         raise HTTPException(status_code=409, detail="authoritative_snapshot_coverage_required")
 
@@ -2654,6 +2691,78 @@ def _is_document_source_type(source_type: str) -> bool:
 
     descriptor = source_type_descriptor(source_type)
     return descriptor is not None and descriptor.family is CollectionFamilyKind.DOCUMENT
+
+
+async def _snapshot_confirm_set(
+    db: Database,
+    *,
+    source: Mapping[str, Any],
+    workspace_id: str,
+    snapshot_id: str,
+    listed_doc_ids: frozenset[str],
+    package_contract_version: int | None,
+) -> tuple[SnapshotConfirmation, ...]:
+    """The items a device manifest asks its device to confirm by identifier.
+
+    Only a document Source whose device listing is a query asks, and only an
+    agent that confirms is asked. It asks about every Document with a current
+    Unit the manifest does not list, by the Unit's provider key, and every
+    failed Document the manifest does not list that never became a Unit, by
+    the provider key of its stored item. A replay of a stored manifest returns
+    the set the manifest was issued, without asking again.
+
+    A set larger than a manifest is issued empty: the run then records
+    ``absence_confirmation_missing`` and removes nothing.
+    """
+
+    source_type = str(source.get("type") or "")
+    descriptor = source_type_descriptor(source_type)
+    if (
+        not local_package_confirms_absence(package_contract_version)
+        or descriptor is None
+        or descriptor.family is not CollectionFamilyKind.DOCUMENT
+    ):
+        return ()
+    gene_cls = cast(type[DocumentGene], descriptor.gene_class())
+    if gene_cls.snapshot_listing_kind() is not ScopeListingKind.QUERY:
+        return ()
+    source_id = str(source["id"])
+    stored = await db.get_source_sync_snapshot_manifest_status(
+        source_id=source_id, workspace_id=workspace_id, snapshot_id=snapshot_id
+    )
+    if stored is not None:
+        issued = await db.list_source_sync_snapshot_confirmations(
+            source_id=source_id, workspace_id=workspace_id, snapshot_id=snapshot_id
+        )
+        return tuple(SnapshotConfirmation(item.doc_id, item.provider_key) for item in issued)
+    held = await db.list_indexed_doc_ids(source_id)
+    unlisted_units = sorted(held - listed_doc_ids)
+    unlisted_failures = sorted(
+        (
+            failure
+            for failure in await db.list_source_item_failures(source_id=source_id)
+            if failure.document_id not in listed_doc_ids and failure.document_id not in held
+        ),
+        key=lambda failure: failure.document_id,
+    )
+    if len(unlisted_units) + len(unlisted_failures) > LOCAL_SOURCE_MANIFEST_MAX_ITEMS:
+        logger.warning(
+            "Source %s has %d unlisted Documents, more than a manifest holds; none is issued for confirmation",
+            source_id,
+            len(unlisted_units) + len(unlisted_failures),
+        )
+        return ()
+    confirm: list[SnapshotConfirmation] = []
+    for doc_id in unlisted_units:
+        unit = await db.find_source_unit_by_document_id(source_id, doc_id, current_only=True)
+        if unit is not None:
+            confirm.append(SnapshotConfirmation(doc_id, unit.provider_key))
+    confirm.extend(
+        SnapshotConfirmation(failure.document_id, gene_cls.provider_key(failure.item))
+        for failure in unlisted_failures
+        if failure.item is not None
+    )
+    return tuple(sorted(confirm, key=lambda item: item.doc_id))
 
 
 @dataclass(frozen=True)
@@ -9080,6 +9189,14 @@ def create_admin_app(
                 ),
             )
             manifest_sha256 = snapshot_manifest_sha256(items)
+            confirm = await _snapshot_confirm_set(
+                db,
+                source=source,
+                workspace_id=workspace_id,
+                snapshot_id=snapshot_id,
+                listed_doc_ids=frozenset(item.doc_id for item in items),
+                package_contract_version=req.package_contract_version,
+            )
             await db.attach_source_sync_inputs_to_snapshot(
                 source_id=source_id,
                 workspace_id=workspace_id,
@@ -9092,6 +9209,7 @@ def create_admin_app(
                 local_agent_job_id=req.local_agent_job_id,
                 local_agent_attempt_count=req.local_agent_attempt_count,
                 source_config_revision=str(lease_payload["source_config_revision"]),
+                confirm=confirm,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -9100,8 +9218,68 @@ def create_admin_app(
             "snapshot_id": snapshot_id,
             "coverage": COMPLETE_SNAPSHOT,
             "manifest_count": len(req.items),
+            "manifest_sha256": manifest_sha256,
             "reused_count": len(plan.reused_memberships),
             "required_doc_ids": list(plan.required_doc_ids),
+            "confirm": [{"doc_id": item.doc_id, "provider_key": item.provider_key} for item in confirm],
+        }
+
+    @source_router.post("/{source_id}/adapter/manifest/confirmations")
+    async def submit_local_source_confirmations(
+        source_id: str,
+        req: LocalSourceConfirmationsRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """Store a device's answers for the items its manifest response asked it to confirm.
+
+        The answers bind to the job attempt and the digest of the manifest. An
+        identical replay is accepted; an item the manifest did not ask about,
+        another digest or attempt, and answers that differ from the stored
+        ones are refused with 409.
+        """
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_sync_execution(request, source)
+        _require_source_sync_support(source)
+        await _require_current_local_agent_lease(
+            request,
+            db,
+            source=source,
+            job_id=req.local_agent_job_id,
+            attempt_count=req.local_agent_attempt_count,
+        )
+        try:
+            snapshot_id = local_agent_collection_attempt_id(
+                source.get("type"),
+                req.local_agent_job_id,
+                req.local_agent_attempt_count,
+                req.sync_snapshot_id,
+            )
+            await db.write_source_sync_snapshot_confirmations(
+                source_id=source_id,
+                workspace_id=workspace_id,
+                snapshot_id=snapshot_id,
+                manifest_sha256=req.manifest_sha256,
+                local_agent_job_id=req.local_agent_job_id,
+                local_agent_attempt_count=req.local_agent_attempt_count,
+                answers=tuple(
+                    SnapshotConfirmation(
+                        item.doc_id, item.provider_key, SnapshotConfirmationAnswer(item.answer)
+                    )
+                    for item in req.answers
+                ),
+                failure_cause=req.failure_cause,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "source_id": source_id,
+            "snapshot_id": snapshot_id,
+            "answered_count": len(req.answers),
+            "failed": req.failure_cause is not None,
         }
 
     # ===================================================================

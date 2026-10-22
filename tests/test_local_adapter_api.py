@@ -1564,8 +1564,11 @@ def test_github_repo_manifest_reuses_unchanged_input_without_another_package(tmp
             "snapshot_id": "test-local-agent-job-2:attempt:1",
             "coverage": "complete_snapshot",
             "manifest_count": 1,
+            "manifest_sha256": planned.json()["manifest_sha256"],
             "reused_count": 1,
             "required_doc_ids": [],
+            # A repository tree is an existence listing: nothing is confirmed.
+            "confirm": [],
         }
         [first_input] = asyncio.run(
             database.list_source_sync_inputs(

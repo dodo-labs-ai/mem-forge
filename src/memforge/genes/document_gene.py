@@ -96,6 +96,14 @@ agent, submits a complete snapshot manifest of its scope. The run reads that
 manifest as the listing, with the Gene's single listing kind, and never calls
 :meth:`DocumentGene.list_scope`. Such a configuration answers ``True`` from
 :meth:`DocumentGene.lists_scope`, and its ``list_scope`` raises.
+
+A query manifest's unlisted items are confirmed on the device, which holds the
+credential. The server names each one by Document id and provider key: the
+key its Source Unit records, or :meth:`DocumentGene.provider_key` of the
+stored item of a failed Document that never became a Unit. The device rebuilds
+each item with :meth:`DocumentGene.confirmation_item`, runs
+:meth:`DocumentGene.confirm_absent` and posts the answers; the run removes only
+the items answered ``absent``.
 """
 
 from __future__ import annotations
@@ -234,6 +242,46 @@ class DocumentGene(Gene):
         """
 
         raise NotImplementedError(f"{type(self).__name__} cannot confirm absence by identifier")
+
+    @classmethod
+    def snapshot_listing_kind(cls) -> ScopeListingKind:
+        """The kind of listing a device's snapshot manifest is: the single kind this Gene declares.
+
+        Startup refuses a device-collected Gene that declares more or fewer
+        kinds, so only a Gene that is never collected on a device raises here.
+        """
+
+        if len(cls.listing_kinds) != 1:
+            raise ValueError(
+                f"{cls.__name__} is listed by a device's snapshot manifest and must declare exactly one listing kind"
+            )
+        return next(iter(cls.listing_kinds))
+
+    @classmethod
+    def provider_key(cls, item: ContentItem) -> str:
+        """The provider's key of an item, as the item's Source Unit records it.
+
+        A device confirms an item its query manifest leaves out by this key,
+        so a Gene whose device listing is a query implements it, together with
+        :meth:`confirmation_item`. For example, Jira answers the issue id, or
+        the issue key when the item does not record the id. A Document that
+        has a Unit is named by the Unit's key; this is asked only for the
+        stored item of a failed Document that never became one.
+        """
+
+        raise NotImplementedError(f"{cls.__name__} does not name its items' provider keys")
+
+    @classmethod
+    def confirmation_item(cls, document_id: str, provider_key: str) -> ContentItem:
+        """The item :meth:`confirm_absent` reads for one Document the server asks a device to confirm.
+
+        ``provider_key`` is the key the server named it by (see
+        :meth:`provider_key`). The item carries only what ``confirm_absent``
+        needs to ask the provider by identifier; ``confirm_absent`` answers it
+        under ``document_id``.
+        """
+
+        raise NotImplementedError(f"{cls.__name__} cannot rebuild an item to confirm on a device")
 
     @classmethod
     def rediscovers_documents(cls, config: Mapping[str, Any]) -> bool:

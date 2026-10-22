@@ -19,7 +19,9 @@ What each family requires:
   Gene that can produce a query listing implements ``confirm_absent``; one
   that answers ``rediscovers_documents`` implements ``rediscover``. A
   document type collected on a device produces exactly one listing kind,
-  which its device snapshot takes.
+  which its device snapshot takes; when that kind is query, the Gene also
+  implements ``provider_key`` and ``confirmation_item``, by which the device
+  confirms what its manifest leaves out.
 - **A conversation type** names its provider in its descriptor
   (``conversation_provider``), and the provider class defines every member of
   the conversation provider port; a provider whose polls can omit replies
@@ -95,6 +97,12 @@ def _validate_document_gene(descriptor: SourceTypeDescriptor, gene_cls: type[Doc
         raise SourceTypeContractError(
             f"{name}: {gene_cls.__name__} is collected on a device, so it must declare exactly one listing kind"
         )
+    if descriptor.local_agent is not None and ScopeListingKind.QUERY in kinds:
+        missing = [member for member in ("provider_key", "confirmation_item") if not _overrides(gene_cls, member)]
+        if missing:
+            raise SourceTypeContractError(
+                f"{name}: {gene_cls.__name__} is confirmed on a device, so it must implement {', '.join(missing)}"
+            )
 
 
 def _overrides(gene_cls: type[DocumentGene], member: str) -> bool:

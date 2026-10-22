@@ -231,6 +231,39 @@ def test_prepare_local_source_snapshot_posts_complete_fenced_manifest():
             },
         )
     ]
+    # The agent confirms by identifier what a query manifest leaves out.
+    assert LOCAL_PACKAGE_CONTRACT_VERSION == 3
+
+
+def test_submit_local_source_confirmations_posts_answers_bound_to_the_manifest():
+    client = _RecordingClient({"answered_count": 1})
+    binding = {
+        "manifest_sha256": "d" * 64,
+        "sync_snapshot_id": "job-1:attempt:2",
+        "local_agent_job_id": "job-1",
+        "local_agent_attempt_count": 2,
+    }
+
+    answered = client.submit_local_source_confirmations(
+        source_id="src-jira",
+        answers=[{"doc_id": "jira-doc-7", "provider_key": "100007", "answer": "absent"}],
+        **binding,
+    )
+    failed = client.submit_local_source_confirmations(
+        source_id="src-jira", failure_cause="RuntimeError: HTTP 401 from Jira", **binding
+    )
+
+    assert answered == {"answered_count": 1}
+    assert failed == {"answered_count": 1}
+    route = "/api/v1/sources/src-jira/adapter/manifest/confirmations"
+    assert client.calls == [
+        (
+            "POST",
+            route,
+            {**binding, "answers": [{"doc_id": "jira-doc-7", "provider_key": "100007", "answer": "absent"}]},
+        ),
+        ("POST", route, {**binding, "answers": [], "failure_cause": "RuntimeError: HTTP 401 from Jira"}),
+    ]
 
 
 def test_push_jira_package_posts_raw_payload_without_markdown_body():

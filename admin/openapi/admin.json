@@ -3148,6 +3148,92 @@
         "title": "LocalCollectionReceiptResponse",
         "type": "object"
       },
+      "LocalSourceConfirmationAnswerRequest": {
+        "description": "The device's answer for one item its manifest response asked it to confirm.",
+        "properties": {
+          "answer": {
+            "enum": [
+              "absent",
+              "exists",
+              "hidden"
+            ],
+            "title": "Answer",
+            "type": "string"
+          },
+          "doc_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Doc Id",
+            "type": "string"
+          },
+          "provider_key": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Provider Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "doc_id",
+          "provider_key",
+          "answer"
+        ],
+        "title": "LocalSourceConfirmationAnswerRequest",
+        "type": "object"
+      },
+      "LocalSourceConfirmationsRequest": {
+        "description": "A device's answers for the items its query manifest left out, bound to that manifest.\n\n``manifest_sha256`` is the digest the manifest response returned, and the\njob attempt is the one that submitted the manifest. The request answers\nevery item the response named in ``confirm``, or, when the device could\nnot confirm them, gives ``failure_cause`` and no answers.",
+        "properties": {
+          "answers": {
+            "items": {
+              "$ref": "#/components/schemas/LocalSourceConfirmationAnswerRequest"
+            },
+            "maxItems": 10000,
+            "title": "Answers",
+            "type": "array"
+          },
+          "failure_cause": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Cause"
+          },
+          "local_agent_attempt_count": {
+            "minimum": 1.0,
+            "title": "Local Agent Attempt Count",
+            "type": "integer"
+          },
+          "local_agent_job_id": {
+            "title": "Local Agent Job Id",
+            "type": "string"
+          },
+          "manifest_sha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Manifest Sha256",
+            "type": "string"
+          },
+          "sync_snapshot_id": {
+            "title": "Sync Snapshot Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sync_snapshot_id",
+          "local_agent_job_id",
+          "local_agent_attempt_count",
+          "manifest_sha256"
+        ],
+        "title": "LocalSourceConfirmationsRequest",
+        "type": "object"
+      },
       "LocalSourceManifestItemRequest": {
         "description": "One item of a device manifest: the item as the device read it.",
         "properties": {
@@ -15493,6 +15579,57 @@
           }
         },
         "summary": "Prepare Local Source Manifest",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/api/v1/sources/{source_id}/adapter/manifest/confirmations": {
+      "post": {
+        "description": "Store a device's answers for the items its manifest response asked it to confirm.\n\nThe answers bind to the job attempt and the digest of the manifest. An\nidentical replay is accepted; an item the manifest did not ask about,\nanother digest or attempt, and answers that differ from the stored\nones are refused with 409.",
+        "operationId": "submit_local_source_confirmations_api_v1_sources__source_id__adapter_manifest_confirmations_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LocalSourceConfirmationsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Local Source Confirmations",
         "tags": [
           "sources"
         ]
