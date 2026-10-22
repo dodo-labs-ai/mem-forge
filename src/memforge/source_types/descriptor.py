@@ -37,15 +37,19 @@ class LocalAgentCollection:
     ``collects`` says whether one configuration is collected by the agent; a
     type such as Jira is collected on the server unless configured otherwise.
     ``immutable_execution_fields`` choose between the two executors, so a
-    stored Source never changes them. ``replay_adapter`` names the class that
-    reads the packages the agent uploads.
+    stored Source never changes them. ``package_submitter`` names the
+    function that accepts one package the agent uploads, and
+    ``replay_adapter`` the class that reads it back during sync. A type with
+    ``accepts_artifact_inputs`` takes binary inputs for its packages.
     """
 
     operation: str
     job_config_fields: frozenset[str]
     collects: Callable[[Mapping[str, Any]], bool] = lambda _config: True
     immutable_execution_fields: tuple[str, ...] = ()
+    package_submitter: str | None = None
     replay_adapter: str | None = None
+    accepts_artifact_inputs: bool = False
     job_config_defaults: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
     def replay_adapter_instance(self) -> LocalSourceReplayAdapter | None:

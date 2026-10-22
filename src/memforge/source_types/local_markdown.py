@@ -35,6 +35,7 @@ DESCRIPTOR = SourceTypeDescriptor(
     local_agent=LocalAgentCollection(
         operation="local_markdown_sync",
         job_config_fields=frozenset({"root", "vault_id", "include", "exclude"}),
+        package_submitter="memforge.local_adapter:submit_local_markdown_request",
         replay_adapter="memforge.local_agent.replay_adapter:LocalMarkdownReplayAdapter",
     ),
     config=SourceConfigPolicy(complete=_complete_config, store=_store_config),

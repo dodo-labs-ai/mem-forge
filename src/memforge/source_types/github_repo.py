@@ -61,7 +61,9 @@ DESCRIPTOR = SourceTypeDescriptor(
         job_config_fields=frozenset({"repo_url", "ref", "include_paths", "exclude_paths", "include_extensions"}),
         collects=_pushed_by_local_agent,
         immutable_execution_fields=("connection_mode",),
+        package_submitter="memforge.local_adapter:submit_github_repo_request",
         replay_adapter="memforge.local_agent.replay_adapter:GitHubRepoReplayAdapter",
+        accepts_artifact_inputs=True,
     ),
     config=SourceConfigPolicy(validate_input=validate_config, store=_store_config),
 )

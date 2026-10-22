@@ -226,7 +226,12 @@ from memforge.source_projection import (
     ProjectionScopeTransition,
 )
 from memforge.source_projection_config import projection_scope_transition_id, source_access_context
-from memforge.source_types import SourceConfigPolicy, source_type_descriptor
+from memforge.source_types import (
+    LocalAgentCollection,
+    SourceConfigPolicy,
+    load_reference,
+    source_type_descriptor,
+)
 from memforge.source_types.jira import jira_auth_mode
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.storage.document_store import LocalDocumentStore
@@ -2987,6 +2992,11 @@ class MemoryReviewDecisionManifestResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _local_agent_collection(source_type: object) -> LocalAgentCollection | None:
+    descriptor = source_type_descriptor(source_type)
+    return descriptor.local_agent if descriptor is not None else None
 
 
 def _config_policy(source_type: str) -> SourceConfigPolicy:
@@ -8359,7 +8369,8 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        if source.get("type") not in {"github_repo", "jira"} and _conversation_gene(source) is None:
+        collection = _local_agent_collection(source.get("type"))
+        if not (collection is not None and collection.accepts_artifact_inputs) and _conversation_gene(source) is None:
             raise HTTPException(status_code=400, detail="source does not support local Artifact inputs")
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
@@ -8446,24 +8457,12 @@ def create_admin_app(
         send raw file text or structured source payloads; source genes perform
         canonical markdown normalization during sync.
         """
-        from memforge.local_adapter import (
-            GITHUB_REPO_SOURCE_TYPE,
-            JIRA_SOURCE_TYPE,
-            LOCAL_MARKDOWN_SOURCE_TYPE,
-            submit_github_repo_document,
-            submit_jira_package,
-            submit_local_markdown_document,
-        )
-
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         source_type = source.get("type")
-        if source_type not in {
-            LOCAL_MARKDOWN_SOURCE_TYPE,
-            GITHUB_REPO_SOURCE_TYPE,
-            JIRA_SOURCE_TYPE,
-        }:
+        collection = _local_agent_collection(source_type)
+        if collection is None or collection.package_submitter is None:
             raise HTTPException(
                 status_code=400,
                 detail=(f"source {source_id} is type {source_type!r}, not a local adapter source"),
@@ -8500,63 +8499,18 @@ def create_admin_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        submit_package = load_reference(collection.package_submitter)
         try:
-            if source_type == GITHUB_REPO_SOURCE_TYPE:
-                result = await submit_github_repo_document(
-                    db=db,
-                    workspace_id=workspace_id,
-                    config=config,
-                    source=source,
-                    repo_url=req.repo_url or "",
-                    repo_ref=req.repo_ref or "",
-                    relative_path=req.relative_path,
-                    markdown_body=req.markdown_body,
-                    content_type=req.content_type,
-                    title=req.title,
-                    raw_hash=req.raw_hash,
-                    blob_sha=req.blob_sha,
-                    symlink_chain=req.symlink_chain,
-                    resolved_relative_path=req.resolved_relative_path,
-                    source_updated_at=req.source_updated_at,
-                    submitted_by=req.submitted_by,
-                    submitted_at=req.submitted_at,
-                    document_store=artifact_store,
-                    sync_snapshot_id=input_snapshot_id,
-                    source_artifacts=source_artifacts,
-                )
-            elif source_type == JIRA_SOURCE_TYPE:
-                result = await submit_jira_package(
-                    db=db,
-                    config=config,
-                    source=source,
-                    base_url=req.base_url or "",
-                    issue_key=req.issue_key or "",
-                    raw_payload=req.raw_payload,
-                    source_url=req.source_url or "",
-                    title=req.title,
-                    raw_hash=req.raw_hash,
-                    provider_revision=req.provider_revision,
-                    submitted_by=req.submitted_by,
-                    submitted_at=req.submitted_at,
-                    document_store=artifact_store,
-                    source_artifacts=source_artifacts,
-                )
-            else:
-                result = await submit_local_markdown_document(
-                    db=db,
-                    config=config,
-                    source=source,
-                    vault_id=req.vault_id or "",
-                    relative_path=req.relative_path,
-                    markdown_body=req.markdown_body,
-                    content_type=req.content_type,
-                    title=req.title,
-                    raw_hash=req.raw_hash,
-                    source_updated_at=req.source_updated_at,
-                    submitted_by=req.submitted_by,
-                    submitted_at=req.submitted_at,
-                    document_store=artifact_store,
-                )
+            result = await submit_package(
+                req,
+                db=db,
+                workspace_id=workspace_id,
+                config=config,
+                source=source,
+                document_store=artifact_store,
+                sync_snapshot_id=input_snapshot_id,
+                source_artifacts=source_artifacts,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
