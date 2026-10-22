@@ -4,7 +4,8 @@ Space PAY holds root 100 with children 101 and 102; 102 carries the excluded
 label ``draft`` and has a child 103. Discovery of the page tree therefore
 visits 100, 101 and 102 and yields 100 and 101; discovery of the space visits
 every PAY page and yields all but 102. Page 200 is in space OPS, outside both
-scopes, and page 300 is gone.
+scopes, 150 is a blog post in PAY, which no page listing returns, and page 300
+is gone.
 """
 
 from __future__ import annotations
@@ -31,14 +32,16 @@ from tests.contracts.document_fakes import (
 BASE_URL = "https://wiki.example.test"
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 
-# page id -> (space, parent page id, labels, changed at)
+# content id -> (space, parent page id, labels, changed at)
 PAGES: dict[str, tuple[str, str | None, tuple[str, ...], datetime]] = {
     "100": ("PAY", None, (), LONG_AGO),
     "101": ("PAY", "100", (), RECENTLY),
     "102": ("PAY", "100", ("draft",), LONG_AGO),
     "103": ("PAY", "102", (), RECENTLY),
+    "150": ("PAY", "100", (), RECENTLY),
     "200": ("OPS", None, (), RECENTLY),
 }
+BLOG_POSTS = {"150"}
 GONE_PAGE = "300"
 
 _CONNECTION = {"base_url": BASE_URL, "pat": "token", "exclude_labels": ["draft"]}
@@ -57,7 +60,7 @@ def _page_header(page_id: str) -> dict:
     space, _parent, labels, changed_at = PAGES[page_id]
     return {
         "id": page_id,
-        "type": "page",
+        "type": "blogpost" if page_id in BLOG_POSTS else "page",
         "status": "current",
         "title": f"Page {page_id}",
         "space": {"key": space},
@@ -105,11 +108,13 @@ class _Provider:
         if self.listing is ProviderListing.FAILED:
             return httpx.Response(500, json={"message": "Internal server error"})
         start = int(params.get("start", 0))
+        pages = {page_id: page for page_id, page in PAGES.items() if page_id not in BLOG_POSTS}
         if path == "/content":
-            members = [page_id for page_id, (space, *_rest) in PAGES.items() if space == params.get("spaceKey")]
+            assert params.get("type") == "page"
+            members = [page_id for page_id, (space, *_rest) in pages.items() if space == params.get("spaceKey")]
         else:
             parent = path.removeprefix("/content/").removesuffix("/child/page")
-            members = [page_id for page_id, (_space, page_parent, *_rest) in PAGES.items() if page_parent == parent]
+            members = [page_id for page_id, (_space, page_parent, *_rest) in pages.items() if page_parent == parent]
         if self.listing is ProviderListing.TRUNCATED and members:
             # The first page claims more; the next one returns nothing.
             return httpx.Response(

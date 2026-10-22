@@ -412,12 +412,21 @@ class ConfluenceGene(DocumentGene):
         return True
 
     async def rediscover(self, item: ContentItem) -> ContentItem | None:
-        """Read one page as a full discovery would list it, or ``None`` when it would not.
+        """Read one page by id and return it only when a full discovery would yield it.
 
-        A full discovery lists a page it would keep: in space mode a current
-        page of a configured space; in page tree mode the root page, or a
-        current page reached from the root through current pages without an
-        excluded label. A page carrying an excluded label is never listed.
+        The predicates are discovery's own:
+
+        - **Space mode:** a current page (not a blog post or other content) of
+          a configured space; discovery asks each space for its pages.
+        - **Page tree mode:** the root page itself; or, with child pages
+          included, a current page whose ancestors below the root are current
+          pages without an excluded label, because discovery walks
+          ``child/page`` from the root and does not descend below such a page.
+        - **Either mode:** a page carrying an excluded label is never yielded.
+
+        ``None`` when a predicate fails or Confluence answers not found or
+        gone, which is also how a page in the trash answers. Any other error
+        raises.
         """
         self.normalize_config(self.config)
         page_id = str(item.extra.get("page_id") or item.item_id.removeprefix(_PAGE_DOC_ID_PREFIX))
@@ -436,7 +445,8 @@ class ConfluenceGene(DocumentGene):
         listed = (
             self._page_tree_lists(page, exclude_labels)
             if page_tree
-            else self._page_status(page) == _CURRENT_PAGE_STATUS
+            else self._is_page(page)
+            and self._page_status(page) == _CURRENT_PAGE_STATUS
             and str((page.get("space") or {}).get("key") or "") in self._space_keys(self.config.get("spaces"))
         )
         if not listed:
@@ -448,7 +458,11 @@ class ConfluenceGene(DocumentGene):
         root_id = str(self.config.get("page_tree_root") or "").strip()
         if str(page.get("id") or "").strip() == root_id:
             return True
-        if not self.config.get("include_children", True) or self._page_status(page) != _CURRENT_PAGE_STATUS:
+        if (
+            not self.config.get("include_children", True)
+            or not self._is_page(page)
+            or self._page_status(page) != _CURRENT_PAGE_STATUS
+        ):
             return False
         ancestors = page.get("ancestors") if isinstance(page.get("ancestors"), list) else []
         ancestor_ids = [str((ancestor or {}).get("id") or "") for ancestor in ancestors]
@@ -462,6 +476,11 @@ class ConfluenceGene(DocumentGene):
             and not self._has_excluded_label(ancestor, exclude_labels)
             for ancestor in below_root
         )
+
+    @staticmethod
+    def _is_page(content: dict) -> bool:
+        """Whether a content record is a page; discovery never lists a blog post, comment or attachment."""
+        return str(content.get("type") or "page") == "page"
 
     @staticmethod
     def _page_status(page: dict) -> str:

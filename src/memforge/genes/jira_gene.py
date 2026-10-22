@@ -19,7 +19,6 @@ from urllib.parse import urlsplit
 import httpx
 
 from memforge.genes.atlassian_auth import (
-    ATLASSIAN_ABSENT_STATUS_CODES,
     atlassian_record_state,
     atlassian_request_limiter,
     bearer_headers,
@@ -100,6 +99,15 @@ def _delta_clause(since: datetime) -> str:
     return f"updated >= '{since.strftime('%Y-%m-%d %H:%M')}'"
 
 
+def _split_order_by(raw_jql: str) -> tuple[str, str | None]:
+    """A user-authored JQL's where clause and its ORDER BY, or ``None`` when it has none."""
+    query = raw_jql.strip()
+    match = _ORDER_BY_RE.search(query)
+    if match is None:
+        return query, None
+    return query[: match.start()].strip(), query[match.start():].strip()
+
+
 def _augment_advanced_jql(raw_jql: str, since: datetime | None, order_by: str | None = None) -> str:
     """Use a user-authored JQL as-is, injecting the delta clause before ORDER BY.
 
@@ -108,18 +116,35 @@ def _augment_advanced_jql(raw_jql: str, since: datetime | None, order_by: str | 
     is AND-ed onto the where clause (wrapped in parentheses so a top-level OR
     keeps its meaning).
     """
-    query = raw_jql.strip()
-    match = _ORDER_BY_RE.search(query)
-    if match:
-        where = query[: match.start()].strip()
-        order = query[match.start():].strip()
-    else:
-        where = query
-        order = _DEFAULT_ORDER_BY
+    where, order = _split_order_by(raw_jql)
     if since:
         delta = _delta_clause(since)
         where = f"({where}) AND {delta}" if where else delta
-    return f"{where} {order_by or order}".strip()
+    return f"{where} {order_by or order or _DEFAULT_ORDER_BY}".strip()
+
+
+def _scope_where(config: Mapping[str, Any]) -> str:
+    """The configured scope as a JQL where clause, without the ``since`` filter or an ORDER BY.
+
+    Empty when an advanced JQL has no condition, which selects every issue the
+    credential can see.
+    """
+    if str(config.get("query_mode") or JIRA_QUERY_MODE_SIMPLE).strip().lower() == JIRA_QUERY_MODE_ADVANCED:
+        where, _order = _split_order_by(str(config.get("jql") or ""))
+        return where
+
+    projects = config.get("projects", [])
+    if isinstance(projects, str):
+        projects = [p.strip() for p in projects.split(",") if p.strip()]
+    issue_types = config.get("issue_types", DEFAULT_ISSUE_TYPES)
+    if isinstance(issue_types, str):
+        issue_types = [t.strip() for t in issue_types.split(",") if t.strip()]
+    jql_filter = config.get("jql_filter", "")
+
+    where = f"project in ({','.join(projects)}) AND issuetype in ({','.join(issue_types)})"
+    if jql_filter:
+        where += f" AND ({jql_filter})"
+    return where
 
 
 def _build_jql(config: dict, since: datetime | None, *, order_by: str | None = None) -> str:
@@ -132,21 +157,21 @@ def _build_jql(config: dict, since: datetime | None, *, order_by: str | None = N
     if str(config.get("query_mode") or JIRA_QUERY_MODE_SIMPLE).strip().lower() == JIRA_QUERY_MODE_ADVANCED:
         return _augment_advanced_jql(str(config.get("jql") or ""), since, order_by)
 
-    projects = config.get("projects", [])
-    if isinstance(projects, str):
-        projects = [p.strip() for p in projects.split(",") if p.strip()]
-    issue_types = config.get("issue_types", DEFAULT_ISSUE_TYPES)
-    if isinstance(issue_types, str):
-        issue_types = [t.strip() for t in issue_types.split(",") if t.strip()]
-    jql_filter = config.get("jql_filter", "")
-
-    jql = f"project in ({','.join(projects)}) AND issuetype in ({','.join(issue_types)})"
-    if jql_filter:
-        jql += f" AND ({jql_filter})"
+    jql = _scope_where(config)
     if since:
         jql += f" AND {_delta_clause(since)}"
     jql += f" {order_by or _DEFAULT_ORDER_BY}"
     return jql
+
+
+def _single_issue_jql(config: Mapping[str, Any], issue_ref: str) -> str:
+    """Search for one issue, by id or key, only within the configured scope.
+
+    The scope's where clause is parenthesized, so a top-level OR in an
+    advanced JQL cannot widen the search beyond the one issue.
+    """
+    where = _scope_where(config)
+    return f"issuekey = {issue_ref} AND ({where})" if where else f"issuekey = {issue_ref}"
 
 
 def _issue_doc_id(issue_key: str) -> str:
@@ -533,23 +558,32 @@ class JiraGene(DocumentGene):
         return " AND ".join(parts) or None
 
     async def rediscover(self, item: ContentItem) -> ContentItem | None:
-        """Read one issue as discovery does, by its stable id when the stored item has it."""
+        """Search for one issue within the configured JQL, as a full discovery would list it.
+
+        The search is ``issuekey = <id> AND (<where clause>)``, by the stored
+        issue's stable id when the stored item has it, so an issue moved to
+        another project is still found while it matches. ``None`` means a full
+        discovery would not list the issue now: it is deleted, no longer
+        visible to the credential, or no longer matches the JQL. The search
+        is not validated, so an unknown id gives no result instead of an
+        error; a search that fails or pages inconsistently raises.
+        """
         issue_ref = _issue_ref(item)
-        try:
-            resp = await self._request(
-                "GET",
-                f"/rest/api/2/issue/{issue_ref}",
-                params={"fields": ",".join(JIRA_SEARCH_FIELDS), "expand": ",".join(JIRA_SEARCH_EXPAND)},
+        issues = [
+            issue
+            async for issue in self._search_issues(
+                _single_issue_jql(self.config, issue_ref),
+                fields=JIRA_SEARCH_FIELDS,
+                expand=JIRA_SEARCH_EXPAND,
+                max_results=1,
+                validate_query=False,
             )
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in ATLASSIAN_ABSENT_STATUS_CODES:
-                return None
-            raise
-        issue = resp.json()
-        if not isinstance(issue, dict) or not str(issue.get("id") or "").strip().isdigit():
-            raise RuntimeError("Jira issue response is missing a stable id")
-        if not str(issue.get("key") or "").strip() or not isinstance(issue.get("fields"), dict):
-            raise RuntimeError("Jira issue response is missing its key or fields")
+        ]
+        if not issues:
+            return None
+        if len(issues) > 1 or issue_ref not in (str(issues[0]["id"]), str(issues[0]["key"])):
+            raise RuntimeError(f"Jira search for issue {issue_ref} returned another issue")
+        issue = issues[0]
         current = _issue_content_item(issue, self._base_url)
         self._hydrated_issues[current.extra["issue_key"]] = issue
         return current
