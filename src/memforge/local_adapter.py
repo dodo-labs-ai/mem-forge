@@ -841,4 +841,3 @@ async def submit_local_markdown_request(
         submitted_at=req.submitted_at,
         document_store=document_store,
     )
-

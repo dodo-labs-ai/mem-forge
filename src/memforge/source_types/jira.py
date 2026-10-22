@@ -98,7 +98,6 @@ def validate_scope(config: Mapping[str, Any]) -> None:
         raise ValueError("Jira Projects to Sync is required in simple query mode")
 
 
-
 def _store_config(config: dict[str, Any], local_inbox: LocalInbox) -> dict[str, Any]:
     # Browser sessions belong to the shared auth sessions, never to one Source.
     for key in _SOURCE_OWNED_COOKIE_FIELDS:
@@ -107,7 +106,7 @@ def _store_config(config: dict[str, Any], local_inbox: LocalInbox) -> dict[str, 
         for key in _PAT_FIELDS:
             config.pop(key, None)
     if _read_by_local_agent(config):
-        config["local_agent_documents_dir"] = local_inbox("local_agent_documents_dir")
+        config["local_agent_documents_dir"] = local_inbox()
     else:
         config.pop("local_agent_documents_dir", None)
     return config

@@ -18,6 +18,7 @@ from memforge.models import (
 )
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.storage.database import Database
+from tests.memory_store_fixture import OrchestratorMemoryStore
 from tests.test_sync_bookkeeping import (
     ProjectionFragmentRecordingExtractor,
     StubDocumentStore,
@@ -563,7 +564,7 @@ def test_source_list_returns_the_document_parts_the_latest_sync_left_unread(tmp_
                 doc_store=StubDocumentStore(),
                 memory_extractor=extractor,
                 memory_engine=engine,
-                memory_store=None,
+                memory_store=OrchestratorMemoryStore(database),
                 max_concurrent=1,
                 retry_sleep=_skip_retry_delay,
             ).sync_gene(gene=_IssueGene(0, 1), source_name="Jira", source_id=source_id, force_full_sync=True)

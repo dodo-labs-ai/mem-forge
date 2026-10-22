@@ -115,6 +115,7 @@ from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.source_sync_manifest import SourceSyncManifestStore
 from memforge.scheduler import SOURCE_SCHEDULE_SCAN_JOB_ID, SyncScheduler
+from tests.memory_store_fixture import OrchestratorMemoryStore
 from tests.llm_fixture import AdmittingClient, NoopMemoryExtractor, fixture_request_planner
 from tests.unit_support_fixture import active_support_evidence
 from tests.embedding_fixture import unconfigured_embedding
@@ -2288,7 +2289,7 @@ async def test_shared_extraction_pool_caps_orchestrator_work_across_sources(db: 
             doc_store=StubDocumentStore(),
             memory_extractor=extractor,
             memory_engine=NoopMemoryEngine(),
-            memory_store=None,
+            memory_store=OrchestratorMemoryStore(db),
             max_concurrent=4,
             extraction_pool=pool,
         )
@@ -2340,7 +2341,7 @@ async def test_document_lifecycle_admission_caps_fetch_across_sources(db: Databa
             doc_store=StubDocumentStore(),
             memory_extractor=NoopMemoryExtractor(),
             memory_engine=NoopMemoryEngine(),
-            memory_store=None,
+            memory_store=OrchestratorMemoryStore(db),
             max_concurrent=2,
             document_lifecycle_admission=admission,
         )
@@ -2423,7 +2424,7 @@ async def test_document_lifecycle_admission_does_not_prequeue_one_source_ahead_o
             doc_store=StubDocumentStore(),
             memory_extractor=NoopMemoryExtractor(),
             memory_engine=NoopMemoryEngine(),
-            memory_store=None,
+            memory_store=OrchestratorMemoryStore(db),
             max_concurrent=3,
             document_lifecycle_admission=admission,
         )
@@ -2726,7 +2727,7 @@ async def test_sync_gene_binds_document_store_at_pipeline_boundary(db: Database)
         doc_store=doc_store,
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
     )
 
     state = await orchestrator.sync_gene(
@@ -2846,22 +2847,15 @@ class NoopMemoryEngine:
         return {"retired": 0, "pending_review": 0, "can_delete_document": True}
 
 
-class FailingDocumentDeleteMemoryStore:
+class FailingDocumentDeleteMemoryStore(OrchestratorMemoryStore):
     async def delete_projected_document(self, doc_id: str, **kwargs):
         raise RuntimeError("delete document failed")
 
 
-class RecordingDocumentDeleteMemoryStore:
-    def __init__(self, db: Database) -> None:
-        self.db = db
-        self.calls: list[tuple[str, dict]] = []
-
-    async def delete_projected_document(self, doc_id: str, **kwargs):
-        self.calls.append((doc_id, kwargs))
-        await self.db.delete_projected_document(doc_id, source_id=kwargs["source_id"])
-
-    async def attempt_lifecycle_vector_delivery(self, *, source_id: str) -> None:
-        del source_id
+class RecordingDocumentDeleteMemoryStore(OrchestratorMemoryStore):
+    @property
+    def calls(self) -> list[tuple[str, dict]]:
+        return self.deleted
 
 
 class CountingMemoryEngine(NoopMemoryEngine):
@@ -3350,8 +3344,9 @@ class MixedBudgetConvergenceMemoryEngine(NoopMemoryEngine):
         )
 
 
-class FailingLifecycleOutboxMemoryStore:
+class FailingLifecycleOutboxMemoryStore(OrchestratorMemoryStore):
     def __init__(self) -> None:
+        super().__init__()
         self.drain_calls = 0
 
     async def attempt_lifecycle_vector_delivery(self, *args, **kwargs):
@@ -3370,7 +3365,7 @@ class FailingLifecycleOutboxMemoryStore:
         )
 
 
-class RaisingLifecycleOutboxMemoryStore:
+class RaisingLifecycleOutboxMemoryStore(OrchestratorMemoryStore):
     async def attempt_lifecycle_vector_delivery(self, *, source_id: str) -> None:
         raise RuntimeError(f"temporary vector failure for {source_id}")
 
@@ -3477,7 +3472,7 @@ async def test_unchanged_multi_observation_projection_skips_full_document_extrac
         doc_store=StubDocumentStore(),
         memory_extractor=extractor,
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=2,
     )
 
@@ -3780,7 +3775,7 @@ async def test_artifact_only_source_unit_enters_multimodal_extraction(db: Databa
         doc_store=StubDocumentStore(),
         memory_extractor=extractor,
         memory_engine=memory_engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -4153,6 +4148,9 @@ class LargeConfluenceGene(UpdatingDocumentGene):
     async def fetch(self, item):
         return _confluence_raw_content(item, self.markdown)
 
+    async def fetch_pdf(self, item):
+        return None
+
     @classmethod
     def metadata(cls):
         return GeneMetadata(
@@ -4281,7 +4279,7 @@ async def test_projection_images_load_only_after_shared_multimodal_admission(
             doc_store=store,
             memory_extractor=extractor,
             memory_engine=NoopMemoryEngine(),
-            memory_store=None,
+            memory_store=OrchestratorMemoryStore(db),
             max_concurrent=2,
             extraction_pool=shared_pool,
         )
@@ -4802,7 +4800,7 @@ async def test_derivation_recovery_resumes_active_v9_before_provider_work(
             fail_if_called=True,
         ),
         memory_engine=recovery_engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -4855,7 +4853,7 @@ async def test_derivation_recovery_supersedes_incomplete_work_of_an_earlier_cont
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(fail_if_called=True),
         memory_engine=recovery_engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -4890,7 +4888,7 @@ async def test_recovered_deferred_lifecycle_joins_commit_only_convergence(
             fail_if_called=True,
         ),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -4938,7 +4936,7 @@ async def test_exact_provider_rediscovery_reuses_recovered_deferred_intent(
             fail_if_called=True,
         ),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -4980,7 +4978,7 @@ async def test_a_recovered_derivation_counts_the_document_parts_it_left_unread(
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(fail_if_called=True),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -5014,7 +5012,7 @@ async def test_newer_provider_target_supersedes_recovered_deferred_intent(
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -5079,7 +5077,7 @@ async def test_failed_newer_provider_target_still_supersedes_recovered_intent(
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     )
@@ -5131,7 +5129,7 @@ async def test_successful_recovery_is_counted_without_provider_rediscovery(
             fail_if_called=True,
         ),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -5167,7 +5165,7 @@ async def test_successful_recovery_keeps_counts_on_exact_provider_rediscovery(
             fail_if_called=True,
         ),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -5226,7 +5224,7 @@ async def test_recovered_external_blocker_does_not_stop_provider_discovery(
             fail_if_called=True,
         ),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -5279,7 +5277,7 @@ async def test_derivation_recovery_commits_the_current_policy_identity(
         doc_store=StubDocumentStore(),
         memory_extractor=extractor,
         memory_engine=recovery_engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -5333,7 +5331,7 @@ async def test_policy_replacement_failure_preserves_recoverable_new_work(
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=LockedProjectedMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -5379,7 +5377,7 @@ async def test_sync_supersedes_completed_derivation_when_its_lifecycle_plan_is_a
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentCandidateExtractor(),
         memory_engine=memory_engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -5443,7 +5441,7 @@ async def test_sync_memory_observer_records_discovery_and_document_stages(db: Da
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         memory_observer=observer,
     )
@@ -5501,7 +5499,7 @@ async def test_document_lifecycle_reclaims_process_memory_after_each_document(
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         memory_observer=observer,
         memory_reclaimer=reclaimer,
@@ -5546,7 +5544,7 @@ async def test_sync_memory_observer_records_pdf_export_stage(db: Database):
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         memory_observer=observer,
     )
@@ -5581,7 +5579,7 @@ async def test_sync_memory_observer_records_lifecycle_exit_when_document_fails(d
         doc_store=StubDocumentStore(),
         memory_extractor=FailingMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         memory_observer=observer,
         retry_sleep=_skip_retry_delay,
@@ -5618,7 +5616,7 @@ async def test_successful_zero_change_sync_advances_last_sync_and_keeps_doc_coun
         doc_store=StubDocumentStore(),
         memory_extractor=None,
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
     )
 
     state = await orchestrator.sync_gene(
@@ -5667,7 +5665,7 @@ async def test_supported_configured_sources_reach_shared_lifecycle_execution_sea
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     ).sync_gene(
         gene=gene_type("# Decision\n\nUse the shared lifecycle seam."),
@@ -5756,7 +5754,7 @@ async def test_incremental_sync_uses_overlap_window_for_discovery(db: Database):
         doc_store=StubDocumentStore(),
         memory_extractor=None,
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
     )
 
     state = await orchestrator.sync_gene(
@@ -5828,7 +5826,7 @@ async def test_force_full_sync_ignores_incremental_cursor(db: Database):
         doc_store=None,
         memory_extractor=None,
         memory_engine=None,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
     )
 
     await orchestrator.sync_gene(
@@ -5860,7 +5858,7 @@ async def test_authoritative_snapshot_ignores_cursor_without_forcing_reprocessin
         doc_store=None,
         memory_extractor=None,
         memory_engine=None,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
     )
 
     await orchestrator.sync_gene(
@@ -5898,7 +5896,7 @@ async def test_complete_source_scope_transition_forces_snapshot_and_applies(db: 
         doc_store=None,
         memory_extractor=None,
         memory_engine=None,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
     )
 
     state = await orchestrator.sync_gene(gene, "Architecture", source_id)
@@ -5937,7 +5935,7 @@ async def test_scope_transition_reenters_same_durable_run_on_worker_retry(db: Da
         doc_store=None,
         memory_extractor=None,
         memory_engine=None,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
     )
 
     state = await orchestrator.sync_gene(
@@ -6018,7 +6016,7 @@ async def test_partial_conversation_scope_transition_preserves_old_membership(db
         doc_store=None,
         memory_extractor=None,
         memory_engine=None,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
     )
 
     state = await orchestrator.sync_gene(gene, "Teams", source_id)
@@ -6057,7 +6055,7 @@ async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_
         doc_store=doc_store,
         memory_extractor=extractor,
         memory_engine=memory_engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -6112,7 +6110,7 @@ async def test_force_resync_extracts_a_unit_whose_location_alone_changed(
         doc_store=doc_store,
         memory_extractor=extractor,
         memory_engine=memory_engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -6153,7 +6151,7 @@ async def test_document_last_modified_is_not_read_as_memory_source_updated_at(db
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=memory_engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -6190,7 +6188,7 @@ async def test_gene_reported_source_updated_at_becomes_memory_source_updated_at(
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=memory_engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -6295,7 +6293,7 @@ async def test_auth_failure_records_failed_sync_state_without_secondary_error(db
         doc_store=None,
         memory_extractor=None,
         memory_engine=None,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
     )
 
     state = await orchestrator.sync_gene(
@@ -6330,7 +6328,7 @@ async def test_source_configuration_failure_is_returned_as_non_retryable(db: Dat
         doc_store=None,
         memory_extractor=None,
         memory_engine=None,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
     )
 
     state = await orchestrator.sync_gene(
@@ -6362,7 +6360,7 @@ async def test_sync_pipeline_can_delegate_terminal_result_persistence(db: Databa
         doc_store=StubDocumentStore(),
         memory_extractor=None,
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
     )
 
     state = await orchestrator.sync_gene(
@@ -9391,7 +9389,7 @@ async def test_document_is_indexed_before_enrichment(db: Database):
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -9426,7 +9424,7 @@ async def test_normal_sync_reconciles_empty_revision_without_llm_extraction(
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=first_engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
     )
     assert (
         await first.sync_gene(
@@ -9449,7 +9447,7 @@ async def test_normal_sync_reconciles_empty_revision_without_llm_extraction(
         doc_store=StubDocumentStore(),
         memory_extractor=SemanticWorkMustNotRun(),
         memory_engine=empty_engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
     )
     state = await second.sync_gene(
         gene=EmptyGitHubPagesBlockingFetchGene(item_count=1, release=release),
@@ -10035,7 +10033,7 @@ async def test_document_retry_does_not_retain_failed_traceback_locals(
         doc_store=StubDocumentStore(),
         memory_extractor=extractor,
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         retry_sleep=assert_traceback_released,
     )
@@ -10399,7 +10397,7 @@ async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(d
         doc_store=doc_store,
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
     first_state = await first.sync_gene(
@@ -10420,7 +10418,7 @@ async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(d
         doc_store=doc_store,
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=failing_engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     )
@@ -10444,7 +10442,7 @@ async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(d
         doc_store=doc_store,
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=retry_engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
     retry_state = await retry.sync_gene(
@@ -10483,7 +10481,7 @@ async def test_non_retryable_lifecycle_failure_stops_document_and_run_retry(
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     ).sync_gene(
@@ -10523,7 +10521,7 @@ async def test_same_run_deferred_lifecycle_uses_commit_only_convergence(
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     ).sync_gene(
@@ -10561,7 +10559,7 @@ async def test_deferred_lifecycle_does_not_retry_external_blocker(
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     ).sync_gene(
@@ -10599,7 +10597,7 @@ async def test_deferred_lifecycle_converges_across_bounded_rounds(
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     ).sync_gene(
@@ -10640,7 +10638,7 @@ async def test_deferred_lifecycle_stops_immediately_when_round_makes_no_progress
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     ).sync_gene(
@@ -10677,7 +10675,7 @@ async def test_deferred_lifecycle_converges_after_same_run_tombstone(
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     ).sync_gene(
         gene=BlockingFetchGene(item_count=2, release=release),
@@ -10779,7 +10777,7 @@ async def test_a_new_unit_commits_before_the_unit_it_replaces_is_removed(db: Dat
     )
     first = await GeneSyncOrchestrator(
         db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
-        memory_engine=NoopMemoryEngine(), memory_store=None, max_concurrent=1,
+        memory_engine=NoopMemoryEngine(), memory_store=OrchestratorMemoryStore(db), max_concurrent=1,
     ).sync_gene(gene=_IssueGene(0, 2), source_name="Jira", source_id=source_id, force_full_sync=True)
     assert first.last_sync_status == "success"
     engine = _OrderRecordingMemoryEngine(defer=defer)
@@ -10804,7 +10802,7 @@ async def test_a_new_unit_that_fails_for_good_keeps_the_old_unit(db: Database) -
     )
     await GeneSyncOrchestrator(
         db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
-        memory_engine=NoopMemoryEngine(), memory_store=None, max_concurrent=1,
+        memory_engine=NoopMemoryEngine(), memory_store=OrchestratorMemoryStore(db), max_concurrent=1,
     ).sync_gene(gene=_IssueGene(0, 2), source_name="Jira", source_id=source_id, force_full_sync=True)
     engine = _OrderRecordingMemoryEngine(defer=True)
 
@@ -10833,7 +10831,7 @@ async def test_a_new_unit_still_deferred_by_this_run_keeps_the_old_unit(db: Data
     )
     await GeneSyncOrchestrator(
         db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
-        memory_engine=NoopMemoryEngine(), memory_store=None, max_concurrent=1,
+        memory_engine=NoopMemoryEngine(), memory_store=OrchestratorMemoryStore(db), max_concurrent=1,
     ).sync_gene(gene=_IssueGene(0, 2), source_name="Jira", source_id=source_id, force_full_sync=True)
     engine = _OrderRecordingMemoryEngine(defer=True)
 
@@ -10876,7 +10874,7 @@ async def test_external_blocker_does_not_consume_commit_attempt_budget(
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     ).sync_gene(
         gene=BlockingFetchGene(item_count=3, release=release),
@@ -10915,7 +10913,7 @@ async def test_external_blocker_does_not_consume_commit_attempt_budget(
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     ).sync_gene(
@@ -10951,7 +10949,7 @@ async def test_matching_staged_document_without_projection_runs_semantic_work(db
         doc_store=StubDocumentStore(),
         memory_extractor=extractor,
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     ).sync_gene(
         gene=UpdatingDocumentGene(markdown, version="2"),
@@ -11005,7 +11003,7 @@ async def test_new_document_lifecycle_retry_reuses_staged_document(
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     ).sync_gene(
@@ -11052,7 +11050,7 @@ async def test_lifecycle_failure_never_attempts_document_snapshot_restore(
         doc_store=StubDocumentStore(),
         memory_extractor=ProjectionFragmentRecordingExtractor(),
         memory_engine=engine,
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     ).sync_gene(
@@ -11100,7 +11098,7 @@ async def test_extraction_failure_never_requires_document_snapshot_restore(
         doc_store=StubDocumentStore(),
         memory_extractor=extractor,
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     ).sync_gene(
@@ -11134,7 +11132,7 @@ async def test_item_processing_is_bounded_by_max_concurrent(db: Database):
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=2,
     )
 
@@ -11175,7 +11173,7 @@ async def test_sync_cancels_and_drains_sibling_items_when_one_item_is_cancelled(
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=3,
     )
 
@@ -11230,7 +11228,7 @@ async def test_running_progress_reports_extracted_memories(db: Database):
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=CountingMemoryEngine(inserted=3),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -11277,7 +11275,7 @@ async def test_unchanged_document_backfills_pdf_uri_without_llm_reprocessing(db:
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -11324,7 +11322,7 @@ async def test_missing_pdf_uri_forces_full_sync_without_llm_reprocessing(db: Dat
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -11365,7 +11363,7 @@ async def test_missing_required_confluence_pdf_fails_sync_without_hiding_gap(db:
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     )
@@ -11404,7 +11402,7 @@ async def test_authoritative_empty_confluence_page_does_not_require_pdf(db: Data
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -11445,7 +11443,7 @@ async def test_authoritative_empty_confluence_page_without_pdf_keeps_incremental
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -11491,7 +11489,7 @@ async def test_confluence_pdf_storage_failure_is_not_reported_as_export_failure(
         doc_store=FailingPdfDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     )
@@ -11536,7 +11534,7 @@ async def test_existing_confluence_pdf_uri_is_preserved_when_unchanged_export_is
         doc_store=StubDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -11593,7 +11591,7 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
         doc_store=NoArtifactRewriteDocumentStore(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 
@@ -11924,7 +11922,7 @@ async def test_unchanged_document_writes_again_the_objects_it_does_not_own(db: D
         doc_store=doc_store,
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
-        memory_store=None,
+        memory_store=OrchestratorMemoryStore(db),
         max_concurrent=1,
     )
 

@@ -41,7 +41,12 @@ def test_every_builtin_source_type_has_one_complete_descriptor() -> None:
             assert descriptor.local_agent.replay_adapter_instance().source_type == source_type
 
 
-def test_only_confluence_exports_pdfs() -> None:
+def test_a_type_exports_pdfs_exactly_when_its_gene_renders_them() -> None:
+    from memforge.genes.base import Gene
+
+    for descriptor in registered_source_types():
+        renders = descriptor.gene_class().fetch_pdf is not Gene.fetch_pdf
+        assert descriptor.exports_pdf is renders, descriptor.source_type
     assert {d.source_type for d in registered_source_types() if d.exports_pdf} == {"confluence"}
 
 

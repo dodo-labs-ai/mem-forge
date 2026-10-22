@@ -6,8 +6,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-LocalInbox = Callable[[str], str]
-"""Create this Source's local-agent inbox and return its path, given the config key that holds it."""
+LocalInbox = Callable[[], str]
+"""Create this Source's local-agent inbox and return its path."""
 
 
 @dataclass(frozen=True)

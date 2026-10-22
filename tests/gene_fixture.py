@@ -9,12 +9,8 @@ from memforge.models import GeneConfigSchema, GeneMetadata
 class FakeGene(Gene):
     """A Gene whose unexercised steps raise; it inherits every optional default."""
 
-    config: dict = {}
-    source_id = "src-fake"
-
     def __init__(self, config: dict | None = None, source_id: str = "src-fake") -> None:
-        self.config = dict(config or {})
-        self.source_id = source_id
+        super().__init__(dict(config or {}), source_id)
 
     @classmethod
     def metadata(cls) -> GeneMetadata:

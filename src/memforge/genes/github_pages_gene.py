@@ -528,17 +528,6 @@ class GitHubPagesGene(Gene):
             return None
         return parse_source_time(github_latest_commit_time(response.json()))
 
-    async def _metadata_headers(self, canonical_url: str) -> dict[str, str]:
-        try:
-            response = await self._client.head(canonical_url)
-            if response.status_code < 400:
-                return dict(response.headers)
-        except requests.RequestException:
-            logger.debug("GitHub Pages HEAD failed for %s", canonical_url, exc_info=True)
-        response = await self._client.get(canonical_url)
-        response.raise_for_status()
-        return dict(response.headers)
-
     async def _sitemap_items(self) -> list[ContentItem] | None:
         sitemap_url = urljoin(self._base_url.rstrip("/") + "/", "sitemap.xml")
         try:

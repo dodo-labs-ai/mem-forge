@@ -98,3 +98,40 @@ def test_jira_adds_its_jql_filter_to_the_summary() -> None:
     assert gene.filter_summary(SINCE) == f"status != Done AND updated >= {SINCE.isoformat()}"
     assert gene.filter_summary(None) == "status != Done"
     assert JiraGene({"base_url": "https://jira.example"}, "src-jira").filter_summary(None) is None
+
+
+class _RefusingChangelogStore:
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    async def insert_changelog(self, entry: ChangelogEntry) -> None:
+        raise RuntimeError("changelog unavailable")
+
+
+async def test_a_changelog_failure_does_not_fail_the_sync(db: Database, caplog) -> None:
+    from memforge.pipeline.sync import GeneSyncOrchestrator
+    from tests.llm_fixture import NoopMemoryExtractor
+    from tests.memory_store_fixture import OrchestratorMemoryStore
+    from tests.test_sync_bookkeeping import NoopMemoryEngine, StubDocumentStore
+
+    orchestrator = GeneSyncOrchestrator(
+        db=_RefusingChangelogStore(db),
+        doc_store=StubDocumentStore(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=OrchestratorMemoryStore(db),
+    )
+    entry = ChangelogEntry(
+        id=None,
+        doc_id="page-1",
+        change_type="updated",
+        previous_version="1",
+        current_version="2",
+        content_diff=None,
+        ai_change_summary=None,
+        detected_at=datetime(2026, 10, 22, tzinfo=timezone.utc),
+    )
+
+    await orchestrator._insert_changelog(entry)
+
+    assert "Failed to insert changelog for page-1" in caplog.text
