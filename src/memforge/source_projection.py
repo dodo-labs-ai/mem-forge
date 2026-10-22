@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Collection, Mapping, Protocol, runtime_checkable
 
@@ -408,6 +409,21 @@ class ProjectionScopeTransition:
             raise ValueError("scope transition requires id and source_id")
         if dict(self.previous_scope) == dict(self.target_scope):
             raise ValueError("scope transition requires distinct old and target scopes")
+
+    @property
+    def opened_at(self) -> datetime:
+        """When the user's scope change opened the transition."""
+
+        if self.created_at is None:
+            raise ValueError(f"scope transition {self.id} records no opening time")
+        return utc_datetime(self.created_at)
+
+
+def utc_datetime(value: str) -> datetime:
+    """An ISO 8601 timestamp a store recorded, in UTC when it names no zone."""
+
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True, slots=True)

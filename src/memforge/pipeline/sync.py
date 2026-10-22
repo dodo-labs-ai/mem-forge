@@ -83,9 +83,11 @@ from memforge.source_projection import (
     ProjectionEnvelope,
     ProjectionRequest,
     ProjectionRunMode,
+    ProjectionScopeTransition,
     SourceProjection,
     SourceProjectionAdapter,
     SourceRemoval,
+    utc_datetime,
 )
 from memforge.source_artifacts import (
     StoredSourceArtifact,
@@ -1000,9 +1002,8 @@ class GeneSyncOrchestrator:
             reusable_projection_doc_ids = frozenset()
         # Each Document that commits during an open transition of a document
         # Source becomes one of the transition's members, in its commit.
-        member_transition_id = (
-            scope_transition.id if scope_transition is not None and family.records_transition_members else None
-        )
+        member_transition = scope_transition if family.records_transition_members else None
+        member_transition_id = member_transition.id if member_transition is not None else None
         transition_started = False
         transition_completed = False
         reused_projection_count = 0
@@ -1032,7 +1033,7 @@ class GeneSyncOrchestrator:
                 run_id=run_id,
                 lifecycle_execution_owner_id=durable_cycle_id,
                 progress_callback=progress_callback,
-                scope_transition_id=member_transition_id,
+                member_transition=member_transition,
             )
             recovered_completed_results = recovered.completed_results
             recovered_deferred_results = recovered.deferred_results
@@ -1632,12 +1633,18 @@ class GeneSyncOrchestrator:
                 and result.get("terminal_error") is None
             }
             left_ledger_doc_ids = committed_doc_ids | settled_doc_ids
+            # Deferred convergence after removal may retry a commit blocked by
+            # any of these Units, as it does before removal.
+            run_source_unit_ids = {
+                str(result["source_unit_id"]) for result in effective_results if result.get("source_unit_id")
+            }
             absence = await family.absence(
                 reprocessing=reprocessing,
                 transition=scope_transition,
                 indexed_doc_ids=indexed_doc_ids,
                 deferred_blockers={
                     str(result["doc_id"]): frozenset(result["deferred_lifecycle"].handle.blocking_source_unit_ids)
+                    - run_source_unit_ids
                     for result in deferred_results
                     if result.get("deferred_lifecycle") is not None
                 },
@@ -2074,12 +2081,17 @@ class GeneSyncOrchestrator:
         lifecycle_execution_owner_id: str | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         source_activity: SourceActivityLease | None = None,
-        scope_transition_id: str | None = None,
+        member_transition: ProjectionScopeTransition | None = None,
     ) -> _SourceDerivationRecovery:
         """Resume durable Source Unit work before reading the provider.
 
-        ``scope_transition_id`` names the open scope transition whose members
-        the recovered commits record.
+        ``member_transition`` is the open scope transition whose members the
+        recovered commits record. Only a derivation staged since the
+        transition opened records one: its item was fetched under the new
+        scope. An older derivation commits without a member, so discovery
+        fetches its Document again and reads any edit made before the
+        transition opened, which the cursor the completing run sets would
+        otherwise skip.
 
         A derivation another release staged is superseded, not resumed: the
         failure ledger records its Document, so the run derives it again with
@@ -2195,7 +2207,12 @@ class GeneSyncOrchestrator:
                             source_activity=source_activity,
                             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
                             diagnostics=diagnostics,
-                            scope_transition_id=scope_transition_id,
+                            scope_transition_id=(
+                                member_transition.id
+                                if member_transition is not None
+                                and utc_datetime(attempt.created_at) >= member_transition.opened_at
+                                else None
+                            ),
                         )
                         if lifecycle_stats is not None:
                             diagnostics.status = "committed"
