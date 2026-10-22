@@ -43,7 +43,6 @@ from memforge.pipeline.stored_document import (
 )
 from memforge.source_item_failures import SourceItemFailure
 from memforge.source_projection import (
-    ProjectionCoverage,
     ProjectionScopeTransition,
     SourceRemoval,
     UnitRemovalReason,
@@ -197,9 +196,9 @@ class CollectionFamily(ABC):
     ) -> AbsenceOutcome:
         """The Documents this run proves the Source no longer has."""
 
-    async def transition_coverage(self, *, docs_failed: int) -> ProjectionCoverage | None:
-        """The coverage with which this family completes the open transition, if it does."""
-        return None
+    async def completes_transition(self, *, docs_failed: int) -> bool:
+        """Whether this family completes the open transition, whatever the run's coverage proves."""
+        return False
 
     def unreadable_conversations(self, *, reprocessing: bool) -> tuple[str, ...]:
         """Selected conversations the Source cannot read; each makes the run partial."""
@@ -434,12 +433,10 @@ class ConversationFamily(CollectionFamily):
             return AbsenceOutcome()
         return AbsenceOutcome(removals=self.gene.removals())
 
-    async def transition_coverage(self, *, docs_failed: int) -> ProjectionCoverage | None:
+    async def completes_transition(self, *, docs_failed: int) -> bool:
         """Complete once deselected conversations are removed and every readable target was polled."""
 
-        if docs_failed == 0 and await self.gene.completes_scope_transition():
-            return ProjectionCoverage.TOMBSTONED_DELTA
-        return None
+        return docs_failed == 0 and await self.gene.completes_scope_transition()
 
     def unreadable_conversations(self, *, reprocessing: bool) -> tuple[str, ...]:
         return () if reprocessing else self.gene.unreadable_conversations()

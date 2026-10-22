@@ -7074,7 +7074,6 @@ def create_admin_app(
                     "target_scope": dict(transition.target_scope),
                     "status": transition.status.value,
                     "run_id": transition.run_id,
-                    "coverage": transition.coverage.value if transition.coverage else None,
                     "error": transition.error,
                     "created_at": transition.created_at,
                     "updated_at": transition.updated_at,

@@ -1382,20 +1382,31 @@ CREATE INDEX IF NOT EXISTS idx_source_projection_runs_source
     ON source_projection_runs(source_id, created_at);
 
 CREATE TABLE IF NOT EXISTS projection_scope_transitions (
-    id                  TEXT PRIMARY KEY,
-    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    previous_scope_json TEXT NOT NULL,
-    target_scope_json   TEXT NOT NULL,
-    status              TEXT NOT NULL CHECK (status IN ('pending', 'running', 'applied', 'failed')),
-    run_id              TEXT,
-    coverage            TEXT,
-    error               TEXT,
-    created_at          TEXT NOT NULL,
-    updated_at          TEXT NOT NULL,
-    completed_at        TEXT
+    id                        TEXT PRIMARY KEY,
+    source_id                 TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    previous_scope_json       TEXT NOT NULL,
+    target_scope_json         TEXT NOT NULL,
+    status                    TEXT NOT NULL CHECK (
+        status IN ('pending', 'running', 'applied', 'failed', 'superseded')
+    ),
+    predecessor_transition_id TEXT,
+    run_id                    TEXT,
+    error                     TEXT,
+    created_at                TEXT NOT NULL,
+    updated_at                TEXT NOT NULL,
+    completed_at              TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_projection_scope_transitions_source
     ON projection_scope_transitions(source_id, created_at);
+
+-- One row per listed Document committed under an open transition; the rows
+-- are deleted when the transition is applied or superseded.
+CREATE TABLE IF NOT EXISTS projection_scope_transition_members (
+    transition_id    TEXT NOT NULL REFERENCES projection_scope_transitions(id) ON DELETE CASCADE,
+    doc_id           TEXT NOT NULL,
+    unit_revision_id TEXT NOT NULL,
+    PRIMARY KEY (transition_id, doc_id)
+);
 
 CREATE TABLE IF NOT EXISTS source_units (
     id                  TEXT PRIMARY KEY,
@@ -4994,6 +5005,49 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # Every Teams sync polls the whole Initial History.
         [],
     ),
+    (
+        126,
+        "Complete Projection Scope transitions by their committed members",
+        # A transition records each listed Document committed under it and
+        # completes once its listing is covered, so it keeps no coverage. A
+        # later scope change supersedes an open transition and names it as
+        # its predecessor.
+        [
+            """CREATE TABLE projection_scope_transitions_v2 (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                previous_scope_json TEXT NOT NULL,
+                target_scope_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('pending', 'running', 'applied', 'failed', 'superseded')
+                ),
+                predecessor_transition_id TEXT,
+                run_id TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            )""",
+            """INSERT INTO projection_scope_transitions_v2 (
+                    id, source_id, previous_scope_json, target_scope_json, status,
+                    predecessor_transition_id, run_id, error, created_at, updated_at,
+                    completed_at
+                ) SELECT id, source_id, previous_scope_json, target_scope_json, status,
+                    NULL, run_id, error, created_at, updated_at, completed_at
+                FROM projection_scope_transitions""",
+            "DROP TABLE projection_scope_transitions",
+            "ALTER TABLE projection_scope_transitions_v2 RENAME TO projection_scope_transitions",
+            "CREATE INDEX IF NOT EXISTS idx_projection_scope_transitions_source "
+            "ON projection_scope_transitions(source_id, created_at)",
+            """CREATE TABLE IF NOT EXISTS projection_scope_transition_members (
+                transition_id TEXT NOT NULL
+                    REFERENCES projection_scope_transitions(id) ON DELETE CASCADE,
+                doc_id TEXT NOT NULL,
+                unit_revision_id TEXT NOT NULL,
+                PRIMARY KEY (transition_id, doc_id)
+            )""",
+        ],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -5052,6 +5106,10 @@ async def _open_aiosqlite_connection(
 # The triggers of a sync a person requested, which retries every failed
 # Document of its Source.
 _REQUESTED_SYNC_TRIGGERS = frozenset({"manual", "force"})
+
+# The statuses of a Projection Scope transition that has neither completed nor
+# been superseded; a Source has at most one transition in them.
+_OPEN_SCOPE_TRANSITION_STATUSES = frozenset({"pending", "running", "failed"})
 
 # Primary result codes of a database another connection holds; the low byte of
 # an extended code is its primary code.
@@ -8002,6 +8060,7 @@ class Database:
         *,
         unit_input: SourceUnitInput | None = None,
         source_activity: SourceActivityLease | None = None,
+        scope_transition_id: str | None = None,
         _manage_transaction: bool = True,
     ) -> None:
         """Persist one complete provider-neutral projection atomically.
@@ -8016,6 +8075,13 @@ class Database:
         projected from. It is recorded in the same transaction as the revision,
         also when the run was recorded before, unless a later revision of the
         Unit is already current.
+
+        ``scope_transition_id`` names the open Projection Scope transition the
+        commit belongs to. The committed Document is then recorded as one of
+        its members, ``(doc_id, unit_revision_id)`` from ``unit_input``, in
+        the same transaction, also when the run was recorded before; the
+        commit is refused when that transition is no longer open. A tombstone
+        records no member.
         """
 
         incoming_payload = source_projection_to_payload(projection)
@@ -8069,6 +8135,10 @@ class Database:
                         raise ValueError("projection retry payload mismatch")
                     if unit_input is not None:
                         await self._record_source_unit_input_unlocked(projection, unit_input, now)
+                    if scope_transition_id is not None:
+                        await self._record_projection_scope_transition_member_unlocked(
+                            projection, unit_input, scope_transition_id
+                        )
                     await self._assert_source_activity_fence_unlocked(
                         projection.source_id,
                         source_activity,
@@ -8348,6 +8418,10 @@ class Database:
                             json.dumps(delta_payloads[index], sort_keys=True, separators=(",", ":")),
                         ),
                     )
+                if scope_transition_id is not None:
+                    await self._record_projection_scope_transition_member_unlocked(
+                        projection, unit_input, scope_transition_id
+                    )
                 await self._assert_source_activity_fence_unlocked(
                     projection.source_id,
                     source_activity,
@@ -8395,42 +8469,52 @@ class Database:
     ) -> ProjectionScopeTransition:
         if transition.status is not ProjectionScopeTransitionStatus.PENDING:
             raise ValueError("new projection scope transition must be pending")
-        now = _now_iso()
-        previous_json = json.dumps(dict(transition.previous_scope), sort_keys=True, separators=(",", ":"))
-        target_json = json.dumps(dict(transition.target_scope), sort_keys=True, separators=(",", ":"))
         async with self._write_lock:
             try:
-                await self.db.execute(
-                    """INSERT OR IGNORE INTO projection_scope_transitions (
-                        id, source_id, previous_scope_json, target_scope_json, status,
-                        run_id, coverage, error, created_at, updated_at, completed_at
-                    ) VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, ?, NULL)""",
-                    (
-                        transition.id,
-                        transition.source_id,
-                        previous_json,
-                        target_json,
-                        transition.created_at or now,
-                        now,
-                    ),
-                )
-                async with self.db.execute(
-                    "SELECT * FROM projection_scope_transitions WHERE id = ?",
-                    (transition.id,),
-                ) as cursor:
-                    row = await cursor.fetchone()
-                if (
-                    row is None
-                    or row["source_id"] != transition.source_id
-                    or row["previous_scope_json"] != previous_json
-                    or row["target_scope_json"] != target_json
-                ):
-                    raise ValueError("projection scope transition retry identity mismatch")
+                row = await self._insert_projection_scope_transition_unlocked(transition)
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
                 raise
         return self._row_to_projection_scope_transition(row)
+
+    async def _insert_projection_scope_transition_unlocked(
+        self,
+        transition: ProjectionScopeTransition,
+    ) -> aiosqlite.Row:
+        """Insert a pending transition, or accept a retry that carries the same identity."""
+        now = _now_iso()
+        previous_json = json.dumps(dict(transition.previous_scope), sort_keys=True, separators=(",", ":"))
+        target_json = json.dumps(dict(transition.target_scope), sort_keys=True, separators=(",", ":"))
+        await self.db.execute(
+            """INSERT OR IGNORE INTO projection_scope_transitions (
+                id, source_id, previous_scope_json, target_scope_json, status,
+                predecessor_transition_id, run_id, error, created_at, updated_at, completed_at
+            ) VALUES (?, ?, ?, ?, 'pending', ?, NULL, NULL, ?, ?, NULL)""",
+            (
+                transition.id,
+                transition.source_id,
+                previous_json,
+                target_json,
+                transition.predecessor_transition_id,
+                transition.created_at or now,
+                now,
+            ),
+        )
+        async with self.db.execute(
+            "SELECT * FROM projection_scope_transitions WHERE id = ?",
+            (transition.id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if (
+            row is None
+            or row["source_id"] != transition.source_id
+            or row["previous_scope_json"] != previous_json
+            or row["target_scope_json"] != target_json
+            or row["predecessor_transition_id"] != transition.predecessor_transition_id
+        ):
+            raise ValueError("projection scope transition retry identity mismatch")
+        return row
 
     async def get_open_projection_scope_transition(
         self,
@@ -8468,7 +8552,7 @@ class Database:
         async with self._write_lock:
             cursor = await self.db.execute(
                 """UPDATE projection_scope_transitions
-                   SET status = 'running', run_id = ?, coverage = NULL, error = NULL,
+                   SET status = 'running', run_id = ?, error = NULL,
                        updated_at = ?, completed_at = NULL
                    WHERE id = ? AND status IN ('pending', 'failed', 'running')
                      AND (status != 'running' OR run_id = ?)""",
@@ -8487,23 +8571,28 @@ class Database:
         transition_id: str,
         *,
         run_id: str,
-        coverage: ProjectionCoverage,
     ) -> ProjectionScopeTransition:
-        if not coverage.proves_absence:
-            raise ValueError("scope transition requires complete snapshot coverage")
+        """Apply the transition the run holds and delete its member rows in one transaction."""
         now = _now_iso()
         async with self._write_lock:
-            cursor = await self.db.execute(
-                """UPDATE projection_scope_transitions
-                   SET status = 'applied', coverage = ?, error = NULL,
-                       updated_at = ?, completed_at = ?
-                   WHERE id = ? AND status = 'running' AND run_id = ?""",
-                (coverage.value, now, now, transition_id, run_id),
-            )
-            if cursor.rowcount != 1:
+            try:
+                cursor = await self.db.execute(
+                    """UPDATE projection_scope_transitions
+                       SET status = 'applied', error = NULL,
+                           updated_at = ?, completed_at = ?
+                       WHERE id = ? AND status = 'running' AND run_id = ?""",
+                    (now, now, transition_id, run_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("projection scope transition completion stale guard failed")
+                await self.db.execute(
+                    "DELETE FROM projection_scope_transition_members WHERE transition_id = ?",
+                    (transition_id,),
+                )
+                await self.db.commit()
+            except Exception:
                 await self.db.rollback()
-                raise ValueError("projection scope transition completion stale guard failed")
-            await self.db.commit()
+                raise
         stored = await self._get_projection_scope_transition(transition_id)
         assert stored is not None
         return stored
@@ -8513,16 +8602,16 @@ class Database:
         transition_id: str,
         *,
         run_id: str,
-        coverage: ProjectionCoverage,
         error: str,
     ) -> ProjectionScopeTransition:
+        """Mark the transition the run holds failed; it stays open and keeps its member rows."""
         now = _now_iso()
         async with self._write_lock:
             cursor = await self.db.execute(
                 """UPDATE projection_scope_transitions
-                   SET status = 'failed', coverage = ?, error = ?, updated_at = ?
+                   SET status = 'failed', error = ?, updated_at = ?
                    WHERE id = ? AND status = 'running' AND run_id = ?""",
-                (coverage.value, error, now, transition_id, run_id),
+                (error, now, transition_id, run_id),
             )
             if cursor.rowcount != 1:
                 await self.db.rollback()
@@ -8542,6 +8631,68 @@ class Database:
         ) as cursor:
             row = await cursor.fetchone()
         return self._row_to_projection_scope_transition(row) if row is not None else None
+
+    async def _supersede_projection_scope_transition_unlocked(self, transition_id: str) -> None:
+        """Close the open transition as superseded and delete its member rows."""
+        cursor = await self.db.execute(
+            """UPDATE projection_scope_transitions
+               SET status = 'superseded', updated_at = ?
+               WHERE id = ? AND status IN ('pending', 'running', 'failed')""",
+            (_now_iso(), transition_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("projection_scope_transition_stale")
+        await self.db.execute(
+            "DELETE FROM projection_scope_transition_members WHERE transition_id = ?",
+            (transition_id,),
+        )
+
+    async def list_projection_scope_transition_member_doc_ids(
+        self,
+        transition_id: str,
+    ) -> tuple[str, ...]:
+        """The Documents committed under the transition, in doc id order."""
+        rows = await self.db.execute_fetchall(
+            """SELECT doc_id FROM projection_scope_transition_members
+               WHERE transition_id = ? ORDER BY doc_id""",
+            (transition_id,),
+        )
+        return tuple(str(row["doc_id"]) for row in rows)
+
+    async def _record_projection_scope_transition_member_unlocked(
+        self,
+        projection: SourceProjection,
+        unit_input: SourceUnitInput | None,
+        scope_transition_id: str,
+    ) -> None:
+        """Record the projection's Document as a member of the open transition.
+
+        A tombstone commits no listed Document and records no member. The
+        transition must belong to the projection's Source and be open
+        (``pending``, ``running`` or ``failed``); otherwise the commit is
+        refused. A member committed again keeps one row, holding the latest
+        Unit revision.
+        """
+        if projection.coverage is ProjectionCoverage.TOMBSTONED_DELTA:
+            return
+        if unit_input is None:
+            raise ValueError("a scope transition member requires the committed Unit's stored input")
+        async with self.db.execute(
+            """SELECT status FROM projection_scope_transitions
+               WHERE id = ? AND source_id = ?""",
+            (scope_transition_id, projection.source_id),
+        ) as cursor:
+            transition = await cursor.fetchone()
+        if transition is None or transition["status"] not in _OPEN_SCOPE_TRANSITION_STATUSES:
+            raise ValueError("projection scope transition is not open")
+        await self.db.execute(
+            """INSERT INTO projection_scope_transition_members (
+                transition_id, doc_id, unit_revision_id
+            ) VALUES (?, ?, ?)
+            ON CONFLICT(transition_id, doc_id) DO UPDATE SET
+                unit_revision_id = excluded.unit_revision_id""",
+            (scope_transition_id, unit_input.document_id, unit_input.unit_revision_id),
+        )
 
     async def get_current_source_unit_revision(
         self,
@@ -9220,6 +9371,36 @@ class Database:
                ORDER BY lineage.is_current DESC, lineage.last_seen_at DESC, su.id
                LIMIT 1""",
             (source_id, document_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return SourceUnit(
+            id=row["id"],
+            source_id=row["source_id"],
+            unit_type=row["unit_type"],
+            provider_key=row["provider_key"],
+            locator=json.loads(row["locator_json"] or "{}"),
+        )
+
+    async def find_current_source_unit_by_provider_key(
+        self,
+        source_id: str,
+        provider_key: str,
+    ) -> SourceUnit | None:
+        """The Source's current Unit with this provider key, or ``None`` when it has none or it was removed.
+
+        A current Unit has a current revision holding at least one current
+        Observation, as in ``list_current_source_units_page``.
+        """
+        async with self.db.execute(
+            """SELECT su.* FROM source_units su
+               WHERE su.source_id = ? AND su.provider_key = ?
+                 AND su.current_revision_id IS NOT NULL
+                 AND EXISTS (SELECT 1 FROM source_observations so
+                             WHERE so.source_unit_id = su.id
+                               AND so.current_revision_id IS NOT NULL)""",
+            (source_id, provider_key),
         ) as cursor:
             row = await cursor.fetchone()
         if row is None:
@@ -10238,11 +10419,14 @@ class Database:
         required_derivation_work_ids: tuple[str, ...] = (),
         source_activity: SourceActivityLease | None = None,
         runtime_bundle: AgentRuntimeBundle | None = None,
+        scope_transition_id: str | None = None,
     ) -> None:
         """Advance Source Projection and Memory lifecycle in one transaction.
 
         ``document`` updates the shared Document row and ``unit_input`` records
-        the stored input of the committed Unit revision.
+        the stored input of the committed Unit revision. ``scope_transition_id``
+        records the committed Document as a member of that open transition, as
+        ``record_source_projection`` does.
         """
 
         if required_derivation_work_ids and derivation_id is None:
@@ -10362,6 +10546,7 @@ class Database:
                     projection,
                     unit_input=unit_input,
                     source_activity=source_activity,
+                    scope_transition_id=scope_transition_id,
                     _manage_transaction=False,
                 )
                 await self._apply_lifecycle_plan(plan, _manage_transaction=False)
@@ -16981,12 +17166,23 @@ class Database:
         created_by_user_id: str | None = None,
         execution_owner_user_id: str | None = None,
         projection_scope_transition: ProjectionScopeTransition | None = None,
+        expected_open_transition_id: str | None = None,
     ) -> None:
         """Insert or update a source row.
 
         `project_binding` is the structured rule the project resolver
         consults when memories are extracted from this source. `None`
         leaves the source unbound and resolves writes to `UNSORTED`.
+
+        `projection_scope_transition` opens that pending transition in the
+        same transaction; a retry with the same transition is accepted. The
+        Source may hold no other open transition, unless
+        `expected_open_transition_id` names it: that transition is then
+        superseded and its member rows are deleted, and the new transition
+        must name it as its predecessor. When the open transition is not the
+        one the caller expected, the update fails with
+        ``projection_scope_transition_stale`` and nothing is written, so the
+        caller can read the Source again.
         """
         from memforge.source_access import memory_visibility_for_source
 
@@ -17005,6 +17201,11 @@ class Database:
             and projection_scope_transition.status is not ProjectionScopeTransitionStatus.PENDING
         ):
             raise ValueError("new projection scope transition must be pending")
+        if expected_open_transition_id is not None and (
+            projection_scope_transition is None
+            or projection_scope_transition.predecessor_transition_id != expected_open_transition_id
+        ):
+            raise ValueError("a superseding projection scope transition must name the superseded one")
         async with self._write_lock:
             try:
                 source_lock = await self.db.execute(
@@ -17101,52 +17302,24 @@ class Database:
                     ),
                 )
                 if projection_scope_transition is not None:
-                    previous_json = json.dumps(
-                        dict(projection_scope_transition.previous_scope),
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    target_json = json.dumps(
-                        dict(projection_scope_transition.target_scope),
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
                     async with self.db.execute(
-                        """SELECT * FROM projection_scope_transitions
+                        """SELECT id FROM projection_scope_transitions
                            WHERE source_id = ?
                              AND status IN ('pending', 'running', 'failed')
                            ORDER BY created_at, id LIMIT 1""",
                         (id,),
                     ) as cursor:
                         open_transition = await cursor.fetchone()
-                    if open_transition is not None and open_transition["id"] != projection_scope_transition.id:
-                        raise ValueError("projection_scope_transition_active")
-                    await self.db.execute(
-                        """INSERT OR IGNORE INTO projection_scope_transitions (
-                            id, source_id, previous_scope_json, target_scope_json, status,
-                            run_id, coverage, error, created_at, updated_at, completed_at
-                        ) VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, ?, NULL)""",
-                        (
-                            projection_scope_transition.id,
-                            id,
-                            previous_json,
-                            target_json,
-                            projection_scope_transition.created_at or _now_iso(),
-                            _now_iso(),
-                        ),
-                    )
-                    async with self.db.execute(
-                        "SELECT * FROM projection_scope_transitions WHERE id = ?",
-                        (projection_scope_transition.id,),
-                    ) as cursor:
-                        stored_transition = await cursor.fetchone()
-                    if (
-                        stored_transition is None
-                        or stored_transition["source_id"] != id
-                        or stored_transition["previous_scope_json"] != previous_json
-                        or stored_transition["target_scope_json"] != target_json
-                    ):
-                        raise ValueError("projection scope transition retry identity mismatch")
+                    open_transition_id = open_transition["id"] if open_transition is not None else None
+                    if open_transition_id != projection_scope_transition.id:
+                        if expected_open_transition_id is None:
+                            if open_transition_id is not None:
+                                raise ValueError("projection_scope_transition_active")
+                        elif open_transition_id != expected_open_transition_id:
+                            raise ValueError("projection_scope_transition_stale")
+                        else:
+                            await self._supersede_projection_scope_transition_unlocked(open_transition_id)
+                    await self._insert_projection_scope_transition_unlocked(projection_scope_transition)
                 stale_metadata_rows = await self.db.execute_fetchall(
                     """SELECT 1
                      FROM memory_search_metadata_fts
@@ -23959,15 +24132,14 @@ class Database:
 
     def _row_to_projection_scope_transition(self, row) -> ProjectionScopeTransition:
         d = dict(row)
-        coverage = d.get("coverage")
         return ProjectionScopeTransition(
             id=d["id"],
             source_id=d["source_id"],
             previous_scope=json.loads(d["previous_scope_json"]),
             target_scope=json.loads(d["target_scope_json"]),
             status=ProjectionScopeTransitionStatus(d["status"]),
+            predecessor_transition_id=d.get("predecessor_transition_id"),
             run_id=d.get("run_id"),
-            coverage=ProjectionCoverage(coverage) if coverage else None,
             error=d.get("error"),
             created_at=d.get("created_at"),
             updated_at=d.get("updated_at"),

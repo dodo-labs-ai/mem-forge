@@ -2734,7 +2734,6 @@ async def test_repeated_source_scope_update_creates_a_new_transition_cycle(
     monkeypatch,
 ):
     from memforge.server.admin_api import create_admin_app
-    from memforge.source_projection import ProjectionCoverage
     from memforge.source_secrets import prepare_source_config_for_storage
 
     monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
@@ -2767,11 +2766,7 @@ async def test_repeated_source_scope_update_creates_a_new_transition_cycle(
         transition = await db.get_open_projection_scope_transition(source_id)
         assert transition is not None
         await db.start_projection_scope_transition(transition.id, run_id=run_id)
-        await db.complete_projection_scope_transition(
-            transition.id,
-            run_id=run_id,
-            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
-        )
+        await db.complete_projection_scope_transition(transition.id, run_id=run_id)
         return transition.id
 
     with TestClient(app) as client:
