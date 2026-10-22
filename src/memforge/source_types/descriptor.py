@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from memforge.source_types.config import SourceConfigPolicy
+
 if TYPE_CHECKING:
     from memforge.genes.base import Gene
     from memforge.local_agent.replay_adapter import LocalSourceReplayAdapter
@@ -62,7 +64,8 @@ class SourceTypeDescriptor:
     mode leaves unused. ``project_native`` turns one fetched item into Units and
     Observations; a type without one is projected generically, with partial
     coverage. ``exports_pdf`` says the Gene renders a PDF of each Unit, which
-    a Unit's stored input must then hold.
+    a Unit's stored input must then hold. ``config`` checks and prepares the
+    Source's configuration.
     """
 
     source_type: str
@@ -77,6 +80,7 @@ class SourceTypeDescriptor:
     record_schemas: Mapping[tuple[str, int], CanonicalRecordSchema] = field(default_factory=dict)
     local_agent: LocalAgentCollection | None = None
     exports_pdf: bool = False
+    config: SourceConfigPolicy = field(default_factory=SourceConfigPolicy)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "evidence_profiles", _frozen(self.evidence_profiles))

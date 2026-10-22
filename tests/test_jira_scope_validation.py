@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from memforge.server.admin_api import _validate_jira_scope_config
+from memforge.source_types.jira import validate_scope as _validate_jira_scope_config
 
 
 def test_simple_mode_requires_projects():

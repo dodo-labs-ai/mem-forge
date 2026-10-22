@@ -9,7 +9,7 @@ from memforge.github_repo_utils import (
     normalize_github_scope_paths,
 )
 from memforge.storage.database import Database
-from memforge.server.admin_api import _validate_github_repo_config
+from memforge.source_types.github_repo import validate_config as _validate_github_repo_config
 
 
 def test_repository_exclusions_override_the_base_scope() -> None:
