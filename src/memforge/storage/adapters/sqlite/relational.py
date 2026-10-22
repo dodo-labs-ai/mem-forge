@@ -652,13 +652,6 @@ class SqliteRelationalStore:
             current_only=current_only,
         )
 
-    async def find_current_source_unit_by_provider_key(
-        self,
-        source_id: str,
-        provider_key: str,
-    ) -> SourceUnit | None:
-        return await self._db.find_current_source_unit_by_provider_key(source_id, provider_key)
-
     async def get_source_unit_input(self, source_unit_id: str) -> SourceUnitInput | None:
         return await self._db.get_source_unit_input(source_unit_id)
 

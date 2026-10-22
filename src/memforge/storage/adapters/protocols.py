@@ -445,18 +445,6 @@ class RelationalStore(Protocol):
         *,
         current_only: bool = False,
     ) -> SourceUnit | None: ...
-    async def find_current_source_unit_by_provider_key(
-        self,
-        source_id: str,
-        provider_key: str,
-    ) -> SourceUnit | None:
-        """The Source's current Unit with this provider key, or ``None``.
-
-        A Unit that was removed (its current revision holds no current
-        Observation) is not current. For example, a GitHub file renamed from
-        ``docs/a.md`` finds its predecessor by the old path's provider key.
-        """
-        ...
     async def get_source_unit_input(self, source_unit_id: str) -> SourceUnitInput | None:
         """The stored input of the Unit's current revision, or ``None`` when that revision has none."""
         ...

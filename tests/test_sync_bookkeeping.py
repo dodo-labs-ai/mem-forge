@@ -4201,8 +4201,10 @@ class MovingGithubFileGene(UpdatingDocumentGene):
         previous_filename: str | None = None,
         file_lineage_id: str | None = "file-lineage-77",
         version: str = "blob-v1",
+        source_id: str = "src-fake",
     ) -> None:
         super().__init__("# Design\n\nKeep A7.", version=version)
+        self.source_id = source_id
         self.item_id = item_id
         self.relative_path = relative_path
         self.previous_filename = previous_filename
@@ -4239,7 +4241,9 @@ class MovingGithubFileGene(UpdatingDocumentGene):
             version=self.version,
             extra=extra,
             renamed_from=github_renamed_from(
-                repository="acme/payroll",
+                source_id=self.source_id,
+                repo_url=MOVING_FILE_REPO_URL,
+                repo_ref="main",
                 previous_filename=self.previous_filename,
                 rename_evidence_authoritative=True,
             ),
@@ -9532,6 +9536,7 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
             item_id=new_doc_id,
             relative_path="new/design.md",
             previous_filename="old/design.md",
+            source_id=source_id,
             file_lineage_id=None,
         ),
         source_name="Payroll Repo",
@@ -9551,6 +9556,7 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
             item_id=final_doc_id,
             relative_path="final/design.md",
             previous_filename="new/design.md",
+            source_id=source_id,
             file_lineage_id=None,
         ),
         source_name="Payroll Repo",
@@ -9639,6 +9645,7 @@ async def test_exact_version_github_file_move_a_to_b_to_a_keeps_one_lineage(db: 
             item_id=b_doc_id,
             relative_path="b/design.md",
             previous_filename="a/design.md",
+            source_id=source_id,
             file_lineage_id=None,
             version="same-blob-sha",
         ),
@@ -9646,6 +9653,7 @@ async def test_exact_version_github_file_move_a_to_b_to_a_keeps_one_lineage(db: 
             item_id=a_doc_id,
             relative_path="a/design.md",
             previous_filename="b/design.md",
+            source_id=source_id,
             file_lineage_id=None,
             version="same-blob-sha",
         ),

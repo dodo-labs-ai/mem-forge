@@ -9,11 +9,13 @@
   - Item failures no longer suspend absence. A Document that failed to fetch,
     normalize, project, derive or commit says nothing about one the listing
     left out, so the unlisted one is removed in the same run. The exception
-    is a rename: `ContentItem.renamed_from` names the predecessor Unit's
-    provider key, and that Unit is kept until its successor commits, while
-    the successor is in the run or in an open ledger row. GitHub maps an
-    attested `previous_filename` to it at discovery; the adapter reads only
-    `renamed_from`, which is serialized only when set.
+    is a rename: `ContentItem.renamed_from` names the Document id the item
+    was renamed from. The item commits to that Document's current Unit, and
+    the Unit is kept until the item commits, while the item is in the run or
+    in an open ledger row. `renamed_from` is serialized only when set. No
+    built-in collector attests renames yet; `github_renamed_from` is the
+    mapping a GitHub collector uses for an attested `previous_filename`, and
+    the GitHub adapter no longer reads rename evidence itself.
   - An existence listing settles every failure ledger row it does not name,
     including a row whose Document never became a Unit and a row a scheduled
     run would leave alone. A server query listing retries an unlisted row

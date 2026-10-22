@@ -414,11 +414,11 @@ class ContentItem:
     not stored. A Gene may reuse a provider fact it recorded for an unchanged
     provider revision instead of asking again.
 
-    ``renamed_from`` is the provider key of the Unit this item was renamed
-    from, set only when the provider attests the rename. For example, a
-    GitHub file moved from ``docs/a.md`` names the Unit of ``docs/a.md``.
-    While the item has not committed, its predecessor's Unit is kept even
-    when the scope listing no longer names it.
+    ``renamed_from`` is the Document id this item was renamed from, set only
+    when the provider attests the rename. For example, a GitHub file moved
+    from ``docs/a.md`` names the Document of ``docs/a.md``. The item commits
+    to that Document's current Unit, and until it commits, the Unit is kept
+    even when the scope listing no longer names it.
     """
 
     item_id: str  # becomes doc_id

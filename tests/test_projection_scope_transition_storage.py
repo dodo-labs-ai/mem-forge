@@ -410,29 +410,6 @@ async def test_an_expected_transition_that_closed_meanwhile_is_stale(db: Databas
     assert await db.get_open_projection_scope_transition(SOURCE) is None
 
 
-async def test_a_current_unit_is_found_by_its_provider_key(db: Database) -> None:
-    projection, unit_input = _document("a.md", "body")
-    await db.record_source_projection(projection, unit_input=unit_input)
-    unit = projection.source_units[0]
-
-    found = await db.find_current_source_unit_by_provider_key(SOURCE, unit.provider_key)
-    elsewhere = await db.find_current_source_unit_by_provider_key(OTHER_SOURCE, unit.provider_key)
-    unknown = await db.find_current_source_unit_by_provider_key(SOURCE, "default:missing.md")
-    tombstone = project_source_unit_tombstone(
-        source_type="local_markdown",
-        run_id="run-tombstone",
-        source_unit=unit,
-        prior_unit_revision=projection.source_unit_revisions[0],
-        prior_observation_revisions={revision.observation_id: revision for revision in projection.observation_revisions},
-        reason="absent_from_source",
-    )
-    await db.record_source_projection(tombstone)
-    removed = await db.find_current_source_unit_by_provider_key(SOURCE, unit.provider_key)
-
-    assert found == replace(unit, locator=dict(unit.locator))
-    assert (elsewhere, unknown, removed) == (None, None, None)
-
-
 async def test_a_tombstone_under_a_closed_transition_is_refused(db: Database) -> None:
     await db.create_projection_scope_transition(_transition("t1", "/new"))
     await db.start_projection_scope_transition("t1", run_id="run-1")

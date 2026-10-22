@@ -87,7 +87,6 @@ from memforge.source_projection import (
     ProjectionRunMode,
     SourceProjection,
     SourceProjectionAdapter,
-    SourceRelationType,
     SourceRemoval,
 )
 from memforge.source_artifacts import (
@@ -2634,9 +2633,8 @@ class GeneSyncOrchestrator:
         }
         if persisted_source_unit is not None:
             # Document lineage is the durable identity bridge after an
-            # authoritative rename.  Reuse both immutable Unit id and provider
-            # key on subsequent ordinary snapshots that no longer carry the
-            # one-time previous_filename signal.
+            # attested rename: later items of the Document, which no longer
+            # name their predecessor, reuse the Unit's id and provider key.
             probe_scope.update(
                 {
                     "source_unit_id": persisted_source_unit.id,
@@ -2700,22 +2698,15 @@ class GeneSyncOrchestrator:
                 normalized=normalized,
             )
         )
-        if persisted_source_unit is None:
-            predecessor_document_ids = {
-                str(relation.metadata.get("predecessor_document_id"))
-                for relation in projection_probe.relations
-                if relation.relation_type is SourceRelationType.RENAMED_FROM
-                and relation.metadata.get("predecessor_document_id")
-            }
-            for predecessor_document_id in sorted(predecessor_document_ids):
-                async with self._db_lock:
-                    predecessor_unit = await self.db.find_source_unit_by_document_id(
-                        source_id,
-                        predecessor_document_id,
-                        current_only=True,
-                    )
-                if predecessor_unit is None:
-                    continue
+        if persisted_source_unit is None and item.renamed_from is not None:
+            async with self._db_lock:
+                predecessor_unit = await self.db.find_source_unit_by_document_id(
+                    source_id,
+                    item.renamed_from,
+                    current_only=True,
+                )
+            if predecessor_unit is not None:
+                # An attested rename continues the predecessor's Unit.
                 persisted_source_unit = predecessor_unit
                 probe_scope.update(
                     {
@@ -2739,7 +2730,6 @@ class GeneSyncOrchestrator:
                         normalized=normalized,
                     )
                 )
-                break
         source_unit = projection_probe.source_units[0]
 
         # Artifact identity belongs to the immutable Source Unit, not to its

@@ -304,23 +304,6 @@ def build_github_repo_doc_id(*, source_id: str, repo_url: str, repo_ref: str, re
     ])
 
 
-def github_file_provider_key(*, repository: str, lineage: str) -> str:
-    """The provider key of a GitHub file Unit: its ``owner/repo`` and the lineage the Unit keeps.
-
-    The lineage is the file's path when the Unit was first seen, or a lineage
-    id the collector supplies, so an attested rename keeps the Unit's key.
-    """
-
-    return f"{repository}:{lineage}"
-
-
-def github_file_lineage(provider_key: str, *, repository: str) -> str | None:
-    """The lineage in a GitHub file Unit's provider key, or ``None`` for a key of another repository."""
-
-    prefix = f"{repository}:"
-    return provider_key[len(prefix):] if provider_key.startswith(prefix) else None
-
-
 def github_path_commits_query(*, relative_path: str, ref: str) -> str:
     """Query string for the latest commit reachable from ``ref`` that changed ``relative_path``.
 
