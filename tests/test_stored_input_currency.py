@@ -95,6 +95,8 @@ class JiraProvider(FakeGene):
         self.rediscovered.append(issue_key)
         return None if issue_key in self.removed else self._item(issue_key)
 
+    listing_kinds = frozenset({ScopeListingKind.QUERY})
+
     async def list_scope(self):
         return ScopeListing(
             kind=ScopeListingKind.QUERY,

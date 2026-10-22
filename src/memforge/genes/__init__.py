@@ -14,11 +14,14 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 from memforge.genes.base import Gene
+from memforge.genes.document_gene import DocumentGene
+from memforge.genes.family import CollectionFamilyKind, gene_family
 from memforge.models import GeneMetadata, SourceExecutionKind
 from memforge.source_types import registered_source_types, source_type_descriptor
 
 __all__ = [
     "GENE_REGISTRY",
+    "DocumentGene",
     "create_gene",
     "list_available_genes",
     "source_rediscovers_documents",
@@ -84,7 +87,11 @@ def source_type_supports_sync(source_type: str) -> bool:
 def source_rediscovers_documents(source_type: str, config: Mapping[str, Any]) -> bool:
     """Whether a configured Source can ask its provider for one Document by id."""
     gene_cls = GENE_REGISTRY.get(str(source_type or "").strip())
-    return gene_cls is not None and gene_cls.rediscovers_documents(config)
+    return (
+        gene_cls is not None
+        and gene_family(gene_cls) is CollectionFamilyKind.DOCUMENT
+        and gene_cls.rediscovers_documents(config)
+    )
 
 
 # Every registered Gene loads with this package, so a connector that cannot

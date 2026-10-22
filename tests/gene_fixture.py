@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from memforge.genes.base import Gene
+from memforge.genes.document_gene import DocumentGene
 from memforge.models import GeneConfigSchema, GeneMetadata
 
 
-class FakeGene(Gene):
-    """A Gene whose unexercised steps raise; it inherits every optional default."""
+class FakeGene(DocumentGene):
+    """A document Gene whose unexercised steps raise; it inherits every optional default."""
+
+    listing_kinds = frozenset()
 
     def __init__(self, config: dict | None = None, source_id: str = "src-fake") -> None:
         super().__init__(dict(config or {}), source_id)

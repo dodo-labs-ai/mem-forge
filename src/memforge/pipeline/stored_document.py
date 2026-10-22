@@ -66,6 +66,7 @@ from memforge.source_representation import current_representation_of
 
 if TYPE_CHECKING:
     from memforge.genes.base import Gene
+    from memforge.genes.document_gene import DocumentGene
     from memforge.storage.adapters.protocols import RelationalStore
     from memforge.storage.document_store import DocumentStore
 
@@ -189,7 +190,7 @@ async def _unit_stored_item(db: RelationalStore, *, source_unit_id: str, documen
 
 async def rediscover_source_document(
     db: RelationalStore,
-    gene: Gene,
+    gene: DocumentGene,
     *,
     source_id: str,
     document_id: str,

@@ -28,7 +28,7 @@ from memforge.genes.atlassian_auth import (
     stream_with_rate_limit_retry,
     tls_verify,
 )
-from memforge.genes.base import Gene
+from memforge.genes.document_gene import DocumentGene
 from memforge.genes.local_adapter_packages import (
     decode_package,
     has_package_manifest,
@@ -327,12 +327,14 @@ def _issue_content_item(issue: dict, base_url: str) -> ContentItem:
     )
 
 
-class JiraGene(Gene):
+class JiraGene(DocumentGene):
     """Jira data source gene.
 
     Discovers issues via JQL, fetches full issue data including comments
     and linked issues, normalizes to comprehensive markdown.
     """
+
+    listing_kinds = frozenset({ScopeListingKind.QUERY})
 
     @classmethod
     def metadata(cls) -> GeneMetadata:

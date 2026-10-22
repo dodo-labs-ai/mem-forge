@@ -15,7 +15,7 @@ from urllib.parse import quote
 
 import requests
 
-from memforge.genes.base import Gene
+from memforge.genes.document_gene import DocumentGene
 from memforge.genes.local_adapter_packages import (
     decode_package,
     has_package_manifest,
@@ -97,7 +97,7 @@ class _RepoRef:
     repo: str
 
 
-class GitHubRepoGene(Gene):
+class GitHubRepoGene(DocumentGene):
     """GitHub repository file source.
 
     The same source type supports two delivery modes:
@@ -105,6 +105,8 @@ class GitHubRepoGene(Gene):
     - ``local_push``: the user's daemon reads the remote repository with its
       local GitHub session and uploads raw file packages for server processing.
     """
+
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
 
     @classmethod
     def metadata(cls) -> GeneMetadata:

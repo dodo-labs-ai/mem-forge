@@ -12,6 +12,7 @@ from memforge.source_types.config import SourceConfigPolicy
 
 if TYPE_CHECKING:
     from memforge.genes.base import Gene
+    from memforge.genes.family import CollectionFamilyKind
     from memforge.local_agent.replay_adapter import LocalSourceReplayAdapter
     from memforge.source_adapters.contracts import CanonicalRecordSchema
     from memforge.source_projection import EvidenceRepresentationProfile
@@ -93,3 +94,11 @@ class SourceTypeDescriptor:
 
     def gene_class(self) -> type[Gene]:
         return self.gene if isinstance(self.gene, type) else load_reference(self.gene)
+
+    @property
+    def family(self) -> CollectionFamilyKind | None:
+        """The collection family its Gene's base class names; ``None`` for managed capture."""
+
+        from memforge.genes.family import gene_family
+
+        return gene_family(self.gene_class())
