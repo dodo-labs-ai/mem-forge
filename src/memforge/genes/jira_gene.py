@@ -20,7 +20,7 @@ import httpx
 
 from memforge.genes.atlassian_auth import (
     ATLASSIAN_ABSENT_STATUS_CODES,
-    atlassian_record_is_gone,
+    atlassian_record_state,
     atlassian_request_limiter,
     bearer_headers,
     request_with_rate_limit_retry,
@@ -40,6 +40,7 @@ from memforge.genes.local_adapter_packages import (
 from memforge.local_agent.jira_contract import validate_jira_observation_identities
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, source_time_iso
 from memforge.models import (
+    AbsenceAnswer,
     ConfigField,
     ConfigFieldType,
     ConfigGroup,
@@ -156,6 +157,11 @@ def _issue_ref(item: ContentItem) -> str:
     """The stored issue's stable id, or its key when the stored item does not record the id."""
     ref = str(item.extra.get("issue_id") or item.extra.get("issue_key") or "").strip()
     return ref or item.item_id.removeprefix(_ISSUE_DOC_ID_PREFIX)
+
+
+def _read_by_local_agent(config: Mapping[str, Any]) -> bool:
+    """Whether the owner's local agent reads this Source's issues, instead of the server."""
+    return str(config.get("sync_mode") or "cloud").strip().lower() == "local_agent"
 
 
 def _request_interval_seconds(config: dict) -> float:
@@ -494,7 +500,7 @@ class JiraGene(DocumentGene):
 
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         """Discover issues via JQL search."""
-        if str(self.config.get("sync_mode") or "cloud").strip().lower() == "local_agent":
+        if _read_by_local_agent(self.config):
             manifest = self._local_agent_package_manifest()
             if has_package_manifest(self.config):
                 async for item in self._discover_local_agent_package_manifest(manifest, since):
@@ -519,7 +525,7 @@ class JiraGene(DocumentGene):
 
     @classmethod
     def rediscovers_documents(cls, config: Mapping[str, Any]) -> bool:
-        return str(config.get("sync_mode") or "cloud").strip().lower() != "local_agent"
+        return not _read_by_local_agent(config)
 
     def filter_summary(self, since: datetime | None) -> str | None:
         jql_filter = str(self.config.get("jql_filter") or "").strip()
@@ -550,7 +556,7 @@ class JiraGene(DocumentGene):
 
     async def discover_inventory(self) -> AsyncIterator[ContentItem]:
         """Discover a complete lightweight issue inventory for daemon planning."""
-        if str(self.config.get("sync_mode") or "cloud").strip().lower() == "local_agent":
+        if _read_by_local_agent(self.config):
             raise ValueError("Jira inventory discovery requires direct provider access")
         self._hydrated_issues = {}
         async for item in self._discover_remote_search(
@@ -562,7 +568,12 @@ class JiraGene(DocumentGene):
         ):
             yield item
 
-    async def list_scope(self) -> ScopeListing | None:
+    @classmethod
+    def lists_scope(cls, config: Mapping[str, Any]) -> bool:
+        """The JQL is listed by an identifier-only search, or by the device's snapshot manifest."""
+        return True
+
+    async def list_scope(self) -> ScopeListing:
         """List every issue the configured JQL matches now, without the ``since`` filter.
 
         Discovery narrows the JQL by ``since`` at the provider, so the scope is
@@ -570,8 +581,11 @@ class JiraGene(DocumentGene):
         ``JIRA_INVENTORY_MAX_RESULTS`` issues. The JQL is a query: an issue it
         no longer matches may still exist (:meth:`confirm_absent`).
         """
-        if str(self.config.get("sync_mode") or "cloud").strip().lower() == "local_agent":
-            return None
+        if _read_by_local_agent(self.config):
+            raise ValueError(
+                "A Jira Source read through the local agent is listed by its device's snapshot manifest, "
+                "not by the server"
+            )
         doc_ids = {
             _issue_doc_id(str(issue["key"]))
             async for issue in self._search_issues(
@@ -583,16 +597,17 @@ class JiraGene(DocumentGene):
         }
         return ScopeListing(kind=ScopeListingKind.QUERY, doc_ids=frozenset(doc_ids))
 
-    async def confirm_absent(self, items: Sequence[ContentItem]) -> frozenset[str]:
+    async def confirm_absent(self, items: Sequence[ContentItem]) -> Mapping[str, AbsenceAnswer]:
         """Search the unlisted issues by id in batches; read each one the search does not return.
 
         The batch search is not validated, so an id Jira does not know is
         dropped from the result rather than failing the batch. Every issue the
         search returns exists. One it does not return is read by id: Jira
         answers not found both for a deleted issue and for one the credential
-        may no longer view, and either is absent to this Source.
+        may no longer view, and either is absent to this Source; a refusal
+        for this one issue is hidden.
         """
-        absent: set[str] = set()
+        answers: dict[str, AbsenceAnswer] = {}
         for start in range(0, len(items), JIRA_INVENTORY_MAX_RESULTS):
             batch = items[start:start + JIRA_INVENTORY_MAX_RESULTS]
             refs = {item.item_id: _issue_ref(item) for item in batch}
@@ -606,11 +621,16 @@ class JiraGene(DocumentGene):
             ):
                 found.update((str(issue["id"]), str(issue["key"])))
             for doc_id, ref in refs.items():
-                if ref not in found and await atlassian_record_is_gone(
-                    self._request("GET", f"/rest/api/2/issue/{ref}", params={"fields": ",".join(JIRA_IDENTITY_FIELDS)})
-                ):
-                    absent.add(doc_id)
-        return frozenset(absent)
+                answers[doc_id] = (
+                    AbsenceAnswer.EXISTS
+                    if ref in found
+                    else await atlassian_record_state(
+                        self._request(
+                            "GET", f"/rest/api/2/issue/{ref}", params={"fields": ",".join(JIRA_IDENTITY_FIELDS)}
+                        )
+                    )
+                )
+        return answers
 
     async def _discover_remote_search(
         self,

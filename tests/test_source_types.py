@@ -110,7 +110,14 @@ def test_every_document_gene_declares_its_listing_kinds() -> None:
 
 
 def test_listing_and_rediscovery_belong_to_document_genes_only() -> None:
-    document_members = {"list_scope", "confirm_absent", "record_scope_listing", "rediscover", "rediscovers_documents"}
+    document_members = {
+        "lists_scope",
+        "list_scope",
+        "confirm_absent",
+        "record_scope_listing",
+        "rediscover",
+        "rediscovers_documents",
+    }
     assert not document_members & set(dir(Gene))
     assert document_members <= set(dir(DocumentGene))
     teams = source_type_descriptor("teams").gene_class()

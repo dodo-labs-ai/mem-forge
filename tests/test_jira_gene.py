@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from memforge.genes.jira_gene import JiraGene
-from memforge.models import ContentItem
+from memforge.models import AbsenceAnswer, ContentItem
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
 
 
@@ -153,7 +153,8 @@ async def test_discovery_rejects_malformed_or_early_terminal_search_page(payload
 
     with pytest.raises(RuntimeError, match="Jira search"):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError, match="Jira search"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -168,7 +169,8 @@ async def test_discovery_rejects_duplicate_issue_identity_before_completion():
 
     with pytest.raises(RuntimeError, match="duplicate issue identity"):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError, match="duplicate issue identity"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -1723,10 +1725,13 @@ async def test_scope_listing_that_ends_before_its_total_raises():
 
 
 @pytest.mark.asyncio
-async def test_local_agent_jira_cannot_list_its_scope():
-    gene = JiraGene(config={"base_url": "https://jira.example.test", "sync_mode": "local_agent"}, source_id="src-jira")
+async def test_local_agent_jira_is_listed_by_its_device_manifest():
+    config = {"base_url": "https://jira.example.test", "sync_mode": "local_agent"}
+    gene = JiraGene(config=config, source_id="src-jira")
 
-    assert await gene.list_scope() is None
+    assert JiraGene.lists_scope(config) is True
+    with pytest.raises(ValueError, match="snapshot manifest"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -1750,11 +1755,16 @@ async def test_confirming_unlisted_issues_keeps_every_issue_jira_still_has():
     gene = _transport_gene(handler)
     items = [_stored_issue(f"PAY-{number}", str(100000 + number)) for number in range(1, 5)]
     try:
-        absent = await gene.confirm_absent(items)
+        answers = await gene.confirm_absent(items)
     finally:
         await gene._client.aclose()
 
-    assert absent == {"jira-PAY-2"}
+    assert answers == {
+        "jira-PAY-1": AbsenceAnswer.EXISTS,
+        "jira-PAY-2": AbsenceAnswer.ABSENT,
+        "jira-PAY-3": AbsenceAnswer.HIDDEN,
+        "jira-PAY-4": AbsenceAnswer.EXISTS,
+    }
     assert [body["jql"] for body in searches] == ["issuekey in (100001, 100002, 100003, 100004)"]
     assert searches[0]["validateQuery"] is False
     assert reads == ["100002", "100003", "100004"]
@@ -1775,11 +1785,12 @@ async def test_confirming_unlisted_issues_searches_in_batches_of_one_page():
     gene = _transport_gene(handler)
     items = [_stored_issue(f"PAY-{number}", str(100000 + number)) for number in range(1, JIRA_INVENTORY_MAX_RESULTS + 2)]
     try:
-        absent = await gene.confirm_absent(items)
+        answers = await gene.confirm_absent(items)
     finally:
         await gene._client.aclose()
 
-    assert absent == frozenset()
+    assert set(answers.values()) == {AbsenceAnswer.EXISTS}
+    assert set(answers) == {item.item_id for item in items}
     assert batch_sizes == [JIRA_INVENTORY_MAX_RESULTS, 1]
 
 

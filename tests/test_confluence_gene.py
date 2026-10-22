@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from memforge.genes.confluence_gene import ConfluenceGene, PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY
-from memforge.models import ContentItem
+from memforge.models import AbsenceAnswer, ContentItem
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
 
 
@@ -787,7 +787,8 @@ async def test_space_discovery_rejects_missing_results_without_completion_eviden
 
     with pytest.raises(RuntimeError, match="missing a results list"):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError, match="missing a results list"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -1078,7 +1079,8 @@ async def test_page_tree_rejects_duplicate_page_identity_before_completion():
 
     with pytest.raises(RuntimeError, match="duplicate page id"):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError, match="duplicate page id"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -1105,7 +1107,8 @@ async def test_page_tree_rejects_page_without_stable_version():
 
     with pytest.raises(RuntimeError, match="version metadata"):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError, match="version metadata"):
+        await gene.list_scope()
 
 
 def _page_tree_gene(client) -> ConfluenceGene:
@@ -1139,7 +1142,8 @@ async def test_preview_limited_discovery_does_not_list_the_scope():
 
     _ = [item async for item in gene.discover()]
 
-    assert await gene.list_scope() is None
+    with pytest.raises(RuntimeError, match="preview"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -1168,11 +1172,15 @@ async def test_confirming_unlisted_pages_keeps_a_page_moved_out_of_the_tree():
         for page_id in status_by_page
     ]
     try:
-        absent = await gene.confirm_absent(items)
+        answers = await gene.confirm_absent(items)
     finally:
         await gene._client.aclose()
 
-    assert absent == {"confluence-deleted"}
+    assert answers == {
+        "confluence-moved": AbsenceAnswer.EXISTS,
+        "confluence-deleted": AbsenceAnswer.ABSENT,
+        "confluence-restricted": AbsenceAnswer.HIDDEN,
+    }
     assert reads == list(status_by_page)
 
 

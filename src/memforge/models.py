@@ -521,6 +521,17 @@ class ScopeListing:
     doc_ids: frozenset[str]
 
 
+class AbsenceAnswer(str, Enum):
+    """What the provider answers when one item a query listing left out is read by its identifier."""
+
+    # Not found or deleted (HTTP 404 or 410, or a page in the trash): the item is gone.
+    ABSENT = "absent"
+    # The provider returned the item: it left the query but still exists.
+    EXISTS = "exists"
+    # The provider refuses to show this one item (HTTP 403): it may still exist.
+    HIDDEN = "hidden"
+
+
 def require_attested_content(raw: RawContent, normalized: NormalizedContent) -> None:
     """Refuse normalized content that is empty unless the provider attested it empty."""
 

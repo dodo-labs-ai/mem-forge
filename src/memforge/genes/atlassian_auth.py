@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from memforge.models import AbsenceAnswer
 
 logger = logging.getLogger(__name__)
 
@@ -96,11 +97,14 @@ class AtlassianRequestLimiter:
                     self._next_request_at = max(self._next_request_at, now + max(response_delay, 0.0))
 
 
-async def atlassian_record_is_gone(read: Awaitable[httpx.Response]) -> bool:
-    """Whether reading one record by id shows that the provider no longer has it.
+async def atlassian_record_state(read: Awaitable[httpx.Response]) -> AbsenceAnswer:
+    """What reading one record by id says about it: absent, exists or hidden.
 
-    Only not found or gone is absence. A permission refusal for this record
-    keeps it; any other error raises, so the run proves nothing from it.
+    Not found or gone (404, 410) is ``absent``, a permission refusal for this
+    one record (403) is ``hidden``, and a successful read is ``exists``. Any
+    other error raises, so the run proves nothing from it: an expired
+    credential (401), a rate limit that outlasted its retries (429) or a
+    server error (5xx).
     """
 
     try:
@@ -108,11 +112,11 @@ async def atlassian_record_is_gone(read: Awaitable[httpx.Response]) -> bool:
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
         if status in ATLASSIAN_ABSENT_STATUS_CODES:
-            return True
+            return AbsenceAnswer.ABSENT
         if status == ATLASSIAN_RECORD_FORBIDDEN_STATUS_CODE:
-            return False
+            return AbsenceAnswer.HIDDEN
         raise
-    return False
+    return AbsenceAnswer.EXISTS
 
 
 def atlassian_request_limiter(

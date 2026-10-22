@@ -7,7 +7,11 @@ from memforge.models import GeneConfigSchema, GeneMetadata
 
 
 class FakeGene(DocumentGene):
-    """A document Gene whose unexercised steps raise; it inherits every optional default."""
+    """A document Gene whose unexercised steps raise; it inherits every optional default.
+
+    It cannot list its scope. A fake that lists answers ``lists_scope`` with
+    ``True`` and implements ``list_scope``.
+    """
 
     listing_kinds = frozenset()
 
@@ -28,6 +32,13 @@ class FakeGene(DocumentGene):
     @classmethod
     def config_schema(cls) -> GeneConfigSchema:
         return GeneConfigSchema(fields=[], groups=[])
+
+    @classmethod
+    def lists_scope(cls, config) -> bool:
+        return False
+
+    async def list_scope(self):
+        raise NotImplementedError
 
     async def authenticate(self) -> None:
         return None

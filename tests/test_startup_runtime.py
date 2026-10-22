@@ -2053,6 +2053,13 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
         listing_kinds = frozenset()
 
         @classmethod
+        def lists_scope(cls, config) -> bool:
+            return False
+
+        async def list_scope(self):
+            raise NotImplementedError
+
+        @classmethod
         def metadata(cls) -> GeneMetadata:
             return GeneMetadata(
                 name="api_key_gene",
@@ -2184,6 +2191,13 @@ async def test_gene_discovery_preview_runs_configured_gene_without_saving_source
         listing_kinds = frozenset()
 
         @classmethod
+        def lists_scope(cls, config) -> bool:
+            return False
+
+        async def list_scope(self):
+            raise NotImplementedError
+
+        @classmethod
         def metadata(cls) -> GeneMetadata:
             return GeneMetadata(
                 name="preview_gene",
@@ -2264,6 +2278,13 @@ async def test_gene_discovery_preview_reuses_existing_source_secret(db, tmp_path
 
     class SecretPreviewGene(DocumentGene):
         listing_kinds = frozenset()
+
+        @classmethod
+        def lists_scope(cls, config) -> bool:
+            return False
+
+        async def list_scope(self):
+            raise NotImplementedError
 
         @classmethod
         def metadata(cls) -> GeneMetadata:

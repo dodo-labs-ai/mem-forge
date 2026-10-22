@@ -74,6 +74,7 @@ class JiraGene(FakeGene):
     discovery_complete = True
 
     def __init__(self) -> None:
+        super().__init__()
         self.provider_open = True
         # Documents whose content normalizes to nothing without provider evidence.
         self.unattested_empty: set[str] = set()
