@@ -29,6 +29,8 @@ from memforge.llm.structured import (
     StructuredLlmError,
 )
 from memforge.genes.base import SourceConfigurationError
+from memforge.genes.github_repo_gene import github_renamed_from
+from memforge.github_repo_utils import build_github_repo_doc_id
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import (
     DeferredProjectedLifecycleHandle,
@@ -4180,6 +4182,16 @@ class LargeConfluenceGene(UpdatingDocumentGene):
         )
 
 
+MOVING_FILE_REPO_URL = "https://github.example/acme/payroll"
+
+
+def moving_file_doc_id(source_id: str, relative_path: str) -> str:
+    """The Document id GitHub discovery gives a file of the moving-file repository."""
+    return build_github_repo_doc_id(
+        source_id=source_id, repo_url=MOVING_FILE_REPO_URL, repo_ref="main", relative_path=relative_path,
+    )
+
+
 class MovingGithubFileGene(UpdatingDocumentGene):
     def __init__(
         self,
@@ -4187,7 +4199,6 @@ class MovingGithubFileGene(UpdatingDocumentGene):
         item_id: str,
         relative_path: str,
         previous_filename: str | None = None,
-        previous_document_id: str | None = None,
         file_lineage_id: str | None = "file-lineage-77",
         version: str = "blob-v1",
     ) -> None:
@@ -4195,7 +4206,6 @@ class MovingGithubFileGene(UpdatingDocumentGene):
         self.item_id = item_id
         self.relative_path = relative_path
         self.previous_filename = previous_filename
-        self.previous_document_id = previous_document_id
         self.file_lineage_id = file_lineage_id
 
     @classmethod
@@ -4212,17 +4222,13 @@ class MovingGithubFileGene(UpdatingDocumentGene):
     async def discover(self, since=None):
         extra = {
             "relative_path": self.relative_path,
+            "repo_url": MOVING_FILE_REPO_URL,
             "repo_owner": "acme",
             "repo_name": "payroll",
             "repo_ref": "main",
         }
         if self.file_lineage_id is not None:
             extra["file_lineage_id"] = self.file_lineage_id
-        if self.previous_filename is not None:
-            extra["previous_filename"] = self.previous_filename
-            extra["rename_evidence_authoritative"] = True
-        if self.previous_document_id is not None:
-            extra["previous_document_id"] = self.previous_document_id
         yield ContentItem(
             item_id=self.item_id,
             title="Design",
@@ -4232,6 +4238,11 @@ class MovingGithubFileGene(UpdatingDocumentGene):
             space_or_project="payroll",
             version=self.version,
             extra=extra,
+            renamed_from=github_renamed_from(
+                repository="acme/payroll",
+                previous_filename=self.previous_filename,
+                rename_evidence_authoritative=True,
+            ),
         )
 
 
@@ -9485,6 +9496,9 @@ async def test_normal_sync_reconciles_empty_revision_without_llm_extraction(
 @pytest.mark.asyncio
 async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: Database):
     source_id = "src-github-move"
+    old_doc_id = moving_file_doc_id(source_id, "old/design.md")
+    new_doc_id = moving_file_doc_id(source_id, "new/design.md")
+    final_doc_id = moving_file_doc_id(source_id, "final/design.md")
     await db.upsert_source(
         id=source_id,
         type="github_repo",
@@ -9505,7 +9519,7 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
 
     first = await orchestrator.sync_gene(
         gene=MovingGithubFileGene(
-            item_id="github-old-design",
+            item_id=old_doc_id,
             relative_path="old/design.md",
             file_lineage_id=None,
         ),
@@ -9515,10 +9529,9 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
     extraction_calls_after_first = len(extractor.fragment_calls)
     moved = await orchestrator.sync_gene(
         gene=MovingGithubFileGene(
-            item_id="github-new-design",
+            item_id=new_doc_id,
             relative_path="new/design.md",
             previous_filename="old/design.md",
-            previous_document_id="github-old-design",
             file_lineage_id=None,
         ),
         source_name="Payroll Repo",
@@ -9526,7 +9539,7 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
     )
     ordinary_after_move = await orchestrator.sync_gene(
         gene=MovingGithubFileGene(
-            item_id="github-new-design",
+            item_id=new_doc_id,
             relative_path="new/design.md",
             file_lineage_id=None,
         ),
@@ -9535,10 +9548,9 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
     )
     moved_again = await orchestrator.sync_gene(
         gene=MovingGithubFileGene(
-            item_id="github-final-design",
+            item_id=final_doc_id,
             relative_path="final/design.md",
             previous_filename="new/design.md",
-            previous_document_id="github-new-design",
             file_lineage_id=None,
         ),
         source_name="Payroll Repo",
@@ -9553,24 +9565,24 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
     assert (
         len(extractor.fragment_calls)
     ) == extraction_calls_after_first
-    assert await db.get_document("github-old-design") is None
-    assert await db.get_document("github-new-design") is None
-    assert await db.get_document("github-final-design") is not None
+    assert await db.get_document(old_doc_id) is None
+    assert await db.get_document(new_doc_id) is None
+    assert await db.get_document(final_doc_id) is not None
     unit_rows = await db.db.execute_fetchall(
         "SELECT id FROM source_units WHERE source_id = ?",
         (source_id,),
     )
     assert len(unit_rows) == 1
     assert await db.list_source_unit_document_ids(str(unit_rows[0]["id"])) == (
-        "github-final-design",
-        "github-new-design",
-        "github-old-design",
+        final_doc_id,
+        new_doc_id,
+        old_doc_id,
     )
     moved_unit_id = str(unit_rows[0]["id"])
 
     reused_old_path = await orchestrator.sync_gene(
         gene=MovingGithubFileGene(
-            item_id="github-old-design",
+            item_id=old_doc_id,
             relative_path="old/design.md",
             file_lineage_id=None,
         ),
@@ -9581,7 +9593,7 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
     assert reused_old_path.last_sync_status == "success"
     current_reused = await db.find_source_unit_by_document_id(
         source_id,
-        "github-old-design",
+        old_doc_id,
         current_only=True,
     )
     assert current_reused is not None
@@ -9596,6 +9608,8 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
 @pytest.mark.asyncio
 async def test_exact_version_github_file_move_a_to_b_to_a_keeps_one_lineage(db: Database):
     source_id = "src-github-move-reversion"
+    a_doc_id = moving_file_doc_id(source_id, "a/design.md")
+    b_doc_id = moving_file_doc_id(source_id, "b/design.md")
     await db.upsert_source(
         id=source_id,
         type="github_repo",
@@ -9616,24 +9630,22 @@ async def test_exact_version_github_file_move_a_to_b_to_a_keeps_one_lineage(db: 
 
     for gene in (
         MovingGithubFileGene(
-            item_id="github-a",
+            item_id=a_doc_id,
             relative_path="a/design.md",
             file_lineage_id=None,
             version="same-blob-sha",
         ),
         MovingGithubFileGene(
-            item_id="github-b",
+            item_id=b_doc_id,
             relative_path="b/design.md",
             previous_filename="a/design.md",
-            previous_document_id="github-a",
             file_lineage_id=None,
             version="same-blob-sha",
         ),
         MovingGithubFileGene(
-            item_id="github-a",
+            item_id=a_doc_id,
             relative_path="a/design.md",
             previous_filename="b/design.md",
-            previous_document_id="github-b",
             file_lineage_id=None,
             version="same-blob-sha",
         ),
@@ -9645,16 +9657,16 @@ async def test_exact_version_github_file_move_a_to_b_to_a_keeps_one_lineage(db: 
         )
         assert state.last_sync_status == "success"
 
-    assert await db.get_document("github-a") is not None
-    assert await db.get_document("github-b") is None
+    assert await db.get_document(a_doc_id) is not None
+    assert await db.get_document(b_doc_id) is None
     unit_rows = await db.db.execute_fetchall(
         "SELECT id FROM source_units WHERE source_id = ?",
         (source_id,),
     )
     assert len(unit_rows) == 1
     assert await db.list_source_unit_document_ids(str(unit_rows[0]["id"])) == (
-        "github-a",
-        "github-b",
+        a_doc_id,
+        b_doc_id,
     )
     assert len(extractor.fragment_calls) == 1
 
@@ -10822,7 +10834,7 @@ async def test_a_new_unit_commits_before_the_unit_it_replaces_is_removed(db: Dat
 
 
 @pytest.mark.asyncio
-async def test_a_new_unit_that_fails_for_good_keeps_the_old_unit(db: Database) -> None:
+async def test_a_new_unit_that_fails_for_good_does_not_keep_the_unit_the_listing_left_out(db: Database) -> None:
     source_id = "src-unit-identity-change-failed"
     await db.upsert_source(
         id=source_id, type="jira", name="Jira", config_json="{}", access_policy="workspace", owner_user_id="dev",
@@ -10844,14 +10856,15 @@ async def test_a_new_unit_that_fails_for_good_keeps_the_old_unit(db: Database) -
         retry_sleep=_skip_retry_delay,
     ).sync_gene(gene=_IssueGene(0, 1), source_name="Jira", source_id=source_id, force_full_sync=True)
 
-    # Absence is proven only when every returned document committed.
+    # The listing proves jira-2 gone; the failure of jira-1, which names no
+    # predecessor, says nothing about it.
     assert state.docs_failed == 1
-    assert ("tombstone", "jira-2") not in engine.events
-    assert await db.get_document("jira-2") is not None
+    assert ("tombstone", "jira-2") in engine.events
+    assert await db.get_document("jira-2") is None
 
 
 @pytest.mark.asyncio
-async def test_a_new_unit_still_deferred_by_this_run_keeps_the_old_unit(db: Database) -> None:
+async def test_a_new_unit_still_deferred_by_this_run_does_not_keep_the_unit_the_listing_left_out(db: Database) -> None:
     source_id = "src-unit-identity-change-stuck"
     await db.upsert_source(
         id=source_id, type="jira", name="Jira", config_json="{}", access_policy="workspace", owner_user_id="dev",
@@ -10873,10 +10886,11 @@ async def test_a_new_unit_still_deferred_by_this_run_keeps_the_old_unit(db: Data
         retry_sleep=_skip_retry_delay,
     ).sync_gene(gene=_IssueGene(0, 1), source_name="Jira", source_id=source_id, force_full_sync=True)
 
-    # jira-1 waits only on a Unit of this run, so no removal can unblock it: it has failed.
+    # jira-1 waits only on a Unit of this run, so no removal can unblock it:
+    # it has failed. The listing still proves jira-2 gone.
     assert state.docs_failed == 1
-    assert ("tombstone", "jira-2") not in engine.events
-    assert await db.get_document("jira-2") is not None
+    assert ("tombstone", "jira-2") in engine.events
+    assert await db.get_document("jira-2") is None
 
 
 @pytest.mark.asyncio
@@ -11900,7 +11914,7 @@ async def test_reused_projection_remains_complete_snapshot_membership_for_deleti
         gene=UnexpectedFetchGene(item_count=1, release=release),
         source_name="Jira Board",
         source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset({"jira-0"})),
         reusable_projection_doc_ids=frozenset({"jira-0"}),
     )
 

@@ -44,11 +44,25 @@ When in doubt, choose query: it never removes an item the provider still has.
 What the listing decides
 ------------------------
 
+A run lists its scope once, after discovery and before it retries failed
+Documents, and keeps that listing for the rest of the run.
+
 Absence. A held Document an existence listing leaves out is removed. One a
 query listing leaves out is removed only when ``confirm_absent`` answers
 ``absent``; one that still exists keeps its Document and is not refreshed
 while it stays outside the query. A configuration that cannot list, a listing
-that fails and a confirmation that fails each remove nothing.
+that fails and a confirmation that fails each remove nothing. A Document that
+failed in this run does not hold back the removal of another one.
+
+Failed Documents. A failed Document the listing names is retried. One an
+existence listing leaves out is gone, so it leaves the failure ledger. One a
+query listing leaves out is looked up through :meth:`DocumentGene.rediscover`,
+which settles it when the provider no longer yields it.
+
+Renames. A connector whose provider attests a rename sets
+:attr:`~memforge.models.ContentItem.renamed_from` on the discovered item to
+the provider key of the Unit it was renamed from. That Unit is kept, even
+unlisted, until the renamed item commits.
 
 Implementing a document connector
 ---------------------------------

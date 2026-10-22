@@ -112,6 +112,7 @@ from memforge.pipeline.extraction_contract import (
 )
 from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot
 from memforge.pipeline.collection_family import (
+    LedgerPartition,
     SnapshotBinding,
     collection_family,
 )
@@ -134,6 +135,7 @@ from memforge.source_item_failures import (
     FailedItemRetry,
     RunItemFailure,
     SourceItemFailure,
+    with_inherited_rename,
 )
 from memforge.source_projection_config import canonical_projection_scope, source_access_context
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time, reported_source_time
@@ -914,9 +916,9 @@ class GeneSyncOrchestrator:
             documents even when their content hash is unchanged.
         input_snapshot:
             The complete input snapshot a device submitted for a document
-            Source's run. The run discovers all of it, so removals can be
-            reconciled, while still skipping Documents whose content is
-            unchanged.
+            Source's run. The run discovers all of it, while still skipping
+            Documents whose content is unchanged, and its manifest is the
+            run's scope listing.
         reprocess_doc_ids:
             The Documents a REPROCESS run processes; required by and only
             accepted with that mode.
@@ -1006,6 +1008,7 @@ class GeneSyncOrchestrator:
         total_item_count = 0
         failure_retryable = True
         absence_check_skipped_reason: AbsenceCheckSkippedReason | None = None
+        unlisted_present_count: int | None = None
         recovered_completed_results: tuple[dict[str, Any], ...] = ()
         recovered_deferred_results: tuple[dict[str, Any], ...] = ()
         recovered_failed_results: tuple[dict[str, Any], ...] = ()
@@ -1178,38 +1181,46 @@ class GeneSyncOrchestrator:
                         len(skipped_doc_ids),
                         source_id,
                     )
+                # The run's one scope listing, taken before any failed
+                # Document is retried, decides the ledger rows it does not
+                # name: settled when their item is gone, or kept untried.
+                ledger_partition = LedgerPartition()
+                if scope_transition is None:
+                    await family.take_scope_listing()
+                    ledger_partition = family.partition_ledger(ledger, rediscovering=rediscovering)
+                    settled_doc_ids.update(ledger_partition.settled)
                 # A failed Document that discovery did not return is read the
-                # way a reprocess reads it. A complete snapshot is the whole
-                # scope: what it did not return is removed, not retried.
-                if not complete_snapshot:
-                    for doc_id in sorted(retried_doc_ids - crawled_doc_ids):
-                        try:
-                            item, stored = await family.document_input(
-                                doc_id,
-                                rediscovering=rediscovering,
-                                failure=ledger.get(doc_id),
-                            )
-                        except StoredDocumentUnavailable as exc:
-                            if exc.reason is StoredDocumentUnavailableReason.PROVIDER_DOCUMENT_MISSING:
-                                # Nothing is left to retry; a run that proves
-                                # the Document absent removes it.
-                                settled_doc_ids.add(doc_id)
-                                continue
-                            docs_failed += 1
-                            fail_document(
-                                _run_item_failure(
-                                    exc,
-                                    document_id=doc_id,
-                                    title=ledger[doc_id].title,
-                                    stage="fetch",
-                                    store=self.db,
-                                ),
-                                error=str(exc),
-                            )
+                # way a reprocess reads it.
+                for doc_id in sorted(
+                    retried_doc_ids - crawled_doc_ids - ledger_partition.settled - ledger_partition.untried
+                ):
+                    try:
+                        item, stored = await family.document_input(
+                            doc_id,
+                            rediscovering=rediscovering,
+                            failure=ledger.get(doc_id),
+                        )
+                    except StoredDocumentUnavailable as exc:
+                        if exc.reason is StoredDocumentUnavailableReason.PROVIDER_DOCUMENT_MISSING:
+                            # Nothing is left to retry: the provider no longer
+                            # has the item, or it left the query.
+                            settled_doc_ids.add(doc_id)
                             continue
-                        if stored is not None:
-                            stored_documents[doc_id] = stored
-                        items.append(item)
+                        docs_failed += 1
+                        fail_document(
+                            _run_item_failure(
+                                exc,
+                                document_id=doc_id,
+                                title=ledger[doc_id].title,
+                                stage="fetch",
+                                store=self.db,
+                            ),
+                            error=str(exc),
+                        )
+                        continue
+                    if stored is not None:
+                        stored_documents[doc_id] = stored
+                    items.append(item)
                 discovered_doc_ids = set(crawled_doc_ids)
                 unexpected_reuse_ids = reusable_projection_doc_ids - discovered_doc_ids
                 if unexpected_reuse_ids and complete_snapshot:
@@ -1240,6 +1251,10 @@ class GeneSyncOrchestrator:
                     full_sync=last_sync_time is None,
                     projection_coverage=run_coverage.value,
                 )
+
+            # A failed Document keeps the rename its ledger row recorded,
+            # because its provider may have reported the rename only once.
+            items = [with_inherited_rename(item, ledger.get(item.item_id)) for item in items]
 
             if progress_callback:
                 progress_callback(
@@ -1591,25 +1606,28 @@ class GeneSyncOrchestrator:
                 if r.get("runtime_bundle") is not None:
                     runtime_bundles.append(r["runtime_bundle"])
 
-            # A complete discovery is the whole scope: a failed Document it did
-            # not return and that holds no Unit has nothing left to retry or
-            # remove.
-            if run_coverage.proves_absence and not reprocessing and scope_transition is None:
-                settled_doc_ids.update(set(ledger) - crawled_doc_ids - indexed_doc_ids)
-
             # ----------------------------------------------------------
             # Step 5: Remove Documents the provider no longer has
             # ----------------------------------------------------------
             # The family decides what the run proves absent. Deferred commits
-            # blocked only by this run's Units converge first; a commit that
-            # fails for good counts as a failed document and keeps absence
-            # unproven.
+            # blocked only by this run's Units converge first. A Document
+            # that has not committed by then keeps the Unit its renamed item
+            # names; it holds back nothing else.
             await self._converge_deferred_projected_lifecycle(effective_results)
             deferred_failures = sum(result.get("terminal_error") is not None for result in deferred_results)
             deleted_count = 0
             tombstoned_source_unit_ids: set[str] = set()
             run_committed = docs_failed + deferred_failures == 0
             absence_is_authoritative = run_coverage.proves_absence and run_committed
+            committed_doc_ids = {
+                str(result["doc_id"])
+                for result in effective_results
+                if result.get("processed")
+                and not result.get("failed")
+                and result.get("deferred_lifecycle") is None
+                and result.get("terminal_error") is None
+            }
+            left_ledger_doc_ids = committed_doc_ids | settled_doc_ids
             absence = await family.absence(
                 reprocessing=reprocessing,
                 transition_open=scope_transition is not None,
@@ -1617,9 +1635,18 @@ class GeneSyncOrchestrator:
                 run_committed=run_committed,
                 indexed_doc_ids=indexed_doc_ids,
                 crawled_doc_ids=crawled_doc_ids,
+                uncommitted=[
+                    *(item for item in items if item.item_id not in committed_doc_ids),
+                    *(
+                        failure.item
+                        for failure in ledger.values()
+                        if failure.item is not None and failure.document_id not in left_ledger_doc_ids
+                    ),
+                ],
             )
             removals = absence.removals
             absence_check_skipped_reason = absence.skipped_reason
+            unlisted_present_count = absence.unlisted_present_count
 
             if removals is not None:
                 if progress_callback:
@@ -1657,12 +1684,9 @@ class GeneSyncOrchestrator:
                     )
             else:
                 logger.debug(
-                    "Skipping deletion detection without absence proof: "
-                    "coverage=%s failed_docs=%d returned=%d indexed=%d",
-                    run_coverage.value,
-                    docs_failed,
-                    len(crawled_doc_ids),
-                    len(indexed_doc_ids),
+                    "No Document of %s is proven absent: no listing, or its check was skipped (%s)",
+                    source_id,
+                    absence_check_skipped_reason or "nothing to check",
                 )
 
             # A removed Unit may have blocked a deferred commit of this run.
@@ -1836,6 +1860,7 @@ class GeneSyncOrchestrator:
             failed_docs=failed_docs,
             failure_retryable=failure_retryable,
             absence_check_skipped_reason=absence_check_skipped_reason,
+            unlisted_present_count=unlisted_present_count,
             runtime_bundles=tuple(runtime_bundles),
         )
 

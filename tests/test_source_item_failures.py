@@ -11,15 +11,16 @@ import pytest
 
 from memforge.config import AppConfig, SyncConfig
 from memforge.pipeline.collection_family import SnapshotBinding
-from memforge.models import SyncState
+from memforge.models import ScopeListingKind, SyncState
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.release import current_release
 from memforge.runtime import SourceSyncWorker, SyncService, failed_item_health, failed_item_retry_for_run
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind, SourceActivityLease
 from memforge.source_derivation import DERIVATION_RELEASE_SUPERSEDED
-from memforge.source_item_failures import FailedItemRetry, SourceItemFailure
+from memforge.source_item_failures import FailedItemRetry, RunItemFailure, SourceItemFailure, with_inherited_rename
 from memforge.storage.database import Database
 from tests.test_stored_input_currency import (
+    ISSUES,
     SOURCE_ID,
     SPRINT_HISTORY,
     SYNCED_AT,
@@ -522,26 +523,88 @@ async def test_a_source_that_cannot_ask_for_one_document_retries_the_revision_th
     assert await _ledger(db) == {}
 
 
-@pytest.mark.asyncio
-async def test_a_complete_input_snapshot_settles_a_failed_document_that_never_committed_and_is_gone(db):
+class ExistenceListedProvider(BreakableProvider):
+    """A provider whose device manifest is an existence listing: an item it leaves out is gone."""
+
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
+
+
+async def _gone_before_it_committed(db, provider: BreakableProvider):
+    """A Source whose PAY-1 failed in its first fetch, then left the provider."""
     await _jira_source(db)
     harness = Harness(db)
-    harness.provider = BreakableProvider()
+    harness.provider = provider
     harness.provider.broken["PAY-1"] = ("fetch", ValueError)
     assert (await harness.sync(retry=SCHEDULED)).last_sync_status == "partial"
     assert set(await _ledger(db)) == {"PAY-1"}
+    harness.provider.broken.clear()
     harness.provider.removed.add("PAY-1")
-    # A partial discovery proves nothing about the Documents it did not return.
-    assert (await harness.sync(retry=SCHEDULED)).last_sync_status == "success"
-    assert set(await _ledger(db)) == {"PAY-1"}
+    harness.provider.fetches.clear()
+    return harness
 
-    state = await harness.orchestrator().sync_gene(
+
+async def _device_sync(harness):
+    listed = frozenset(doc_id(key) for key in ISSUES if key not in harness.provider.removed)
+    return await harness.orchestrator().sync_gene(
         gene=harness.provider, source_name="Jira", source_id=SOURCE_ID,
-        failed_item_retry=SCHEDULED, input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
+        failed_item_retry=SCHEDULED, input_snapshot=SnapshotBinding("snapshot-1", listed),
     )
 
+
+@pytest.mark.asyncio
+async def test_a_server_query_listing_settles_a_failed_document_its_rediscovery_finds_gone(db):
+    harness = await _gone_before_it_committed(db, BreakableProvider())
+
+    # A scheduled run leaves this release's deterministic failure alone.
+    assert (await harness.sync(retry=SCHEDULED)).last_sync_status == "success"
+    assert set(await _ledger(db)) == {"PAY-1"}
+    assert harness.provider.rediscovered == []
+
+    state = await harness.sync()
+
     assert state.last_sync_status == "success"
+    assert harness.provider.rediscovered == ["PAY-1"]
+    assert harness.provider.fetches == []
     assert await _ledger(db) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_server_query_listing_keeps_untried_a_failed_document_it_cannot_rediscover(db, monkeypatch):
+    monkeypatch.setattr("memforge.pipeline.sync.source_rediscovers_documents", lambda *args: False)
+    harness = await _gone_before_it_committed(db, BreakableProvider())
+
+    state = await harness.sync()
+
+    assert state.last_sync_status == "success"
+    assert harness.provider.fetches == []
+    assert set(await _ledger(db)) == {"PAY-1"}
+
+
+@pytest.mark.asyncio
+async def test_a_device_existence_manifest_settles_a_failed_document_it_does_not_list(db):
+    harness = await _gone_before_it_committed(db, ExistenceListedProvider())
+
+    state = await _device_sync(harness)
+
+    assert state.last_sync_status == "success"
+    assert state.absence_check_skipped_reason is None
+    assert "PAY-1" not in harness.provider.fetches
+    assert await _ledger(db) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_device_query_manifest_keeps_untried_a_failed_document_it_does_not_list(db):
+    harness = await _gone_before_it_committed(db, BreakableProvider())
+
+    state = await _device_sync(harness)
+
+    # Only the device can confirm by identifier whether PAY-1 left the query
+    # or is gone, and it has not.
+    assert state.last_sync_status == "success"
+    assert state.absence_check_skipped_reason == "absence_confirmation_missing"
+    assert state.unlisted_present_count is None
+    assert "PAY-1" not in harness.provider.fetches
+    assert set(await _ledger(db)) == {"PAY-1"}
 
 
 @pytest.mark.asyncio
@@ -583,3 +646,32 @@ async def test_a_ledger_write_without_the_current_source_activity_lease_is_refus
         await db.delete_source_item_failures(SOURCE_ID, ["doc-1"], source_activity=lost)
 
     assert await db.list_source_item_failures(source_id=SOURCE_ID) == (row,)
+
+
+def test_a_ledger_row_keeps_the_rename_an_earlier_item_attested():
+    now = datetime(2026, 10, 17, tzinfo=timezone.utc)
+    renamed = JiraProvider()._item("PAY-1")
+    renamed.renamed_from = "PAY:old-unit"
+    fresh = JiraProvider()._item("PAY-1")
+    first = SourceItemFailure.recorded(
+        None,
+        RunItemFailure(
+            document_id=doc_id("PAY-1"), stage="fetch", error_class="builtins.ValueError", message="failed",
+            retryable=False, item=renamed,
+        ),
+        source_id=SOURCE_ID, release=current_release(), failed_at=now,
+    )
+
+    again = SourceItemFailure.recorded(
+        first,
+        RunItemFailure(
+            document_id=doc_id("PAY-1"), stage="fetch", error_class="builtins.ValueError", message="failed",
+            retryable=False, item=fresh,
+        ),
+        source_id=SOURCE_ID, release=current_release(), failed_at=now,
+    )
+
+    assert again.item is not None and again.item.renamed_from == "PAY:old-unit"
+    assert fresh.renamed_from is None
+    assert with_inherited_rename(fresh, first).renamed_from == "PAY:old-unit"
+    assert with_inherited_rename(fresh, None) is fresh

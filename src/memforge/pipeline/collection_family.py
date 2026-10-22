@@ -6,8 +6,10 @@ where the families differ and runs everything else, such as fetching,
 projection, extraction and the Memory lifecycle, the same way for both.
 
 - :class:`DocumentFamily` reads a provider's items. It discovers changes
-  since the incremental cursor, and proves a Document gone from a submitted
-  snapshot or from a listing of the configured scope.
+  since the incremental cursor, and takes one listing of the configured scope
+  per run: a device's snapshot manifest, or the connector's own listing. That
+  listing decides which failed Documents are retried and which held
+  Documents are gone.
 - :class:`ConversationFamily` plans each run from the collection attempt it
   is bound to. Each Unit the conversation layer removes carries its own
   evidence.
@@ -17,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, cast
@@ -32,6 +34,7 @@ from memforge.models import (
     AbsenceAnswer,
     AbsenceCheckSkippedReason,
     ContentItem,
+    ScopeListing,
     ScopeListingKind,
     SyncState,
 )
@@ -62,6 +65,7 @@ __all__ = [
     "CollectionFamily",
     "ConversationFamily",
     "DocumentFamily",
+    "LedgerPartition",
     "SnapshotBinding",
     "collection_family",
 ]
@@ -99,11 +103,26 @@ class AbsenceOutcome:
 
     ``removals`` are the Documents to remove with their reasons; ``None``
     means the run proved nothing absent. ``skipped_reason`` names the step
-    that failed when the check could not complete.
+    that failed when the check could not complete. ``unlisted_present_count``
+    counts the unlisted Documents the provider confirmed it still has or
+    hides, and is ``None`` when the run confirmed nothing.
     """
 
     removals: Mapping[str, SourceRemoval] | None = None
     skipped_reason: AbsenceCheckSkippedReason | None = None
+    unlisted_present_count: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerPartition:
+    """The failure ledger rows a run's scope listing does not name, by what the run does with them.
+
+    ``settled`` rows leave the ledger: their item is gone. ``untried`` rows
+    stay in the ledger and are not retried in this run.
+    """
+
+    settled: frozenset[str] = frozenset()
+    untried: frozenset[str] = frozenset()
 
 
 def _absent(doc_ids: set[str], *, evidence: str) -> dict[str, SourceRemoval]:
@@ -175,6 +194,13 @@ class CollectionFamily(ABC):
     async def _requires_full_discovery(self) -> bool:
         return False
 
+    async def take_scope_listing(self) -> None:
+        """Take the run's one listing of its scope, after discovery and before failed Documents are retried."""
+
+    def partition_ledger(self, ledger_doc_ids: Collection[str], *, rediscovering: bool) -> LedgerPartition:
+        """The failure ledger rows the run's listing settles or leaves untried; the rest follow the retry rules."""
+        return LedgerPartition()
+
     @abstractmethod
     async def document_input(
         self,
@@ -195,8 +221,15 @@ class CollectionFamily(ABC):
         run_committed: bool,
         indexed_doc_ids: set[str],
         crawled_doc_ids: set[str],
+        uncommitted: Sequence[ContentItem],
     ) -> AbsenceOutcome:
-        """The Documents this run proves the Source no longer has."""
+        """The Documents this run proves the Source no longer has.
+
+        ``coverage_proves_absence`` and ``run_committed`` decide the run of an
+        open scope transition. ``uncommitted`` holds the item of every
+        Document of this run, and of every failure ledger row the run leaves
+        open, that has not committed.
+        """
 
     async def completes_transition(self, *, docs_failed: int) -> bool:
         """Whether this family completes the open transition, whatever the run's coverage proves."""
@@ -208,9 +241,30 @@ class CollectionFamily(ABC):
 
 
 class DocumentFamily(CollectionFamily):
-    """A document Source: provider items, discovered since the cursor and listed by scope."""
+    """A document Source: provider items, discovered since the cursor and listed by scope.
+
+    A run takes at most one :class:`~memforge.models.ScopeListing`, right
+    after discovery and before it retries failed Documents, and keeps it for
+    the rest of the run: a connector such as Confluence resets its discovery
+    walk when it rediscovers one Document, so listing again later could
+    answer differently. A run bound to a device's input snapshot reads the
+    snapshot manifest as its listing, with the Gene's single listing kind.
+    """
 
     gene: DocumentGene
+
+    def __init__(
+        self,
+        gene: Gene,
+        *,
+        db: RelationalStore,
+        doc_store: DocumentStore,
+        source_id: str,
+    ) -> None:
+        super().__init__(gene, db=db, doc_store=doc_store, source_id=source_id)
+        self.scope_listing: ScopeListing | None = None
+        self._listing_skipped_reason: AbsenceCheckSkippedReason | None = None
+        self._unconfirmed_ledger_doc_ids: frozenset[str] = frozenset()
 
     def prepare(
         self,
@@ -219,6 +273,57 @@ class DocumentFamily(CollectionFamily):
         input_snapshot: SnapshotBinding | None,
     ) -> None:
         self.input_snapshot = input_snapshot
+
+    async def take_scope_listing(self) -> None:
+        """Take the run's listing: the bound snapshot manifest, or the connector's own listing.
+
+        A configuration that cannot list, and one collected on a device whose
+        run is bound to no snapshot, has no listing. A connector listing that
+        raises leaves the run without one and records ``scope_listing_failed``,
+        so nothing is removed or settled by listing in this run.
+        """
+
+        if not self.gene.lists_scope(self.gene.config):
+            return
+        if self.input_snapshot is not None:
+            self.scope_listing = ScopeListing(kind=self._device_listing_kind(), doc_ids=self.input_snapshot.doc_ids)
+            return
+        if self._collected_on_device():
+            return
+        try:
+            self.scope_listing = await self.gene.list_scope()
+        except Exception as exc:
+            # The provider's error stays in the log; the run records which
+            # step failed, so its sync activity shows that nothing was removed.
+            logger.warning("Scope listing of %s failed; nothing is removed in this run: %s", self.source_id, exc)
+            self._listing_skipped_reason = "scope_listing_failed"
+
+    def partition_ledger(self, ledger_doc_ids: Collection[str], *, rediscovering: bool) -> LedgerPartition:
+        """Settle or keep the failure ledger rows the listing does not name.
+
+        - Existence listing: every unlisted row is settled, whatever the retry
+          rules say, including a row whose Document never became a Unit.
+        - Query listing read from the provider: an unlisted row is retried
+          through ``rediscover``, which settles it when the item is gone or has
+          left the query. A Source that cannot rediscover keeps it untried.
+        - Query listing from a device: an unlisted row is kept untried until
+          the device confirms it by identifier.
+
+        A listed row, and every row of a run without a listing, follows the
+        retry rules. The rows a device has yet to confirm also keep the run
+        from removing anything (:meth:`absence`).
+        """
+
+        listing = self.scope_listing
+        if listing is None:
+            return LedgerPartition()
+        unlisted = frozenset(ledger_doc_ids) - listing.doc_ids
+        if listing.kind is ScopeListingKind.EXISTENCE:
+            return LedgerPartition(settled=unlisted)
+        if self.input_snapshot is not None:
+            self._unconfirmed_ledger_doc_ids = unlisted
+            return LedgerPartition(untried=unlisted)
+        return LedgerPartition() if rediscovering else LedgerPartition(untried=unlisted)
 
     async def _requires_full_discovery(self) -> bool:
         if not gene_exports_pdf(self.gene):
@@ -285,30 +390,65 @@ class DocumentFamily(CollectionFamily):
         run_committed: bool,
         indexed_doc_ids: set[str],
         crawled_doc_ids: set[str],
+        uncommitted: Sequence[ContentItem],
     ) -> AbsenceOutcome:
-        """Remove what a submitted snapshot did not return, or what the scope listing proves gone.
+        """Remove the held Documents the run's scope listing shows gone.
 
-        Discovery narrowed by ``since`` returns changed items only, so a
-        Document it did not return proves nothing. A submitted snapshot, or a
-        complete discovery of a newly configured scope, is the whole scope:
-        what it did not return is removed. Every other run lists the
-        configured scope by identifier and removes only what that listing
-        proves absent. Absence is proven only after every Unit of the run has
-        committed.
+        A reprocess removes nothing. A run of an open scope transition removes
+        what a complete discovery of the new scope did not return, once every
+        Document of the run committed. Any other run reads its listing: a
+        failed Document says nothing about one the listing left out, so item
+        failures do not hold absence back.
+
+        - Without a listing, nothing is removed; a listing that failed
+          records why.
+        - A held Document the listing does not name is kept while it is the
+          predecessor of a renamed item in ``uncommitted``.
+        - Existence listing: every other unlisted Document is absent.
+        - Query listing: each other unlisted Document is read by identifier,
+          and only one the provider answers ``absent`` for is absent. A
+          confirmation that fails, or a device listing whose confirmations
+          are missing, removes nothing and records why.
         """
 
-        if coverage_proves_absence and run_committed:
-            return AbsenceOutcome(removals=_absent(indexed_doc_ids - crawled_doc_ids, evidence="complete snapshot"))
-        if not run_committed or reprocessing or transition_open:
+        if reprocessing:
+            return AbsenceOutcome()
+        if transition_open:
+            if coverage_proves_absence and run_committed:
+                return AbsenceOutcome(removals=_absent(indexed_doc_ids - crawled_doc_ids, evidence="complete snapshot"))
+            return AbsenceOutcome()
+        if self._listing_skipped_reason is not None:
+            return AbsenceOutcome(skipped_reason=self._listing_skipped_reason)
+        listing = self.scope_listing
+        if listing is None:
+            return AbsenceOutcome()
+        unlisted = indexed_doc_ids - listing.doc_ids
+        held = await self._held_by_renames(unlisted, uncommitted)
+        if held:
+            logger.info(
+                "Kept %d unlisted Documents of %s whose renamed successor has not committed",
+                len(held),
+                self.source_id,
+            )
+        unlisted -= held
+        if listing.kind is ScopeListingKind.EXISTENCE:
+            return AbsenceOutcome(removals=_absent(unlisted, evidence="scope listing"))
+        if self.input_snapshot is not None:
+            if unlisted or self._unconfirmed_ledger_doc_ids:
+                logger.warning(
+                    "Device listing of %s left %d held and %d failed Documents unlisted, and the device "
+                    "confirmed none of them; nothing is removed",
+                    self.source_id,
+                    len(unlisted),
+                    len(self._unconfirmed_ledger_doc_ids),
+                )
+                return AbsenceOutcome(skipped_reason="absence_confirmation_missing")
+            return AbsenceOutcome()
+        if not unlisted:
             return AbsenceOutcome()
         try:
-            absent_doc_ids = await self._absent_from_scope_listing(indexed_doc_ids)
+            absent = await self._confirmed_absent(unlisted)
         except AbsenceCheckSkipped as exc:
-            # The run's content is committed; only the absence proof is
-            # missing, so every unlisted Document keeps its Support and the
-            # next run lists again. The run records which step failed, so its
-            # sync activity shows that nothing was removed; the provider's
-            # error stays in the log.
             logger.warning(
                 "Absence check skipped for %s (%s): %s",
                 self.source_id,
@@ -316,40 +456,38 @@ class DocumentFamily(CollectionFamily):
                 exc.__cause__,
             )
             return AbsenceOutcome(skipped_reason=exc.reason)
-        if absent_doc_ids is None:
-            return AbsenceOutcome()
-        return AbsenceOutcome(removals=_absent(absent_doc_ids, evidence="scope listing"))
+        return AbsenceOutcome(
+            removals=_absent(absent, evidence="scope listing"),
+            unlisted_present_count=len(unlisted) - len(absent),
+        )
 
-    async def _absent_from_scope_listing(self, indexed_doc_ids: set[str]) -> set[str] | None:
-        """The held Documents this run's scope listing proves the provider no longer has.
+    async def _held_by_renames(self, unlisted: set[str], uncommitted: Sequence[ContentItem]) -> set[str]:
+        """The unlisted Documents of each Unit an uncommitted item names as its ``renamed_from``."""
 
-        ``None`` when the run has no listing to read: the configuration cannot
-        list its scope, or its listing is a device's snapshot manifest this
-        run is not bound to. A listing or confirmation that fails raises
-        ``AbsenceCheckSkipped`` naming the step, and the caller removes
-        nothing in this run. An unlisted Document of an existence listing is
-        absent. One of a query listing is absent only when the provider
-        answers ``absent`` for it; one that exists or is hidden keeps its Unit
-        and Support and is not refreshed while it stays outside the query.
+        if not unlisted:
+            return set()
+        held: set[str] = set()
+        for provider_key in sorted({item.renamed_from for item in uncommitted if item.renamed_from}):
+            predecessor = await self.db.find_current_source_unit_by_provider_key(self.source_id, provider_key)
+            if predecessor is not None:
+                held.update(set(await self.db.list_source_unit_document_ids(predecessor.id)) & unlisted)
+        return held
+
+    async def _confirmed_absent(self, unlisted: set[str]) -> set[str]:
+        """The unlisted Documents the provider answers ``absent`` for when read by identifier.
+
+        One that exists or is hidden keeps its Unit and Support and is not
+        refreshed while it stays outside the query. One whose stored item
+        cannot be rebuilt identifies nothing to ask for, so it is kept. A
+        confirmation that fails raises ``AbsenceCheckSkipped``.
         """
 
-        if self._collected_on_device() or not self.gene.lists_scope(self.gene.config):
-            return None
-        try:
-            listing = await self.gene.list_scope()
-        except Exception as exc:
-            raise AbsenceCheckSkipped("scope_listing_failed") from exc
-        unlisted = indexed_doc_ids - listing.doc_ids
-        if not unlisted or listing.kind is ScopeListingKind.EXISTENCE:
-            return unlisted
         try:
             items = []
             for doc_id in sorted(unlisted):
                 try:
                     items.append(await stored_source_item(self.db, source_id=self.source_id, document_id=doc_id))
                 except StoredDocumentUnavailable as exc:
-                    # Nothing identifies the Document to ask its provider for,
-                    # so its absence cannot be proven and it is kept.
                     logger.warning("Cannot confirm whether unlisted Document %s still exists: %s", doc_id, exc)
             answers = await self.gene.confirm_absent(items)
         except Exception as exc:
@@ -362,6 +500,17 @@ class DocumentFamily(CollectionFamily):
             len(absent),
         )
         return absent
+
+    def _device_listing_kind(self) -> ScopeListingKind:
+        """The kind of a device's snapshot manifest: the single kind its Gene declares."""
+
+        kinds = self.gene.listing_kinds
+        if len(kinds) != 1:
+            raise ValueError(
+                f"{type(self.gene).__name__} is listed by a device's snapshot manifest and must declare "
+                "exactly one listing kind"
+            )
+        return next(iter(kinds))
 
     def _collected_on_device(self) -> bool:
         """Whether the owner's device collects this Source, so its listing is the device's snapshot manifest."""
@@ -430,6 +579,7 @@ class ConversationFamily(CollectionFamily):
         run_committed: bool,
         indexed_doc_ids: set[str],
         crawled_doc_ids: set[str],
+        uncommitted: Sequence[ContentItem],
     ) -> AbsenceOutcome:
         """The removals the conversation layer planned for this attempt.
 
