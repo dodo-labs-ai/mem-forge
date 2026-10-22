@@ -3869,8 +3869,9 @@ def _teams_rejected_token_hashes_from_payload(payload: dict[str, Any]) -> set[st
 
 
 def _teams_region_from_payload(payload: dict[str, Any]) -> str:
-    region = str(payload.get("region") or "emea").strip().lower()
-    return region if region in {"emea", "amer", "apac"} else "emea"
+    from memforge.genes.teams_provider import teams_region
+
+    return teams_region(payload)
 
 
 def _run_cloud_teams_sync_job(
@@ -3896,7 +3897,7 @@ def _run_cloud_teams_sync_job(
     _report_local_agent_progress(report_progress, _sync_progress_snapshot(phase="connecting"))
     try:
         try:
-            result = asyncio.run(_collect_teams_on_device(job, payload, source_id, client, report_progress))
+            result = asyncio.run(_collect_conversation_on_device(job, payload, source_id, client, report_progress))
         except ConversationUploadError:
             # The server refused an upload; a new Teams session would not change its answer.
             raise
@@ -3916,7 +3917,7 @@ def _run_cloud_teams_sync_job(
             )
             if reauth.get("error"):
                 raise RuntimeError(str(reauth.get("error") or "Teams authentication failed.")) from exc
-            result = asyncio.run(_collect_teams_on_device(job, payload, source_id, client, report_progress))
+            result = asyncio.run(_collect_conversation_on_device(job, payload, source_id, client, report_progress))
     except ConversationUploadError as exc:
         _raise_if_local_agent_lease_not_current(exc.response)
         return {"operation": operation, "source_id": source_id, "error": str(exc), "retryable": True}
@@ -3934,16 +3935,21 @@ def _run_cloud_teams_sync_job(
     return {**outcome, "sync_started": True, **source_processing_receipt(result.processing)}
 
 
-async def _collect_teams_on_device(
+async def _collect_conversation_on_device(
     job: dict[str, Any],
     payload: dict[str, Any],
     source_id: str,
     client: ToolClient,
     report_progress: Callable[[dict[str, Any]], None] | None,
 ):
-    from memforge.genes.teams_client import TeamsChatClient
-    from memforge.genes.teams_provider import TeamsConversationProvider
+    """Collect one attempt of a conversation Source through the provider its descriptor names."""
+
     from memforge.local_agent.conversation_executor import run_device_collection
+    from memforge.source_types import source_type_descriptor
+
+    descriptor = source_type_descriptor(str(job.get("source_type") or ""))
+    if descriptor is None or descriptor.conversation_provider is None:
+        raise ValueError(f"source type {job.get('source_type')!r} has no conversation provider")
 
     def report(phase: str, completed: int, total: int) -> None:
         unit = "conversation" if phase == "fetching" else "message"
@@ -3952,11 +3958,9 @@ async def _collect_teams_on_device(
             _sync_progress_snapshot(phase=phase, completed=completed, total=total, unit=unit),
         )
 
-    teams = TeamsChatClient(region=_teams_region_from_payload(payload))
-    try:
-        await teams.validate()
+    async with descriptor.conversation_provider.open(payload) as provider:
         return await run_device_collection(
-            TeamsConversationProvider(teams),
+            provider,
             client,
             source_id=source_id,
             local_agent_job_id=str(job["job_id"]),
@@ -3966,8 +3970,6 @@ async def _collect_teams_on_device(
             force_full_sync=bool(payload.get("force_full_sync", False)),
             report=report,
         )
-    finally:
-        await teams.close()
 
 
 def _github_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:

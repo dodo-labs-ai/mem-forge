@@ -161,7 +161,7 @@ def test_a_lease_the_server_no_longer_honours_ends_the_job(monkeypatch):
             "manifest upload", {"error": "Conflict", "status_code": 409, "detail": "local_agent_lease_not_current"}
         )
 
-    monkeypatch.setattr(main, "_collect_teams_on_device", refused)
+    monkeypatch.setattr(main, "_collect_conversation_on_device", refused)
 
     class Client:
         target = main.build_target(origin="http://localhost:8000", edition="oss")

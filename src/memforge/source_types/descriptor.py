@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable, Mapping
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -11,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from memforge.source_types.config import SourceConfigPolicy
 
 if TYPE_CHECKING:
+    from memforge.conversations.port import ConversationProvider
     from memforge.genes.base import Gene
     from memforge.genes.family import CollectionFamilyKind
     from memforge.local_agent.replay_adapter import LocalSourceReplayAdapter
@@ -60,6 +62,31 @@ class LocalAgentCollection:
 
 
 @dataclass(frozen=True)
+class ConversationProviderReference:
+    """How a conversation source type's device executor opens its provider.
+
+    ``provider`` is the provider class, checked at startup for the members of
+    the conversation provider port. ``factory`` is an async context manager
+    factory, called with the job's configuration, that opens the provider and
+    releases it when the collection ends; Teams validates its session first
+    and closes its client after. Either is a class or callable, or a
+    ``"module:name"`` reference imported on first use.
+    """
+
+    provider: str | type
+    factory: str | Callable[[Mapping[str, Any]], AbstractAsyncContextManager[ConversationProvider]]
+
+    def provider_class(self) -> type:
+        return self.provider if isinstance(self.provider, type) else load_reference(self.provider)
+
+    def factory_function(self) -> Callable[[Mapping[str, Any]], AbstractAsyncContextManager[ConversationProvider]]:
+        return load_reference(self.factory) if isinstance(self.factory, str) else self.factory
+
+    def open(self, job_config: Mapping[str, Any]) -> AbstractAsyncContextManager[ConversationProvider]:
+        return self.factory_function()(job_config)
+
+
+@dataclass(frozen=True)
 class SourceTypeDescriptor:
     """Every per-type fact shared sync, projection, configuration and store code reads.
 
@@ -70,7 +97,8 @@ class SourceTypeDescriptor:
     Observations; a type without one is projected generically, with partial
     coverage. ``exports_pdf`` says the Gene renders a PDF of each Unit, which
     a Unit's stored input must then hold. ``config`` checks and prepares the
-    Source's configuration.
+    Source's configuration. ``conversation_provider`` opens a conversation
+    type's provider on the device.
     """
 
     source_type: str
@@ -86,6 +114,7 @@ class SourceTypeDescriptor:
     local_agent: LocalAgentCollection | None = None
     exports_pdf: bool = False
     config: SourceConfigPolicy = field(default_factory=SourceConfigPolicy)
+    conversation_provider: ConversationProviderReference | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "evidence_profiles", _frozen(self.evidence_profiles))

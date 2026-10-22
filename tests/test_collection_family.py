@@ -26,7 +26,7 @@ from tests.gene_fixture import FakeGene
 FAMILY_CLASSES = {"ConversationGene", "DocumentGene"}
 TEAMS_CONFIG = {"conversation_ids": ["19:chat@thread.v2"], "initial_history_days": 30}
 # The only modules that ask a Gene class which family it belongs to.
-FAMILY_CLASSIFIERS = {Path("genes/family.py")}
+FAMILY_CLASSIFIERS = {Path("genes/family.py"), Path("genes/contract.py")}
 
 
 @pytest.fixture
