@@ -3862,6 +3862,23 @@ export interface components {
             sync_snapshot_id: string;
         };
         /**
+         * LocalSourceExcludedListingRequest
+         * @description What the device listed in one scope its job's open transition excludes, or that the provider rejected it.
+         *
+         *     ``scope_key`` is the key the job named the scope by. A listing holds the
+         *     Document ids the scope lists, up to the manifest's item bound. A
+         *     definitive rejection, such as a JQL the provider refuses, gives its cause
+         *     in ``rejection`` and lists nothing.
+         */
+        LocalSourceExcludedListingRequest: {
+            /** Doc Ids */
+            doc_ids?: string[];
+            /** Rejection */
+            rejection?: string | null;
+            /** Scope Key */
+            scope_key: string;
+        };
+        /**
          * LocalSourceManifestItemRequest
          * @description One item of a device manifest: the item as the device read it.
          */
@@ -3884,7 +3901,8 @@ export interface components {
          *     ``complete_snapshot`` coverage and every item an ``upsert``.
          *     ``package_contract_version`` is the package contract the local agent
          *     collects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates
-         *     the numbered contract sends none.
+         *     the numbered contract sends none. ``excluded_listings`` answers the
+         *     excluded scopes the job carried, one entry per scope at most.
          */
         LocalSourceManifestRequest: {
             /**
@@ -3892,6 +3910,8 @@ export interface components {
              * @constant
              */
             coverage: "complete_snapshot";
+            /** Excluded Listings */
+            excluded_listings?: components["schemas"]["LocalSourceExcludedListingRequest"][];
             /** Items */
             items: components["schemas"]["LocalSourceManifestItemRequest"][];
             /** Local Agent Attempt Count */

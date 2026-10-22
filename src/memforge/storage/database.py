@@ -6829,8 +6829,7 @@ class Database:
                 raise ValueError("local agent retry target does not match source and owner")
             if target["status"] != "queued":
                 return retry_job_id, False
-            current_payload = local_agent_sync_job_payload(source)
-            if target["payload"].get("source_config_revision") != current_payload["source_config_revision"]:
+            if target["payload"].get("source_config_revision") != local_agent_source_config_revision(source):
                 raise ValueError("local agent retry target configuration is stale")
             if trigger != "manual":
                 raise ValueError("targeted retry requires manual intent")
@@ -7125,17 +7124,24 @@ class Database:
         claim_time = now or datetime.now(timezone.utc)
         due_at = _utc_iso(claim_time)
         enqueued = 0
+        # Each job's payload is read before the write transaction; the schedule
+        # update below claims a Source only while its due time is unchanged.
+        async with self.db.execute(
+            """SELECT * FROM sources s WHERE status = 'active'
+               AND sync_schedule_enabled = 1
+               AND sync_schedule_next_at IS NOT NULL
+               AND sync_schedule_next_at <= ?
+               ORDER BY s.sync_schedule_next_at, s.created_at LIMIT ?""",
+            (due_at, limit),
+        ) as cursor:
+            rows = [dict(row) async for row in cursor]
+        payloads = {
+            row["id"]: await local_agent_sync_job_payload(self, row)
+            for row in rows
+            if local_agent_sync_operation(row["type"], row["config"]) is not None
+        }
         async with self._write_lock:
             try:
-                async with self.db.execute(
-                    """SELECT * FROM sources s WHERE status = 'active'
-                       AND sync_schedule_enabled = 1
-                       AND sync_schedule_next_at IS NOT NULL
-                       AND sync_schedule_next_at <= ?
-                       ORDER BY s.sync_schedule_next_at, s.created_at LIMIT ?""",
-                    (due_at, limit),
-                ) as cursor:
-                    rows = [dict(row) async for row in cursor]
                 for row in rows:
                     operation = local_agent_sync_operation(row["type"], row["config"])
                     if operation is None:
@@ -7184,7 +7190,7 @@ class Database:
                         _, created = await self._enqueue_local_agent_job_locked(
                             job_id=job_id, workspace_id=workspace_id, source_id=row["id"],
                             source_type=row["type"], operation=operation,
-                            payload=local_agent_sync_job_payload(row), created_by_user_id=owner,
+                            payload=payloads[row["id"]], created_by_user_id=owner,
                             execution_owner_user_id=owner, now_iso=due_at, trigger="scheduled",
                         )
                         enqueued += int(created)

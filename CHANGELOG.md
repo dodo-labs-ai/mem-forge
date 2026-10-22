@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- A local-agent Jira scope transition now completes, removing only what the
+  user's change excluded. Every local-agent sync job is built by one async
+  `local_agent_sync_job_payload(db, source)` (the manual and explicit routes
+  and both schedulers), which carries the open transition as
+  `projection_scope_transition` and, once the transition's previous run left
+  no listed issue that is not yet a member, every distinct excluded scope as
+  `excluded_scopes` (`scope_key` and the job configuration that lists it). The
+  agent lists each with its own JQL and its session, and sends the device
+  Document ids, or the rejection of a JQL Jira refuses, as the manifest's
+  `excluded_listings`; a scope it cannot reach is left out. The server accepts
+  only scopes the job carried, each once and within the manifest's item
+  bound, stores them with the manifest, and hashes them into the manifest
+  digest only when present, so a manifest without them keeps its digest. The
+  run that completes removes the held issues an excluded scope lists and the
+  new JQL does not as `removed_from_scope`; every other unlisted issue
+  follows the device's confirmations. A rejected scope completes the
+  transition with the ordinary rule, and a manifest without the listings
+  keeps it open.
+
 - Local-agent Jira removes an issue only when the device confirms it is gone.
   For an agent that declares package contract 3
   (`LOCAL_PACKAGE_CONTRACT_VERSION`), the manifest response returns
@@ -79,8 +98,7 @@
   excluded scope keeps the transition open; an excluded scope the provider
   rejects, or whose configuration cannot be built
   (`SourceConfigurationError`), completes it with the ordinary rule.
-  Until a device lists its excluded scopes, a local-agent Jira transition
-  stays open. `sync_gene` takes `excluded_scope_gene`, which `run_source_sync`
+  `sync_gene` takes `excluded_scope_gene`, which `run_source_sync`
   builds, and both stores gain `get_projection_scope_transition`.
   - A Confluence Page Tree Root that answers 404, a Confluence scope without
     its root or spaces, and a JQL Jira refuses (HTTP 400, `JiraQueryRejected`)

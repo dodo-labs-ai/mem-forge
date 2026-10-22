@@ -381,11 +381,14 @@ class ToolClient:
         sync_snapshot_id: str,
         local_agent_job_id: str,
         local_agent_attempt_count: int,
+        excluded_listings: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Declare covered membership and request only missing content bodies.
 
         The request declares the package contract this agent collects under, so
         the service asks again for retained packages that predate it.
+        ``excluded_listings`` answers the excluded scopes the job carried, each
+        ``{"scope_key", "doc_ids"}`` or ``{"scope_key", "rejection"}``.
         """
         source_id = source_id.strip()
         if not source_id:
@@ -398,6 +401,8 @@ class ToolClient:
             "local_agent_attempt_count": local_agent_attempt_count,
             "package_contract_version": LOCAL_PACKAGE_CONTRACT_VERSION,
         }
+        if excluded_listings:
+            body["excluded_listings"] = list(excluded_listings)
         return self._resource_json(
             "POST",
             f"/sources/{quote(source_id, safe='')}/adapter/manifest",

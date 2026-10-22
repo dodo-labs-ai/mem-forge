@@ -27,20 +27,49 @@ class SnapshotManifestItem:
     revision: str
 
 
-def snapshot_manifest_sha256(items: Iterable[SnapshotManifestItem]) -> str:
-    """The digest that binds a device manifest: its coverage and its items, in Document id order.
+def snapshot_manifest_sha256(
+    items: Iterable[SnapshotManifestItem],
+    excluded_listings: Iterable[ExcludedScopeListing] = (),
+) -> str:
+    """The digest that binds a device manifest: its coverage, its items and its excluded listings.
 
-    Coverage and change kind are constants, and both stay in the digest, so a
-    manifest hashes as it always has.
+    Items are in Document id order. Coverage and change kind are constants,
+    and both stay in the digest, so a manifest hashes as it always has. The
+    excluded listings, in scope key order, are hashed only when the manifest
+    carries any, so a manifest without them keeps the digest it always had.
     """
-    payload = {
+    payload: dict[str, object] = {
         "coverage": COMPLETE_SNAPSHOT,
         "items": sorted(
             ({"doc_id": item.doc_id, "revision": item.revision, "change_kind": UPSERT} for item in items),
             key=lambda item: item["doc_id"],
         ),
     }
+    listings = sorted(excluded_listings, key=lambda listing: listing.scope_key)
+    if listings:
+        payload["excluded_listings"] = [
+            {"scope_key": listing.scope_key, "doc_ids": sorted(listing.doc_ids), "rejection": listing.rejection}
+            for listing in listings
+        ]
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def validate_excluded_listings_for_job(
+    listings: Sequence[ExcludedScopeListing],
+    carried_scope_keys: Iterable[str],
+) -> None:
+    """Check that a manifest lists only the excluded scopes its job carried, each at most once.
+
+    A scope the job carried may be left out, as when the device could not
+    reach it; the transition then stays open until a manifest lists it.
+    """
+    carried = set(carried_scope_keys)
+    scope_keys = [listing.scope_key for listing in listings]
+    if len(set(scope_keys)) != len(scope_keys):
+        raise ValueError("snapshot excluded listings contain duplicate scope_key")
+    unknown = sorted(set(scope_keys) - carried)
+    if unknown:
+        raise ValueError(f"snapshot excluded listing names a scope the job did not carry: {unknown[0]}")
 
 
 def validate_snapshot_manifest_values(coverage: str, manifest_items: Sequence[tuple[str, str, str]]) -> None:

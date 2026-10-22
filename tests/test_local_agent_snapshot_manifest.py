@@ -3,9 +3,11 @@ from dataclasses import dataclass
 import pytest
 
 from memforge.local_agent.snapshot_manifest import (
+    ExcludedScopeListing,
     SnapshotManifestItem,
     plan_snapshot_manifest,
     snapshot_manifest_sha256,
+    validate_excluded_listings_for_job,
     validate_snapshot_manifest_values,
 )
 
@@ -120,3 +122,33 @@ def test_a_manifest_declares_complete_coverage_of_upserts_only(coverage: str, ch
     validate_snapshot_manifest_values("complete_snapshot", [("doc-a", "v1", "upsert")])
     with pytest.raises(ValueError, match=message):
         validate_snapshot_manifest_values(coverage, [("doc-a", "v1", change_kind)])
+
+
+def test_excluded_listings_enter_the_digest_only_when_a_manifest_carries_them() -> None:
+    items = [
+        SnapshotManifestItem(doc_id="jira-PAY-9", revision="2026-10-01T10:00:00.000+0000"),
+        SnapshotManifestItem(doc_id="jira-PAY-10", revision="2026-10-02T11:30:00.000+0000"),
+    ]
+    listings = (
+        ExcludedScopeListing("scope-b", frozenset({"jira-PAY-3", "jira-PAY-1"})),
+        ExcludedScopeListing("scope-a", rejection="JiraQueryRejected: no"),
+    )
+
+    # Without listings, the digest every stored manifest already carries.
+    assert snapshot_manifest_sha256(items, ()) == "785035e8f86e446f38ba663f6a87d0a83ae1f7bb2ee0211be2491e7aba380169"
+    assert snapshot_manifest_sha256(items, listings) == (
+        "c37e3c9a0ca799b2340ee3c89094aa598152b79518aac9fcc46ab843a2c71eb6"
+    )
+    assert snapshot_manifest_sha256(items, tuple(reversed(listings))) == snapshot_manifest_sha256(items, listings)
+    assert snapshot_manifest_sha256(items, listings[:1]) != snapshot_manifest_sha256(items, listings)
+
+
+def test_a_manifest_lists_only_the_excluded_scopes_its_job_carried() -> None:
+    listing = ExcludedScopeListing("scope-old", frozenset({"jira-PAY-1"}))
+
+    validate_excluded_listings_for_job([listing], {"scope-old", "scope-superseded"})
+    validate_excluded_listings_for_job([], {"scope-old"})
+    with pytest.raises(ValueError, match="did not carry: scope-old"):
+        validate_excluded_listings_for_job([listing], set())
+    with pytest.raises(ValueError, match="duplicate scope_key"):
+        validate_excluded_listings_for_job([listing, ExcludedScopeListing("scope-old")], {"scope-old"})

@@ -276,13 +276,16 @@ from memforge.local_agent.readiness import (
 from memforge.local_agent.snapshot_manifest import (
     COMPLETE_SNAPSHOT,
     UPSERT,
+    ExcludedScopeListing,
     SnapshotConfirmation,
     SnapshotConfirmationAnswer,
     SnapshotManifestItem,
     plan_snapshot_manifest,
     snapshot_manifest_sha256,
+    validate_excluded_listings_for_job,
 )
 from memforge.local_agent.source_contract import (
+    LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
     LOCAL_AGENT_SYNC_OPERATIONS,
     execution_owner_user_id,
     is_local_agent_backed_source,
@@ -2558,6 +2561,26 @@ class LocalSourceManifestItemRequest(BaseModel):
 LOCAL_SOURCE_MANIFEST_MAX_ITEMS = 10_000
 
 
+class LocalSourceExcludedListingRequest(BaseModel):
+    """What the device listed in one scope its job's open transition excludes, or that the provider rejected it.
+
+    ``scope_key`` is the key the job named the scope by. A listing holds the
+    Document ids the scope lists, up to the manifest's item bound. A
+    definitive rejection, such as a JQL the provider refuses, gives its cause
+    in ``rejection`` and lists nothing.
+    """
+
+    scope_key: str = Field(min_length=1, max_length=128)
+    doc_ids: list[str] = Field(default_factory=list, max_length=LOCAL_SOURCE_MANIFEST_MAX_ITEMS)
+    rejection: str | None = Field(default=None, min_length=1, max_length=2_000)
+
+    @model_validator(mode="after")
+    def _listed_or_rejected(self) -> "LocalSourceExcludedListingRequest":
+        if self.rejection is not None and self.doc_ids:
+            raise ValueError("a rejected excluded scope lists nothing")
+        return self
+
+
 class LocalSourceManifestRequest(BaseModel):
     """One complete local collection, planned against the retained packages.
 
@@ -2565,7 +2588,8 @@ class LocalSourceManifestRequest(BaseModel):
     ``complete_snapshot`` coverage and every item an ``upsert``.
     ``package_contract_version`` is the package contract the local agent
     collects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates
-    the numbered contract sends none.
+    the numbered contract sends none. ``excluded_listings`` answers the
+    excluded scopes the job carried, one entry per scope at most.
     """
 
     items: list[LocalSourceManifestItemRequest] = Field(max_length=LOCAL_SOURCE_MANIFEST_MAX_ITEMS)
@@ -2574,6 +2598,7 @@ class LocalSourceManifestRequest(BaseModel):
     local_agent_job_id: str
     local_agent_attempt_count: int = Field(ge=1)
     package_contract_version: int | None = Field(default=None, ge=1)
+    excluded_listings: list[LocalSourceExcludedListingRequest] = Field(default_factory=list, max_length=100)
 
 
 class LocalSourceConfirmationAnswerRequest(BaseModel):
@@ -8317,20 +8342,11 @@ def create_admin_app(
                 detail="local_agent_sync_execution_owner_required",
             )
         job_id = f"laj-{uuid.uuid4().hex}"
-        payload = local_agent_sync_job_payload(
+        payload = await local_agent_sync_job_payload(
+            db,
             source,
             {"force_full_sync": force_full_sync, "retry_failed_items": True, **({"dry_run": True} if dry_run else {})},
         )
-        transition = await db.get_open_projection_scope_transition(source["id"])
-        if transition is not None:
-            transition = canonical_scope_transition(
-                source["type"], transition, _sync_scope_config(source["type"], source.get("config") or {})
-            )
-            payload["projection_scope_transition"] = {
-                "id": transition.id,
-                "previous_scope": dict(transition.previous_scope),
-                "target_scope": dict(transition.target_scope),
-            }
         job_id, created = await _enqueue_sync_local_agent_job(
             request,
             db,
@@ -9186,7 +9202,21 @@ def create_admin_app(
                     req.package_contract_version,
                 ),
             )
-            manifest_sha256 = snapshot_manifest_sha256(items)
+            excluded_listings = tuple(
+                ExcludedScopeListing(
+                    scope_key=listing.scope_key, doc_ids=frozenset(listing.doc_ids), rejection=listing.rejection
+                )
+                for listing in req.excluded_listings
+            )
+            validate_excluded_listings_for_job(
+                excluded_listings,
+                (
+                    str(entry.get("scope_key") or "")
+                    for entry in lease_payload.get(LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD) or ()
+                    if isinstance(entry, Mapping)
+                ),
+            )
+            manifest_sha256 = snapshot_manifest_sha256(items, excluded_listings)
             confirm = await _snapshot_confirm_set(
                 db,
                 source=source,
@@ -9208,6 +9238,7 @@ def create_admin_app(
                 local_agent_attempt_count=req.local_agent_attempt_count,
                 source_config_revision=str(lease_payload["source_config_revision"]),
                 confirm=confirm,
+                excluded_listings=excluded_listings,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -10323,7 +10354,7 @@ def create_admin_app(
                 raise HTTPException(status_code=409, detail="local_agent_sync_execution_owner_required")
             if requester != owner:
                 raise HTTPException(status_code=403, detail="local_agent_sync_execution_owner_forbidden")
-            payload = local_agent_sync_job_payload(source, payload)
+            payload = await local_agent_sync_job_payload(db, source, payload)
         else:
             expected_type = LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES.get(req.operation)
             if expected_type is None:

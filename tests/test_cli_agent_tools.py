@@ -2518,10 +2518,24 @@ def _confirming_jira_gene(
             events.append("closed")
 
     class ConfirmingJiraGene:
+        configs: list[dict] = []
+
         def __init__(self, config, source_id):
             self.config = config
             self.source_id = source_id
             self._client = HttpClient()
+            ConfirmingJiraGene.configs.append(dict(config))
+
+        async def list_scope(self):
+            from memforge.genes.jira_gene import JiraQueryRejected
+            from memforge.models import ScopeListing, ScopeListingKind
+
+            jql = self.config["jql"]
+            if jql == "project = GONE":
+                raise JiraQueryRejected("Jira rejected the JQL (HTTP 400): project 'GONE' does not exist")
+            if jql == "project = SLOW":
+                raise RuntimeError("Jira timed out")
+            return ScopeListing(kind=ScopeListingKind.QUERY, doc_ids=frozenset({"jira-PAY-1", "jira-PAY-9"}))
 
         async def authenticate(self):
             if authenticate_error is not None:
@@ -2565,7 +2579,7 @@ def _confirming_jira_gene(
     return ConfirmingJiraGene
 
 
-def _run_confirming_jira_job(monkeypatch, gene_cls) -> dict:
+def _run_confirming_jira_job(monkeypatch, gene_cls, **payload) -> dict:
     from memforge.auth import jira_capture
     import memforge.genes.jira_gene as jira_gene
 
@@ -2593,7 +2607,12 @@ def _run_confirming_jira_job(monkeypatch, gene_cls) -> dict:
             "workspace_id": "ws-from-cloud",
             "operation": "jira_sync",
             "source_id": "src-jira",
-            "payload": {"base_url": "https://jira.example.test", "auth_mode": "browser_cookie", "projects": ["PAY"]},
+            "payload": {
+                "base_url": "https://jira.example.test",
+                "auth_mode": "browser_cookie",
+                "projects": ["PAY"],
+                **payload,
+            },
         },
         _cloud_test_client(),
         browser="chrome",
@@ -2606,6 +2625,52 @@ def _call_names() -> list[str]:
         for name, _kwargs in FakeToolClient.calls
         if name in {"prepare_local_source_snapshot", "submit_local_source_confirmations", "start_source_processing"}
     ]
+
+
+def test_local_agent_cloud_jira_lists_each_excluded_scope_with_its_own_jql(monkeypatch):
+    from memforge.local_agent.document_identity import build_jira_doc_id
+
+    events: list[str] = []
+    FakeToolClient.reset({})
+    gene_cls = _confirming_jira_gene(events)
+    scope = {"base_url": "https://jira.example.test", "auth_mode": "browser_cookie", "query_mode": "advanced"}
+
+    payload = _run_confirming_jira_job(
+        monkeypatch,
+        gene_cls,
+        projection_scope_transition={"id": "t1", "previous_scope": {}, "target_scope": {}},
+        excluded_scopes=[
+            {"scope_key": "scope-old", "config": {**scope, "jql": "project in (PAY, OPS)"}},
+            {"scope_key": "scope-rejected", "config": {**scope, "jql": "project = GONE"}},
+            {"scope_key": "scope-unreachable", "config": {**scope, "jql": "project = SLOW"}},
+        ],
+    )
+
+    assert payload.get("error") is None, payload
+    [(_name, planned)] = [call for call in FakeToolClient.calls if call[0] == "prepare_local_source_snapshot"]
+    # Each issue under this Source's device Document id; a rejected JQL is
+    # reported; a scope that could not be reached is left out.
+    assert planned["excluded_listings"] == [
+        {
+            "scope_key": "scope-old",
+            "doc_ids": sorted(build_jira_doc_id(source_id="src-jira", issue_key=key) for key in ("PAY-1", "PAY-9")),
+        },
+        {
+            "scope_key": "scope-rejected",
+            "rejection": "JiraQueryRejected: Jira rejected the JQL (HTTP 400): project 'GONE' does not exist",
+        },
+    ]
+    assert [config.get("jql") for config in gene_cls.configs] == [
+        None,
+        "project in (PAY, OPS)",
+        "project = GONE",
+        "project = SLOW",
+    ]
+    assert all(
+        "excluded_scopes" not in config and "projection_scope_transition" not in config for config in gene_cls.configs
+    )
+    # Every session, the collection's and each excluded scope's, is closed.
+    assert events.count("closed") == 4
 
 
 def test_local_agent_cloud_jira_confirms_what_its_manifest_left_out_before_processing(monkeypatch):

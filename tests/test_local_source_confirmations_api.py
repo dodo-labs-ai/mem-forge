@@ -11,6 +11,7 @@ import pytest
 import memforge.server.admin_api as admin_api
 from memforge.local_agent.document_identity import build_jira_doc_id
 from memforge.local_agent.snapshot_manifest import (
+    ExcludedScopeListing,
     SnapshotConfirmation,
     SnapshotConfirmationAnswer,
     SnapshotManifestItem,
@@ -37,13 +38,14 @@ EMPTY_DIGEST = snapshot_manifest_sha256([])
 
 
 class _Lease:
-    """The leased job's state, as the job broker validates it for each request."""
+    """The leased job's state, as the job broker validates it for each request: its payload while current."""
 
     def __init__(self) -> None:
         self.current = True
+        self.payload: dict = {"leased": True}
 
-    async def __call__(self, *args, **kwargs) -> bool:
-        return self.current
+    async def __call__(self, *args, **kwargs) -> dict | bool:
+        return self.payload if self.current else False
 
 
 def _hold(database: Database, source_id: str, issues: dict[str, str], *, incarnation: str | None = None) -> None:
@@ -147,7 +149,9 @@ async def _fail(database: Database, source_id: str, doc_id: str, issue_key: str)
     )
 
 
-def _manifest(client, source_id: str, *, job: str = JOB, items=(), version=LOCAL_PACKAGE_CONTRACT_VERSION):
+def _manifest(
+    client, source_id: str, *, job: str = JOB, items=(), version=LOCAL_PACKAGE_CONTRACT_VERSION, excluded=None
+):
     body = {
         "items": [{"doc_id": doc_id, "revision": "r1", "change_kind": "upsert"} for doc_id in items],
         "coverage": "complete_snapshot",
@@ -157,6 +161,8 @@ def _manifest(client, source_id: str, *, job: str = JOB, items=(), version=LOCAL
     }
     if version is not None:
         body["package_contract_version"] = version
+    if excluded is not None:
+        body["excluded_listings"] = excluded
     return client.post(f"/api/v1/sources/{source_id}/adapter/manifest", json=body)
 
 
@@ -353,3 +359,56 @@ def test_an_existence_manifest_asks_nothing(tmp_path):
         assert planned.json()["confirm"] == []
     finally:
         asyncio.run(database.close())
+
+
+def test_a_manifest_answers_only_the_excluded_scopes_its_job_carried(jira):
+    client, database, source_id, lease = jira
+    lease.payload = {"excluded_scopes": [{"scope_key": "scope-old", "config": {}}, {"scope_key": "scope-gone", "config": {}}]}
+    listed = [_doc(source_id, "PAY-1")]
+    excluded = [
+        {"scope_key": "scope-old", "doc_ids": [_doc(source_id, "PAY-1"), _doc(source_id, "PAY-2")]},
+        {"scope_key": "scope-gone", "rejection": "JiraQueryRejected: project 'GONE' does not exist"},
+    ]
+
+    uncarried = _manifest(client, source_id, job="job-uncarried", excluded=[{"scope_key": "scope-new", "doc_ids": []}])
+    twice = _manifest(client, source_id, job="job-twice", excluded=[excluded[0], excluded[0]])
+    rejected_with_items = _manifest(
+        client, source_id, job="job-mixed", excluded=[{**excluded[1], "doc_ids": [_doc(source_id, "PAY-1")]}]
+    )
+    oversized = _manifest(
+        client,
+        source_id,
+        job="job-oversized",
+        excluded=[{"scope_key": "scope-old", "doc_ids": [f"doc-{n}" for n in range(10_001)]}],
+    )
+    planned = _manifest(client, source_id, items=listed, excluded=excluded)
+    replayed_without = _manifest(client, source_id, items=listed)
+
+    assert (uncarried.status_code, uncarried.json()["detail"]) == (
+        409,
+        "snapshot excluded listing names a scope the job did not carry: scope-new",
+    )
+    assert twice.status_code == 409
+    assert rejected_with_items.status_code == 422
+    assert oversized.status_code == 422
+    assert planned.status_code == 200, planned.text
+    assert planned.json()["manifest_sha256"] == snapshot_manifest_sha256(
+        [SnapshotManifestItem(listed[0], "r1")],
+        [
+            ExcludedScopeListing("scope-old", frozenset(excluded[0]["doc_ids"])),
+            ExcludedScopeListing("scope-gone", rejection=excluded[1]["rejection"]),
+        ],
+    )
+    assert asyncio.run(
+        database.list_source_sync_snapshot_excluded_listings(
+            source_id=source_id, workspace_id="local", snapshot_id=f"{JOB}:attempt:1"
+        )
+    ) == (
+        ExcludedScopeListing("scope-gone", rejection=excluded[1]["rejection"]),
+        ExcludedScopeListing("scope-old", frozenset(excluded[0]["doc_ids"])),
+    )
+    # The listings belong to the manifest: a replay without them is another manifest.
+    assert (replayed_without.status_code, replayed_without.json()["detail"]) == (
+        409,
+        "source snapshot manifest changed",
+    )

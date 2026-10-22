@@ -3234,6 +3234,43 @@
         "title": "LocalSourceConfirmationsRequest",
         "type": "object"
       },
+      "LocalSourceExcludedListingRequest": {
+        "description": "What the device listed in one scope its job's open transition excludes, or that the provider rejected it.\n\n``scope_key`` is the key the job named the scope by. A listing holds the\nDocument ids the scope lists, up to the manifest's item bound. A\ndefinitive rejection, such as a JQL the provider refuses, gives its cause\nin ``rejection`` and lists nothing.",
+        "properties": {
+          "doc_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10000,
+            "title": "Doc Ids",
+            "type": "array"
+          },
+          "rejection": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rejection"
+          },
+          "scope_key": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Scope Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope_key"
+        ],
+        "title": "LocalSourceExcludedListingRequest",
+        "type": "object"
+      },
       "LocalSourceManifestItemRequest": {
         "description": "One item of a device manifest: the item as the device read it.",
         "properties": {
@@ -3264,12 +3301,20 @@
         "type": "object"
       },
       "LocalSourceManifestRequest": {
-        "description": "One complete local collection, planned against the retained packages.\n\nA device manifest lists the complete item set of its scope, so it declares\n``complete_snapshot`` coverage and every item an ``upsert``.\n``package_contract_version`` is the package contract the local agent\ncollects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates\nthe numbered contract sends none.",
+        "description": "One complete local collection, planned against the retained packages.\n\nA device manifest lists the complete item set of its scope, so it declares\n``complete_snapshot`` coverage and every item an ``upsert``.\n``package_contract_version`` is the package contract the local agent\ncollects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates\nthe numbered contract sends none. ``excluded_listings`` answers the\nexcluded scopes the job carried, one entry per scope at most.",
         "properties": {
           "coverage": {
             "const": "complete_snapshot",
             "title": "Coverage",
             "type": "string"
+          },
+          "excluded_listings": {
+            "items": {
+              "$ref": "#/components/schemas/LocalSourceExcludedListingRequest"
+            },
+            "maxItems": 100,
+            "title": "Excluded Listings",
+            "type": "array"
           },
           "items": {
             "items": {

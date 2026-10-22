@@ -30,7 +30,11 @@ from memforge.genes.base import SourceConfigurationError
 from memforge.genes.conversation_gene import CollectionAttempt, ConversationGene
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind, gene_family
-from memforge.local_agent.snapshot_manifest import SnapshotConfirmation, SnapshotConfirmationAnswer
+from memforge.local_agent.snapshot_manifest import (
+    ExcludedScopeListing,
+    SnapshotConfirmation,
+    SnapshotConfirmationAnswer,
+)
 from memforge.local_agent.source_contract import local_agent_sync_operation
 from memforge.models import (
     AbsenceAnswer,
@@ -54,7 +58,11 @@ from memforge.source_projection import (
     SourceRemoval,
     UnitRemovalReason,
 )
-from memforge.source_projection_config import canonical_projection_scope, canonical_stored_scope
+from memforge.source_projection_config import (
+    ExcludedScopesUnavailable,
+    excluded_projection_scopes,
+    projection_scope_fingerprint,
+)
 
 if TYPE_CHECKING:
     from memforge.genes.base import Gene
@@ -97,12 +105,14 @@ class SnapshotBinding:
     holds, as the device read it. ``confirmations`` are the unlisted items the
     server asked the device to confirm with a query manifest, with the
     device's answers; a manifest issued none, as from an agent that does not
-    confirm, has none.
+    confirm, has none. ``excluded_listings`` are what the device listed in
+    each scope an open transition excludes, when its job carried them.
     """
 
     snapshot_id: str
     doc_ids: frozenset[str]
     confirmations: tuple[SnapshotConfirmation, ...] = ()
+    excluded_listings: tuple[ExcludedScopeListing, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -694,19 +704,29 @@ class DocumentFamily(CollectionFamily):
           excluded scope is rejected as a configuration, it cannot say what
           it held, so every unlisted Document follows the ordinary rule.
 
+        A device lists the excluded scopes in its manifest and answers the
+        ordinary rule's confirmations itself (:meth:`_device_absence`).
         Raises ``_TransitionStaysOpen`` when an excluded scope cannot be
-        listed for any other reason.
+        listed for any other reason, or the device's manifest lacks it.
         """
 
         if listing.kind is ScopeListingKind.EXISTENCE:
             return AbsenceOutcome(removals=_removed_from_scope(unlisted))
         if self.input_snapshot is not None:
-            raise _TransitionStaysOpen("the device has not listed the scopes the change excluded")
-        excluded = await self._list_excluded_scopes(transition)
+            excluded = await self._device_excluded_listings(transition)
+        else:
+            excluded = await self._list_excluded_scopes(transition)
         removed = unlisted & excluded if excluded is not None else set()
         rest = unlisted - removed
         rest -= await self._held_by_renames(rest, uncommitted)
         removals = _removed_from_scope(removed)
+        if self.input_snapshot is not None:
+            confirmed = self._device_absence(rest)
+            return AbsenceOutcome(
+                removals={**removals, **(confirmed.removals or {})},
+                skipped_reason=confirmed.skipped_reason,
+                unlisted_present_count=confirmed.unlisted_present_count,
+            )
         if not rest:
             return AbsenceOutcome(removals=removals)
         try:
@@ -753,46 +773,42 @@ class DocumentFamily(CollectionFamily):
             listed |= excluded_listing.doc_ids
         return listed
 
-    async def _excluded_scopes(self, transition: ProjectionScopeTransition) -> list[dict[str, object]]:
-        """The distinct scopes the transition excludes: the last applied scope and every superseded target.
+    async def _device_excluded_listings(self, transition: ProjectionScopeTransition) -> set[str] | None:
+        """Every Document the device listed in the transition's excluded scopes, from its manifest.
 
-        The superseded chain is walked by ``predecessor_transition_id`` back
-        to the last applied scope. A scope equal to the new target is not
-        excluded. Each scope is canonicalized again against the configured
-        one (:func:`canonical_stored_scope`), so one stored before a scope
-        field was added reads that field as the open transition does.
+        ``None`` when the device reported an excluded scope rejected as a
+        configuration. Raises ``_TransitionStaysOpen`` when the manifest lacks
+        the listing of an excluded scope, as when the job carried none: the
+        next job carries them once this run left no listed Document waiting.
         """
 
-        source_type = self.gene.metadata().name
-        target = canonical_projection_scope(source_type, transition.target_scope)
-        stored = await self.db.get_projection_scope_transition(transition.id)
-        if stored is None:
-            raise _TransitionStaysOpen(f"the transition {transition.id} is missing")
-        configured = canonical_projection_scope(source_type, self.gene.config)
+        assert self.input_snapshot is not None
+        listings = {listing.scope_key: listing for listing in self.input_snapshot.excluded_listings}
+        listed: set[str] = set()
+        for scope in await self._excluded_scopes(transition):
+            listing = listings.get(projection_scope_fingerprint(scope))
+            if listing is None:
+                raise _TransitionStaysOpen("the device has not listed every scope the change excluded")
+            if listing.rejection is not None:
+                logger.warning(
+                    "The device reported an excluded scope of %s rejected (%s); every unlisted Document follows "
+                    "the ordinary rule",
+                    self.source_id,
+                    listing.rejection,
+                )
+                return None
+            listed |= listing.doc_ids
+        return listed
 
-        def canonical(scope: Mapping[str, object]) -> dict[str, object]:
-            return canonical_stored_scope(
-                source_type, scope, stored_target=stored.target_scope, configured_scope=configured
+    async def _excluded_scopes(self, transition: ProjectionScopeTransition) -> list[dict[str, object]]:
+        """The distinct scopes the transition excludes (:func:`excluded_projection_scopes`)."""
+
+        try:
+            return await excluded_projection_scopes(
+                self.db, transition, source_type=self.gene.metadata().name, config=self.gene.config
             )
-
-        chain = [transition.previous_scope]
-        predecessor_id = transition.predecessor_transition_id
-        walked: set[str] = set()
-        while predecessor_id is not None:
-            if predecessor_id in walked:
-                raise _TransitionStaysOpen(f"the superseded transitions loop back to {predecessor_id}")
-            walked.add(predecessor_id)
-            predecessor = await self.db.get_projection_scope_transition(predecessor_id)
-            if predecessor is None or predecessor.source_id != self.source_id:
-                raise _TransitionStaysOpen(f"the superseded transition {predecessor_id} is missing")
-            chain.append(predecessor.target_scope)
-            predecessor_id = predecessor.predecessor_transition_id
-        scopes: list[dict[str, object]] = []
-        for scope in chain:
-            excluded = canonical(scope)
-            if excluded != target and excluded not in scopes:
-                scopes.append(excluded)
-        return scopes
+        except ExcludedScopesUnavailable as exc:
+            raise _TransitionStaysOpen(str(exc)) from exc
 
     async def transition_outstanding(self, *, docs_failed: int, removals_failed: int) -> str | None:
         """Complete once every listed Document is a member and every removal succeeded.

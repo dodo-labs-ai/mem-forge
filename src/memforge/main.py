@@ -68,6 +68,8 @@ from memforge.local_agent.document_identity import (
     build_local_markdown_doc_id,
 )
 from memforge.local_agent.source_contract import (
+    LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
+    LOCAL_AGENT_TRANSITION_PAYLOAD_FIELDS,
     GitHubProviderConnectionError,
     local_agent_sync_snapshot_id,
     source_processing_receipt,
@@ -3467,6 +3469,7 @@ def _plan_local_source_manifest(
     sync_snapshot_id: str,
     local_agent_job_id: str,
     local_agent_attempt_count: int,
+    excluded_listings: list[dict[str, Any]] | None = None,
 ) -> _LocalSourceManifestPlan:
     """Plan one fenced collection and validate the returned materialization and confirmation sets."""
     plan = client.prepare_local_source_snapshot(
@@ -3476,6 +3479,7 @@ def _plan_local_source_manifest(
         sync_snapshot_id=sync_snapshot_id,
         local_agent_job_id=local_agent_job_id,
         local_agent_attempt_count=local_agent_attempt_count,
+        excluded_listings=excluded_listings,
     )
     _raise_if_local_agent_lease_not_current(plan)
     if plan.get("error"):
@@ -4122,6 +4126,7 @@ async def _collect_jira_documents_from_cloud_job(
             ): item
             for item in inventory_items
         }
+        excluded_listings = await _list_excluded_jira_scopes(payload, source_id=source_id, jira_cookie=jira_cookie)
         manifest = _plan_local_source_manifest(
             client,
             source_id=source_id,
@@ -4138,6 +4143,7 @@ async def _collect_jira_documents_from_cloud_job(
             sync_snapshot_id=sync_snapshot_id,
             local_agent_job_id=local_agent_job_id,
             local_agent_attempt_count=local_agent_attempt_count,
+            excluded_listings=excluded_listings,
         )
         if manifest.confirm:
             await _confirm_unlisted_jira_issues(
@@ -4246,6 +4252,55 @@ async def _collect_jira_documents_from_cloud_job(
     }
 
 
+async def _list_excluded_jira_scopes(
+    payload: dict[str, Any],
+    *,
+    source_id: str,
+    jira_cookie: str,
+) -> list[dict[str, Any]]:
+    """List each scope the job's open transition excludes, as the manifest's ``excluded_listings``.
+
+    Each scope runs its own JQL with this session, and its issues are named by
+    this Source's device Document ids. A scope whose configuration cannot be
+    built, or whose JQL Jira rejects, is reported rejected with the cause. A
+    scope that fails for any other reason, such as the network, is left out,
+    so the transition stays open until a later collection lists it.
+    """
+    from memforge.genes.base import SourceConfigurationError
+    from memforge.genes.jira_gene import JiraGene
+
+    listings: list[dict[str, Any]] = []
+    for scope in payload.get(LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD) or ():
+        scope_key = str(scope.get("scope_key") or "")
+        gene = None
+        try:
+            config = _jira_cloud_config_from_job_payload(dict(scope.get("config") or {}))
+            config["jira_cookie"] = jira_cookie
+            gene = JiraGene(config, source_id)
+            await gene.authenticate()
+            listing = await gene.list_scope()
+        except (SourceConfigurationError, ValueError, click.ClickException) as exc:
+            listings.append({"scope_key": scope_key, "rejection": f"{type(exc).__name__}: {exc}"[:2_000]})
+            continue
+        except Exception as exc:
+            logger.warning("Listing an excluded Jira scope of %s failed: %s", source_id, exc)
+            continue
+        finally:
+            http_client = getattr(gene, "_client", None)
+            if http_client is not None:
+                await http_client.aclose()
+        listings.append(
+            {
+                "scope_key": scope_key,
+                "doc_ids": sorted(
+                    build_jira_doc_id(source_id=source_id, issue_key=doc_id.removeprefix("jira-"))
+                    for doc_id in listing.doc_ids
+                ),
+            }
+        )
+    return listings
+
+
 async def _confirm_unlisted_jira_issues(
     gene: JiraGene,
     manifest: _LocalSourceManifestPlan,
@@ -4293,7 +4348,7 @@ async def _confirm_unlisted_jira_issues(
 def _jira_cloud_config_from_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
     from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE
 
-    config = dict(payload)
+    config = {key: value for key, value in payload.items() if key not in LOCAL_AGENT_TRANSITION_PAYLOAD_FIELDS}
     config.pop("local_agent_documents_dir", None)
     config.pop("pat", None)
     config.pop("pat_encrypted", None)
