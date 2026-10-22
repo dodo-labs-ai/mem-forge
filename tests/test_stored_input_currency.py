@@ -53,6 +53,8 @@ def authored(history: dict, author: str) -> dict:
 class JiraProvider(FakeGene):
     """A Jira provider whose issues carry changelog entries that never reach the markdown."""
 
+    listing_kinds = frozenset({ScopeListingKind.QUERY})
+
     discovery_complete = True
 
     def __init__(self) -> None:
@@ -94,8 +96,6 @@ class JiraProvider(FakeGene):
         issue_key = item.extra["issue_key"]
         self.rediscovered.append(issue_key)
         return None if issue_key in self.removed else self._item(issue_key)
-
-    listing_kinds = frozenset({ScopeListingKind.QUERY})
 
     async def list_scope(self):
         return ScopeListing(

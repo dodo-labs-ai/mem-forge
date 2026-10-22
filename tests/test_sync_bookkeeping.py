@@ -3564,6 +3564,8 @@ def _confluence_raw_content(item: ContentItem, markdown: str) -> RawContent:
 
 
 class BlockingFetchGene(FakeGene):
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
+
     discovery_complete = True
 
     def __init__(self, item_count: int, release: asyncio.Event):
@@ -3608,8 +3610,6 @@ class BlockingFetchGene(FakeGene):
                 version=str(idx),
                 extra={"issue_id": str(100000 + idx), "issue_key": f"PAY-{idx}"},
             )
-
-    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
 
     async def list_scope(self):
         """Every issue discovery lists whatever ``since`` is: the whole provider."""
@@ -10718,13 +10718,13 @@ async def test_deferred_lifecycle_converges_after_same_run_tombstone(
 class _IssueGene(BlockingFetchGene):
     """A Jira project whose issues are exactly the given numbers."""
 
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
+
     def __init__(self, *issues: int) -> None:
         release = asyncio.Event()
         release.set()
         super().__init__(item_count=len(issues), release=release)
         self.issues = issues
-
-    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
 
     async def list_scope(self):
         return ScopeListing(

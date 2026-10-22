@@ -85,7 +85,9 @@ class Gene(ABC):
     :class:`~memforge.genes.document_gene.DocumentGene` for providers whose
     items can be listed, and
     :class:`~memforge.genes.conversation_gene.ConversationGene` for message
-    streams collected through the conversation layer.
+    streams collected through the conversation layer. Only a managed-capture
+    Gene, whose Source receives content as it is captured and has no sync run,
+    subclasses this class itself.
     """
 
     # ------------------------------------------------------------------
