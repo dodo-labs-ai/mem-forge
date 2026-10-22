@@ -2401,10 +2401,13 @@ async def _stop_source_sync(
     sync_service: SyncService,
     source: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Stop the Source's sync run and the collection jobs of its local daemon."""
+    """Stop the collection jobs of the Source's local daemon, then its sync run.
+
+    The jobs go first, so that a job that completes meanwhile hands over a run
+    that the run's stop then reaches.
+    """
 
     source_id = str(source["id"])
-    run = await sync_service.stop_source(source_id)
     job_ids: list[str] = []
     if local_agent_sync_operation(source["type"], source.get("config")) is not None:
         stopper = getattr(request.app.state, "local_agent_job_stopper", None)
@@ -2412,6 +2415,7 @@ async def _stop_source_sync(
             job_ids = await stopper(source_id)
         else:
             job_ids = await db.stop_local_agent_source_jobs(source_id=source_id)
+    run = await sync_service.stop_source(source_id)
     if run is not None and run.status == "running":
         outcome = "stopping"
     elif run is not None or job_ids:
@@ -8173,7 +8177,7 @@ def create_admin_app(
     ):
         """Stop the Source's sync in progress. The Source stays active and later syncs run as scheduled.
 
-        A server run that has not started, and the collection jobs of the
+        A person who manages the Source, or who runs its sync, can stop it. A server run that has not started, and the collection jobs of the
         Source's local daemon, end at once. A running server run ends at its
         worker's next heartbeat: what it committed stays, and it removes
         nothing and does not advance the sync cursor.
@@ -8181,7 +8185,14 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_sync_execution(request, source)
+        _require_source_discoverability(request, source)
+        # Whoever can pause the Source can stop its sync, as can whoever runs it.
+        if not can_manage_source(
+            source,
+            viewer_id=resolve_request_principal(request),
+            viewer_role=resolve_request_workspace_role(request),
+        ):
+            _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
         return await _stop_source_sync(request, db, sync_service, source)
 

@@ -124,6 +124,30 @@ async def test_a_running_run_records_the_first_request_and_drops_the_sync_waitin
 
 
 @pytest.mark.asyncio
+async def test_a_failure_that_would_be_retried_ends_a_run_asked_to_stop(db: Database):
+    source_id = await _source(db)
+    queued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    leased = await db.lease_next_source_sync_run(worker_id="worker-a", lease_seconds=60, now=NOW)
+    await db.request_source_sync_stop(source_id=source_id, now=NOW + timedelta(seconds=1))
+
+    assert await db.fail_source_sync_run(
+        queued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        error_message="provider timed out",
+        retryable=True,
+        failed_at=NOW + timedelta(seconds=2),
+        next_attempt_at=NOW + timedelta(minutes=15),
+    )
+
+    ended = await db.get_source_sync_run(queued.run_id)
+    assert (ended.status, ended.error_message, ended.next_attempt_at) == ("failed", SOURCE_SYNC_CANCELLED_BY_USER, None)
+    [history] = await db.get_sync_history(source=source_id, limit=5)
+    assert history["error_message"] == SOURCE_SYNC_CANCELLED_BY_USER
+    assert await _activity(db, source_id) == []
+
+
+@pytest.mark.asyncio
 async def test_a_stopped_run_leaves_its_scope_transition_open_for_the_next_run(db: Database):
     source_id = await _source(db)
     transition = ProjectionScopeTransition(
@@ -366,6 +390,31 @@ def test_pausing_stops_the_running_sync_and_a_change_names_the_way_out(tmp_path:
         stopping = asyncio.run(database.get_source_sync_run(run.run_id))
         assert stopping.stop_requested_at is not None
         assert asyncio.run(database.get_source(source_id))["status"] == "paused"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_whoever_can_pause_a_device_source_can_stop_its_sync(tmp_path: Path):
+    database = _connect_database(tmp_path)
+    owner = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
+    try:
+        with TestClient(_app(tmp_path, database)) as client:
+            source_id = client.post(
+                "/api/v1/sources", headers=owner, json=_jira_payload(sync_mode="local_agent")
+            ).json()["id"]
+            client.post(f"/api/v1/sources/{source_id}/sync", headers=owner)
+            member = client.post(
+                f"/api/v1/sources/{source_id}/sync/stop",
+                headers={"x-test-user": "member-b", "x-test-workspace-role": "member"},
+            )
+            admin = client.post(
+                f"/api/v1/sources/{source_id}/sync/stop",
+                headers={"x-test-user": "admin-c", "x-test-workspace-role": "workspace_admin"},
+            )
+
+        assert member.status_code == 403, member.text
+        assert admin.status_code == 200, admin.text
+        assert admin.json()["outcome"] == "stopped"
     finally:
         asyncio.run(database.close())
 
