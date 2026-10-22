@@ -59,6 +59,7 @@ DURABLE_SYNC_KEYS = {
     "progress",
     "progress_revision",
     "progress_updated_at",
+    "stop_requested_at",
 }
 IN_PROCESS_SYNC_KEYS = {
     "status",
