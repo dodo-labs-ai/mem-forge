@@ -364,14 +364,14 @@ class ConfluenceGene(DocumentGene):
 
         if sync_mode == "page_tree":
             if not page_tree_root:
-                raise ValueError("Confluence Page Tree Root is required when syncing a page tree")
+                raise SourceConfigurationError("Confluence Page Tree Root is required when syncing a page tree")
             async for item in self._discover_page_tree(page_tree_root, include_children, since):
                 yield item
             return
 
         spaces = self._space_keys(self.config.get("spaces"))
         if not spaces:
-            raise ValueError("Confluence Spaces to Sync is required when syncing whole spaces")
+            raise SourceConfigurationError("Confluence Spaces to Sync is required when syncing whole spaces")
         for space_key in spaces:
             async for item in self._discover_space(space_key, since):
                 yield item

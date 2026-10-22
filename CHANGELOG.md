@@ -12,13 +12,14 @@
   before the change and follows the ordinary rule: confirmed absent is
   `absent_from_source`, still present is kept. A transient failure listing an
   excluded scope keeps the transition open; an excluded scope the provider
-  rejects (`SourceConfigurationError`) completes it with the ordinary rule.
+  rejects, or whose configuration cannot be built
+  (`SourceConfigurationError`), completes it with the ordinary rule.
   Until a device lists its excluded scopes, a local-agent Jira transition
   stays open. `sync_gene` takes `excluded_scope_gene`, which `run_source_sync`
   builds, and both stores gain `get_projection_scope_transition`.
-  - A Confluence Page Tree Root that answers 404 and a JQL Jira refuses (HTTP
-    400, `JiraQueryRejected`) are configuration errors: the run fails without
-    a retry.
+  - A Confluence Page Tree Root that answers 404, a Confluence scope without
+    its root or spaces, and a JQL Jira refuses (HTTP 400, `JiraQueryRejected`)
+    are configuration errors: the run fails without a retry.
   - GitHub Pages single-page and explicit-list Sources list their configured
     pages, so a page dropped from the configuration is removed and a page that
     cannot be read fails the run's listing. A sitemap declared complete that
