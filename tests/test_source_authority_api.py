@@ -912,6 +912,51 @@ def test_non_owner_admin_can_manage_local_source_but_cannot_change_connection(tm
         asyncio.run(database.close())
 
 
+def test_a_conversation_scope_change_still_reads_everything_on_its_next_run(tmp_path):
+    """Only a document Source keeps its cursor through a scope change; a conversation Source starts over."""
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/v1/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json=_teams_payload(),
+            )
+            assert created.status_code == 200, created.text
+            source_id = created.json()["id"]
+            asyncio.run(
+                database.upsert_sync_state(
+                    SyncState(
+                        source=source_id,
+                        last_sync_at=datetime.now(timezone.utc),
+                        last_sync_status="success",
+                        docs_processed=1,
+                        docs_updated=1,
+                    )
+                )
+            )
+
+            updated = client.put(
+                f"/api/v1/sources/{source_id}",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json={
+                    "config": {
+                        "region": "emea",
+                        "conversation_ids": ["19:conversation-b@example.test"],
+                        "initial_history_days": 14,
+                        "rolling_retention_days": None,
+                    }
+                },
+            )
+
+        assert updated.status_code == 200, updated.text
+        assert asyncio.run(database.get_open_projection_scope_transition(source_id)) is not None
+        assert asyncio.run(database.get_sync_state(source_id)) is None
+    finally:
+        asyncio.run(database.close())
+
+
 def test_non_owner_admin_cannot_trigger_local_source_sync(tmp_path):
     database = _connect_database(tmp_path)
     try:

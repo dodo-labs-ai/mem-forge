@@ -2628,6 +2628,13 @@ async def _require_ready_snapshot_manifest(
         raise HTTPException(status_code=409, detail="authoritative_snapshot_coverage_required")
 
 
+def _is_document_source_type(source_type: str) -> bool:
+    """Whether Sources of this type belong to the document collection family."""
+
+    descriptor = source_type_descriptor(source_type)
+    return descriptor is not None and descriptor.family is CollectionFamilyKind.DOCUMENT
+
+
 def _conversation_gene(source: Mapping[str, Any]) -> ConversationGene | None:
     """The conversation Gene of a Source, or ``None`` for a Source of another family."""
 
@@ -7978,7 +7985,11 @@ def create_admin_app(
                 enabled=schedule.enabled,
                 interval_minutes=schedule.interval_minutes,
             )
-        if scope_changed or auth_secret_changed:
+        if auth_secret_changed or (scope_changed and not _is_document_source_type(existing["type"])):
+            # A new credential may read what the old one could not, so the
+            # next run reads everything. A document Source keeps its cursor
+            # through a scope change: its transition runs discover the whole
+            # new scope, and the run that completes it moves the cursor.
             await db.reset_source_sync_cursor(source_id)
         return {"ok": True, "id": source_id}
 
