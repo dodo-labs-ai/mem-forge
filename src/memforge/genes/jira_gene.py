@@ -27,6 +27,7 @@ from memforge.genes.atlassian_auth import (
     stream_with_rate_limit_retry,
     tls_verify,
 )
+from memforge.genes.base import SourceConfigurationError
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.local_adapter_packages import (
     decode_package,
@@ -147,6 +148,10 @@ def _scope_where(config: Mapping[str, Any]) -> str:
     if jql_filter:
         where += f" AND ({jql_filter})"
     return where
+
+
+class JiraQueryRejected(SourceConfigurationError):
+    """Jira refused the configured JQL (HTTP 400): the query itself is wrong, so retrying cannot help."""
 
 
 def _build_jql(config: dict, since: datetime | None, *, order_by: str | None = None) -> str:
@@ -709,7 +714,10 @@ class JiraGene(DocumentGene):
         max_results: int,
         validate_query: bool = True,
     ) -> AsyncIterator[dict]:
-        """Page one JQL search to its declared total, yielding each issue once, or raise."""
+        """Page one JQL search to its declared total, yielding each issue once, or raise.
+
+        A JQL Jira refuses (HTTP 400) raises :class:`JiraQueryRejected`.
+        """
         seen_issue_ids: set[str] = set()
         seen_issue_keys: set[str] = set()
         expected_total: int | None = None
@@ -733,6 +741,11 @@ class JiraGene(DocumentGene):
                     json_body=request_body,
                 )
                 data = resp.json()
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 400:
+                    raise JiraQueryRejected(f"Jira rejected the JQL {jql!r}: {e.response.text[:500]}") from e
+                logger.error("Jira search failed: %s", e)
+                raise RuntimeError(f"Jira search failed: {e}") from e
             except Exception as e:
                 logger.error("Jira search failed: %s", e)
                 raise RuntimeError(f"Jira search failed: {e}") from e

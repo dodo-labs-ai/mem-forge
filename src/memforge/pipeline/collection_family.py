@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 from memforge.conversations.collections import StoredCollections
 from memforge.genes import gene_exports_pdf
+from memforge.genes.base import SourceConfigurationError
 from memforge.genes.conversation_gene import CollectionAttempt, ConversationGene
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind, gene_family
@@ -52,6 +53,7 @@ from memforge.source_projection import (
     SourceRemoval,
     UnitRemovalReason,
 )
+from memforge.source_projection_config import canonical_projection_scope
 
 if TYPE_CHECKING:
     from memforge.genes.base import Gene
@@ -65,6 +67,7 @@ __all__ = [
     "CollectionFamily",
     "ConversationFamily",
     "DocumentFamily",
+    "ExcludedScopeGeneFactory",
     "LedgerPartition",
     "SnapshotBinding",
     "collection_family",
@@ -125,6 +128,27 @@ class LedgerPartition:
     untried: frozenset[str] = frozenset()
 
 
+ExcludedScopeGeneFactory = Callable[[Mapping[str, object]], Awaitable[DocumentGene]]
+"""Builds an authenticated Gene that lists a scope the Source's open transition excluded.
+
+It takes the excluded canonical scope; the Gene reads the Source's current
+configuration and credential with that scope's fields in place of the current
+ones (see :func:`memforge.source_projection_config.excluded_scope_config`).
+"""
+
+
+class _TransitionStaysOpen(Exception):
+    """The run cannot complete the open transition; the message says why."""
+
+
+def _removed_from_scope(doc_ids: Collection[str]) -> dict[str, SourceRemoval]:
+    """Documents the user's scope change left out of the Source."""
+    return {
+        doc_id: SourceRemoval(reason=UnitRemovalReason.REMOVED_FROM_SCOPE, evidence="scope transition listing")
+        for doc_id in doc_ids
+    }
+
+
 def _absent(doc_ids: set[str], *, evidence: str) -> dict[str, SourceRemoval]:
     """Documents the provider no longer has, as the run's evidence shows."""
     return {
@@ -158,6 +182,7 @@ class CollectionFamily(ABC):
         *,
         collection_attempt: CollectionAttempt | None,
         input_snapshot: SnapshotBinding | None,
+        excluded_scope_gene: ExcludedScopeGeneFactory | None = None,
     ) -> None:
         """Bind the run to what it collects, before anything else runs."""
 
@@ -300,6 +325,7 @@ class DocumentFamily(CollectionFamily):
         self.scope_listing: ScopeListing | None = None
         self._listing_skipped_reason: AbsenceCheckSkippedReason | None = None
         self._unconfirmed_ledger_doc_ids: frozenset[str] = frozenset()
+        self._excluded_scope_gene: ExcludedScopeGeneFactory | None = None
         self._transition: ProjectionScopeTransition | None = None
         self._transition_outstanding: str | None = None
 
@@ -308,8 +334,10 @@ class DocumentFamily(CollectionFamily):
         *,
         collection_attempt: CollectionAttempt | None,
         input_snapshot: SnapshotBinding | None,
+        excluded_scope_gene: ExcludedScopeGeneFactory | None = None,
     ) -> None:
         self.input_snapshot = input_snapshot
+        self._excluded_scope_gene = excluded_scope_gene
         self.gene.reset_scope_listing()
 
     def begin_scope_transition(self, transition: ProjectionScopeTransition) -> None:
@@ -452,7 +480,7 @@ class DocumentFamily(CollectionFamily):
         if reprocessing:
             return AbsenceOutcome()
         if transition is not None:
-            return await self._transition_removals(transition, indexed_doc_ids, deferred_blockers)
+            return await self._transition_removals(transition, indexed_doc_ids, uncommitted, deferred_blockers)
         if self._listing_skipped_reason is not None:
             return AbsenceOutcome(skipped_reason=self._listing_skipped_reason)
         listing = self.scope_listing
@@ -501,6 +529,7 @@ class DocumentFamily(CollectionFamily):
         self,
         transition: ProjectionScopeTransition,
         indexed_doc_ids: set[str],
+        uncommitted: Sequence[ContentItem],
         deferred_blockers: Mapping[str, frozenset[str]],
     ) -> AbsenceOutcome:
         """What the run removes when it can complete the open transition; nothing otherwise.
@@ -512,11 +541,10 @@ class DocumentFamily(CollectionFamily):
         blocks it is one this completion removes: removing them is what lets
         it commit, and :meth:`transition_outstanding` checks that it did.
 
-        Completion removes every held Document the new listing leaves out, as
-        ``removed_from_scope``. A run that cannot complete the transition
-        removes nothing: a Unit whose Document id changed with the scope, such
-        as a file under a new Git ref, carries over to its new Document only
-        when that Document commits.
+        What completion removes is :meth:`_completion_removals`. A run that
+        cannot complete the transition removes nothing: a Unit whose Document
+        id changed with the scope, such as a file under a new Git ref, carries
+        over to its new Document only when that Document commits.
         """
 
         if self._listing_skipped_reason is not None:
@@ -526,34 +554,146 @@ class DocumentFamily(CollectionFamily):
         if listing is None:
             self._transition_outstanding = "the new scope cannot be listed"
             return AbsenceOutcome()
-        removals = {
-            doc_id: SourceRemoval(reason=UnitRemovalReason.REMOVED_FROM_SCOPE, evidence="scope transition listing")
-            for doc_id in indexed_doc_ids - listing.doc_ids
-        }
         waiting = listing.doc_ids - set(await self.db.list_projection_scope_transition_member_doc_ids(transition.id))
-        if waiting:
-            removed_unit_ids = await self._current_unit_ids(removals)
-            waiting = {
-                doc_id
-                for doc_id in waiting
-                if not deferred_blockers.get(doc_id) or not deferred_blockers[doc_id] <= removed_unit_ids
-            }
-        if waiting:
-            self._transition_outstanding = f"{len(waiting)} listed Documents have not committed under the transition"
+        blocked = {doc_id for doc_id in waiting if deferred_blockers.get(doc_id)}
+        try:
+            if waiting - blocked:
+                raise _TransitionStaysOpen(
+                    f"{len(waiting - blocked)} listed Documents have not committed under the transition"
+                )
+            outcome = await self._completion_removals(
+                transition, listing, indexed_doc_ids - listing.doc_ids, uncommitted,
+            )
+            if blocked:
+                removed_unit_ids = await self._current_unit_ids(outcome.removals or {})
+                if still_blocked := {doc_id for doc_id in blocked if not deferred_blockers[doc_id] <= removed_unit_ids}:
+                    raise _TransitionStaysOpen(
+                        f"{len(still_blocked)} listed Documents have not committed under the transition"
+                    )
+        except _TransitionStaysOpen as exc:
+            self._transition_outstanding = str(exc)
             logger.info(
-                "Scope transition %s of %s waits on %d listed Documents; nothing is removed",
+                "Scope transition %s of %s stays open (%s); nothing is removed",
                 transition.id,
                 self.source_id,
-                len(waiting),
+                exc,
             )
             return AbsenceOutcome()
         logger.info(
-            "Scope transition %s of %s completes: %d Documents the new scope leaves out are removed",
+            "Scope transition %s of %s completes: %d Documents are removed",
             transition.id,
             self.source_id,
-            len(removals),
+            len(outcome.removals or {}),
         )
-        return AbsenceOutcome(removals=removals)
+        return outcome
+
+    async def _completion_removals(
+        self,
+        transition: ProjectionScopeTransition,
+        listing: ScopeListing,
+        unlisted: set[str],
+        uncommitted: Sequence[ContentItem],
+    ) -> AbsenceOutcome:
+        """What the run that completes the transition removes from the held Documents the new listing leaves out.
+
+        - Existence listing: every one, as ``removed_from_scope``; the new
+          scope does not hold them.
+        - Query listing: the ones an excluded scope lists, as
+          ``removed_from_scope``, because the user's change took them out.
+          Every other one had left the query before the change and follows
+          the ordinary rule: confirmed absent is removed as
+          ``absent_from_source``, and one still present is kept. When an
+          excluded scope is rejected as a configuration, it cannot say what
+          it held, so every unlisted Document follows the ordinary rule.
+
+        Raises ``_TransitionStaysOpen`` when an excluded scope cannot be
+        listed for any other reason.
+        """
+
+        if listing.kind is ScopeListingKind.EXISTENCE:
+            return AbsenceOutcome(removals=_removed_from_scope(unlisted))
+        if self.input_snapshot is not None:
+            raise _TransitionStaysOpen("the device has not listed the scopes the change excluded")
+        excluded = await self._list_excluded_scopes(transition)
+        removed = unlisted & excluded if excluded is not None else set()
+        rest = unlisted - removed
+        rest -= await self._held_by_renames(rest, uncommitted)
+        removals = _removed_from_scope(removed)
+        if not rest:
+            return AbsenceOutcome(removals=removals)
+        try:
+            absent = await self._confirmed_absent(rest)
+        except AbsenceCheckSkipped as exc:
+            logger.warning(
+                "Absence check skipped for %s (%s): %s",
+                self.source_id,
+                exc.reason,
+                exc.__cause__,
+            )
+            return AbsenceOutcome(removals=removals, skipped_reason=exc.reason)
+        return AbsenceOutcome(
+            removals={**removals, **_absent(absent, evidence="scope listing")},
+            unlisted_present_count=len(rest) - len(absent),
+        )
+
+    async def _list_excluded_scopes(self, transition: ProjectionScopeTransition) -> set[str] | None:
+        """Every Document the transition's excluded scopes list, each distinct scope listed once.
+
+        ``None`` when the provider rejects an excluded scope as a
+        configuration (``SourceConfigurationError``), such as a page tree root
+        that answers 404 or a JQL Jira refuses.
+        """
+
+        scopes = await self._excluded_scopes(transition)
+        if scopes and self._excluded_scope_gene is None:
+            raise _TransitionStaysOpen("this run cannot list the scopes the change excluded")
+        listed: set[str] = set()
+        for scope in scopes:
+            try:
+                gene = await self._excluded_scope_gene(scope)
+                excluded_listing = await gene.list_scope()
+            except SourceConfigurationError as exc:
+                logger.warning(
+                    "An excluded scope of %s was rejected (%s); every unlisted Document follows the ordinary rule",
+                    self.source_id,
+                    exc,
+                )
+                return None
+            except Exception as exc:
+                logger.warning("Listing an excluded scope of %s failed: %s", self.source_id, exc)
+                raise _TransitionStaysOpen("listing a scope the change excluded failed") from exc
+            listed |= excluded_listing.doc_ids
+        return listed
+
+    async def _excluded_scopes(self, transition: ProjectionScopeTransition) -> list[dict[str, object]]:
+        """The distinct scopes the transition excludes: the last applied scope and every superseded target.
+
+        The superseded chain is walked by ``predecessor_transition_id`` back
+        to the last applied scope. A scope equal to the new target is not
+        excluded. Each scope is canonicalized again, so one stored before a
+        scope field was added reads that field's default.
+        """
+
+        source_type = self.gene.metadata().name
+        target = canonical_projection_scope(source_type, transition.target_scope)
+        chain = [transition.previous_scope]
+        predecessor_id = transition.predecessor_transition_id
+        walked: set[str] = set()
+        while predecessor_id is not None:
+            if predecessor_id in walked:
+                raise _TransitionStaysOpen(f"the superseded transitions loop back to {predecessor_id}")
+            walked.add(predecessor_id)
+            predecessor = await self.db.get_projection_scope_transition(predecessor_id)
+            if predecessor is None:
+                raise _TransitionStaysOpen(f"the superseded transition {predecessor_id} is missing")
+            chain.append(predecessor.target_scope)
+            predecessor_id = predecessor.predecessor_transition_id
+        scopes: list[dict[str, object]] = []
+        for scope in chain:
+            canonical = canonical_projection_scope(source_type, scope)
+            if canonical != target and canonical not in scopes:
+                scopes.append(canonical)
+        return scopes
 
     async def transition_outstanding(self, *, docs_failed: int, removals_failed: int) -> str | None:
         """Complete once every listed Document is a member and every removal succeeded.
@@ -693,6 +833,7 @@ class ConversationFamily(CollectionFamily):
         *,
         collection_attempt: CollectionAttempt | None,
         input_snapshot: SnapshotBinding | None,
+        excluded_scope_gene: ExcludedScopeGeneFactory | None = None,
     ) -> None:
         if input_snapshot is not None:
             raise ValueError("a conversation Source plans from its collection attempt, not an input snapshot")

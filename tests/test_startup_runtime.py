@@ -1987,8 +1987,10 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             record_terminal_result=True,
             failed_item_retry=None,
             collection_attempt=None,
+            excluded_scope_gene=None,
         ):
             del (
+                excluded_scope_gene,
                 failed_item_retry,
                 input_snapshot,
                 reprocess_doc_ids,
@@ -2121,8 +2123,10 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             record_terminal_result=True,
             failed_item_retry=None,
             collection_attempt=None,
+            excluded_scope_gene=None,
         ):
             del (
+                excluded_scope_gene,
                 failed_item_retry,
                 input_snapshot,
                 reprocess_doc_ids,

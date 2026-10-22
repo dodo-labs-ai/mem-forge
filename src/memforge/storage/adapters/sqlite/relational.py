@@ -589,6 +589,9 @@ class SqliteRelationalStore:
     async def list_projection_scope_transitions(self, source_id: str, *, limit: int = 20):
         return await self._db.list_projection_scope_transitions(source_id, limit=limit)
 
+    async def get_projection_scope_transition(self, transition_id: str):
+        return await self._db.get_projection_scope_transition(transition_id)
+
     async def start_projection_scope_transition(self, transition_id: str, *, run_id: str):
         return await self._db.start_projection_scope_transition(transition_id, run_id=run_id)
 

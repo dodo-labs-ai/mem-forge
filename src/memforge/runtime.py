@@ -36,7 +36,11 @@ from memforge.local_agent.source_contract import (
     snapshot_document_ids,
     source_with_sync_inputs,
 )
-from memforge.source_projection_config import projection_access_fingerprint, source_access_context
+from memforge.source_projection_config import (
+    excluded_scope_config,
+    projection_access_fingerprint,
+    source_access_context,
+)
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.health import MemoryIndexHealthChecker, MemoryIndexHealthReport
@@ -45,7 +49,7 @@ from memforge.memory.store import MemoryStore
 from memforge.models import SourceSyncRun, SyncState
 from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.genes.family import CollectionFamilyKind
-from memforge.pipeline.collection_family import SnapshotBinding
+from memforge.pipeline.collection_family import ExcludedScopeGeneFactory, SnapshotBinding
 from memforge.source_types import source_type_descriptor
 from memforge.conversations.collections import StoredCollections
 from memforge.pipeline.memory_extractor import MemoryExtractor
@@ -942,6 +946,29 @@ def _build_default_sync_runtime(
     )
 
 
+def excluded_scope_gene_factory(source: Mapping[str, Any], source_config: Mapping[str, Any]) -> ExcludedScopeGeneFactory:
+    """Authenticated Genes that list the scopes a Source's scope change excluded.
+
+    ``source_config`` is the Source's configuration as the run uses it:
+    decrypted, with any browser session cookie injected. Each Gene reads it
+    with the excluded scope's fields in place of the current ones, so it
+    reuses the current credential and never sees a current scope field.
+    """
+
+    source_type = str(source["type"])
+
+    async def excluded_scope_gene(scope: Mapping[str, object]):
+        gene = create_gene(
+            name=source_type,
+            config=excluded_scope_config(source_type, source_config, scope),
+            source_id=str(source["id"]),
+        )
+        await gene.authenticate()
+        return gene
+
+    return excluded_scope_gene
+
+
 async def run_source_sync(
     db: "Database",
     config: AppConfig,
@@ -1024,6 +1051,7 @@ async def run_source_sync(
             "record_terminal_result": record_terminal_result,
             "failed_item_retry": failed_item_retry,
             "collection_attempt": collection_attempt,
+            "excluded_scope_gene": excluded_scope_gene_factory(source, source_config),
         }
         sync_operation = runtime.orchestrator().sync_gene(**sync_kwargs)
         if heartbeat_task is None:

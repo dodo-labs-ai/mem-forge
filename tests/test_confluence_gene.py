@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from memforge.genes.base import SourceConfigurationError
 from memforge.genes.confluence_gene import ConfluenceGene, PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY
 from memforge.models import AbsenceAnswer, ContentItem
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
@@ -903,7 +904,7 @@ async def test_authenticate_closes_confluence_client_when_pat_validation_fails(m
 
 
 @pytest.mark.asyncio
-async def test_page_tree_discovery_raises_when_root_page_cannot_be_fetched():
+async def test_a_page_tree_root_confluence_does_not_return_is_a_configuration_error():
     gene = ConfluenceGene(
         config={
             "base_url": "https://wiki.example.com",
@@ -916,7 +917,7 @@ async def test_page_tree_discovery_raises_when_root_page_cannot_be_fetched():
     gene._api_prefix = "/wiki"
     gene._client = NotFoundClient()
 
-    with pytest.raises(RuntimeError, match="Failed to fetch Confluence page 123"):
+    with pytest.raises(SourceConfigurationError, match="Page Tree Root 123 does not exist"):
         [
             item
             async for item in gene.discover(
