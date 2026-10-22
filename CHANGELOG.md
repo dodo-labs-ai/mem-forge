@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A Source's configuration opens while it syncs. The Admin UI's configuration
+  dialog says "A sync is running. Saving will stop it first.", and saving
+  asks first: "Stop sync and save" stops the sync, waits until its run has
+  ended and saves; "Wait for the sync to finish" keeps the dialog open with
+  the edits. A save the server refuses because a sync started meanwhile
+  (409 `source_sync_running`) asks the same way. The server is unchanged: it
+  still refuses every change but a pause while a sync runs.
 - A person can stop a Source's sync in progress: `POST
   /api/v1/sources/{id}/sync/stop`, the Admin UI's "Stop sync" and `memforge
   sources stop`. The Source stays active and later syncs run as scheduled. A
@@ -13,7 +20,7 @@
   transition stays open for the next run, and the sync cursor does not move.
   Pausing a Source also stops its sync. A configuration change refused while a
   sync runs answers 409 `source_sync_running` naming the run, and the Admin UI
-  offers "Stop the running sync and save". Migration 125 adds
+  offers to stop the sync and save. Migration 125 adds
   `source_sync_runs.stop_requested_at`; `heartbeat_source_sync_run` returns a
   `SourceSyncHeartbeat` instead of a boolean, and a run that fails for good
   marks a scope transition it left running as failed.

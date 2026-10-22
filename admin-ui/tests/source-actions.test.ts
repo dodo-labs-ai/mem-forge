@@ -153,8 +153,8 @@ assert.match(
 );
 assert.match(
   sourceRowSource,
-  /aria-label=\{`Configure \$\{source\.name\}`\}[\s\S]*disabled=\{isSourceBusy \|\| isDeleting\}/,
-  "An active sync should block source configuration at the row seam",
+  /aria-label=\{`Configure \$\{source\.name\}`\}\s*(?:\/\/[^\n]*\s*)?disabled=\{isDeleting\}/,
+  "Configure should stay available during a sync, because saving offers to stop it",
 );
 assert.match(
   sourcesPageSource,
