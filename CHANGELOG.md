@@ -7,11 +7,16 @@
   `local_agent_sync_job_payload(db, source)` (the manual and explicit routes
   and both schedulers), which carries the open transition as
   `projection_scope_transition` and, once the transition's previous run left
-  no listed issue that is not yet a member, every distinct excluded scope as
+  no listed issue that is not yet a member or reached the step that lists the
+  excluded scopes (`excluded_scopes_due`, a new transition column in both
+  stores, SQLite migration 128), every distinct excluded scope as
   `excluded_scopes` (`scope_key` and the job configuration that lists it). The
   agent lists each with its own JQL and its session, and sends the device
-  Document ids, or the rejection of a JQL Jira refuses, as the manifest's
-  `excluded_listings`; a scope it cannot reach is left out. The server accepts
+  Document ids, or the rejection of a JQL Jira refuses or of a scope larger
+  than a manifest holds, as the manifest's `excluded_listings`; a scope it
+  cannot reach is left out. An issue an excluded listing names is not asked
+  about in the manifest's `confirm` set. The SQLite scheduler claims a due
+  Source only while its configuration is the one its job payload read. The server accepts
   only scopes the job carried, each once and within the manifest's item
   bound, stores them with the manifest, and hashes them into the manifest
   digest only when present, so a manifest without them keeps its digest. The

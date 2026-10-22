@@ -275,6 +275,7 @@ from memforge.local_agent.readiness import (
 )
 from memforge.local_agent.snapshot_manifest import (
     COMPLETE_SNAPSHOT,
+    SNAPSHOT_MANIFEST_MAX_ITEMS,
     UPSERT,
     ExcludedScopeListing,
     SnapshotConfirmation,
@@ -2558,7 +2559,7 @@ class LocalSourceManifestItemRequest(BaseModel):
     change_kind: Literal["upsert"]
 
 
-LOCAL_SOURCE_MANIFEST_MAX_ITEMS = 10_000
+LOCAL_SOURCE_MANIFEST_MAX_ITEMS = SNAPSHOT_MANIFEST_MAX_ITEMS
 
 
 class LocalSourceExcludedListingRequest(BaseModel):
@@ -2726,6 +2727,7 @@ async def _snapshot_confirm_set(
     workspace_id: str,
     snapshot_id: str,
     listed_doc_ids: frozenset[str],
+    excluded_listings: Sequence[ExcludedScopeListing],
     package_contract_version: int | None,
 ) -> tuple[SnapshotConfirmation, ...]:
     """The items a device manifest asks its device to confirm by identifier.
@@ -2736,7 +2738,10 @@ async def _snapshot_confirm_set(
     (without the incarnation a Unit that came back carries), and every
     failed Document the manifest does not list that never became a Unit, by
     the provider key of its stored item. A replay of a stored manifest returns
-    the set the manifest was issued, without asking again.
+    the set the manifest was issued, without asking again. When the manifest
+    lists the excluded scopes of a transition and none was rejected, an item
+    an excluded listing names is not asked about: completing the transition
+    removes it on that listing.
 
     A set larger than a manifest is issued empty: the run then records
     ``absence_confirmation_missing`` and removes nothing.
@@ -2763,6 +2768,8 @@ async def _snapshot_confirm_set(
         )
         return tuple(SnapshotConfirmation(item.doc_id, item.provider_key) for item in issued)
     held = await db.list_current_document_provider_keys(source_id)
+    if excluded_listings and all(listing.rejection is None for listing in excluded_listings):
+        listed_doc_ids = listed_doc_ids.union(*(listing.doc_ids for listing in excluded_listings))
     unlisted_units = sorted(set(held) - listed_doc_ids)
     unlisted_failures = sorted(
         (
@@ -9223,6 +9230,7 @@ def create_admin_app(
                 workspace_id=workspace_id,
                 snapshot_id=snapshot_id,
                 listed_doc_ids=frozenset(item.doc_id for item in items),
+                excluded_listings=excluded_listings,
                 package_contract_version=req.package_contract_version,
             )
             await db.attach_source_sync_inputs_to_snapshot(

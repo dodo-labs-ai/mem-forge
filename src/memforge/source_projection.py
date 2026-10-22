@@ -407,6 +407,9 @@ class ProjectionScopeTransition:
 
     ``predecessor_transition_id`` names the open transition this one
     superseded, or is ``None`` when the change found no open transition.
+    ``excluded_scopes_due`` is set while the latest run reached the step that
+    lists the excluded scopes and stayed open, so the next device job carries
+    them.
     The two scopes differ, except in a transition that supersedes another to
     return to the last applied scope: it lists that scope again, so Units the
     superseded target added are removed when it completes. ``completed_at``
@@ -424,6 +427,7 @@ class ProjectionScopeTransition:
     created_at: str | None = None
     updated_at: str | None = None
     completed_at: str | None = None
+    excluded_scopes_due: bool = False
 
     def __post_init__(self) -> None:
         if not self.id or not self.source_id:

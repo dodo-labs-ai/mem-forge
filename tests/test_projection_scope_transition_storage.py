@@ -238,7 +238,7 @@ async def test_migration_keeps_transitions_and_drops_their_coverage(tmp_path):
         await database.close()
 
     assert "coverage" not in columns
-    assert "predecessor_transition_id" in columns
+    assert {"predecessor_transition_id", "excluded_scopes_due"} <= columns
     assert "idx_projection_scope_transitions_source" in indexes
     assert member_columns == ["transition_id", "doc_id", "unit_revision_id"]
     assert open_transition == ProjectionScopeTransition(
@@ -379,6 +379,34 @@ async def test_supersession_closes_the_expected_transition_and_fences_its_member
     with pytest.raises(ValueError, match="not open"):
         await db.record_source_projection(late, unit_input=late_input, scope_transition_id="t1")
     assert await db.get_source_projection(late.run_id) is None
+
+
+async def test_a_run_that_reached_the_excluded_scopes_marks_the_transition_until_it_closes(db: Database) -> None:
+    async def due(transition_id: str) -> bool:
+        transition = await db.get_projection_scope_transition(transition_id)
+        assert transition is not None
+        return transition.excluded_scopes_due
+
+    await _change_scope(db, _transition("t1", "/b"))
+    await db.start_projection_scope_transition("t1", run_id="run-1")
+    await db.fail_projection_scope_transition("t1", run_id="run-1", error="excluded listings missing", excluded_scopes_due=True)
+    marked = await due("t1")
+    await db.start_projection_scope_transition("t1", run_id="run-2")
+    kept_while_running = await due("t1")
+    await db.fail_projection_scope_transition("t1", run_id="run-2", error="a listed Document failed")
+    cleared_by_a_run_that_did_not_reach = await due("t1")
+    await db.start_projection_scope_transition("t1", run_id="run-3")
+    await db.fail_projection_scope_transition("t1", run_id="run-3", error="excluded listings missing", excluded_scopes_due=True)
+    await db.start_projection_scope_transition("t1", run_id="run-4")
+    await db.complete_projection_scope_transition("t1", run_id="run-4")
+    await _change_scope(db, _transition("t2", "/c"))
+    await db.start_projection_scope_transition("t2", run_id="run-5")
+    await db.fail_projection_scope_transition("t2", run_id="run-5", error="excluded listings missing", excluded_scopes_due=True)
+    await _change_scope(db, _transition("t3", "/d", predecessor="t2"), expected_open_transition_id="t2")
+
+    assert (marked, kept_while_running, cleared_by_a_run_that_did_not_reach) == (True, True, False)
+    assert await due("t1") is False
+    assert await due("t2") is False
 
 
 async def test_a_stale_expected_transition_changes_nothing(db: Database) -> None:

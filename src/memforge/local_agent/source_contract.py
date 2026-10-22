@@ -441,11 +441,14 @@ async def _excluded_scope_job_configs(
 ) -> list[dict[str, Any]]:
     """The job configuration of each scope the transition excludes, once its next run can complete it.
 
-    The next run can complete it when the transition's previous run, bound to
-    a device snapshot, listed only Documents that are already members. Before
-    any such run, and while a listed Document waits, none is carried.
+    The next run can complete it when the transition's latest run reached the
+    step that lists the excluded scopes (``excluded_scopes_due``), or when
+    that run, bound to a device snapshot, listed only Documents that are
+    already members. Before any such run, and while a listed Document waits
+    for anything but the removals completion makes, none is carried.
     """
 
+    from memforge.genes.family import CollectionFamilyKind
     from memforge.models import ScopeListingKind
     from memforge.source_projection_config import (
         ExcludedScopesUnavailable,
@@ -455,22 +458,11 @@ async def _excluded_scope_job_configs(
     )
 
     descriptor = source_type_descriptor(source_type)
-    if descriptor is None or descriptor.local_agent is None:
+    if descriptor is None or descriptor.local_agent is None or descriptor.family is not CollectionFamilyKind.DOCUMENT:
         return []
-    listing_kinds = getattr(descriptor.gene_class(), "listing_kinds", frozenset())
-    if ScopeListingKind.QUERY not in listing_kinds or transition.run_id is None:
+    if descriptor.gene_class().snapshot_listing_kind() is not ScopeListingKind.QUERY:
         return []
-    run = await db.get_source_sync_run(transition.run_id)
-    if run is None or run.input_snapshot_id is None:
-        return []
-    listed = snapshot_document_ids(
-        await db.list_source_sync_inputs(
-            source_id=transition.source_id,
-            workspace_id=run.workspace_id,
-            input_snapshot_id=run.input_snapshot_id,
-        )
-    )
-    if listed - set(await db.list_projection_scope_transition_member_doc_ids(transition.id)):
+    if not transition.excluded_scopes_due and not await _previous_run_left_none_waiting(db, transition):
         return []
     try:
         scopes = await excluded_projection_scopes(db, transition, source_type=source_type, config=config)
@@ -483,6 +475,24 @@ async def _excluded_scope_job_configs(
         }
         for scope in scopes
     ]
+
+
+async def _previous_run_left_none_waiting(db: Any, transition: Any) -> bool:
+    """Whether the transition's latest run, bound to a device snapshot, listed only Documents that are members."""
+
+    if transition.run_id is None:
+        return False
+    run = await db.get_source_sync_run(transition.run_id)
+    if run is None or run.input_snapshot_id is None:
+        return False
+    listed = snapshot_document_ids(
+        await db.list_source_sync_inputs(
+            source_id=transition.source_id,
+            workspace_id=run.workspace_id,
+            input_snapshot_id=run.input_snapshot_id,
+        )
+    )
+    return not listed - set(await db.list_projection_scope_transition_member_doc_ids(transition.id))
 
 
 def local_agent_source_config_revision(source: Mapping[str, Any]) -> str:

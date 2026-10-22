@@ -532,8 +532,13 @@ class RelationalStore(Protocol):
         *,
         run_id: str,
         error: str,
+        excluded_scopes_due: bool = False,
     ) -> ProjectionScopeTransition:
-        """Mark the transition held by ``run_id`` failed; it stays open and keeps its member rows."""
+        """Mark the transition held by ``run_id`` failed; it stays open and keeps its member rows.
+
+        ``excluded_scopes_due`` records whether the run reached the step that
+        lists the excluded scopes; completion and supersession clear it.
+        """
         ...
     async def list_projection_scope_transition_member_doc_ids(
         self,

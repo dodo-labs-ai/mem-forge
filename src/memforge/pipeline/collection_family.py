@@ -198,6 +198,12 @@ class CollectionFamily(ABC):
     ) -> None:
         self.gene = gene
         self.db = db
+        self.excluded_scopes_due = False
+        """Whether this run reached the step that lists the open transition's excluded scopes.
+
+        A transition that stays open records it, so the next device job
+        carries the excluded scopes for the device to list.
+        """
         self.doc_store = doc_store
         self.source_id = source_id
         self.input_snapshot: SnapshotBinding | None = None
@@ -713,6 +719,7 @@ class DocumentFamily(CollectionFamily):
         if listing.kind is ScopeListingKind.EXISTENCE:
             return AbsenceOutcome(removals=_removed_from_scope(unlisted))
         if self.input_snapshot is not None:
+            self.excluded_scopes_due = True
             excluded = await self._device_excluded_listings(transition)
         else:
             excluded = await self._list_excluded_scopes(transition)
