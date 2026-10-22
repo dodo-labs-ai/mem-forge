@@ -390,6 +390,37 @@ async def test_recovery_ends_a_derivation_that_cannot_commit_before_any_model_ca
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("listing_kind", [ScopeListingKind.EXISTENCE, ScopeListingKind.QUERY])
+async def test_a_document_whose_recovery_ended_leaves_the_ledger_once_it_is_removed(db, monkeypatch, listing_kind):
+    harness = await synced(db)
+    staged = await _staged_changes(harness)
+    projection = staged["PAY-1"].projection
+    observations = {observation.id: observation for observation in projection.observations}
+    [issue_core] = [
+        revision.id
+        for revision in projection.observation_revisions
+        if observations[revision.observation_id].observation_type == "issue_core"
+    ]
+    await _conflict_with_stored_identity(db, issue_core)
+    harness.provider.removed.add("PAY-1")
+
+    async def list_scope(self):
+        return ScopeListing(
+            kind=listing_kind,
+            doc_ids=frozenset(doc_id(key) for key in ISSUES if key not in self.removed),
+        )
+
+    monkeypatch.setattr(JiraProvider, "list_scope", list_scope)
+
+    state = await harness.sync()
+
+    # PAY-1's resumed derivation failed for good, and the listing proved it gone.
+    assert [failed.doc_id for failed in state.failed_docs] == [doc_id("PAY-1")]
+    assert await db.get_document(doc_id("PAY-1")) is None
+    assert await _ledger(db) == {}
+
+
 class _FailingLifecycleEngine(RecordingMemoryEngine):
     """Fails the lifecycle of one Document while ``failure`` is set, as the lifecycle engine reports it.
 

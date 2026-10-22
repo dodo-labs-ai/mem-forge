@@ -1675,7 +1675,12 @@ class GeneSyncOrchestrator:
                 for deletion_failure in deletion_failures:
                     fail_document(deletion_failure)
                 docs_failed += len(deletion_failures)
-                settled_doc_ids.update(set(removals) - {failure.document_id for failure in deletion_failures})
+                removed_doc_ids = set(removals) - {failure.document_id for failure in deletion_failures}
+                # A removed Document has nothing left to retry, whatever
+                # failed for it earlier in this run.
+                for removed_doc_id in removed_doc_ids:
+                    item_failures.pop(removed_doc_id, None)
+                settled_doc_ids.update(removed_doc_ids)
                 if deleted_count > 0:
                     logger.info(
                         "Soft-deleted memories from %d removed documents",
