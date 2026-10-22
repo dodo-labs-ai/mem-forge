@@ -60,9 +60,11 @@ from memforge.release import current_release
 from memforge.source_item_failures import REMOVAL_STAGE, FailedItemRetry
 from memforge.source_secrets import decrypt_source_config_for_runtime, source_secret_fields
 from memforge.source_activity import (
+    SOURCE_SYNC_CANCELLED_BY_USER,
     SourceActivityConflict,
     SourceActivityKind,
     SourceActivityLease,
+    SourceSyncHeartbeat,
 )
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.adapters.sqlite import SqliteAdapters, SqliteVectorStore, build_sqlite_adapters
@@ -105,6 +107,10 @@ class SourceNotActiveError(RuntimeError):
 
 class SourceSyncLeaseLost(RuntimeError):
     """Raised when a worker no longer owns the leased source-sync run."""
+
+
+class SourceSyncStopRequested(RuntimeError):
+    """Raised when a person asked to stop the source-sync run a worker holds."""
 
 
 class SourceSyncBoundaryError(RuntimeError):
@@ -1241,6 +1247,7 @@ class SourceSyncWorker:
         run: SourceSyncRun,
         stop: asyncio.Event,
         lease_lost: asyncio.Event,
+        stop_requested: asyncio.Event,
     ) -> None:
         while not stop.is_set():
             try:
@@ -1248,7 +1255,7 @@ class SourceSyncWorker:
                 return
             except asyncio.TimeoutError:
                 try:
-                    renewed = await self.db.heartbeat_source_sync_run(
+                    heartbeat = await self.db.heartbeat_source_sync_run(
                         run.run_id,
                         worker_id=self.worker_id,
                         lease_attempt_count=run.lease_attempt_count,
@@ -1258,9 +1265,13 @@ class SourceSyncWorker:
                     logger.exception("Source sync worker heartbeat failed for run %s", run.run_id)
                     lease_lost.set()
                     return
-                if not renewed:
+                if heartbeat is SourceSyncHeartbeat.LOST:
                     logger.warning("Source sync worker lost lease for run %s", run.run_id)
                     lease_lost.set()
+                    return
+                if heartbeat is SourceSyncHeartbeat.STOP_REQUESTED:
+                    logger.info("Source sync worker stops run %s on request", run.run_id)
+                    stop_requested.set()
                     return
 
     async def _progress_until_stopped(
@@ -1297,6 +1308,7 @@ class SourceSyncWorker:
     async def _run_source_sync_with_heartbeat(self, run: SourceSyncRun, **kwargs: Any) -> SyncState | None:
         stop = asyncio.Event()
         lease_lost = asyncio.Event()
+        stop_requested = asyncio.Event()
         source_type = str(kwargs.get("source", {}).get("type") or "")
         previous_attempt_progress = run.progress if run.lease_attempt_count > 1 else None
         progress_accumulator = SourceSyncProgressAccumulator(previous_attempt_progress)
@@ -1311,7 +1323,7 @@ class SourceSyncWorker:
             latest_progress["snapshot"] = snapshot
 
         kwargs["progress_callback"] = report_progress
-        heartbeat_task = asyncio.create_task(self._heartbeat_until_stopped(run, stop, lease_lost))
+        heartbeat_task = asyncio.create_task(self._heartbeat_until_stopped(run, stop, lease_lost, stop_requested))
         progress_task = asyncio.create_task(self._progress_until_stopped(run, stop, lease_lost, latest_progress))
         sync_task = asyncio.create_task(self.runtime_provider.run_source_sync(**kwargs))
         try:
@@ -1319,11 +1331,18 @@ class SourceSyncWorker:
                 {sync_task, heartbeat_task, progress_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if lease_lost.is_set() and (heartbeat_task in done or progress_task in done):
+            # A stop request ends the sync the way a lost lease does: the sync
+            # task is cancelled, so it commits nothing further, removes nothing
+            # and records no result.
+            if (lease_lost.is_set() or stop_requested.is_set()) and (
+                heartbeat_task in done or progress_task in done
+            ):
                 sync_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await sync_task
-                raise SourceSyncLeaseLost(f"source sync lease lost for run {run.run_id}")
+                if lease_lost.is_set():
+                    raise SourceSyncLeaseLost(f"source sync lease lost for run {run.run_id}")
+                raise SourceSyncStopRequested(f"source sync run {run.run_id} was asked to stop")
             result = await sync_task
             if lease_lost.is_set():
                 raise SourceSyncLeaseLost(f"source sync lease lost for run {run.run_id}")
@@ -1377,6 +1396,10 @@ class SourceSyncWorker:
         if run is None:
             await self.process_bounded_maintenance_once()
             return None
+
+        if run.stop_requested_at is not None:
+            # The worker that held the run stopped before it could end it.
+            return await self._end_stopped_run(run, await self.db.get_source(run.source_id))
 
         if run.lease_attempt_count > self.config.sync.worker_max_attempts:
             failed = await self.db.fail_source_sync_run(
@@ -1576,6 +1599,8 @@ class SourceSyncWorker:
         except SourceSyncLeaseLost:
             logger.warning("Source sync worker stopped terminal update after losing lease for run %s", run.run_id)
             return run
+        except SourceSyncStopRequested:
+            return await self._end_stopped_run(run, source)
         except Exception as exc:
             logger.exception("Source sync worker failed run %s", run.run_id)
             if source and "browser session" in str(exc).lower():
@@ -1607,6 +1632,28 @@ class SourceSyncWorker:
             if not failed:
                 logger.warning("Source sync worker stopped failure update after losing lease for run %s", run.run_id)
             return run
+
+    async def _end_stopped_run(self, run: SourceSyncRun, source: Mapping[str, Any] | None) -> SourceSyncRun:
+        """Fail a run a person stopped, not retryable, and release its Source.
+
+        The run ends like one whose lease was lost: what it committed stays,
+        and its sync cursor and failure ledger are left as they were.
+        """
+
+        failed = await self.db.fail_source_sync_run(
+            run.run_id,
+            worker_id=self.worker_id,
+            lease_attempt_count=run.lease_attempt_count,
+            error_message=SOURCE_SYNC_CANCELLED_BY_USER,
+            retryable=False,
+        )
+        if not failed:
+            logger.warning("Source sync worker lost lease before ending stopped run %s", run.run_id)
+            return run
+        logger.info("Source sync run %s stopped on request", run.run_id)
+        if source is not None:
+            await self._release_collection(run, source)
+        return run
 
     async def _release_collection(self, run: SourceSyncRun, source: Mapping[str, Any]) -> None:
         """Drop the collected bodies a conversation run has finished with, and every older collection.
@@ -1879,6 +1926,14 @@ class SyncService:
             source_id=source_id,
             error_message="cancelled_by_source_change",
         )
+
+    async def stop_source(self, source_id: str) -> SourceSyncRun | None:
+        """Stop the Source's pending or running durable sync run, and return it as it now is.
+
+        A pending run fails at once; a running run is stopped by its worker at
+        the worker's next heartbeat (``Database.request_source_sync_stop``).
+        """
+        return await self.db.request_source_sync_stop(source_id=source_id)
 
     async def shutdown(self) -> None:
         source_ids = list(self.tasks)

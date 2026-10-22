@@ -50,9 +50,11 @@ from memforge.storage.recovery_points import (
     installed_release,
 )
 from memforge.source_activity import (
+    SOURCE_SYNC_CANCELLED_BY_USER,
     SourceActivityConflict,
     SourceActivityKind,
     SourceActivityLease,
+    SourceSyncHeartbeat,
     SourceSyncRunActive,
 )
 from memforge.sync_progress import normalize_sync_progress_snapshot
@@ -841,6 +843,7 @@ def _source_sync_run_from_row(
         updated_at=_parse_dt(data.get("updated_at")),
         started_at=_parse_dt(data.get("started_at")),
         completed_at=_parse_dt(data.get("completed_at")),
+        stop_requested_at=_parse_dt(data.get("stop_requested_at")),
         source_activity=source_activity,
     )
 
@@ -1935,7 +1938,8 @@ CREATE TABLE IF NOT EXISTS source_sync_runs (
     created_at              TEXT NOT NULL,
     updated_at              TEXT NOT NULL,
     started_at              TEXT,
-    completed_at            TEXT
+    completed_at            TEXT,
+    stop_requested_at       TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_source_sync_runs_active
@@ -4994,6 +4998,12 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # Every Teams sync polls the whole Initial History.
         [],
     ),
+    (
+        125,
+        "Record a request to stop a running sync",
+        # The worker running the sync sees the request at its next heartbeat.
+        ["ALTER TABLE source_sync_runs ADD COLUMN stop_requested_at TEXT"],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -6924,6 +6934,44 @@ class Database:
             )
             await self.db.commit()
         return bool(cursor.rowcount)
+
+    async def stop_local_agent_source_jobs(
+        self,
+        *,
+        source_id: str,
+        now: datetime | None = None,
+    ) -> list[str]:
+        """Fail the Source's queued and leased sync jobs as stopped by a person; return their ids.
+
+        The jobs are not retried. A daemon collecting one learns at its next
+        heartbeat that the job is no longer leased to it and stops, and the
+        server refuses its uploads and completion.
+        """
+
+        stopped_at = _utc_iso(now)
+        operations = sorted(LOCAL_AGENT_SYNC_OPERATIONS)
+        placeholders = ",".join("?" for _ in operations)
+        selection = f"source_id = ? AND operation IN ({placeholders}) AND status IN ('queued', 'leased')"
+        params = (source_id, *operations)
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    f"SELECT job_id FROM local_agent_jobs WHERE {selection} ORDER BY created_at, job_id",
+                    params,
+                ) as cursor:
+                    job_ids = [str(row["job_id"]) async for row in cursor]
+                await self.db.execute(
+                    f"""UPDATE local_agent_jobs SET status = 'failed', last_error = ?,
+                           lease_owner_user_id = NULL, leased_until = NULL,
+                           next_attempt_at = NULL, finished_at = ?, updated_at = ?
+                       WHERE {selection}""",
+                    (SOURCE_SYNC_CANCELLED_BY_USER, stopped_at, stopped_at, *params),
+                )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        return job_ids
 
     async def get_local_agent_heartbeat(self, user_id: str) -> str | None:
         async with self.db.execute(
@@ -17056,7 +17104,10 @@ class Database:
                             requested_status=status,
                         )
                         if not pause_only:
-                            raise ValueError(f"source sync run already active: {active_run['run_id']}")
+                            raise SourceSyncRunActive(
+                                f"source sync run already active: {active_run['run_id']}",
+                                run_id=str(active_run["run_id"]),
+                            )
             except Exception:
                 await self.db.rollback()
                 raise
@@ -19224,7 +19275,10 @@ class Database:
         ) as cursor:
             existing = await cursor.fetchone()
         if existing and reprocess_document_ids:
-            raise SourceSyncRunActive(f"Source {source_id} has an active sync run: {existing['run_id']}")
+            raise SourceSyncRunActive(
+                f"Source {source_id} has an active sync run: {existing['run_id']}",
+                run_id=str(existing["run_id"]),
+            )
         if existing and existing["reprocess_document_ids_json"]:
             # A reprocess keeps its meaning; the requested sync runs after it,
             # forced when requested, as a running sync's successor is.
@@ -19440,6 +19494,85 @@ class Database:
             await self.db.commit()
         return bool(cursor.rowcount)
 
+    async def request_source_sync_stop(
+        self,
+        *,
+        source_id: str,
+        now: datetime | None = None,
+    ) -> SourceSyncRun | None:
+        """Stop the Source's pending or running sync run, and return it as it now is.
+
+        A pending run has not started: it fails here, not retryable, with
+        ``SOURCE_SYNC_CANCELLED_BY_USER`` and its terminal sync history. A
+        running run records the request, keeping the first one, and its worker
+        stops at its next heartbeat and fails the run the same way. Either way a
+        sync requested earlier and waiting to run after it is dropped. Returns
+        ``None`` when the Source has no pending or running run.
+        """
+
+        requested_at = _utc_iso(now)
+        async with self._write_lock:
+            try:
+                await self.db.execute(
+                    "UPDATE sources SET status = status WHERE id = ?",
+                    (source_id,),
+                )
+                async with self.db.execute(
+                    """SELECT * FROM source_sync_runs
+                       WHERE source_id = ? AND status IN ('pending', 'running')
+                       ORDER BY created_at LIMIT 1""",
+                    (source_id,),
+                ) as cursor:
+                    active = await cursor.fetchone()
+                if active is None:
+                    await self.db.commit()
+                    return None
+                pending = active["status"] == "pending"
+                await self.db.execute(
+                    """UPDATE source_sync_runs
+                       SET status = CASE WHEN status = 'pending' THEN 'failed' ELSE status END,
+                           stop_requested_at = COALESCE(stop_requested_at, ?),
+                           rerun_requested = 0,
+                           rerun_input_snapshot_id = NULL,
+                           rerun_input_generation_watermark = NULL,
+                           rerun_source_config_revision = NULL,
+                           rerun_predecessor_activity_id = NULL,
+                           rerun_retry_failed_items = 0,
+                           next_attempt_at = CASE WHEN status = 'pending' THEN NULL ELSE next_attempt_at END,
+                           error_message = CASE WHEN status = 'pending' THEN ? ELSE error_message END,
+                           completed_at = CASE WHEN status = 'pending' THEN ? ELSE completed_at END,
+                           updated_at = ?
+                       WHERE run_id = ? AND status IN ('pending', 'running')""",
+                    (
+                        requested_at,
+                        SOURCE_SYNC_CANCELLED_BY_USER,
+                        requested_at,
+                        requested_at,
+                        active["run_id"],
+                    ),
+                )
+                if pending:
+                    await self._insert_terminal_sync_history_unlocked(
+                        run_id=str(active["run_id"]),
+                        state=SyncState(
+                            source=source_id,
+                            last_sync_status="failed",
+                            error_message=SOURCE_SYNC_CANCELLED_BY_USER,
+                        ),
+                        started_at=str(active["started_at"] or active["created_at"]),
+                        finished_at=requested_at,
+                    )
+                async with self.db.execute(
+                    "SELECT * FROM source_sync_runs WHERE run_id = ?",
+                    (active["run_id"],),
+                ) as cursor:
+                    stopped = await cursor.fetchone()
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        return _source_sync_run_from_row(stopped)
+
     async def get_latest_source_sync_run(
         self,
         *,
@@ -19599,7 +19732,12 @@ class Database:
         lease_attempt_count: int,
         lease_seconds: int = 300,
         now: datetime | None = None,
-    ) -> bool:
+    ) -> SourceSyncHeartbeat:
+        """Renew the worker's lease of a running run and its Source activity.
+
+        Answers ``STOP_REQUESTED`` once a person asked to stop the run: the
+        lease is renewed, so that the worker can still fail the run.
+        """
         heartbeat_at = now or datetime.now(timezone.utc)
         heartbeat_iso = _utc_iso(heartbeat_at)
         lease_expires_at = _utc_iso(heartbeat_at + timedelta(seconds=max(1, lease_seconds)))
@@ -19635,7 +19773,7 @@ class Database:
                 )
                 if activity.rowcount != 1:
                     await self.db.rollback()
-                    return False
+                    return SourceSyncHeartbeat.LOST
                 run = await self.db.execute(
                     """UPDATE source_sync_runs
                        SET lease_expires_at = ?, updated_at = ?
@@ -19655,12 +19793,19 @@ class Database:
                 )
                 if run.rowcount != 1:
                     await self.db.rollback()
-                    return False
+                    return SourceSyncHeartbeat.LOST
+                async with self.db.execute(
+                    "SELECT stop_requested_at FROM source_sync_runs WHERE run_id = ?",
+                    (run_id,),
+                ) as cursor:
+                    renewed = await cursor.fetchone()
                 await self.db.commit()
             except BaseException:
                 await self.db.rollback()
                 raise
-        return True
+        if renewed["stop_requested_at"] is not None:
+            return SourceSyncHeartbeat.STOP_REQUESTED
+        return SourceSyncHeartbeat.RENEWED
 
     async def report_source_sync_run_progress(
         self,
@@ -19997,6 +20142,14 @@ class Database:
                         state=terminal_state,
                         started_at=str(leased_run["started_at"] or leased_run["created_at"]),
                         finished_at=failed_iso,
+                    )
+                    # A run stopped or interrupted mid-transition leaves the
+                    # transition open and startable by the Source's next run.
+                    await self.db.execute(
+                        """UPDATE projection_scope_transitions
+                           SET status = 'failed', error = ?, updated_at = ?
+                           WHERE run_id = ? AND status = 'running'""",
+                        (error_message, failed_iso, run_id),
                     )
                     await self._enqueue_successor_for_completed_run(run_id, failed_iso)
                 await self.db.commit()

@@ -85,7 +85,7 @@ from memforge.pipeline.sync import (
     summarize_failed_documents,
 )
 from memforge.runtime import SyncService
-from memforge.source_activity import SourceActivityKind
+from memforge.source_activity import SourceActivityKind, SourceSyncHeartbeat
 from memforge.source_artifacts import (
     RawSourceArtifact,
     SourceArtifactDownload,
@@ -964,10 +964,10 @@ async def test_heartbeat_source_sync_run_extends_only_current_worker_lease(db: D
     )
     after_right_worker = await db.get_source_sync_run(enqueued.run_id)
 
-    assert wrong_worker is False
+    assert wrong_worker is SourceSyncHeartbeat.LOST
     assert after_wrong_worker is not None
     assert after_wrong_worker.lease_expires_at == now + timedelta(seconds=60)
-    assert right_worker is True
+    assert right_worker is SourceSyncHeartbeat.RENEWED
     assert after_right_worker is not None
     assert after_right_worker.lease_expires_at == now + timedelta(seconds=70)
     activity = await db.db.execute_fetchall(
@@ -988,7 +988,7 @@ async def test_heartbeat_source_sync_run_extends_only_current_worker_lease(db: D
         lease_seconds=60,
         now=now + timedelta(seconds=71),
     )
-    assert expired is False
+    assert expired is SourceSyncHeartbeat.LOST
 
 
 @pytest.mark.asyncio
@@ -8715,7 +8715,7 @@ async def test_source_sync_worker_does_not_complete_after_losing_lease(db: Datab
 
     async def lost_lease(*args, **kwargs):
         del args, kwargs
-        return False
+        return SourceSyncHeartbeat.LOST
 
     monkeypatch.setattr(db, "heartbeat_source_sync_run", lost_lease)
     worker = runtime.SourceSyncWorker(

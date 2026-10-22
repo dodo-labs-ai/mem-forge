@@ -673,6 +673,9 @@ class SourceSyncRun:
     updated_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    # When a person asked to stop the run. Its worker sees the request at its
+    # next heartbeat, stops, and fails the run with SOURCE_SYNC_CANCELLED_BY_USER.
+    stop_requested_at: datetime | None = None
     source_activity: SourceActivityLease | None = field(
         default=None,
         repr=False,
