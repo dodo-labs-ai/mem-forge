@@ -90,7 +90,7 @@ def test_legacy_jira_schema_upgrade_plans_current_reading_and_next_revision_stay
     old_content = json.dumps(old_record, sort_keys=True)
     legacy = replace(core, id="legacy-core", content=old_content,
         semantic_hash=hashlib.sha256(old_content.encode()).hexdigest(),
-        evidence_profile=LEGACY_OBSERVATION_PROFILES[("jira", "issue_core")])
+        evidence_profile=LEGACY_OBSERVATION_PROFILES["issue_core"])
     legacy_unit = replace(base.source_unit_revisions[0], id="legacy-unit", observation_revision_ids=(legacy.id,))
     old = replace(base, observation_revisions=(legacy,), source_unit_revisions=(legacy_unit,), deltas=())
     target = projection("Keep A.", "<p>Keep A.</p>", prior=old)
@@ -391,7 +391,7 @@ def test_list_content_between_items_stays_in_reading_order():
 
 def test_schema_cutover_keeps_historical_profile_truth():
     for key, profile in CURRENT_OBSERVATION_PROFILES.items():
-        assert profile.schema_version == (4 if key[1] == "changelog" else 5)
+        assert profile.schema_version == (4 if key == "changelog" else 5)
         legacy = LEGACY_OBSERVATION_PROFILES[key]
         assert legacy.schema_version == 1
         schema = CANONICAL_RECORD_SCHEMAS[(legacy.schema_name, legacy.schema_version)]
@@ -453,11 +453,11 @@ def test_jira_underline_is_not_an_insertion_event_and_legacy_format_remains_pinn
 
 
 def test_jira_format_upgrade_preserves_historical_text_views():
-    from memforge.source_adapters.jira import _profile
+    from memforge.source_adapters.contracts import canonical_record_profile
 
     projected = projection('+Keep the condition.+', '<p><ins>Keep the condition.</ins></p>')
     revision = projected.observation_revisions[0]
-    historical = replace(revision, id='historical-v4', evidence_profile=_profile('jira-issue-core', 4))
+    historical = replace(revision, id='historical-v4', evidence_profile=canonical_record_profile('jira-issue-core', 4))
     old_index = build_revision_fragment_index(historical)
     assert not old_index.errors
     old_fragment = next(f for f in old_index.fragments if '[inserted: Keep the condition.]' in f.presentation_text)

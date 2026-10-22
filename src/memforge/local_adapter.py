@@ -743,3 +743,101 @@ def _github_package_count(inbox: Path, config: dict[str, Any]) -> int:
             ):
                 count += 1
     return count
+
+
+async def submit_github_repo_request(
+    req: Any,
+    *,
+    db: Any,
+    workspace_id: str,
+    config: AppConfig,
+    source: dict[str, Any],
+    document_store: Any,
+    sync_snapshot_id: str,
+    source_artifacts: Any,
+) -> dict[str, Any]:
+    """Submit one GitHub repository file the local agent pushed."""
+
+    return await submit_github_repo_document(
+        db=db,
+        workspace_id=workspace_id,
+        config=config,
+        source=source,
+        repo_url=req.repo_url or "",
+        repo_ref=req.repo_ref or "",
+        relative_path=req.relative_path,
+        markdown_body=req.markdown_body,
+        content_type=req.content_type,
+        title=req.title,
+        raw_hash=req.raw_hash,
+        blob_sha=req.blob_sha,
+        symlink_chain=req.symlink_chain,
+        resolved_relative_path=req.resolved_relative_path,
+        source_updated_at=req.source_updated_at,
+        submitted_by=req.submitted_by,
+        submitted_at=req.submitted_at,
+        document_store=document_store,
+        sync_snapshot_id=sync_snapshot_id,
+        source_artifacts=source_artifacts,
+    )
+
+
+async def submit_jira_request(
+    req: Any,
+    *,
+    db: Any,
+    workspace_id: str,
+    config: AppConfig,
+    source: dict[str, Any],
+    document_store: Any,
+    sync_snapshot_id: str,
+    source_artifacts: Any,
+) -> dict[str, Any]:
+    """Submit one Jira issue the local agent read."""
+
+    return await submit_jira_package(
+        db=db,
+        config=config,
+        source=source,
+        base_url=req.base_url or "",
+        issue_key=req.issue_key or "",
+        raw_payload=req.raw_payload,
+        source_url=req.source_url or "",
+        title=req.title,
+        raw_hash=req.raw_hash,
+        provider_revision=req.provider_revision,
+        submitted_by=req.submitted_by,
+        submitted_at=req.submitted_at,
+        document_store=document_store,
+        source_artifacts=source_artifacts,
+    )
+
+
+async def submit_local_markdown_request(
+    req: Any,
+    *,
+    db: Any,
+    workspace_id: str,
+    config: AppConfig,
+    source: dict[str, Any],
+    document_store: Any,
+    sync_snapshot_id: str,
+    source_artifacts: Any,
+) -> dict[str, Any]:
+    """Submit one local markdown file the local agent snapshotted."""
+
+    return await submit_local_markdown_document(
+        db=db,
+        config=config,
+        source=source,
+        vault_id=req.vault_id or "",
+        relative_path=req.relative_path,
+        markdown_body=req.markdown_body,
+        content_type=req.content_type,
+        title=req.title,
+        raw_hash=req.raw_hash,
+        source_updated_at=req.source_updated_at,
+        submitted_by=req.submitted_by,
+        submitted_at=req.submitted_at,
+        document_store=document_store,
+    )

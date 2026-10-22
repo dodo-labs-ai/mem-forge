@@ -217,7 +217,6 @@ from memforge.server.model_settings_api import (
 )
 from memforge.source_secrets import (
     decrypt_source_config_for_runtime,
-    decrypt_secret,
     SecretConfigurationError,
     prepare_source_config_for_storage,
     redact_source_config,
@@ -227,6 +226,13 @@ from memforge.source_projection import (
     ProjectionScopeTransition,
 )
 from memforge.source_projection_config import projection_scope_transition_id, source_access_context
+from memforge.source_types import (
+    LocalAgentCollection,
+    SourceConfigPolicy,
+    load_reference,
+    source_type_descriptor,
+)
+from memforge.source_types.jira import jira_auth_mode
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.recovery_points import RecoveryPoints, UpgradeError
@@ -259,7 +265,6 @@ from memforge.local_agent.readiness import (
 )
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_SYNC_OPERATIONS,
-    TEAMS_ROLLING_RETENTION_PRESETS,
     execution_owner_user_id,
     is_local_agent_backed_source,
     local_agent_collection_attempt_id,
@@ -2989,11 +2994,63 @@ class MemoryReviewDecisionManifestResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _local_agent_collection(source_type: object) -> LocalAgentCollection | None:
+    descriptor = source_type_descriptor(source_type)
+    return descriptor.local_agent if descriptor is not None else None
+
+
+def _config_policy(source_type: str) -> SourceConfigPolicy:
+    descriptor = source_type_descriptor(source_type)
+    return descriptor.config if descriptor is not None else SourceConfigPolicy()
+
+
 def _source_secret_fields(source_type: str) -> tuple[str, ...]:
     fields = set(source_secret_fields(source_type, GENE_REGISTRY))
-    if source_type == "jira":
-        fields.add("jira_cookie")
+    fields.update(_config_policy(source_type).extra_secret_fields)
     return tuple(sorted(fields))
+
+
+def _complete_source_config(
+    source_type: str,
+    config: dict[str, Any],
+    source_id: str,
+    existing_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fill the values a source type derives from the Source or its stored configuration."""
+
+    policy = _config_policy(source_type)
+    return policy.complete(dict(config), source_id, existing_config) if policy.complete else config
+
+
+def _store_source_config(
+    source_type: str,
+    config: dict[str, Any],
+    source_id: str,
+    app_config: AppConfig,
+) -> dict[str, Any]:
+    """Adjust a configuration whose secrets are encrypted before it is stored."""
+
+    policy = _config_policy(source_type)
+    if policy.store is None:
+        return config
+
+    def local_inbox() -> str:
+        from memforge.local_adapter import default_local_adapter_inbox
+
+        inbox = default_local_adapter_inbox(app_config, source_id)
+        inbox.mkdir(parents=True, exist_ok=True)
+        return str(inbox)
+
+    return policy.store(dict(config), local_inbox)
+
+
+def _source_credentials_changed(
+    source_type: str,
+    config: dict[str, Any],
+    existing_config: dict[str, Any],
+) -> bool:
+    policy = _config_policy(source_type)
+    return policy.credentials_changed(config, existing_config) if policy.credentials_changed else False
 
 
 def _sync_scope_config(source_type: str, config: dict[str, Any]) -> dict[str, Any]:
@@ -3005,19 +3062,10 @@ def _sync_scope_config(source_type: str, config: dict[str, Any]) -> dict[str, An
 
 
 def _public_source_config(source_type: str, config: dict[str, Any]) -> dict[str, Any]:
-    """Expose user intent while keeping connector partition policy internal."""
+    """The configuration a reader of the Source sees."""
 
-    if source_type != "teams":
-        return config
-    result = dict(config)
-    result["initial_history_days"] = result.get("initial_history_days", result.get("max_age_days", 14))
-    retention = result.get("rolling_retention_days")
-    result["rolling_retention_days"] = (
-        retention if retention in TEAMS_ROLLING_RETENTION_PRESETS else None
-    )
-    for key in ("max_age_days", "conversation_gap_minutes", "max_block_messages"):
-        result.pop(key, None)
-    return result
+    policy = _config_policy(source_type)
+    return policy.public(dict(config)) if policy.public else config
 
 
 def _provider_namespace_config(source_type: str, config: dict[str, Any]) -> dict[str, Any]:
@@ -3028,27 +3076,14 @@ def _provider_namespace_config(source_type: str, config: dict[str, Any]) -> dict
     return canonical_provider_namespace(source_type, config)
 
 
-def _config_bool(value: Any, *, default: bool) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        text = value.strip().lower()
-        if text in {"true", "1", "yes", "on"}:
-            return True
-        if text in {"false", "0", "no", "off"}:
-            return False
-    return default
-
-
 def _validate_source_config(
     source_type: str,
     config: dict[str, Any],
     existing_config: dict[str, Any] | None = None,
 ) -> None:
-    if source_type == "github_pages":
-        _validate_github_pages_config(config, existing_config=existing_config)
-    if source_type == "github_repo":
-        _validate_github_repo_config(config, existing_config=existing_config)
+    policy = _config_policy(source_type)
+    if policy.validate_input is not None:
+        policy.validate_input(config, existing_config or {})
     validate_tls_ca_bundle(config)
     secret_fields = _source_secret_fields(source_type)
     gene_cls = GENE_REGISTRY.get(source_type)
@@ -3072,366 +3107,8 @@ def _validate_source_config(
             config,
             existing_config=existing_config,
         )
-    if source_type == "confluence":
-        _validate_confluence_config(config, existing_config=existing_config)
-    if source_type == "jira":
-        _validate_jira_auth_config(config, existing_config=existing_config)
-        _validate_jira_scope_config(config)
-
-
-def _validate_github_repo_config(
-    config: dict[str, Any],
-    existing_config: dict[str, Any] | None = None,
-) -> None:
-    existing_config = existing_config or {}
-    if "repo_path" in config:
-        raise ValueError("GitHub Repository reads the configured remote repository; repo_path is not a supported field")
-    repo_url = str(config.get("repo_url") or existing_config.get("repo_url") or "").strip()
-    require_https_base_url(repo_url, "GitHub Repository")
-    from urllib.parse import urlsplit
-
-    parts = urlsplit(repo_url)
-    path_parts = [part for part in parts.path.split("/") if part]
-    if len(path_parts) < 2:
-        raise ValueError("GitHub Repository URL must include owner and repository")
-    connection_mode = (
-        str(config.get("connection_mode") or existing_config.get("connection_mode") or "cloud_pull").strip().lower()
-    )
-    if connection_mode not in {"cloud_pull", "local_push"}:
-        raise ValueError("GitHub Repository Access must be Public internet or Internal network / VPN")
-    max_files = config.get("max_files", existing_config.get("max_files", 500))
-    try:
-        if int(max_files) < 1:
-            raise ValueError
-    except (TypeError, ValueError):
-        raise ValueError("GitHub Repository Max Files must be a positive integer") from None
-
-
-def _validate_confluence_config(
-    config: dict[str, Any],
-    existing_config: dict[str, Any] | None = None,
-) -> None:
-    existing_config = existing_config or {}
-    sync_mode = str(config.get("sync_mode") or existing_config.get("sync_mode") or "").strip().lower()
-    if sync_mode not in {"", "page_tree", "space"}:
-        raise ValueError("Confluence Sync Scope must be Page tree or Space")
-    if not sync_mode:
-        sync_mode = (
-            "page_tree"
-            if str(config.get("page_tree_root") or existing_config.get("page_tree_root") or "").strip()
-            else "space"
-        )
-
-    if sync_mode == "page_tree":
-        page_tree_root = str(config.get("page_tree_root") or existing_config.get("page_tree_root") or "").strip()
-        if not page_tree_root:
-            raise ValueError("Confluence Page Tree Root is required when syncing a page tree")
-        return
-
-    if not _config_list_has_value(config.get("spaces")) and not _config_list_has_value(existing_config.get("spaces")):
-        raise ValueError("Confluence Spaces to Sync is required when syncing whole spaces")
-
-
-def _config_list_has_value(value: Any) -> bool:
-    if isinstance(value, list):
-        return any(str(item).strip() for item in value)
-    if isinstance(value, str):
-        return any(part.strip() for part in value.split(","))
-    return False
-
-
-def _validate_github_pages_config(
-    config: dict[str, Any],
-    existing_config: dict[str, Any] | None = None,
-) -> None:
-    existing_config = existing_config or {}
-    base_url = _ensure_github_pages_base_url(config, existing_config=existing_config)
-    require_https_base_url(base_url, "GitHub Pages")
-
-    auth_mode = str(config.get("auth_mode") or existing_config.get("auth_mode") or "github_pat").strip().lower()
-    if auth_mode not in {"github_pat", "none"}:
-        raise ValueError("GitHub Pages Authentication Method must be Personal access token or No authentication")
-    if auth_mode == "github_pat" and not _source_secret_has_value("pat", config, existing_config):
-        raise ValueError("GitHub Pages Personal Access Token is required for github_pat authentication")
-
-    sync_mode = str(config.get("sync_mode") or "single_page").strip().lower()
-    if sync_mode == "single_page":
-        page_url = str(config.get("page_url") or "").strip()
-        if not page_url:
-            raise ValueError("GitHub Pages Page URL is required for single page sync")
-        _validate_github_pages_scope_url(base_url, page_url, "Page URL")
-        return
-    if sync_mode == "subtree":
-        root_url = str(config.get("root_url") or "").strip()
-        if not root_url:
-            raise ValueError("GitHub Pages Subtree Root URL is required for subtree sync")
-        _validate_github_pages_scope_url(base_url, root_url, "Subtree Root URL")
-        return
-    if sync_mode == "explicit_list":
-        pages = config.get("pages")
-        page_urls = [
-            str(page).strip()
-            for page in (pages if isinstance(pages, list) else str(pages or "").split(","))
-            if str(page).strip()
-        ]
-        if page_urls:
-            for page_url in page_urls:
-                _validate_github_pages_scope_url(base_url, page_url, "Explicit Page URL")
-            return
-        raise ValueError("GitHub Pages Explicit Page URLs are required for explicit list sync")
-    raise ValueError("GitHub Pages Sync Mode must be Single page, Subtree, or Explicit list")
-
-
-def _ensure_github_pages_base_url(
-    config: dict[str, Any],
-    existing_config: dict[str, Any] | None = None,
-) -> str:
-    existing_config = existing_config or {}
-    base_url = str(config.get("base_url") or existing_config.get("base_url") or "").strip()
-    if not base_url:
-        scope_url = _github_pages_scope_url(config, existing_config)
-        base_url = _github_pages_site_root_from_url(scope_url)
-    if base_url:
-        config["base_url"] = base_url
-    return base_url
-
-
-def _github_pages_scope_url(config: dict[str, Any], existing_config: dict[str, Any]) -> str:
-    sync_mode = str(config.get("sync_mode") or existing_config.get("sync_mode") or "single_page").strip().lower()
-    if sync_mode == "subtree":
-        return str(config.get("root_url") or existing_config.get("root_url") or "").strip()
-    if sync_mode == "explicit_list":
-        pages = config.get("pages") or existing_config.get("pages")
-        page_urls = [
-            str(page).strip()
-            for page in (pages if isinstance(pages, list) else str(pages or "").split(","))
-            if str(page).strip()
-        ]
-        return page_urls[0] if page_urls else ""
-    return str(config.get("page_url") or existing_config.get("page_url") or "").strip()
-
-
-def _github_pages_site_root_from_url(url: str) -> str:
-    from urllib.parse import urlsplit, urlunsplit
-
-    value = str(url or "").strip()
-    if not value:
-        return ""
-    parts = urlsplit(value)
-    path_parts = [part for part in parts.path.split("/") if part]
-    if len(path_parts) >= 3 and path_parts[0] == "pages":
-        root_path = "/" + "/".join(path_parts[:3])
-        return urlunsplit((parts.scheme, parts.netloc, root_path, "", ""))
-    if len(path_parts) >= 2 and (parts.hostname or "").lower().startswith("pages."):
-        root_path = "/" + "/".join(path_parts[:2])
-        return urlunsplit((parts.scheme, parts.netloc, root_path, "", ""))
-    return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
-
-
-def _validate_github_pages_scope_url(base_url: str, candidate_url: str, label: str) -> None:
-    require_https_base_url(candidate_url, f"GitHub Pages {label}")
-    from urllib.parse import urlsplit
-
-    base = urlsplit(base_url)
-    candidate = urlsplit(candidate_url)
-    if candidate.netloc.lower() != base.netloc.lower():
-        raise ValueError(f"GitHub Pages {label} must stay on the configured site origin")
-    base_path = base.path.rstrip("/") + "/"
-    candidate_path = candidate.path.rstrip("/") + "/"
-    if not candidate_path.startswith(base_path):
-        raise ValueError(f"GitHub Pages {label} must stay under the configured site path")
-
-
-def _validate_jira_scope_config(config: dict[str, Any]) -> None:
-    """Require the field that actually drives discovery for the chosen query mode.
-
-    ``projects`` is optional at the schema level so advanced JQL queries (which
-    embed their own project clause) do not have to duplicate it.
-    """
-    mode = str(config.get("query_mode") or "simple").strip().lower()
-    if mode == "advanced":
-        if not str(config.get("jql") or "").strip():
-            raise ValueError("Jira JQL is required in advanced query mode")
-        return
-    projects = config.get("projects")
-    has_projects = (isinstance(projects, list) and any(str(p).strip() for p in projects)) or (
-        isinstance(projects, str) and any(p.strip() for p in projects.split(","))
-    )
-    if not has_projects:
-        raise ValueError("Jira Projects to Sync is required in simple query mode")
-
-
-def _validate_jira_auth_config(
-    config: dict[str, Any],
-    existing_config: dict[str, Any] | None = None,
-) -> None:
-    existing_config = existing_config or {}
-    _reject_source_owned_jira_cookie(config)
-    auth_mode = _jira_auth_mode(config, existing_config)
-    if auth_mode not in {"browser_cookie", "pat"}:
-        raise ValueError("Jira Authentication Method must be Browser session or Personal access token")
-
-    sync_mode = str(config.get("sync_mode") or existing_config.get("sync_mode") or "cloud").strip().lower()
-    if sync_mode not in {"cloud", "local_agent"}:
-        raise ValueError("Jira Sync Location must be Cloud or Local daemon")
-    if sync_mode == "local_agent" and auth_mode != "browser_cookie":
-        raise ValueError("Jira Local daemon sync currently requires Browser session authentication")
-
-    if auth_mode == "browser_cookie":
-        return
-
-    if _source_secret_has_value("pat", config, existing_config):
-        return
-    raise ValueError("Jira Personal Access Token is required for pat authentication")
-
-
-def _reject_source_owned_jira_cookie(config: dict[str, Any]) -> None:
-    forbidden = {"jira_cookie", "jira_cookie_encrypted"}
-    if any(key in config for key in forbidden):
-        raise ValueError("Jira browser sessions are managed by shared auth sessions, not source config")
-
-
-def _jira_auth_mode(
-    config: dict[str, Any],
-    existing_config: dict[str, Any] | None = None,
-) -> str:
-    existing_config = existing_config or {}
-    configured_auth_mode = config.get("auth_mode") or existing_config.get("auth_mode")
-    if configured_auth_mode is None and _source_secret_has_value("pat", config, existing_config):
-        return "pat"
-    return str(configured_auth_mode or "browser_cookie").strip().lower()
-
-
-def _source_secret_has_value(
-    field: str,
-    config: dict[str, Any],
-    existing_config: dict[str, Any],
-) -> bool:
-    value = config.get(field)
-    if isinstance(value, str) and value.strip():
-        return True
-    return bool(
-        config.get(f"{field}_encrypted")
-        or existing_config.get(f"{field}_encrypted")
-        or (isinstance(existing_config.get(field), str) and existing_config[field].strip())
-    )
-
-
-def _jira_auth_secret_changed(
-    source_type: str,
-    config: dict[str, Any],
-    existing_config: dict[str, Any],
-) -> bool:
-    if source_type != "jira":
-        return False
-    auth_mode = _jira_auth_mode(config, existing_config)
-    if auth_mode != _jira_auth_mode(existing_config):
-        return True
-    if auth_mode == "browser_cookie":
-        return False
-    field = "pat"
-    incoming = config.get(field)
-    if not isinstance(incoming, str) or not incoming.strip():
-        return False
-    existing_secret = _stored_secret_value(field, existing_config)
-    return existing_secret != incoming.strip()
-
-
-def _stored_secret_value(field: str, config: dict[str, Any]) -> str | None:
-    encrypted = config.get(f"{field}_encrypted")
-    if encrypted:
-        try:
-            return decrypt_secret(str(encrypted))
-        except SecretConfigurationError:
-            return None
-    plaintext = config.get(field)
-    if isinstance(plaintext, str) and plaintext.strip():
-        return plaintext.strip()
-    return None
-
-
-def _drop_source_owned_jira_cookie(config: dict[str, Any]) -> dict[str, Any]:
-    cleaned = dict(config)
-    for key in (
-        "jira_cookie",
-        "jira_cookie_encrypted",
-        "jira_cookie_configured",
-        "jira_cookie_hint",
-        "jira_cookie_decrypt_failed",
-    ):
-        cleaned.pop(key, None)
-    if _jira_auth_mode(cleaned) == "browser_cookie":
-        for key in (
-            "pat",
-            "pat_encrypted",
-            "pat_configured",
-            "pat_hint",
-            "pat_decrypt_failed",
-        ):
-            cleaned.pop(key, None)
-    return cleaned
-
-
-def _populate_local_adapter_inbox(
-    config: dict[str, Any],
-    source_id: str,
-    app_config: AppConfig,
-    *,
-    key: str,
-) -> dict[str, Any]:
-    """Fill the per-source inbox path so the gene can read pushed packages."""
-    from memforge.local_adapter import default_local_adapter_inbox
-
-    cleaned = dict(config)
-    inbox = default_local_adapter_inbox(app_config, source_id)
-    inbox.mkdir(parents=True, exist_ok=True)
-    cleaned[key] = str(inbox)
-    return cleaned
-
-
-def _populate_local_markdown_inbox(
-    config: dict[str, Any],
-    source_id: str,
-    app_config: AppConfig,
-) -> dict[str, Any]:
-    return _populate_local_adapter_inbox(config, source_id, app_config, key="documents_dir")
-
-
-def _ensure_local_markdown_vault_id(
-    config: dict[str, Any],
-    source_id: str,
-    existing_config: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    cleaned = dict(config)
-    existing_config = existing_config or {}
-    vault_id = str(cleaned.get("vault_id") or existing_config.get("vault_id") or "").strip()
-    cleaned["vault_id"] = vault_id or f"local-{source_id}"
-    return cleaned
-
-
-def _ensure_jira_sync_mode(
-    config: dict[str, Any],
-    existing_config: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    cleaned = dict(config)
-    existing_config = existing_config or {}
-    if not str(cleaned.get("sync_mode") or "").strip():
-        sync_mode = str(existing_config.get("sync_mode") or "").strip()
-        if sync_mode:
-            cleaned["sync_mode"] = sync_mode
-    return cleaned
-
-
-def _populate_jira_local_agent_inbox(
-    config: dict[str, Any],
-    source_id: str,
-    app_config: AppConfig,
-) -> dict[str, Any]:
-    cleaned = dict(config)
-    if str(cleaned.get("sync_mode") or "cloud").strip().lower() != "local_agent":
-        cleaned.pop("local_agent_documents_dir", None)
-        return cleaned
-    return _populate_local_adapter_inbox(cleaned, source_id, app_config, key="local_agent_documents_dir")
+    if policy.validate is not None:
+        policy.validate(config, existing_config or {})
 
 
 async def _cancel_running_jira_browser_sources_for_origin(
@@ -6609,7 +6286,7 @@ def create_admin_app(
         jira_auth_service = JiraAuthSessionService(db)
         for s in sources:
             original_config = s.get("config", {})
-            jira_auth_mode = _jira_auth_mode(original_config) if s["type"] == "jira" else None
+            auth_mode = jira_auth_mode(original_config) if s["type"] == "jira" else None
             if s.get("capabilities", {}).get("can_configure"):
                 s["config"] = redact_source_config(
                     original_config,
@@ -6628,7 +6305,7 @@ def create_admin_app(
                 s["client"] = None
             if (
                 s["type"] == "jira"
-                and jira_auth_mode == "browser_cookie"
+                and auth_mode == "browser_cookie"
                 and s.get("capabilities", {}).get("can_configure_connection")
             ):
                 try:
@@ -8052,23 +7729,14 @@ def create_admin_app(
 
         source_id = f"src-{uuid.uuid4().hex[:8]}"
         try:
-            incoming_config = (
-                _ensure_local_markdown_vault_id(req.config, source_id) if req.type == "local_markdown" else req.config
-            )
+            incoming_config = _complete_source_config(req.type, req.config, source_id)
             _validate_source_config(req.type, incoming_config)
             source_config = prepare_source_config_for_storage(
                 incoming_config,
                 secret_fields=_source_secret_fields(req.type),
             )
             _validate_source_project_binding(req.project_binding)
-            if req.type == "jira":
-                source_config = _drop_source_owned_jira_cookie(source_config)
-                source_config = _populate_jira_local_agent_inbox(source_config, source_id, config)
-            if req.type == "local_markdown" or (
-                req.type == "github_repo"
-                and str(source_config.get("connection_mode") or "").strip().lower() == "local_push"
-            ):
-                source_config = _populate_local_markdown_inbox(source_config, source_id, config)
+            source_config = _store_source_config(req.type, source_config, source_id, config)
         except (SecretConfigurationError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         creator_user_id = resolve_request_principal(request)
@@ -8123,27 +7791,14 @@ def create_admin_app(
         name = req.name or existing["name"]
         if req.config is not None:
             try:
-                incoming_config = (
-                    _ensure_local_markdown_vault_id(req.config, source_id, existing["config"])
-                    if existing["type"] == "local_markdown"
-                    else req.config
-                )
-                if existing["type"] == "jira":
-                    incoming_config = _ensure_jira_sync_mode(incoming_config, existing["config"])
+                incoming_config = _complete_source_config(existing["type"], req.config, source_id, existing["config"])
                 _validate_source_config(existing["type"], incoming_config, existing_config=existing["config"])
                 src_config = prepare_source_config_for_storage(
                     incoming_config,
                     existing_config=existing["config"],
                     secret_fields=_source_secret_fields(existing["type"]),
                 )
-                if existing["type"] == "jira":
-                    src_config = _drop_source_owned_jira_cookie(src_config)
-                    src_config = _populate_jira_local_agent_inbox(src_config, source_id, config)
-                if existing["type"] == "local_markdown" or (
-                    existing["type"] == "github_repo"
-                    and str(src_config.get("connection_mode") or "").strip().lower() == "local_push"
-                ):
-                    src_config = _populate_local_markdown_inbox(src_config, source_id, config)
+                src_config = _store_source_config(existing["type"], src_config, source_id, config)
             except (SecretConfigurationError, ValueError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             existing_is_local = is_local_agent_backed_source(existing)
@@ -8185,7 +7840,7 @@ def create_admin_app(
             )
             if previous_scope_transitions:
                 predecessor_scope_transition_id = previous_scope_transitions[0].id
-        auth_secret_changed = req.config is not None and _jira_auth_secret_changed(
+        auth_secret_changed = req.config is not None and _source_credentials_changed(
             existing["type"],
             req.config,
             existing["config"],
@@ -8714,7 +8369,8 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        if source.get("type") not in {"github_repo", "jira"} and _conversation_gene(source) is None:
+        collection = _local_agent_collection(source.get("type"))
+        if not (collection is not None and collection.accepts_artifact_inputs) and _conversation_gene(source) is None:
             raise HTTPException(status_code=400, detail="source does not support local Artifact inputs")
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
@@ -8801,24 +8457,12 @@ def create_admin_app(
         send raw file text or structured source payloads; source genes perform
         canonical markdown normalization during sync.
         """
-        from memforge.local_adapter import (
-            GITHUB_REPO_SOURCE_TYPE,
-            JIRA_SOURCE_TYPE,
-            LOCAL_MARKDOWN_SOURCE_TYPE,
-            submit_github_repo_document,
-            submit_jira_package,
-            submit_local_markdown_document,
-        )
-
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         source_type = source.get("type")
-        if source_type not in {
-            LOCAL_MARKDOWN_SOURCE_TYPE,
-            GITHUB_REPO_SOURCE_TYPE,
-            JIRA_SOURCE_TYPE,
-        }:
+        collection = _local_agent_collection(source_type)
+        if collection is None or collection.package_submitter is None:
             raise HTTPException(
                 status_code=400,
                 detail=(f"source {source_id} is type {source_type!r}, not a local adapter source"),
@@ -8855,63 +8499,18 @@ def create_admin_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        submit_package = load_reference(collection.package_submitter)
         try:
-            if source_type == GITHUB_REPO_SOURCE_TYPE:
-                result = await submit_github_repo_document(
-                    db=db,
-                    workspace_id=workspace_id,
-                    config=config,
-                    source=source,
-                    repo_url=req.repo_url or "",
-                    repo_ref=req.repo_ref or "",
-                    relative_path=req.relative_path,
-                    markdown_body=req.markdown_body,
-                    content_type=req.content_type,
-                    title=req.title,
-                    raw_hash=req.raw_hash,
-                    blob_sha=req.blob_sha,
-                    symlink_chain=req.symlink_chain,
-                    resolved_relative_path=req.resolved_relative_path,
-                    source_updated_at=req.source_updated_at,
-                    submitted_by=req.submitted_by,
-                    submitted_at=req.submitted_at,
-                    document_store=artifact_store,
-                    sync_snapshot_id=input_snapshot_id,
-                    source_artifacts=source_artifacts,
-                )
-            elif source_type == JIRA_SOURCE_TYPE:
-                result = await submit_jira_package(
-                    db=db,
-                    config=config,
-                    source=source,
-                    base_url=req.base_url or "",
-                    issue_key=req.issue_key or "",
-                    raw_payload=req.raw_payload,
-                    source_url=req.source_url or "",
-                    title=req.title,
-                    raw_hash=req.raw_hash,
-                    provider_revision=req.provider_revision,
-                    submitted_by=req.submitted_by,
-                    submitted_at=req.submitted_at,
-                    document_store=artifact_store,
-                    source_artifacts=source_artifacts,
-                )
-            else:
-                result = await submit_local_markdown_document(
-                    db=db,
-                    config=config,
-                    source=source,
-                    vault_id=req.vault_id or "",
-                    relative_path=req.relative_path,
-                    markdown_body=req.markdown_body,
-                    content_type=req.content_type,
-                    title=req.title,
-                    raw_hash=req.raw_hash,
-                    source_updated_at=req.source_updated_at,
-                    submitted_by=req.submitted_by,
-                    submitted_at=req.submitted_at,
-                    document_store=artifact_store,
-                )
+            result = await submit_package(
+                req,
+                db=db,
+                workspace_id=workspace_id,
+                config=config,
+                source=source,
+                document_store=artifact_store,
+                sync_snapshot_id=input_snapshot_id,
+                source_artifacts=source_artifacts,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
