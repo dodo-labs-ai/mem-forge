@@ -70,7 +70,7 @@ it("accepts without waiting for daemon completion and keeps refreshing through C
   fireEvent.click(await screen.findByRole("button", { name: "Sync" }));
   await screen.findAllByRole("button", { name: "Retry now" });
   expect(createLocalAgentJob).toHaveBeenCalledTimes(1);
-  expect(screen.getByRole("button", { name: "Configure Local fixture" }).hasAttribute("disabled")).toBe(true);
+  expect(screen.getByRole("button", { name: "Configure Local fixture" }).hasAttribute("disabled")).toBe(false);
   expect(queryClient.isMutating()).toBe(0);
   jobs = [{ ...jobs[0], status: "succeeded", result: { source_sync_run_id: "cloud-run" }, finished_at: "2026-09-03T00:00:00Z" }];
   await waitFor(() => {
@@ -124,7 +124,7 @@ it("retains admitted work across a failed first refresh and recovers without use
   fireEvent.click(await screen.findByRole("button", { name: "Sync" }));
   await screen.findByText(/Unable to refresh sync status/);
   expect(queryClient.isMutating()).toBe(0);
-  expect(screen.getByRole("button", { name: "Configure Local fixture" }).hasAttribute("disabled")).toBe(true);
+  expect(screen.getByRole("button", { name: "Sync in progress" }).hasAttribute("disabled")).toBe(true);
   expect(screen.queryByText("Sync failed")).toBeNull();
   failRefresh = false;
   await waitFor(() => expect(screen.getAllByRole("button", { name: "Retry now" }).length).toBeGreaterThan(0), { timeout: 5000 });
@@ -145,7 +145,7 @@ it("clears an admission when the first refresh already shows a newer terminal ru
   mount();
   fireEvent.click(await screen.findByRole("button", { name: "Sync" }));
   await waitFor(() => expect(queryClient.getQueryData<Source[]>(["sources", workspace])?.[0].sync?.run_id).toBe("r2"));
-  await waitFor(() => expect(screen.getByRole("button", { name: "Configure Local fixture" }).hasAttribute("disabled")).toBe(false));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Sync" }).hasAttribute("disabled")).toBe(false));
   expect(screen.queryByText("Waiting to sync")).toBeNull();
 });
 
@@ -163,7 +163,7 @@ it("does not retain a stale exact retry receipt after the server returns termina
   });
   mount();
   fireEvent.click((await screen.findAllByRole("button", { name: "Retry now" }))[0]);
-  await waitFor(() => expect(screen.getByRole("button", { name: "Configure Local fixture" }).hasAttribute("disabled")).toBe(false));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Sync" }).hasAttribute("disabled")).toBe(false));
   expect(screen.queryByText("Waiting to sync")).toBeNull();
 });
 
@@ -183,7 +183,7 @@ it("resolves equal-timestamp local successors by exact ID instead of guessing or
   mount();
   fireEvent.click((await screen.findAllByRole("button", { name: "Retry now" }))[0]);
   await waitFor(() => expect(getLocalAgentJob).toHaveBeenCalledWith("j1"));
-  await waitFor(() => expect(screen.getByRole("button", { name: "Configure Local fixture" }).hasAttribute("disabled")).toBe(false));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Sync" }).hasAttribute("disabled")).toBe(false));
   expect(createLocalAgentJob).toHaveBeenCalledTimes(1);
 });
 
@@ -201,7 +201,7 @@ it("resolves equal-timestamp server successors through a read-only exact-run req
   mount();
   fireEvent.click((await screen.findAllByRole("button", { name: "Retry now" }))[0]);
   await waitFor(() => expect(resourceClient.get).toHaveBeenCalledWith("/sources/src-local/sync-runs/r1"));
-  await waitFor(() => expect(screen.getByRole("button", { name: "Configure Local fixture" }).hasAttribute("disabled")).toBe(false));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Sync" }).hasAttribute("disabled")).toBe(false));
   expect(resourceClient.post).toHaveBeenCalledTimes(1);
   expect(createLocalAgentJob).not.toHaveBeenCalled();
 });
@@ -215,7 +215,7 @@ it("shows exact-record refresh failures without releasing the admitted-work guar
   fireEvent.click(await screen.findByRole("button", { name: "Sync" }));
   await screen.findByText(/Unable to refresh.*sync status/);
   expect(getLocalAgentJob).toHaveBeenCalledWith("admitted-job");
-  expect(screen.getByRole("button", { name: "Configure Local fixture" }).hasAttribute("disabled")).toBe(true);
+  expect(screen.getByRole("button", { name: "Sync in progress" }).hasAttribute("disabled")).toBe(true);
   expect(screen.queryByText("Sync failed")).toBeNull();
   expect(createLocalAgentJob).toHaveBeenCalledTimes(1);
 });

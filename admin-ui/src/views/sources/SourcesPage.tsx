@@ -37,6 +37,7 @@ import {
 import { useSharedWorkspace } from "@/state/sharedWorkspace";
 import { timeAgo } from "@/utils/date";
 import { SourceIcon } from "@/components/sources/SourceIcon";
+import { activeSyncRunOf } from "./runningSyncSave";
 import { SourceSetupDialog } from "./SourceSetupDialog";
 import { SourceAccessChangeDialog } from "./SourceAccessChangeDialog";
 import { LocalAgentDaemonStatus } from "./LocalAgentDaemonStatus";
@@ -968,6 +969,9 @@ export function SourcesPage() {
         sourceType={configDialog.sourceType}
         source={configDialog.source}
         initialFocus={configDialog.initialFocus}
+        activeSyncRunId={activeSyncRunOf(
+          configDialog.source && sources.find((source) => source.id === configDialog.source?.id),
+        )}
         onSaved={(sourceId) => {
           if (!configDialog.source) {
             setSourceSearch("");
