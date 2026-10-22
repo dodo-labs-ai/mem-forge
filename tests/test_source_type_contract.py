@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pytest
 
+import memforge
 import memforge.genes.teams_provider as teams_provider
 import memforge.main as main
 from memforge.genes.agent_session_gene import AgentSessionGene
@@ -84,7 +87,11 @@ def test_a_collecting_gene_of_neither_family_is_refused() -> None:
 
 def test_a_gene_of_both_families_is_refused() -> None:
     class Both(FakeGene, ConversationGene):
-        pass
+        def conversation_selection(self):
+            raise NotImplementedError
+
+        def selected_conversation_ids(self, projection_scope):
+            raise NotImplementedError
 
     _refused(Both, "both DocumentGene and ConversationGene")
 
@@ -136,6 +143,44 @@ def test_answering_rediscovers_documents_needs_rediscover() -> None:
     _refused(Unanswered, "must implement rediscover")
 
 
+def test_an_override_counts_however_it_is_written() -> None:
+    class PlainRediscovery(FakeGene):
+        def rediscovers_documents(self, config) -> bool:
+            return True
+
+    class StaticRediscovery(FakeGene):
+        @staticmethod
+        def rediscovers_documents(config) -> bool:
+            return True
+
+    class ClassConfirmation(FakeGene):
+        listing_kinds = frozenset({ScopeListingKind.QUERY})
+
+        @classmethod
+        async def confirm_absent(cls, items):
+            return frozenset()
+
+    _refused(PlainRediscovery, "must implement rediscover")
+    _refused(StaticRediscovery, "must implement rediscover")
+    validate_source_type(_descriptor(ClassConfirmation))
+
+
+def test_a_subclass_of_a_built_in_gene_inherits_its_contract() -> None:
+    from memforge.genes.jira_gene import JiraGene
+
+    class CustomJira(JiraGene):
+        pass
+
+    validate_source_type(_descriptor(CustomJira, local_agent=DEVICE))
+
+
+def test_a_gene_missing_its_metadata_is_named_as_unimplemented() -> None:
+    class Nameless(DocumentGene):
+        listing_kinds = frozenset()
+
+    _refused(Nameless, "does not implement authenticate, config_schema, discover, fetch, metadata, normalize")
+
+
 def test_a_device_collected_gene_declares_one_listing_kind() -> None:
     class Both(QueryGene):
         listing_kinds = frozenset({ScopeListingKind.QUERY, ScopeListingKind.EXISTENCE})
@@ -180,6 +225,15 @@ def test_a_provider_whose_polls_omit_replies_must_fetch_threads() -> None:
     validate_source_type(_descriptor(TeamsGene, local_agent=DEVICE, conversation_provider=_provider(Fetching)))
 
 
+def test_a_conversation_provider_factory_must_be_callable() -> None:
+    _refused(
+        TeamsGene,
+        "factory is not callable",
+        local_agent=DEVICE,
+        conversation_provider=ConversationProviderReference(provider=TeamsConversationProvider, factory=42),
+    )
+
+
 def test_a_refused_built_in_fails_the_import(tmp_path) -> None:
     # A Gene that collects content without a family, named by a built-in
     # descriptor before the genes package loads and validates every type.
@@ -203,7 +257,14 @@ from memforge.source_types import SourceTypeDescriptor
 source_types._DESCRIPTORS["agent_session"] = SourceTypeDescriptor(source_type="agent_session", gene="probe_gene:Broken")
 import memforge.genes
 """
-    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=False)
+    package_root = str(Path(memforge.__file__).parent.parent)
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": package_root},
+    )
 
     assert result.returncode != 0
     assert "SourceTypeContractError" in result.stderr
@@ -297,3 +358,9 @@ async def test_device_collection_opens_the_provider_its_descriptor_names(monkeyp
     assert result == "collected"
     assert opened == [{"region": "emea"}]
     assert collected == [provider]
+
+
+async def test_device_collection_refuses_a_job_without_a_conversation_type() -> None:
+    for job in ({"job_id": "laj-1", "attempt_count": 1}, {"job_id": "laj-1", "attempt_count": 1, "source_type": "jira"}):
+        with pytest.raises(ValueError, match="has no conversation provider"):
+            await main._collect_conversation_on_device(job, {}, "src-1", object(), None)

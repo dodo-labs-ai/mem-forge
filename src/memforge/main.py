@@ -3741,10 +3741,11 @@ def _run_cloud_jira_sync_job(
 
 def _run_cloud_teams_auth_job(job: dict[str, Any]) -> dict[str, Any]:
     from memforge.auth import teams_auth
+    from memforge.genes.teams_provider import teams_region
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    region = _teams_region_from_payload(payload)
+    region = teams_region(payload)
     try:
         token_data = teams_auth.TeamsAuthenticator().authenticate(
             region=region,
@@ -3779,22 +3780,24 @@ def _run_cloud_teams_auth_job(job: dict[str, Any]) -> dict[str, Any]:
 
 def _run_cloud_teams_auth_check_job(job: dict[str, Any]) -> dict[str, Any]:
     from memforge.local_agent.teams_browse import teams_auth_status
+    from memforge.genes.teams_provider import teams_region
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     return {
         "operation": operation,
-        "region": _teams_region_from_payload(payload),
+        "region": teams_region(payload),
         **teams_auth_status(),
     }
 
 
 def _run_cloud_teams_browse_job(job: dict[str, Any]) -> dict[str, Any]:
     from memforge.local_agent.teams_browse import browse_teams_conversations
+    from memforge.genes.teams_provider import teams_region
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    region = _teams_region_from_payload(payload)
+    region = teams_region(payload)
     try:
         data = asyncio.run(browse_teams_conversations(region=region))
     except Exception as exc:
@@ -3866,12 +3869,6 @@ def _teams_rejected_token_hashes_from_payload(payload: dict[str, Any]) -> set[st
     if not isinstance(value, (list, tuple, set)):
         return set()
     return {str(item) for item in value if str(item).strip()}
-
-
-def _teams_region_from_payload(payload: dict[str, Any]) -> str:
-    from memforge.genes.teams_provider import teams_region
-
-    return teams_region(payload)
 
 
 def _run_cloud_teams_sync_job(

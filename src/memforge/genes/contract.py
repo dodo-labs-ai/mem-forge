@@ -50,6 +50,9 @@ def validate_source_type(descriptor: SourceTypeDescriptor) -> None:
 
     gene_cls = descriptor.gene_class()
     name = descriptor.source_type
+    if gene_cls.__abstractmethods__:
+        missing = ", ".join(sorted(gene_cls.__abstractmethods__))
+        raise SourceTypeContractError(f"{name}: {gene_cls.__name__} does not implement {missing}")
     families = [base for base in (DocumentGene, ConversationGene) if issubclass(gene_cls, base)]
     collected = bool(gene_cls.metadata().execution_kinds) or descriptor.local_agent is not None
     if len(families) > 1:
@@ -60,9 +63,6 @@ def validate_source_type(descriptor: SourceTypeDescriptor) -> None:
                 f"{name}: {gene_cls.__name__} collects content, so it must subclass DocumentGene or ConversationGene"
             )
         return
-    if gene_cls.__abstractmethods__:
-        missing = ", ".join(sorted(gene_cls.__abstractmethods__))
-        raise SourceTypeContractError(f"{name}: {gene_cls.__name__} does not implement {missing}")
     if families[0] is DocumentGene:
         _validate_document_gene(descriptor, gene_cls)
     else:
@@ -76,14 +76,11 @@ def _validate_document_gene(descriptor: SourceTypeDescriptor, gene_cls: type[Doc
         raise SourceTypeContractError(
             f"{name}: {gene_cls.__name__}.listing_kinds must be a frozenset of ScopeListingKind values"
         )
-    if ScopeListingKind.QUERY in kinds and gene_cls.confirm_absent is DocumentGene.confirm_absent:
+    if ScopeListingKind.QUERY in kinds and not _overrides(gene_cls, "confirm_absent"):
         raise SourceTypeContractError(
             f"{name}: {gene_cls.__name__} can produce a query listing, so it must implement confirm_absent"
         )
-    if (
-        gene_cls.rediscovers_documents.__func__ is not DocumentGene.rediscovers_documents.__func__
-        and gene_cls.rediscover is DocumentGene.rediscover
-    ):
+    if _overrides(gene_cls, "rediscovers_documents") and not _overrides(gene_cls, "rediscover"):
         raise SourceTypeContractError(
             f"{name}: {gene_cls.__name__} answers rediscovers_documents, so it must implement rediscover"
         )
@@ -91,6 +88,13 @@ def _validate_document_gene(descriptor: SourceTypeDescriptor, gene_cls: type[Doc
         raise SourceTypeContractError(
             f"{name}: {gene_cls.__name__} is collected on a device, so it must declare exactly one listing kind"
         )
+
+
+def _overrides(gene_cls: type[DocumentGene], member: str) -> bool:
+    """Whether ``gene_cls`` defines ``member`` itself or inherits it from a class other than DocumentGene."""
+
+    owner = next(klass for klass in gene_cls.__mro__ if member in vars(klass))
+    return owner is not DocumentGene
 
 
 def _validate_conversation_type(descriptor: SourceTypeDescriptor) -> None:
