@@ -330,11 +330,6 @@ class ConfluenceGene(DocumentGene):
         async for item in self._walk_scope(since):
             yield item
         if self._preview_discovery_limit() is None:
-            self.attest_discovery_complete(
-                "confluence_page_tree_exhausted"
-                if self._effective_sync_mode(self.config) == "page_tree"
-                else "confluence_spaces_exhausted"
-            )
             self._record_walked_pages()
 
     async def list_scope(self) -> ScopeListing:

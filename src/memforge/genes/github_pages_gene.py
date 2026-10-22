@@ -272,7 +272,6 @@ class GitHubPagesGene(DocumentGene):
             item = await self._content_item_for_url(url)
             if _is_modified_since(item.last_modified, since):
                 yield item
-            self.attest_discovery_complete("github_pages_single_page_resolved")
             return
 
         if mode == SYNC_MODE_EXPLICIT_LIST:
@@ -280,7 +279,6 @@ class GitHubPagesGene(DocumentGene):
                 item = await self._content_item_for_url(url)
                 if _is_modified_since(item.last_modified, since):
                     yield item
-            self.attest_discovery_complete("github_pages_explicit_list_exhausted")
             return
 
         if mode != SYNC_MODE_SUBTREE:
@@ -289,7 +287,6 @@ class GitHubPagesGene(DocumentGene):
         if self._auth_mode == AUTH_MODE_GITHUB_PAT:
             async for item in self._repo_subtree_items(since):
                 yield item
-            self.attest_discovery_complete("github_pages_repository_tree_exhausted")
             return
 
         sitemap_items = await self._sitemap_items()
@@ -298,7 +295,6 @@ class GitHubPagesGene(DocumentGene):
                 if _is_modified_since(item.last_modified, since):
                     yield item
             if _bool_config(self.config, "sitemap_authoritative", False):
-                self.attest_discovery_complete("github_pages_authoritative_sitemap_exhausted")
                 # The site declares its sitemap exhaustive: a page it no
                 # longer lists is no longer published.
                 self.record_scope_listing(ScopeListingKind.EXISTENCE, {item.item_id for item in sitemap_items})

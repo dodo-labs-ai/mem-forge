@@ -1367,7 +1367,6 @@ async def test_discover_inventory_uses_lightweight_complete_search_without_hydra
 
     assert [item.extra["issue_key"] for item in items] == ["PAY-1"]
     assert items[0].extra["attest_materialized_revision"] is True
-    assert gene.discovery_complete is True
     assert gene._hydrated_issues == {}
     request = gene._request.await_args.kwargs["json_body"]
     assert request["fields"] == ["summary", "updated", "project"]

@@ -849,7 +849,6 @@ async def test_incremental_cloud_pull_lists_the_whole_tree_as_an_existence_listi
     )
 
     await gene.authenticate()
-    gene.begin_discovery()
     _ = [item async for item in gene.discover(since=datetime(2026, 9, 30, tzinfo=timezone.utc))]
     listing = await gene.list_scope()
 
@@ -880,7 +879,6 @@ async def test_cloud_pull_with_a_truncated_tree_fails_the_listing(monkeypatch):
     )
 
     await gene.authenticate()
-    gene.begin_discovery()
     with pytest.raises(RuntimeError, match="truncated"):
         _ = [item async for item in gene.discover()]
 

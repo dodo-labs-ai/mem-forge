@@ -63,8 +63,6 @@ class JiraProvider(FakeGene):
 
     listing_kinds = frozenset({ScopeListingKind.QUERY})
 
-    discovery_complete = True
-
     def __init__(self) -> None:
         super().__init__()
         self.histories: dict[str, list[dict]] = {key: [authored(DOMAIN_HISTORY, "Ann")] for key in ISSUES}

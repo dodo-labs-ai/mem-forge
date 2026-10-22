@@ -71,8 +71,6 @@ class RawKeepingDocumentStore(StubDocumentStore):
 class JiraGene(FakeGene):
     """Serves the provider until it is closed; a reprocess must never reach it."""
 
-    discovery_complete = True
-
     def __init__(self) -> None:
         super().__init__()
         self.provider_open = True
@@ -377,8 +375,6 @@ async def test_stored_input_whose_raw_object_is_not_its_own_has_no_stored_raw_co
 
 class ConfluenceGene(FakeGene):
     """Places a child page under its parent only from the item metadata fetched with it."""
-
-    discovery_complete = True
 
     async def fetch_pdf(self, item):
         return None

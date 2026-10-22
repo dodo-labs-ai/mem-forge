@@ -20658,9 +20658,10 @@ class Database:
         A current membership is reusable only when its immutable input was
         already attested by an earlier manifest, the item stored with its
         current Unit revision still has the manifest's revision, and that
-        revision was projected under the current access context. Scope
-        transitions retain the full projection path because they require
-        run-scoped coverage.
+        revision was projected under the current access context. Nothing is
+        reusable while the Source has an open scope transition (``pending``,
+        ``running`` or ``failed``): each listed Document must commit under the
+        transition to become one of its members.
         """
 
         normalized_snapshot_id = _non_empty_string(snapshot_id)
@@ -20703,7 +20704,7 @@ class Database:
                          SELECT 1
                          FROM projection_scope_transitions transition
                          WHERE transition.source_id = mi.source_id
-                           AND transition.status IN ('pending', 'running')
+                           AND transition.status IN ('pending', 'running', 'failed')
                      )
                      AND EXISTS (
                          SELECT 1

@@ -1125,7 +1125,6 @@ def _page_tree_gene(client) -> ConfluenceGene:
 @pytest.mark.asyncio
 async def test_incremental_page_tree_discovery_lists_every_walked_page_as_a_query():
     gene = _page_tree_gene(PageTreeClient())
-    gene.begin_discovery()
 
     _ = [item async for item in gene.discover(since=datetime(2026, 5, 25, tzinfo=timezone.utc))]
     listing = await gene.list_scope()
@@ -1138,7 +1137,6 @@ async def test_incremental_page_tree_discovery_lists_every_walked_page_as_a_quer
 async def test_preview_limited_discovery_does_not_list_the_scope():
     gene = _page_tree_gene(PreviewLimitClient())
     gene.config[PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY] = 1
-    gene.begin_discovery()
 
     _ = [item async for item in gene.discover()]
 

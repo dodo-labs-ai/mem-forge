@@ -135,8 +135,9 @@ class DocumentGene(Gene):
         super().__init__(config, source_id)
         self._discovered_scope: ScopeListing | None = None
 
-    def begin_discovery(self) -> None:
-        super().begin_discovery()
+    def reset_scope_listing(self) -> None:
+        """Forget the listing an earlier discovery walk recorded, before a run discovers again."""
+
         self._discovered_scope = None
 
     @classmethod

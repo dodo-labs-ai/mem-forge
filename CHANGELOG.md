@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- A document Source's scope transition completes by accumulated commitment.
+  Each Document that commits under an open transition, through an unchanged
+  item's projection, a lifecycle commit, deferred convergence or a recovered
+  derivation, is recorded as one of its members in the same transaction; a
+  deferred commit is recorded only when it commits, and a tombstone never.
+  Each transition run discovers everything, lists the new scope and fetches
+  only the listed Documents that are not members yet (`force_full_sync`
+  fetches them all). The transition completes once that listing is complete
+  and every listed Document is a member, so a large Source no longer needs a
+  whole run without failures. Only the completing run removes: every held
+  Document the new listing leaves out, as `removed_from_scope` under the
+  transition's lifecycle cycle. A listed Document whose commit waits only on
+  Units that completion removes counts as committed: the run removes them,
+  converges, and completes only if that Document then committed; otherwise
+  the transition stays open with those removals applied. A run that cannot
+  complete removes nothing and records why in the transition's error.
+  - The run that completes a transition sets the sync cursor to the time the
+    transition opened, so the next run discovers every change made while it
+    was open. Other transition runs keep the cursor; a successful one that
+    finds none, as after a credential change, records the opening time.
+  - Changing a document Source's scope no longer resets its sync cursor or
+    wipes its sync history. A credential change, and a conversation Source's
+    scope change, still do.
+  - Projection reuse is off while a transition is open, failed included.
+  - `Gene.attest_discovery_complete`, `discovery_complete`,
+    `discovery_completion_reason` and `begin_discovery` are removed, with
+    `source_run_projection_coverage`: the listing is the only evidence.
+    `DocumentGene.reset_scope_listing()` forgets a recorded listing.
+  - Until excluded scopes are listed, a query listing's transition also
+    removes every held Document its new listing leaves out, as before.
+  - Cloud: the HANA reuse predicate also excludes `failed` transitions.
+
 - A document sync run takes one listing of its scope after discovery, before
   it retries failed Documents, and decides both absence and the failure
   ledger from it. A device's snapshot manifest is that listing, with the

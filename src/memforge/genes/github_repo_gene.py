@@ -438,7 +438,6 @@ class GitHubRepoGene(DocumentGene):
                     "repo_blob_url": _blob_url(repo_ref, blob_sha),
                 },
             )
-        self.attest_discovery_complete("github_recursive_tree_exhausted")
         self.record_scope_listing(ScopeListingKind.EXISTENCE, self._listed_doc_ids(tree))
 
     async def fetch(self, item: ContentItem) -> RawContent:

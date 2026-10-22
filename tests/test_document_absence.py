@@ -16,8 +16,6 @@ from memforge.pipeline.collection_family import SnapshotBinding
 from memforge.pipeline.stored_document import StoredDocumentUnavailable, StoredDocumentUnavailableReason
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
 from memforge.source_item_failures import FailedItemRetry
-from memforge.source_projection import ProjectionScopeTransition, ProjectionScopeTransitionStatus
-from memforge.source_projection_config import canonical_projection_scope
 from memforge.storage.database import Database
 from tests.test_sync_bookkeeping import (
     BlockingFetchGene,
@@ -399,42 +397,6 @@ async def test_runs_where_nothing_changed_at_the_provider_remove_nothing(workspa
     assert project.confirmed == []
     assert workspace.tombstoned() == []
     assert await workspace.held() == {"jira-0", "jira-1"}
-
-
-@pytest.mark.asyncio
-async def test_removing_a_project_from_the_jql_is_a_scope_transition_that_removes_its_units(workspace):
-    project = JiraProject(existing={0, 1})
-    await _synced(workspace, project)
-    target_config = {"query_mode": "advanced", "jql": "project = PAY"}
-    await workspace.db.upsert_source(
-        id=SOURCE_ID,
-        type="jira",
-        name="Jira",
-        config_json=json.dumps(target_config),
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    await workspace.db.create_projection_scope_transition(
-        ProjectionScopeTransition(
-            id="scope-transition-drop-ops",
-            source_id=SOURCE_ID,
-            previous_scope=canonical_projection_scope("jira", JIRA_CONFIG),
-            target_scope=canonical_projection_scope("jira", target_config),
-        )
-    )
-
-    # jira-1 is in the removed project; it still exists, but the user no
-    # longer asks for it.
-    project.move_on(existing={0, 1}, in_query={0})
-    project.listing_error = AssertionError("a scope transition removes by its complete discovery")
-    state = await workspace.sync(project)
-    transition = (await workspace.db.list_projection_scope_transitions(SOURCE_ID))[0]
-
-    assert state.last_sync_status == "success"
-    assert project.seen_since[-1] is None
-    assert workspace.tombstoned() == ["jira-1"]
-    assert transition.status is ProjectionScopeTransitionStatus.APPLIED
-    assert await workspace.held() == {"jira-0"}
 
 
 @pytest.mark.asyncio
