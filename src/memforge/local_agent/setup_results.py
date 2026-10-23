@@ -4,25 +4,26 @@ A setup job is the admin UI asking the user's local daemon to do one
 interactive step while a Source is being set up: open the folder picker, list
 a repository tree, sign in to Jira or Teams, or list Teams conversations. The
 daemon handler for the operation builds its result through the operation's
-model and completes the job with ``model.model_dump(exclude_unset=True)``, so
-the model is the one owner of the shape and a field the handler did not set
-stays absent.
+model and completes the job with ``model.model_dump()``, so the model is the
+one owner of the shape and every field it declares is present, as null when
+the handler did not set it.
 
 Example: the admin UI creates a ``local_markdown_pick_root`` job, the user
 picks a folder, and the daemon completes the job with::
 
     LocalMarkdownPickRootResult(operation="local_markdown_pick_root", root="/Users/me/notes")
 
-The admin UI reads the job back and finds ``{"operation": ..., "root": ...}``
-in its ``result``. ``SETUP_RESULT_MODELS`` maps every setup operation to its
+The admin UI reads the job back and finds ``{"operation": ..., "root": ...,
+"cancelled": null, "error": null, ...}`` in its ``result``. ``SETUP_RESULT_MODELS`` maps every setup operation to its
 model, and the admin API publishes each model in its OpenAPI document so the
 admin UI's generated types describe ``result`` per operation. Sync jobs keep
 their free-form result.
 
 A job whose result carries ``error`` failed. A handler that raises instead
-completes the job as failed with only ``retryable`` in its result, so a
-reader reads ``result`` as the operation's model once the job has succeeded,
-and only ``error`` once it has failed.
+completes the job as failed with only ``retryable`` in its result and the
+message in the job's ``last_error``. A reader therefore reads ``result`` as
+the operation's model once the job has succeeded, and on failure reads
+``result.error`` when it is present, otherwise the job's ``last_error``.
 """
 
 from __future__ import annotations

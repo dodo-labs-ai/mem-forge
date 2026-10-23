@@ -32,7 +32,9 @@ export type LocalAgentJob = Omit<Schemas["LocalAgentJobResponse"], "result"> & {
 
 /**
  * The result each local setup job reports once it has succeeded, keyed by
- * operation. A failed setup job's result is only certain to carry `error`.
+ * operation. Every field its model declares is present, as null when unset.
+ * On failure, read `result.error` when it is present, otherwise the job's
+ * `last_error`.
  */
 export interface SetupJobResults {
   github_repo_preview_tree: Schemas["GitHubRepoPreviewTreeResult"];

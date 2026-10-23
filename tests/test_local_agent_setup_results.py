@@ -2,9 +2,9 @@
 
 The handlers run with fakes for the folder picker, the file system, Git, Jira
 capture and the Teams clients. Every result, success or failure, must
-validate against the operation's model in ``SETUP_RESULT_MODELS`` and must be
-exactly what that model dumps, so the published types match what the daemon
-sends.
+validate against the operation's model in ``SETUP_RESULT_MODELS``, carry
+every field that model declares and be exactly what it dumps, so the
+published types match what the daemon sends.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from memforge import main
 from memforge.auth import jira_capture
 from memforge.auth.jira_auth import JIRA_PRINCIPAL_CHANGED_CODE
 from memforge.genes.teams_client import AuthenticationError
-from memforge.local_agent.setup_results import SETUP_RESULT_MODELS
+from memforge.local_agent.setup_results import SETUP_RESULT_MODELS, JiraAuthResult, LocalMarkdownPickRootResult
 from memforge.server.admin_api import LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES
 from tests.test_cli_agent_tools import FakeToolClient, _cloud_test_client, _fake_github_remote_run
 from tests.test_source_authority_api import _app, _connect_database
@@ -51,7 +51,8 @@ def _run(operation: str, payload: dict | None = None, **job) -> dict:
 
 def _assert_described(operation: str, result: dict) -> None:
     model = SETUP_RESULT_MODELS[operation]
-    assert model.model_validate(result).model_dump(exclude_unset=True) == result
+    assert result.keys() == model.model_fields.keys()
+    assert model.model_validate(result).model_dump() == result
 
 
 def test_every_setup_operation_has_a_result_model():
@@ -127,7 +128,7 @@ def test_local_markdown_pick_root_result(monkeypatch, outcome, expected):
     result = _run("local_markdown_pick_root", {"title": "Choose folder to sync"})
 
     _assert_described("local_markdown_pick_root", result)
-    assert result == {"operation": "local_markdown_pick_root", **expected}
+    assert result == LocalMarkdownPickRootResult(operation="local_markdown_pick_root", **expected).model_dump()
 
 
 def _capture(*, fail: Exception | None = None):
@@ -179,7 +180,7 @@ def test_jira_auth_without_a_source_is_a_described_failure():
     result = _run("jira_auth", {"base_url": "https://jira.example.test"})
 
     _assert_described("jira_auth", result)
-    assert result == {"operation": "jira_auth", "error": "source_id is required", "retryable": False}
+    assert result == JiraAuthResult(operation="jira_auth", error="source_id is required", retryable=False).model_dump()
 
 
 class _NoTeamsSession:
