@@ -14,6 +14,12 @@ export interface ConfigControlProps {
   choices: readonly ConfigOption[];
   value: FieldValue;
   onChange: (value: FieldValue) => void;
+  /**
+   * The person has finished with the field. A switch, a choice, a checkbox or a
+   * picker calls it in the same event as `onChange`, before the parent has applied
+   * the change, so the caller reads the committed value from its own latest state,
+   * never from what it rendered with.
+   */
   onBlur?: () => void;
   invalid?: boolean;
   /** The field is fixed after create and the Source exists. */

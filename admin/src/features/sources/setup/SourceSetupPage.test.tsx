@@ -244,6 +244,19 @@ test("a sync scope the user chose is not overwritten by a derived value", async 
   expect(screen.queryByLabelText("Page Tree Root")).not.toBeInTheDocument();
 });
 
+test("a radio change and a switch toggle check the configuration they commit", async () => {
+  const { calls } = renderSetup("/sources/new/confluence?step=scope");
+  const checks = () => requestsTo(calls, "POST", "/api/v1/genes/confluence/config-check");
+
+  await userEvent.click(await screen.findByRole("radio", { name: "This page tree" }));
+  await waitFor(() => expect(checks()).toHaveLength(1));
+  expect(await checks()[0]!.clone().json()).toEqual({ config: { sync_mode: "page_tree" }, source_id: null });
+
+  await userEvent.click(screen.getByRole("switch", { name: "Include Child Pages" }));
+  await waitFor(() => expect(checks()).toHaveLength(2));
+  expect(await checks()[1]!.clone().json()).toEqual({ config: { sync_mode: "page_tree", include_children: false }, source_id: null });
+});
+
 test("an untouched mode field is sent absent", async () => {
   const { calls } = renderSetup("/sources/new/jira", {
     routes: { "POST /api/v1/sources": () => ({ ...CREATED, type: "jira" }) },
