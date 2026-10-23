@@ -63,11 +63,14 @@ class Gene(ABC):
     Lifecycle (called by the sync orchestrator)::
 
         gene = create_gene("confluence", config, source_id)
-        await gene.authenticate()
-        async for item in gene.discover(since=last_sync):
-            raw  = await gene.fetch(item)
-            norm = await gene.normalize(raw)
-            # ... hand off to enricher / memory extraction pipeline
+        try:
+            await gene.authenticate()
+            async for item in gene.discover(since=last_sync):
+                raw  = await gene.fetch(item)
+                norm = await gene.normalize(raw)
+                # ... hand off to enricher / memory extraction pipeline
+        finally:
+            await gene.close()
 
     Subclasses **must** implement:
     - ``metadata()``      -- static gene description
@@ -80,6 +83,7 @@ class Gene(ABC):
     Subclasses **may** override:
     - ``health_check()``  -- connectivity / credential validity probe
     - ``requires_pdf_artifact()`` -- whether a document must retain PDF provenance
+    - ``close()``         -- release what the Gene holds beyond ``self._client``
 
     A connector subclasses one family's base rather than this class:
     :class:`~memforge.genes.document_gene.DocumentGene` for providers whose
@@ -171,6 +175,22 @@ class Gene(ABC):
     @abstractmethod
     async def authenticate(self) -> None:
         """Validate credentials and establish an authenticated session.
+
+        Keep the HTTP client you open here in ``self._client``, so the
+        inherited :meth:`close` releases it. Authenticating again replaces
+        the client, so close the previous one first::
+
+            async def authenticate(self) -> None:
+                await self.close()
+                self._client = ConnectorHttpClient(
+                    product_name="Wiki",
+                    base_url=self.config["base_url"],
+                    timeout=30.0,
+                    follow_redirects=True,
+                )
+
+        :class:`memforge.genes.toolkit.http.ConnectorHttpClient` retries and
+        paces the requests the same way for every connector.
 
         Raises
         ------
@@ -272,3 +292,31 @@ class Gene(ABC):
         richer diagnostics (e.g. remaining rate-limit quota, auth expiry).
         """
         return {"healthy": True}
+
+    async def close(self) -> None:
+        """Release the HTTP client this Gene holds in ``self._client``.
+
+        Whoever creates a Gene closes it when done, in a ``finally``, after a
+        failed run as after a successful one::
+
+            gene = create_gene("jira", config, source_id)
+            try:
+                await gene.authenticate()
+                listing = await gene.list_scope()
+            finally:
+                await gene.close()
+
+        The client is anything with an async ``aclose()``, such as a
+        ``ConnectorHttpClient``. A Gene without one, like ``local_markdown``,
+        has nothing to release. Calling ``close()`` twice, or before
+        ``authenticate``, does nothing.
+
+        Override only when the Gene holds more than ``self._client``, and
+        call ``await super().close()`` from the override.
+        """
+        client = getattr(self, "_client", None)
+        if client is None:
+            return
+        self._client = None
+        await client.aclose()
+        self._log.debug("Closed the provider client")

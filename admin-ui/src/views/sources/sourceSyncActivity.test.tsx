@@ -49,6 +49,13 @@ it.each(["discovery", "Internal network / VPN sync"])("shows bounded file-limit 
   expect(onConfigureScope).toHaveBeenCalledOnce();
 });
 
+it("says a file count read from a truncated repository tree is a lower bound", () => {
+  render(<SourceSyncStatusCard activity={{ state: "failed", error: {
+    message: "GitHub Repository discovery matched at least 501 files, exceeding max_files=500",
+  } }} sourceName="Cookbook" itemLabel="files" onConfigureScope={vi.fn()} />);
+  expect(screen.getByText(/Last sync matched at least 501 files, exceeding its configured limit of 500/)).toBeTruthy();
+});
+
 it("does not expose arbitrary raw errors or offer unavailable configuration", () => {
   render(<SourceSyncStatusCard activity={{ state: "failed", error: {
     message: "private credentials: secret",

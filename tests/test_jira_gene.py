@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 import json
+import ssl
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
-from memforge.genes.jira_gene import JiraGene
+from memforge.genes import atlassian_auth, jira_gene
+from memforge.genes.jira_gene import JiraGene, JiraQueryRejected
+from memforge.genes.toolkit.http import ConnectorHttpClient
 from memforge.models import AbsenceAnswer, ContentItem
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
+from tests.connector_http_fixture import AnsweringClient, FakeConnectorHttp
+from tests.tls_bundle_fixture import BUNDLE_CA_COUNT, trusted_ca_count, write_ca_bundle
+
+
+@pytest.fixture(autouse=True)
+def own_origin_limiters(monkeypatch):
+    """Give each test its own Atlassian origin limiters, so no pacing carries over from another test."""
+    monkeypatch.setattr("memforge.genes.atlassian_auth._ATLASSIAN_REQUEST_LIMITERS", {})
 
 
 def _search_page(issues: list[dict], *, total: int | None = None, start_at: int = 0) -> dict:
@@ -82,55 +93,43 @@ def test_jira_schema_hides_runtime_transport_fields_from_ui():
     assert "request_interval_ms" not in fields
 
 
-class JsonResponse:
+class JsonResponse(httpx.Response):
     def __init__(self, payload: dict, status_code: int = 200, headers: dict | None = None):
-        self._payload = payload
-        self.status_code = status_code
-        self.headers = headers or {}
-
-    def json(self) -> dict:
-        return self._payload
-
-    def raise_for_status(self) -> None:
-        if self.status_code >= 400:
-            request = httpx.Request("GET", "https://jira.example.test/rest/api/2/search")
-            response = httpx.Response(self.status_code, request=request)
-            raise httpx.HTTPStatusError("request failed", request=request, response=response)
-        return None
+        super().__init__(status_code, json=payload, headers=headers)
 
 
-class BinaryResponse:
+class BinaryResponse(httpx.Response):
     def __init__(self, content: bytes, content_type: str):
-        self.content = content
-        self.headers = {"content-type": content_type}
-        self.status_code = 200
-
-    def raise_for_status(self) -> None:
-        return None
+        super().__init__(200, content=content, headers={"content-type": content_type})
 
 
-class RecordingAsyncClient:
-    instances: list["RecordingAsyncClient"] = []
+def _recording_http() -> tuple[list[str], FakeConnectorHttp]:
+    """A fake Jira that answers every request with 200 and records its path."""
+    paths: list[str] = []
 
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
+    def handle(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    return paths, FakeConnectorHttp(handle)
+
+
+class RecordingAsyncClient(AnsweringClient):
+    """A Jira in UTC answering searches with no issues and each issue read with that issue; it records every call."""
+
+    def __init__(self, base_url: str = "https://jira.example.test") -> None:
+        super().__init__(base_url=base_url)
         self.calls: list[tuple[str, str, dict]] = []
-        self.closed = False
-        RecordingAsyncClient.instances.append(self)
 
-    async def request(self, method: str, url: str, **kwargs):
+    async def answer(self, method: str, url: str, **kwargs):
         self.calls.append((method, url, kwargs))
+        if url.endswith("/myself"):
+            return JsonResponse({"name": "me", "timeZone": "UTC"})
         if url.endswith("/comment"):
             return JsonResponse({"startAt": 0, "comments": [], "total": 0})
         if "/issue/" in url:
             return JsonResponse(_jira_issue(url.split("/issue/", 1)[1].split("/", 1)[0]))
         return JsonResponse(_search_page([]))
-
-    async def get(self, url: str, **kwargs):
-        return await self.request("GET", url, **kwargs)
-
-    async def aclose(self) -> None:
-        self.closed = True
 
 
 @pytest.mark.asyncio
@@ -183,7 +182,7 @@ async def test_fetch_rejects_missing_requested_collection_evidence(missing_colle
         issue.pop("changelog")
 
     class MissingCollectionClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             return JsonResponse(_search_page([issue]))
 
@@ -207,7 +206,7 @@ async def test_fetch_rejects_duplicate_comment_provider_ids():
     )
 
     class DuplicateCommentClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             return JsonResponse(_search_page([issue]))
 
@@ -223,58 +222,9 @@ async def test_fetch_rejects_duplicate_comment_provider_ids():
         await gene.fetch(item)
 
 
-class RateLimitedThenSuccessClient(RecordingAsyncClient):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.responses = [
-            JsonResponse({}, status_code=429),
-            JsonResponse({}, status_code=429),
-            JsonResponse(_search_page([])),
-        ]
-
-    async def request(self, method: str, url: str, **kwargs):
-        self.calls.append((method, url, kwargs))
-        return self.responses.pop(0)
-
-
-class AlwaysRateLimitedClient(RecordingAsyncClient):
-    async def request(self, method: str, url: str, **kwargs):
-        self.calls.append((method, url, kwargs))
-        return JsonResponse({}, status_code=429)
-
-
-class ZeroQuotaClient(RecordingAsyncClient):
-    async def request(self, method: str, url: str, **kwargs):
-        self.calls.append((method, url, kwargs))
-        return JsonResponse(
-            {},
-            status_code=429,
-            headers={
-                "X-RateLimit-Limit": "0",
-                "X-RateLimit-Remaining": "0",
-                "X-RateLimit-FillRate": "0",
-                "Retry-After": "9223372036854775807",
-            },
-        )
-
-
-class IssueThenRateLimitedCommentClient(RecordingAsyncClient):
-    async def request(self, method: str, url: str, **kwargs):
-        self.calls.append((method, url, kwargs))
-        if url.endswith("/comment"):
-            return JsonResponse({}, status_code=429)
-        return JsonResponse(_jira_issue("PAY-123"))
-
-
-class AsyncNoop:
-    async def __call__(self, delay: float) -> None:
-        return None
-
-
 @pytest.mark.asyncio
-async def test_authenticate_prepares_bearer_pat_client_without_remote_probe(monkeypatch):
-    RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("memforge.genes.jira_gene.httpx.AsyncClient", RecordingAsyncClient)
+async def test_authenticate_prepares_bearer_pat_client_without_remote_probe():
+    paths, http = _recording_http()
     gene = JiraGene(
         config={
             "base_url": "https://jira.example.test/",
@@ -285,20 +235,23 @@ async def test_authenticate_prepares_bearer_pat_client_without_remote_probe(monk
         source_id="src-jira",
     )
 
-    await gene.authenticate()
+    with http.serving(jira_gene):
+        await gene.authenticate()
+    await gene.close()
 
     assert gene._base_url == "https://jira.example.test"
-    assert RecordingAsyncClient.instances[-1].kwargs["base_url"] == "https://jira.example.test"
-    assert RecordingAsyncClient.instances[-1].kwargs["headers"]["Authorization"] == "Bearer jira-pat"
-    assert "Cookie" not in RecordingAsyncClient.instances[-1].kwargs["headers"]
-    assert RecordingAsyncClient.instances[-1].kwargs["verify"] is True
-    assert RecordingAsyncClient.instances[-1].calls == []
+    [options] = http.options
+    assert options["base_url"] == "https://jira.example.test"
+    assert options["headers"]["Authorization"] == "Bearer jira-pat"
+    assert "Cookie" not in options["headers"]
+    assert options["verify"] is True
+    assert options["follow_redirects"] is True
+    assert paths == []
 
 
 @pytest.mark.asyncio
-async def test_authenticate_prepares_cookie_client_without_bearer_header(monkeypatch):
-    RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("memforge.genes.jira_gene.httpx.AsyncClient", RecordingAsyncClient)
+async def test_authenticate_prepares_cookie_client_without_bearer_header():
+    paths, http = _recording_http()
     gene = JiraGene(
         config={
             "base_url": "https://jira.example.test/",
@@ -309,21 +262,21 @@ async def test_authenticate_prepares_cookie_client_without_bearer_header(monkeyp
         source_id="src-jira",
     )
 
-    await gene.authenticate()
+    with http.serving(jira_gene):
+        await gene.authenticate()
+    await gene.close()
 
-    headers = RecordingAsyncClient.instances[-1].kwargs["headers"]
+    headers = http.options[-1]["headers"]
     assert headers["Cookie"] == "JSESSIONID=session; atlassian.xsrf.token=token"
     assert headers["Accept"] == "application/json"
     assert "Authorization" not in headers
-    assert RecordingAsyncClient.instances[-1].calls == []
+    assert paths == []
 
 
 @pytest.mark.asyncio
-async def test_authenticate_uses_configured_jira_ca_bundle(monkeypatch, tmp_path):
-    RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("memforge.genes.jira_gene.httpx.AsyncClient", RecordingAsyncClient)
-    ca_bundle = tmp_path / "corp-ca.pem"
-    ca_bundle.write_text("test-ca", encoding="utf-8")
+async def test_authenticate_uses_configured_jira_ca_bundle(tmp_path):
+    _paths, http = _recording_http()
+    ca_bundle = write_ca_bundle(tmp_path / "corp-ca.pem")
     gene = JiraGene(
         config={
             "base_url": "https://jira.example.test/",
@@ -335,9 +288,14 @@ async def test_authenticate_uses_configured_jira_ca_bundle(monkeypatch, tmp_path
         source_id="src-jira",
     )
 
-    await gene.authenticate()
+    with http.serving(jira_gene):
+        await gene.authenticate()
+    await gene.close()
 
-    assert RecordingAsyncClient.instances[-1].kwargs["verify"] == str(ca_bundle)
+    verify = http.options[-1]["verify"]
+    assert isinstance(verify, ssl.SSLContext)
+    assert verify.verify_mode == ssl.CERT_REQUIRED
+    assert trusted_ca_count(verify) == BUNDLE_CA_COUNT
 
 
 @pytest.mark.asyncio
@@ -374,11 +332,9 @@ async def test_authenticate_requires_jira_cookie_for_cookie_mode():
 
 
 @pytest.mark.asyncio
-async def test_cookie_mode_reports_expired_session_without_retry(monkeypatch):
-    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
-
+async def test_cookie_mode_reports_expired_session_without_retry():
     class ExpiredCookieClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             return JsonResponse({"message": "Client must be authenticated"}, status_code=401)
 
@@ -401,47 +357,61 @@ async def test_cookie_mode_reports_expired_session_without_retry(monkeypatch):
     assert [call[0:2] for call in client.calls] == [("POST", "/rest/api/2/search")]
 
 
-@pytest.mark.asyncio
-async def test_pat_zero_quota_rate_limit_fails_fast(monkeypatch):
-    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
-    gene = JiraGene(
-        config={"base_url": "https://jira.example.test", "projects": ["PAY"], "auth_mode": "pat", "pat": "jira-pat"},
-        source_id="src-jira",
-    )
-    client = ZeroQuotaClient(base_url="https://jira.example.test")
-    gene._client = client
-    gene._base_url = "https://jira.example.test"
-
-    with pytest.raises(RuntimeError, match="Jira PAT API quota is zero"):
-        [item async for item in gene.discover()]
-
-    assert [call[0:2] for call in client.calls] == [("POST", "/rest/api/2/search")]
-
-
-@pytest.mark.asyncio
-async def test_cookie_zero_quota_rate_limit_reports_cookie_context(monkeypatch):
-    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
-    gene = JiraGene(
-        config={
-            "base_url": "https://jira.example.test",
-            "projects": ["PAY"],
-            "auth_mode": "browser_cookie",
-            "jira_cookie": "JSESSIONID=session",
+def _zero_quota(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(
+        429,
+        headers={
+            "X-RateLimit-Limit": "0",
+            "X-RateLimit-Remaining": "0",
+            "X-RateLimit-FillRate": "0",
+            "Retry-After": "9223372036854775807",
         },
-        source_id="src-jira",
     )
-    client = ZeroQuotaClient(base_url="https://jira.example.test")
-    gene._client = client
-    gene._base_url = "https://jira.example.test"
 
-    with pytest.raises(RuntimeError) as exc_info:
-        [item async for item in gene.discover()]
+
+async def _authenticated_gene(config: dict, handler) -> tuple[JiraGene, FakeConnectorHttp, list[str]]:
+    """A Gene authenticated through its real client, answered by ``handler``; the paths it requested, in order."""
+    paths: list[str] = []
+
+    def recording(request: httpx.Request):
+        paths.append(f"{request.method} {request.url.path}")
+        return handler(request)
+
+    http = FakeConnectorHttp(recording)
+    gene = JiraGene(config={"base_url": "https://jira.example.test", "projects": ["PAY"], **config}, source_id="src-jira")
+    with http.serving(jira_gene):
+        await gene.authenticate()
+    return gene, http, paths
+
+
+@pytest.mark.asyncio
+async def test_pat_zero_quota_rate_limit_fails_fast():
+    gene, _http, paths = await _authenticated_gene({"auth_mode": "pat", "pat": "jira-pat"}, _zero_quota)
+    try:
+        with pytest.raises(RuntimeError, match="Jira PAT API quota is zero"):
+            [item async for item in gene.discover()]
+    finally:
+        await gene.close()
+
+    assert paths == ["POST /rest/api/2/search"]
+
+
+@pytest.mark.asyncio
+async def test_cookie_zero_quota_rate_limit_reports_cookie_context():
+    gene, _http, paths = await _authenticated_gene(
+        {"auth_mode": "browser_cookie", "jira_cookie": "JSESSIONID=session"}, _zero_quota
+    )
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            [item async for item in gene.discover()]
+    finally:
+        await gene.close()
 
     message = str(exc_info.value)
     assert "browser-cookie session" in message
     assert "PAT API quota" not in message
     assert "Use browser cookie authentication" not in message
-    assert [call[0:2] for call in client.calls] == [("POST", "/rest/api/2/search")]
+    assert paths == ["POST /rest/api/2/search"]
 
 
 @pytest.mark.asyncio
@@ -467,8 +437,8 @@ async def test_discover_uses_configured_project_filter_and_issue_types():
     ]
 
     assert items == []
-    assert client.calls[0][1] == "/rest/api/2/search"
-    jql = client.calls[0][2]["json"]["jql"]
+    assert [call[1] for call in client.calls] == ["/rest/api/2/myself", "/rest/api/2/search"]
+    jql = client.calls[1][2]["json"]["jql"]
     assert "project in (PAY)" in jql
     assert "issuetype in (Story,Bug)" in jql
     assert '("Agile Team" = "ExampleTeam-DeliveryBoard")' in jql
@@ -478,7 +448,7 @@ async def test_discover_uses_configured_project_filter_and_issue_types():
 @pytest.mark.asyncio
 async def test_discover_hydrates_search_result_so_fetch_uses_no_per_issue_requests():
     class SearchIssueClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             return JsonResponse(
                 _search_page(
@@ -572,7 +542,7 @@ def _changelog_keys(projection) -> list[str]:
 class _LongChangelogClient(RecordingAsyncClient):
     """Serves PAY-7 with its whole long changelog embedded, as Jira Data Center does."""
 
-    async def request(self, method: str, url: str, **kwargs):
+    async def answer(self, method: str, url: str, **kwargs):
         self.calls.append((method, url, kwargs))
         issue = _jira_issue("PAY-7", issue_id="100007", histories=_histories(LONG_CHANGELOG_HISTORY_COUNT))
         if url.endswith("/comment"):
@@ -652,7 +622,7 @@ async def test_limited_changelog_keeps_returned_histories_and_projects_partial_c
     from memforge.source_projection import ProjectionCoverage
 
     class LimitedChangelogClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             return JsonResponse(
                 _search_page(
@@ -695,7 +665,7 @@ async def test_fetch_describes_jira_image_attachment_with_comment_parent():
     image = b"\x89PNG\r\n\x1a\nknown-jira-image"
 
     class AttachmentClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             if url == "/rest/api/2/attachment/content/7001":
                 return BinaryResponse(image, "image/png")
@@ -761,7 +731,7 @@ async def test_jira_secure_attachment_stream_uses_id_based_locator():
     image = b"\xff\xd8\xffknown-jira-image"
 
     class AttachmentClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             return JsonResponse(
                 _search_page(
@@ -809,24 +779,20 @@ async def test_jira_secure_attachment_stream_uses_id_based_locator():
             headers={"content-type": "image/jpeg", "content-length": str(len(image))},
         )
 
-    gene._client = httpx.AsyncClient(
-        base_url="https://jira.example.test",
-        transport=httpx.MockTransport(handler),
-    )
-    gene._request_limiter = None
+    gene._client = FakeConnectorHttp(handler).client("https://jira.example.test", product_name="Jira")
     gene._auth_mode = "pat"
     try:
         assert artifact.locator["request_path"] == "/secure/attachment/7001/attachment-7001"
         async with gene.open_source_artifact(artifact) as download:
             assert b"".join([chunk async for chunk in download.chunks]) == image
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
 
 @pytest.mark.asyncio
 async def test_jira_secure_attachment_rejects_descriptor_url_identity_mismatch():
     class AttachmentClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             return JsonResponse(
                 _search_page(
@@ -886,11 +852,7 @@ async def test_open_source_artifact_streams_jira_attachment():
         config={"base_url": "https://jira.example.test", "projects": ["PAY"]},
         source_id="src-jira",
     )
-    gene._client = httpx.AsyncClient(
-        base_url="https://jira.example.test",
-        transport=httpx.MockTransport(handler),
-    )
-    gene._request_limiter = None
+    gene._client = FakeConnectorHttp(handler).client("https://jira.example.test", product_name="Jira")
     gene._auth_mode = "pat"
     artifact = RawSourceArtifact(
         provider_key="7001",
@@ -907,7 +869,7 @@ async def test_open_source_artifact_streams_jira_attachment():
             assert b"".join([chunk async for chunk in download.chunks]) == image
             assert download.content_length == len(image)
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
 
 @pytest.mark.asyncio
@@ -940,7 +902,7 @@ async def test_fetch_does_not_count_unsupported_jira_attachments_against_image_b
     }
 
     class AttachmentClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             return JsonResponse(
                 _search_page(
@@ -997,13 +959,11 @@ async def test_jira_attachment_inventory_is_not_rejected_by_descriptor_count():
 
 
 @pytest.mark.asyncio
-async def test_discover_paces_paginated_jira_search_requests(monkeypatch):
-    import memforge.genes.atlassian_auth as atlassian_auth
-
+async def test_discover_paces_paginated_jira_search_requests():
     now = 1000.0
     sleeps: list[float] = []
 
-    def fake_monotonic() -> float:
+    def clock() -> float:
         return now
 
     async def fake_sleep(delay: float) -> None:
@@ -1011,54 +971,46 @@ async def test_discover_paces_paginated_jira_search_requests(monkeypatch):
         sleeps.append(delay)
         now += delay
 
-    class TwoPageClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
-            self.calls.append((method, url, kwargs))
-            start_at = kwargs["json"]["startAt"]
-            page_size = 1 if start_at == 100 else 50
-            return JsonResponse(
-                {
-                    "startAt": start_at,
-                    "total": 101,
-                    "issues": [
-                        _jira_issue(f"PAY-{index + 1}")
-                        for index in range(start_at, start_at + page_size)
-                    ],
-                }
-            )
+    searches: list[int] = []
 
-    monkeypatch.setattr(atlassian_auth.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(atlassian_auth.asyncio, "sleep", fake_sleep)
+    def handle(request: httpx.Request) -> httpx.Response:
+        start_at = json.loads(request.content)["startAt"]
+        searches.append(start_at)
+        page_size = 1 if start_at == 100 else 50
+        issues = [_jira_issue(f"PAY-{index + 1}") for index in range(start_at, start_at + page_size)]
+        return httpx.Response(200, json={"startAt": start_at, "total": 101, "issues": issues})
+
     gene = JiraGene(
-        config={
-            "base_url": "https://jira.example.test",
-            "projects": ["PAY"],
-            "request_interval_ms": 750,
-        },
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"], "request_interval_ms": 750},
         source_id="src-jira",
     )
-    client = TwoPageClient(base_url="https://jira.example.test")
-    gene._client = client
+    gene._client = ConnectorHttpClient(
+        product_name="Jira",
+        base_url="https://jira.example.test",
+        timeout=5.0,
+        follow_redirects=True,
+        limiter=atlassian_auth.AtlassianRequestLimiter(min_interval_seconds=0.75, clock=clock),
+        sleep=fake_sleep,
+        transport=httpx.MockTransport(handle),
+    )
     gene._base_url = "https://jira.example.test"
-    gene._request_limiter = atlassian_auth.AtlassianRequestLimiter(min_interval_seconds=0.75)
 
-    items = [item async for item in gene.discover()]
+    try:
+        items = [item async for item in gene.discover()]
+    finally:
+        await gene.close()
 
     assert len(items) == 101
     assert items[0].item_id == "jira-PAY-1"
     assert items[-1].item_id == "jira-PAY-101"
-    assert [call[0:2] for call in client.calls] == [
-        ("POST", "/rest/api/2/search"),
-        ("POST", "/rest/api/2/search"),
-        ("POST", "/rest/api/2/search"),
-    ]
+    assert searches == [0, 50, 100]
     assert sleeps == [0.75, 0.75]
 
 
 @pytest.mark.asyncio
 async def test_fetch_tops_up_truncated_hydrated_comments_through_limiter():
     class SearchIssueClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             if url.endswith("/comment"):
                 return JsonResponse(
@@ -1116,7 +1068,7 @@ async def test_fetch_rejects_malformed_comment_top_up_instead_of_clearing_trunca
     )
 
     class MalformedTopUpClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             if url.endswith("/comment"):
                 return JsonResponse({})
@@ -1136,7 +1088,6 @@ async def test_fetch_rejects_malformed_comment_top_up_instead_of_clearing_trunca
 
 @pytest.mark.asyncio
 async def test_atlassian_limiter_paces_after_request_exception(monkeypatch):
-    import memforge.genes.atlassian_auth as atlassian_auth
 
     now = 1000.0
     sleeps: list[float] = []
@@ -1183,7 +1134,6 @@ def test_atlassian_limiter_is_shared_by_base_host():
 
 @pytest.mark.asyncio
 async def test_releasing_limiter_owner_removes_strict_interval(monkeypatch):
-    import memforge.genes.atlassian_auth as atlassian_auth
 
     now = 2500.0
     sleeps: list[float] = []
@@ -1227,7 +1177,6 @@ async def test_releasing_limiter_owner_removes_strict_interval(monkeypatch):
 
 
 def test_releasing_last_limiter_owner_drops_cached_origin():
-    import memforge.genes.atlassian_auth as atlassian_auth
 
     first = atlassian_auth.atlassian_request_limiter(
         "https://drop-jira.example.test",
@@ -1253,7 +1202,6 @@ def test_releasing_last_limiter_owner_drops_cached_origin():
 
 @pytest.mark.asyncio
 async def test_atlassian_limiter_uses_strictest_interval_for_same_host(monkeypatch):
-    import memforge.genes.atlassian_auth as atlassian_auth
 
     now = 2000.0
     sleeps: list[float] = []
@@ -1290,46 +1238,9 @@ async def test_atlassian_limiter_uses_strictest_interval_for_same_host(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_request_limiter_honors_retry_after_on_degraded_response(monkeypatch):
-    import memforge.genes.atlassian_auth as atlassian_auth
-
-    now = 3000.0
-    sleeps: list[float] = []
-
-    def fake_monotonic() -> float:
-        return now
-
-    async def fake_sleep(delay: float) -> None:
-        nonlocal now
-        sleeps.append(delay)
-        now += delay
-
-    class DegradedClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
-            self.calls.append((method, url, kwargs))
-            return JsonResponse({}, status_code=503, headers={"Retry-After": "3"})
-
-    monkeypatch.setattr(atlassian_auth.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(atlassian_auth.asyncio, "sleep", fake_sleep)
-    limiter = atlassian_auth.AtlassianRequestLimiter(min_interval_seconds=0.5)
-
-    with pytest.raises(httpx.HTTPStatusError):
-        await atlassian_auth.get_with_rate_limit_retry(
-            DegradedClient(),
-            "/rest/api/2/search",
-            product_name="Jira",
-            limiter=limiter,
-        )
-
-    await limiter.run(lambda: _async_json_response({}))
-
-    assert sleeps == [3.0]
-
-
-@pytest.mark.asyncio
 async def test_discover_resets_hydrated_issue_cache_between_runs():
     class OneIssueClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             issue_key = "PAY-1" if len(self.calls) == 1 else "PAY-2"
             return JsonResponse(
@@ -1376,7 +1287,7 @@ async def test_discover_inventory_uses_lightweight_complete_search_without_hydra
 @pytest.mark.asyncio
 async def test_discover_inventory_preserves_lightweight_fields_across_pages():
     class TwoPageInventoryClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             start_at = kwargs["json"]["startAt"]
             issue = _jira_issue("PAY-1" if start_at == 0 else "PAY-2")
@@ -1412,7 +1323,7 @@ class InventorySearchClient(RecordingAsyncClient):
         self.attested = attested
         self.comments = comments or []
 
-    async def request(self, method: str, url: str, **kwargs):
+    async def answer(self, method: str, url: str, **kwargs):
         self.calls.append((method, url, kwargs))
         if url == "/rest/api/2/search":
             fields = kwargs["json"]["fields"]
@@ -1461,11 +1372,11 @@ async def test_inventory_fetch_rejects_an_issue_changed_before_its_full_read():
     updated = _jira_issue("PAY-1", field_overrides={"updated": "2026-05-21T08:01:00.000+0000"})
 
     class ChangedBeforeReadClient(InventorySearchClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             if url == "/rest/api/2/search" and kwargs["json"]["fields"] == ["summary", "updated", "project"]:
                 self.calls.append((method, url, kwargs))
                 return JsonResponse(_search_page([original]))
-            return await super().request(method, url, **kwargs)
+            return await super().answer(method, url, **kwargs)
 
     client = ChangedBeforeReadClient(full=updated, attested=updated, base_url="https://jira.example.test")
     gene = _inventory_gene(client)
@@ -1483,14 +1394,14 @@ async def test_inventory_fetch_rejects_an_issue_whose_key_changed_or_that_left_t
     moved = _jira_issue("OPS-7", issue_id="100001")
 
     class ListedThenReadClient(InventorySearchClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             if url == "/rest/api/2/search" and kwargs["json"]["fields"] == ["summary", "updated", "project"]:
                 self.calls.append((method, url, kwargs))
                 return JsonResponse(_search_page([listed]))
             if url == "/rest/api/2/search" and self.full is None:
                 self.calls.append((method, url, kwargs))
                 return JsonResponse(_search_page([]))
-            return await super().request(method, url, **kwargs)
+            return await super().answer(method, url, **kwargs)
 
     for full in (moved, None):
         client = ListedThenReadClient(full=full, attested=listed, base_url="https://jira.example.test")
@@ -1526,57 +1437,77 @@ async def test_inventory_fetch_rejects_comment_body_from_newer_issue_revision():
         ["updated"],
     ]
 
-async def _async_json_response(payload: dict) -> JsonResponse:
-    return JsonResponse(payload)
+def _answers(*responses: httpx.Response | Exception):
+    """A handler answering each request with the next response, or raising the next error; the last one repeats."""
+    queue = list(responses)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        answer = queue.pop(0) if len(queue) > 1 else queue[0]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    return handle
 
 
 @pytest.mark.asyncio
-async def test_discover_retries_jira_rate_limit(monkeypatch):
-    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
-    gene = JiraGene(
-        config={"base_url": "https://jira.example.test", "projects": ["PAY"]},
-        source_id="src-jira",
+async def test_discover_retries_jira_rate_limit():
+    gene, http, paths = await _authenticated_gene(
+        {"auth_mode": "pat", "pat": "jira-pat"},
+        _answers(httpx.Response(429), httpx.Response(429), httpx.Response(200, json=_search_page([]))),
     )
-    client = RateLimitedThenSuccessClient(base_url="https://jira.example.test")
-    gene._client = client
-    gene._base_url = "https://jira.example.test"
-
-    items = [item async for item in gene.discover()]
+    try:
+        items = [item async for item in gene.discover()]
+    finally:
+        await gene.close()
 
     assert items == []
-    assert [call[1] for call in client.calls] == [
-        "/rest/api/2/search",
-        "/rest/api/2/search",
-        "/rest/api/2/search",
-    ]
+    assert paths == ["POST /rest/api/2/search"] * 3
 
 
 @pytest.mark.asyncio
-async def test_discover_reports_jira_rate_limit_after_retries(monkeypatch):
-    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
-    gene = JiraGene(
-        config={"base_url": "https://jira.example.test", "projects": ["PAY"]},
-        source_id="src-jira",
+async def test_discover_reports_jira_rate_limit_after_retries():
+    gene, _http, paths = await _authenticated_gene({"auth_mode": "pat", "pat": "jira-pat"}, _answers(httpx.Response(429)))
+    try:
+        with pytest.raises(RuntimeError, match="Jira search failed: Jira rate limit persisted"):
+            [item async for item in gene.discover()]
+    finally:
+        await gene.close()
+
+    assert paths == ["POST /rest/api/2/search"] * 4
+
+
+@pytest.mark.asyncio
+async def test_discover_retries_a_jira_search_server_error_as_a_safe_read():
+    gene, _http, paths = await _authenticated_gene(
+        {"auth_mode": "pat", "pat": "jira-pat"},
+        _answers(httpx.Response(500), httpx.Response(503), httpx.Response(200, json=_search_page([]))),
     )
-    client = AlwaysRateLimitedClient(base_url="https://jira.example.test")
-    gene._client = client
-    gene._base_url = "https://jira.example.test"
+    try:
+        items = [item async for item in gene.discover()]
+    finally:
+        await gene.close()
 
-    with pytest.raises(RuntimeError, match="Jira search failed: Jira rate limit persisted"):
-        [item async for item in gene.discover()]
+    assert items == []
+    assert paths == ["POST /rest/api/2/search"] * 3
 
-    assert [call[1] for call in client.calls] == [
-        "/rest/api/2/search",
-        "/rest/api/2/search",
-        "/rest/api/2/search",
-        "/rest/api/2/search",
-    ]
+
+@pytest.mark.asyncio
+async def test_discover_fails_when_a_jira_search_server_error_persists():
+    gene, _http, paths = await _authenticated_gene({"auth_mode": "pat", "pat": "jira-pat"}, _answers(httpx.Response(502)))
+    try:
+        with pytest.raises(RuntimeError, match="Jira search failed: Jira answered 502 Bad Gateway after 4 attempts"):
+            [item async for item in gene.discover()]
+    finally:
+        await gene.close()
+
+    assert paths == ["POST /rest/api/2/search"] * 4
 
 
 @pytest.mark.asyncio
 async def test_discover_raises_when_jira_search_is_unauthorized():
     class UnauthorizedClient(RecordingAsyncClient):
-        async def request(self, method: str, url: str, **kwargs):
+        async def answer(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
             return JsonResponse({}, status_code=401)
 
@@ -1614,14 +1545,15 @@ async def test_fetch_respects_include_comments_config():
 
 
 @pytest.mark.asyncio
-async def test_fetch_reports_comment_rate_limit_when_comments_are_enabled(monkeypatch):
-    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
-    gene = JiraGene(
-        config={"base_url": "https://jira.example.test", "projects": ["PAY"], "include_comments": True},
-        source_id="src-jira",
+async def test_fetch_reports_comment_rate_limit_when_comments_are_enabled():
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/comment"):
+            return httpx.Response(429)
+        return httpx.Response(200, json=_jira_issue("PAY-123"))
+
+    gene, _http, paths = await _authenticated_gene(
+        {"auth_mode": "pat", "pat": "jira-pat", "include_comments": True}, handle
     )
-    client = IssueThenRateLimitedCommentClient(base_url="https://jira.example.test")
-    gene._client = client
     item = ContentItem(
         item_id="jira-PAY-123",
         title="PAY-123: Example issue",
@@ -1630,93 +1562,52 @@ async def test_fetch_reports_comment_rate_limit_when_comments_are_enabled(monkey
         content_type="application/json",
         extra={"issue_key": "PAY-123"},
     )
+    try:
+        with pytest.raises(httpx.HTTPStatusError, match="Jira rate limit persisted"):
+            await gene.fetch(item)
+    finally:
+        await gene.close()
 
-    with pytest.raises(RuntimeError, match="Jira rate limit persisted"):
-        await gene.fetch(item)
-
-    assert [call[1] for call in client.calls] == [
-        "/rest/api/2/issue/PAY-123",
-        "/rest/api/2/issue/PAY-123/comment",
-        "/rest/api/2/issue/PAY-123/comment",
-        "/rest/api/2/issue/PAY-123/comment",
-        "/rest/api/2/issue/PAY-123/comment",
-    ]
+    assert paths == ["GET /rest/api/2/issue/PAY-123", *["GET /rest/api/2/issue/PAY-123/comment"] * 4]
 
 
 @pytest.mark.asyncio
-async def test_discover_retries_once_on_transient_timeout(monkeypatch):
-    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
-
-    class TimeoutThenSuccessClient(RecordingAsyncClient):
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-            self._timed_out = False
-
-        async def request(self, method: str, url: str, **kwargs):
-            self.calls.append((method, url, kwargs))
-            if not self._timed_out:
-                self._timed_out = True
-                raise httpx.ReadTimeout("slow", request=httpx.Request(method, f"https://jira.example.test{url}"))
-            return JsonResponse(_search_page([]))
-
-    gene = JiraGene(
-        config={
-            "base_url": "https://jira.example.test",
-            "projects": ["PAY"],
-            "auth_mode": "browser_cookie",
-            "jira_cookie": "JSESSIONID=ok",
-        },
-        source_id="src-jira",
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ReadTimeout("slow"),
+        httpx.ConnectError("flaky"),
+    ],
+    ids=["timeout", "connect-error"],
+)
+async def test_discover_retries_once_on_a_transient_transport_error(error):
+    gene, http, paths = await _authenticated_gene(
+        {"auth_mode": "browser_cookie", "jira_cookie": "JSESSIONID=ok"},
+        _answers(error, httpx.Response(200, json=_search_page([]))),
     )
-    client = TimeoutThenSuccessClient(base_url="https://jira.example.test")
-    gene._client = client
-    gene._base_url = "https://jira.example.test"
-
-    items = [item async for item in gene.discover()]
+    try:
+        items = [item async for item in gene.discover()]
+    finally:
+        await gene.close()
 
     assert items == []  # search returned no issues once the retry succeeded
-    assert [call[0:2] for call in client.calls] == [
-        ("POST", "/rest/api/2/search"),
-        ("POST", "/rest/api/2/search"),
-    ]
+    assert paths == ["POST /rest/api/2/search"] * 2
+    assert http.waits[0] == 1.0
 
 
 @pytest.mark.asyncio
-async def test_discover_retries_on_transient_connect_error(monkeypatch):
-    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", AsyncNoop())
-
-    class ConnectErrorThenSuccessClient(RecordingAsyncClient):
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-            self._failed = False
-
-        async def request(self, method: str, url: str, **kwargs):
-            self.calls.append((method, url, kwargs))
-            if not self._failed:
-                self._failed = True
-                raise httpx.ConnectError("flaky", request=httpx.Request(method, f"https://jira.example.test{url}"))
-            return JsonResponse(_search_page([]))
-
-    gene = JiraGene(
-        config={
-            "base_url": "https://jira.example.test",
-            "projects": ["PAY"],
-            "auth_mode": "browser_cookie",
-            "jira_cookie": "JSESSIONID=ok",
-        },
-        source_id="src-jira",
+async def test_discover_reports_an_unreachable_jira_with_the_vpn_hint():
+    gene, _http, paths = await _authenticated_gene(
+        {"auth_mode": "pat", "pat": "jira-pat"}, _answers(httpx.ConnectError("All connection attempts failed"))
     )
-    client = ConnectErrorThenSuccessClient(base_url="https://jira.example.test")
-    gene._client = client
-    gene._base_url = "https://jira.example.test"
+    try:
+        with pytest.raises(RuntimeError, match="check VPN or network") as raised:
+            [item async for item in gene.discover()]
+    finally:
+        await gene.close()
 
-    items = [item async for item in gene.discover()]
-
-    assert items == []  # search returned no issues once the connect retry succeeded
-    assert [call[0:2] for call in client.calls] == [
-        ("POST", "/rest/api/2/search"),
-        ("POST", "/rest/api/2/search"),
-    ]
+    assert "All connection attempts failed" in str(raised.value)
+    assert paths == ["POST /rest/api/2/search"] * 4
 
 
 def _transport_gene(handler, config: dict | None = None) -> JiraGene:
@@ -1724,9 +1615,8 @@ def _transport_gene(handler, config: dict | None = None) -> JiraGene:
         config={"base_url": "https://jira.example.test", "projects": ["PAY"], **(config or {})},
         source_id="src-jira",
     )
-    gene._client = httpx.AsyncClient(base_url="https://jira.example.test", transport=httpx.MockTransport(handler))
+    gene._client = FakeConnectorHttp(handler).client("https://jira.example.test", product_name="Jira")
     gene._base_url = "https://jira.example.test"
-    gene._request_limiter = None
     gene._auth_mode = "pat"
     gene._hydrated_issues = {}
     return gene
@@ -1773,7 +1663,7 @@ async def test_scope_listing_pages_the_configured_jql_without_since_by_identifie
     try:
         listing = await gene.list_scope()
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert listing.kind.value == "query"
     assert listing.doc_ids == {"jira-PAY-1", "jira-PAY-2", "jira-PAY-3"}
@@ -1794,7 +1684,7 @@ async def test_scope_listing_that_ends_before_its_total_raises():
         with pytest.raises(RuntimeError, match="declared total"):
             await gene.list_scope()
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
 
 @pytest.mark.asyncio
@@ -1830,7 +1720,7 @@ async def test_confirming_unlisted_issues_keeps_every_issue_jira_still_has():
     try:
         answers = await gene.confirm_absent(items)
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert answers == {
         "jira-PAY-1": AbsenceAnswer.EXISTS,
@@ -1860,7 +1750,7 @@ async def test_confirming_unlisted_issues_searches_in_batches_of_one_page():
     try:
         answers = await gene.confirm_absent(items)
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert set(answers.values()) == {AbsenceAnswer.EXISTS}
     assert set(answers) == {item.item_id for item in items}
@@ -1879,7 +1769,7 @@ async def test_confirming_unlisted_issues_fails_when_jira_rejects_the_credential
         with pytest.raises(httpx.HTTPStatusError):
             await gene.confirm_absent([_stored_issue("PAY-2", "100002")])
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
 
 @pytest.mark.asyncio
@@ -1910,7 +1800,7 @@ async def test_a_device_confirms_an_issue_by_the_key_the_server_names_it_by():
     try:
         answers = await gene.confirm_absent(items)
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert answers == {"jira-src-pay-1-abc": AbsenceAnswer.EXISTS, "jira-src-pay-5-abc": AbsenceAnswer.EXISTS}
     assert searched == ["issuekey in (100001, PAY-5)"]
@@ -1923,7 +1813,7 @@ async def test_complete_hydrated_comments_without_rendering_fetch_attested_comme
     issue = _jira_issue("PAY-123", comments=[{"id": "c1", "body": "*Require approval.*"}])
     rendered = {**issue["fields"]["comment"]["comments"][0], "renderedBody": "<p><strong>Require approval.</strong></p>"}
     class CommentClient(RecordingAsyncClient):
-        async def request(self, method, url, **kwargs):
+        async def answer(self, method, url, **kwargs):
             self.calls.append((method, url, kwargs))
             assert method == "GET" and url == "/rest/api/2/issue/PAY-123/comment"
             assert kwargs["params"]["expand"] == "renderedBody"
@@ -1973,7 +1863,7 @@ async def test_rediscovery_searches_for_the_issue_within_the_configured_jql(conf
     try:
         current = await gene.rediscover(_stored_issue("PAY-1", "100001"))
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert current.item_id == "jira-PAY-1"
     assert [body["jql"] for body in searches] == [expected_jql]
@@ -1990,7 +1880,7 @@ async def test_rediscovery_finds_an_issue_whose_key_changed_by_its_id():
     try:
         current = await gene.rediscover(_stored_issue("PAY-1", "100001"))
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert (current.item_id, current.extra["issue_id"]) == ("jira-OPS-7", "100001")
 
@@ -2002,7 +1892,7 @@ async def test_rediscovery_gives_nothing_for_an_issue_outside_the_jql():
     try:
         assert await gene.rediscover(_stored_issue("PAY-2", "100002")) is None
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert len(searches) == 1
 
@@ -2026,7 +1916,7 @@ async def test_rediscovery_raises_when_the_search_fails_or_answers_inconsistentl
         with pytest.raises(RuntimeError):
             await gene.rediscover(_stored_issue("PAY-1", "100001"))
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
 
 @pytest.mark.asyncio
@@ -2045,7 +1935,7 @@ async def test_rediscovery_by_an_old_key_accepts_the_issue_under_its_new_key():
     try:
         current = await gene.rediscover(stored)
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert [body["jql"].split(" AND ", 1)[0] for body in searches] == ["issuekey = PAY-1"]
     assert (current.item_id, current.extra["issue_id"]) == ("jira-OPS-7", "100001")
@@ -2063,6 +1953,51 @@ async def test_an_issue_reference_that_is_not_an_id_or_key_never_reaches_jql(iss
         with pytest.raises(ValueError, match="neither an issue id nor an issue key"):
             await gene.confirm_absent([stored])
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert searches == []
+
+
+@pytest.mark.asyncio
+async def test_search_refuses_a_page_whose_start_at_does_not_continue_the_walk():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        start = json.loads(request.content)["startAt"]
+        # The second page claims to start at 0 again, overlapping the first.
+        issues = [_jira_issue("PAY-1")] if start == 0 else [_jira_issue("PAY-2")]
+        return httpx.Response(200, json=_search_page(issues, total=2, start_at=0))
+
+    gene = _transport_gene(handler)
+    try:
+        with pytest.raises(RuntimeError, match="Jira search response startAt does not match the requested page"):
+            await gene.list_scope()
+    finally:
+        await gene.close()
+
+
+@pytest.mark.asyncio
+async def test_search_refuses_issues_beyond_the_total_before_yielding_that_page():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_search_page([_jira_issue("PAY-1"), _jira_issue("PAY-2")], total=1))
+
+    gene = _transport_gene(handler)
+    yielded: list[dict] = []
+    try:
+        with pytest.raises(RuntimeError, match="Jira search unique issue count did not match total"):
+            async for issue in gene._search_issues("project = PAY", fields=["updated"], expand=None, max_results=50):
+                yielded.append(issue)
+    finally:
+        await gene.close()
+    assert yielded == []
+
+
+@pytest.mark.asyncio
+async def test_search_refused_by_jira_raises_query_rejected():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"errorMessages": ["The value 'NOPE' does not exist for the field 'project'."]})
+
+    gene = _transport_gene(handler)
+    try:
+        with pytest.raises(JiraQueryRejected, match="Jira rejected the JQL"):
+            await gene.list_scope()
+    finally:
+        await gene.close()

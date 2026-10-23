@@ -8,10 +8,9 @@ the way the agent-session gene handles client-generated session summaries.
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import AsyncIterator, Mapping
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +21,7 @@ from memforge.genes.local_adapter_packages import (
     package_manifest,
     read_package_body,
 )
+from memforge.genes.toolkit.local_packages import device_packages
 from memforge.source_time import SOURCE_UPDATED_AT_KEY
 from memforge.models import (
     ConfigField,
@@ -42,12 +42,6 @@ logger = logging.getLogger(__name__)
 
 LOCAL_MARKDOWN_PACKAGE_KIND = "local_markdown_document"
 LOCAL_MARKDOWN_CONTENT_ROLE = "user_markdown_note"
-
-
-def _parse_dt(value: str) -> datetime:
-    if not value:
-        return datetime.now(timezone.utc)
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def _to_markdown(content_type: str, body: str) -> str:
@@ -172,34 +166,26 @@ class LocalMarkdownGene(DocumentGene):
         documents_dir.mkdir(parents=True, exist_ok=True)
 
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
-        manifest = self._package_manifest()
-        if has_package_manifest(self.config):
-            async for item in self._discover_package_manifest(manifest, since):
-                yield item
-            return
-        documents_dir = self._documents_dir()
-        for package_path in sorted(documents_dir.rglob("*.json")):
-            try:
-                package = json.loads(package_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                logger.warning("Skipping unreadable local markdown package: %s", package_path)
+        packages = device_packages(
+            self.config,
+            package_kind=LOCAL_MARKDOWN_PACKAGE_KIND,
+            inbox=self._documents_dir,
+        )
+        for package in packages:
+            if not package.changed_after(since):
                 continue
-            if package.get("package_kind") != LOCAL_MARKDOWN_PACKAGE_KIND:
-                continue
-            last_modified = _parse_dt(package.get("last_modified", ""))
-            if since and last_modified <= since:
-                continue
+            doc_id = str(package.fields["doc_id"])
             yield ContentItem(
-                item_id=package["doc_id"],
-                title=package.get("title") or package["doc_id"],
-                source_url=package.get("source_url", ""),
-                last_modified=last_modified,
-                content_type=package.get("content_type") or "text/markdown",
-                space_or_project=package.get("space_or_project") or package.get("vault_id") or "",
-                version=package.get("version", ""),
-                author=package.get("author"),
+                item_id=doc_id,
+                title=package.text("title", doc_id),
+                source_url=package.text("source_url"),
+                last_modified=package.last_modified,
+                content_type=package.text("content_type", "text/markdown"),
+                space_or_project=package.text("space_or_project", package.text("vault_id")),
+                version=package.text("version"),
+                author=package.fields.get("submitted_by"),
                 labels=["local_markdown"],
-                extra={"package_path": str(package_path)},
+                extra={**package.locator, "relative_path": package.fields.get("relative_path")},
             )
 
     async def fetch(self, item: ContentItem) -> RawContent:
@@ -232,11 +218,12 @@ class LocalMarkdownGene(DocumentGene):
         )
 
     async def health_check(self) -> dict:
-        if self._package_manifest():
+        manifest = package_manifest(self.config)
+        if manifest:
             return {
                 "healthy": True,
                 "documents_dir": self.config.get("documents_dir"),
-                "package_manifest_entries": len(self._package_manifest()),
+                "package_manifest_entries": len(manifest),
                 "vault_id": self.config.get("vault_id"),
             }
         documents_dir = self._documents_dir()
@@ -254,41 +241,3 @@ class LocalMarkdownGene(DocumentGene):
                 "fills this in when the source is created or updated."
             )
         return Path(configured).expanduser()
-
-    def _package_manifest(self) -> list[dict]:
-        return package_manifest(self.config)
-
-    async def _discover_package_manifest(
-        self,
-        manifest: list[dict],
-        since: datetime | None,
-    ) -> AsyncIterator[ContentItem]:
-        for entry in sorted(
-            manifest,
-            key=lambda item: (str(item.get("last_modified") or ""), str(item.get("doc_id") or "")),
-        ):
-            package_uri = str(entry.get("package_uri") or "").strip()
-            if not package_uri:
-                continue
-            last_modified = _parse_dt(str(entry.get("last_modified") or ""))
-            if since and last_modified <= since:
-                continue
-            doc_id = str(entry.get("doc_id") or "")
-            yield ContentItem(
-                item_id=doc_id,
-                title=str(entry.get("title") or doc_id),
-                source_url=str(entry.get("source_url") or ""),
-                last_modified=last_modified,
-                content_type=str(entry.get("content_type") or "text/markdown"),
-                space_or_project=str(entry.get("space_or_project") or entry.get("vault_id") or ""),
-                version=str(entry.get("version") or ""),
-                author=entry.get("submitted_by"),
-                labels=["local_markdown"],
-                extra={
-                    "package_uri": package_uri,
-                    "package_path": entry.get("package_path"),
-                    "package_sha256": entry.get("package_sha256"),
-                    "input_sha256": entry.get("input_sha256"),
-                    "relative_path": entry.get("relative_path"),
-                },
-            )

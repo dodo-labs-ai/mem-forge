@@ -25,7 +25,7 @@ from memforge.auth.browser_session import (
     BrowserSessionStore,
     register_provider,
 )
-from memforge.genes.atlassian_auth import require_https_base_url, tls_verify
+from memforge.genes.toolkit.config import require_https_base_url, tls_verify
 from memforge.source_secrets import decrypt_secret, encrypt_secret
 
 logger = logging.getLogger(__name__)

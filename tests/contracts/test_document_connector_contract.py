@@ -8,6 +8,7 @@ and fails it until ``tests/contracts/document_fakes`` has a module for it.
 
 from __future__ import annotations
 
+from datetime import datetime
 from types import SimpleNamespace
 
 import httpx
@@ -24,6 +25,7 @@ from memforge.models import AbsenceAnswer, ScopeListingKind
 from memforge.source_types import source_type_descriptor
 from tests.contracts.document_fakes import (
     CHANGED_SINCE,
+    IN_THE_CURSOR_MINUTE,
     DocumentConnectorFakes,
     MissingDocumentFakes,
     ProviderListing,
@@ -50,6 +52,9 @@ STATUSES_THAT_RAISE = (
     httpx.codes.INTERNAL_SERVER_ERROR,
     httpx.codes.SERVICE_UNAVAILABLE,
 )
+# Statuses that ask the client to wait: it retries them for any method, then
+# raises once its attempts run out.
+STATUSES_RETRIED = (httpx.codes.TOO_MANY_REQUESTS, httpx.codes.SERVICE_UNAVAILABLE)
 
 
 def _gene_class(source_type: str) -> type[DocumentGene]:
@@ -97,8 +102,8 @@ QUERY_TYPES = [
 
 
 @pytest.fixture(autouse=True)
-def unpaced_requests(monkeypatch):
-    """Give each test its own Atlassian origin limiters, without a gap between requests."""
+def own_origin_limiters(monkeypatch):
+    """Give each test its own Atlassian origin limiters; the fakes' stub sleep skips their gaps."""
     monkeypatch.setattr("memforge.genes.atlassian_auth._ATLASSIAN_REQUEST_LIMITERS", {})
 
 
@@ -183,6 +188,19 @@ async def test_a_standalone_listing_equals_the_listing_after_discovery(source_ty
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("source_type", "config_name"), LISTING_CASES)
+async def test_discover_never_hides_an_item_edited_in_the_cursor_minute(source_type, config_name) -> None:
+    fakes = fakes_for(source_type)
+    listing = fakes.listing_configs[config_name]
+    async with fakes.connect(listing.config) as connection:
+        changed = {item.item_id async for item in connection.gene.discover(CHANGED_SINCE)}
+
+    # Edited thirty seconds after the cursor, in its minute: a provider that
+    # compares by the minute must read the cursor's minute from its start.
+    assert listing.edited_in_the_cursor_minute in changed
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("source_type", "config_name"), WALKING_CASES)
 async def test_a_listing_reuses_the_discovery_walk(source_type, config_name) -> None:
     fakes = fakes_for(source_type)
@@ -217,27 +235,37 @@ async def test_a_failed_listing_raises(source_type, config_name) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("source_type", "config_name"), DEVICE_CASES)
-async def test_a_device_collected_configuration_lists_through_its_manifest(source_type, config_name) -> None:
+def _manifest_inputs(source_type: str, config_name: str) -> list[SimpleNamespace]:
+    """The stored inputs of a device's snapshot manifest, one per entry the fake submits."""
     fakes = fakes_for(source_type)
-    config = fakes.device_configs[config_name]
-    gene_cls = _gene_class(source_type)
-    entries = fakes.manifest_entries(config)
-    inputs = [
+    return [
         SimpleNamespace(
             metadata={"manifest_entry": entry},
             raw_uri=f"artifact://{entry['doc_id']}",
             raw_sha256=f"input-{generation}",
             input_generation=generation,
         )
-        for generation, entry in enumerate(entries)
+        for generation, entry in enumerate(fakes.manifest_entries(fakes.device_configs[config_name]))
     ]
+
+
+async def _manifest_gene(source_type: str, config_name: str, inputs: list[SimpleNamespace]) -> DocumentGene:
+    """The authenticated Gene of a run bound to the device's snapshot manifest ``inputs``."""
+    config = fakes_for(source_type).device_configs[config_name]
     projected = source_with_sync_inputs(
         {"type": source_type, "config": dict(config)}, inputs, input_snapshot_supplied=True
     )
     gene = create_gene(source_type, projected["config"], "src-contract")
     await gene.authenticate()
+    return gene
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("source_type", "config_name"), DEVICE_CASES)
+async def test_a_device_collected_configuration_lists_through_its_manifest(source_type, config_name) -> None:
+    gene_cls = _gene_class(source_type)
+    inputs = _manifest_inputs(source_type, config_name)
+    gene = await _manifest_gene(source_type, config_name, inputs)
 
     # The run lists through the manifest with the Gene's one kind, never through list_scope.
     assert len(gene_cls.listing_kinds) == 1
@@ -247,6 +275,30 @@ async def test_a_device_collected_configuration_lists_through_its_manifest(sourc
     discovered = {item.item_id async for item in gene.discover(None)}
     assert discovered == snapshot_document_ids(inputs)
     assert discovered
+    # The device read the provider; the server holds no client to release.
+    assert getattr(gene, "_client", None) is None
+    await gene.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("source_type", "config_name"), DEVICE_CASES)
+async def test_a_device_manifest_never_hides_an_item_edited_in_the_cursor_minute(source_type, config_name) -> None:
+    inputs = _manifest_inputs(source_type, config_name)
+    in_the_cursor_minute = [
+        stored
+        for stored in inputs
+        if datetime.fromisoformat(stored.metadata["manifest_entry"]["last_modified"]) == IN_THE_CURSOR_MINUTE
+    ]
+    gene = await _manifest_gene(source_type, config_name, inputs)
+    try:
+        changed = {item.item_id async for item in gene.discover(CHANGED_SINCE)}
+    finally:
+        await gene.close()
+
+    assert in_the_cursor_minute
+    assert snapshot_document_ids(in_the_cursor_minute) <= changed
+    # The manifest's packages are still read incrementally: one changed before the cursor is skipped.
+    assert changed < snapshot_document_ids(inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -258,14 +310,29 @@ async def test_a_device_collected_configuration_lists_through_its_manifest(sourc
 @pytest.mark.parametrize("status", [*STATUS_ANSWERS, *STATUSES_THAT_RAISE], ids=str)
 @pytest.mark.parametrize("source_type", QUERY_TYPES)
 async def test_confirm_absent_maps_each_provider_status(source_type, status) -> None:
-    async with fakes_for(source_type).reading_by_id(status) as (gene, items):
+    async with fakes_for(source_type).reading_by_id(status) as (connection, items):
         assert items
         if status in STATUS_ANSWERS:
-            answers = await gene.confirm_absent(items)
+            answers = await connection.gene.confirm_absent(items)
             assert answers == {item.item_id: STATUS_ANSWERS[status] for item in items}
         else:
             with pytest.raises(Exception):  # noqa: B017 - any error leaves the run's absence unproven
-                await gene.confirm_absent(items)
+                await connection.gene.confirm_absent(items)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", STATUSES_RETRIED, ids=str)
+@pytest.mark.parametrize("source_type", QUERY_TYPES)
+async def test_confirm_absent_retries_a_provider_that_asks_to_wait_then_raises(source_type, status) -> None:
+    async with fakes_for(source_type).reading_by_id(status) as (connection, items):
+        with pytest.raises(Exception):  # noqa: B017 - any error leaves the run's absence unproven
+            await connection.gene.confirm_absent(items)
+
+    # The read was sent again after the wait the answer asked for, and the retries ended.
+    read = connection.requests[-1]
+    assert connection.requests.count(read) > 1
+    low, high = fakes_for(source_type).retry_waits[status]
+    assert any(low <= wait <= high for wait in connection.waits), connection.waits
 
 
 # ---------------------------------------------------------------------------
@@ -288,3 +355,39 @@ async def test_rediscover_keeps_the_predicates_of_discover(source_type, config_n
     # Every item a full discovery yields is found again, and nothing else is.
     assert sorted(found) == sorted(discovered)
     assert len(candidates) > len(found)
+
+
+# ---------------------------------------------------------------------------
+# close
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("source_type", "config_name"), LISTING_CASES)
+async def test_close_releases_every_client_the_gene_opened(source_type, config_name) -> None:
+    fakes = fakes_for(source_type)
+    async with fakes.connect(fakes.listing_configs[config_name].config) as connection:
+        await connection.gene.list_scope()
+        assert connection.clients
+        assert not any(client.is_closed for client in connection.clients)
+
+        await connection.gene.close()
+
+        assert all(client.is_closed for client in connection.clients)
+        # Closing again does nothing.
+        await connection.gene.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_type", DOCUMENT_TYPES)
+async def test_close_before_authenticate_does_nothing(source_type) -> None:
+    fakes = fakes_for(source_type)
+    configs = [
+        *(listing.config for listing in fakes.listing_configs.values()),
+        *fakes.non_listing_configs.values(),
+        *fakes.device_configs.values(),
+    ]
+    for config in configs:
+        gene = create_gene(source_type, dict(config), "src-contract")
+        await gene.close()
+        await gene.close()

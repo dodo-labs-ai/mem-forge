@@ -21,7 +21,7 @@ def _canonical_scope(scope: dict[str, object]) -> dict[str, object]:
 
 
 def _validate_config(config: dict[str, Any], existing_config: Mapping[str, Any]) -> None:
-    from memforge.genes.atlassian_auth import require_https_base_url
+    from memforge.genes.toolkit.config import require_https_base_url
 
     base_url = _ensure_base_url(config, existing_config)
     require_https_base_url(base_url, "GitHub Pages")
@@ -104,7 +104,7 @@ def _site_root_from_url(url: str) -> str:
 def _validate_scope_url(base_url: str, candidate_url: str, label: str) -> None:
     from urllib.parse import urlsplit
 
-    from memforge.genes.atlassian_auth import require_https_base_url
+    from memforge.genes.toolkit.config import require_https_base_url
 
     require_https_base_url(candidate_url, f"GitHub Pages {label}")
     base = urlsplit(base_url)

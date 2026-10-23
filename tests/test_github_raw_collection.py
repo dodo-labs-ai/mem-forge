@@ -7,10 +7,13 @@ import sys
 import hashlib
 from tempfile import TemporaryFile
 
+import httpx
 import pytest
 
+from memforge.genes import github_repo_gene
 from memforge.genes.github_repo_gene import GitHubRepoGene
 from memforge import main
+from tests.connector_http_fixture import FakeConnectorHttp
 from tests.test_cli_agent_tools import FakeToolClient, _cloud_test_client
 
 
@@ -71,7 +74,6 @@ class RepositorySession:
             return Response({"sha": self.sha, "size": self.size,
                              "encoding": "base64", "content": base64.b64encode(b"transformed").decode()})
         if "/git/blobs/" in url:
-            assert kwargs["stream"] is True
             assert kwargs["headers"]["Accept"] == "application/vnd.github.raw+json"
             return Response(body=self.body)
         raise AssertionError(url)
@@ -80,14 +82,43 @@ class RepositorySession:
         pass
 
 
+class _Chunks(httpx.AsyncByteStream):
+    """A raw body handed to the client chunk by chunk, read only as far as the client reads."""
+
+    def __init__(self, response: Response) -> None:
+        self._response = response
+
+    async def __aiter__(self):
+        for chunk in self._response.iter_content(65_536):
+            yield chunk
+
+
+async def _cloud_gene(session: RepositorySession) -> GitHubRepoGene:
+    """A cloud-pull Gene whose GitHub requests ``session`` answers."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        response = session.get(str(request.url), headers=request.headers)
+        if response.payload is not None:
+            return httpx.Response(200, json=response.payload)
+        # Header values as the bytes a server sends, which may be any UTF-8.
+        headers = [(name.encode(), value.encode()) for name, value in response.headers.items()]
+        return httpx.Response(200, headers=headers, stream=_Chunks(response))
+
+    gene = GitHubRepoGene(
+        config={"connection_mode": "cloud_pull", "repo_url": "https://github.com/example/repo", "ref": "main"},
+        source_id="src-test",
+    )
+    with FakeConnectorHttp(handle).serving(github_repo_gene):
+        await gene.authenticate()
+    return gene
+
+
 @pytest.fixture
-def cloud_collection(monkeypatch):
+async def cloud_collection():
     session = RepositorySession()
-    monkeypatch.setattr("memforge.genes.github_repo_gene.requests.Session", lambda: session)
-    gene = GitHubRepoGene(config={"connection_mode": "cloud_pull",
-                                "repo_url": "https://github.com/example/repo", "ref": "main"},
-                          source_id="src-test")
-    return gene, session
+    gene = await _cloud_gene(session)
+    yield gene, session
+    await gene.close()
 
 
 @pytest.mark.asyncio
@@ -259,7 +290,7 @@ async def test_malformed_symlink_tree_entry_fails_instead_of_disappearing(cloud_
 
 
 @pytest.mark.asyncio
-async def test_cloud_collection_resolves_selected_text_symlink_at_pinned_tree(monkeypatch):
+async def test_cloud_collection_resolves_selected_text_symlink_at_pinned_tree():
     link_target = b"docs/CONTRIBUTIONS.md"
     link_sha = hashlib.sha1(
         b"blob " + str(len(link_target)).encode() + b"\0" + link_target
@@ -292,11 +323,7 @@ async def test_cloud_collection_resolves_selected_text_symlink_at_pinned_tree(mo
             raise AssertionError(url)
 
     session = SymlinkSession()
-    monkeypatch.setattr("memforge.genes.github_repo_gene.requests.Session", lambda: session)
-    gene = GitHubRepoGene(
-        config={"connection_mode": "cloud_pull", "repo_url": "https://github.com/example/repo", "ref": "main"},
-        source_id="src-test",
-    )
+    gene = await _cloud_gene(session)
 
     items = [item async for item in gene.discover()]
     readme = next(item for item in items if item.extra["relative_path"] == "README.md")
@@ -317,7 +344,7 @@ async def test_cloud_collection_resolves_selected_text_symlink_at_pinned_tree(mo
 
 
 @pytest.mark.asyncio
-async def test_cloud_collection_rejects_text_symlink_to_binary_target(monkeypatch):
+async def test_cloud_collection_rejects_text_symlink_to_binary_target():
     link_target = b"assets/photo.png"
     link_sha = hashlib.sha1(
         b"blob " + str(len(link_target)).encode() + b"\0" + link_target
@@ -340,11 +367,7 @@ async def test_cloud_collection_rejects_text_symlink_to_binary_target(monkeypatc
             raise AssertionError(url)
 
     session = BinaryTargetSession()
-    monkeypatch.setattr("memforge.genes.github_repo_gene.requests.Session", lambda: session)
-    gene = GitHubRepoGene(
-        config={"connection_mode": "cloud_pull", "repo_url": "https://github.com/example/repo", "ref": "main"},
-        source_id="src-test",
-    )
+    gene = await _cloud_gene(session)
 
     with pytest.raises(RuntimeError, match="binary Artifact"):
         [item async for item in gene.discover()]

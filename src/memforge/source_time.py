@@ -11,12 +11,22 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
 SOURCE_UPDATED_AT_KEY = "source_updated_at"
 """``NormalizedContent.source_semantics`` key for the time of a Unit's body."""
+
+WESTERNMOST_ZONE = timezone(timedelta(hours=-12), "UTC-12")
+"""UTC-12, the westernmost offset in use, where a local time names its latest instant.
+
+A wall-clock time with no offset, such as ``2026-03-01 15:00``, names a
+different instant in every timezone, and the latest of them is the one at
+UTC-12: 2026-03-02 03:00 UTC. Comparing that instant with ``since`` never
+hides a change. Written at UTC-12, an instant reads back in any timezone as
+itself or earlier.
+"""
 
 
 def parse_source_time(value: object) -> datetime | None:

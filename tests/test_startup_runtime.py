@@ -1959,9 +1959,13 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
     class FakeGene:
         def __init__(self) -> None:
             self.auth_calls = 0
+            self.closed = False
 
         async def authenticate(self) -> None:
             self.auth_calls += 1
+
+        async def close(self) -> None:
+            self.closed = True
 
     class FakeRuntime:
         lifecycle_cycle_id = None
@@ -2026,6 +2030,7 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
     )
 
     assert gene.auth_calls == 1
+    assert gene.closed
     assert fake_runtime.lifecycle_cycle_id == "source-sync-run-1"
 
 

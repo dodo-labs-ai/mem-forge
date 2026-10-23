@@ -3,30 +3,33 @@
 from __future__ import annotations
 
 import hashlib
-import asyncio
 import logging
 import re
 import xml.etree.ElementTree as ET
 from collections import deque
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 
-import requests
+import httpx
 from bs4 import BeautifulSoup
 
-from memforge.genes.atlassian_auth import require_https_base_url, resolve_pat, tls_verify
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.document_gene import DocumentGene
-from memforge.github_repo_utils import (
-    decode_github_contents_payload,
-    github_latest_commit_time,
-    github_path_commits_query,
-    validate_github_tree_payload,
+from memforge.genes.toolkit.config import (
+    bool_config,
+    int_config,
+    list_config,
+    require_https_base_url,
+    resolve_pat,
+    tls_verify,
 )
+from memforge.genes.toolkit.github_api import GitHubApi, GitHubRepository, github_rate_limit_wait
+from memforge.genes.toolkit.http import ConnectorHttpClient
+from memforge.github_repo_utils import decode_github_contents_payload
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -42,7 +45,7 @@ from memforge.models import (
 )
 from memforge.pipeline.normalizer_utils import annotate_code_blocks, html_to_markdown, strip_boilerplate
 from memforge.repo_identity import normalize_repo_identifier
-from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time
+from memforge.source_time import SOURCE_UPDATED_AT_KEY, WESTERNMOST_ZONE, parse_source_time
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +60,9 @@ DEFAULT_MAX_DEPTH = 5
 DEFAULT_MAX_PAGES = 200
 # ``ContentItem.extra`` key for the page's source time: its commit time in
 # repository mode, else its sitemap ``lastmod`` or HTTP ``Last-Modified``.
+# ``ContentItem.last_modified`` is the discovery marker compared with
+# ``since``: the source time, except that a sitemap page's marker is the later
+# of its ``lastmod`` marker (see ``_Lastmod``) and its HTTP ``Last-Modified``.
 CONTENT_UPDATED_AT_KEY = "content_updated_at"
 
 
@@ -68,11 +74,19 @@ class _RepoRef:
     repo: str
     page_path: str
 
+    @property
+    def repository(self) -> GitHubRepository:
+        return GitHubRepository(origin=self.origin, owner=self.owner, name=self.repo)
+
 
 class GitHubPagesGene(DocumentGene):
     """Rendered GitHub Pages documentation source."""
 
     listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
+    # Opened by ``authenticate``; reads the published site and, with a token, its repository.
+    _client: ConnectorHttpClient | None = None
+    # Each repository's branch and tree, by API URL, read once per connection.
+    _branch_trees: dict[str, tuple[str, list[dict]]]
 
     @classmethod
     def metadata(cls) -> GeneMetadata:
@@ -220,14 +234,45 @@ class GitHubPagesGene(DocumentGene):
         if auth_mode == AUTH_MODE_GITHUB_PAT:
             headers["Authorization"] = f"Bearer {resolve_pat(self.config, 'GitHub Pages')}"
 
+        await self.close()
         self._base_url = base_url
         self._auth_mode = auth_mode
-        self._client = _RequestsAsyncClient(
+        self._client = ConnectorHttpClient(
+            product_name="GitHub Pages",
             headers=headers,
             timeout=30.0,
+            verify=tls_verify(self.config, honor_requests_ca_bundle=True),
             follow_redirects=True,
-            verify=tls_verify(self.config),
+            fail_fast=_refuse_login_page,
+            rate_limit=github_rate_limit_wait,
         )
+
+    def _connected_client(self) -> ConnectorHttpClient:
+        if self._client is None:
+            raise RuntimeError("GitHub Pages is not connected: call authenticate() first")
+        return self._client
+
+    async def close(self) -> None:
+        """Release the client and forget the branch trees read through it, so the next run reads them afresh."""
+        await super().close()
+        self._branch_trees = {}
+
+    def _github(self, ref: _RepoRef) -> GitHubApi:
+        """The REST API of the repository a Pages URL is published from."""
+        return GitHubApi(self._connected_client(), ref.repository, label="GitHub Pages repository")
+
+    async def _branch_tree(self, ref: _RepoRef) -> tuple[str, list[dict]]:
+        """The configured branch, else the default one, of the repository a Pages URL is published from, and its tree.
+
+        Each repository's tree is read once per connection, however many
+        configured pages it publishes; ``authenticate`` and ``close`` forget it.
+        """
+        github = self._github(ref)
+        api_url = ref.repository.api_url
+        if api_url not in self._branch_trees:
+            branch = str(self.config.get("branch") or "").strip() or await github.default_branch()
+            self._branch_trees[api_url] = (branch, await github.tree(branch))
+        return self._branch_trees[api_url]
 
     @classmethod
     def lists_scope(cls, config: Mapping[str, Any]) -> bool:
@@ -242,7 +287,7 @@ class GitHubPagesGene(DocumentGene):
             return True
         if _sync_mode(config) != SYNC_MODE_SUBTREE:
             return False
-        return _auth_mode(config) == AUTH_MODE_GITHUB_PAT or _bool_config(config, "sitemap_authoritative", False)
+        return _auth_mode(config) == AUTH_MODE_GITHUB_PAT or bool_config(config, "sitemap_authoritative", default=False)
 
     @classmethod
     def unlisted_scope_mode(cls, config: Mapping[str, Any]) -> UnlistedScopeMode:
@@ -290,7 +335,7 @@ class GitHubPagesGene(DocumentGene):
         """The page of a single-page Source, or the pages of an explicit list."""
         if _sync_mode(self.config) == SYNC_MODE_SINGLE_PAGE:
             return [str(self.config.get("page_url") or "").strip()]
-        return _list_config(self.config.get("pages"))
+        return list_config(self.config.get("pages"))
 
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         mode = _sync_mode(self.config)
@@ -313,7 +358,7 @@ class GitHubPagesGene(DocumentGene):
                 yield item
             return
 
-        if _bool_config(self.config, "sitemap_authoritative", False):
+        if bool_config(self.config, "sitemap_authoritative", default=False):
             # The site declares its sitemap exhaustive: a page it no longer
             # lists is no longer published. A sitemap that cannot be read
             # fails discovery; the link crawl would list less.
@@ -341,7 +386,7 @@ class GitHubPagesGene(DocumentGene):
     async def fetch(self, item: ContentItem) -> RawContent:
         repo_api_url = item.extra.get("repo_api_url")
         if repo_api_url:
-            response = await self._client.get(str(repo_api_url))
+            response = await self._connected_client().get(str(repo_api_url))
             response.raise_for_status()
             payload = response.json()
             try:
@@ -364,7 +409,7 @@ class GitHubPagesGene(DocumentGene):
                 ),
             )
 
-        response = await self._client.get(item.source_url)
+        response = await self._connected_client().get(item.source_url)
         response.raise_for_status()
         self._validate_http_response_identity(response, item.source_url)
         expected_hash = str(item.extra.get("http_content_sha256") or "").strip()
@@ -442,10 +487,9 @@ class GitHubPagesGene(DocumentGene):
         return NormalizedContent(item=raw.item, markdown_body=markdown, source_semantics=source_semantics)
 
     async def health_check(self) -> dict:
+        """Whether the site answers ``HEAD`` below 400; ``authenticate`` first, or the answer is unhealthy."""
         try:
-            if not hasattr(self, "_client"):
-                await self.authenticate()
-            response = await self._client.head(self._base_url)
+            response = await self._connected_client().request("HEAD", self._base_url)
             return {"healthy": response.status_code < 400, "status_code": response.status_code}
         except Exception as exc:
             return {"healthy": False, "error": str(exc)}
@@ -458,7 +502,7 @@ class GitHubPagesGene(DocumentGene):
         if self._auth_mode == AUTH_MODE_GITHUB_PAT:
             return await self._repo_file_item_for_url(canonical_url)
         # Build identity and revision from the same successful body response.
-        response = await self._client.get(canonical_url)
+        response = await self._connected_client().get(canonical_url)
         response.raise_for_status()
         self._validate_http_response_identity(response, canonical_url)
         return self._content_item_from_http_response(canonical_url, dict(response.headers), response.content)
@@ -519,10 +563,7 @@ class GitHubPagesGene(DocumentGene):
         ref = _repo_ref_from_pages_url(canonical_url)
         if ref is None:
             raise ValueError(_repository_backed_pages_url_error())
-        branch = str(self.config.get("branch") or "").strip()
-        if not branch:
-            branch = await self._default_branch(ref)
-        tree = await self._repo_tree(ref, branch)
+        branch, tree = await self._branch_tree(ref)
         repo_path, blob_sha = _resolve_repo_markdown_path(ref.page_path, tree)
         if not repo_path:
             raise RuntimeError(
@@ -542,10 +583,7 @@ class GitHubPagesGene(DocumentGene):
         ref = _repo_ref_from_pages_url(root_url)
         if ref is None:
             raise ValueError(_repository_backed_pages_url_error())
-        branch = str(self.config.get("branch") or "").strip()
-        if not branch:
-            branch = await self._default_branch(ref)
-        tree = await self._repo_tree(ref, branch)
+        branch, tree = await self._branch_tree(ref)
         entries = _repo_markdown_entries_under_page_path(ref.page_path, tree)
 
         page_urls: list[str] = []
@@ -577,34 +615,15 @@ class GitHubPagesGene(DocumentGene):
             {_page_doc_id(page_url) for page_url, _repo_path, _blob_sha in scoped_entries},
         )
 
-    async def _default_branch(self, ref: "_RepoRef") -> str:
-        response = await self._client.get(_repo_api_url(ref))
-        response.raise_for_status()
-        payload = response.json()
-        branch = str(payload.get("default_branch") or "").strip() if isinstance(payload, dict) else ""
-        if not branch:
-            raise RuntimeError("GitHub Pages repository response is missing default_branch")
-        return branch
-
-    async def _repo_tree(self, ref: "_RepoRef", branch: str) -> list[dict]:
-        response = await self._client.get(f"{_repo_api_url(ref)}/git/trees/{branch}?recursive=1")
-        response.raise_for_status()
-        payload = response.json()
-        try:
-            return validate_github_tree_payload(payload, label="GitHub Pages repository")
-        except ValueError as exc:
-            raise RuntimeError(str(exc)) from exc
-
     async def _repo_path_commit_time(self, ref: "_RepoRef", branch: str, repo_path: str) -> datetime | None:
-        """The page file's latest commit time on ``branch``; None when GitHub gives none."""
+        """The page file's latest commit time on ``branch``; None when GitHub lists none or refuses."""
 
-        query = github_path_commits_query(relative_path=repo_path, ref=branch)
-        response = await self._client.get(f"{_repo_api_url(ref)}/commits?{query}")
-        if response.status_code >= 400:
+        try:
+            return parse_source_time(await self._github(ref).latest_commit_time(repo_path, ref=branch))
+        except httpx.HTTPStatusError:
             return None
-        return parse_source_time(github_latest_commit_time(response.json()))
 
-    async def _authoritative_sitemap_scope(self) -> tuple[str, list[str]]:
+    async def _authoritative_sitemap_scope(self) -> tuple[bytes, list[str]]:
         """The sitemap a site declares complete, read as :meth:`_sitemap_scope` reads it, or raise.
 
         A missing sitemap, one that cannot be fetched or parsed, and one that
@@ -612,21 +631,21 @@ class GitHubPagesGene(DocumentGene):
         publishes.
         """
         sitemap_url = self._sitemap_url()
-        response = await self._client.get(sitemap_url)
+        response = await self._connected_client().get(sitemap_url)
         response.raise_for_status()
-        sitemap_kind, urls = _urls_from_sitemap(response.text)
+        sitemap_kind, urls = _urls_from_sitemap(response.content)
         if sitemap_kind != "urlset":
             raise RuntimeError(f"The GitHub Pages sitemap at {sitemap_url} is a {sitemap_kind}, not a urlset")
-        return response.text, self._scoped_sitemap_urls(urls)
+        return response.content, self._scoped_sitemap_urls(urls)
 
-    async def _sitemap_scope(self) -> tuple[str, list[str]] | None:
-        """The sitemap's text and its page URLs in scope; ``None`` when the site has no urlset sitemap."""
+    async def _sitemap_scope(self) -> tuple[bytes, list[str]] | None:
+        """The sitemap's bytes and its page URLs in scope; ``None`` when the site has no urlset sitemap."""
         sitemap_url = self._sitemap_url()
         try:
-            response = await self._client.get(sitemap_url)
+            response = await self._connected_client().get(sitemap_url)
             if response.status_code >= 400:
                 return None
-            sitemap_kind, urls = _urls_from_sitemap(response.text)
+            sitemap_kind, urls = _urls_from_sitemap(response.content)
         except Exception:
             logger.debug("GitHub Pages sitemap discovery failed for %s", sitemap_url, exc_info=True)
             return None
@@ -637,7 +656,7 @@ class GitHubPagesGene(DocumentGene):
                 sitemap_url,
             )
             return None
-        return response.text, self._scoped_sitemap_urls(urls)
+        return response.content, self._scoped_sitemap_urls(urls)
 
     def _sitemap_url(self) -> str:
         return urljoin(self._base_url.rstrip("/") + "/", "sitemap.xml")
@@ -650,23 +669,24 @@ class GitHubPagesGene(DocumentGene):
         scoped = sorted(url for url in canonical_urls if self._url_is_in_scope(url))
         return _limit_urls(scoped, _max_pages(self.config))
 
-    async def _sitemap_items(self, sitemap: tuple[str, list[str]]) -> list[ContentItem]:
-        sitemap_text, page_urls = sitemap
+    async def _sitemap_items(self, sitemap: tuple[bytes, list[str]]) -> list[ContentItem]:
+        sitemap_xml, page_urls = sitemap
         items: list[ContentItem] = []
         for url in page_urls:
-            lastmod = _lastmod_for_url(sitemap_text, url)
-            if lastmod:
-                item = await self._content_item_for_url(url)
-                item.last_modified = lastmod
-                item.extra[CONTENT_UPDATED_AT_KEY] = lastmod.isoformat()
-            else:
-                item = await self._content_item_for_url(url)
+            item = await self._content_item_for_url(url)
+            lastmod = _lastmod_for_url(sitemap_xml, url)
+            if lastmod is not None:
+                # A lastmod may be the commit time, which a deploy can follow
+                # by hours; the page's own Last-Modified is the deploy time.
+                served_at = parse_source_time(item.extra.get(CONTENT_UPDATED_AT_KEY))
+                item.last_modified = max(lastmod.discovery_marker, served_at or lastmod.discovery_marker)
+                item.extra[CONTENT_UPDATED_AT_KEY] = lastmod.source_time.isoformat()
             items.append(item)
         return items
 
     async def _discover_bfs(self, since: datetime | None) -> AsyncIterator[ContentItem]:
         root_url = self._require_in_site(str(self.config.get("root_url") or ""))
-        max_depth = _int_config(self.config, "max_depth", DEFAULT_MAX_DEPTH)
+        max_depth = int_config(self.config, "max_depth", default=DEFAULT_MAX_DEPTH)
         max_pages = _max_pages(self.config)
         queue: deque[tuple[str, int]] = deque([(root_url, 0)])
         seen: set[str] = set()
@@ -684,7 +704,7 @@ class GitHubPagesGene(DocumentGene):
                     "or Exclude URL Patterns, then retry."
                 )
             discovered += 1
-            response = await self._client.get(url)
+            response = await self._connected_client().get(url)
             response.raise_for_status()
             self._validate_http_response_identity(response, url)
             item = self._content_item_from_http_response(url, dict(response.headers), response.content)
@@ -692,7 +712,7 @@ class GitHubPagesGene(DocumentGene):
                 yield item
             if depth >= max_depth:
                 continue
-            for link in _links_from_html(response.text, base_url=url):
+            for link in _links_from_html(response.content, base_url=url, encoding=response.charset_encoding):
                 canonical = _canonicalize_url(link)
                 if canonical not in seen and self._url_is_in_scope(canonical):
                     queue.append((canonical, depth + 1))
@@ -720,47 +740,7 @@ class GitHubPagesGene(DocumentGene):
         if mode == SYNC_MODE_SUBTREE and root:
             if not _path_is_under(canonical_url, root):
                 return False
-        return not _matches_any(canonical_url, _list_config(self.config.get("exclude_url_patterns")))
-
-
-class _RequestsAsyncClient:
-    def __init__(
-        self,
-        *,
-        headers: dict[str, str],
-        timeout: float,
-        follow_redirects: bool,
-        verify: bool | str,
-    ) -> None:
-        self._session = requests.Session()
-        self._session.headers.update(headers)
-        self._timeout = timeout
-        self._follow_redirects = follow_redirects
-        self._verify = verify
-
-    async def get(self, url: str) -> requests.Response:
-        return await asyncio.to_thread(self._request, "GET", url)
-
-    async def head(self, url: str) -> requests.Response:
-        return await asyncio.to_thread(self._request, "HEAD", url)
-
-    async def aclose(self) -> None:
-        await asyncio.to_thread(self._session.close)
-
-    def _request(self, method: str, url: str) -> requests.Response:
-        response = self._session.request(
-            method,
-            url,
-            timeout=self._timeout,
-            allow_redirects=self._follow_redirects,
-            verify=self._verify,
-        )
-        if _is_github_login_response(response):
-            raise RuntimeError(
-                "GitHub Pages returned the login page. Check that the PAT can access the published page, "
-                "or use a public/no-auth page."
-            )
-        return response
+        return not _matches_any(canonical_url, list_config(self.config.get("exclude_url_patterns")))
 
 
 def _auth_mode(config: dict) -> str:
@@ -772,7 +752,7 @@ def _scope_url_for_config(config: dict) -> str:
     if mode == SYNC_MODE_SUBTREE:
         return str(config.get("root_url") or "")
     if mode == SYNC_MODE_EXPLICIT_LIST:
-        pages = _list_config(config.get("pages"))
+        pages = list_config(config.get("pages"))
         return pages[0] if pages else ""
     return str(config.get("page_url") or "")
 
@@ -782,29 +762,7 @@ def _sync_mode(config: dict) -> str:
 
 
 def _max_pages(config: dict) -> int:
-    return _int_config(config, "max_pages", DEFAULT_MAX_PAGES)
-
-
-def _int_config(config: dict, key: str, default: int) -> int:
-    try:
-        return max(int(config.get(key, default)), 1)
-    except (TypeError, ValueError):
-        return default
-
-
-def _list_config(value: object) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
-    return []
-
-
-def _bool_config(config: dict, key: str, default: bool) -> bool:
-    value = config.get(key, default)
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    return int_config(config, "max_pages", default=DEFAULT_MAX_PAGES)
 
 
 def _canonicalize_url(url: str) -> str:
@@ -887,12 +845,8 @@ def _repo_identifier_for_item(item: ContentItem) -> str | None:
     return identifier
 
 
-def _repo_api_url(ref: _RepoRef) -> str:
-    return f"{ref.origin}/api/v3/repos/{ref.owner}/{ref.repo}"
-
-
 def _repo_contents_url(ref: _RepoRef, repo_path: str, branch: str) -> str:
-    return f"{_repo_api_url(ref)}/contents/{quote(repo_path, safe='/')}?ref={quote(branch, safe='')}"
+    return f"{ref.repository.api_url}/contents/{quote(repo_path, safe='/')}?ref={quote(branch, safe='')}"
 
 
 def _resolve_repo_markdown_path(page_path: str, tree: list[dict]) -> tuple[str, str]:
@@ -1026,9 +980,49 @@ def _last_modified_from_headers(headers: dict[str, str]) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _lastmod_for_url(sitemap_text: str, url: str) -> datetime | None:
+@dataclass(frozen=True)
+class _Lastmod:
+    """A sitemap ``lastmod``, as the page's source time and as its discovery marker.
+
+    W3C Datetime lets ``lastmod`` stop at the date or the minute, and leave
+    out the offset, so it may name a span of time rather than one instant.
+    MkDocs, for example, stamps every page with the build date: ``2026-03-01``.
+
+    - ``source_time`` reads it as written, at UTC when it has no offset:
+      ``2026-03-01T00:00:00+00:00``.
+    - ``discovery_marker``, compared with ``since``, is the latest instant it
+      can name: the end of the span it states, at UTC-12 when it has no offset.
+
+    ======================== ====================================
+    ``lastmod``              ``discovery_marker`` (UTC)
+    ======================== ====================================
+    ``2026-03-01``           ``2026-03-02T11:59:59.999999``
+    ``2026-03-01T15:00``     ``2026-03-02T03:00:59.999999``
+    ``2026-03-01T15:00Z``    ``2026-03-01T15:00:59.999999``
+    ``2026-03-01T15:00:30Z`` ``2026-03-01T15:00:30``
+    ======================== ====================================
+
+    Read as its start, a date-only page rebuilt at 14:00 UTC after a 09:30
+    run would compare earlier than the next ``since`` and be hidden; so would
+    an edit at 15:00:30 stamped ``15:00Z`` for ``since`` 15:00:10. A value with
+    seconds is taken as exact.
+
+    The page's item compares the later of this marker and the page's HTTP
+    ``Last-Modified``, when it has one. A generator that writes the commit
+    time as ``lastmod`` (Hugo with ``enableGitInfo``, the MkDocs git revision
+    plugin) can be deployed hours after the commit, and after a run started;
+    the deploy time, which GitHub Pages serves as ``Last-Modified``, still
+    finds the page. Without ``Last-Modified`` the marker alone stays the
+    same from run to run, so an unchanged page reads as the same revision.
+    """
+
+    source_time: datetime
+    discovery_marker: datetime
+
+
+def _lastmod_for_url(sitemap_xml: bytes, url: str) -> _Lastmod | None:
     try:
-        root = ET.fromstring(sitemap_text)
+        root = ET.fromstring(sitemap_xml)
     except ET.ParseError:
         return None
     namespace = _xml_namespace(root.tag)
@@ -1039,8 +1033,40 @@ def _lastmod_for_url(sitemap_text: str, url: str) -> datetime | None:
         lastmod_node = node.find(f"{namespace}lastmod")
         if lastmod_node is None or not lastmod_node.text:
             return None
-        return _parse_datetime(lastmod_node.text.strip())
+        return _parse_lastmod(lastmod_node.text.strip())
     return None
+
+
+def _parse_lastmod(value: str) -> _Lastmod | None:
+    """A sitemap ``lastmod`` (see :class:`_Lastmod`), or ``None`` when it is not an ISO 8601 date or time."""
+    source_time = _parse_datetime(value)
+    if source_time is None:
+        return None
+    start = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=WESTERNMOST_ZONE)
+    span = _stated_span(value)
+    marker = start + span - timedelta(microseconds=1) if span else start
+    return _Lastmod(source_time=source_time, discovery_marker=marker.astimezone(timezone.utc))
+
+
+# The clock of an ISO 8601 time: hours, then minutes and seconds when stated.
+_ISO_CLOCK = re.compile(r"\d{2}(?::?(\d{2}))?(?::?(\d{2}))?")
+
+
+def _stated_span(value: str) -> timedelta:
+    """How long the time an ISO 8601 value states lasts, at the precision it states it.
+
+    A day for ``2026-03-01``, an hour for ``…T15``, a minute for ``…T15:00``,
+    and nothing for a value with seconds, which is exact.
+    """
+    parts = re.split(r"[T ]", value, maxsplit=1)
+    if len(parts) == 1:
+        return timedelta(days=1)
+    clock = _ISO_CLOCK.match(parts[1])
+    if clock is None or clock.group(2) is not None:
+        return timedelta(0)
+    return timedelta(minutes=1) if clock.group(1) is not None else timedelta(hours=1)
 
 
 def _parse_datetime(value: str) -> datetime | None:
@@ -1053,8 +1079,9 @@ def _parse_datetime(value: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _urls_from_sitemap(sitemap_text: str) -> tuple[str, list[str]]:
-    root = ET.fromstring(sitemap_text)
+def _urls_from_sitemap(sitemap_xml: bytes) -> tuple[str, list[str]]:
+    """The root element's name and every ``<loc>``; the XML declares its own encoding, UTF-8 by default."""
+    root = ET.fromstring(sitemap_xml)
     namespace = _xml_namespace(root.tag)
     root_name = root.tag.rsplit("}", 1)[-1]
     if root_name not in {"urlset", "sitemapindex"}:
@@ -1072,8 +1099,14 @@ def _xml_namespace(tag: str) -> str:
     return ""
 
 
-def _links_from_html(html: str, *, base_url: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
+def _links_from_html(html: bytes, *, base_url: str, encoding: str | None = None) -> list[str]:
+    """Every followable link of a page, absolute.
+
+    The page is decoded by the charset its response declares, else by its own
+    ``<meta charset>``, else as UTF-8 or Windows-1252, so a link is read
+    correctly whatever the page's encoding.
+    """
+    soup = BeautifulSoup(html, "html.parser", from_encoding=encoding)
     links: list[str] = []
     for anchor in soup.find_all("a", href=True):
         href = str(anchor.get("href") or "").strip()
@@ -1103,7 +1136,20 @@ def _matches_any(value: str, patterns: list[str]) -> bool:
     return False
 
 
-def _is_github_login_response(response: requests.Response) -> bool:
+def _refuse_login_page(response: httpx.Response) -> None:
+    """Raise when GitHub answered with its login page, at the end of a redirect or on the way to it.
+
+    The client runs it on every response, so a token that cannot see the site
+    fails with this message instead of syncing the login page as content.
+    """
+    if _is_github_login_response(response):
+        raise RuntimeError(
+            "GitHub Pages returned the login page. Check that the PAT can access the published page, "
+            "or use a public/no-auth page."
+        )
+
+
+def _is_github_login_response(response: httpx.Response) -> bool:
     final_path = urlsplit(str(response.url)).path.rstrip("/")
     if final_path == "/login":
         return True
@@ -1115,11 +1161,17 @@ def _is_github_login_response(response: requests.Response) -> bool:
 
 
 def _is_modified_since(last_modified: datetime, since: datetime | None) -> bool:
+    """Whether a page whose discovery marker is ``last_modified`` changed at or after ``since``.
+
+    A page's times have whole seconds (HTTP ``Last-Modified``, commit times,
+    most sitemaps), so ``since`` is compared at whole seconds too: a page
+    stamped 09:30:10 is yielded for ``since`` 09:30:10.5.
+    """
     if since is None:
         return True
     candidate = last_modified if last_modified.tzinfo else last_modified.replace(tzinfo=timezone.utc)
     baseline = since if since.tzinfo else since.replace(tzinfo=timezone.utc)
-    return candidate > baseline
+    return candidate >= baseline.replace(microsecond=0)
 
 
 def _extract_article_html(html: str) -> str:

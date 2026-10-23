@@ -1,26 +1,31 @@
 """A fake Confluence: one page tree in space PAY, a page in space OPS, and the REST API v1 over them.
 
-Space PAY holds root 100 with children 101 and 102; 102 carries the excluded
-label ``draft`` and has a child 103. Discovery of the page tree therefore
-visits 100, 101 and 102 and yields 100 and 101; discovery of the space visits
-every PAY page and yields all but 102. Page 200 is in space OPS, outside both
-scopes, 150 is a blog post in PAY, which no page listing returns, and page 300
-is gone.
+Space PAY holds root 100 with children 101, 102 and 104; 102 carries the
+excluded label ``draft`` and has a child 103. Discovery of the page tree
+therefore visits 100, 101, 102 and 104 and yields 100, 101 and 104; discovery
+of the space visits every PAY page and yields all but 102. Page 104 was edited
+in the cursor's minute. Page 200 is in space OPS, outside both scopes, 150 is
+a blog post in PAY, which no page listing returns, and page 300 is gone.
+
+Each page's ``version.when`` is a full timestamp, as Confluence answers it,
+and discovery compares it with ``since`` itself.
 """
 
 from __future__ import annotations
 
-import functools
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
-from datetime import datetime
-from unittest.mock import patch
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 
 import httpx
 
+from memforge.genes import confluence_gene
 from memforge.genes.confluence_gene import ConfluenceGene
 from memforge.models import ContentItem
+from tests.connector_http_fixture import FakeConnectorHttp
 from tests.contracts.document_fakes import (
+    IN_THE_CURSOR_MINUTE,
     LONG_AGO,
     RECENTLY,
     DocumentConnectorFakes,
@@ -30,7 +35,6 @@ from tests.contracts.document_fakes import (
 )
 
 BASE_URL = "https://wiki.example.test"
-_REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 # content id -> (space, parent page id, labels, changed at)
 PAGES: dict[str, tuple[str, str | None, tuple[str, ...], datetime]] = {
@@ -38,6 +42,7 @@ PAGES: dict[str, tuple[str, str | None, tuple[str, ...], datetime]] = {
     "101": ("PAY", "100", (), RECENTLY),
     "102": ("PAY", "100", ("draft",), LONG_AGO),
     "103": ("PAY", "102", (), RECENTLY),
+    "104": ("PAY", "100", (), IN_THE_CURSOR_MINUTE),
     "150": ("PAY", "100", (), RECENTLY),
     "200": ("OPS", None, (), RECENTLY),
 }
@@ -85,6 +90,10 @@ class _Provider:
         self.listing = listing
         self.read_status = read_status
         self.requests: list[str] = []
+        self.http = FakeConnectorHttp(self.handle)
+
+    def connection(self, gene: ConfluenceGene) -> FakeConnection:
+        return FakeConnection(gene=gene, requests=self.requests, clients=self.http.clients, waits=self.http.waits)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(f"{request.method} {request.url}")
@@ -98,8 +107,7 @@ class _Provider:
         if self.read_status is not None:
             if self.read_status == 200:
                 return httpx.Response(200, json=_page("101"))
-            headers = {"Retry-After": "0"} if self.read_status == 429 else {}
-            return httpx.Response(self.read_status, json={}, headers=headers)
+            return httpx.Response(self.read_status, json={}, headers=_wait_headers(self.read_status))
         if page_id not in PAGES:
             return httpx.Response(404, json={"message": "No content found"})
         return httpx.Response(200, json=_page(page_id))
@@ -124,9 +132,19 @@ class _Provider:
 
 
 class ConfluenceFakes(DocumentConnectorFakes):
+    # 30 s in seconds on 429; an HTTP date 30 s ahead on 503, read to the whole second.
+    retry_waits = {429: (30.0, 30.0), 503: (29.0, 30.0)}
     listing_configs = {
-        "page-tree": ListingConfig({**_CONNECTION, "page_tree_root": "100", "include_children": True}, walks_scope=True),
-        "space": ListingConfig({**_CONNECTION, "sync_mode": "space", "spaces": ["PAY"]}, walks_scope=True),
+        "page-tree": ListingConfig(
+            {**_CONNECTION, "page_tree_root": "100", "include_children": True},
+            walks_scope=True,
+            edited_in_the_cursor_minute="confluence-104",
+        ),
+        "space": ListingConfig(
+            {**_CONNECTION, "sync_mode": "space", "spaces": ["PAY"]},
+            walks_scope=True,
+            edited_in_the_cursor_minute="confluence-104",
+        ),
     }
 
     @asynccontextmanager
@@ -138,19 +156,19 @@ class ConfluenceFakes(DocumentConnectorFakes):
         provider = _Provider(listing)
         gene = await _authenticated(dict(config), provider)
         try:
-            yield FakeConnection(gene=gene, requests=provider.requests)
+            yield provider.connection(gene)
         finally:
-            await gene._client.aclose()
+            await gene.close()
 
     @asynccontextmanager
-    async def reading_by_id(self, status: int) -> AsyncIterator[tuple[ConfluenceGene, Sequence[ContentItem]]]:
+    async def reading_by_id(self, status: int) -> AsyncIterator[tuple[FakeConnection, Sequence[ContentItem]]]:
         provider = _Provider(ProviderListing.COMPLETE)
         gene = await _authenticated(dict(self.listing_configs["page-tree"].config), provider)
         provider.read_status = status
         try:
-            yield gene, [_stored_page("101")]
+            yield provider.connection(gene), [_stored_page("101")]
         finally:
-            await gene._client.aclose()
+            await gene.close()
 
     def rediscover_candidates(self, config: Mapping[str, object]) -> list[ContentItem]:
         return [_stored_page(page_id) for page_id in [*PAGES, GONE_PAGE]]
@@ -158,16 +176,19 @@ class ConfluenceFakes(DocumentConnectorFakes):
 
 async def _authenticated(config: dict, provider: _Provider) -> ConfluenceGene:
     gene = ConfluenceGene(config=config, source_id="src-contract")
-    client = functools.partial(_REAL_ASYNC_CLIENT, transport=httpx.MockTransport(provider.handle))
-    # The fake answers at once, so requests need no pacing.
-    with (
-        patch("httpx.AsyncClient", client),
-        patch("memforge.genes.confluence_gene.CONFLUENCE_REQUEST_INTERVAL_SECONDS", 0.0),
-    ):
+    with provider.http.serving(confluence_gene):
         await gene.authenticate()
-    gene._request_limiter = None
     provider.requests.clear()
     return gene
+
+
+def _wait_headers(status: int) -> dict[str, str]:
+    """A wait in seconds on 429 and as an HTTP date on 503; the stub sleep makes both instant."""
+    if status == httpx.codes.TOO_MANY_REQUESTS:
+        return {"Retry-After": "30"}
+    if status == httpx.codes.SERVICE_UNAVAILABLE:
+        return {"Retry-After": format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True)}
+    return {}
 
 
 def _stored_page(page_id: str) -> ContentItem:
