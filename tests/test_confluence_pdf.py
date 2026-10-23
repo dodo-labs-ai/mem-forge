@@ -849,3 +849,48 @@ async def test_a_download_still_running_at_the_image_deadline_is_cancelled(tmp_p
     assert BeautifulSoup(captured_html["body"], "html.parser").find("img")["src"] == ""
     # The cut came at the image deadline, 0.1 s in, leaving about the 0.3 s reserve.
     assert left_at_render[0] > 0.2
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_export_cancels_its_image_downloads(tmp_path):
+    requested: list[str] = []
+    first_downloads = asyncio.Event()
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/wiki/rest/api/content/123":
+            return httpx.Response(200, json=_image_page(8))
+        requested.append(request.url.path)
+        first_downloads.set()
+        await asyncio.sleep(0.3)
+        return httpx.Response(200, content=b"png", headers={"content-type": "image/png"})
+
+    async def render_pdf(html_path: Path) -> bytes:
+        return b"%PDF-local"
+
+    async with ConnectorHttpClient(
+        product_name="Confluence",
+        base_url="https://wiki.example.test",
+        timeout=5.0,
+        follow_redirects=True,
+        transport=httpx.MockTransport(handle),
+    ) as client:
+        export = asyncio.ensure_future(
+            export_confluence_page_pdf(
+                client=client,
+                base_url="https://wiki.example.test",
+                api_prefix="/wiki",
+                page_id="123",
+                title="Architecture",
+                render_pdf=render_pdf,
+                work_dir=tmp_path,
+            )
+        )
+        await first_downloads.wait()
+        export.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await export
+        requested_at_cancel = len(requested)
+        await asyncio.sleep(0.5)
+
+    assert requested_at_cancel < 8
+    assert len(requested) == requested_at_cancel
