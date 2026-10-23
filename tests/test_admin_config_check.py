@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -11,9 +13,9 @@ from fastapi.testclient import TestClient
 
 from memforge.genes import GENE_REGISTRY
 from memforge.local_adapter import default_local_adapter_inbox
-from memforge.models import ConfigFieldType
+from memforge.models import ConfigFieldType, comparison_string
 from memforge.source_types import source_type_descriptor
-from memforge.source_types.form import comparison_string, effective_value
+from memforge.source_types.form import effective_value
 from tests.test_source_authority_api import _app, _config, _connect_database, _teams_payload
 from tests.test_startup_runtime import TEST_SOURCE_KEY
 
@@ -154,6 +156,36 @@ def test_jira_fact_shows_effective_jql_with_order_by(client):
             ),
         }
     ]
+
+
+def test_jira_issue_types_that_are_not_a_list_are_an_issue_not_an_error(client):
+    submitted = {**SUBMITTED["jira"], "projects": ["PAY"], "auth_mode": "pat", "issue_types": 5}
+
+    response = _check(client, "jira", submitted)
+
+    assert response.status_code == 200, response.text
+    assert "issue_types" in {issue["key"] for issue in response.json()["issues"]}
+
+
+@pytest.mark.parametrize("issue_types", [[5], ["Bug", None]])
+def test_jira_fact_reads_issue_types_of_any_item(client, issue_types):
+    submitted = {**SUBMITTED["jira"], "projects": ["PAY"], "auth_mode": "pat", "issue_types": issue_types}
+
+    response = _check(client, "jira", submitted)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["facts"][0]["label"] == "Effective query at sync"
+
+
+def test_form_module_imports_on_its_own():
+    completed = subprocess.run(
+        [sys.executable, "-c", "import memforge.source_types.form"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_github_repo_fact_names_owner_and_repo(client):

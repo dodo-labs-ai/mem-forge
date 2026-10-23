@@ -182,6 +182,7 @@ from memforge.models import (
     VIRTUAL_DOCUMENT_SOURCE_IDS,
     Visibility,
     canonicalize_entity_name,
+    comparison_string,
 )
 from memforge.sync_progress import (
     SyncProgressPhase,
@@ -250,7 +251,7 @@ from memforge.source_types import (
     load_reference,
     source_type_descriptor,
 )
-from memforge.source_types.form import check_config, comparison_string, effective_value
+from memforge.source_types.form import check_config, effective_value
 from memforge.source_types.jira import jira_auth_mode
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind, SourceSyncRunActive
 from memforge.storage.document_store import LocalDocumentStore

@@ -776,17 +776,25 @@ def _auth_mode(config: dict) -> str:
     return str(config.get("auth_mode") or AUTH_MODE_GITHUB_PAT).strip().lower()
 
 
-def _scope_url_for_config(config: dict) -> str:
+def scope_urls_for_config(config: Mapping[str, Any]) -> list[str]:
+    """The URLs the configured sync mode names, empty when it names none.
+
+    A single page or a subtree root is one URL, read whole because it may
+    itself hold a comma; only an explicit list names several.
+    """
     mode = _sync_mode(config)
-    if mode == SYNC_MODE_SUBTREE:
-        return str(config.get("root_url") or "")
     if mode == SYNC_MODE_EXPLICIT_LIST:
-        pages = list_config(config.get("pages"))
-        return pages[0] if pages else ""
-    return str(config.get("page_url") or "")
+        return list_config(config.get("pages"))
+    url = str(config.get("root_url" if mode == SYNC_MODE_SUBTREE else "page_url") or "").strip()
+    return [url] if url else []
 
 
-def _sync_mode(config: dict) -> str:
+def _scope_url_for_config(config: dict) -> str:
+    urls = scope_urls_for_config(config)
+    return urls[0] if urls else ""
+
+
+def _sync_mode(config: Mapping[str, Any]) -> str:
     return str(config.get("sync_mode") or SYNC_MODE_SINGLE_PAGE).strip().lower()
 
 

@@ -9,7 +9,7 @@ form shows and hides exactly what the server checks.
 
 Two rules make server and client agree:
 
-- **Comparison string** (:func:`comparison_string`). A condition and the
+- **Comparison string** (:func:`memforge.models.comparison_string`). A condition and the
   choices check compare values as strings: ``None``, ``""`` and an empty list
   are blank; a boolean is ``"true"`` or ``"false"``; a number is its decimal
   string; a string is stripped and lower-cased. A list, or a comma string of
@@ -30,45 +30,25 @@ from typing import Any
 
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.toolkit.config import FieldIssue, validate_bool_fields
-from memforge.models import ConfigCondition, ConfigField, ConfigFieldType, ConfigOption, GeneConfigSchema
+from memforge.models import (
+    LIST_CONFIG_FIELD_TYPES,
+    ConfigCondition,
+    ConfigField,
+    ConfigFieldType,
+    ConfigOption,
+    GeneConfigSchema,
+    comparison_string,
+)
 from memforge.source_types.config import secret_has_value
 from memforge.source_types.descriptor import SourceTypeDescriptor
 
 __all__ = [
     "check_config",
-    "comparison_string",
     "conditions_hold",
     "effective_value",
     "visible_choices",
     "visible_fields",
 ]
-
-_LIST_FIELD_TYPES = frozenset({ConfigFieldType.TAG_LIST, ConfigFieldType.MULTI_SELECT})
-
-
-def comparison_string(value: Any, field_type: ConfigFieldType | None = None) -> str:
-    """The string a condition or the choices check compares, ``""`` for a blank value::
-
-        comparison_string(" PAT ")                                    # "pat"
-        comparison_string(365)                                        # "365"
-        comparison_string(True)                                       # "true"
-        comparison_string(["a", " B", ""])                            # "a,b"
-        comparison_string("A, B", ConfigFieldType.TAG_LIST)           # "a,b"
-        comparison_string(None)                                       # ""
-    """
-
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, (list, tuple)):
-        return ",".join(item for item in (comparison_string(item) for item in value) if item)
-    text = str(value)
-    if field_type in _LIST_FIELD_TYPES:
-        return comparison_string(text.split(","))
-    return text.strip().lower()
 
 
 def effective_value(field: ConfigField, config: Mapping[str, Any], descriptor: SourceTypeDescriptor) -> Any:
@@ -189,7 +169,7 @@ def _field_issue(
         return None
     value = config.get(field.key)
     name = _issue_name(product_name, field.label)
-    if field.field_type in _LIST_FIELD_TYPES and value is not None and not isinstance(value, (list, str)):
+    if field.field_type in LIST_CONFIG_FIELD_TYPES and value is not None and not isinstance(value, (list, str)):
         return FieldIssue(field.key, f"{name} must be a list or a comma-separated string")
     if field.required and not _has_value(field, config, existing_config, descriptor):
         return FieldIssue(field.key, f"{name} is required")

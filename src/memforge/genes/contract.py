@@ -50,6 +50,7 @@ from memforge.models import (
     ConfigField,
     GeneConfigSchema,
     ScopeListingKind,
+    comparison_string,
 )
 from memforge.source_types import SourceTypeDescriptor, registered_source_types
 
@@ -93,8 +94,6 @@ def validate_source_type(descriptor: SourceTypeDescriptor) -> None:
 
 
 def _validate_config_schema(name: str, schema: GeneConfigSchema) -> None:
-    from memforge.source_types.form import comparison_string
-
     group_order = {group.key: (group.order, index) for index, group in enumerate(schema.groups)}
     for group in schema.groups:
         if group.purpose not in CONFIG_GROUP_PURPOSES:
