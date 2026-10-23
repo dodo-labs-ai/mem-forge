@@ -785,7 +785,8 @@ class NotionGene(DocumentGene):
 
         The request goes through the file client, which sends no
         ``Authorization`` header (Notion's file host refuses one), and names
-        the signature only in its query, so no log or error shows it. A file
+        the signature only in its query, so MemForge's retry logs and error
+        messages, which name the address alone, never show it. A file
         this connection's fetch did not read, or one the file host refuses
         (an expired signature answers 400 or 403), fails the item, and the
         next run fetches it again with fresh URLs.
