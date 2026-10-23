@@ -259,6 +259,7 @@ from memforge.server.memory_admin_service import (
     pick_origin_source_type,
 )
 from memforge.server.source_admin_service import (
+    ScopeChangeRemoval,
     can_manage_source,
     can_manage_workspace,
     image_documents_by_source,
@@ -2031,7 +2032,7 @@ class SourceScopeTransitionResponse(BaseModel):
     error: str | None = Field(description="Why the latest sync left the change open; null before one did.")
     failing_items: SourceFailedItemsResponse
     restore_config: dict[str, Any] | None
-    removes: Literal["at_completion", "next_sync"] = Field(
+    removes: ScopeChangeRemoval = Field(
         description=(
             "When the change removes what the new scope leaves out: at_completion, once every listed item "
             "has committed (a document Source); next_sync, the deselected conversations in the next sync "
@@ -2496,7 +2497,7 @@ class SourceScopeChangePreviewResponse(BaseModel):
         "refused",
     ]
     open_transition: bool
-    removes: Literal["at_completion", "next_sync"] = Field(
+    removes: ScopeChangeRemoval = Field(
         description=(
             "When a change that opens removes what the new scope leaves out: at_completion (a document Source) "
             "or next_sync (a conversation Source)."
