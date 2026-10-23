@@ -581,6 +581,14 @@ def test_source_agent_evaluation_route_groups_actionable_cases_and_preserves_sem
     assert review_group["representative_cases"][0]["observation_id"] == "observation-1"
 
 
+def test_source_agent_evaluation_route_is_deprecated_with_the_v1_admin_ui(tmp_path):
+    """Only V1's unrendered dialog calls it; the admin UI reads the workspace overview."""
+    operations = create_admin_app(db=object(), config=_config(tmp_path)).openapi()["paths"]
+
+    assert operations["/api/v1/sources/{source_id}/agent-evaluation"]["get"]["deprecated"] is True
+    assert "deprecated" not in operations["/api/v1/agent-evaluations/online-overview"]["get"]
+
+
 def test_workspace_agent_evaluation_route_aggregates_only_discoverable_sources(tmp_path):
     now = datetime.now(timezone.utc)
 

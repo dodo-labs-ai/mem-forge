@@ -17632,6 +17632,7 @@
     },
     "/api/v1/sources/{source_id}/agent-evaluation": {
       "get": {
+        "deprecated": true,
         "description": "Return a bounded, authorized online-assessment view for one Source.",
         "operationId": "get_source_agent_evaluation_api_v1_sources__source_id__agent_evaluation_get",
         "parameters": [

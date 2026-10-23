@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { projectMemoriesPath } from "@/lib/paths";
+import searchRequestContract from "./fixtures/memory-search-request.json";
 import {
   activeFilterKeys,
   changeFilters,
@@ -96,6 +97,13 @@ describe("the list request", () => {
         source_filter: { source_ids: ["src-a"] },
       },
     });
+  });
+
+  test("sends the search body the server's request model accepts", () => {
+    // tests/test_phase4_search_request.py validates the same fixture against
+    // MemorySearchRequest, so the page and the server cannot drift apart.
+    const state = stateFrom("q=payroll+cutoff&project=PAY&scope=only&type=decision&status=retired&source=src-jira");
+    expect(memoryListRequest(state)).toEqual({ kind: "search", body: searchRequestContract });
   });
 
   test("lists a project without search text", () => {
