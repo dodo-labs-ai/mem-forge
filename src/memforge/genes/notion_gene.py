@@ -595,9 +595,9 @@ class NotionGene(DocumentGene):
         ancestor that is trashed, archived or answers 404 (an ancestor
         between a shared root and the page is always visible). A configured
         root is read like any other ancestor, so a page below a trashed or
-        archived root is out of scope, as it is for the walk. Verdicts on ancestors are kept for the connection,
-        so pages under one ancestor read it once. A chain longer than 64
-        ancestors raises.
+        archived root is out of scope, as it is for the walk. Verdicts on
+        ancestors are kept for the connection, so pages under one ancestor
+        read it once. A chain longer than 64 ancestors raises.
         """
         page_id = _item_page_id(item)
         response = await self._notion().get(f"/v1/pages/{page_id}")
