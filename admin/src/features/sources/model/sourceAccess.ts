@@ -39,22 +39,17 @@ export function canChangeSourceAccess(source: Source, sharedWorkspace: boolean):
   return sharedWorkspace && Boolean(source.capabilities?.can_change_access) && source.access_state === "active";
 }
 
-/** The failed access change of a source, which only its owner can retry or revert; null otherwise. */
-export function recoverableAccessTransition(source: Source): SourceAccessTransition | null {
-  const transition = source.access_transition;
-  if (source.access_state !== "changing" || transition?.status !== "failed") return null;
-  return source.ownership?.viewer_relationship === "owner" ? transition : null;
-}
-
 /** How a source's access reads on its row and in its drawer. */
 export type SourceAccessView =
   | { kind: "policy"; label: string; personal: boolean }
   | { kind: "changing"; label: string }
-  | { kind: "failed"; label: string }
-  | { kind: "owner_required"; label: string };
+  | { kind: "failed"; label: string };
 
+/**
+ * The server lists a source only to someone who can use it, so a changing
+ * source reaches its owner alone and an `orphaned_private` one reaches no one.
+ */
 export function presentSourceAccess(source: Source): SourceAccessView {
-  if (source.access_state === "orphaned_private") return { kind: "owner_required", label: "Owner required" };
   if (source.access_state === "changing") {
     return source.access_transition?.status === "failed"
       ? { kind: "failed", label: "Access change failed" }

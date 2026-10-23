@@ -10,7 +10,6 @@ import {
   accessChoiceLabel,
   accessTransitionProgress,
   presentSourceAccess,
-  recoverableAccessTransition,
 } from "./model/sourceAccess";
 import type { Source } from "./model/types";
 
@@ -18,7 +17,7 @@ import type { Source } from "./model/types";
 export function SourceAccessLabel({ source }: { source: Source }) {
   const view = presentSourceAccess(source);
   if (view.kind === "changing") return <StatusBadge tone="live">{view.label}</StatusBadge>;
-  if (view.kind === "failed" || view.kind === "owner_required") return <StatusBadge tone="danger">{view.label}</StatusBadge>;
+  if (view.kind === "failed") return <StatusBadge tone="danger">{view.label}</StatusBadge>;
   const Icon = view.personal ? Lock : Users;
   return (
     <span className="inline-flex items-center gap-1.5 text-sm text-subtle-foreground">
@@ -30,7 +29,9 @@ export function SourceAccessLabel({ source }: { source: Source }) {
 
 /**
  * The access change a source is applying: how many of its memories are
- * updated, or, when it failed, why, with Retry and Revert for its owner.
+ * updated, or, when it failed, why, with Retry and Revert. Only the owner of
+ * a source can see it while its access changes, so whoever sees a failed
+ * change can settle it.
  */
 export function SourceAccessTransitionSection({ source }: { source: Source }) {
   const settle = useSettleSourceAccess();
@@ -43,8 +44,8 @@ export function SourceAccessTransitionSection({ source }: { source: Source }) {
     return (
       <DrawerSection title="Access change">
         <Notice tone="live" icon={RefreshCw} title={`Changing access to ${target}`}>
-          Syncing is paused while the existing memories are updated. Until then, only the source owner can find the
-          source or query its memories.
+          Syncing is paused while the existing memories are updated. Until then, only you can find the source or query
+          its memories.
         </Notice>
         <div className="space-y-1.5">
           <div
@@ -67,7 +68,6 @@ export function SourceAccessTransitionSection({ source }: { source: Source }) {
     );
   }
 
-  const recoverable = recoverableAccessTransition(source);
   const previous = accessChoiceLabel(transition.previous_policy);
 
   function run(kind: "retry" | "revert") {
@@ -89,20 +89,17 @@ export function SourceAccessTransitionSection({ source }: { source: Source }) {
       <Notice tone="danger" icon={CircleAlert} title={`The change to ${target} failed`}>
         <p>{transition.error_message || "Some existing memories were not updated."}</p>
         <p>
-          Until it is retried or reverted, syncing stays paused and only the source owner can use the source.
-          {recoverable ? null : " The source owner can retry or revert it."}
+          Until it is retried or reverted, syncing stays paused and only you can use the source.
         </p>
       </Notice>
-      {recoverable ? (
-        <div className="flex flex-wrap gap-2">
-          <Button size="sm" disabled={settle.isPending} onClick={() => run("retry")}>
-            Retry
-          </Button>
-          <Button size="sm" variant="outline" disabled={settle.isPending} onClick={() => run("revert")}>
-            Revert to {previous}
-          </Button>
-        </div>
-      ) : null}
+      <div className="flex flex-wrap gap-2">
+        <Button size="sm" disabled={settle.isPending} onClick={() => run("retry")}>
+          Retry
+        </Button>
+        <Button size="sm" variant="outline" disabled={settle.isPending} onClick={() => run("revert")}>
+          Revert to {previous}
+        </Button>
+      </div>
     </DrawerSection>
   );
 }
