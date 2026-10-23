@@ -488,8 +488,13 @@ works the same self-hosted and hosted.
 4. Paste each root's URL, or its ID, into **Root pages** or **Databases**.
 
 Until the admin UI's new Add Source dialog offers Notion, create the source
-through the API instead: `POST /api/v1/sources` with `"type": "notion"`, a
-`name`, and a `config` holding `token`, `root_pages` and `databases`.
+through the API instead, with `POST /api/v1/sources` and this body
+(`access_policy` is `"private"` or `"workspace"`):
+
+```json
+{"type": "notion", "name": "Team wiki", "access_policy": "private",
+ "config": {"token": "<token>", "root_pages": ["<page URL or ID>"], "databases": []}}
+```
 
 MemForge collects every page under those roots: child pages, pages inside
 toggles and columns, and the rows of each database, with a row's properties
