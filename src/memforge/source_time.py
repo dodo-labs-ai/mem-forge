@@ -35,7 +35,10 @@ def utc_minute_floor(moment: datetime) -> datetime:
     A provider that compares times only to the minute, such as a filter that
     takes ``on_or_after`` a minute, is asked from this floor, so nothing
     within that minute is skipped. An aware time is converted to UTC, a naive
-    time is read as UTC, and the seconds and microseconds are dropped::
+    time is read as UTC, and the seconds and microseconds are dropped. The
+    floor is for times the provider already gives in UTC, such as Notion's
+    ``created_time``, so a naive value is UTC wall time; it is not the
+    ambiguous offset-less local time that :data:`WESTERNMOST_ZONE` reads::
 
         plus_two = timezone(timedelta(hours=2))
         utc_minute_floor(datetime(2026, 3, 1, 9, 30, 40, tzinfo=timezone.utc))  # 2026-03-01 09:30 UTC

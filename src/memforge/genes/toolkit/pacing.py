@@ -22,6 +22,10 @@ it to its client::
 The client sends every attempt through the limiter, retries included, and a
 response that asks to wait (a 429, or a 5xx with ``Retry-After``) holds back
 the next request of every client sharing it.
+
+A limiter paces the clients of one process that run on one event loop.
+Separate processes, such as Cloud's web and worker, each keep their own
+budget, and a 429 with ``Retry-After`` covers what they send together.
 """
 
 from __future__ import annotations
@@ -55,8 +59,9 @@ class RateLimiter:
 
     A response that asks to wait pushes the next start back to the end of
     that wait, when that is later. The limiter reads the time through
-    ``clock`` (``time.monotonic`` by default) and waits only through the
-    ``sleep`` the client passes to :meth:`run`, so a test controls both.
+    ``clock`` (``time.monotonic`` by default) and waits through the
+    ``sleep`` passed to :meth:`run` (``asyncio.sleep`` when none is), so a
+    test controls both.
 
     It spaces requests start to start, because a per-minute budget counts
     starts: a request that takes longer than the interval leaves the next one
