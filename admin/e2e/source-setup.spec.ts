@@ -133,3 +133,119 @@ test("a scope edit saved during a running sync stops the sync first", async ({ p
   expect(stopped).toEqual(["src-wiki"]);
   await expect(page).toHaveURL(appUrl("sources"));
 });
+
+/** Stubs local setup jobs: each job is named for its operation and completes with what `results` gives it. */
+function setupJobs(results: Record<string, unknown>, created: unknown[]): Record<string, (route: Route) => unknown> {
+  const routes: Record<string, (route: Route) => unknown> = {
+    "POST /api/cloud/local-agent/jobs": (route) => {
+      const body = route.request().postDataJSON() as { operation: string };
+      created.push(body);
+      return route.fulfill({ status: 201, json: { job_id: `laj-${body.operation}`, status: "queued" } });
+    },
+  };
+  for (const [operation, result] of Object.entries(results)) {
+    routes[`GET /api/cloud/local-agent/jobs/laj-${operation}`] = (route) =>
+      route.fulfill({ json: { job_id: `laj-${operation}`, status: "succeeded", last_error: null, result: { operation, error: null, ...(result as object) } } });
+  }
+  return routes;
+}
+
+test("a Teams source is created with the conversations its session lists", async ({ page }) => {
+  const created: unknown[] = [];
+  const jobs: unknown[] = [];
+  await stubApi(page, {
+    "GET /api/v1/sources": (route) => route.fulfill({ json: { data: [] } }),
+    "GET /api/v1/genes/teams/config-schema": (route) => route.fulfill({ json: FORMS.schemas.teams }),
+    "POST /api/v1/genes/teams/config-check": (route) => route.fulfill({ json: { derived: {}, facts: [], issues: [] } }),
+    "POST /api/v1/sources": (route) => {
+      created.push(route.request().postDataJSON());
+      return route.fulfill({ json: { id: "src-teams", name: "Team chats", type: "teams", access_policy: "private" } });
+    },
+    ...setupJobs(
+      {
+        teams_auth_check: { region: "emea", authenticated: true, expires_in_minutes: 50 },
+        teams_browse: {
+          region: "emea",
+          favorites: [],
+          teams: [{ id: "t-eng", displayName: "Engineering", channels: [{ id: "19:arch@thread.tacv2", displayName: "Architecture" }] }],
+          group_chats: [{ id: "19:planning@thread.v2", topic: "Planning chat", lastActivity: null }],
+          individual_chats: [],
+        },
+      },
+      jobs,
+    ),
+  });
+
+  await page.goto(appPath("sources/new/teams"));
+  await page.getByLabel("Source name").fill("Team chats");
+  await page.getByRole("button", { name: "Next" }).click();
+  await expect(page.getByText("Teams session active")).toBeVisible();
+  await page.getByRole("button", { name: "Next" }).click();
+  await page.getByRole("list", { name: "Teams conversations" }).getByRole("button", { name: /Planning chat/ }).click();
+  await expect(page.getByRole("list", { name: "Selected conversations" })).toContainText("Planning chat");
+  await page.getByRole("button", { name: "Create source" }).click();
+
+  await expect.poll(() => created).toEqual([
+    {
+      name: "Team chats",
+      type: "teams",
+      access_policy: "private",
+      config: { conversation_ids: ["19:planning@thread.v2"] },
+      project_binding: null,
+      sync_schedule: { enabled: false, interval_minutes: 60 },
+    },
+  ]);
+  expect(jobs).toEqual([
+    { source_id: "", source_type: "teams", operation: "teams_auth_check", payload: { region: "emea" } },
+    { source_id: "", source_type: "teams", operation: "teams_browse", payload: { region: "emea" } },
+  ]);
+  await expect(page).toHaveURL(appUrl("sources"));
+});
+
+test("a GitHub repository source syncs the folder chosen from its tree", async ({ page }) => {
+  const created: unknown[] = [];
+  await stubApi(page, {
+    "GET /api/v1/sources": (route) => route.fulfill({ json: { data: [] } }),
+    "GET /api/v1/genes/github_repo/config-schema": (route) => route.fulfill({ json: FORMS.schemas.github_repo }),
+    "POST /api/v1/genes/github_repo/config-check": (route) => route.fulfill({ json: { derived: {}, facts: [], issues: [] } }),
+    "POST /api/v1/genes/github_repo/browse-tree": (route) =>
+      route.fulfill({
+        json: {
+          source_type: "github_repo",
+          ref: "main",
+          count: 3,
+          truncated: false,
+          items: [
+            { path: "docs", type: "tree" },
+            { path: "docs/guide.md", type: "blob", size: 10 },
+            { path: "README.md", type: "blob", size: 10 },
+          ],
+        },
+      }),
+    "POST /api/v1/sources": (route) => {
+      created.push(route.request().postDataJSON());
+      return route.fulfill({ json: { id: "src-repo", name: "Docs repo", type: "github_repo", access_policy: "private" } });
+    },
+  });
+
+  await page.goto(appPath("sources/new/github_repo"));
+  await page.getByLabel("Source name").fill("Docs repo");
+  await page.getByRole("button", { name: "Next" }).click();
+  await page.getByLabel("Repository URL").fill("https://github.com/acme/docs");
+  await page.getByRole("button", { name: "Next" }).click();
+  await page.getByRole("button", { name: "Browse repository" }).first().click();
+  await page.getByRole("tree", { name: "Repository paths" }).getByRole("checkbox", { name: "docs", exact: true }).click();
+  await page.getByRole("button", { name: "Create source" }).click();
+
+  await expect.poll(() => created).toEqual([
+    {
+      name: "Docs repo",
+      type: "github_repo",
+      access_policy: "private",
+      config: { repo_url: "https://github.com/acme/docs", include_paths: ["docs"] },
+      project_binding: null,
+      sync_schedule: { enabled: false, interval_minutes: 1440 },
+    },
+  ]);
+  await expect(page).toHaveURL(appUrl("sources"));
+});

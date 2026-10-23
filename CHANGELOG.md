@@ -40,7 +40,13 @@
   overwriting what was typed, previews a scope change and sends the
   change in progress it saw, offers to stop a running sync before saving,
   and asks before leaving with unsaved changes. Configure, Choose a
-  project and Configure file scope open the matching step.
+  project and Configure file scope open the matching step. The interactive
+  parts run on the same pages: the GitHub repository folder tree, the local
+  folder picker, the Teams session check and connect and the Teams
+  conversation picker, and the Jira browser session with renewal and the
+  copyable refresh command; a local folder's Check setup lists the files
+  local sync finds. Sign in renews a Teams or Jira browser session in place
+  and opens the connection step for a token, so V2 no longer links to V1.
 
 - A local-agent Jira collection reads each listed issue with a one-issue
   search in the Source's scope, `issuekey = <id> AND (<scope>)`, and, when
