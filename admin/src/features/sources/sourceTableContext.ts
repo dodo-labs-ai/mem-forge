@@ -8,6 +8,7 @@ interface SourceTableContextValue {
   onViewDetails: (source: Source) => void;
   onDelete: (source: Source) => void;
   onReRead: (source: Source) => void;
+  onChangeAccess: (source: Source) => void;
 }
 
 /** What the table cells need from the page. Columns stay module-level so rows never remount. */

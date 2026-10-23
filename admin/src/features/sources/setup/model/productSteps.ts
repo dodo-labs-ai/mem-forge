@@ -1,8 +1,8 @@
 import type { components } from "@/api";
+import type { AccessPolicy } from "../../model/sourceAccess";
 import type { Source } from "../../model/types";
 
 type GeneMetadata = components["schemas"]["GeneMetadataResponse"];
-export type AccessPolicy = components["schemas"]["CreateSourceRequest"]["access_policy"];
 export type SyncSchedule = components["schemas"]["SourceSyncScheduleRequest"];
 
 /**
@@ -10,16 +10,6 @@ export type SyncSchedule = components["schemas"]["SourceSyncScheduleRequest"];
  * Basics (`name`), Access (`access_policy`), Project (`project_binding`) and
  * Schedule (`sync_schedule`).
  */
-
-/** Who can use a new Source in a shared workspace. */
-export const ACCESS_CHOICES: readonly { value: AccessPolicy; label: string; description: string }[] = [
-  { value: "private", label: "Only me", description: "Only you can find this source or query memories from it." },
-  {
-    value: "workspace",
-    label: "Everyone in this workspace",
-    description: "Workspace members can find the source and query its memories.",
-  },
-];
 
 /** In a workspace of one, every Source is the owner's own. */
 export const PERSONAL_ACCESS_POLICY: AccessPolicy = "private";

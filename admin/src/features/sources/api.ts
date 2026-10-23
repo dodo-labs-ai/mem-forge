@@ -3,6 +3,7 @@ import { queryOptions, useMutation, useQueries, useQuery, useQueryClient } from 
 import { unwrap, useApi, type ApiClient, type Source, type SourceListSortMode } from "@/api";
 import { localSyncKeys } from "@/features/local-sync";
 import { ACTIVE_POLL_MS } from "./constants";
+import type { AccessPolicy } from "./model/sourceAccess";
 import type { SourceSyncRetryTarget } from "./model/sourceSyncActivity";
 import { sourceProjectBinding } from "./model/projectBinding";
 import { sourcesByProjectKey, type ResolvedBySource } from "./model/projectGrouping";
@@ -355,5 +356,58 @@ export function useDeleteSource() {
   const api = useApi();
   return useSourceMutation((sourceId: string) =>
     unwrap(api.DELETE("/api/v1/sources/{source_id}", { params: { path: { source_id: sourceId } } })),
+  );
+}
+
+/**
+ * Starts changing who can use a source, across its whole history. The
+ * server answers at once and re-shares the source's memories in the
+ * background; the source list follows it while it runs. `requestId` makes a
+ * repeated request start the same change, not a second one.
+ */
+export function useChangeSourceAccess() {
+  const api = useApi();
+  return useSourceMutation(
+    ({ sourceId, targetPolicy, requestId }: { sourceId: string; targetPolicy: AccessPolicy; requestId: string }) =>
+      unwrap(
+        api.POST("/api/v1/sources/{source_id}/access-transitions", {
+          params: { path: { source_id: sourceId }, header: { "Idempotency-Key": requestId } },
+          body: { target_policy: targetPolicy },
+        }),
+      ),
+  );
+}
+
+/** How long a retry or revert is followed until the server's worker picks it up. */
+const SETTLE_PICKUP_MS = 30_000;
+
+/**
+ * Settles a failed access change: `retry` runs it again, and `revert`
+ * returns every memory to the policy the source had before it. The server
+ * queues either one, so this follows the source's current access change
+ * until the worker has picked it up; the refreshed source list then follows
+ * it while it runs.
+ */
+export function useSettleSourceAccess() {
+  const api = useApi();
+  return useSourceMutation(
+    async ({ source, settle }: { source: Source; settle: "retry" | "revert" }) => {
+      const failed = source.access_transition;
+      if (!failed) throw new Error("This source has no access change to settle.");
+      const path = { source_id: source.id, operation_id: failed.operation_id };
+      await unwrap(
+        settle === "retry"
+          ? api.POST("/api/v1/sources/{source_id}/access-transitions/{operation_id}/retry", { params: { path } })
+          : api.POST("/api/v1/sources/{source_id}/access-transitions/{operation_id}/revert", { params: { path } }),
+      );
+      const deadline = Date.now() + SETTLE_PICKUP_MS;
+      while (Date.now() < deadline) {
+        const { transition } = await unwrap(
+          api.GET("/api/v1/sources/{source_id}/access-transition", { params: { path: { source_id: source.id } } }),
+        );
+        if (transition?.status !== "failed" || transition.updated_at !== failed.updated_at) return;
+        await new Promise((resolve) => window.setTimeout(resolve, ACTIVE_POLL_MS));
+      }
+    },
   );
 }

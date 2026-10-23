@@ -6,13 +6,8 @@ import { Button } from "@/ui/button";
 import { Input } from "@/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/ui/select";
 import { Switch } from "@/ui/switch";
-import {
-  ACCESS_CHOICES,
-  scheduleIntervalChoices,
-  scheduleIntervalLabel,
-  type AccessPolicy,
-  type SyncSchedule,
-} from "./model/productSteps";
+import { ACCESS_CHOICES, type AccessPolicy } from "../model/sourceAccess";
+import { scheduleIntervalChoices, scheduleIntervalLabel, type SyncSchedule } from "./model/productSteps";
 
 // Loaded when it opens, so the Sources pages and the Projects feature do not import each other.
 const CreateProjectDialog = lazy(() =>

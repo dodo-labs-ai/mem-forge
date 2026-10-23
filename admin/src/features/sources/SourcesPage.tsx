@@ -40,6 +40,7 @@ import type { Source } from "./model/types";
 import { sourceColumns } from "./sourceColumns";
 import { SourceTableContext } from "./sourceTableContext";
 import { ReReadSourceDialog } from "./ReReadSourceDialog";
+import { SourceAccessChangeDialog } from "./SourceAccessChangeDialog";
 import { SourceDetailDrawer } from "./SourceDetailDrawer";
 import { useSourceActions } from "./useSourceActions";
 
@@ -69,6 +70,7 @@ export function SourcesPage() {
   const [openRowKey, setOpenRowKey] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Source | null>(null);
   const [pendingReRead, setPendingReRead] = useState<Source | null>(null);
+  const [pendingAccessChange, setPendingAccessChange] = useState<Source | null>(null);
   const tableRef = useRef<HTMLDivElement>(null);
 
   const daemonState = localSyncState(daemonQuery);
@@ -218,6 +220,7 @@ export function SourcesPage() {
               onViewDetails: viewDetails,
               onDelete: setPendingDelete,
               onReRead: setPendingReRead,
+              onChangeAccess: setPendingAccessChange,
             }}
           >
             <DataTable
@@ -240,6 +243,7 @@ export function SourcesPage() {
         typeLabel={openRow ? (typeLabels[openRow.source.type] ?? openRow.source.type) : ""}
         projectName={openGroup?.title ?? ""}
         actions={actions}
+        onChangeAccess={setPendingAccessChange}
         onOpenChange={(open) => {
           if (!open) setOpenRowKey(null);
         }}
@@ -262,6 +266,13 @@ export function SourcesPage() {
         source={pendingReRead}
         onOpenChange={(open) => {
           if (!open) setPendingReRead(null);
+        }}
+      />
+
+      <SourceAccessChangeDialog
+        source={pendingAccessChange}
+        onOpenChange={(open) => {
+          if (!open) setPendingAccessChange(null);
         }}
       />
     </div>
