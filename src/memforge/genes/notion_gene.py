@@ -66,6 +66,7 @@ from memforge.genes.notion_api import (
     notion_blocked_integration,
     notion_error_code,
     notion_id,
+    notion_link_id,
     notion_object,
     notion_parent,
     notion_time,
@@ -98,7 +99,7 @@ from memforge.source_artifacts import (
 )
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, utc_minute_floor
 
-__all__ = ["NOTION_RAW_VERSION", "NotionGene", "notion_raw_envelope", "notion_token"]
+__all__ = ["NOTION_RAW_VERSION", "NotionGene", "notion_envelope", "notion_raw_envelope", "notion_token"]
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +201,29 @@ class NotionGene(DocumentGene):
                 ),
             ],
         )
+
+    @classmethod
+    def normalize_config(cls, config: dict) -> None:
+        """Read pasted root links as ids and fix the API origin, in place.
+
+        Each value of ``root_pages`` and ``databases`` that names a Notion
+        page or database (:func:`~memforge.genes.notion_api.notion_link_id`)
+        becomes its 32-hex id; any other value is kept as given, so the
+        source type's check refuses it by its field. ``base_url`` is always
+        Notion's API origin, which no user supplies::
+
+            config = {"root_pages": ["https://www.notion.so/team/Roadmap-1f3c2a4b5d6e4f708a9b0c1d2e3f4a5b"]}
+            NotionGene.normalize_config(config)
+            # {"root_pages": ["1f3c2a4b5d6e4f708a9b0c1d2e3f4a5b"], "base_url": "https://api.notion.com"}
+        """
+        for field, open_page in (("root_pages", True), ("databases", False)):
+            if field in config:
+                config[field] = list(
+                    dict.fromkeys(
+                        notion_link_id(value, open_page=open_page) or value for value in list_config(config[field])
+                    )
+                )
+        config["base_url"] = NOTION_API_ORIGIN
 
     def __init__(self, config: dict, source_id: str) -> None:
         super().__init__(config, source_id)
@@ -883,17 +907,22 @@ class _BodyState:
 
 
 def notion_raw_envelope(raw: RawContent) -> dict[str, Any]:
-    """The envelope a Notion fetch stored, checked to be version 1 in its documented shape.
-
-    An envelope of another version or shape raises ``ValueError``, so the
-    item fails rather than projects a body it cannot read.
-    """
+    """The envelope a Notion fetch stored as ``raw``'s body (:func:`notion_envelope`)."""
     try:
         envelope = json.loads(raw.body.decode("utf-8")) if raw.content_type == "application/json" else None
     except (UnicodeDecodeError, ValueError):
         envelope = None
+    return notion_envelope(envelope, raw.item.item_id)
+
+
+def notion_envelope(envelope: object, item_id: str) -> dict[str, Any]:
+    """A decoded Notion raw body, checked to be a version 1 envelope in its documented shape.
+
+    An envelope of another version or shape raises ``ValueError``, so the
+    item fails rather than projects a body it cannot read.
+    """
     if not isinstance(envelope, dict) or envelope.get("notion_raw") != NOTION_RAW_VERSION:
-        raise ValueError(f"Notion raw body of {raw.item.item_id} is not a version {NOTION_RAW_VERSION} envelope")
+        raise ValueError(f"Notion raw body of {item_id} is not a version {NOTION_RAW_VERSION} envelope")
     properties = envelope.get("properties", [])
     if (
         not isinstance(envelope.get("markdown"), str)
@@ -905,7 +934,7 @@ def notion_raw_envelope(raw: RawContent) -> dict[str, Any]:
             for record in properties
         )
     ):
-        raise ValueError(f"Notion raw body of {raw.item.item_id} has an envelope of another shape")
+        raise ValueError(f"Notion raw body of {item_id} has an envelope of another shape")
     return envelope
 
 

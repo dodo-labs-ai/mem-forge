@@ -26,6 +26,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
@@ -43,6 +44,7 @@ __all__ = [
     "notion_blocked_integration",
     "notion_error_code",
     "notion_id",
+    "notion_link_id",
     "notion_object",
     "notion_parent",
     "notion_time",
@@ -60,6 +62,10 @@ _PAGE_SIZE = 100
 _RESULT_LIMIT_REACHED = "query_result_limit_reached"
 _REQUEST_BLOCKED = "public_api_request_blocked"
 _DASHED_OR_PLAIN_ID = re.compile(r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$")
+# The id that ends a link's last path segment, after a ``Title-`` slug or alone.
+_TRAILING_ID = re.compile(
+    r"(?:^|-)([0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+)
 
 
 @dataclass(frozen=True)
@@ -92,6 +98,39 @@ def notion_id(value: object) -> str | None:
     if not _DASHED_OR_PLAIN_ID.match(text):
         return None
     return text.replace("-", "").lower()
+
+
+def notion_link_id(value: object, *, open_page: bool) -> str | None:
+    """The 32-hex id a pasted Notion link or id names, or ``None`` when it names none.
+
+    The id is read from the link's last path segment, after an optional
+    ``Title-`` slug (a slug alone reads too), whatever the host:
+    ``www.notion.so``, ``notion.so``, ``<team>.notion.site`` and
+    ``app.notion.com`` links read alike, and a link without a scheme reads as
+    one with ``https://``. With ``open_page``, a page open over a database
+    view (``?p=<id>``) is the page named; a view (``?v=<id>``) is never one::
+
+        notion_link_id("https://www.notion.so/team/Roadmap-1f3c2a4b5d6e4f708a9b0c1d2e3f4a5b", open_page=True)
+        # "1f3c2a4b5d6e4f708a9b0c1d2e3f4a5b"
+        notion_link_id("https://app.notion.com/p/9c0d…?v=5e6f…&p=1f3c…", open_page=True)   # "1f3c…"
+        notion_link_id("https://app.notion.com/p/9c0d…?v=5e6f…&p=1f3c…", open_page=False)  # "9c0d…"
+        notion_link_id("1f3c2a4b-5d6e-4f70-8a9b-0c1d2e3f4a5b", open_page=False)            # "1f3c2a4b…"
+        notion_link_id("Roadmap", open_page=True)                                         # None
+    """
+    text = str(value or "").strip()
+    if (bare := notion_id(text)) is not None:
+        return bare
+    if "/" in text or "?" in text:
+        link = urlsplit(text if "://" in text else f"https://{text}")
+        if open_page:
+            for opened in parse_qs(link.query).get("p", []):
+                if (page_id := notion_id(opened)) is not None:
+                    return page_id
+        segment = link.path.rstrip("/").rsplit("/", 1)[-1]
+    else:
+        segment = text
+    match = _TRAILING_ID.search(segment)
+    return match.group(1).replace("-", "").lower() if match else None
 
 
 def notion_time(value: object, what: str) -> datetime:
