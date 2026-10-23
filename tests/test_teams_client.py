@@ -384,6 +384,24 @@ async def test_running_out_of_pages_before_the_start_is_history_exhausted(monkey
 
     assert [message["id"] for message in poll.messages] == ["newest"]
     assert poll.outcome is PollOutcome.HISTORY_EXHAUSTED
+    assert poll.earliest_complete_page_time == NOW
+
+
+@pytest.mark.parametrize("last_page", ["epoch", "empty"])
+async def test_running_out_of_history_names_the_time_its_read_is_complete_from(monkeypatch, last_page):
+    monkeypatch.setattr("memforge.genes.teams_client.asyncio.sleep", AsyncMock())
+    certified = NOW - timedelta(hours=1)
+    first = NOW - timedelta(hours=3)
+    newer = _page(_message("newest", NOW), _message("deleted-later", NOW - timedelta(days=3)), complete_from=certified)
+    epoch = _page(_message("older", NOW - timedelta(hours=2)), _message("first", first))
+    oldest = epoch if last_page == "epoch" else _page()
+    client = _client(newer, oldest)
+
+    poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
+
+    assert poll.outcome is PollOutcome.HISTORY_EXHAUSTED
+    assert poll.earliest_complete_page_time == (first if last_page == "epoch" else certified)
+    assert client._request.await_count == 2
 
 
 async def test_pages_follow_the_certified_time_cursor_and_repeat_the_boundary_millisecond(monkeypatch):
