@@ -106,7 +106,9 @@ When unsure, choose query: it never removes an item the provider still has.
 Declare the kinds in `listing_kinds`. Answer `lists_scope(config)` for each
 configuration, and answer `False` for one that cannot list completely, such as
 a bounded link crawl; its sources then never remove a Document through a
-listing. `list_scope()` returns a complete listing or raises; it never returns
+listing. Override `unlisted_scope_mode(config)` to name that mode and suggest
+one that lists; a scope change into such a configuration is refused with that
+suggestion. `list_scope()` returns a complete listing or raises; it never returns
 less. A type the local daemon collects is listed by its snapshot manifest and
 declares exactly one kind. When that kind is query, the Gene also implements
 `provider_key` and `confirmation_item`, so the daemon can confirm items by
@@ -116,10 +118,10 @@ identifier.
 checks each one against its family's contract (`genes/contract.py`). A type
 that breaks it stops the service with a `SourceTypeContractError` naming the
 type and the missing piece: a collecting Gene outside both families, an
-unimplemented abstract method, undeclared `listing_kinds`, a query listing
-without `confirm_absent`, `rediscovers_documents` without `rediscover`, a
-daemon-collected Gene with more than one listing kind, or a conversation
-provider missing a member of the port.
+unimplemented abstract method, undeclared `listing_kinds`, `lists_scope` not
+declared as a class method, a query listing without `confirm_absent`,
+`rediscovers_documents` without `rediscover`, a daemon-collected Gene with more
+than one listing kind, or a conversation provider missing a member of the port.
 
 **Add the contract-suite fakes.** `tests/contracts/test_document_connector_contract.py`
 runs every registered document type against fakes of its provider, kept in
