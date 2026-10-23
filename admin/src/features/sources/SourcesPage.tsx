@@ -39,6 +39,7 @@ import {
 import type { Source } from "./model/types";
 import { sourceColumns } from "./sourceColumns";
 import { SourceTableContext } from "./sourceTableContext";
+import { FullSyncDialog } from "./FullSyncDialog";
 import { ReReadSourceDialog } from "./ReReadSourceDialog";
 import { SourceAccessChangeDialog } from "./SourceAccessChangeDialog";
 import { SourceDetailDrawer } from "./SourceDetailDrawer";
@@ -70,6 +71,7 @@ export function SourcesPage() {
   const [openRowKey, setOpenRowKey] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Source | null>(null);
   const [pendingReRead, setPendingReRead] = useState<Source | null>(null);
+  const [pendingFullSync, setPendingFullSync] = useState<Source | null>(null);
   const [pendingAccessChange, setPendingAccessChange] = useState<Source | null>(null);
   const tableRef = useRef<HTMLDivElement>(null);
 
@@ -220,6 +222,7 @@ export function SourcesPage() {
               onViewDetails: viewDetails,
               onDelete: setPendingDelete,
               onReRead: setPendingReRead,
+              onFullSync: setPendingFullSync,
               onChangeAccess: setPendingAccessChange,
             }}
           >
@@ -244,6 +247,7 @@ export function SourcesPage() {
         projectName={openGroup?.title ?? ""}
         actions={actions}
         onChangeAccess={setPendingAccessChange}
+        onFullSync={setPendingFullSync}
         onOpenChange={(open) => {
           if (!open) setOpenRowKey(null);
         }}
@@ -266,6 +270,13 @@ export function SourcesPage() {
         source={pendingReRead}
         onOpenChange={(open) => {
           if (!open) setPendingReRead(null);
+        }}
+      />
+
+      <FullSyncDialog
+        source={pendingFullSync}
+        onOpenChange={(open) => {
+          if (!open) setPendingFullSync(null);
         }}
       />
 

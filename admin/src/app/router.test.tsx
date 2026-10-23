@@ -29,6 +29,7 @@ function openApp(path: string, extension?: AdminExtension) {
     "GET /api/cloud/local-agent/jobs/current": () => ({ data: [] }),
     "GET /api/v1/model-settings": () => makeModelSettings(),
     "GET /api/v1/model-settings/providers": () => ({ providers: PROVIDERS }),
+    "GET /api/v1/memory-reviews": () => ({ data: [], total: 0, limit: 1, offset: 0 }),
   });
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const workspace = createWorkspaceController(() => queryClient.clear());

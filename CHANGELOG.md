@@ -56,6 +56,18 @@
   change shows its reason, and its owner can retry it or revert it to the
   previous policy.
 
+- The admin UI V2 shows how many reviews wait for a decision beside Review
+  in the navigation (read every 30 seconds, `99+` above 99), and a chip on a
+  Source's row and drawer when its pipeline checks over the last day found
+  issues, left evaluations pending or want a review, which opens Evaluation
+  scoped to that Source. The row and drawer menus offer "Full sync" beside
+  "Re-read all documents" to someone who can force a resync: after a
+  confirmation that names its model cost, it calls
+  `POST /api/v1/sources/{id}/force-resync`, which lists the whole Source
+  again from its provider or device and processes every document, unchanged
+  ones included. `GET /api/v1/sources/{id}/agent-evaluation` is deprecated
+  and is removed with the V1 admin UI.
+
 - A local-agent Jira collection reads each listed issue with a one-issue
   search in the Source's scope, `issuekey = <id> AND (<scope>)`, and, when
   its comments are read apart, confirms its revision with another such

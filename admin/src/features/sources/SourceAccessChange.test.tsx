@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, expect, test, vi } from "vitest";
 import { STANDALONE_TARGET, type Source, type WorkspaceTarget } from "@/api";
 import type { Route } from "@/test/fakeApi";
+import { makeOverview } from "@/test/evaluationFixtures";
 import { renderRoutes } from "@/test/renderRoutes";
 import { makeSource } from "@/test/sourceFixtures";
 import { SourcesPage } from "./SourcesPage";
@@ -50,6 +51,7 @@ function renderPage(sources: () => Source[], routes: Record<string, Route> = {},
       "GET /api/v1/source-list/preferences": () => ({ sort_mode: "name" }),
       "GET /api/cloud/local-agent/status": () => ({ status: "online", last_seen_at: null, checked_at: "", stale_after_seconds: 60 }),
       "GET /api/cloud/local-agent/jobs/current": () => ({ data: [] }),
+      "GET /api/v1/agent-evaluations/online-overview": () => makeOverview({ sources: [] }),
       ...routes,
     },
   });
@@ -71,7 +73,9 @@ test("hidden in a standalone workspace", async () => {
   await userEvent.keyboard("{Escape}");
 
   const drawer = await openDrawer();
-  expect(within(drawer).queryByRole("button", { name: "More actions for Payroll wiki" })).not.toBeInTheDocument();
+  await userEvent.click(within(drawer).getByRole("button", { name: "More actions for Payroll wiki" }));
+  expect(await screen.findByRole("menuitem", { name: /Full sync/ })).toBeInTheDocument();
+  expect(screen.queryByRole("menuitem", { name: "Change who can use this source" })).not.toBeInTheDocument();
 });
 
 test("hidden from a viewer who cannot manage the source", async () => {

@@ -14,7 +14,9 @@ import type { SourceRow } from "./model/sourceRows";
 import type { Source } from "./model/types";
 import { sourceRunsOn } from "./sourceRunsOn";
 import { SourceAccessLabel, SourceAccessTransitionSection } from "./SourceAccess";
+import { SourceEvaluationChip } from "./SourceEvaluationChip";
 import { SourceIcon } from "./SourceIcon";
+import { FullSyncMenuItem } from "./SourceRowActions";
 import { SourceScopeTransitionSection } from "./SourceScopeTransitionSection";
 import type { SourceActions } from "./useSourceActions";
 
@@ -24,6 +26,7 @@ interface SourceDetailDrawerProps {
   projectName: string;
   actions: SourceActions;
   onChangeAccess: (source: Source) => void;
+  onFullSync: (source: Source) => void;
   onOpenChange: (open: boolean) => void;
 }
 
@@ -33,7 +36,15 @@ function unrecognizedSessionLinesTitle(count: number, type: string, client: stri
   return `${pluralize(count, "session line")} from ${clientLabel} ${count === 1 ? "was" : "were"} not recognized`;
 }
 
-export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onChangeAccess, onOpenChange }: SourceDetailDrawerProps) {
+export function SourceDetailDrawer({
+  row,
+  typeLabel,
+  projectName,
+  actions,
+  onChangeAccess,
+  onFullSync,
+  onOpenChange,
+}: SourceDetailDrawerProps) {
   const sharedWorkspace = useSharedWorkspace();
   if (row === null) return <DetailDrawer open={false} onOpenChange={onOpenChange} title="" children={null} />;
   const { source, activity, attention } = row;
@@ -45,6 +56,8 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onCha
   const canStop = actions.canStopSync(source, activity);
   const canSync = Boolean(source.capabilities?.can_sync) && source.status === "active";
   const canChangeAccess = canChangeSourceAccess(source, sharedWorkspace);
+  const fullSync = actions.fullSyncControl(source, activity);
+  const hasMenu = canChangeAccess || fullSync.visible;
 
   return (
     <DetailDrawer
@@ -58,7 +71,7 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onCha
         </span>
       }
       actions={
-        canStop || canSync || canChangeAccess ? (
+        canStop || canSync || hasMenu ? (
           <>
             {canStop ? (
               <Button size="sm" variant="outline" onClick={() => actions.stopSync(source)}>
@@ -70,13 +83,18 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onCha
                 {sync.label}
               </Button>
             ) : null}
-            {canChangeAccess ? (
+            {hasMenu ? (
               <DropdownMenu>
                 <DropdownMenuTrigger render={<Button size="icon-sm" variant="ghost" aria-label={`More actions for ${source.name}`} />}>
                   <MoreHorizontal />
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="w-64">
-                  <DropdownMenuItem onClick={() => onChangeAccess(source)}>Change who can use this source</DropdownMenuItem>
+                  {fullSync.visible ? (
+                    <FullSyncMenuItem enabled={fullSync.enabled} onClick={() => onFullSync(source)} />
+                  ) : null}
+                  {canChangeAccess ? (
+                    <DropdownMenuItem onClick={() => onChangeAccess(source)}>Change who can use this source</DropdownMenuItem>
+                  ) : null}
                 </DropdownMenuContent>
               </DropdownMenu>
             ) : null}
@@ -94,6 +112,8 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onCha
           { label: "Saves to", value: projectName },
         ]}
       />
+
+      <SourceEvaluationChip source={source} />
 
       {attention ? (
         <ActionCard

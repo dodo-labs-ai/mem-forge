@@ -77,6 +77,11 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
         retryTarget ? `Could not start the retry for ${source.name}` : `Could not start a sync for ${source.name}`,
       );
     },
+    /** Whether Full sync is offered for the source, and whether it can start now: an active source with no sync on its way. */
+    fullSyncControl(source: Source, activity: SourceSyncActivity | undefined) {
+      const visible = Boolean(source.capabilities?.can_force_resync);
+      return { visible, enabled: visible && source.status === "active" && this.syncControl(source, activity).enabled };
+    },
     /** Whether the source's sync can be stopped from here, by someone who can sync or pause it. */
     canStopSync(source: Source, activity: SourceSyncActivity | undefined) {
       const capabilities = source.capabilities;

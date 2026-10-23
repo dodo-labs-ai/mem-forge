@@ -2,6 +2,7 @@ import { Clock } from "lucide-react";
 import { formatCount, formatInterval, formatRelative, formatUntil, pluralize } from "@/lib/format";
 import { StatusBadge } from "@/patterns";
 import { SourceAccessLabel } from "./SourceAccess";
+import { SourceEvaluationChip } from "./SourceEvaluationChip";
 import { retryingAfterUpgradeTitle } from "./model/sourceFailedItems";
 import { presentSourceSyncActivity, sourceSyncActivityIsVisible } from "./model/sourceSyncActivity";
 import type { SourceRow } from "./model/sourceRows";
@@ -21,6 +22,7 @@ export function SourceNameCell({ row, typeLabel }: { row: SourceRow; typeLabel: 
           <span className="truncate font-medium text-foreground">{source.name}</span>
           {source.status === "paused" ? <StatusBadge tone="idle">Paused</StatusBadge> : null}
           {!usedInSearches ? <StatusBadge tone="idle">Not in my searches</StatusBadge> : null}
+          <SourceEvaluationChip source={source} />
         </div>
         <div className="truncate text-xs text-muted-foreground">{typeLabel}</div>
       </div>
