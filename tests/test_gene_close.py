@@ -6,15 +6,13 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from unittest.mock import patch
-
 import pytest
 from fastapi.testclient import TestClient
 
 from memforge import runtime
 from memforge.config import AppConfig
 from memforge.storage.database import Database
-from memforge.genes import confluence_gene, jira_gene
+from memforge.genes import confluence_gene, github_pages_gene, github_repo_gene, jira_gene
 from memforge.genes.base import SourceConfigurationError
 from memforge.models import ContentItem, SyncState
 from tests.contracts.document_fakes import ProviderListing
@@ -110,21 +108,14 @@ def _serving_connector_http(gene_module):
     return serve
 
 
-def _serving_requests_client(client_class: str):
-    def serve(provider):
-        return patch(client_class, provider.client), provider.clients
-
-    return serve
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("fakes", "serve"),
     [
         (confluence_fakes, _serving_connector_http(confluence_gene)),
         (jira_fakes, _serving_connector_http(jira_gene)),
-        (github_repo_fakes, _serving_requests_client("memforge.genes.github_repo_gene._RequestsAsyncClient")),
-        (github_pages_fakes, _serving_requests_client("memforge.genes.github_pages_gene._RequestsAsyncClient")),
+        (github_repo_fakes, _serving_connector_http(github_repo_gene)),
+        (github_pages_fakes, _serving_connector_http(github_pages_gene)),
     ],
     ids=["confluence", "jira", "github_repo", "github_pages"],
 )
@@ -335,14 +326,10 @@ async def test_the_discovery_preview_closes_its_gene(database, tmp_path, monkeyp
 )
 async def test_the_github_folder_browse_closes_its_gene(database, tmp_path, listing, status) -> None:
     provider = github_repo_fakes._Provider(listing)
-    # Browsing reads the tree of the ref it is given; the fake serves the branch's tree by its sha.
-    config = {**github_repo_fakes.FAKES.listing_configs["cloud-pull"].config, "ref": "tree-main"}
+    config = dict(github_repo_fakes.FAKES.listing_configs["cloud-pull"].config)
 
-    with (
-        patch("memforge.genes.github_repo_gene._RequestsAsyncClient", provider.client),
-        _admin_client(database, tmp_path) as client,
-    ):
+    with provider.http.serving(github_repo_gene), _admin_client(database, tmp_path) as client:
         response = client.post("/api/v1/genes/github_repo/browse-tree", json={"config": config, "limit": 50})
 
     assert response.status_code == status, response.text
-    assert [client.is_closed for client in provider.clients] == [True]
+    assert [client.is_closed for client in provider.http.clients] == [True]

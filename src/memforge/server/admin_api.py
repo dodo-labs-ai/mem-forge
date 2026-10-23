@@ -74,7 +74,9 @@ from memforge.genes.conversation_gene import ConversationGene
 from memforge.genes.family import CollectionFamilyKind
 from memforge.genes.atlassian_auth import release_atlassian_request_limiter
 from memforge.genes.base import SourceConfigurationError
+from memforge.genes.github_repo_gene import GitHubRepoGene
 from memforge.genes.toolkit.config import require_https_base_url, validate_bool_fields, validate_tls_ca_bundle
+from memforge.genes.toolkit.github_api import BROWSE_TREE_REQUEST_BUDGET, GitHubTreeBudgetExceeded
 from memforge.github_repo_utils import github_extension_allowed, github_include_extensions
 from memforge.memory.audit import AuditContext
 from memforge.memory.cross_document_relation import (
@@ -6824,7 +6826,13 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
     ):
-        """List selectable repository paths for the GitHub Repository source UI."""
+        """List selectable repository paths for the GitHub Repository source UI.
+
+        The tree is read with the Source's own client and TLS. A tree GitHub
+        truncates is walked folder by folder within
+        ``BROWSE_TREE_REQUEST_BUDGET`` requests; a larger repository answers
+        400, and its paths are typed instead.
+        """
         gene = None
         try:
             config = dict(req.config)
@@ -6844,13 +6852,13 @@ def create_admin_app(
             _validate_source_config("github_repo", config)
             if str(config.get("connection_mode") or "cloud_pull").strip().lower() != "cloud_pull":
                 raise ValueError("GitHub Repository folder browsing is available only for Public internet access")
-            gene = create_gene("github_repo", config, source_id="browse-github-repo")
+            gene = cast(GitHubRepoGene, create_gene("github_repo", config, source_id="browse-github-repo"))
             await gene.authenticate()
-            repo_ref = getattr(gene, "_repo_ref")
+            github = gene.github_api()
             ref = str(config.get("ref") or "").strip()
             if not ref:
-                ref = await gene._default_branch(repo_ref)  # noqa: SLF001 - shared source implementation.
-            entries = await gene._repo_tree(repo_ref, ref)  # noqa: SLF001 - shared source implementation.
+                ref = await github.default_branch()
+            entries = await github.tree(ref, max_requests=BROWSE_TREE_REQUEST_BUDGET)
             items = _github_repo_tree_items(
                 entries,
                 limit=req.limit,
@@ -6860,6 +6868,11 @@ def create_admin_app(
             raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except GitHubTreeBudgetExceeded as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{exc} to browse. Type the folder or file paths to sync instead.",
+            ) from exc
         except Exception as exc:
             logger.exception("GitHub Repository tree browse failed")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
