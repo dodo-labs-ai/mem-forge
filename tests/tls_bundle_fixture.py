@@ -1,4 +1,4 @@
-"""A small CA bundle for TLS tests, and a way to read which CAs an ``ssl.SSLContext`` trusts."""
+"""A small CA bundle for TLS tests, and a way to count the CAs an ``ssl.SSLContext`` has loaded."""
 
 from __future__ import annotations
 
