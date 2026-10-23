@@ -67,8 +67,10 @@ def notion_file_reference(url: str) -> str | None:
 def split_signed_url(url: str) -> tuple[str, list[tuple[str, str]]]:
     """A signed URL as its address without the query, and the query's parameters in order.
 
-    A request built from the two sends the same URL, while logs and errors,
-    which name only the address, never show the signature.
+    A request built from the two sends the same URL, while MemForge's retry
+    logs and error messages, which name only the address, never show the
+    signature. httpx's own request line, which shows the full URL, is kept
+    out of the logs where the application configures logging.
     """
     parts = urlsplit(url)
     return parts._replace(query="", fragment="").geturl(), parse_qsl(parts.query, keep_blank_values=True)
