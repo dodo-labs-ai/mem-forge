@@ -1399,58 +1399,106 @@ async def test_discover_inventory_preserves_lightweight_fields_across_pages():
     ]
 
 
-@pytest.mark.asyncio
-async def test_inventory_fetch_rejects_comment_body_from_newer_issue_revision():
-    original = _jira_issue("PAY-1")
-    updated = _jira_issue(
-        "PAY-1",
-        field_overrides={"updated": "2026-05-21T08:01:00.000+0000"},
-    )
+class InventorySearchClient(RecordingAsyncClient):
+    """Answers each search by its fields: the inventory, the full read, and the revision check.
 
-    class ConcurrentCommentClient(RecordingAsyncClient):
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-            self.issue_reads = 0
+    Like Jira Data Center, a search writes ``updated`` at whole seconds and an
+    issue read writes it with milliseconds.
+    """
 
-        async def request(self, method: str, url: str, **kwargs):
-            self.calls.append((method, url, kwargs))
-            if url == "/rest/api/2/search":
-                return JsonResponse(_search_page([original]))
-            if url.endswith("/comment"):
-                return JsonResponse(
-                    {
-                        "startAt": 0,
-                        "comments": [{"id": "comment-new", "body": "New comment"}],
-                        "total": 1,
-                    }
-                )
-            self.issue_reads += 1
-            return JsonResponse(original if self.issue_reads == 1 else updated)
+    def __init__(self, *, full: dict, attested: dict, comments: list[dict] | None = None, **kwargs):
+        super().__init__(**kwargs)
+        self.full = full
+        self.attested = attested
+        self.comments = comments or []
 
+    async def request(self, method: str, url: str, **kwargs):
+        self.calls.append((method, url, kwargs))
+        if url == "/rest/api/2/search":
+            fields = kwargs["json"]["fields"]
+            if fields == ["updated"]:
+                return JsonResponse(_search_page([self.attested]))
+            return JsonResponse(_search_page([self.full]))
+        if url.endswith("/comment"):
+            return JsonResponse({"startAt": 0, "comments": self.comments, "total": len(self.comments)})
+        key = url.split("/issue/", 1)[1].split("/", 1)[0]
+        return JsonResponse(_jira_issue(key, field_overrides={"updated": "2026-05-21T08:00:00.517+0000"}))
+
+
+def _inventory_gene(client: RecordingAsyncClient, **config) -> JiraGene:
     gene = JiraGene(
-        config={
-            "base_url": "https://jira.example.test",
-            "projects": ["PAY"],
-            "include_comments": True,
-        },
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"], **config},
         source_id="src-jira",
     )
-    client = ConcurrentCommentClient(base_url="https://jira.example.test")
     gene._client = client
     gene._base_url = "https://jira.example.test"
+    return gene
+
+
+def _search_fields(client: RecordingAsyncClient) -> list[object]:
+    return [call[2]["json"]["fields"] if call[1] == "/rest/api/2/search" else call[1] for call in client.calls]
+
+
+@pytest.mark.asyncio
+async def test_inventory_fetch_reads_and_attests_the_issue_through_search():
+    issue = _jira_issue("PAY-1")
+    client = InventorySearchClient(full=issue, attested=issue, base_url="https://jira.example.test")
+    gene = _inventory_gene(client, include_comments=True)
+    item = [item async for item in gene.discover_inventory()][0]
+
+    raw = await gene.fetch(item)
+
+    assert json.loads(raw.body)["fields"]["updated"] == item.version == "2026-05-21T08:00:00.000+0000"
+    assert _search_fields(client) == [["summary", "updated", "project"], ["*all"], ["updated"]]
+    scope = "(project in (PAY) AND issuetype in (Epic,Story,Bug,Task))"
+    assert client.calls[1][2]["json"]["jql"] == f"issuekey = 100001 AND {scope}"
+    assert client.calls[2][2]["json"]["jql"] == f"issuekey = PAY-1 AND {scope}"
+
+
+@pytest.mark.asyncio
+async def test_inventory_fetch_rejects_an_issue_changed_before_its_full_read():
+    original = _jira_issue("PAY-1")
+    updated = _jira_issue("PAY-1", field_overrides={"updated": "2026-05-21T08:01:00.000+0000"})
+
+    class ChangedBeforeReadClient(InventorySearchClient):
+        async def request(self, method: str, url: str, **kwargs):
+            if url == "/rest/api/2/search" and kwargs["json"]["fields"] == ["summary", "updated", "project"]:
+                self.calls.append((method, url, kwargs))
+                return JsonResponse(_search_page([original]))
+            return await super().request(method, url, **kwargs)
+
+    client = ChangedBeforeReadClient(full=updated, attested=updated, base_url="https://jira.example.test")
+    gene = _inventory_gene(client)
     item = [item async for item in gene.discover_inventory()][0]
 
     with pytest.raises(RuntimeError, match="changed during materialization; retry inventory"):
         await gene.fetch(item)
 
-    assert [call[1] for call in client.calls] == [
-        "/rest/api/2/search",
-        "/rest/api/2/issue/PAY-1",
-        "/rest/api/2/issue/PAY-1/comment",
-        "/rest/api/2/issue/PAY-1",
-    ]
-    assert client.calls[-1][2]["params"] == {"fields": "updated"}
+    assert _search_fields(client) == [["summary", "updated", "project"], ["*all"]]
 
+
+@pytest.mark.asyncio
+async def test_inventory_fetch_rejects_comment_body_from_newer_issue_revision():
+    original = _jira_issue("PAY-1", comments=[{"body": "Old comment"}], comment_total=2)
+    updated = _jira_issue("PAY-1", field_overrides={"updated": "2026-05-21T08:01:00.000+0000"})
+    client = InventorySearchClient(
+        full=original,
+        attested=updated,
+        comments=[{"id": "comment-new", "body": "New comment"}],
+        base_url="https://jira.example.test",
+    )
+    gene = _inventory_gene(client, include_comments=True)
+    item = [item async for item in gene.discover_inventory()][0]
+
+    with pytest.raises(RuntimeError, match="changed during materialization; retry inventory"):
+        await gene.fetch(item)
+
+    assert _search_fields(client) == [
+        ["summary", "updated", "project"],
+        ["*all"],
+        "/rest/api/2/issue/PAY-1/comment",
+        ["updated"],
+    ]
 
 async def _async_json_response(payload: dict) -> JsonResponse:
     return JsonResponse(payload)
