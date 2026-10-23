@@ -1,4 +1,5 @@
 import { ApiError } from "@/api";
+import type { components } from "@/api/schema.gen";
 import { errorMessage } from "@/lib/errors";
 import { formatCount, pluralize } from "@/lib/format";
 import { recordedFailedItems, type SourceFailedItems } from "./sourceFailedItems";
@@ -17,10 +18,13 @@ export interface ScopeFieldChange {
 
 /** What the Source page shows about the scope change a source is applying. */
 export interface SourceScopeTransitionView {
+  /** The change returns to the previous scope, as a restore made it. */
+  returning: boolean;
   /** Where the change stands, in a few words. */
   status: string;
   /** Why the last sync left it open, as the server recorded it; null when there is nothing to add. */
   reason: string | null;
+  /** The settings the change moves; empty when it returns to the previous scope or the viewer cannot read them. */
   changes: ScopeFieldChange[];
   /** Listed items synced under the change out of the items its new scope lists, or what comes next. */
   progressLabel: string;
@@ -61,29 +65,52 @@ export function scopeFieldChanges(
   transition: Pick<SourceScopeTransition, "previous_scope" | "target_scope">,
   labels: Readonly<Record<string, string>> = {},
 ): ScopeFieldChange[] {
-  const fields = [...new Set([...Object.keys(transition.previous_scope), ...Object.keys(transition.target_scope)])];
+  const { previous_scope: previous, target_scope: target } = transition;
+  if (!previous || !target) return [];
+  const fields = [...new Set([...Object.keys(previous), ...Object.keys(target)])];
   return fields
     .map((field) => ({
       field,
       label: scopeFieldLabel(field, labels),
-      from: scopeValueLabel(transition.previous_scope[field]),
-      to: scopeValueLabel(transition.target_scope[field]),
+      from: scopeValueLabel(previous[field]),
+      to: scopeValueLabel(target[field]),
     }))
     .filter((change) => change.from !== change.to)
     .sort((a, b) => a.label.localeCompare(b.label));
 }
 
+/**
+ * The failed items not yet synced under the change. One the new scope lists
+ * keeps the change open; one only the previous scope held is settled when it
+ * completes. Which is which is not known here, so the title names neither.
+ */
 export function transitionFailedItemsTitle(count: number): string {
-  return `${pluralize(count, "failed item")} ${count === 1 ? "keeps" : "keep"} the change open`;
+  return `${pluralize(count, "failed item")} not yet synced under the change`;
 }
 
-function progressLabel(transition: SourceScopeTransition): string {
+/** Whether the change returns to the previous scope, as restoring it does. */
+export function scopeTransitionReturns(transition: Pick<SourceScopeTransition, "previous_scope" | "target_scope">): boolean {
+  const { previous_scope: previous, target_scope: target } = transition;
+  return previous !== null && target !== null && stableJson(previous) === stableJson(target);
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function progressLabel(transition: SourceScopeTransition, returning: boolean): string {
   if (transition.excluded_scopes_due) {
     return "Every listed item is synced. The next sync checks what the previous scope held, then completes the change.";
   }
-  if (transition.listed_count === null) return "The next sync lists what the new scope holds.";
+  const scope = returning ? "the previous scope" : "the new scope";
+  if (transition.listed_count === null) return `The next sync lists what ${scope} holds.`;
   const synced = Math.min(transition.members_committed, transition.listed_count);
-  return `${formatCount(synced)} of ${pluralize(transition.listed_count, "listed item")} synced under the new scope`;
+  return `${formatCount(synced)} of ${pluralize(transition.listed_count, "listed item")} synced under ${scope}`;
 }
 
 /** The scope change a source is applying, as its detail shows it; null when none is in progress. */
@@ -94,11 +121,13 @@ export function presentSourceScopeTransition(
 ): SourceScopeTransitionView | null {
   const transition = source.scope_transition;
   if (!transition) return null;
+  const returning = scopeTransitionReturns(transition);
   return {
+    returning,
     status: STATUS_LABELS[transition.status],
     reason: transition.status === "failed" && !transition.excluded_scopes_due ? transition.error : null,
     changes: scopeFieldChanges(transition, labels),
-    progressLabel: progressLabel(transition),
+    progressLabel: progressLabel(transition, returning),
     failedItems: recordedFailedItems(transition.failing_items, activity),
     restoreConfig: transition.restore_config,
   };
@@ -126,4 +155,57 @@ export function scopeChangeErrorMessage(error: unknown): string {
   const message = errorMessage(error);
   const code = error instanceof ApiError ? (error.code ?? message) : message;
   return SCOPE_CHANGE_ERROR_MESSAGES[code] ?? message;
+}
+
+export type ScopeChangePreview = components["schemas"]["SourceScopeChangePreviewResponse"];
+
+/** What the restore confirmation says, from the server's preview of saving the previous scope. */
+export interface RestorePresentation {
+  description: string;
+  /** False while the preview is on its way, or when restoring would not do what the dialog offers. */
+  ready: boolean;
+}
+
+/**
+ * The restore confirmation for a source, from the preview of saving its
+ * restore configuration. A configuration that cannot list closes the change
+ * and removes nothing. One that lists opens a change back to the previous
+ * scope, which removes what only the replaced change added once a sync lists
+ * the previous scope in full.
+ */
+export function presentRestore(
+  sourceName: string,
+  preview: ScopeChangePreview | undefined,
+  previewFailed: boolean,
+): RestorePresentation {
+  if (previewFailed) {
+    return {
+      description: `This undoes the scope change in progress and saves ${sourceName}'s previous scope again, keeping its other settings. Nothing the previous scope synced is removed.`,
+      ready: true,
+    };
+  }
+  if (!preview) return { description: "Checking what restoring the previous scope does…", ready: false };
+  switch (preview.outcome) {
+    case "restores_previous_scope":
+      return {
+        description: `This closes the scope change in progress and saves ${sourceName}'s previous scope again, keeping its other settings. Nothing is removed.`,
+        ready: true,
+      };
+    case "returns_to_previous_scope":
+      return {
+        description:
+          `This replaces the scope change in progress with a change back to ${sourceName}'s previous scope, keeping its other settings. `
+          + "Nothing the previous scope synced is removed. Once a sync lists the previous scope in full, items only the replaced change added are removed.",
+        ready: true,
+      };
+    case "refused":
+      return {
+        description: preview.refusal?.message
+          ?? SCOPE_CHANGE_ERROR_MESSAGES[preview.refusal?.code ?? ""]
+          ?? "The previous scope cannot be restored now.",
+        ready: false,
+      };
+    default:
+      return { description: SCOPE_CHANGE_ERROR_MESSAGES.projection_scope_transition_stale!, ready: false };
+  }
 }

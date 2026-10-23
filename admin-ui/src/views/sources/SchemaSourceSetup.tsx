@@ -332,6 +332,7 @@ function SourceConfigForm({
   const scopeChangePreview = useScopeChangePreview(
     source?.id,
     isEdit && canConfigureConnection && previewReady ? serializeConfig(schema.fields, config) : null,
+    secretFieldKeys(schema.fields),
   );
   const showDiscoveryPreview = sourceType !== "github_repo"
     && !(sourceType === "jira" && stringValue(config.sync_mode) === "local_agent");
@@ -1159,6 +1160,10 @@ function localMarkdownPreviewFromJob(status: LocalAgentJobStatusResponse): Disco
       };
     }),
   };
+}
+
+function secretFieldKeys(fields: ConfigField[]): string[] {
+  return fields.filter((field) => field.field_type === "secret").map((field) => field.key);
 }
 
 function extractSaveError(error: unknown): string {

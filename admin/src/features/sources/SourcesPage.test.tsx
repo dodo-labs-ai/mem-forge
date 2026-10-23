@@ -532,7 +532,15 @@ const CONFLUENCE_SCHEMA = {
 };
 
 async function openScopeChange(source = makeSource({ scope_transition: makeScopeTransition() }), routes: Record<string, Route> = {}) {
-  const page = renderPage([source], { "GET /api/v1/genes/confluence/config-schema": () => CONFLUENCE_SCHEMA, ...routes });
+  const page = renderPage([source], {
+    "GET /api/v1/genes/confluence/config-schema": () => CONFLUENCE_SCHEMA,
+    "POST /api/v1/sources/src-wiki/scope-change-preview": () => ({
+      outcome: "returns_to_previous_scope",
+      open_transition: true,
+      refusal: null,
+    }),
+    ...routes,
+  });
   const table = await screen.findByRole("table", { name: "Sources" });
   await userEvent.click(await within(table).findByText("Payroll wiki"));
   const drawer = await screen.findByRole("dialog", { name: "Payroll wiki" });
@@ -554,7 +562,7 @@ test("the drawer shows the scope change in progress: what it changes, how far it
   expect(within(section).getByText("ENG")).toBeInTheDocument();
   expect(within(section).getByText("ENG, OPS")).toBeInTheDocument();
   expect(within(section).getByText("117 of 120 listed items synced under the new scope")).toBeInTheDocument();
-  expect(within(section).getByText("1 failed item keeps the change open")).toBeInTheDocument();
+  expect(within(section).getByText("1 failed item not yet synced under the change")).toBeInTheDocument();
   expect(within(section).getByText("OPS runbook")).toBeInTheDocument();
   expect(within(section).getByText("403 Forbidden")).toBeInTheDocument();
 });
@@ -567,34 +575,66 @@ test("Restore the previous scope confirms, then saves the previous scope through
 
   await userEvent.click(within(section).getByRole("button", { name: "Restore the previous scope" }));
   const confirm = await screen.findByRole("dialog", { name: "Restore the previous scope?" });
-  expect(within(confirm).getByText(/undoes the scope change in progress/)).toBeInTheDocument();
+  expect(await within(confirm).findByText(/replaces the scope change in progress with a change back/)).toBeInTheDocument();
   expect(within(confirm).getByText(/Nothing the previous scope synced is removed/)).toBeInTheDocument();
+  const preview = calls.find((request) => new URL(request.url).pathname.endsWith("/scope-change-preview"))!;
+  expect(await preview.clone().json()).toEqual({ config: transition.restore_config });
   await userEvent.click(within(confirm).getByRole("button", { name: "Restore" }));
 
   await vi.waitFor(() => expect(calls.some((request) => request.method === "PUT")).toBe(true));
   const save = calls.find((request) => request.method === "PUT")!;
   expect(new URL(save.url).pathname).toBe("/api/v1/sources/src-wiki");
-  expect(await save.clone().json()).toEqual({ config: transition.restore_config });
+  expect(await save.clone().json()).toEqual({
+    config: transition.restore_config,
+    expected_scope_transition_id: transition.id,
+  });
   await vi.waitFor(() => expect(toast.success).toHaveBeenCalledWith("Payroll wiki returns to its previous scope"));
 });
 
-test("a refused restore explains the refusal and keeps the dialog open", async () => {
+test.each([
+  [{ code: "source_sync_running", run_id: "run-9", message: "A sync of this Source is running." }, "A sync of this source is running. Stop the sync, then try again."],
+  ["projection_scope_transition_stale", "The scope change in progress changed while you were looking at it. Reload the source, then try again."],
+])("a refused restore explains the refusal and keeps the dialog open (%o)", async (detail, message) => {
   const { section } = await openScopeChange(undefined, {
-    "PUT /api/v1/sources/src-wiki": () =>
-      errorResponse(409, { code: "source_sync_running", run_id: "run-9", message: "A sync of this Source is running." }),
+    "PUT /api/v1/sources/src-wiki": () => errorResponse(409, detail),
   });
 
   await userEvent.click(within(section).getByRole("button", { name: "Restore the previous scope" }));
   const confirm = await screen.findByRole("dialog", { name: "Restore the previous scope?" });
-  await userEvent.click(within(confirm).getByRole("button", { name: "Restore" }));
+  const restore = within(confirm).getByRole("button", { name: "Restore" });
+  await vi.waitFor(() => expect(restore).toBeEnabled());
+  await userEvent.click(restore);
 
-  expect(await within(confirm).findByText("A sync of this source is running. Stop the sync, then try again.")).toBeInTheDocument();
+  expect(await within(confirm).findByText(message)).toBeInTheDocument();
   expect(toast.success).not.toHaveBeenCalled();
 });
 
-test("a viewer who cannot change the configuration sees the scope change without a way back", async () => {
-  const { section } = await openScopeChange(makeSource({ scope_transition: makeScopeTransition({ restore_config: null }) }));
+test("a change back to the previous scope reads as returning there, with no restore of its own", async () => {
+  const { section } = await openScopeChange(
+    makeSource({
+      scope_transition: makeScopeTransition({
+        target_scope: { sync_mode: "spaces", spaces: ["ENG"] },
+        restore_config: null,
+        listed_count: null,
+      }),
+    }),
+  );
+
+  expect(within(section).getByText("Returning to the previous scope")).toBeInTheDocument();
+  expect(within(section).getByText("The next sync lists what the previous scope holds.")).toBeInTheDocument();
+  expect(within(section).queryByRole("button", { name: "Restore the previous scope" })).not.toBeInTheDocument();
+});
+
+test("a viewer who cannot read the configuration sees the progress, but neither scope nor a way back", async () => {
+  const { section } = await openScopeChange(
+    makeSource({
+      scope_transition: makeScopeTransition({ previous_scope: null, target_scope: null, restore_config: null }),
+    }),
+  );
 
   expect(within(section).getByText("The last sync left it open")).toBeInTheDocument();
+  expect(within(section).getByText("117 of 120 listed items synced under the new scope")).toBeInTheDocument();
+  expect(within(section).queryByText("ENG")).not.toBeInTheDocument();
+  expect(within(section).queryByText("ENG, OPS")).not.toBeInTheDocument();
   expect(within(section).queryByRole("button", { name: "Restore the previous scope" })).not.toBeInTheDocument();
 });
