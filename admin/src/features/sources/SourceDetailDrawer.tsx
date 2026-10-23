@@ -9,6 +9,7 @@ import { presentSourceSyncActivity } from "./model/sourceSyncActivity";
 import type { SourceRow } from "./model/sourceRows";
 import { sourceRunsOn } from "./sourceRunsOn";
 import { SourceIcon } from "./SourceIcon";
+import { SourceScopeTransitionSection } from "./SourceScopeTransitionSection";
 import type { SourceActions } from "./useSourceActions";
 
 interface SourceDetailDrawerProps {
@@ -100,6 +101,8 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpe
           Update the MemForge plugin so new sessions are read in full.
         </Notice>
       ) : null}
+
+      <SourceScopeTransitionSection source={source} activity={activity} />
 
       <DrawerSection title="Sync">
         <PropertyList

@@ -44,3 +44,46 @@ test("the Sources page renders in the shell", async ({ page }) => {
   await expect(page.getByRole("navigation", { name: "Main" }).getByRole("link", { name: "Sources" })).toHaveAttribute("aria-current", "page");
   await expect(page.getByText("Local sync offline")).toBeVisible();
 });
+
+test("a source's scope change in progress shows in its drawer and restores the previous scope", async ({ page }) => {
+  const restoreConfig = { base_url: "https://wiki.example", sync_mode: "spaces", spaces: ["ENG"] };
+  const source = {
+    ...SOURCE,
+    scope_transition: {
+      id: "scope-transition-1",
+      status: "failed",
+      previous_scope: { sync_mode: "spaces", spaces: ["ENG"] },
+      target_scope: { sync_mode: "spaces", spaces: ["ENG", "OPS"] },
+      created_at: "2026-09-29T09:00:00Z",
+      updated_at: "2026-09-29T11:00:00Z",
+      members_committed: 117,
+      listed_count: 120,
+      excluded_scopes_due: false,
+      error: null,
+      failing_items: { count: 0, retrying_after_upgrade: 0, items: [] },
+      restore_config: restoreConfig,
+    },
+  };
+  const saved: unknown[] = [];
+  await page.route("**/api/**", (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (request.method() === "PUT" && path === "/api/v1/sources/src-wiki") {
+      saved.push(request.postDataJSON());
+      return route.fulfill({ json: { ok: true, id: "src-wiki" } });
+    }
+    const body = path === "/api/v1/sources" ? { data: [source] } : RESPONSES[path];
+    return body === undefined ? route.fulfill({ status: 404, json: { detail: "Not stubbed" } }) : route.fulfill({ json: body });
+  });
+
+  await page.goto("/v2/sources");
+  await page.getByRole("table", { name: "Sources" }).getByText("Payroll wiki").click();
+  const drawer = page.getByRole("dialog", { name: "Payroll wiki" });
+  await expect(drawer.getByRole("heading", { name: "Scope change in progress" })).toBeVisible();
+  await expect(drawer.getByText("117 of 120 listed items synced under the new scope")).toBeVisible();
+
+  await drawer.getByRole("button", { name: "Restore the previous scope" }).click();
+  await page.getByRole("dialog", { name: "Restore the previous scope?" }).getByRole("button", { name: "Restore" }).click();
+
+  await expect.poll(() => saved).toEqual([{ config: restoreConfig }]);
+});
