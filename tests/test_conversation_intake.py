@@ -259,7 +259,7 @@ async def test_a_poll_that_ran_out_of_history_or_stopped_early_cannot_be_complet
     before = backfill.start - timedelta(milliseconds=1)
     payload, _ = _polled(regular, backfill, outcome=outcome, complete_from=before, returned=True)
 
-    with pytest.raises(CollectionRejected, match="is complete from before its start; upgrade"):
+    with pytest.raises(CollectionRejected, match="is complete from before its requested start; upgrade"):
         await _receive(database, payload)
 
 
@@ -269,7 +269,7 @@ async def test_a_poll_stopped_early_must_be_complete_from_inside_its_interval(da
     late = backfill.end if complete_from == "at_end" else backfill.end + timedelta(hours=1)
     payload, _ = _polled(regular, backfill, outcome=PollOutcome.STOPPED_EARLY, complete_from=late, returned=True)
 
-    with pytest.raises(CollectionRejected, match="stopped early complete from at or after its end; upgrade"):
+    with pytest.raises(CollectionRejected, match="that stopped early is complete from at or after its requested end; upgrade"):
         await _receive(database, payload)
 
 
