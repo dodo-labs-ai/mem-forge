@@ -2120,6 +2120,7 @@ export interface paths {
         };
         /**
          * Get Source Agent Evaluation
+         * @deprecated
          * @description Return a bounded, authorized online-assessment view for one Source.
          */
         get: operations["get_source_agent_evaluation_api_v1_sources__source_id__agent_evaluation_get"];

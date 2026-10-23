@@ -7496,7 +7496,11 @@ def create_admin_app(
             "assessments": view["assessments"],
         }
 
-    @source_router.get("/{source_id}/agent-evaluation")
+    # Deprecated (admin-ui-v1): only the V1 per-source evaluation dialog calls
+    # this route, and V1 never renders that dialog. The admin UI reads
+    # GET /agent-evaluations/online-overview, scoped by source_id; this route
+    # is removed with the V1 admin UI.
+    @source_router.get("/{source_id}/agent-evaluation", deprecated=True)
     async def get_source_agent_evaluation(
         source_id: str,
         request: Request,
