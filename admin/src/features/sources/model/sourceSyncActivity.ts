@@ -41,6 +41,8 @@ export interface SourceSyncActivity {
   finishedAt?: string | null;
   nextAttemptAt?: string | null;
   retryTarget?: SourceSyncRetryTarget;
+  /** Where the sync ran: on the person's device through the local agent, or on the server. */
+  executor?: "local_agent" | "server";
   /** Why a finished run removed nothing although it was due to check for deleted items. */
   absenceCheckSkippedReason?: AbsenceCheckSkippedReason | null;
   /** Items a finished run found outside its scope that the source confirmed it still has; they are kept. */
@@ -87,6 +89,7 @@ export function sourceSyncActivityFromLocalJob(job: LocalAgentJob): SourceSyncAc
     nextAttemptAt: job.next_attempt_at,
     retryTarget: job.status === "queued"
       ? { execution_kind: "local_agent_job", execution_id: job.job_id } : undefined,
+    executor: "local_agent",
   };
 }
 
@@ -108,6 +111,7 @@ export function sourceSyncActivityFromStatus(sync: SyncStatus): SourceSyncActivi
     nextAttemptAt: sync.next_attempt_at,
     retryTarget: sync.status === "pending" && sync.run_id
       ? { execution_kind: "source_sync_run", execution_id: sync.run_id } : undefined,
+    executor: "server",
     absenceCheckSkippedReason: sync.absence_check_skipped_reason,
     unlistedPresentCount: sync.unlisted_present_count,
     skippedReadingGroupCount: sync.skipped_reading_group_count,
@@ -242,7 +246,7 @@ export function presentSourceSyncActivity(
       return {
         message: "Waiting to retry",
         detail: `Next retry ${new Date(activity.nextAttemptAt!).toLocaleString()}`
-          + (activity.error?.message ? `. ${safeFailureDetail(activity.error)}` : ""),
+          + (activity.error?.message ? `. ${safeFailureDetail(activity.error, activity.executor)}` : ""),
       };
     }
     if (activity.retryTarget?.execution_kind === "local_agent_job") {
@@ -260,7 +264,7 @@ export function presentSourceSyncActivity(
       detail: `Last sync matched ${limit.count} files, exceeding its configured limit of ${limit.limit}. Adjust Max Files or narrow the scope, then retry.`,
       configureScope: true,
     };
-    return { message: "Action needed", detail: safeFailureDetail(activity.error) };
+    return { message: "Action needed", detail: safeFailureDetail(activity.error, activity.executor) };
   }
   if (activity.state === "partial" || activity.state === "success") {
     const presentation = withProgress(
@@ -396,8 +400,29 @@ function currentSourceDate(snapshot: SyncProgressSnapshot): string {
 
 // How rate-limit failures read; a bare "429" is not matched, since identifiers in other errors contain those digits.
 const RATE_LIMIT_MARKERS = ["rate limit", "ratelimit", "too many requests"];
+// The sources whose sign-in is a browser session the person refreshes from Configure.
+const BROWSER_SESSION_SYSTEMS = ["Jira", "Confluence"];
+// A sign-in the source rejects; a bare "401" is not matched, for the same reason as "429".
+const SIGN_IN_REJECTED_MARKERS = [
+  "bad credentials",
+  "401 unauthorized",
+  "http 401",
+  "status code 401",
+  "gh auth login",
+  "authentication required",
+];
+// How a source host that cannot be reached reads, beyond the connection failures of isConnectivityFailure.
+const SOURCE_UNREACHABLE_MARKERS = [
+  "error connecting to",
+  "could not resolve host",
+  "no such host",
+  "name or service not known",
+  "temporary failure in name resolution",
+  "nodename nor servname provided",
+  "i/o timeout",
+];
 
-function safeFailureDetail(error: SourceSyncActivity["error"]): string {
+function safeFailureDetail(error: SourceSyncActivity["error"], executor?: SourceSyncActivity["executor"]): string {
   const messages = [error?.message, ...(error?.items ?? []).map((item) => item.error)]
     .filter((value): value is string => Boolean(value?.trim()));
   const normalized = messages.join(" ").toLowerCase();
@@ -431,6 +456,29 @@ function safeFailureDetail(error: SourceSyncActivity["error"]): string {
   }
   if (normalized.includes("certificate_verify_failed") || normalized.includes("certificate verify")) {
     return "The source certificate could not be verified. Check the connection, then retry.";
+  }
+  if (normalized.includes("browser session expired")) {
+    const system = BROWSER_SESSION_SYSTEMS.find((name) => normalized.includes(name.toLowerCase()));
+    return system
+      ? `The ${system} browser session has expired. Sign in to ${system}, then refresh it in Configure.`
+      : "The source sign-in is no longer valid. Update it in Configure, then retry.";
+  }
+  if (SIGN_IN_REJECTED_MARKERS.some((marker) => normalized.includes(marker))) {
+    if (executor === "local_agent") {
+      return normalized.includes("github cli") || normalized.includes("gh auth")
+        ? "Sign in to the GitHub CLI on this device, then retry sync."
+        : "Sign in to the source's CLI on this device, then retry sync.";
+    }
+    return "The access token has expired or was revoked. Update it in Configure, then retry.";
+  }
+  if (isConnectivityFailure(normalized) || SOURCE_UNREACHABLE_MARKERS.some((marker) => normalized.includes(marker))) {
+    if (executor === "local_agent") {
+      return "The source could not be reached from this device. Check your network or VPN, then retry.";
+    }
+    if (executor === "server") {
+      return "The server could not reach the source. Check its address, or use Local sync if it is on your network.";
+    }
+    return "The source could not be reached. Check the network connection, then retry.";
   }
   return "Sync failed. Retry when ready.";
 }
