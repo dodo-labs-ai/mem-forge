@@ -755,6 +755,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/genes/{name}/config-check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check Gene Config
+         * @description What saving this configuration would store and refuse, without saving it.
+         *
+         *     It runs save's own steps (``complete`` and every configuration check)
+         *     on a copy, and writes nothing: no Source, no inbox, no encrypted
+         *     secret. ``derived`` holds the declared non-secret fields whose
+         *     effective value the steps change, such as the page tree a pasted
+         *     Confluence page URL names; ``facts`` states what the type can tell
+         *     about the configuration; ``issues`` holds every refusal. With
+         *     ``source_id``, the stored configuration completes the copy as it does
+         *     on update, and the caller needs the access that update needs.
+         */
+        post: operations["check_gene_config_api_v1_genes__name__config_check_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/genes/{name}/config-schema": {
         parameters: {
             query?: never;
@@ -764,7 +793,10 @@ export interface paths {
         };
         /**
          * Get Gene Config Schema
-         * @description Get the configuration schema for a gene type (for dynamic UI rendering).
+         * @description The form description of a source type, which the admin UI draws without per-type code.
+         *
+         *     Besides what the Gene declares, each field says whether it is a scope
+         *     field and whether it is fixed after create, from the type's descriptor.
          */
         get: operations["get_gene_config_schema_api_v1_genes__name__config_schema_get"];
         put?: never;
@@ -3067,6 +3099,43 @@ export interface components {
             /** Status */
             status: string;
         };
+        /** ConfigCheckRequest */
+        ConfigCheckRequest: {
+            /** Config */
+            config: {
+                [key: string]: unknown;
+            };
+            /** Source Id */
+            source_id?: string | null;
+        };
+        /** ConfigCheckResponse */
+        ConfigCheckResponse: {
+            /**
+             * Derived
+             * @description Declared non-secret fields whose effective value the save would change, as it would store them.
+             */
+            derived: {
+                [key: string]: unknown;
+            };
+            /** Facts */
+            facts: components["schemas"]["ConfigFactResponse"][];
+            /** Issues */
+            issues: components["schemas"]["FieldIssueResponse"][];
+        };
+        /** ConfigConditionResponse */
+        ConfigConditionResponse: {
+            /** Field */
+            field: string;
+            /** Values */
+            values: string[];
+        };
+        /** ConfigFactResponse */
+        ConfigFactResponse: {
+            /** Label */
+            label: string;
+            /** Value */
+            value: string;
+        };
         /** ConfigFieldResponse */
         ConfigFieldResponse: {
             /**
@@ -3075,12 +3144,23 @@ export interface components {
              */
             advanced: boolean;
             /**
+             * Choices
+             * @default []
+             */
+            choices: components["schemas"]["ConfigOptionResponse"][];
+            /**
              * Default
              * @default
              */
             default: string;
             /** Field Type */
             field_type: string;
+            /**
+             * Fixed After Create
+             * @description Chooses the executor; a stored Source keeps it.
+             * @default false
+             */
+            fixed_after_create: boolean;
             /**
              * Group
              * @default general
@@ -3097,6 +3177,8 @@ export interface components {
             label: string;
             /**
              * Options
+             * @deprecated
+             * @description The values of `choices`.
              * @default []
              */
             options: string[];
@@ -3112,12 +3194,31 @@ export interface components {
             placeholder: string;
             /**
              * Required
+             * @description Required while the field is visible.
              * @default true
              */
             required: boolean;
+            /**
+             * Scope
+             * @description Changing it changes which items the Source holds.
+             * @default false
+             */
+            scope: boolean;
+            /**
+             * Visible When
+             * @default []
+             */
+            visible_when: components["schemas"]["ConfigConditionResponse"][];
+            /** Widget */
+            widget?: string | null;
         };
         /** ConfigGroupResponse */
         ConfigGroupResponse: {
+            /**
+             * Description
+             * @default
+             */
+            description: string;
             /** Key */
             key: string;
             /** Label */
@@ -3127,6 +3228,44 @@ export interface components {
              * @default 0
              */
             order: number;
+            /**
+             * Panels
+             * @default []
+             */
+            panels: components["schemas"]["ConfigPanelResponse"][];
+            /**
+             * Purpose
+             * @default content
+             * @enum {string}
+             */
+            purpose: "connection" | "content" | "options";
+        };
+        /** ConfigOptionResponse */
+        ConfigOptionResponse: {
+            /**
+             * Help Text
+             * @default
+             */
+            help_text: string;
+            /** Label */
+            label: string;
+            /** Value */
+            value: string;
+            /**
+             * Visible When
+             * @default []
+             */
+            visible_when: components["schemas"]["ConfigConditionResponse"][];
+        };
+        /** ConfigPanelResponse */
+        ConfigPanelResponse: {
+            /** Name */
+            name: string;
+            /**
+             * Visible When
+             * @default []
+             */
+            visible_when: components["schemas"]["ConfigConditionResponse"][];
         };
         /** ConversationArtifactLinkRequest */
         ConversationArtifactLinkRequest: {
@@ -3497,6 +3636,13 @@ export interface components {
             /** Id */
             id: number;
         };
+        /** FieldIssueResponse */
+        FieldIssueResponse: {
+            /** Key */
+            key: string | null;
+            /** Message */
+            message: string;
+        };
         /** GeneConfigSchemaResponse */
         GeneConfigSchemaResponse: {
             /**
@@ -3509,6 +3655,8 @@ export interface components {
              * @default []
              */
             groups: components["schemas"]["ConfigGroupResponse"][];
+            /** Project Field */
+            project_field?: string | null;
         };
         /** GeneMetadataResponse */
         GeneMetadataResponse: {
@@ -3524,6 +3672,11 @@ export interface components {
             display_name: string;
             /** Execution Kinds */
             execution_kinds: ("server" | "local_agent")[];
+            /**
+             * Managed
+             * @description Managed capture, created by the service; the type picker leaves it out.
+             */
+            managed: boolean;
             /** Name */
             name: string;
         };
@@ -7886,6 +8039,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["GitHubRepoTreeResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    check_gene_config_api_v1_genes__name__config_check_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConfigCheckRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConfigCheckResponse"];
                 };
             };
             /** @description Validation Error */
