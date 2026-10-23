@@ -392,6 +392,41 @@ async def test_github_pat_reads_a_configured_branch_named_with_a_slash_as_one_pa
 
 
 @pytest.mark.asyncio
+async def test_configured_pages_of_one_repository_read_its_branch_tree_once_per_connection():
+    site = runbooks_site(truncated={""})
+    root = "https://github.example.test/pages/example-org/runbooks/runbooks"
+    gene = await site.connect(
+        {
+            "auth_mode": "github_pat",
+            "pat": "github-secret",
+            "sync_mode": "explicit_list",
+            "pages": [
+                f"{root}/Process%20Tracking/stuck-lock",
+                f"{root}/Process%20Tracking/timed-out-process-instance",
+                f"{root}/Other%20Runbook/overview",
+            ],
+        }
+    )
+
+    def reads() -> tuple[int, int]:
+        branch_reads = sum(url == RUNBOOKS_API for _, url in site.requests)
+        root_tree_reads = sum(url.endswith("/git/trees/main?recursive=1") for _, url in site.requests)
+        return branch_reads, root_tree_reads
+
+    listing = await gene.list_scope()
+    discovered = {item.item_id async for item in gene.discover()}
+
+    assert discovered == listing.doc_ids and len(discovered) == 3
+    assert reads() == (1, 1)
+
+    # A new connection reads the branch afresh.
+    with site.http.serving(github_pages_gene):
+        await gene.authenticate()
+    _ = [item async for item in gene.discover()]
+    assert reads() == (2, 2)
+
+
+@pytest.mark.asyncio
 async def test_github_pat_subtree_rejects_missing_tree_without_completion_evidence():
     site = org_repo_site(answers={"/git/trees/main?recursive=1": {}})
     gene = await site.connect({**SUBTREE_PAT, "root_url": f"{SITE}cloud-native-platform/"})

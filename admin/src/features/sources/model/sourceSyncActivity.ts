@@ -449,7 +449,7 @@ function isConnectivityFailure(value: string): boolean {
 }
 
 function repositoryFileLimit(error: SourceSyncActivity["error"]): { count: string; limit: string } | null {
-  const match = error?.message?.match(/^GitHub Repository (?:discovery|Internal network \/ VPN sync) matched ([0-9]{1,9}) files, exceeding max_files=([0-9]{1,9})$/);
+  const match = error?.message?.match(/^GitHub Repository (?:discovery|Internal network \/ VPN sync) matched ((?:at least )?[0-9]{1,9}) files, exceeding max_files=([0-9]{1,9})$/);
   const [, count, limit] = match ?? [];
   return count && limit ? { count, limit } : null;
 }

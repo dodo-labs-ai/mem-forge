@@ -198,6 +198,49 @@ async def test_a_folder_listing_with_a_duplicate_path_fails_closed():
 
 
 @pytest.mark.asyncio
+async def test_a_one_level_listing_that_names_a_nested_path_fails_closed():
+    # A malformed listing of the root: "docs/guide.md" beside the folder "docs" would be read twice.
+    nested = {"truncated": False, "tree": [*FakeGitHub(API, files=FILES).children(""), {
+        "path": "docs/guide.md", "type": "blob", "sha": "sha-guide", "mode": "100644",
+    }]}
+    github = FakeGitHub(API, files=FILES, truncated={""}, answers={"/git/trees/tree-main": nested})
+
+    with pytest.raises(RuntimeError, match="tree entry has an invalid path"):
+        await _api(github).tree("tree-main")
+
+
+@pytest.mark.asyncio
+async def test_a_submodule_is_kept_as_an_entry_and_never_walked_into():
+    github = FakeGitHub(API, files=FILES, truncated={"", "vendor"}, submodules={"vendor/sdk": "c0ffee", "themes": "decade"})
+
+    entries = await _api(github).tree("tree-main")
+
+    submodules = {entry["path"]: entry["sha"] for entry in entries if entry["type"] == "commit"}
+    assert submodules == {"vendor/sdk": "c0ffee", "themes": "decade"}
+    assert not any(sha in request for sha in ("c0ffee", "decade") for request in github.requests)
+
+
+@pytest.mark.asyncio
+async def test_a_folder_named_with_url_characters_is_read_and_rooted_by_its_own_name():
+    odd = "notes #1? 100% done"
+    github = FakeGitHub(API, files={**FILES, f"{odd}/plan.md": b"# Plan\n", f"{odd}/deep/more.md": b"# More\n"}, truncated={""})
+
+    entries = await _api(github).tree("tree-main")
+
+    assert {f"{odd}/plan.md", f"{odd}/deep", f"{odd}/deep/more.md"} <= {entry["path"] for entry in entries}
+    assert _paths(entries) == _paths(github.recursive(""))
+
+
+@pytest.mark.asyncio
+async def test_a_folder_github_cannot_find_during_a_walk_fails_the_walk():
+    github = FakeGitHub(API, files=FILES, truncated={""})
+    github.answers[f"/git/trees/{github.tree_sha('vendor')}?recursive=1"] = httpx.Response(404, json={"message": "Not Found"})
+
+    with pytest.raises(httpx.HTTPStatusError, match="404"):
+        await _api(github).tree("tree-main")
+
+
+@pytest.mark.asyncio
 async def test_a_walk_that_needs_more_requests_than_its_budget_fails_closed():
     github = FakeGitHub(API, files=FILES, truncated={"", "vendor"})
 
@@ -219,7 +262,8 @@ async def test_a_walk_stops_at_the_first_folder_that_selects_more_than_allowed()
             max_selected=3,
         )
 
-    assert (raised.value.selected, raised.value.max_selected) == (4, 3)
+    assert (raised.value.selected, raised.value.max_selected, raised.value.exact) == (4, 3, False)
+    assert "at least 4" in str(raised.value)
     assert _tree_requests(github) == ["/ recursive", "/", "area-0 recursive", "area-1 recursive"]
 
 
@@ -231,7 +275,7 @@ async def test_a_complete_tree_counts_every_selected_entry():
     with pytest.raises(GitHubTreeSelectionExceeded) as raised:
         await _api(github).tree("tree-main", selects=lambda entry: entry["type"] == "blob", max_selected=3)
 
-    assert raised.value.selected == 5
+    assert (raised.value.selected, raised.value.exact) == (5, True)
 
 
 # ---------------------------------------------------------------------------

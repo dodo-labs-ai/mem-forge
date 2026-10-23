@@ -77,6 +77,7 @@ from memforge.genes.toolkit.http import DEFAULT_RETRY_POLICY, ConnectorHttpClien
 from memforge.github_repo_utils import (
     github_latest_commit_time,
     github_path_commits_query,
+    normalize_github_relative_path,
     validate_github_tree_payload,
 )
 
@@ -98,10 +99,10 @@ TREE_REQUEST_BUDGET = 500
 
 A tenth of the 5,000 REST requests an hour GitHub grants an authenticated
 user, which leaves the rest of the hour's quota for the per-file commit and
-blob reads that follow. A walk costs two requests for each truncated folder
-and one for each folder directly inside it, so only a repository past
-GitHub's 100,000-entry limit whose truncated folders hold hundreds of
-folders reaches it.
+blob reads that follow. A walk costs one recursive request for each folder
+it reads, plus one one-level listing for each truncated folder, so only a
+repository past GitHub's 100,000-entry limit whose truncated folders hold
+hundreds of folders reaches it.
 """
 
 BROWSE_TREE_REQUEST_BUDGET = 20
@@ -130,15 +131,19 @@ class GitHubTreeBudgetExceeded(RuntimeError):
 class GitHubTreeSelectionExceeded(RuntimeError):
     """The walk selected more entries than allowed; ``selected`` counts them when it stopped.
 
-    The count is exact for a tree GitHub returned whole, and a lower bound
-    for one read folder by folder, whose walk stops at the first folder that
-    passes the limit.
+    ``exact`` says whether that is every entry the tree selects: it is for a
+    tree GitHub returned whole, and a lower bound for one read folder by
+    folder, whose walk stops at the first folder that passes the limit::
+
+        GitHubTreeSelectionExceeded(4, 3, exact=False)  # "selects at least 4 entries, exceeding 3"
     """
 
-    def __init__(self, selected: int, max_selected: int) -> None:
-        super().__init__(f"The GitHub tree selects at least {selected} entries, exceeding {max_selected}")
+    def __init__(self, selected: int, max_selected: int, *, exact: bool) -> None:
+        count = str(selected) if exact else f"at least {selected}"
+        super().__init__(f"The GitHub tree selects {count} entries, exceeding {max_selected}")
         self.selected = selected
         self.max_selected = max_selected
+        self.exact = exact
 
 
 @dataclass(frozen=True)
@@ -280,14 +285,17 @@ class _TreeWalk:
         self.max_selected = max_selected
         self.requests = 0
         self.selected = 0
+        self.truncated = False
+        self.paths: set[str] = set()
 
     async def entries(self, tree_ish: str, *, prefix: str) -> list[dict[str, Any]]:
         """The entries under ``tree_ish``, their paths prefixed by the folder ``prefix`` it sits at."""
         recursive = await self.read(tree_ish, recursive=True)
         if not (isinstance(recursive, Mapping) and recursive.get("truncated") is True):
-            return self.keep(recursive, prefix)
+            return self.keep(recursive, prefix, one_level=False)
+        self.truncated = True
         entries: list[dict[str, Any]] = []
-        for entry in self.keep(await self.read(tree_ish, recursive=False), prefix):
+        for entry in self.keep(await self.read(tree_ish, recursive=False), prefix, one_level=True):
             entries.append(entry)
             if entry.get("type") == "tree":
                 entries.extend(await self.entries(str(entry["sha"]), prefix=str(entry["path"])))
@@ -303,19 +311,32 @@ class _TreeWalk:
         url = f"{self.github.repository.api_url}/git/trees/{quote(tree_ish, safe='')}"
         return await _json(self.github.client, f"{url}?recursive=1" if recursive else url)
 
-    def keep(self, payload: object, prefix: str) -> list[dict[str, Any]]:
-        """Validate one complete tree response, root its paths at ``prefix``, and count what it selects."""
+    def keep(self, payload: object, prefix: str, *, one_level: bool) -> list[dict[str, Any]]:
+        """Validate one complete tree response, root its paths at ``prefix``, and count what it selects.
+
+        A one-level listing names each entry by its bare name, and no path
+        may appear twice anywhere in the walk; either fault fails closed.
+        """
+        label = self.github.label
         try:
-            entries = validate_github_tree_payload(payload, label=self.github.label)
+            entries = validate_github_tree_payload(payload, label=label)
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
-        if prefix:
-            entries = [{**entry, "path": f"{prefix}/{str(entry['path']).strip().strip('/')}"} for entry in entries]
+        rooted: list[dict[str, Any]] = []
+        for entry in entries:
+            name = normalize_github_relative_path(str(entry["path"])).rstrip("/")
+            if one_level and "/" in name:
+                raise RuntimeError(f"{label} tree entry has an invalid path")
+            path = f"{prefix}/{name}" if prefix else name
+            if path in self.paths:
+                raise RuntimeError(f"{label} tree response contains duplicate path {path!r}")
+            self.paths.add(path)
+            rooted.append({**entry, "path": path} if prefix else entry)
         if self.selects is not None and self.max_selected is not None:
-            self.selected += sum(1 for entry in entries if self.selects(entry))
+            self.selected += sum(1 for entry in rooted if self.selects(entry))
             if self.selected > self.max_selected:
-                raise GitHubTreeSelectionExceeded(self.selected, self.max_selected)
-        return entries
+                raise GitHubTreeSelectionExceeded(self.selected, self.max_selected, exact=not self.truncated)
+        return rooted
 
 
 def github_rate_limit_wait(response: httpx.Response) -> float | None:
@@ -332,7 +353,10 @@ def github_rate_limit_wait(response: httpx.Response) -> float | None:
 
     It raises :class:`GitHubRateLimitError` when that wait is longer than
     :data:`RATE_LIMIT_MAX_WAIT_SECONDS`, and returns ``None`` for any other
-    response, a 403 that refuses access included::
+    response, a 403 that refuses access included. The body of a streamed
+    response is not read here, so a secondary rate limit that a streamed
+    blob read signals only in its body is not detected and fails as a
+    refusal::
 
         github_rate_limit_wait(httpx.Response(403, headers={"Retry-After": "30"}))   # 30.0
         github_rate_limit_wait(httpx.Response(403, json={"message": "Resource not accessible"}))  # None
