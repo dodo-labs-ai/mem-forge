@@ -220,6 +220,7 @@ class GitHubPagesGene(DocumentGene):
         if auth_mode == AUTH_MODE_GITHUB_PAT:
             headers["Authorization"] = f"Bearer {resolve_pat(self.config, 'GitHub Pages')}"
 
+        await self.close()
         self._base_url = base_url
         self._auth_mode = auth_mode
         self._client = _RequestsAsyncClient(
@@ -443,7 +444,7 @@ class GitHubPagesGene(DocumentGene):
 
     async def health_check(self) -> dict:
         try:
-            if not hasattr(self, "_client"):
+            if getattr(self, "_client", None) is None:
                 await self.authenticate()
             response = await self._client.head(self._base_url)
             return {"healthy": response.status_code < 400, "status_code": response.status_code}

@@ -4242,9 +4242,7 @@ async def _collect_jira_documents_from_cloud_job(
                 ),
             )
     finally:
-        http_client = getattr(gene, "_client", None)
-        if http_client is not None:
-            await http_client.aclose()
+        await gene.close()
     return {
         "documents": documents,
         "inventory_count": len(inventory_items),
@@ -4288,9 +4286,8 @@ async def _list_excluded_jira_scopes(
             logger.warning("Listing an excluded Jira scope of %s failed: %s", source_id, exc)
             continue
         finally:
-            http_client = getattr(gene, "_client", None)
-            if http_client is not None:
-                await http_client.aclose()
+            if gene is not None:
+                await gene.close()
         if len(listing.doc_ids) > SNAPSHOT_MANIFEST_MAX_ITEMS:
             # The scope can never be listed within a manifest, so it is as
             # definitive as a JQL Jira refuses.

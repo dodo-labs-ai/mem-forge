@@ -6765,6 +6765,7 @@ def create_admin_app(
             )
             preview_config = {**stored_config, **preview_config}
 
+        gene = None
         try:
             _validate_source_config(name, preview_config)
             preview_config["_memforge_preview_limit"] = req.limit + 1
@@ -6797,11 +6798,8 @@ def create_admin_app(
             logger.exception("Discovery preview failed for gene %s", name)
             raise HTTPException(status_code=502, detail=f"Discovery preview failed: {exc}") from exc
         finally:
-            client = locals().get("gene") and getattr(locals()["gene"], "_client", None)
-            if client is not None:
-                close = getattr(client, "aclose", None)
-                if close:
-                    await close()
+            if gene is not None:
+                await gene.close()
 
         return DiscoveryPreviewResponse(
             source_type=name,
@@ -6817,6 +6815,7 @@ def create_admin_app(
         db: Database = Depends(get_db),
     ):
         """List selectable repository paths for the GitHub Repository source UI."""
+        gene = None
         try:
             config = dict(req.config)
             if req.source_id:
@@ -6855,11 +6854,8 @@ def create_admin_app(
             logger.exception("GitHub Repository tree browse failed")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:
-            client = locals().get("gene") and getattr(locals()["gene"], "_client", None)
-            if client is not None:
-                close = getattr(client, "aclose", None)
-                if close:
-                    await close()
+            if gene is not None:
+                await gene.close()
 
         return GitHubRepoTreeResponse(
             ref=ref,

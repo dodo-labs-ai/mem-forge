@@ -56,9 +56,13 @@ class _Provider:
     def __init__(self, listing: ProviderListing) -> None:
         self.listing = listing
         self.requests: list[str] = []
+        self.clients: list[_Client] = []
 
     def client(self, **_kwargs) -> _Client:
-        return _Client(self)
+        """The client the Gene builds in ``authenticate``, answered by this provider."""
+        built = _Client(self)
+        self.clients.append(built)
+        return built
 
     def get(self, url: str) -> _Response:
         self.requests.append(f"GET {url}")
@@ -111,12 +115,13 @@ class _Provider:
 class _Client:
     def __init__(self, provider: _Provider) -> None:
         self._provider = provider
+        self.is_closed = False
 
     async def get(self, url: str, **_kwargs) -> _Response:
         return self._provider.get(url)
 
     async def aclose(self) -> None:
-        return None
+        self.is_closed = True
 
 
 class GitHubPagesFakes(DocumentConnectorFakes):
@@ -173,7 +178,10 @@ class GitHubPagesFakes(DocumentConnectorFakes):
         gene = GitHubPagesGene(config=dict(config), source_id="src-contract")
         with patch("memforge.genes.github_pages_gene._RequestsAsyncClient", provider.client):
             await gene.authenticate()
-        yield FakeConnection(gene=gene, requests=provider.requests)
+        try:
+            yield FakeConnection(gene=gene, requests=provider.requests, clients=provider.clients)
+        finally:
+            await gene.close()
 
 
 FAKES = GitHubPagesFakes()

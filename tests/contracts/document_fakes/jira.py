@@ -13,7 +13,6 @@ as Jira rejects an ORDER BY inside the parentheses.
 
 from __future__ import annotations
 
-import functools
 import json
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -85,6 +84,13 @@ class _Provider:
         self.listing = listing
         self.read_status = read_status
         self.requests: list[str] = []
+        self.clients: list[httpx.AsyncClient] = []
+
+    def client(self, *args, **kwargs) -> httpx.AsyncClient:
+        """The client the Gene builds in ``authenticate``, answered by this provider."""
+        built = _REAL_ASYNC_CLIENT(*args, transport=httpx.MockTransport(self.handle), **kwargs)
+        self.clients.append(built)
+        return built
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(f"{request.method} {request.url.path}")
@@ -161,9 +167,9 @@ class JiraFakes(DocumentConnectorFakes):
         provider = _Provider(listing)
         gene = await _authenticated(dict(config), provider)
         try:
-            yield FakeConnection(gene=gene, requests=provider.requests)
+            yield FakeConnection(gene=gene, requests=provider.requests, clients=provider.clients)
         finally:
-            await gene._client.aclose()
+            await gene.close()
 
     def manifest_entries(self, config: Mapping[str, object]) -> list[dict]:
         return [
@@ -191,12 +197,12 @@ class JiraFakes(DocumentConnectorFakes):
         try:
             yield gene, [_stored_issue("PAY-1", "100001")]
         finally:
-            await gene._client.aclose()
+            await gene.close()
 
 
 async def _authenticated(config: dict, provider: _Provider) -> JiraGene:
     gene = JiraGene(config=config, source_id="src-contract")
-    client = functools.partial(_REAL_ASYNC_CLIENT, transport=httpx.MockTransport(provider.handle))
+    client = provider.client
     with patch("httpx.AsyncClient", client):
         await gene.authenticate()
     gene._request_limiter = None

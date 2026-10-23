@@ -270,6 +270,7 @@ class GitHubRepoGene(DocumentGene):
         config["exclude_paths"] = normalize_github_scope_paths(list_config(config.get("exclude_paths")))
 
     async def authenticate(self) -> None:
+        await self.close()
         self._repo_ref = _parse_repo_url(str(self.config.get("repo_url") or ""))
         self._connection_mode = _connection_mode(self.config)
         if self._connection_mode == CONNECTION_MODE_LOCAL_PUSH:
@@ -314,7 +315,7 @@ class GitHubRepoGene(DocumentGene):
 
     async def _scope_tree(self) -> _ScopeTree:
         """Read the repository tree at the ref's current commit and select the files in scope, or raise."""
-        if not hasattr(self, "_client"):
+        if getattr(self, "_client", None) is None:
             await self.authenticate()
         repo_ref = self._repo_ref
         ref = str(self.config.get("ref") or "").strip()

@@ -779,7 +779,7 @@ async def test_jira_rediscovers_one_issue_by_its_id_and_fetches_it_as_discovered
         raw = await gene.fetch(current)
         assert await gene.rediscover(missing) is None
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert (current.item_id, current.title, current.version) == (
         doc_id("PAY-1"), "PAY-1: Payroll run", "2026-09-21T08:00:00.000+0000",
@@ -832,7 +832,7 @@ async def _rediscover_confluence(config: dict, pages: dict[str, dict]) -> dict[s
             )
             found[page_id] = await gene.rediscover(stored)
     finally:
-        await gene._client.aclose()
+        await gene.close()
     assert all(expand.startswith("version,metadata.labels,space") for expand in expands)
     return found
 

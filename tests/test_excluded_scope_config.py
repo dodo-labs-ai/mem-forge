@@ -86,9 +86,13 @@ async def test_the_run_builds_excluded_genes_from_its_own_configuration_and_auth
         def __init__(self, config):
             self.config = config
             self.authenticated = False
+            self.closed = False
 
         async def authenticate(self):
             self.authenticated = True
+
+        async def close(self):
+            self.closed = True
 
     def create_gene(*, name, config, source_id):
         assert (name, source_id) == ("jira", "src-jira")
@@ -106,9 +110,11 @@ async def test_the_run_builds_excluded_genes_from_its_own_configuration_and_auth
     }
     factory = runtime.excluded_scope_gene_factory({"id": "src-jira", "type": "jira"}, run_config)
 
-    gene = await factory({"query_mode": "simple", "projects": ["OPS"]})
+    async with factory({"query_mode": "simple", "projects": ["OPS"]}) as gene:
+        assert gene.authenticated
+        assert not gene.closed
 
-    assert gene.authenticated
+    assert gene.closed
     assert built == [
         {
             "base_url": "https://jira.example",
@@ -150,15 +156,20 @@ async def test_an_excluded_scope_that_cannot_be_built_is_a_configuration_error_a
     monkeypatch.setattr(runtime, "create_gene", unbuildable)
     factory = runtime.excluded_scope_gene_factory({"id": "src", "type": "jira"}, {"query_mode": "advanced", "jql": "x"})
     with pytest.raises(SourceConfigurationError, match="cannot be configured"):
-        await factory({"query_mode": "simple", "projects": ["OPS"]})
+        async with factory({"query_mode": "simple", "projects": ["OPS"]}):
+            pass
 
     class OfflineGene:
         async def authenticate(self):
             raise ValueError("Jira base URL must use HTTPS")
 
+        async def close(self):
+            return None
+
     monkeypatch.setattr(runtime, "create_gene", lambda **_kwargs: OfflineGene())
     with pytest.raises(ValueError) as raised:
-        await factory({"query_mode": "simple", "projects": ["OPS"]})
+        async with factory({"query_mode": "simple", "projects": ["OPS"]}):
+            pass
     assert not isinstance(raised.value, SourceConfigurationError)
 
 
@@ -198,6 +209,9 @@ async def test_run_source_sync_hands_the_orchestrator_a_factory_for_excluded_sco
         async def authenticate(self):
             return None
 
+        async def close(self):
+            return None
+
     def create_gene(*, name, config, source_id):
         built.append(dict(config))
         return RecordingGene(config)
@@ -215,7 +229,8 @@ async def test_run_source_sync_hands_the_orchestrator_a_factory_for_excluded_sco
             source={"id": "src-jira", "type": "jira", "name": "Jira", "config": source_config},
             runtime=CapturingRuntime(),
         )
-        excluded = await received["excluded_scope_gene"]({"query_mode": "simple", "projects": ["OPS"]})
+        async with received["excluded_scope_gene"]({"query_mode": "simple", "projects": ["OPS"]}) as excluded:
+            pass
     finally:
         await database.close()
 

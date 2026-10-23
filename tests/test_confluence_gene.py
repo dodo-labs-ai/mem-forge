@@ -471,7 +471,7 @@ async def test_open_source_artifact_streams_confluence_attachment():
             assert b"".join([chunk async for chunk in download.chunks]) == image
             assert download.content_length == len(image)
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
 
 @pytest.mark.asyncio
@@ -1173,7 +1173,7 @@ async def test_confirming_unlisted_pages_keeps_a_page_moved_out_of_the_tree():
     try:
         answers = await gene.confirm_absent(items)
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert answers == {
         "confluence-moved": AbsenceAnswer.EXISTS,
@@ -1201,4 +1201,4 @@ async def test_confirming_unlisted_pages_fails_when_confluence_rejects_the_crede
         with pytest.raises(httpx.HTTPStatusError):
             await gene.confirm_absent([item])
     finally:
-        await gene._client.aclose()
+        await gene.close()

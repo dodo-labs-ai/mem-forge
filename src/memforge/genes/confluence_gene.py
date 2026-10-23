@@ -171,6 +171,7 @@ class ConfluenceGene(DocumentGene):
             owner_id=self.source_id,
         )
 
+        await self.close()
         client = httpx.AsyncClient(
             base_url=base_url,
             headers=bearer_headers(self.config, "Confluence"),

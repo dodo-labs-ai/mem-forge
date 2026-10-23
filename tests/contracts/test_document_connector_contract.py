@@ -247,6 +247,9 @@ async def test_a_device_collected_configuration_lists_through_its_manifest(sourc
     discovered = {item.item_id async for item in gene.discover(None)}
     assert discovered == snapshot_document_ids(inputs)
     assert discovered
+    # The device read the provider; the server holds no client to release.
+    assert getattr(gene, "_client", None) is None
+    await gene.close()
 
 
 # ---------------------------------------------------------------------------
@@ -288,3 +291,39 @@ async def test_rediscover_keeps_the_predicates_of_discover(source_type, config_n
     # Every item a full discovery yields is found again, and nothing else is.
     assert sorted(found) == sorted(discovered)
     assert len(candidates) > len(found)
+
+
+# ---------------------------------------------------------------------------
+# close
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("source_type", "config_name"), LISTING_CASES)
+async def test_close_releases_every_client_the_gene_opened(source_type, config_name) -> None:
+    fakes = fakes_for(source_type)
+    async with fakes.connect(fakes.listing_configs[config_name].config) as connection:
+        await connection.gene.list_scope()
+        assert connection.clients
+        assert not any(client.is_closed for client in connection.clients)
+
+        await connection.gene.close()
+
+        assert all(client.is_closed for client in connection.clients)
+        # Closing again does nothing.
+        await connection.gene.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_type", DOCUMENT_TYPES)
+async def test_close_before_authenticate_does_nothing(source_type) -> None:
+    fakes = fakes_for(source_type)
+    configs = [
+        *(listing.config for listing in fakes.listing_configs.values()),
+        *fakes.non_listing_configs.values(),
+        *fakes.device_configs.values(),
+    ]
+    for config in configs:
+        gene = create_gene(source_type, dict(config), "src-contract")
+        await gene.close()
+        await gene.close()
