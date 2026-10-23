@@ -2905,6 +2905,55 @@ def test_agent_session_window_resolves_project_through_repo_binding(tmp_path):
     assert memory.project_key == "APP"
 
 
+def test_a_repo_binding_saved_through_the_admin_api_survives_the_next_window(tmp_path):
+    """The binding the admin UI saves on the managed Source routes the next window and stays stored."""
+    from memforge.server.admin_api import create_admin_app
+
+    class PatchClient(_AuthorizesAllCandidateUserEvidence):
+        async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+            return _knowledge_patch(
+                title="Project attribution",
+                claim_text="Agent-session memories carry the project and repository of their window.",
+            )
+
+    import asyncio
+
+    database = Database(str(tmp_path / "api.db"))
+    asyncio.run(database.connect())
+    try:
+        asyncio.run(database.create_project(key="APP", name="App"))
+        source = asyncio.run(ensure_agent_session_source(database, client="codex", owner_user_id="dev"))
+        binding = {"mode": "by_field", "field": "repo", "map": {"github.com/acme/app": "APP"}, "default": "UNSORTED"}
+        app = create_admin_app(db=database, config=_config(tmp_path))
+        app.state.agent_session_window_client = PatchClient()
+        with TestClient(app) as client:
+            saved = client.put(f"/api/v1/sources/{source['id']}", json={"project_binding": binding})
+            assert saved.status_code == 200, saved.text
+            response = client.post(
+                "/api/v1/agent-sessions/windows",
+                json={
+                    "client": "codex",
+                    "session_id": "sess-bound",
+                    "trigger": "Stop",
+                    "workspace": "/work/app",
+                    "repo": "github.com/acme/app",
+                    "events": _authorized_events({"role": "assistant", "text": "Worth keeping."}),
+                },
+            )
+            assert response.status_code == 200, response.text
+            listed = client.get("/api/v1/sources").json()["data"]
+
+        memory = asyncio.run(database.get_memory(response.json()["memory_id"]))
+        assert memory is not None
+        assert memory.project_key == "APP"
+        stored = asyncio.run(database.get_source(source["id"]))
+        assert stored is not None
+        assert stored["project_binding"] == binding
+        assert next(item for item in listed if item["id"] == source["id"])["project_binding"] == binding
+    finally:
+        asyncio.run(database.close())
+
+
 def test_agent_session_window_normalizes_repo_identifier(tmp_path):
     memory = _submit_patching_window(
         tmp_path,
