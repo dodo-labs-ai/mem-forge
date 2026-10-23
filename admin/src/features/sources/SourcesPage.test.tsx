@@ -96,7 +96,18 @@ test.each([
     name: "Claude Code Session",
     unrecognized_session_lines: lines,
   });
-  renderPage([source]);
+  renderPage([source], {
+    "GET /api/v1/agent-sessions/completeness": () => ({
+      session_id: null,
+      source_id: "src-claude",
+      total: 0,
+      processed_total: 0,
+      counts: { knowledge_patched: 0, no_output: 0, failed: 0 },
+      no_output_fraction: 0,
+      latest_failure: null,
+    }),
+    "GET /api/v1/sources/src-claude/projects": () => ({ source_id: "src-claude", projects: [] }),
+  });
 
   const table = await screen.findByRole("table", { name: "Sources" });
   await userEvent.click(await within(table).findByText("Claude Code Session"));

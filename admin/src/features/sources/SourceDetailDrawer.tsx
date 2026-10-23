@@ -3,6 +3,8 @@ import { useSharedWorkspace } from "@/api";
 import { formatCount, formatDateTime, formatInterval, formatRelative, formatUntil, pluralize } from "@/lib/format";
 import { ActionCard, DetailDrawer, DrawerSection, Notice, PropertyList, StatusBadge } from "@/patterns";
 import { Button } from "@/ui/button";
+import { AgentSessionCoverage } from "./AgentSessionCoverage";
+import { AGENT_SESSION_SOURCE_TYPE } from "./model/agentSessions";
 import { BRAND_MARKS, sourceBrandKeysFor } from "./model/sourceBrand";
 import { failedItemsTitle, retryingAfterUpgradeTitle } from "./model/sourceFailedItems";
 import { presentSourceSyncActivity } from "./model/sourceSyncActivity";
@@ -157,6 +159,8 @@ export function SourceDetailDrawer({ row, typeLabel, projectName, actions, onOpe
           ]}
         />
       </DrawerSection>
+
+      {source.type === AGENT_SESSION_SOURCE_TYPE ? <AgentSessionCoverage source={source} /> : null}
 
       {failedItems ? (
         <DrawerSection title={failedItemsTitle(failedItems.count)}>
