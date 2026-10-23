@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -116,24 +116,43 @@ class TeamsChatClient:
 
     Loads OAuth tokens via TeamsAuthenticator and provides typed methods
     for conversations, messages, teams, channels, and user resolution.
+
+    Production passes only the region. A test serves the client from a fake
+    Chat Service: ``transport`` answers every request, ``sleep`` takes every
+    wait (the pause between pages and the retry backoff), ``clock`` is the
+    monotonic time a poll's budget is measured on (the running loop's time
+    by default), and ``load_tokens`` returns the tokens the keychain would.
     """
 
-    def __init__(self, region: str = "emea") -> None:
+    def __init__(
+        self,
+        region: str = "emea",
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        sleep: Callable[[float], Awaitable[object]] | None = None,
+        clock: Callable[[], float] | None = None,
+        load_tokens: Callable[[], Mapping[str, object] | None] | None = None,
+    ) -> None:
         self._region = region
         self._chat_base = _REGION_URLS.get(region, _REGION_URLS["emea"])
         self._chat_client: httpx.AsyncClient | None = None
         self._graph_client: httpx.AsyncClient | None = None
+        self._transport = transport
+        self._sleep = sleep
+        self._clock = clock
+        self._token_source = load_tokens
 
     async def _load_tokens(self) -> tuple[str, str | None]:
         """Load chat and graph tokens.
 
         The collection path is read-only and never starts authentication UI.
         """
-        from memforge.auth.teams_auth import (
-            TeamsAuthenticator,
-        )
+        if self._token_source is not None:
+            tokens = self._token_source()
+        else:
+            from memforge.auth.teams_auth import TeamsAuthenticator
 
-        tokens = TeamsAuthenticator.load_tokens()
+            tokens = TeamsAuthenticator.load_tokens()
         if not tokens:
             raise AuthenticationError("No Teams session found. Connect Teams from the source wizard.")
 
@@ -171,12 +190,14 @@ class TeamsChatClient:
             base_url=self._chat_base,
             headers={"Authorization": f"Bearer {chat_token}"},
             timeout=30.0,
+            transport=self._transport,
         )
         if graph_token:
             self._graph_client = httpx.AsyncClient(
                 base_url=_GRAPH_BASE,
                 headers={"Authorization": f"Bearer {graph_token}"},
                 timeout=30.0,
+                transport=self._transport,
             )
 
     def _require_graph_client(self, capability: str) -> httpx.AsyncClient:
@@ -242,6 +263,7 @@ class TeamsChatClient:
                 httpx.RemoteProtocolError,
             ),
             description=f"Teams API {method} {url}",
+            sleep=self._sleep,
         )
 
     async def _request_bytes(
@@ -292,6 +314,7 @@ class TeamsChatClient:
                 httpx.RemoteProtocolError,
             ),
             description=f"Teams API GET {url}",
+            sleep=self._sleep,
         )
 
     # --- Chat API methods ---
@@ -394,8 +417,8 @@ class TeamsChatClient:
         """
 
         await self._ensure_clients()
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + budget_seconds
+        clock = self._clock or asyncio.get_running_loop().time
+        deadline = clock() + budget_seconds
         url = f"/conversations/{conversation_id}/messages"
         end_time = _last_millisecond_before(end) if end is not None else None
         params = _teams_message_page_params(page_size=_MAX_PAGE_SIZE, end_time=end_time)
@@ -405,7 +428,7 @@ class TeamsChatClient:
         pages = 0
         while True:
             if pages:
-                if loop.time() >= deadline:
+                if clock() >= deadline:
                     return TeamsMessagePoll(
                         messages=tuple(messages.values()),
                         outcome=PollOutcome.STOPPED_EARLY,
@@ -413,7 +436,7 @@ class TeamsChatClient:
                         stop_reason="time_budget_exhausted",
                     )
                 # Teams allows 15 requests in 10 seconds.
-                await asyncio.sleep(1.0)
+                await (self._sleep or asyncio.sleep)(1.0)
             response = await self._request(self._chat_client, "GET", url, params=params)
             pages += 1
             page = _validated_teams_message_page(response.json())
