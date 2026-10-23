@@ -444,6 +444,7 @@ and run the printed CLI command. See [local-repo-sync.md](local-repo-sync.md).
 | Jira | Tickets, decisions and work items |
 | GitHub Repository | Repository files from GitHub or GitHub Enterprise, scoped by folders and file types |
 | GitHub Pages | Rendered documentation pages |
+| Notion | Every page under the root pages and databases you share, database rows included, with their images and PDFs |
 | Microsoft Teams | Channel messages, group chats and direct messages |
 | Local Repository | Markdown, text, JSON and HTML files from a local folder or repo, uploaded by the local daemon |
 
@@ -471,6 +472,27 @@ custom path.
 Confluence PDF artifacts are rendered with WeasyPrint. When running the Python
 service directly on macOS, install WeasyPrint's native text-rendering libraries
 with `brew install pango`. The Docker image already includes them.
+
+### Notion
+
+The service reads Notion with an internal connection token, so a Notion source
+works the same self-hosted and hosted.
+
+1. Open [notion.so/profile/integrations](https://www.notion.so/profile/integrations),
+   create an internal connection for your workspace, and give it **Read
+   content**. Also give it **Read user information without email addresses**
+   if you want people properties to show names instead of IDs.
+2. Copy the connection's token into **Internal connection token**.
+3. In Notion, share each root page or database with the connection: open it,
+   choose **•••** → **Connections**, and add the connection.
+4. Paste each root's URL, or its ID, into **Root pages** or **Databases**.
+
+MemForge collects every page under those roots: child pages, pages inside
+toggles and columns, and the rows of each database, with a row's properties
+kept apart from its body. It never uses Notion's search. A full sync reads
+every page, so a Notion source syncs once a day unless you choose another
+interval. A page moved to the trash is removed at the next sync; an archived
+page, or one moved out of the roots, is kept as it was.
 
 ## 5. Query Memory From An Agent
 
