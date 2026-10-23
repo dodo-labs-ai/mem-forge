@@ -258,7 +258,8 @@ export function SourceRow({
               type="button"
               variant="outline"
               aria-label={`Configure ${source.name}`}
-              disabled={isSourceBusy || isDeleting}
+              // Configure stays open during a sync: saving offers to stop the sync first.
+              disabled={isDeleting}
               onClick={() => onConfigure()}
             >
               <SlidersHorizontal className="size-4" />

@@ -39,7 +39,7 @@ import type { RepoPickerItem } from "./githubRepoFolderPickerUtils";
 import { isImmutableExecutionModeField } from "./localAgentSources";
 import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
-import { useStopRunningSyncAndSave } from "./runningSyncSave";
+import { useRunningSyncSave } from "./runningSyncSave";
 import { refusedSaveMessage, scopeChangeWarning, useScopeChangePreview } from "./scopeChange";
 import { SourceSetupShell } from "./SourceSetupShell";
 import type { SourceSetupSection, SourceSetupSectionId } from "./SourceSetupShell";
@@ -74,6 +74,7 @@ export function SchemaSourceSetup({
   source,
   onSaved,
   initialFocus,
+  activeSyncRunId,
   onRequestAccessChange,
 }: {
   open: boolean;
@@ -82,6 +83,8 @@ export function SchemaSourceSetup({
   source?: Source | null;
   onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" | "content" };
+  /** The sync of `source` in progress, from the live Sources list; saving stops it first. */
+  activeSyncRunId?: string | null;
   onRequestAccessChange?: (source: Source) => void;
 }) {
   // Backend authority: an existing source the viewer cannot configure should
@@ -137,6 +140,7 @@ export function SchemaSourceSetup({
             onSaved={onSaved}
             initialFocus={initialFocus}
             canConfigureConnection={canConfigureConnection}
+            activeSyncRunId={activeSyncRunId}
             onRequestAccessChange={onRequestAccessChange}
           />
         )}
@@ -153,6 +157,7 @@ function SourceConfigForm({
   onSaved,
   initialFocus,
   canConfigureConnection,
+  activeSyncRunId,
   onRequestAccessChange,
 }: {
   sourceType: string;
@@ -162,6 +167,7 @@ function SourceConfigForm({
   onSaved?: (sourceId: string) => void;
   initialFocus?: { step: "project" | "content" };
   canConfigureConnection: boolean;
+  activeSyncRunId?: string | null;
   onRequestAccessChange?: (source: Source) => void;
 }) {
   const queryClient = useQueryClient();
@@ -247,8 +253,11 @@ function SourceConfigForm({
     },
   });
 
-  const runningSync = useStopRunningSyncAndSave(source?.id, saveSource.error, () => {
-    if (saveSource.variables) saveSource.mutate(saveSource.variables);
+  const runningSync = useRunningSyncSave({
+    sourceId: source?.id,
+    activeRunId: activeSyncRunId,
+    saveError: saveSource.error,
+    save: saveSource.mutateAsync,
   });
 
   const previewDiscovery = useMutation<DiscoveryPreviewResponse, unknown, void>({
@@ -378,7 +387,7 @@ function SourceConfigForm({
       setFocusSection("schedule");
       return;
     }
-    saveSource.mutate({
+    runningSync.save({
       name: name.trim(),
       ...(canConfigureConnection ? { config: serializeConfig(schema.fields, config) } : {}),
       project_binding: binding,
@@ -626,13 +635,16 @@ function SourceConfigForm({
       sections={sharedWorkspace ? sections : sections.filter((section) => section.id !== "access")}
       openSection={focusSection}
       onOpenSectionChange={setFocusSection}
-      error={saveSource.isError ? extractSaveError(saveSource.error) : null}
+      error={saveSource.isError && !runningSync.refusedForRunningSync ? extractSaveError(saveSource.error) : null}
       scopeChange={scopeChangeWarning(scopeChangePreview)}
-      runningSync={runningSync.runId ? {
-        stopping: runningSync.pending,
+      runningSync={{
+        running: runningSync.running,
+        confirming: runningSync.confirming,
+        stopping: runningSync.stopping,
         error: runningSync.error ? extractSaveError(runningSync.error) : null,
-        onStopAndSave: runningSync.run,
-      } : null}
+        onStopAndSave: runningSync.stopAndSave,
+        onWait: runningSync.wait,
+      }}
       validationMessage={validationMessage}
       saving={saveSource.isPending}
       saveDisabled={!isEdit && accessPolicy === null}

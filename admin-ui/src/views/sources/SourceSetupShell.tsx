@@ -1,10 +1,17 @@
 import type { ReactNode } from "react";
-import { AlertCircle, Check, ChevronDown, Info, Loader2 } from "lucide-react";
+import { AlertCircle, Check, ChevronDown, Info, Loader2, RefreshCw } from "lucide-react";
 
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 
 import type { ScopeChangeWarning } from "./scopeChange";
 import type { SourceConnectionMode } from "./sourceConnectionPresentation";
@@ -25,11 +32,20 @@ export interface SourceSetupSection {
   content: ReactNode;
 }
 
-/** A save refused because a sync of the Source runs, and the way out: stop that sync, then save. */
+/**
+ * Saving while a sync of the Source runs. The server refuses the change until
+ * the sync has ended, so a save asks first: stop the sync and save, or wait.
+ */
 export interface RunningSyncSave {
+  /** A sync of the Source is running; the dialog says that saving stops it. */
+  running: boolean;
+  /** A save is waiting for the person's choice. */
+  confirming: boolean;
   stopping: boolean;
   error: string | null;
   onStopAndSave: () => void;
+  /** Keeps the dialog open with its edits and saves nothing, also while the sync is stopping. */
+  onWait: () => void;
 }
 
 export function SourceSetupShell({
@@ -115,6 +131,13 @@ export function SourceSetupShell({
           </div>
         </div>
 
+        {runningSync?.running && (
+          <div role="status" className="mb-3 flex items-start gap-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-900 dark:bg-amber-900/20 dark:text-amber-100">
+            <RefreshCw className="mt-0.5 size-4 shrink-0" />
+            <span>A sync is running. Saving will stop it first.</span>
+          </div>
+        )}
+
         <div className="space-y-2">
           {sections.map((section, index) => {
             const open = section.id === openSection;
@@ -158,24 +181,7 @@ export function SourceSetupShell({
           </div>
         )}
 
-        {runningSync ? (
-          <div role="alert" className="mt-3 space-y-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-900 dark:bg-amber-900/20 dark:text-amber-100">
-            <div className="flex items-start gap-2">
-              <AlertCircle className="mt-0.5 size-4 shrink-0" />
-              <span>
-                A sync of this source is running, so this change cannot be saved yet. Stopping the sync keeps
-                what it has saved, and the next sync uses your new settings.
-              </span>
-            </div>
-            {runningSync.error && <p className="pl-6 text-destructive">{runningSync.error}</p>}
-            <div className="pl-6">
-              <Button type="button" size="sm" variant="outline" disabled={runningSync.stopping} onClick={runningSync.onStopAndSave}>
-                {runningSync.stopping && <Loader2 className="size-4 animate-spin" />}
-                {runningSync.stopping ? "Stopping the sync…" : "Stop the running sync and save"}
-              </Button>
-            </div>
-          </div>
-        ) : (error || validationMessage) && (
+        {(error || validationMessage) && (
           <div className={`mt-3 flex items-start gap-2 rounded-lg p-3 text-sm ${error ? "bg-destructive/10 text-destructive" : "bg-muted/50 text-muted-foreground"}`}>
             <AlertCircle className="mt-0.5 size-4 shrink-0" />
             <span>{error || validationMessage}</span>
@@ -185,12 +191,56 @@ export function SourceSetupShell({
 
       <DialogFooter className="mx-0 mb-0 shrink-0 flex-row justify-between rounded-none rounded-b-xl border-t bg-background px-5 py-4 sm:justify-between">
         <Button type="button" variant="outline" onClick={onCancel}>Cancel</Button>
-        <Button type="button" onClick={onSave} disabled={saving || saveDisabled}>
+        <Button type="button" onClick={onSave} disabled={saving || saveDisabled || runningSync?.stopping}>
           {saving ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
           {isEdit ? "Save Changes" : "Create Source"}
         </Button>
       </DialogFooter>
+
+      {runningSync && <RunningSyncConfirmation runningSync={runningSync} />}
     </>
+  );
+}
+
+function RunningSyncConfirmation({ runningSync }: { runningSync: RunningSyncSave }) {
+  return (
+    <Dialog
+      open={runningSync.confirming}
+      onOpenChange={(open) => {
+        if (!open) runningSync.onWait();
+      }}
+    >
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Stop the sync and save?</DialogTitle>
+          <DialogDescription>
+            A sync of this source is running, and a change can be saved only once it has ended. Stopping the sync
+            keeps what it has saved, and the next sync uses your new settings.
+          </DialogDescription>
+        </DialogHeader>
+        {runningSync.stopping && (
+          <p className="text-sm text-muted-foreground">
+            The sync usually stops within a minute. Waiting instead keeps your edits unsaved, and the sync still
+            stops.
+          </p>
+        )}
+        {runningSync.error && (
+          <div className="flex items-start gap-2 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
+            <AlertCircle className="mt-0.5 size-4 shrink-0" />
+            <span>{runningSync.error}</span>
+          </div>
+        )}
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={runningSync.onWait}>
+            Wait for the sync to finish
+          </Button>
+          <Button type="button" disabled={runningSync.stopping} onClick={runningSync.onStopAndSave}>
+            {runningSync.stopping && <Loader2 className="size-4 animate-spin" />}
+            {runningSync.stopping ? "Stopping the sync…" : "Stop sync and save"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
