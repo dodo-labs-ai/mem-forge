@@ -91,10 +91,18 @@ test("the exclude picker suggests outdated folders and counts the files left to 
   expect(screen.queryByRole("button", { name: "+ docs/archive" })).not.toBeInTheDocument();
 });
 
-test("local sync lists the remote repository through the daemon", async () => {
+test("local sync lists the remote repository through the daemon with a job that carries no secret or path", async () => {
   const created: Parameters<typeof setupJobRoutes>[1] = [];
+  const config = {
+    connection_mode: "local_push",
+    repo_url: "https://github.tools.example/acme/docs",
+    ref: "dev",
+    pat: "ghp_typed-under-cloud-access",
+    exclude_paths: ["docs/archive"],
+    include_extensions: ["md"],
+  };
   renderWithApi(
-    <Picker fieldKey="include_paths" config={{ connection_mode: "local_push", repo_url: "https://github.tools.example/acme/docs", ref: "dev" }} onChange={vi.fn()} />,
+    <Picker fieldKey="include_paths" config={config} onChange={vi.fn()} />,
     setupJobRoutes(
       {
         github_repo_preview_tree: {
@@ -118,7 +126,7 @@ test("local sync lists the remote repository through the daemon", async () => {
       source_id: "",
       source_type: "github_repo",
       operation: "github_repo_preview_tree",
-      payload: { connection_mode: "local_push", repo_url: "https://github.tools.example/acme/docs", ref: "dev", include_paths: [], limit: 2000 },
+      payload: { repo_url: "https://github.tools.example/acme/docs", ref: "dev", include_extensions: ["md"], limit: 2000 },
     },
   ]);
 });

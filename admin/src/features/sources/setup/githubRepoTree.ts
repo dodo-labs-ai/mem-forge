@@ -21,8 +21,9 @@ function text(config: ServerConfig, key: string): string {
  * A GitHub repository's folders and files for the path picker, loaded when
  * `requested` is true. Cloud access asks the server (`browse-tree`); local
  * sync lists the remote repository through the daemon's Git access
- * (`github_repo_preview_tree`). Both pickers of the form, include and
- * exclude, share one tree for the repository and ref.
+ * (`github_repo_preview_tree`), whose job carries only the repository, ref
+ * and file types it reads. Both pickers of the form, include and exclude,
+ * share one tree for the repository, ref and file types.
  */
 export function useRepoTree(config: ServerConfig, sourceId: string | undefined, requested: boolean) {
   const api = useApi();
@@ -30,11 +31,12 @@ export function useRepoTree(config: ServerConfig, sourceId: string | undefined, 
   const local = text(config, "connection_mode") === "local_push";
   const repoUrl = text(config, "repo_url");
   const ref = text(config, "ref");
+  const includeExtensions = config.include_extensions;
   return useQuery({
-    queryKey: ["github-repo-tree", sourceId ?? null, local, repoUrl, ref] as const,
+    queryKey: ["github-repo-tree", sourceId ?? null, local, repoUrl, ref, includeExtensions] as const,
     queryFn: async (): Promise<RepoTree> => {
       if (local) {
-        const result = await previewTree({ sourceId, payload: { ...config, limit: REPO_TREE_LIMIT } });
+        const result = await previewTree({ sourceId, payload: { repo_url: repoUrl, ref, include_extensions: includeExtensions, limit: REPO_TREE_LIMIT } });
         const items = repoItemsFromFilePaths(result.items.map((item) => normalizeRepoPath(item.relative_path)));
         return { items, truncated: result.counts.included > result.items.length };
       }
