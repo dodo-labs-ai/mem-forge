@@ -43,6 +43,7 @@ export function makeSource(overrides: Partial<Source> = {}): Source {
       progress: null,
     },
     failed_items: null,
+    scope_transition: null,
     connection_status: { state: "ready", reason: null },
     created_at: "2026-09-01T00:00:00Z",
     project_binding: { mode: "fixed", project_key: "PAY" },
@@ -56,6 +57,26 @@ export function makeSource(overrides: Partial<Source> = {}): Source {
 }
 
 type FailedItem = NonNullable<Source["failed_items"]>["items"][number];
+type ScopeTransition = NonNullable<Source["scope_transition"]>;
+
+/** A scope change from space ENG to ENG and OPS that the last sync left open; override what a test needs. */
+export function makeScopeTransition(overrides: Partial<ScopeTransition> = {}): ScopeTransition {
+  return {
+    id: "scope-transition-1",
+    status: "failed",
+    previous_scope: { sync_mode: "spaces", spaces: ["ENG"] },
+    target_scope: { sync_mode: "spaces", spaces: ["ENG", "OPS"] },
+    created_at: "2026-09-29T09:00:00Z",
+    updated_at: "2026-09-29T11:00:00Z",
+    members_committed: 117,
+    listed_count: 120,
+    excluded_scopes_due: false,
+    error: "3 listed Documents have not committed under the transition",
+    failing_items: { count: 0, retrying_after_upgrade: 0, items: [] },
+    restore_config: { base_url: "https://wiki.example", sync_mode: "spaces", spaces: ["ENG"] },
+    ...overrides,
+  };
+}
 
 /** A failed item as the server's failure record lists it; override what a test needs. */
 export function makeFailedItem(overrides: Partial<FailedItem> = {}): FailedItem {

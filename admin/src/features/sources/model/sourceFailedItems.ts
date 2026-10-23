@@ -62,21 +62,7 @@ function syncOnItsWay(activity: SourceSyncActivity | undefined): boolean {
  */
 export function sourceFailedItems(source: Source, activity: SourceSyncActivity | undefined): SourceFailedItems | null {
   const recorded = source.failed_items;
-  if (recorded != null) {
-    if (recorded.count === 0) return null;
-    const retrying = syncOnItsWay(activity) ? recorded.retrying_after_upgrade : 0;
-    return {
-      count: recorded.count,
-      retryingAfterUpgrade: retrying,
-      items: recorded.items.map((item) => ({
-        documentId: item.document_id,
-        title: item.title || item.document_id,
-        stage: failedItemStageLabel(item.stage),
-        reason: item.message,
-        retryingAfterUpgrade: retrying > 0 && item.retrying_after_upgrade,
-      })),
-    };
-  }
+  if (recorded != null) return recordedFailedItems(recorded, activity);
   const lastRunItems = activity?.error?.items ?? [];
   if (lastRunItems.length === 0) return null;
   return {
@@ -88,6 +74,28 @@ export function sourceFailedItems(source: Source, activity: SourceSyncActivity |
       stage: null,
       reason: item.error,
       retryingAfterUpgrade: false,
+    })),
+  };
+}
+
+type RecordedFailedItems = NonNullable<Source["failed_items"]>;
+
+/** Failed items as the server's failure record lists them; null when it lists none. */
+export function recordedFailedItems(
+  recorded: RecordedFailedItems,
+  activity: SourceSyncActivity | undefined,
+): SourceFailedItems | null {
+  if (recorded.count === 0) return null;
+  const retrying = syncOnItsWay(activity) ? recorded.retrying_after_upgrade : 0;
+  return {
+    count: recorded.count,
+    retryingAfterUpgrade: retrying,
+    items: recorded.items.map((item) => ({
+      documentId: item.document_id,
+      title: item.title || item.document_id,
+      stage: failedItemStageLabel(item.stage),
+      reason: item.message,
+      retryingAfterUpgrade: retrying > 0 && item.retrying_after_upgrade,
     })),
   };
 }

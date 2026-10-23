@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import { STANDALONE_TARGET, type WorkspaceTarget } from "@/api";
 import { errorResponse, type Route } from "@/test/fakeApi";
 import { renderRoutes } from "@/test/renderRoutes";
-import { makeFailedItem, makeLocalAgentJob, makeSource } from "@/test/sourceFixtures";
+import { makeFailedItem, makeLocalAgentJob, makeScopeTransition, makeSource } from "@/test/sourceFixtures";
 import { SourcesPage } from "./SourcesPage";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -524,4 +524,77 @@ test("a sync being stopped reads Stopping and a stopped one reads Stopped, not f
   expect(within(table).queryByRole("button", { name: "Stop sync" })).not.toBeInTheDocument();
   expect(within(table).getByText("Stopped")).toBeInTheDocument();
   expect(screen.queryByRole("region", { name: "Needs you" })).not.toBeInTheDocument();
+});
+
+const CONFLUENCE_SCHEMA = {
+  fields: [{ key: "spaces", label: "Spaces", field_type: "text", options: [], default: "", help_text: "", group: "content", order: 1, advanced: false }],
+  groups: [],
+};
+
+async function openScopeChange(source = makeSource({ scope_transition: makeScopeTransition() }), routes: Record<string, Route> = {}) {
+  const page = renderPage([source], { "GET /api/v1/genes/confluence/config-schema": () => CONFLUENCE_SCHEMA, ...routes });
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await userEvent.click(await within(table).findByText("Payroll wiki"));
+  const drawer = await screen.findByRole("dialog", { name: "Payroll wiki" });
+  const section = within(drawer).getByRole("heading", { name: "Scope change in progress" }).closest("section")!;
+  return { ...page, drawer, section };
+}
+
+test("the drawer shows the scope change in progress: what it changes, how far it is, and what keeps it open", async () => {
+  const { section } = await openScopeChange(
+    makeSource({
+      scope_transition: makeScopeTransition({
+        failing_items: { count: 1, retrying_after_upgrade: 0, items: [makeFailedItem({ document_id: "page-3", title: "OPS runbook" })] },
+      }),
+    }),
+  );
+
+  expect(within(section).getByText("The last sync left it open")).toBeInTheDocument();
+  expect(await within(section).findByText("Spaces")).toBeInTheDocument();
+  expect(within(section).getByText("ENG")).toBeInTheDocument();
+  expect(within(section).getByText("ENG, OPS")).toBeInTheDocument();
+  expect(within(section).getByText("117 of 120 listed items synced under the new scope")).toBeInTheDocument();
+  expect(within(section).getByText("1 failed item keeps the change open")).toBeInTheDocument();
+  expect(within(section).getByText("OPS runbook")).toBeInTheDocument();
+  expect(within(section).getByText("403 Forbidden")).toBeInTheDocument();
+});
+
+test("Restore the previous scope confirms, then saves the previous scope through the update route", async () => {
+  const transition = makeScopeTransition();
+  const { section, calls } = await openScopeChange(makeSource({ scope_transition: transition }), {
+    "PUT /api/v1/sources/src-wiki": () => ({ ok: true, id: "src-wiki" }),
+  });
+
+  await userEvent.click(within(section).getByRole("button", { name: "Restore the previous scope" }));
+  const confirm = await screen.findByRole("dialog", { name: "Restore the previous scope?" });
+  expect(within(confirm).getByText(/undoes the scope change in progress/)).toBeInTheDocument();
+  expect(within(confirm).getByText(/Nothing the previous scope synced is removed/)).toBeInTheDocument();
+  await userEvent.click(within(confirm).getByRole("button", { name: "Restore" }));
+
+  await vi.waitFor(() => expect(calls.some((request) => request.method === "PUT")).toBe(true));
+  const save = calls.find((request) => request.method === "PUT")!;
+  expect(new URL(save.url).pathname).toBe("/api/v1/sources/src-wiki");
+  expect(await save.clone().json()).toEqual({ config: transition.restore_config });
+  await vi.waitFor(() => expect(toast.success).toHaveBeenCalledWith("Payroll wiki returns to its previous scope"));
+});
+
+test("a refused restore explains the refusal and keeps the dialog open", async () => {
+  const { section } = await openScopeChange(undefined, {
+    "PUT /api/v1/sources/src-wiki": () =>
+      errorResponse(409, { code: "source_sync_running", run_id: "run-9", message: "A sync of this Source is running." }),
+  });
+
+  await userEvent.click(within(section).getByRole("button", { name: "Restore the previous scope" }));
+  const confirm = await screen.findByRole("dialog", { name: "Restore the previous scope?" });
+  await userEvent.click(within(confirm).getByRole("button", { name: "Restore" }));
+
+  expect(await within(confirm).findByText("A sync of this source is running. Stop the sync, then try again.")).toBeInTheDocument();
+  expect(toast.success).not.toHaveBeenCalled();
+});
+
+test("a viewer who cannot change the configuration sees the scope change without a way back", async () => {
+  const { section } = await openScopeChange(makeSource({ scope_transition: makeScopeTransition({ restore_config: null }) }));
+
+  expect(within(section).getByText("The last sync left it open")).toBeInTheDocument();
+  expect(within(section).queryByRole("button", { name: "Restore the previous scope" })).not.toBeInTheDocument();
 });

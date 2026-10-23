@@ -64,6 +64,21 @@ export function useSourceTypeLabels(): Record<string, string> {
   );
 }
 
+/** The labels a source type's configuration gives its fields, keyed by field, such as "Spaces" for `spaces`. */
+export function useSourceConfigLabels(sourceType: string | null): Record<string, string> {
+  const api = useApi();
+  const schema = useQuery({
+    queryKey: [...sourceKeys.types, sourceType, "config-schema"],
+    queryFn: () => unwrap(api.GET("/api/v1/genes/{name}/config-schema", { params: { path: { name: sourceType! } } })),
+    enabled: sourceType !== null,
+    staleTime: Infinity,
+  });
+  return useMemo(
+    () => Object.fromEntries((schema.data?.fields ?? []).map((field) => [field.key, field.label])),
+    [schema.data],
+  );
+}
+
 /** The projects each field-bound source has sent memories to, as the server resolved them. */
 export function useResolvedProjects(sources: Source[]): ResolvedBySource {
   const api = useApi();
@@ -212,6 +227,22 @@ export function useSetPaused() {
       api.PUT("/api/v1/sources/{source_id}", {
         params: { path: { source_id: sourceId } },
         body: { status: paused ? "paused" : "active" },
+      }),
+    ),
+  );
+}
+
+/**
+ * Saves the configuration that returns a source to the scope it had before
+ * the change in progress, which replaces that change.
+ */
+export function useRestorePreviousScope() {
+  const api = useApi();
+  return useSourceMutation(({ sourceId, config }: { sourceId: string; config: Record<string, unknown> }) =>
+    unwrap(
+      api.PUT("/api/v1/sources/{source_id}", {
+        params: { path: { source_id: sourceId } },
+        body: { config },
       }),
     ),
   );
