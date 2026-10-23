@@ -525,3 +525,46 @@ test("a sync a person stops reads Stopping until it ends, then Stopped, and is n
     "failed",
   );
 });
+
+test("says what to do when the source cannot be reached or its sign-in is no longer valid", () => {
+  const detail = (message: string, executor?: "local_agent" | "server") =>
+    presentSourceSyncActivity({ state: "failed", error: { message }, executor }, "Source", "items").detail;
+  const unreachable = "GitHub CLI request failed: error connecting to git.example.internal\ncheck your internet connection";
+
+  assert.equal(
+    detail(unreachable, "local_agent"),
+    "The source could not be reached from this device. Check your network or VPN, then retry.",
+  );
+  assert.equal(
+    detail("All connection attempts failed", "server"),
+    "The server could not reach the source. Check its address, or use Local sync if it is on your network.",
+  );
+  assert.equal(
+    detail("could not resolve host: wiki.example.internal"),
+    "The source could not be reached. Check the network connection, then retry.",
+  );
+  assert.equal(
+    detail("Jira browser session expired for https://jira.example.com. Sign in to Jira in your browser, then run `memforge adapter auth jira refresh`.", "server"),
+    "The Jira browser session has expired. Sign in to Jira, then refresh it in Configure.",
+  );
+  assert.equal(
+    detail("GitHub CLI request failed: HTTP 401: Bad credentials (https://api.github.com/user)", "local_agent"),
+    "Sign in to the GitHub CLI on this device, then retry sync.",
+  );
+  assert.equal(
+    detail("Client error '401 Unauthorized' for url 'https://wiki.example.com/rest/api/space'", "server"),
+    "The access token has expired or was revoked. Update it in Configure, then retry.",
+  );
+  // None of these messages show the host, URL or command from the raw error.
+  for (const message of [unreachable, "Jira browser session expired for https://jira.example.com."]) {
+    assert.doesNotMatch(detail(message, "local_agent"), /example|https?:|memforge adapter/);
+  }
+});
+
+test("records where a sync ran", () => {
+  assert.equal(sourceSyncActivityFromLocalJob(makeLocalAgentJob({ status: "failed", last_error: "x" })).executor, "local_agent");
+  assert.equal(
+    sourceSyncActivityFromStatus({ status: "failed", run_id: "ssr-1", error_message: "x" } as SyncStatus).executor,
+    "server",
+  );
+});
