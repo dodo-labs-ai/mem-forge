@@ -7,6 +7,7 @@ sources/genes, schedule, model settings, and system health/stats.
 from __future__ import annotations
 
 import asyncio
+import copy
 from dataclasses import asdict, dataclass, is_dataclass
 import hashlib
 import hmac
@@ -75,7 +76,12 @@ from memforge.genes.family import CollectionFamilyKind
 from memforge.genes.atlassian_auth import release_atlassian_request_limiter
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.github_repo_gene import GitHubRepoGene
-from memforge.genes.toolkit.config import require_https_base_url, validate_bool_fields, validate_tls_ca_bundle
+from memforge.genes.toolkit.config import (
+    FieldIssue,
+    SourceConfigInvalid,
+    require_https_base_url,
+    validate_tls_ca_bundle,
+)
 from memforge.genes.toolkit.github_api import BROWSE_TREE_REQUEST_BUDGET, GitHubTreeBudgetExceeded
 from memforge.github_repo_utils import github_extension_allowed, github_include_extensions
 from memforge.memory.audit import AuditContext
@@ -155,7 +161,8 @@ from memforge.vector_index_errors import (
 from memforge.memory.store import MemoryStore
 from memforge.models import (
     AbsenceCheckSkippedReason,
-    ConfigField,
+    ConfigCondition,
+    ConfigGroupPurpose,
     ScopeListingKind,
     ConfigFieldType,
     Entity,
@@ -243,6 +250,7 @@ from memforge.source_types import (
     load_reference,
     source_type_descriptor,
 )
+from memforge.source_types.form import check_config, comparison_string, effective_value
 from memforge.source_types.jira import jira_auth_mode
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind, SourceSyncRunActive
 from memforge.storage.document_store import LocalDocumentStore
@@ -1687,31 +1695,82 @@ class GeneMetadataResponse(BaseModel):
     auth_method: str
     data_shape: str
     execution_kinds: list[SourceExecutionKind]
+    managed: bool = Field(description="Managed capture, created by the service; the type picker leaves it out.")
+
+
+class ConfigConditionResponse(BaseModel):
+    field: str
+    values: list[str]
+
+
+class ConfigOptionResponse(BaseModel):
+    value: str
+    label: str
+    help_text: str = ""
+    visible_when: list[ConfigConditionResponse] = []
+
+
+class ConfigPanelResponse(BaseModel):
+    name: str
+    visible_when: list[ConfigConditionResponse] = []
 
 
 class ConfigFieldResponse(BaseModel):
     key: str
     label: str
     field_type: str
-    required: bool = True
+    required: bool = Field(default=True, description="Required while the field is visible.")
     placeholder: str = ""
     help_text: str = ""
     group: str = "general"
     order: int = 0
     default: str = ""
-    options: list[str] = []
+    choices: list[ConfigOptionResponse] = []
+    visible_when: list[ConfigConditionResponse] = []
+    widget: str | None = None
     advanced: bool = False
+    scope: bool = Field(default=False, description="Changing it changes which items the Source holds.")
+    fixed_after_create: bool = Field(default=False, description="Chooses the executor; a stored Source keeps it.")
+    # Deprecated (admin-ui-v1): V1 setup reads bare option values; removed with V1.
+    options: list[str] = Field(default=[], deprecated=True, description="The values of `choices`.")
 
 
 class ConfigGroupResponse(BaseModel):
     key: str
     label: str
     order: int = 0
+    description: str = ""
+    purpose: ConfigGroupPurpose = "content"
+    panels: list[ConfigPanelResponse] = []
 
 
 class GeneConfigSchemaResponse(BaseModel):
     groups: list[ConfigGroupResponse] = []
     fields: list[ConfigFieldResponse] = []
+    project_field: str | None = None
+
+
+class ConfigCheckRequest(BaseModel):
+    config: dict[str, Any]
+    source_id: str | None = None
+
+
+class ConfigFactResponse(BaseModel):
+    label: str
+    value: str
+
+
+class FieldIssueResponse(BaseModel):
+    key: str | None
+    message: str
+
+
+class ConfigCheckResponse(BaseModel):
+    derived: dict[str, Any] = Field(
+        description="Declared non-secret fields whose effective value the save would change, as it would store them."
+    )
+    facts: list[ConfigFactResponse]
+    issues: list[FieldIssueResponse]
 
 
 class DiscoveryPreviewRequest(BaseModel):
@@ -3066,6 +3125,8 @@ async def _plan_config_change(
             secret_fields=_source_secret_fields(source_type),
         )
         config = _store_source_config(source_type, config, source_id, app_config, create_inbox=not preview)
+    except SourceConfigInvalid as exc:
+        raise _config_invalid_response(exc) from exc
     except (SecretConfigurationError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if is_local_agent_backed_source(source) != is_local_agent_backed_source({"type": source_type, "config": config}):
@@ -3609,10 +3670,20 @@ def _complete_source_config(
     source_id: str,
     existing_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Fill the values a source type derives from the Source or its stored configuration."""
+    """Fill the values a source type derives from the Source or its stored configuration.
+
+    A refusal raises ``SourceConfigInvalid``, which the routes answer as 400 ``config_invalid``.
+    """
 
     policy = _config_policy(source_type)
-    return policy.complete(dict(config), source_id, existing_config) if policy.complete else config
+    if policy.complete is None:
+        return config
+    try:
+        return policy.complete(dict(config), source_id, existing_config)
+    except SourceConfigInvalid:
+        raise
+    except ValueError as exc:
+        raise _unkeyed_refusal(exc) from exc
 
 
 def _store_source_config(
@@ -3681,46 +3752,81 @@ def _validate_source_config(
     config: dict[str, Any],
     existing_config: dict[str, Any] | None = None,
 ) -> None:
-    """Raise ``ValueError``, which the routes answer with 400, for a configuration the source type cannot use.
+    """Check a configuration the way a save does, normalizing it in place.
 
-    Besides the source type's own checks, every required field the Gene
-    declares must have a value, and every field it declares as
-    ``ConfigFieldType.BOOLEAN`` must hold a boolean value
-    (:func:`~memforge.genes.toolkit.config.bool_config`).
+    The steps run in this order (``SourceConfigPolicy``): the type's
+    ``validate_input`` on the configuration as given, the TLS CA bundle check,
+    the Gene's ``normalize_config``, the shared form check
+    (:func:`~memforge.source_types.form.check_config`), the secret-origin
+    guard, and the type's ``validate``. Any refusal raises
+    ``SourceConfigInvalid``, a ``ValueError`` the routes answer as 400
+    ``config_invalid``; a plain ``ValueError`` from a hook becomes one issue
+    with no field.
     """
+    existing_config = existing_config or {}
     policy = _config_policy(source_type)
-    if policy.validate_input is not None:
-        policy.validate_input(config, existing_config or {})
-    validate_tls_ca_bundle(config)
+    gene_cls = GENE_REGISTRY.get(source_type)
+    try:
+        if policy.validate_input is not None:
+            policy.validate_input(config, existing_config)
+        validate_tls_ca_bundle(config)
+        if gene_cls:
+            normalizer = getattr(gene_cls, "normalize_config", None)
+            if callable(normalizer):
+                normalizer(config)
+            descriptor = source_type_descriptor(source_type)
+            issues = check_config(gene_cls.config_schema(), config, existing_config, descriptor)
+            if issues:
+                raise SourceConfigInvalid(issues)
+        _require_secret_origin(source_type, config)
+        if policy.validate is not None:
+            policy.validate(config, existing_config)
+    except SourceConfigInvalid:
+        raise
+    except ValueError as exc:
+        raise _unkeyed_refusal(exc) from exc
+
+
+def _require_secret_origin(source_type: str, config: dict[str, Any]) -> None:
+    """A type that stores a secret sends it only to an HTTPS ``base_url``.
+
+    The refusal names ``base_url`` when the Gene declares that field, and no
+    field when the Gene derives it.
+    """
     secret_fields = _source_secret_fields(source_type)
     gene_cls = GENE_REGISTRY.get(source_type)
-    if gene_cls:
-        normalizer = getattr(gene_cls, "normalize_config", None)
-        if callable(normalizer):
-            normalizer(config)
     has_secret_contract = bool(secret_fields) if gene_cls else _config_contains_secret(config, secret_fields)
-    if has_secret_contract:
-        product_name = gene_cls.metadata().display_name if gene_cls else source_type
-        base_url = str(config.get("base_url") or "").strip()
-        if not base_url:
-            raise ValueError(f"{product_name} base_url is required before storing source secrets")
+    if not has_secret_contract:
+        return
+    product_name = gene_cls.metadata().display_name if gene_cls else source_type
+    declares_base_url = gene_cls is not None and any(f.key == "base_url" for f in gene_cls.config_schema().fields)
+    key = "base_url" if declares_base_url else None
+    base_url = str(config.get("base_url") or "").strip()
+    if not base_url:
+        raise SourceConfigInvalid([FieldIssue(key, f"{product_name} base_url is required before storing source secrets")])
+    try:
         require_https_base_url(base_url, product_name)
+    except ValueError as exc:
+        raise SourceConfigInvalid([FieldIssue(key, str(exc))]) from None
 
-    if gene_cls:
-        product_name = gene_cls.metadata().display_name
-        fields = gene_cls.config_schema().fields
-        _validate_required_source_fields(
-            product_name,
-            fields,
-            config,
-            existing_config=existing_config,
-        )
-        try:
-            validate_bool_fields(config, fields)
-        except SourceConfigurationError as exc:
-            raise ValueError(f"{product_name} {exc}") from exc
-    if policy.validate is not None:
-        policy.validate(config, existing_config or {})
+
+def _unkeyed_refusal(exc: ValueError) -> SourceConfigInvalid:
+    """A plain ``ValueError`` from a configuration hook, as a refusal that names no field."""
+
+    return SourceConfigInvalid([FieldIssue(None, str(exc))])
+
+
+def _config_invalid_response(exc: SourceConfigInvalid) -> HTTPException:
+    """The 400 every configuration refusal answers, keyed by field where the check knows it."""
+
+    return HTTPException(
+        status_code=400,
+        detail={
+            "code": "config_invalid",
+            "message": str(exc),
+            "fields": [{"key": issue.key, "message": issue.message} for issue in exc.issues],
+        },
+    )
 
 
 async def _cancel_running_jira_browser_sources_for_origin(
@@ -3776,45 +3882,6 @@ def _require_secure_or_loopback(request: Request) -> None:
             "(for example a server reached through Docker's localhost port mapping)."
         ),
     )
-
-
-def _validate_required_source_fields(
-    product_name: str,
-    fields: list[ConfigField],
-    config: dict[str, Any],
-    existing_config: dict[str, Any] | None = None,
-) -> None:
-    existing_config = existing_config or {}
-    for field in fields:
-        if not field.required:
-            continue
-        if _source_field_has_value(field, config, existing_config):
-            continue
-        raise ValueError(f"{product_name} {field.label} is required")
-
-
-def _source_field_has_value(
-    field: ConfigField,
-    config: dict[str, Any],
-    existing_config: dict[str, Any],
-) -> bool:
-    value = config.get(field.key)
-    if field.field_type == ConfigFieldType.SECRET:
-        if isinstance(value, str) and value.strip():
-            return True
-        return bool(
-            existing_config.get(f"{field.key}_encrypted")
-            or (isinstance(existing_config.get(field.key), str) and existing_config[field.key].strip())
-        )
-    if field.field_type in {ConfigFieldType.TAG_LIST, ConfigFieldType.MULTI_SELECT}:
-        if isinstance(value, list):
-            return any(str(item).strip() for item in value)
-        if isinstance(value, str):
-            return any(item.strip() for item in value.split(","))
-        return bool(field.default)
-    if field.field_type == ConfigFieldType.BOOLEAN:
-        return field.key in config or field.default != ""
-    return str(value if value is not None else field.default).strip() != ""
 
 
 def _config_contains_secret(config: dict[str, Any], secret_fields: tuple[str, ...]) -> bool:
@@ -6718,21 +6785,41 @@ def create_admin_app(
                 auth_method=g.auth_method,
                 data_shape=g.data_shape,
                 execution_kinds=list(g.execution_kinds),
+                managed=source_type_descriptor(g.name).family is None,
             )
             for g in genes
         ]
 
     @gene_router.get("/{name}/config-schema", response_model=GeneConfigSchemaResponse)
     async def get_gene_config_schema(name: str):
-        """Get the configuration schema for a gene type (for dynamic UI rendering)."""
+        """The form description of a source type, which the admin UI draws without per-type code.
+
+        Besides what the Gene declares, each field says whether it is a scope
+        field and whether it is fixed after create, from the type's descriptor.
+        """
         if name not in GENE_REGISTRY:
             raise HTTPException(status_code=404, detail=f"Gene '{name}' not found")
 
-        cls = GENE_REGISTRY[name]
-        schema = cls.config_schema()
+        schema = GENE_REGISTRY[name].config_schema()
+        descriptor = source_type_descriptor(name)
+        scope_fields = set(descriptor.scope_fields)
+        fixed_fields = set(descriptor.local_agent.immutable_execution_fields) if descriptor.local_agent else set()
+
+        def conditions(items: Iterable[ConfigCondition]) -> list[ConfigConditionResponse]:
+            return [ConfigConditionResponse(field=c.field, values=list(c.values)) for c in items]
 
         return GeneConfigSchemaResponse(
-            groups=[ConfigGroupResponse(key=g.key, label=g.label, order=g.order) for g in schema.groups],
+            groups=[
+                ConfigGroupResponse(
+                    key=g.key,
+                    label=g.label,
+                    order=g.order,
+                    description=g.description,
+                    purpose=g.purpose,
+                    panels=[ConfigPanelResponse(name=p.name, visible_when=conditions(p.visible_when)) for p in g.panels],
+                )
+                for g in schema.groups
+            ],
             fields=[
                 ConfigFieldResponse(
                     key=f.key,
@@ -6744,11 +6831,84 @@ def create_admin_app(
                     group=f.group,
                     order=f.order,
                     default=f.default,
-                    options=f.options,
+                    choices=[
+                        ConfigOptionResponse(
+                            value=o.value,
+                            label=o.label,
+                            help_text=o.help_text,
+                            visible_when=conditions(o.visible_when),
+                        )
+                        for o in f.choices
+                    ],
+                    visible_when=conditions(f.visible_when),
+                    widget=f.widget,
                     advanced=f.advanced,
+                    scope=f.key in scope_fields,
+                    fixed_after_create=f.key in fixed_fields,
+                    options=[o.value for o in f.choices],
                 )
                 for f in schema.fields
             ],
+            project_field=schema.project_field,
+        )
+
+    @gene_router.post("/{name}/config-check", response_model=ConfigCheckResponse)
+    async def check_gene_config(
+        name: str,
+        req: ConfigCheckRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """What saving this configuration would store and refuse, without saving it.
+
+        It runs save's own steps (``complete`` and every configuration check)
+        on a copy, and writes nothing: no Source, no inbox, no encrypted
+        secret. ``derived`` holds the declared non-secret fields whose
+        effective value the steps change, such as the page tree a pasted
+        Confluence page URL names; ``facts`` states what the type can tell
+        about the configuration; ``issues`` holds every refusal. With
+        ``source_id``, the stored configuration completes the copy as it does
+        on update, and the caller needs the access that update needs.
+        """
+        if name not in GENE_REGISTRY:
+            raise HTTPException(status_code=404, detail=f"Gene '{name}' not found")
+        existing_config: dict[str, Any] | None = None
+        if req.source_id:
+            existing = await db.get_source(req.source_id)
+            if not existing:
+                raise HTTPException(status_code=404, detail="Source not found")
+            _require_source_management(request, existing)
+            _require_local_agent_connection_management(request, existing)
+            if existing["type"] != name:
+                raise HTTPException(status_code=400, detail="Config-check source type does not match the existing source")
+            existing_config = existing["config"]
+
+        submitted = copy.deepcopy(req.config)
+        config = copy.deepcopy(req.config)
+        issues: tuple[FieldIssue, ...] = ()
+        try:
+            config = _complete_source_config(name, config, req.source_id or "config-check", existing_config)
+            _validate_source_config(name, config, existing_config=existing_config)
+        except SourceConfigInvalid as exc:
+            issues = exc.issues
+
+        descriptor = source_type_descriptor(name)
+        derived: dict[str, Any] = {}
+        for field in GENE_REGISTRY[name].config_schema().fields:
+            if field.field_type == ConfigFieldType.SECRET:
+                continue
+            before = comparison_string(effective_value(field, submitted, descriptor), field.field_type)
+            after = comparison_string(effective_value(field, config, descriptor), field.field_type)
+            if before != after:
+                derived[field.key] = config.get(field.key)
+
+        facts: list[tuple[str, str]] = []
+        if descriptor.config.facts is not None:
+            facts = descriptor.config.facts(config)
+        return ConfigCheckResponse(
+            derived=derived,
+            facts=[ConfigFactResponse(label=label, value=value) for label, value in facts],
+            issues=[FieldIssueResponse(key=issue.key, message=issue.message) for issue in issues],
         )
 
     @gene_router.post("/{name}/preview-discovery", response_model=DiscoveryPreviewResponse)
@@ -6802,6 +6962,8 @@ def create_admin_app(
                     )
                 if count > req.limit:
                     break
+        except SourceConfigInvalid as exc:
+            raise _config_invalid_response(exc) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except browser_session.BrowserSessionError as exc:
@@ -6866,6 +7028,8 @@ def create_admin_app(
             )
         except HTTPException:
             raise
+        except SourceConfigInvalid as exc:
+            raise _config_invalid_response(exc) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except GitHubTreeBudgetExceeded as exc:
@@ -8360,6 +8524,8 @@ def create_admin_app(
             )
             _validate_source_project_binding(req.project_binding)
             source_config = _store_source_config(req.type, source_config, source_id, config)
+        except SourceConfigInvalid as exc:
+            raise _config_invalid_response(exc) from exc
         except (SecretConfigurationError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         creator_user_id = resolve_request_principal(request)

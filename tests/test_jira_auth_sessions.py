@@ -348,7 +348,7 @@ def test_admin_rejects_source_owned_jira_cookie(tmp_path, monkeypatch):
         )
 
     assert response.status_code == 400
-    assert "shared auth sessions" in response.json()["detail"]
+    assert "shared auth sessions" in response.json()["detail"]["message"]
 
 
 @pytest.mark.asyncio

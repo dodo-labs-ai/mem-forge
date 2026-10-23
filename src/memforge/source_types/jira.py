@@ -46,56 +46,48 @@ def jira_auth_mode(config: Mapping[str, Any], existing_config: Mapping[str, Any]
 
 
 def _complete_config(config: dict[str, Any], source_id: str, existing_config: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Carry the immutable ``sync_mode`` over, and name the authentication method a token implies.
+
+    A blank ``auth_mode`` becomes ``pat`` when a token is supplied or already
+    stored; otherwise it stays blank and reads as the declared default,
+    ``browser_cookie``.
+    """
+
+    existing_config = existing_config or {}
     if not str(config.get("sync_mode") or "").strip():
-        sync_mode = str((existing_config or {}).get("sync_mode") or "").strip()
+        sync_mode = str(existing_config.get("sync_mode") or "").strip()
         if sync_mode:
             config["sync_mode"] = sync_mode
+    if not str(config.get("auth_mode") or "").strip() and secret_has_value("pat", config, existing_config):
+        config["auth_mode"] = "pat"
     return config
 
 
 def _validate_config(config: dict[str, Any], existing_config: Mapping[str, Any]) -> None:
-    _validate_auth(config, existing_config)
-    validate_scope(config)
-
-
-def _validate_auth(config: dict[str, Any], existing_config: Mapping[str, Any]) -> None:
     if any(key in config for key in ("jira_cookie", "jira_cookie_encrypted")):
         raise ValueError("Jira browser sessions are managed by shared auth sessions, not source config")
-    auth_mode = jira_auth_mode(config, existing_config)
-    if auth_mode not in {"browser_cookie", "pat"}:
-        raise ValueError("Jira Authentication Method must be Browser session or Personal access token")
-
-    sync_mode = str(config.get("sync_mode") or existing_config.get("sync_mode") or "cloud").strip().lower()
-    if sync_mode not in {"cloud", "local_agent"}:
-        raise ValueError("Jira Sync Location must be Cloud or Local daemon")
-    if sync_mode == "local_agent" and auth_mode != "browser_cookie":
-        raise ValueError("Jira Local daemon sync currently requires Browser session authentication")
-
-    if auth_mode == "browser_cookie":
-        return
-
-    if secret_has_value("pat", config, existing_config):
-        return
-    raise ValueError("Jira Personal Access Token is required for pat authentication")
 
 
-def validate_scope(config: Mapping[str, Any]) -> None:
-    """Require the field that actually drives discovery for the chosen query mode.
+def _public_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Name the effective authentication method of a Source stored without one."""
 
-    ``projects`` is optional at the schema level so advanced JQL queries (which
-    embed their own project clause) do not have to duplicate it.
-    """
-    mode = str(config.get("query_mode") or "simple").strip().lower()
-    if mode == "advanced":
-        if not str(config.get("jql") or "").strip():
-            raise ValueError("Jira JQL is required in advanced query mode")
-        return
-    projects = config.get("projects")
-    has_projects = (isinstance(projects, list) and any(str(p).strip() for p in projects)) or (
-        isinstance(projects, str) and any(p.strip() for p in projects.split(","))
-    )
-    if not has_projects:
-        raise ValueError("Jira Projects to Sync is required in simple query mode")
+    if not str(config.get("auth_mode") or "").strip():
+        config["auth_mode"] = "pat" if config.get("pat_configured") else "browser_cookie"
+    return config
+
+
+def _facts(config: Mapping[str, Any]) -> list[tuple[str, str]]:
+    from memforge.genes.jira_gene import _build_jql
+    from memforge.genes.toolkit.config import list_config
+
+    advanced = str(config.get("query_mode") or "simple").strip().lower() == "advanced"
+    projects = list_config(config.get("projects"))
+    if not (str(config.get("jql") or "").strip() if advanced else projects):
+        return []
+    scoped = {**config, "projects": projects}
+    if "issue_types" in config:
+        scoped["issue_types"] = list_config(config["issue_types"])
+    return [("Effective query at sync", _build_jql(scoped, "updated >= '<last sync>'"))]
 
 
 def _store_config(config: dict[str, Any], local_inbox: LocalInbox) -> dict[str, Any]:
@@ -177,6 +169,8 @@ DESCRIPTOR = SourceTypeDescriptor(
         complete=_complete_config,
         validate=_validate_config,
         store=_store_config,
+        public=_public_config,
         credentials_changed=_credentials_changed,
+        facts=_facts,
     ),
 )

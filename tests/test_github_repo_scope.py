@@ -9,7 +9,7 @@ from memforge.github_repo_utils import (
     normalize_github_scope_paths,
 )
 from memforge.storage.database import Database
-from memforge.source_types.github_repo import validate_config as _validate_github_repo_config
+from memforge.source_types.github_repo import DESCRIPTOR as GITHUB_REPO
 
 
 def test_repository_exclusions_override_the_base_scope() -> None:
@@ -60,12 +60,13 @@ def test_scope_paths_are_canonical_and_collapse_descendants() -> None:
 
 def test_source_config_rejects_local_clone_paths() -> None:
     with pytest.raises(ValueError, match="remote repository"):
-        _validate_github_repo_config(
+        GITHUB_REPO.config.validate_input(
             {
                 "repo_url": "https://github.example/org/repo",
                 "connection_mode": "local_push",
                 "repo_path": "/tmp/repo",
-            }
+            },
+            {},
         )
 
 

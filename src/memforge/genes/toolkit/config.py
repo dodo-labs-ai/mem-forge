@@ -17,12 +17,46 @@ from __future__ import annotations
 import os
 import ssl
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from memforge.genes.base import SourceConfigurationError
 from memforge.models import ConfigField, ConfigFieldType
+
+
+
+@dataclass(frozen=True)
+class FieldIssue:
+    """Why one configuration field is refused; ``key`` is ``None`` when no single field is at fault."""
+
+    key: str | None
+    message: str
+
+
+class SourceConfigInvalid(ValueError):
+    """A Source configuration refused field by field.
+
+    Any configuration hook of a source type (``complete``, ``validate_input``,
+    ``normalize_config``, ``validate``) may raise it to name the field it
+    refuses, so the admin UI shows the reason on that field::
+
+        raise SourceConfigInvalid([FieldIssue("page_url", "GitHub Pages Page URL must stay on the site origin")])
+
+    The admin API answers it as 400 with ``detail`` ``{"code": "config_invalid",
+    "message", "fields": [{"key", "message"}]}``, where ``message`` is the first
+    issue's. A plain ``ValueError`` from a hook is answered the same way, as one
+    issue with ``key`` ``None``. ``str()`` of the exception is the first issue's
+    message, so a caller that catches ``ValueError`` still reads a reason.
+    """
+
+    def __init__(self, issues: Iterable[FieldIssue]) -> None:
+        self.issues: tuple[FieldIssue, ...] = tuple(issues)
+        if not self.issues:
+            raise ValueError("SourceConfigInvalid needs at least one issue")
+        super().__init__(self.issues[0].message)
+
 
 _TRUE_STRINGS = frozenset({"true", "yes", "on", "1"})
 _FALSE_STRINGS = frozenset({"false", "no", "off", "0"})

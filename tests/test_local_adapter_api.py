@@ -594,7 +594,10 @@ def test_jira_local_agent_mode_rejects_pat_auth(tmp_path):
             )
 
         assert response.status_code == 400, response.text
-        assert "Browser session" in response.json()["detail"]
+        # The token option is offered only while Jira is read by the server.
+        assert response.json()["detail"]["fields"] == [
+            {"key": "auth_mode", "message": "Jira Authentication Method must be one of: Browser session"}
+        ]
     finally:
         asyncio.run(database.close())
 

@@ -592,9 +592,108 @@ class GeneMetadata:
     execution_kinds: tuple[SourceExecutionKind, ...] = ("server",)
 
 
+ConfigGroupPurpose = Literal["connection", "content", "options"]
+"""Where a group's step sits in the admin setup flow.
+
+``connection`` reaches the provider (site, credentials, execution choice) and
+is the step a "Configure" action opens. ``content`` chooses what to collect;
+"Check setup" follows the last such step. ``options`` holds settings with
+working defaults, so the step is complete without input.
+"""
+
+CONFIG_GROUP_PURPOSES: frozenset[str] = frozenset({"connection", "content", "options"})
+
+KNOWN_WIDGETS: frozenset[str] = frozenset({"github_repo_paths", "local_folder", "teams_conversations"})
+"""Interactive field controls the admin UI provides, named by ``ConfigField.widget``."""
+
+KNOWN_PANELS: frozenset[str] = frozenset({"jira_session", "teams_session"})
+"""Interactive panels the admin UI provides, named by ``ConfigPanel.name``."""
+
+
+@dataclass(frozen=True)
+class ConfigCondition:
+    """Holds when an earlier ``select`` field's effective value is one of ``values``.
+
+    The field is read the way the server stores it: the value in the
+    configuration after ``complete`` and ``normalize_config``, else the
+    descriptor's ``scope_defaults`` entry, else the field's declared
+    ``default``. Values compare as comparison strings
+    (:func:`memforge.source_types.form.comparison_string`): stripped and
+    lower-cased, so ``"PAT"`` matches ``"pat"``. A tuple of conditions means
+    every one holds::
+
+        # Shown only while the Jira authentication method is a token.
+        ConfigField(key="pat", ..., visible_when=(ConfigCondition("auth_mode", ("pat",)),))
+
+        # Shown for two of the three GitHub Pages sync modes.
+        ConfigCondition("sync_mode", ("subtree", "explicit_list"))
+
+    Registration refuses a condition that names a later field, or a value
+    the named field does not declare as a choice.
+    """
+
+    field: str
+    values: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ConfigOption:
+    """One choice of a ``select`` or ``multi_select`` field.
+
+    ``value`` is what the configuration stores, declared as a string;
+    ``label`` is what a person reads. An option with ``visible_when`` is
+    offered only while its conditions hold, and the server refuses its value
+    otherwise::
+
+        ConfigField(
+            key="auth_mode", label="Authentication Method", field_type=ConfigFieldType.SELECT,
+            choices=[
+                ConfigOption("browser_cookie", "Browser session"),
+                # A token works only when MemForge itself reads Jira.
+                ConfigOption("pat", "Personal access token",
+                             visible_when=(ConfigCondition("sync_mode", ("cloud",)),)),
+            ],
+            default="browser_cookie",
+        )
+    """
+
+    value: str
+    label: str
+    help_text: str = ""
+    visible_when: tuple[ConfigCondition, ...] = ()
+
+
+@dataclass(frozen=True)
+class ConfigPanel:
+    """An interactive panel the admin UI draws after its group's visible fields.
+
+    ``name`` is one of ``KNOWN_PANELS``, such as ``jira_session``, which shows
+    and renews the Jira browser session. Its conditions may name any field of
+    its own group or an earlier group::
+
+        ConfigGroup(
+            key="connection", label="Jira access", purpose="connection",
+            panels=[ConfigPanel("jira_session", (ConfigCondition("auth_mode", ("browser_cookie",)),))],
+        )
+    """
+
+    name: str
+    visible_when: tuple[ConfigCondition, ...] = ()
+
+
 @dataclass
 class ConfigField:
-    """A single configuration field for a gene's config schema."""
+    """A single configuration field for a gene's config schema.
+
+    ``required`` means required while visible: the field must have a value
+    whenever its ``visible_when`` conditions hold. A non-secret field reads
+    its effective value, so a declared ``default`` satisfies it; a secret
+    reads the submitted or stored secret. ``choices`` list the values a
+    ``select`` or ``multi_select`` field accepts. ``widget`` names an
+    interactive control from ``KNOWN_WIDGETS``; a client that does not know
+    it draws the control for ``field_type``. ``advanced`` places the field in
+    its step's collapsed "Advanced settings".
+    """
 
     key: str
     label: str
@@ -605,17 +704,28 @@ class ConfigField:
     group: str = "general"
     order: int = 0
     default: str = ""
-    options: list[str] = field(default_factory=list)  # for SELECT / MULTI_SELECT
+    choices: list[ConfigOption] = field(default_factory=list)
     advanced: bool = False
+    visible_when: tuple[ConfigCondition, ...] = ()
+    widget: str | None = None
 
 
 @dataclass
 class ConfigGroup:
-    """A group of config fields displayed together in the UI."""
+    """A group of config fields the admin UI draws as one setup step.
+
+    ``description`` is the step's text. ``purpose`` places the step in the
+    setup flow (:data:`ConfigGroupPurpose`); a group that declares none is a
+    ``content`` step. ``panels`` are interactive panels drawn after the
+    group's fields.
+    """
 
     key: str
     label: str
     order: int = 0
+    description: str = ""
+    purpose: ConfigGroupPurpose = "content"
+    panels: list[ConfigPanel] = field(default_factory=list)
 
 
 @dataclass
