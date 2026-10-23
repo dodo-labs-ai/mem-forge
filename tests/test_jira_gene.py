@@ -1440,7 +1440,7 @@ def _search_fields(client: RecordingAsyncClient) -> list[object]:
 
 
 @pytest.mark.asyncio
-async def test_inventory_fetch_reads_and_attests_the_issue_through_search():
+async def test_inventory_fetch_reads_the_issue_through_search():
     issue = _jira_issue("PAY-1")
     client = InventorySearchClient(full=issue, attested=issue, base_url="https://jira.example.test")
     gene = _inventory_gene(client, include_comments=True)
@@ -1449,10 +1449,10 @@ async def test_inventory_fetch_reads_and_attests_the_issue_through_search():
     raw = await gene.fetch(item)
 
     assert json.loads(raw.body)["fields"]["updated"] == item.version == "2026-05-21T08:00:00.000+0000"
-    assert _search_fields(client) == [["summary", "updated", "project"], ["*all"], ["updated"]]
+    # The full read carries complete comments, so nothing is read apart to check again.
+    assert _search_fields(client) == [["summary", "updated", "project"], ["*all"]]
     scope = "(project in (PAY) AND issuetype in (Epic,Story,Bug,Task))"
     assert client.calls[1][2]["json"]["jql"] == f"issuekey = 100001 AND {scope}"
-    assert client.calls[2][2]["json"]["jql"] == f"issuekey = PAY-1 AND {scope}"
 
 
 @pytest.mark.asyncio
@@ -1475,6 +1475,32 @@ async def test_inventory_fetch_rejects_an_issue_changed_before_its_full_read():
         await gene.fetch(item)
 
     assert _search_fields(client) == [["summary", "updated", "project"], ["*all"]]
+
+
+@pytest.mark.asyncio
+async def test_inventory_fetch_rejects_an_issue_whose_key_changed_or_that_left_the_scope():
+    listed = _jira_issue("PAY-1")
+    moved = _jira_issue("OPS-7", issue_id="100001")
+
+    class ListedThenReadClient(InventorySearchClient):
+        async def request(self, method: str, url: str, **kwargs):
+            if url == "/rest/api/2/search" and kwargs["json"]["fields"] == ["summary", "updated", "project"]:
+                self.calls.append((method, url, kwargs))
+                return JsonResponse(_search_page([listed]))
+            if url == "/rest/api/2/search" and self.full is None:
+                self.calls.append((method, url, kwargs))
+                return JsonResponse(_search_page([]))
+            return await super().request(method, url, **kwargs)
+
+    for full in (moved, None):
+        client = ListedThenReadClient(full=full, attested=listed, base_url="https://jira.example.test")
+        gene = _inventory_gene(client)
+        item = [item async for item in gene.discover_inventory()][0]
+
+        with pytest.raises(RuntimeError, match="changed during materialization; retry inventory"):
+            await gene.fetch(item)
+
+        assert gene._hydrated_issues == {}
 
 
 @pytest.mark.asyncio

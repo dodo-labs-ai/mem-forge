@@ -857,12 +857,13 @@ class JiraGene(DocumentGene):
             payload = _issue_payload_from_search(hydrated_issue, self.config)
             from memforge.source_adapters.jira import comment_requires_rendering
 
-            if payload.get("_comments_truncated") or any(
+            comments_read_apart = bool(payload.get("_comments_truncated")) or any(
                 comment_requires_rendering(comment) for comment in payload.get("_comments", [])
-            ):
+            )
+            if comments_read_apart:
                 await self._fetch_comment_snapshot(key, payload)
             getattr(self, "_hydrated_issues", {}).pop(key, None)
-            if attested:
+            if attested and comments_read_apart:
                 await self._attest_materialized_revision(key, str(item.version or ""))
             artifacts = await self._fetch_source_artifacts(payload)
             return RawContent(
@@ -1060,20 +1061,22 @@ class JiraGene(DocumentGene):
         return "issue_core", f"{issue_id}:core"
 
     async def _hydrate_inventory_issue(self, item: ContentItem, key: str) -> None:
-        """Read an inventory issue in full through the search that listed it, at the listed revision.
+        """Read a listed issue in full with a one-issue search in the scope, at the listed revision.
 
         Jira writes ``updated`` per endpoint: a search can answer it at a
-        coarser precision than an issue read, so an inventory revision
-        compares exactly only with another search.
+        coarser precision than an issue read, so a listed revision is
+        compared only with another search.
         """
         current = await self.rediscover(item)
         if current is None or current.extra["issue_key"] != key or current.version != item.version:
+            if current is not None:
+                self._hydrated_issues.pop(current.extra["issue_key"], None)
             raise RuntimeError(
                 f"Jira issue {key} changed during materialization; retry inventory"
             )
 
     async def _attest_materialized_revision(self, key: str, expected_revision: str) -> None:
-        """Search the issue again after its comments are read, and require the inventory revision."""
+        """Search the issue again after its comments are read apart, and require the listed revision."""
         issues = [
             issue
             async for issue in self._search_issues(
