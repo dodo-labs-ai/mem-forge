@@ -24,7 +24,6 @@ from fastapi.testclient import TestClient
 
 from memforge.conversations.collect import collect
 from memforge.conversations.collections import ArtifactLink, CollectedBody, StoredCollections
-from memforge.conversations.coverage import proven_interval
 from memforge.conversations.intake import CollectionIntake
 from memforge.conversations.layer import ConversationLayer
 from memforge.conversations.port import (
@@ -52,7 +51,7 @@ from memforge.source_projection import ProjectionScopeTransition, ProjectionScop
 from memforge.source_projection_config import canonical_projection_scope
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
-from tests.conversation_attempts_fixture import without
+from tests.conversation_attempts_fixture import poll_read, without
 from tests.test_startup_runtime import TEST_SOURCE_KEY, _config
 from tests.test_sync_bookkeeping import (
     NoopMemoryEngine,
@@ -791,15 +790,10 @@ async def test_a_backfill_poll_that_stops_early_is_continued_without_removing_an
 
 
 def _read_by(manifest) -> list[tuple[datetime, datetime]]:
-    """What each poll of the manifest read: its proven interval, from its requested start unless it stopped early."""
+    """What each poll of the manifest's one conversation read."""
 
     (evidence,) = manifest.conversations
-    reads = []
-    for poll in evidence.polls:
-        proven = proven_interval(poll, evidence.ref, received_at=manifest.received_at)
-        start = proven.start if poll.outcome is PollOutcome.STOPPED_EARLY else poll.requested.start
-        reads.append((start, proven.end))
-    return reads
+    return [poll_read(poll, received_at=manifest.received_at, conversation=evidence.ref) for poll in evidence.polls]
 
 
 async def test_a_reprocess_reads_each_unit_from_its_committed_input(workspace):
