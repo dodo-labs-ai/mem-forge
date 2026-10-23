@@ -35,6 +35,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from memforge.api_target import CAPABILITY_PATH, Edition, capability_document
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic.json_schema import models_json_schema
 
 from memforge.config import DEFAULT_SEARCH_TOP_K, AppConfig
 from memforge.auth import browser_session
@@ -283,6 +284,7 @@ from memforge.local_agent.readiness import (
     SourceConnectionState,
     connection_status_from_browser_session,
 )
+from memforge.local_agent.setup_results import SETUP_RESULT_MODELS
 from memforge.local_agent.snapshot_manifest import (
     COMPLETE_SNAPSHOT,
     SNAPSHOT_MANIFEST_MAX_ITEMS,
@@ -836,6 +838,32 @@ def _operation_id(route: APIRoute) -> str:
     """
     operation_id = re.sub(r"\W", "_", f"{route.name}{route.path_format}")
     return f"{operation_id}_{sorted(route.methods)[0].lower()}"
+
+
+def _publish_setup_result_models(app: FastAPI) -> None:
+    """List each local setup job's result model in the app's OpenAPI document.
+
+    The host job route serves every operation, so its ``result`` stays a
+    free-form object and FastAPI publishes no setup model of its own. Adding
+    the models of ``SETUP_RESULT_MODELS`` as components lets the admin UI
+    generate one result type per setup operation from the same document.
+    """
+    generate = app.openapi
+
+    def openapi() -> dict[str, Any]:
+        if app.openapi_schema is None:
+            document = generate()
+            _, definitions = models_json_schema(
+                [(model, "serialization") for model in SETUP_RESULT_MODELS.values()],
+                ref_template="#/components/schemas/{model}",
+            )
+            schemas = document.setdefault("components", {}).setdefault("schemas", {})
+            for name, schema in definitions["$defs"].items():
+                if schemas.setdefault(name, schema) != schema:
+                    raise RuntimeError(f"setup result model {name} collides with another OpenAPI component")
+        return app.openapi_schema
+
+    app.openapi = openapi  # type: ignore[method-assign]
 
 
 def _request_audit_context(request: Request) -> AuditContext:
@@ -5227,6 +5255,7 @@ def create_admin_app(
         lifespan=lifespan,
         generate_unique_id_function=_operation_id,
     )
+    _publish_setup_result_models(app)
     if db is not None:
         app.state.db = db
         app.state.sync_service = SyncService(
