@@ -20,16 +20,17 @@ intent alone.
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from memforge.conversations.coverage import JUST_AFTER, ProvenInterval, conversation_coverage
+from memforge.conversations.coverage import JUST_AFTER, ProvenInterval, conversation_coverage, proven_interval
 from memforge.conversations.manifest import (
     CollectionManifest,
     CollectionRequest,
     ConversationEvidence,
     ManifestMessage,
+    PollEvidence,
     RequestedConversation,
 )
 from memforge.conversations.membership import (
@@ -41,7 +42,7 @@ from memforge.conversations.membership import (
     rooted_threads,
     units_to_read,
 )
-from memforge.conversations.port import ConversationAccess, Interval, PollOutcome
+from memforge.conversations.port import ConversationAccess, ConversationRef, Interval, PollOutcome
 from memforge.conversations.reader import ConversationUnitReader
 from memforge.conversations.records import MessageIdentity, record_revision
 from memforge.conversations.time_scope import MAX_INITIAL_HISTORY_DAYS
@@ -106,25 +107,39 @@ class ConversationLayer:
         """The conversations and intervals one attempt collects.
 
         The regular poll starts ``min(initial history, regular ceiling)`` ago,
-        never before the retention cutoff. A poll of the previous attempt that
-        stopped early is continued as a backfill of the range it did not read,
-        until a poll of that range completes. Each conversation carries the
-        label the previous attempt recorded for it.
+        never before the retention cutoff, and has no end. At most two
+        backfills follow it, over what the previous attempt left unread after
+        the history floor, ``max(now − initial history, retention cutoff)``
+        (:func:`_left_unread`): one for the lowest unread range, and one
+        spanning every other, so a request holds at most three intervals per
+        conversation. Each conversation carries the label the previous attempt
+        recorded for it.
+
+        The previous attempt is the manifest the Source received last, which
+        may be a failed run or a dry run; a range only a dry run read counts
+        as read (issue dodoman-sun/memforge-cloud#638).
         """
 
-        reach = timedelta(days=selection.initial_history_days)
+        initial_history = timedelta(days=selection.initial_history_days)
+        reach = initial_history
         if selection.regular_ceiling is not None:
             reach = min(reach, selection.regular_ceiling)
-        floor = retention_cutoff(now, selection.rolling_retention_days)
-        regular_start = now - reach if floor is None else max(now - reach, floor)
+        cutoff = retention_cutoff(now, selection.rolling_retention_days)
+        floor = now - initial_history if cutoff is None else max(now - initial_history, cutoff)
+        regular_start = now - reach if cutoff is None else max(now - reach, cutoff)
         conversations = []
         for conversation_id in selection.conversation_ids:
             evidence = previous.conversation(conversation_id) if previous is not None else None
+            unread = (
+                _left_unread(evidence, floor=floor, regular_start=regular_start, received_at=previous.received_at)
+                if previous is not None and evidence is not None
+                else []
+            )
             intervals = [Interval(start=regular_start)]
-            for backfill in _backfills(evidence):
-                start = backfill.start if floor is None else max(backfill.start, floor)
-                if backfill.end is not None and start < backfill.end:
-                    intervals.append(Interval(start=start, end=backfill.end))
+            if unread:
+                intervals.append(Interval(start=unread[0][0], end=unread[0][1]))
+            if len(unread) > 1:
+                intervals.append(Interval(start=unread[1][0], end=unread[-1][1]))
             conversations.append(
                 RequestedConversation(
                     conversation_id=conversation_id,
@@ -332,20 +347,112 @@ def _returned(
     )
 
 
-def _backfills(evidence: ConversationEvidence | None) -> list[Interval]:
-    """The ranges stopped-early polls of the previous attempt left unread.
+_Range = tuple[datetime, datetime]
+"""A half-open creation-time range ``[start, end)``."""
 
-    Each ends just after the page time its poll proved from, so a message at
-    that very time is read again.
+
+def _left_unread(
+    evidence: ConversationEvidence,
+    *,
+    floor: datetime,
+    regular_start: datetime,
+    received_at: datetime,
+) -> list[_Range]:
+    """The ranges after the history floor the previous attempt left unread, sorted and disjoint.
+
+    A poll that reached its start or ran out of history read
+    ``[requested start, proven end)``: nothing it did not return lies below
+    its last page. A poll that stopped early read its proven interval
+    (:func:`~memforge.conversations.coverage.proven_interval`), so a range
+    the visibility margin leaves unproven stays unread. The regular poll is
+    the one whose requested interval has no end.
+
+    Let ``L`` be the later of ``floor`` and the earliest requested start of
+    the previous polls, ``R`` the regular poll's proven end, and ``T`` the
+    highest end of the previous backfill requests, or ``L`` when there were
+    none. Unread are:
+
+    - below ``T``, what a backfill requested and no poll read;
+    - from ``T`` up to ``R``, what the regular poll requested and no poll read;
+    - ``[regular_start, previous regular requested start)`` when this
+      attempt's regular start is the earlier, because Initial History was
+      widened: no previous poll requested it;
+    - the instant a stopped regular poll is complete from, when it lies in
+      ``[L, R)``. Its proven interval starts just after that instant, and
+      requesting it keeps the next ``T`` at that poll's read start, so a chat
+      whose regular poll keeps stopping continues from there instead of
+      re-reading from the floor. A stop at or after ``R``, inside the
+      visibility margin, proved nothing: ``[T, R)`` is unread whole, and the
+      instant lies in the next regular poll's range.
+
+    Above ``R`` lies the next regular poll's range. A conversation the
+    previous attempt could not read leaves nothing to backfill; the regular
+    poll restarts the chain. The previous attempt may be a failed run or a dry
+    run; a range only a dry run read counts as read (issue
+    dodoman-sun/memforge-cloud#638).
     """
 
-    if evidence is None:
+    conversation = evidence.ref
+    if conversation is None or not evidence.polls:
         return []
-    return [
-        Interval(start=poll.requested.start, end=poll.earliest_complete_page_time + JUST_AFTER)
-        for poll in evidence.polls
-        if poll.outcome is PollOutcome.STOPPED_EARLY and poll.earliest_complete_page_time is not None
+    regular = next((poll for poll in evidence.polls if poll.requested.end is None), None)
+    if regular is None:
+        raise ValueError(f"the previous attempt has no regular poll of conversation {evidence.conversation_id}")
+    backfills = [poll.requested for poll in evidence.polls if poll.requested.end is not None]
+    read = _union(_read(poll, conversation, received_at) for poll in evidence.polls)
+    lowest = max(floor, min(poll.requested.start for poll in evidence.polls))
+    end = proven_interval(regular, conversation, received_at=received_at).end
+    top = max((backfill.end for backfill in backfills if backfill.end is not None), default=lowest)
+    requested: list[_Range] = [
+        (max(backfill.start, lowest), backfill.end) for backfill in backfills if backfill.end is not None
     ]
+    requested.append((max(top, lowest, regular.requested.start), end))
+    if regular_start < regular.requested.start:
+        requested.append((regular_start, regular.requested.start))
+    unread = _without(_union(requested), read)
+    complete = regular.earliest_complete_page_time
+    if regular.outcome is PollOutcome.STOPPED_EARLY and complete is not None and lowest <= complete < end:
+        unread = _union([*unread, (complete, complete + JUST_AFTER)])
+    return unread
+
+
+def _read(poll: PollEvidence, conversation: ConversationRef, received_at: datetime) -> _Range:
+    """The range one poll read: its proven interval, from its requested start unless it stopped early."""
+
+    proven = proven_interval(poll, conversation, received_at=received_at)
+    if poll.outcome is PollOutcome.STOPPED_EARLY:
+        return proven.start, proven.end
+    return poll.requested.start, proven.end
+
+
+def _union(ranges: Iterable[_Range]) -> list[_Range]:
+    """The non-empty ranges merged where they overlap or touch, sorted."""
+
+    merged: list[_Range] = []
+    for start, end in sorted(item for item in ranges if item[0] < item[1]):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _without(ranges: Sequence[_Range], removed: Sequence[_Range]) -> list[_Range]:
+    """``ranges`` minus ``removed``; both sorted and disjoint."""
+
+    result: list[_Range] = []
+    for start, end in ranges:
+        for cut_start, cut_end in removed:
+            if cut_end <= start or cut_start >= end:
+                continue
+            if cut_start > start:
+                result.append((start, cut_start))
+            start = max(start, cut_end)
+            if start >= end:
+                break
+        if start < end:
+            result.append((start, end))
+    return result
 
 
 def _once(removals: Sequence[PlannedRemoval]) -> tuple[PlannedRemoval, ...]:
