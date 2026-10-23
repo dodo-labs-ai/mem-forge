@@ -28,6 +28,7 @@ from memforge.source_activity import SourceActivityConflict
 from memforge.source_derivation import DERIVATION_DETERMINISTIC_FAILURE
 from memforge.source_item_failures import FailedItemRetry
 from memforge.storage.database import Database
+from tests.connector_http_fixture import FakeConnectorHttp
 from tests.memory_store_fixture import OrchestratorMemoryStore
 from tests.gene_fixture import FakeGene
 from tests.test_source_reprocess import RawKeepingDocumentStore
@@ -737,8 +738,7 @@ def _jira_gene(handler):
     gene = JiraGene(
         config={"base_url": "https://jira.example.test", "pat": "token", "projects": ["PAY"]}, source_id=SOURCE_ID,
     )
-    gene._client = httpx.AsyncClient(base_url="https://jira.example.test", transport=httpx.MockTransport(handler))
-    gene._request_limiter = None
+    gene._client = FakeConnectorHttp(handler).client("https://jira.example.test", product_name="Jira")
     gene._auth_mode = "pat"
     gene._base_url = "https://jira.example.test"
     gene._hydrated_issues = {}
@@ -819,8 +819,7 @@ async def _rediscover_confluence(config: dict, pages: dict[str, dict]) -> dict[s
         return httpx.Response(httpx.codes.OK, json=page)
 
     gene = ConfluenceGene(config={"base_url": "https://wiki.example.test", "pat": "token", **config}, source_id=SOURCE_ID)
-    gene._client = httpx.AsyncClient(base_url="https://wiki.example.test", transport=httpx.MockTransport(handler))
-    gene._request_limiter = None
+    gene._client = FakeConnectorHttp(handler).client("https://wiki.example.test", product_name="Confluence")
     gene._api_prefix = ""
     gene._base_url = "https://wiki.example.test"
     try:

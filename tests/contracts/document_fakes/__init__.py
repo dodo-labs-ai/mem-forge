@@ -10,10 +10,11 @@ Adding a document source type
 -----------------------------
 
 Add ``document_fakes/<source_type>.py`` defining ``FAKES``, an instance of a
-:class:`DocumentConnectorFakes` subclass. Fake the provider at its transport
-(an ``httpx.MockTransport``, or the client class the Gene builds in
-``authenticate``), never the Gene's own methods, so the checks exercise the
-Gene's paging, validation and error handling. Give every item a time either
+:class:`DocumentConnectorFakes` subclass. Fake the provider at its transport,
+never the Gene's own methods, so the checks exercise the Gene's paging,
+validation, retries and error handling. A Gene on ``ConnectorHttpClient`` is
+served by ``tests.connector_http_fixture.FakeConnectorHttp``, which hands the
+client the fake's ``httpx.MockTransport`` and a sleep that returns at once. Give every item a time either
 before or after :data:`CHANGED_SINCE`, so incremental discovery yields some
 items and skips others.
 
@@ -40,8 +41,9 @@ What each fake must answer
     it; each client tells whether it ``is_closed``. Close the Gene with
     ``await gene.close()`` when the connection ends.
 ``reading_by_id(status)``
-    Required when ``listing_kinds`` include ``query``: a Gene and stored items
-    whose read by identifier answers HTTP ``status``.
+    Required when ``listing_kinds`` include ``query``: a connection and stored
+    items whose read by identifier answers HTTP ``status``, every time it is
+    asked.
 ``rediscover_candidates(config)``
     Required for a configuration ``rediscovers_documents`` answers ``True``
     for: stored items to rediscover against ``connect(config)``'s provider,
@@ -108,11 +110,13 @@ class FakeConnection:
     """A Gene connected to a fake provider, every request the provider received, in order, and every client it opened.
 
     Each client has an ``is_closed`` property, as ``httpx.AsyncClient`` does.
+    ``waits`` lists every wait the Gene's client asked its stub sleep for.
     """
 
     gene: DocumentGene
     requests: list[str] = field(default_factory=list)
     clients: list = field(default_factory=list)
+    waits: list[float] = field(default_factory=list)
 
 
 class DocumentConnectorFakes:
@@ -132,7 +136,7 @@ class DocumentConnectorFakes:
     def manifest_entries(self, config: Mapping[str, object]) -> list[dict]:
         raise NotImplementedError(f"{type(self).__name__} does not fake a device manifest")
 
-    def reading_by_id(self, status: int) -> AbstractAsyncContextManager[tuple[DocumentGene, Sequence[ContentItem]]]:
+    def reading_by_id(self, status: int) -> AbstractAsyncContextManager[tuple[FakeConnection, Sequence[ContentItem]]]:
         raise NotImplementedError(f"{type(self).__name__} does not fake reads by identifier")
 
     def rediscover_candidates(self, config: Mapping[str, object]) -> list[ContentItem]:

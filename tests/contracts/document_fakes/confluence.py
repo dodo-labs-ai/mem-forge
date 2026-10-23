@@ -12,13 +12,15 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
-from datetime import datetime
-from unittest.mock import patch
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 
 import httpx
 
+from memforge.genes import confluence_gene
 from memforge.genes.confluence_gene import ConfluenceGene
 from memforge.models import ContentItem
+from tests.connector_http_fixture import FakeConnectorHttp
 from tests.contracts.document_fakes import (
     LONG_AGO,
     RECENTLY,
@@ -29,7 +31,6 @@ from tests.contracts.document_fakes import (
 )
 
 BASE_URL = "https://wiki.example.test"
-_REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 # content id -> (space, parent page id, labels, changed at)
 PAGES: dict[str, tuple[str, str | None, tuple[str, ...], datetime]] = {
@@ -84,13 +85,10 @@ class _Provider:
         self.listing = listing
         self.read_status = read_status
         self.requests: list[str] = []
-        self.clients: list[httpx.AsyncClient] = []
+        self.http = FakeConnectorHttp(self.handle)
 
-    def client(self, *args, **kwargs) -> httpx.AsyncClient:
-        """The client the Gene builds in ``authenticate``, answered by this provider."""
-        built = _REAL_ASYNC_CLIENT(*args, transport=httpx.MockTransport(self.handle), **kwargs)
-        self.clients.append(built)
-        return built
+    def connection(self, gene: ConfluenceGene) -> FakeConnection:
+        return FakeConnection(gene=gene, requests=self.requests, clients=self.http.clients, waits=self.http.waits)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(f"{request.method} {request.url}")
@@ -104,8 +102,7 @@ class _Provider:
         if self.read_status is not None:
             if self.read_status == 200:
                 return httpx.Response(200, json=_page("101"))
-            headers = {"Retry-After": "0"} if self.read_status == 429 else {}
-            return httpx.Response(self.read_status, json={}, headers=headers)
+            return httpx.Response(self.read_status, json={}, headers=_wait_headers(self.read_status))
         if page_id not in PAGES:
             return httpx.Response(404, json={"message": "No content found"})
         return httpx.Response(200, json=_page(page_id))
@@ -144,17 +141,17 @@ class ConfluenceFakes(DocumentConnectorFakes):
         provider = _Provider(listing)
         gene = await _authenticated(dict(config), provider)
         try:
-            yield FakeConnection(gene=gene, requests=provider.requests, clients=provider.clients)
+            yield provider.connection(gene)
         finally:
             await gene.close()
 
     @asynccontextmanager
-    async def reading_by_id(self, status: int) -> AsyncIterator[tuple[ConfluenceGene, Sequence[ContentItem]]]:
+    async def reading_by_id(self, status: int) -> AsyncIterator[tuple[FakeConnection, Sequence[ContentItem]]]:
         provider = _Provider(ProviderListing.COMPLETE)
         gene = await _authenticated(dict(self.listing_configs["page-tree"].config), provider)
         provider.read_status = status
         try:
-            yield gene, [_stored_page("101")]
+            yield provider.connection(gene), [_stored_page("101")]
         finally:
             await gene.close()
 
@@ -164,16 +161,19 @@ class ConfluenceFakes(DocumentConnectorFakes):
 
 async def _authenticated(config: dict, provider: _Provider) -> ConfluenceGene:
     gene = ConfluenceGene(config=config, source_id="src-contract")
-    client = provider.client
-    # The fake answers at once, so requests need no pacing.
-    with (
-        patch("httpx.AsyncClient", client),
-        patch("memforge.genes.confluence_gene.CONFLUENCE_REQUEST_INTERVAL_SECONDS", 0.0),
-    ):
+    with provider.http.serving(confluence_gene):
         await gene.authenticate()
-    gene._request_limiter = None
     provider.requests.clear()
     return gene
+
+
+def _wait_headers(status: int) -> dict[str, str]:
+    """A wait in seconds on 429 and as an HTTP date on 503; the stub sleep makes both instant."""
+    if status == httpx.codes.TOO_MANY_REQUESTS:
+        return {"Retry-After": "30"}
+    if status == httpx.codes.SERVICE_UNAVAILABLE:
+        return {"Retry-After": format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True)}
+    return {}
 
 
 def _stored_page(page_id: str) -> ContentItem:

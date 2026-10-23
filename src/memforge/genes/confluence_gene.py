@@ -17,14 +17,14 @@ import httpx
 
 from memforge.genes.atlassian_auth import (
     ATLASSIAN_ABSENT_STATUS_CODES,
+    atlassian_fail_fast,
     atlassian_record_state,
     atlassian_request_limiter,
-    get_with_rate_limit_retry,
-    stream_with_rate_limit_retry,
 )
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.toolkit.config import bearer_headers, bool_config, list_config, require_https_base_url, tls_verify
+from memforge.genes.toolkit.http import ConnectorHttpClient
 from memforge.genes.toolkit.paging import OffsetPage, PagingErrors, paged_by_offset
 from memforge.genes.confluence_artifacts import resolve_current_confluence_artifacts
 from memforge.genes.confluence_pdf import export_confluence_page_pdf
@@ -54,6 +54,7 @@ from memforge.source_artifacts import (
 
 logger = logging.getLogger(__name__)
 CONFLUENCE_REQUEST_INTERVAL_SECONDS = 2.0
+CONFLUENCE_TIMEOUT_SECONDS = 30.0
 PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY = "_memforge_preview_limit"
 
 __all__ = ["ConfluenceGene"]
@@ -173,19 +174,21 @@ class ConfluenceGene(DocumentGene):
         self._base_url = base_url
         # Confluence REST API prefix — on-prem instances typically use /wiki
         self._api_prefix = "/wiki"
-        self._request_limiter = atlassian_request_limiter(
-            base_url,
-            min_interval_seconds=CONFLUENCE_REQUEST_INTERVAL_SECONDS,
-            owner_id=self.source_id,
-        )
 
         await self.close()
-        client = httpx.AsyncClient(
+        client = ConnectorHttpClient(
+            product_name="Confluence",
             base_url=base_url,
             headers=bearer_headers(self.config, "Confluence"),
-            timeout=30.0,
-            follow_redirects=True,
+            timeout=CONFLUENCE_TIMEOUT_SECONDS,
             verify=tls_verify(self.config),
+            follow_redirects=True,
+            limiter=atlassian_request_limiter(
+                base_url,
+                min_interval_seconds=CONFLUENCE_REQUEST_INTERVAL_SECONDS,
+                owner_id=self.source_id,
+            ),
+            fail_fast=atlassian_fail_fast("Confluence"),
         )
         try:
             self._api_prefix = await self._select_api_prefix(client)
@@ -299,12 +302,13 @@ class ConfluenceGene(DocumentGene):
             return [configured]
         return ["/wiki", ""]
 
-    async def _select_api_prefix(self, client: httpx.AsyncClient) -> str:
+    async def _select_api_prefix(self, client: ConnectorHttpClient) -> str:
         """Return the REST prefix that answers with Confluence JSON."""
         last_error: Exception | None = None
         for prefix in self._api_prefix_candidates(self.config):
             try:
-                resp = await self._get(client, f"{prefix}/rest/api/space", params={"limit": 1})
+                resp = await client.get(f"{prefix}/rest/api/space", params={"limit": 1})
+                resp.raise_for_status()
                 self._json_response(resp, "checking Confluence REST API")
                 self.config["api_prefix"] = prefix
                 return prefix
@@ -832,13 +836,8 @@ class ConfluenceGene(DocumentGene):
         download_path = str(artifact.locator.get("download_path") or "").strip()
         if not download_path:
             raise SourceArtifactContractError("Confluence attachment locator is incomplete")
-        async with stream_with_rate_limit_retry(
-            self._client,
-            "GET",
-            download_path,
-            product_name="Confluence",
-            limiter=getattr(self, "_request_limiter", None),
-        ) as response:
+        async with self._client.stream("GET", download_path) as response:
+            response.raise_for_status()
             yield SourceArtifactDownload(
                 chunks=response.aiter_bytes(),
                 media_type=response.headers.get("content-type"),
@@ -910,7 +909,6 @@ class ConfluenceGene(DocumentGene):
                 api_prefix=self._api_prefix,
                 page_id=page_id,
                 title=item.title,
-                limiter=getattr(self, "_request_limiter", None),
             )
         except Exception as e:
             logger.warning("PDF export failed for %s: %s", item.title, e)
@@ -1018,28 +1016,11 @@ class ConfluenceGene(DocumentGene):
         except Exception as e:
             return {"healthy": False, "error": str(e)}
 
-    async def _get(
-        self,
-        url_or_client: str | httpx.AsyncClient,
-        url: str | None = None,
-        *,
-        params: dict | None = None,
-    ) -> httpx.Response:
-        """GET a Confluence REST URL with bounded HTTP 429 retry handling."""
-        if url is None:
-            client = self._client
-            request_url = str(url_or_client)
-        else:
-            client = url_or_client
-            request_url = url
-
-        return await get_with_rate_limit_retry(
-            client,
-            request_url,
-            product_name="Confluence",
-            params=params,
-            limiter=getattr(self, "_request_limiter", None),
-        )
+    async def _get(self, url: str, *, params: dict | None = None) -> httpx.Response:
+        """GET a Confluence REST path through the Gene's client, raising ``httpx.HTTPStatusError`` for an error status."""
+        resp = await self._client.get(url, params=params)
+        resp.raise_for_status()
+        return resp
 
     @staticmethod
     def _json_response(resp: httpx.Response, action: str) -> dict:
