@@ -56,11 +56,24 @@ connector's, and a failure while reading it raises::
         async for chunk in response.aiter_bytes():
             ...
 
-Two hooks fit a provider's own rules, and both see every attempt:
+Three hooks fit a provider's own rules, and each sees every attempt:
 
 - ``fail_fast(response)`` runs on each response before the client decides to
   retry, and raises to stop at once, as Atlassian does when it reports a REST
   quota of zero.
+- ``rate_limit(response)`` reads a provider's own rate-limit signal. It
+  returns the seconds the provider asks the client to wait, and the client
+  waits that long, capped, and retries as for 429 whatever the status; or it
+  returns ``None`` when the response is not a rate limit. GitHub answers a
+  rate limit with 403 or 429 and says when it resets
+  (:func:`memforge.genes.toolkit.github_api.github_rate_limit_wait`)::
+
+      def rate_limit(response: httpx.Response) -> float | None:
+          if response.status_code == 403 and response.headers.get("Retry-After", "").isdigit():
+              return float(response.headers["Retry-After"])
+          return None
+
+  Like ``fail_fast``, it may raise to stop at once.
 - ``limiter`` paces the requests that share it (see :class:`RequestLimiter`).
   Every attempt, retries included, passes through it, and a response that
   asks to wait spaces the limiter's next request by the same capped wait.
@@ -90,14 +103,18 @@ __all__ = [
     "IDEMPOTENT_METHODS",
     "ConnectorHttpClient",
     "ConnectorUnreachableError",
+    "RateLimit",
     "RequestLimiter",
     "RetryPolicy",
     "Sleep",
+    "retry_after_seconds",
 ]
 
 logger = logging.getLogger(__name__)
 
 Sleep = Callable[[float], Awaitable[None]]
+# A provider's rate-limit signal: the seconds a response asks the client to wait, or None.
+RateLimit = Callable[[httpx.Response], float | None]
 
 # Methods a server may receive twice without a different outcome (RFC 9110 §9.2.2).
 IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
@@ -138,7 +155,7 @@ class RetryPolicy:
             RetryPolicy().wait_after(httpx.Response(503, headers={"Retry-After": "600"}), 1)  # 60.0
             RetryPolicy().wait_after(httpx.Response(500), 2)                                  # 4.0
         """
-        requested = _retry_after_seconds(response)
+        requested = retry_after_seconds(response)
         wait = requested if requested is not None else self.backoff_seconds * attempt
         return min(max(wait, 0.0), self.max_wait_seconds)
 
@@ -185,8 +202,8 @@ class ConnectorHttpClient:
       :func:`memforge.genes.toolkit.config.tls_verify` returns.
     - ``follow_redirects`` says whether a 3xx is followed.
 
-    ``limiter``, ``fail_fast`` and ``retry`` set the policy (module
-    docstring). ``clock``, ``sleep`` and ``transport`` exist for tests: the
+    ``limiter``, ``fail_fast``, ``rate_limit`` and ``retry`` set the policy
+    (module docstring). ``clock``, ``sleep`` and ``transport`` exist for tests: the
     client reads monotonic time only through ``clock`` (``time.monotonic`` by
     default) and waits only through ``sleep``; a caller that sets a
     ``deadline`` reads it from :attr:`clock` too.
@@ -206,6 +223,7 @@ class ConnectorHttpClient:
         follow_redirects: bool,
         limiter: RequestLimiter | None = None,
         fail_fast: Callable[[httpx.Response], None] | None = None,
+        rate_limit: RateLimit | None = None,
         retry: RetryPolicy = DEFAULT_RETRY_POLICY,
         sleep: Sleep = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
@@ -214,6 +232,7 @@ class ConnectorHttpClient:
         self.product_name = product_name
         self._limiter = limiter
         self._fail_fast = fail_fast
+        self._rate_limit = rate_limit
         self._retry = retry
         self._sleep = sleep
         self.clock = clock
@@ -386,18 +405,27 @@ class ConnectorHttpClient:
             try:
                 if self._fail_fast is not None:
                     self._fail_fast(response)
+                provider_wait = self._rate_limit(response) if self._rate_limit is not None else None
             except BaseException:
                 await response.aclose()
                 raise
             status = response.status_code
-            if not (status in _WAIT_STATUSES or (replayable and httpx.codes.is_server_error(status))):
+            rate_limited = provider_wait is not None or status == httpx.codes.TOO_MANY_REQUESTS
+            if not (
+                provider_wait is not None
+                or status in _WAIT_STATUSES
+                or (replayable and httpx.codes.is_server_error(status))
+            ):
                 return response
 
-            wait = policy.wait_after(response, attempt)
+            if provider_wait is not None:
+                wait = min(max(provider_wait, 0.0), policy.max_wait_seconds)
+            else:
+                wait = policy.wait_after(response, attempt)
             if attempt >= policy.attempts or self._too_late(deadline, wait + attempt_seconds):
                 if streamed:
                     await _read_and_close(response)
-                raise self._exhausted(response, url, attempt)
+                raise self._exhausted(response, url, attempt, rate_limited=rate_limited)
             logger.warning(
                 "%s answered %d for %s; retrying in %.1f s (attempt %d of %d)",
                 self.product_name,
@@ -445,9 +473,11 @@ class ConnectorHttpClient:
             return max(limits) if limits else math.inf
         return math.inf
 
-    def _exhausted(self, response: httpx.Response, url: str, attempts: int) -> httpx.HTTPStatusError:
+    def _exhausted(
+        self, response: httpx.Response, url: str, attempts: int, *, rate_limited: bool
+    ) -> httpx.HTTPStatusError:
         tried = _attempts_phrase(attempts)
-        if response.status_code == httpx.codes.TOO_MANY_REQUESTS:
+        if rate_limited:
             message = (
                 f"{self.product_name} rate limit persisted after {tried} for {url}. "
                 "Retry later or reduce the source sync frequency."
@@ -485,8 +515,12 @@ def _limiter_delay(policy: RetryPolicy, response: httpx.Response, attempt: int) 
     return None
 
 
-def _retry_after_seconds(response: httpx.Response) -> float | None:
-    """The wait ``Retry-After`` asks for, in seconds or as an HTTP date, or ``None`` when absent or unreadable."""
+def retry_after_seconds(response: httpx.Response) -> float | None:
+    """The wait ``Retry-After`` asks for, in seconds or as an HTTP date, or ``None`` when absent or unreadable::
+
+        retry_after_seconds(httpx.Response(429, headers={"Retry-After": "5"}))  # 5.0
+        retry_after_seconds(httpx.Response(429))                                # None
+    """
     value = response.headers.get("Retry-After", "").strip()
     if not value:
         return None

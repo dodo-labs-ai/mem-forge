@@ -362,7 +362,7 @@ async def test_a_wait_that_would_pass_the_deadline_gives_up_instead() -> None:
 
 
 # ---------------------------------------------------------------------------
-# fail_fast and the limiter
+# fail_fast, rate_limit and the limiter
 # ---------------------------------------------------------------------------
 
 
@@ -391,6 +391,66 @@ async def test_fail_fast_sees_every_response_and_stops_the_loop() -> None:
 
     assert seen == [503, 429]
     assert len(requests) == 2
+
+
+def _forbidden_with_retry_after(response: httpx.Response) -> float | None:
+    """A provider that answers its rate limit with 403 and Retry-After."""
+    if response.status_code == 403 and response.headers.get("Retry-After"):
+        return float(response.headers["Retry-After"])
+    return None
+
+
+@pytest.mark.asyncio
+async def test_a_provider_rate_limit_is_waited_out_capped_and_retried_whatever_its_status() -> None:
+    http, requests = _http(
+        httpx.Response(403, headers={"Retry-After": "600"}),
+        httpx.Response(403, headers={"Retry-After": "4"}),
+        httpx.Response(200),
+    )
+
+    async with http.client(BASE_URL, rate_limit=_forbidden_with_retry_after) as client:
+        assert (await client.post("/search")).status_code == 200
+
+    assert len(requests) == 3
+    assert http.waits == [60.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_a_provider_rate_limit_that_persists_raises_as_a_rate_limit() -> None:
+    http, _requests = _http(httpx.Response(403, headers={"Retry-After": "1"}))
+
+    async with http.client(BASE_URL, product_name="Wiki", rate_limit=_forbidden_with_retry_after) as client:
+        with pytest.raises(httpx.HTTPStatusError, match="Wiki rate limit persisted after 4 attempts"):
+            await client.get("/items")
+
+
+@pytest.mark.asyncio
+async def test_a_response_that_is_no_provider_rate_limit_is_returned_as_it_arrived() -> None:
+    http, requests = _http(httpx.Response(403))
+
+    async with http.client(BASE_URL, rate_limit=_forbidden_with_retry_after) as client:
+        assert (await client.get("/items")).status_code == 403
+
+    assert len(requests) == 1
+    assert http.waits == []
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limit_hook_that_raises_stops_the_loop_and_closes_a_stream() -> None:
+    http, requests = _http(httpx.Response(403, headers={"Retry-After": "3600"}), httpx.Response(200))
+    opened: list[httpx.Response] = []
+
+    def refuse_long_waits(response: httpx.Response) -> float | None:
+        opened.append(response)
+        raise QuotaIsZero("resets in an hour")
+
+    async with http.client(BASE_URL, rate_limit=refuse_long_waits) as client:
+        with pytest.raises(QuotaIsZero):
+            async with client.stream("GET", "/download"):
+                pass
+
+    assert len(requests) == 1
+    assert opened[0].is_closed
 
 
 @pytest.mark.asyncio

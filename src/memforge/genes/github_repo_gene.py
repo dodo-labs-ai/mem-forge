@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 from collections.abc import AsyncIterator, Mapping
@@ -13,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-import requests
+import httpx
 
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.local_adapter_packages import (
@@ -24,7 +23,14 @@ from memforge.genes.local_adapter_packages import (
     source_artifacts_from_package,
 )
 from memforge.genes.local_markdown_gene import _to_markdown
-from memforge.genes.toolkit.config import int_config, list_config
+from memforge.genes.toolkit.config import int_config, list_config, resolve_pat, tls_verify
+from memforge.genes.toolkit.github_api import (
+    GitHubApi,
+    GitHubRepository,
+    GitHubTreeSelectionExceeded,
+    github_rate_limit_wait,
+)
+from memforge.genes.toolkit.http import ConnectorHttpClient
 from memforge.genes.toolkit.local_packages import device_packages
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSIONS,
@@ -41,13 +47,10 @@ from memforge.github_repo_utils import (
     github_extension_allowed,
     github_include_extensions,
     github_include_paths,
-    github_latest_commit_time,
-    github_path_commits_query,
     github_path_in_scope,
     normalize_github_scope_paths,
     normalize_github_relative_path,
     parse_github_repo_url,
-    validate_github_tree_payload,
     validate_github_file_mode,
 )
 from memforge.models import (
@@ -65,7 +68,6 @@ from memforge.models import (
 from memforge.repo_identity import normalize_repo_identifier
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, latest_source_time
 from memforge.source_artifacts import (
-    SOURCE_ARTIFACT_STREAM_CHUNK_BYTES,
     SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
     RawSourceArtifact,
     SourceArtifactContractError,
@@ -123,6 +125,10 @@ class _RepoRef:
     owner: str
     repo: str
 
+    @property
+    def repository(self) -> GitHubRepository:
+        return GitHubRepository(origin=self.origin, owner=self.owner, name=self.repo)
+
 
 @dataclass(frozen=True)
 class _ScopeTree:
@@ -147,6 +153,8 @@ class GitHubRepoGene(DocumentGene):
     """
 
     listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
+    # Opened by ``authenticate`` for cloud pull; a pushed repository is read from its packages.
+    _client: ConnectorHttpClient | None = None
 
     @classmethod
     def metadata(cls) -> GeneMetadata:
@@ -269,6 +277,13 @@ class GitHubRepoGene(DocumentGene):
         config["exclude_paths"] = normalize_github_scope_paths(list_config(config.get("exclude_paths")))
 
     async def authenticate(self) -> None:
+        """Open the client for cloud pull; a pushed repository needs only its documents directory.
+
+        The token is optional: a public repository is read without one. TLS
+        trusts ``tls_ca_bundle``, else ``REQUESTS_CA_BUNDLE``, else the
+        default trust store, so a GitHub Enterprise Server behind a private
+        CA is reached however its users already trust that CA.
+        """
         await self.close()
         self._repo_ref = _parse_repo_url(str(self.config.get("repo_url") or ""))
         self._connection_mode = _connection_mode(self.config)
@@ -284,10 +299,32 @@ class GitHubRepoGene(DocumentGene):
             "Accept": "application/vnd.github+json",
             "User-Agent": "memforge-github-repo-source",
         }
-        pat = str(self.config.get("pat") or "").strip()
-        if pat:
-            headers["Authorization"] = f"Bearer {pat}"
-        self._client = _RequestsAsyncClient(headers=headers, timeout=30.0)
+        if str(self.config.get("pat") or "").strip() or str(self.config.get("pat_env_var") or "").strip():
+            headers["Authorization"] = f"Bearer {resolve_pat(self.config, 'GitHub Repository')}"
+        self._client = ConnectorHttpClient(
+            product_name="GitHub",
+            headers=headers,
+            timeout=30.0,
+            verify=tls_verify(self.config, honor_requests_ca_bundle=True),
+            follow_redirects=True,
+            rate_limit=github_rate_limit_wait,
+        )
+
+    def github_api(self) -> GitHubApi:
+        """The configured repository's REST API, read through this Gene's client; ``authenticate`` first.
+
+        The admin folder browse reads the tree this way, with the client and
+        TLS a sync would use::
+
+            await gene.authenticate()
+            entries = await gene.github_api().tree("main", max_requests=BROWSE_TREE_REQUEST_BUDGET)
+        """
+        return GitHubApi(self._connected_client(), self._repo_ref.repository, label="GitHub repository")
+
+    def _connected_client(self) -> ConnectorHttpClient:
+        if self._client is None:
+            raise RuntimeError("GitHub Repository is not connected: call authenticate() first")
+        return self._client
 
     @classmethod
     def lists_scope(cls, config: Mapping[str, Any]) -> bool:
@@ -313,46 +350,43 @@ class GitHubRepoGene(DocumentGene):
         return ScopeListing(kind=ScopeListingKind.EXISTENCE, doc_ids=frozenset(self._listed_doc_ids(tree)))
 
     async def _scope_tree(self) -> _ScopeTree:
-        """Read the repository tree at the ref's current commit and select the files in scope, or raise."""
-        if getattr(self, "_client", None) is None:
-            await self.authenticate()
+        """Read the repository's complete tree at the ref's current commit and select the files in scope, or raise.
+
+        The whole tree is read, not only the selected folders, because a
+        selected symbolic link resolves anywhere in it. Reading stops as soon
+        as more than ``max_files`` files are selected.
+        """
+        github = self.github_api()
         repo_ref = self._repo_ref
         ref = str(self.config.get("ref") or "").strip()
         if not ref:
-            ref = await self._default_branch(repo_ref)
-        commit_response = await self._client.get(f"{_repo_api_url(repo_ref)}/commits/{quote(ref, safe='')}")
-        commit_response.raise_for_status()
-        commit_payload = commit_response.json()
-        commit_payload = commit_payload if isinstance(commit_payload, dict) else {}
-        commit = commit_payload.get("commit")
-        tree = commit.get("tree") if isinstance(commit, dict) else None
-        commit_sha = str(commit_payload.get("sha") or "")
-        root_tree = str(tree.get("sha") or "") if isinstance(tree, dict) else ""
-        if not commit_sha or not root_tree:
-            raise RuntimeError("GitHub did not return an immutable commit and root tree for this collection")
-        entries = await self._repo_tree(repo_ref, root_tree)
+            ref = await github.default_branch()
+        commit = await github.commit(ref)
         include_paths = github_include_paths(self.config)
         exclude_paths = github_exclude_paths(self.config)
         include_exts = github_include_extensions(self.config)
         max_files = int_config(self.config, "max_files", default=DEFAULT_MAX_FILES)
-        selected = [
-            entry
-            for entry in entries
-            if (
-                entry.get("type") in {"blob", "commit"}
-                or entry.get("mode") == GITHUB_SYMLINK_MODE
+
+        def selects(entry: Mapping[str, Any]) -> bool:
+            path = str(entry.get("path") or "")
+            return (
+                (entry.get("type") in {"blob", "commit"} or entry.get("mode") == GITHUB_SYMLINK_MODE)
+                and github_path_in_scope(path, include_paths, exclude_paths)
+                and github_extension_allowed(path, include_exts)
             )
-            and github_path_in_scope(str(entry.get("path") or ""), include_paths, exclude_paths)
-            and github_extension_allowed(str(entry.get("path") or ""), include_exts)
-        ]
-        if len(selected) > max_files:
-            raise RuntimeError(f"GitHub Repository discovery matched {len(selected)} files, exceeding max_files={max_files}")
+
+        try:
+            entries = await github.tree(commit.tree_sha, selects=selects, max_selected=max_files)
+        except GitHubTreeSelectionExceeded as exc:
+            raise RuntimeError(
+                f"GitHub Repository discovery matched {exc.selected} files, exceeding max_files={max_files}"
+            ) from exc
         return _ScopeTree(
             repo_ref=repo_ref,
             ref=ref,
-            commit_sha=commit_sha,
-            root_tree=root_tree,
-            selected=selected,
+            commit_sha=commit.sha,
+            root_tree=commit.tree_sha,
+            selected=[entry for entry in entries if selects(entry)],
             entries_by_path={
                 normalize_github_relative_path(str(entry.get("path") or "")).rstrip("/"): entry
                 for entry in entries
@@ -435,7 +469,7 @@ class GitHubRepoGene(DocumentGene):
                     "resolved_relative_path": resolved.resolved_relative_path,
                     "commit_sha": commit_sha,
                     "root_tree_sha": root_tree,
-                    "repo_blob_url": _blob_url(repo_ref, blob_sha),
+                    "repo_blob_url": repo_ref.repository.blob_url(blob_sha),
                 },
             )
         self.record_scope_listing(ScopeListingKind.EXISTENCE, self._listed_doc_ids(tree))
@@ -528,13 +562,14 @@ class GitHubRepoGene(DocumentGene):
         blob_sha = str(artifact.locator.get("blob_sha") or "").strip()
         if not blob_url or not blob_sha or not blob_url.rstrip("/").endswith(f"/{quote(blob_sha, safe='')}"):
             raise SourceArtifactContractError("GitHub binary Artifact locator is incomplete")
-        async with self._client.stream(
+        async with self._connected_client().stream(
+            "GET",
             blob_url,
             headers={"Accept": "application/vnd.github.raw+json"},
         ) as response:
             response.raise_for_status()
             yield SourceArtifactDownload(
-                chunks=_iter_response_chunks(response),
+                chunks=response.aiter_bytes(),
                 # GitHub raw blob responses may use application/octet-stream.
                 # The immutable tree descriptor supplies the scoped media type.
                 media_type=None,
@@ -615,16 +650,14 @@ class GitHubRepoGene(DocumentGene):
         relative_path = str(item.extra.get("relative_path") or "").strip()
         if not commit_sha or not relative_path:
             raise RuntimeError("GitHub file identity is missing its collection commit or path")
+        github = self.github_api()
         commit_times = []
         for path in github_content_paths(relative_path, item.extra.get("resolved_relative_path")):
-            query = github_path_commits_query(relative_path=path, ref=commit_sha)
             try:
-                response = await self._client.get(f"{_repo_api_url(self._repo_ref)}/commits?{query}")
-                response.raise_for_status()
-            except requests.HTTPError as exc:
+                commit_times.append(await github.latest_commit_time(path, ref=commit_sha))
+            except httpx.HTTPStatusError as exc:
                 logger.warning("GitHub commit time for %s is unknown: %s", path, exc)
                 return None
-            commit_times.append(github_latest_commit_time(response.json()))
         return latest_source_time(commit_times)
 
     async def _resolve_repo_entry(
@@ -643,7 +676,7 @@ class GitHubRepoGene(DocumentGene):
         try:
             while link := resolver.next_symlink_read():
                 raw_target = await self._read_text_blob(
-                    blob_url=_blob_url(repo_ref, link.blob_sha),
+                    blob_url=repo_ref.repository.blob_url(link.blob_sha),
                     blob_sha=link.blob_sha,
                     blob_size=link.blob_size,
                     label=link.path,
@@ -661,7 +694,8 @@ class GitHubRepoGene(DocumentGene):
         blob_size: object,
         label: str,
     ) -> bytes:
-        async with self._client.stream(
+        async with self._connected_client().stream(
+            "GET",
             blob_url,
             headers={"Accept": "application/vnd.github.raw+json", "Accept-Encoding": "identity"},
         ) as response:
@@ -677,27 +711,9 @@ class GitHubRepoGene(DocumentGene):
                 content_length=int(length_header) if length_header is not None else None,
                 label=label,
             )
-            async for chunk in _iter_response_chunks(response):
+            async for chunk in response.aiter_bytes():
                 buffer.write(chunk)
             return buffer.finish()
-
-    async def _default_branch(self, ref: _RepoRef) -> str:
-        response = await self._client.get(_repo_api_url(ref))
-        response.raise_for_status()
-        payload = response.json()
-        branch = str(payload.get("default_branch") or "").strip() if isinstance(payload, dict) else ""
-        if not branch:
-            raise RuntimeError("GitHub repository response is missing default_branch")
-        return branch
-
-    async def _repo_tree(self, ref: _RepoRef, repo_ref: str) -> list[dict]:
-        response = await self._client.get(f"{_repo_api_url(ref)}/git/trees/{quote(repo_ref, safe='')}?recursive=1")
-        response.raise_for_status()
-        payload = response.json()
-        try:
-            return validate_github_tree_payload(payload, label="GitHub repository")
-        except ValueError as exc:
-            raise RuntimeError(str(exc)) from exc
 
     async def _discover_local_push(self, since: datetime | None) -> AsyncIterator[ContentItem]:
         packages = [
@@ -738,33 +754,6 @@ class GitHubRepoGene(DocumentGene):
         return Path(configured).expanduser()
 
 
-class _RequestsAsyncClient:
-    def __init__(self, *, headers: dict[str, str], timeout: float) -> None:
-        self._session = requests.Session()
-        self._session.headers.update(headers)
-        self._timeout = timeout
-
-    async def get(self, url: str) -> requests.Response:
-        return await asyncio.to_thread(self._session.get, url, timeout=self._timeout)
-
-    @asynccontextmanager
-    async def stream(self, url: str, *, headers: dict[str, str] | None = None):
-        response = await asyncio.to_thread(
-            self._session.get,
-            url,
-            headers=headers,
-            timeout=self._timeout,
-            stream=True,
-        )
-        try:
-            yield response
-        finally:
-            await asyncio.to_thread(response.close)
-
-    async def aclose(self) -> None:
-        await asyncio.to_thread(self._session.close)
-
-
 def _parse_repo_url(url: str) -> _RepoRef:
     value = str(url or "").strip()
     if not value:
@@ -786,16 +775,6 @@ def _connection_mode(config: dict) -> str:
     return str(config.get("connection_mode") or CONNECTION_MODE_CLOUD_PULL).strip().lower()
 
 
-def _repo_api_url(ref: _RepoRef) -> str:
-    if ref.host == "github.com":
-        return f"https://api.github.com/repos/{quote(ref.owner, safe='')}/{quote(ref.repo, safe='')}"
-    return f"{ref.origin}/api/v3/repos/{quote(ref.owner, safe='')}/{quote(ref.repo, safe='')}"
-
-
-def _blob_url(ref: _RepoRef, blob_sha: str) -> str:
-    return f"{_repo_api_url(ref)}/git/blobs/{quote(blob_sha, safe='')}"
-
-
 def _file_url(ref: _RepoRef, repo_ref: str, relative_path: str) -> str:
     return f"{ref.repo_url}/blob/{quote(repo_ref, safe='')}/{quote(relative_path, safe='/')}"
 
@@ -803,16 +782,6 @@ def _file_url(ref: _RepoRef, repo_ref: str, relative_path: str) -> str:
 def _title_from_path(relative_path: str) -> str:
     filename = relative_path.rstrip("/").rsplit("/", 1)[-1]
     return re.sub(r"\.[^.]+$", "", filename) or filename
-
-
-async def _iter_response_chunks(response: requests.Response) -> AsyncIterator[bytes]:
-    iterator = response.iter_content(chunk_size=SOURCE_ARTIFACT_STREAM_CHUNK_BYTES)
-    while True:
-        chunk = await asyncio.to_thread(next, iterator, None)
-        if chunk is None:
-            return
-        if chunk:
-            yield chunk
 
 
 def _package_matches_config(package: Mapping[str, Any], config: dict) -> bool:

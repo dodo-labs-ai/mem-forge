@@ -1,217 +1,118 @@
 from __future__ import annotations
 
-import base64
 import hashlib
+import ssl
+from collections.abc import Callable
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
 
+import httpx
 import pytest
-import requests
 
-from memforge.genes import GENE_REGISTRY
+from memforge.genes import GENE_REGISTRY, github_pages_gene
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.github_pages_gene import GitHubPagesGene
+from memforge.genes.toolkit.github_api import TREE_REQUEST_BUDGET, GitHubTreeBudgetExceeded
 from memforge.models import ContentItem, RawContent
+from tests.connector_http_fixture import FakeConnectorHttp
+from tests.github_api_fixture import FakeGitHub, git_blob_sha
+from tests.tls_bundle_fixture import BUNDLE_CA_COUNT, trusted_ca_count, write_ca_bundle
+
+Answer = Callable[[httpx.Request], httpx.Response]
+
+PAGE_HEADERS = {"Last-Modified": "Tue, 26 May 2026 14:51:21 GMT", "ETag": '"abc123"'}
+PAGE_HTML = "<main><h1>Process Tracking</h1><p>Body</p></main>"
+
+PROCESS_TRACKING = b"# Process Tracking\n\nUse `/api/` for REST clients."
+ORG_REPO_FILES = {"docs/cloud-native-platform/process-tracking.md": PROCESS_TRACKING}
+RUNBOOKS_FILES = {
+    "docs/runbooks/Process Tracking/stuck-lock.md": b"# Stuck Lock\n\nUnlock the process.",
+    "docs/runbooks/Process Tracking/timed-out-process-instance.md": b"# Timed Out\n",
+    "docs/runbooks/Other Runbook/overview.md": b"# Overview\n",
+    "docs/runbooks/Process Tracking/assets/diagram.png": b"\x89PNG\r\n",
+}
+RUNBOOKS_API = "https://github.example.test/api/v3/repos/example-org/runbooks"
 
 
-class HtmlResponse:
+def page(text: str = PAGE_HTML, *, status: int = 200, headers: dict[str, str] | None = None) -> Answer:
+    """An answer serving one page, built afresh for each request."""
+    return lambda _request: httpx.Response(status, text=text, headers=headers or {})
+
+
+def not_found(_request: httpx.Request) -> httpx.Response:
+    return httpx.Response(404, text="missing")
+
+
+class Site:
+    """The provider behind a Pages Gene: a GitHub repository's REST API, the published pages, or both.
+
+    ``pages`` answers a URL; ``fallback`` answers any other request.
+    ``requests`` lists each request as ``(method, url)``.
+    """
+
     def __init__(
         self,
-        text: str,
+        pages: dict[str, Answer] | None = None,
         *,
-        status_code: int = 200,
-        headers: dict[str, str] | None = None,
-        url: str = "https://github-pages.example.test/pages/org/repo/path/",
+        github: FakeGitHub | None = None,
+        fallback: Answer = not_found,
     ) -> None:
-        self.text = text
-        self.content = text.encode("utf-8")
-        self.status_code = status_code
-        self.headers = headers or {}
-        self.url = url
-        self.history = []
+        self.pages = pages or {}
+        self.github = github
+        self.fallback = fallback
+        self.requests: list[tuple[str, str]] = []
+        self.http = FakeConnectorHttp(self.handle)
 
-    def raise_for_status(self) -> None:
-        if self.status_code >= 400:
-            raise requests.HTTPError("request failed")
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append((request.method, str(request.url)))
+        if self.github is not None and (answer := self.github.answer(request)) is not None:
+            return answer
+        return self.pages.get(str(request.url), self.fallback)(request)
 
-    def json(self) -> dict:
-        return {}
-
-
-class RecordingAsyncClient:
-    instances: list["RecordingAsyncClient"] = []
-
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.calls: list[tuple[str, str]] = []
-        self.closed = False
-        RecordingAsyncClient.instances.append(self)
-
-    async def head(self, url: str, **_kwargs):
-        self.calls.append(("HEAD", url))
-        return HtmlResponse(
-            "",
-            headers={
-                "Last-Modified": "Tue, 26 May 2026 14:51:21 GMT",
-                "ETag": '"abc123"',
-            },
-            url=url,
-        )
-
-    async def get(self, url: str, **_kwargs):
-        self.calls.append(("GET", url))
-        return HtmlResponse(
-            "<main><h1>Process Tracking</h1><p>Body</p></main>",
-            headers={
-                "Last-Modified": "Tue, 26 May 2026 14:51:21 GMT",
-                "ETag": '"abc123"',
-            },
-            url=url,
-        )
-
-    async def aclose(self) -> None:
-        self.closed = True
+    async def connect(self, config: dict) -> GitHubPagesGene:
+        gene = GitHubPagesGene(config=config, source_id="src-pages")
+        with self.http.serving(github_pages_gene):
+            await gene.authenticate()
+        return gene
 
 
-class RepoApiResponse(HtmlResponse):
-    def __init__(self, payload, **kwargs):
-        super().__init__("", **kwargs)
-        self._payload = payload
-
-    def json(self):
-        return self._payload
+def org_repo_site(api_origin: str = "https://github-pages.example.test", **github_options) -> Site:
+    return Site(github=FakeGitHub(f"{api_origin}/api/v3/repos/org/repo", files=ORG_REPO_FILES, **github_options))
 
 
-class RepoApiClient(RecordingAsyncClient):
-    async def get(self, url: str, **_kwargs):
-        self.calls.append(("GET", url))
-        if url.endswith("/api/v3/repos/org/repo"):
-            return RepoApiResponse({"default_branch": "main"}, url=url)
-        if url.endswith("/api/v3/repos/org/repo/git/trees/main?recursive=1"):
-            return RepoApiResponse(
-                {
-                    "truncated": False,
-                    "tree": [
-                        {
-                            "path": "docs/cloud-native-platform/process-tracking.md",
-                            "type": "blob",
-                            "sha": "blob-sha-123",
-                        }
-                    ]
-                },
-                url=url,
-            )
-        if url.endswith(
-            "/api/v3/repos/org/repo/commits?sha=main&path=docs/cloud-native-platform/process-tracking.md&per_page=1"
-        ):
-            return RepoApiResponse([{"commit": {"committer": {"date": "2026-05-26T14:51:21Z"}}}], url=url)
-        if url.endswith("/api/v3/repos/org/repo/contents/docs/cloud-native-platform/process-tracking.md?ref=main"):
-            body = b"# Process Tracking\n\nUse `/api/` for REST clients."
-            encoded = base64.b64encode(body).decode()
-            return RepoApiResponse(
-                {"sha": "blob-sha-123", "content": encoded, "encoding": "base64", "size": len(body)},
-                url=url,
-            )
-        return await super().get(url, **_kwargs)
+def runbooks_site(**github_options) -> Site:
+    return Site(github=FakeGitHub(RUNBOOKS_API, files=RUNBOOKS_FILES, **github_options))
 
 
-class RunbooksRepoApiClient(RecordingAsyncClient):
-    async def get(self, url: str, **_kwargs):
-        self.calls.append(("GET", url))
-        if url.endswith("/api/v3/repos/example-org/runbooks"):
-            return RepoApiResponse({"default_branch": "main"}, url=url)
-        if url.endswith("/api/v3/repos/example-org/runbooks/git/trees/main?recursive=1"):
-            return RepoApiResponse(
-                {
-                    "truncated": False,
-                    "tree": [
-                        {
-                            "path": "docs/runbooks/Process Tracking/stuck-lock.md",
-                            "type": "blob",
-                            "sha": "stuck-lock-sha",
-                        },
-                        {
-                            "path": "docs/runbooks/Process Tracking/timed-out-process-instance.md",
-                            "type": "blob",
-                            "sha": "timed-out-sha",
-                        },
-                        {
-                            "path": "docs/runbooks/Other Runbook/overview.md",
-                            "type": "blob",
-                            "sha": "other-sha",
-                        },
-                        {
-                            "path": "docs/runbooks/Process Tracking/assets/diagram.png",
-                            "type": "blob",
-                            "sha": "asset-sha",
-                        },
-                    ]
-                },
-                url=url,
-            )
-        if "/api/v3/repos/example-org/runbooks/commits?sha=main&path=" in url:
-            return RepoApiResponse([{"commit": {"committer": {"date": "2026-05-26T14:51:21Z"}}}], url=url)
-        if url.endswith(
-            "/api/v3/repos/example-org/runbooks/contents/docs/runbooks/Process%20Tracking/stuck-lock.md?ref=main"
-        ):
-            body = b"# Stuck Lock\n\nUnlock the process."
-            encoded = base64.b64encode(body).decode()
-            return RepoApiResponse(
-                {"sha": "stuck-lock-sha", "content": encoded, "encoding": "base64", "size": len(body)},
-                url=url,
-            )
-        return await super().get(url, **_kwargs)
+def published_site() -> Site:
+    """A site whose every page answers the Process Tracking page."""
+    return Site(fallback=page(headers=PAGE_HEADERS))
 
 
-class TruncatedRepoApiClient(RepoApiClient):
-    async def get(self, url: str, **_kwargs):
-        if url.endswith("/api/v3/repos/org/repo/git/trees/main?recursive=1"):
-            return RepoApiResponse(
-                {
-                    "truncated": True,
-                    "tree": [
-                        {
-                            "path": "docs/cloud-native-platform/process-tracking.md",
-                            "type": "blob",
-                            "sha": "blob-sha-123",
-                        }
-                    ],
-                },
-                url=url,
-            )
-        return await super().get(url, **_kwargs)
+SITEMAP = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking/</loc>
+    <lastmod>2026-05-26T14:51:21Z</lastmod>
+  </url>
+  <url>
+    <loc>https://github-pages.example.test/pages/org/repo/cloud-native-platform/locking/</loc>
+    <lastmod>2026-05-25T00:00:00Z</lastmod>
+  </url>
+  <url>
+    <loc>https://github-pages.example.test/pages/org/repo/general/overview/</loc>
+    <lastmod>2026-05-24T00:00:00Z</lastmod>
+  </url>
+</urlset>"""
+SITE = "https://github-pages.example.test/pages/org/repo/"
+SITEMAP_URL = f"{SITE}sitemap.xml"
 
 
-class MissingTreeRepoApiClient(RepoApiClient):
-    async def get(self, url: str, **_kwargs):
-        if url.endswith("/api/v3/repos/org/repo/git/trees/main?recursive=1"):
-            return RepoApiResponse({}, url=url)
-        return await super().get(url, **_kwargs)
+def sitemap_site(sitemap: str = SITEMAP) -> Site:
+    return Site({SITEMAP_URL: page(sitemap)}, fallback=page(headers=PAGE_HEADERS))
 
 
-class SitemapClient(RecordingAsyncClient):
-    async def get(self, url: str, **_kwargs):
-        self.calls.append(("GET", url))
-        if url.endswith("/sitemap.xml"):
-            return HtmlResponse(
-                """<?xml version="1.0" encoding="UTF-8"?>
-                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-                  <url>
-                    <loc>https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking/</loc>
-                    <lastmod>2026-05-26T14:51:21Z</lastmod>
-                  </url>
-                  <url>
-                    <loc>https://github-pages.example.test/pages/org/repo/cloud-native-platform/locking/</loc>
-                    <lastmod>2026-05-25T00:00:00Z</lastmod>
-                  </url>
-                  <url>
-                    <loc>https://github-pages.example.test/pages/org/repo/general/overview/</loc>
-                    <lastmod>2026-05-24T00:00:00Z</lastmod>
-                  </url>
-                </urlset>""",
-                url=url,
-            )
-        return await super().get(url, **_kwargs)
+SUBTREE_PAT = {"auth_mode": "github_pat", "pat": "github-secret", "sync_mode": "subtree"}
+RUNBOOKS_ROOT = "https://github.example.test/pages/example-org/runbooks/runbooks/Process%20Tracking"
 
 
 def test_github_pages_gene_is_registered_and_schema_is_practical():
@@ -233,20 +134,16 @@ def test_github_pages_gene_is_registered_and_schema_is_practical():
 
 
 @pytest.mark.asyncio
-async def test_single_page_discovery_uses_canonical_url_metadata(monkeypatch):
-    RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RecordingAsyncClient)
-
-    gene = GitHubPagesGene(
-        config={
+async def test_single_page_discovery_uses_canonical_url_metadata():
+    site = published_site()
+    gene = await site.connect(
+        {
             "auth_mode": "none",
             "sync_mode": "single_page",
             "page_url": "https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking/#tracking",
-        },
-        source_id="src-pages",
+        }
     )
 
-    await gene.authenticate()
     items = [item async for item in gene.discover()]
 
     assert len(items) == 1
@@ -256,51 +153,67 @@ async def test_single_page_discovery_uses_canonical_url_metadata(monkeypatch):
     assert item.source_url == "https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking"
     assert item.last_modified == datetime(2026, 5, 26, 14, 51, 21, tzinfo=timezone.utc)
     assert item.extra["content_updated_at"] == "2026-05-26T14:51:21+00:00"
-    assert item.version == "sha256:" + hashlib.sha256(
-        b"<main><h1>Process Tracking</h1><p>Body</p></main>"
-    ).hexdigest()
-    assert RecordingAsyncClient.instances[-1].calls == [
+    assert item.version == "sha256:" + hashlib.sha256(PAGE_HTML.encode()).hexdigest()
+    assert site.requests == [
         ("GET", "https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking")
     ]
 
 
 @pytest.mark.asyncio
-async def test_github_pat_authentication_uses_bearer_header(monkeypatch):
-    RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RecordingAsyncClient)
-
-    gene = GitHubPagesGene(
-        config={
+async def test_github_pat_authentication_uses_bearer_header():
+    site = published_site()
+    await site.connect(
+        {
             "base_url": "https://github-pages.example.test/pages/org/repo/",
             "auth_mode": "github_pat",
             "pat": "github-secret",
             "sync_mode": "single_page",
             "page_url": "https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking/",
-        },
-        source_id="src-pages",
+        }
     )
 
-    await gene.authenticate()
-
-    assert RecordingAsyncClient.instances[-1].kwargs["headers"]["Authorization"] == "Bearer github-secret"
+    assert site.http.options[-1]["headers"]["Authorization"] == "Bearer github-secret"
 
 
 @pytest.mark.asyncio
-async def test_github_pat_discovers_and_fetches_repository_markdown_for_page_url(monkeypatch):
-    RepoApiClient.instances.clear()
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RepoApiClient)
+async def test_the_client_follows_redirects_and_trusts_requests_ca_bundle(tmp_path, monkeypatch):
+    bundle = write_ca_bundle(tmp_path / "corp-ca.pem")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(bundle))
+    site = published_site()
 
-    gene = GitHubPagesGene(
-        config={
+    await site.connect({"auth_mode": "none", "sync_mode": "single_page", "page_url": f"{SITE}page/"})
+
+    options = site.http.options[-1]
+    assert options["follow_redirects"] is True
+    assert isinstance(options["verify"], ssl.SSLContext)
+    assert trusted_ca_count(options["verify"]) == BUNDLE_CA_COUNT
+
+
+@pytest.mark.asyncio
+async def test_a_redirect_to_the_github_login_page_fails_instead_of_syncing_it():
+    login = "https://github-pages.example.test/login"
+    site = Site(
+        {f"{SITE}page": lambda _request: httpx.Response(302, headers={"Location": login})},
+        fallback=page("<form>Sign in</form>"),
+    )
+    gene = await site.connect({"auth_mode": "none", "sync_mode": "single_page", "page_url": f"{SITE}page/"})
+
+    with pytest.raises(RuntimeError, match="returned the login page"):
+        _ = [item async for item in gene.discover()]
+
+
+@pytest.mark.asyncio
+async def test_github_pat_discovers_and_fetches_repository_markdown_for_page_url():
+    site = org_repo_site()
+    gene = await site.connect(
+        {
             "auth_mode": "github_pat",
             "pat": "github-secret",
             "sync_mode": "single_page",
             "page_url": "https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking/",
-        },
-        source_id="src-pages",
+        }
     )
 
-    await gene.authenticate()
     items = [item async for item in gene.discover()]
     raw = await gene.fetch(items[0])
     normalized = await gene.normalize(raw)
@@ -309,7 +222,7 @@ async def test_github_pat_discovers_and_fetches_repository_markdown_for_page_url
         items[0].source_url == "https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking"
     )
     assert items[0].extra["repo_path"] == "docs/cloud-native-platform/process-tracking.md"
-    assert items[0].version == "blob-sha-123"
+    assert items[0].version == git_blob_sha(PROCESS_TRACKING)
     assert raw.content_type == "text/markdown"
     assert "# Process Tracking" in normalized.markdown_body
     assert "Repository Path: docs/cloud-native-platform/process-tracking.md" in normalized.markdown_body
@@ -317,21 +230,17 @@ async def test_github_pat_discovers_and_fetches_repository_markdown_for_page_url
 
 
 @pytest.mark.asyncio
-async def test_github_pat_supports_enterprise_pages_subdomain_isolation(monkeypatch):
-    RepoApiClient.instances.clear()
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RepoApiClient)
-
-    gene = GitHubPagesGene(
-        config={
+async def test_github_pat_supports_enterprise_pages_subdomain_isolation():
+    site = org_repo_site("https://github.example.test")
+    gene = await site.connect(
+        {
             "auth_mode": "github_pat",
             "pat": "github-secret",
             "sync_mode": "single_page",
             "page_url": "https://pages.github.example.test/org/repo/cloud-native-platform/process-tracking/",
-        },
-        source_id="src-pages",
+        }
     )
 
-    await gene.authenticate()
     items = [item async for item in gene.discover()]
     normalized = await gene.normalize(await gene.fetch(items[0]))
 
@@ -355,19 +264,15 @@ async def test_github_pat_supports_enterprise_pages_subdomain_isolation(monkeypa
     ],
 )
 async def test_github_pat_fetch_rejects_missing_or_invalid_content_contract(payload):
-    gene = GitHubPagesGene(
-        config={
+    site = Site(fallback=lambda _request: httpx.Response(200, json=payload))
+    gene = await site.connect(
+        {
             "auth_mode": "github_pat",
             "pat": "github-secret",
             "sync_mode": "single_page",
             "page_url": "https://github-pages.example.test/pages/org/repo/page/",
-        },
-        source_id="src-pages",
+        }
     )
-    response = HtmlResponse("")
-    response.json = lambda: payload
-    gene._client = AsyncMock()
-    gene._client.get.return_value = response
     item = ContentItem(
         item_id="github-pages-page",
         title="Page",
@@ -383,21 +288,17 @@ async def test_github_pat_fetch_rejects_missing_or_invalid_content_contract(payl
 
 
 @pytest.mark.asyncio
-async def test_github_pat_decodes_encoded_page_url_when_matching_repository_markdown(monkeypatch):
-    RunbooksRepoApiClient.instances.clear()
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RunbooksRepoApiClient)
-
-    gene = GitHubPagesGene(
-        config={
+async def test_github_pat_decodes_encoded_page_url_when_matching_repository_markdown():
+    site = runbooks_site()
+    gene = await site.connect(
+        {
             "auth_mode": "github_pat",
             "pat": "github-secret",
             "sync_mode": "single_page",
             "page_url": "https://github.example.test/pages/example-org/runbooks/runbooks/Process%20Tracking/stuck-lock",
-        },
-        source_id="src-pages",
+        }
     )
 
-    await gene.authenticate()
     items = [item async for item in gene.discover()]
     raw = await gene.fetch(items[0])
 
@@ -410,21 +311,10 @@ async def test_github_pat_decodes_encoded_page_url_when_matching_repository_mark
 
 
 @pytest.mark.asyncio
-async def test_github_pat_subtree_discovers_repository_markdown_without_crawling_pages(monkeypatch):
-    RunbooksRepoApiClient.instances.clear()
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RunbooksRepoApiClient)
+async def test_github_pat_subtree_discovers_repository_markdown_without_crawling_pages():
+    site = runbooks_site()
+    gene = await site.connect({**SUBTREE_PAT, "root_url": RUNBOOKS_ROOT})
 
-    gene = GitHubPagesGene(
-        config={
-            "auth_mode": "github_pat",
-            "pat": "github-secret",
-            "sync_mode": "subtree",
-            "root_url": "https://github.example.test/pages/example-org/runbooks/runbooks/Process%20Tracking",
-        },
-        source_id="src-pages",
-    )
-
-    await gene.authenticate()
     items = [item async for item in gene.discover()]
 
     assert [item.extra["repo_path"] for item in items] == [
@@ -432,89 +322,80 @@ async def test_github_pat_subtree_discovers_repository_markdown_without_crawling
         "docs/runbooks/Process Tracking/timed-out-process-instance.md",
     ]
     assert [item.source_url for item in items] == [
-        "https://github.example.test/pages/example-org/runbooks/runbooks/Process%20Tracking/stuck-lock",
-        "https://github.example.test/pages/example-org/runbooks/runbooks/Process%20Tracking/timed-out-process-instance",
+        f"{RUNBOOKS_ROOT}/stuck-lock",
+        f"{RUNBOOKS_ROOT}/timed-out-process-instance",
     ]
-    assert all(item.version.endswith("-sha") for item in items)
-    assert not any("/sitemap.xml" in url for _, url in RunbooksRepoApiClient.instances[-1].calls)
+    assert [item.version for item in items] == [git_blob_sha(RUNBOOKS_FILES[item.extra["repo_path"]]) for item in items]
+    assert not any("/sitemap.xml" in url for _, url in site.requests)
 
 
 @pytest.mark.asyncio
-async def test_github_pat_subtree_preserves_enterprise_pages_subdomain_urls(monkeypatch):
-    RunbooksRepoApiClient.instances.clear()
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RunbooksRepoApiClient)
-
-    gene = GitHubPagesGene(
-        config={
-            "auth_mode": "github_pat",
-            "pat": "github-secret",
-            "sync_mode": "subtree",
-            "root_url": (
-                "https://pages.github.example.test/example-org/runbooks/"
-                "runbooks/Process%20Tracking"
-            ),
-        },
-        source_id="src-pages",
+async def test_github_pat_subtree_preserves_enterprise_pages_subdomain_urls():
+    site = runbooks_site()
+    gene = await site.connect(
+        {**SUBTREE_PAT, "root_url": "https://pages.github.example.test/example-org/runbooks/runbooks/Process%20Tracking"}
     )
 
-    await gene.authenticate()
     items = [item async for item in gene.discover()]
 
     assert [item.source_url for item in items] == [
-        (
-            "https://pages.github.example.test/example-org/runbooks/"
-            "runbooks/Process%20Tracking/stuck-lock"
-        ),
-        (
-            "https://pages.github.example.test/example-org/runbooks/"
-            "runbooks/Process%20Tracking/timed-out-process-instance"
-        ),
+        "https://pages.github.example.test/example-org/runbooks/runbooks/Process%20Tracking/stuck-lock",
+        "https://pages.github.example.test/example-org/runbooks/runbooks/Process%20Tracking/timed-out-process-instance",
     ]
-    assert any(
-        url.startswith("https://github.example.test/api/v3/repos/example-org/runbooks/")
-        for _, url in RunbooksRepoApiClient.instances[-1].calls
-    )
+    assert any(url.startswith(f"{RUNBOOKS_API}/") for _, url in site.requests)
 
 
 @pytest.mark.asyncio
-async def test_github_pat_subtree_fails_closed_when_recursive_tree_is_truncated(monkeypatch):
-    RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr(
-        "memforge.genes.github_pages_gene._RequestsAsyncClient",
-        TruncatedRepoApiClient,
-    )
-    gene = GitHubPagesGene(
-        config={
-            "auth_mode": "github_pat",
-            "pat": "github-secret",
-            "sync_mode": "subtree",
-            "root_url": "https://github-pages.example.test/pages/org/repo/cloud-native-platform/",
-        },
-        source_id="src-pages",
-    )
+async def test_github_pat_subtree_reads_a_truncated_branch_tree_by_its_subtrees():
+    # GitHub truncates the root and every folder down to the runbooks, so the walk descends level by level.
+    site = runbooks_site(truncated={"", "docs", "docs/runbooks"})
+    gene = await site.connect({**SUBTREE_PAT, "root_url": RUNBOOKS_ROOT})
 
-    await gene.authenticate()
-    with pytest.raises(RuntimeError, match="truncated"):
+    items = [item async for item in gene.discover()]
+
+    assert [item.extra["repo_path"] for item in items] == [
+        "docs/runbooks/Process Tracking/stuck-lock.md",
+        "docs/runbooks/Process Tracking/timed-out-process-instance.md",
+    ]
+    assert ("GET", f"{RUNBOOKS_API}/git/trees/{site.github.tree_sha('docs/runbooks')}") in site.requests
+
+
+@pytest.mark.asyncio
+async def test_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pend():
+    files = {**RUNBOOKS_FILES, **{f"vendor-{index:04}/README.md": b"# Vendored\n" for index in range(TREE_REQUEST_BUDGET)}}
+    site = Site(github=FakeGitHub(RUNBOOKS_API, files=files, truncated={""}))
+    gene = await site.connect({**SUBTREE_PAT, "root_url": RUNBOOKS_ROOT})
+
+    with pytest.raises(GitHubTreeBudgetExceeded, match=f"more than {TREE_REQUEST_BUDGET} requests"):
         _ = [item async for item in gene.discover()]
 
+    assert sum("/git/trees/" in url for _, url in site.requests) == TREE_REQUEST_BUDGET
+
 
 @pytest.mark.asyncio
-async def test_github_pat_subtree_rejects_missing_tree_without_completion_evidence(monkeypatch):
-    monkeypatch.setattr(
-        "memforge.genes.github_pages_gene._RequestsAsyncClient",
-        MissingTreeRepoApiClient,
-    )
-    gene = GitHubPagesGene(
-        config={
+async def test_github_pat_reads_a_configured_branch_named_with_a_slash_as_one_path_segment():
+    site = org_repo_site(default_branch="release/2026")
+    gene = await site.connect(
+        {
             "auth_mode": "github_pat",
             "pat": "github-secret",
-            "sync_mode": "subtree",
-            "root_url": "https://github-pages.example.test/pages/org/repo/cloud-native-platform/",
-        },
-        source_id="src-pages",
+            "sync_mode": "single_page",
+            "page_url": "https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking/",
+            "branch": "release/2026",
+        }
     )
 
-    await gene.authenticate()
+    [item] = [item async for item in gene.discover()]
+
+    assert item.extra["repo_branch"] == "release/2026"
+    assert any(url.endswith("/git/trees/release%2F2026?recursive=1") for _, url in site.requests)
+
+
+@pytest.mark.asyncio
+async def test_github_pat_subtree_rejects_missing_tree_without_completion_evidence():
+    site = org_repo_site(answers={"/git/trees/main?recursive=1": {}})
+    gene = await site.connect({**SUBTREE_PAT, "root_url": f"{SITE}cloud-native-platform/"})
+
     with pytest.raises(RuntimeError, match="truncated=false"):
         _ = [item async for item in gene.discover()]
     with pytest.raises(RuntimeError, match="truncated=false"):
@@ -522,34 +403,17 @@ async def test_github_pat_subtree_rejects_missing_tree_without_completion_eviden
 
 
 @pytest.mark.asyncio
-async def test_github_pat_subtree_rejects_duplicate_repository_paths(monkeypatch):
-    class DuplicateTreeClient(RepoApiClient):
-        async def get(self, url: str, **_kwargs):
-            if url.endswith("/api/v3/repos/org/repo/git/trees/main?recursive=1"):
-                return RepoApiResponse(
-                    {
-                        "truncated": False,
-                        "tree": [
-                            {"path": "docs/a.md", "type": "blob", "sha": "sha-a"},
-                            {"path": "docs/a.md", "type": "blob", "sha": "sha-b"},
-                        ],
-                    },
-                    url=url,
-                )
-            return await super().get(url, **_kwargs)
+async def test_github_pat_subtree_rejects_duplicate_repository_paths():
+    duplicate = {
+        "truncated": False,
+        "tree": [
+            {"path": "docs/a.md", "type": "blob", "sha": "sha-a"},
+            {"path": "docs/a.md", "type": "blob", "sha": "sha-b"},
+        ],
+    }
+    site = org_repo_site(answers={"/git/trees/main?recursive=1": duplicate})
+    gene = await site.connect({**SUBTREE_PAT, "root_url": SITE})
 
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", DuplicateTreeClient)
-    gene = GitHubPagesGene(
-        config={
-            "auth_mode": "github_pat",
-            "pat": "github-secret",
-            "sync_mode": "subtree",
-            "root_url": "https://github-pages.example.test/pages/org/repo/",
-        },
-        source_id="src-pages",
-    )
-
-    await gene.authenticate()
     with pytest.raises(RuntimeError, match="duplicate path"):
         _ = [item async for item in gene.discover()]
     with pytest.raises(RuntimeError, match="duplicate path"):
@@ -557,22 +421,10 @@ async def test_github_pat_subtree_rejects_duplicate_repository_paths(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_github_pat_subtree_honors_max_pages(monkeypatch):
-    RunbooksRepoApiClient.instances.clear()
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RunbooksRepoApiClient)
+async def test_github_pat_subtree_honors_max_pages():
+    site = runbooks_site()
+    gene = await site.connect({**SUBTREE_PAT, "root_url": RUNBOOKS_ROOT, "max_pages": 1})
 
-    gene = GitHubPagesGene(
-        config={
-            "auth_mode": "github_pat",
-            "pat": "github-secret",
-            "sync_mode": "subtree",
-            "root_url": "https://github.example.test/pages/example-org/runbooks/runbooks/Process%20Tracking",
-            "max_pages": 1,
-        },
-        source_id="src-pages",
-    )
-
-    await gene.authenticate()
     with pytest.raises(
         SourceConfigurationError,
         match=r"found 2 pages.*Max Pages \(1\).*Increase Max Pages.*narrow",
@@ -596,22 +448,14 @@ async def test_github_pat_authentication_requires_pat():
         await gene.authenticate()
 
 
+SUBTREE_NONE = {"base_url": SITE, "auth_mode": "none", "sync_mode": "subtree"}
+
+
 @pytest.mark.asyncio
-async def test_subtree_discovery_prefers_sitemap_and_filters_to_root(monkeypatch):
-    RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", SitemapClient)
+async def test_subtree_discovery_prefers_sitemap_and_filters_to_root():
+    site = sitemap_site()
+    gene = await site.connect({**SUBTREE_NONE, "root_url": f"{SITE}cloud-native-platform/"})
 
-    gene = GitHubPagesGene(
-        config={
-            "base_url": "https://github-pages.example.test/pages/org/repo/",
-            "auth_mode": "none",
-            "sync_mode": "subtree",
-            "root_url": "https://github-pages.example.test/pages/org/repo/cloud-native-platform/",
-        },
-        source_id="src-pages",
-    )
-
-    await gene.authenticate()
     items = [item async for item in gene.discover()]
 
     assert [item.title for item in items] == ["locking", "process tracking"]
@@ -623,54 +467,80 @@ async def test_subtree_discovery_prefers_sitemap_and_filters_to_root(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_subtree_bfs_never_grants_source_wide_absence_authority(monkeypatch):
-    class BfsClient(RecordingAsyncClient):
-        async def get(self, url: str, **_kwargs):
-            self.calls.append(("GET", url))
-            if url.endswith("/sitemap.xml"):
-                return HtmlResponse("missing", status_code=404, url=url)
-            return HtmlResponse("<main><p>Reachable page</p></main>", url=url)
+async def test_subtree_bfs_never_grants_source_wide_absence_authority():
+    site = Site({SITEMAP_URL: not_found}, fallback=page("<main><p>Reachable page</p></main>"))
+    gene = await site.connect({**SUBTREE_NONE, "root_url": SITE})
 
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", BfsClient)
-    gene = GitHubPagesGene(
-        config={
-            "base_url": "https://github-pages.example.test/pages/org/repo/",
-            "auth_mode": "none",
-            "sync_mode": "subtree",
-            "root_url": "https://github-pages.example.test/pages/org/repo/",
-        },
-        source_id="src-pages",
-    )
-
-    await gene.authenticate()
     items = [item async for item in gene.discover()]
 
     assert len(items) == 1
     assert GitHubPagesGene.lists_scope(gene.config) is False
 
 
-@pytest.mark.asyncio
-async def test_http_fetch_rejects_body_or_final_url_drift_from_discovery(monkeypatch):
-    class DriftingClient(RecordingAsyncClient):
-        fetch_count = 0
+# Latin-1 pages: read as UTF-8, "Caf\u00e9" would become "Caf\ufffd".
+LATIN1_PAGE = (
+    '<html><head><meta charset="iso-8859-1"></head>'
+    f'<body><p>Caf\u00e9</p><a href="{SITE}guide/">Guide</a><a href="{SITE}caf\u00e9/">Caf\u00e9</a></body></html>'
+)
+LATIN1_SITEMAP = (
+    '<?xml version="1.0" encoding="ISO-8859-1"?>'
+    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><!-- Caf\u00e9 -->'
+    f"<url><loc>{SITE}guide/</loc><lastmod>2026-05-25T00:00:00Z</lastmod></url>"
+    f"<url><loc>{SITE}caf\u00e9/</loc></url></urlset>"
+)
 
-        async def get(self, url: str, **_kwargs):
-            self.calls.append(("GET", url))
-            self.fetch_count += 1
-            if self.fetch_count == 1:
-                return HtmlResponse("<main>Revision B</main>", url=url)
-            return HtmlResponse("<main>Revision A</main>", url=url)
 
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", DriftingClient)
-    gene = GitHubPagesGene(
-        config={
-            "auth_mode": "none",
-            "sync_mode": "single_page",
-            "page_url": "https://github-pages.example.test/pages/org/repo/page/",
-        },
-        source_id="src-pages",
+def latin1(text: str, content_type: str) -> Answer:
+    return lambda _request: httpx.Response(200, content=text.encode("latin-1"), headers={"content-type": content_type})
+
+
+def test_links_and_sitemap_locations_are_read_in_the_encoding_the_page_declares():
+    assert github_pages_gene._links_from_html(LATIN1_PAGE.encode("latin-1"), base_url=SITE) == [
+        f"{SITE}guide/",
+        f"{SITE}caf\u00e9/",
+    ]
+    # A charset the response declares comes first.
+    utf8_page = '<html><body><a href="caf\u00e9/">x</a></body></html>'.encode()
+    assert github_pages_gene._links_from_html(utf8_page, base_url=SITE, encoding="utf-8") == [f"{SITE}caf\u00e9/"]
+    assert github_pages_gene._urls_from_sitemap(LATIN1_SITEMAP.encode("latin-1")) == (
+        "urlset",
+        [f"{SITE}guide", f"{SITE}caf\u00e9"],
     )
-    await gene.authenticate()
+
+
+@pytest.mark.asyncio
+async def test_the_link_crawl_reads_a_page_that_is_not_utf8():
+    site = Site(
+        {SITEMAP_URL: not_found, SITE.rstrip("/"): latin1(LATIN1_PAGE, "text/html"), f"{SITE}caf%C3%A9": not_found},
+        fallback=page(),
+    )
+    gene = await site.connect({**SUBTREE_NONE, "root_url": SITE, "max_depth": 1})
+
+    # The café page is gone; what matters is that its link was read by its own name and followed.
+    with pytest.raises(httpx.HTTPStatusError):
+        _ = [item async for item in gene.discover()]
+
+    assert ("GET", f"{SITE}guide") in site.requests
+    assert ("GET", f"{SITE}caf%C3%A9") in site.requests
+
+
+@pytest.mark.asyncio
+async def test_an_authoritative_sitemap_that_is_not_utf8_lists_its_pages():
+    sitemap = LATIN1_SITEMAP.replace(f"<url><loc>{SITE}caf\u00e9/</loc></url>", "")
+    site = Site({SITEMAP_URL: latin1(sitemap, "application/xml")}, fallback=page())
+    gene = await site.connect({**SUBTREE_NONE, "root_url": SITE, "sitemap_authoritative": True})
+
+    items = [item async for item in gene.discover()]
+
+    assert [item.source_url for item in items] == [f"{SITE}guide"]
+    assert items[0].extra["content_updated_at"] == "2026-05-25T00:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_http_fetch_rejects_body_or_final_url_drift_from_discovery():
+    revisions = iter(["<main>Revision B</main>", "<main>Revision A</main>"])
+    site = Site(fallback=lambda _request: httpx.Response(200, text=next(revisions)))
+    gene = await site.connect({"auth_mode": "none", "sync_mode": "single_page", "page_url": f"{SITE}page/"})
     [item] = [item async for item in gene.discover()]
 
     with pytest.raises(RuntimeError, match="changed between discovery and fetch"):
@@ -678,21 +548,12 @@ async def test_http_fetch_rejects_body_or_final_url_drift_from_discovery(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_subtree_sitemap_requires_explicit_authoritative_contract(monkeypatch):
-    RecordingAsyncClient.instances.clear()
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", SitemapClient)
-    gene = GitHubPagesGene(
-        config={
-            "base_url": "https://github-pages.example.test/pages/org/repo/",
-            "auth_mode": "none",
-            "sync_mode": "subtree",
-            "root_url": "https://github-pages.example.test/pages/org/repo/cloud-native-platform/",
-            "sitemap_authoritative": True,
-        },
-        source_id="src-pages",
+async def test_subtree_sitemap_requires_explicit_authoritative_contract():
+    site = sitemap_site()
+    gene = await site.connect(
+        {**SUBTREE_NONE, "root_url": f"{SITE}cloud-native-platform/", "sitemap_authoritative": True}
     )
 
-    await gene.authenticate()
     items = [item async for item in gene.discover()]
 
     assert GitHubPagesGene.lists_scope(gene.config) is True
@@ -702,30 +563,13 @@ async def test_subtree_sitemap_requires_explicit_authoritative_contract(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_subtree_rejects_duplicate_canonical_sitemap_urls(monkeypatch):
-    class DuplicateSitemapClient(SitemapClient):
-        async def get(self, url: str, **_kwargs):
-            if url.endswith("/sitemap.xml"):
-                page = "https://github-pages.example.test/pages/org/repo/cloud-native-platform/locking/"
-                return HtmlResponse(
-                    f"<urlset><url><loc>{page}</loc></url><url><loc>{page}</loc></url></urlset>",
-                    url=url,
-                )
-            return await super().get(url, **_kwargs)
-
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", DuplicateSitemapClient)
-    gene = GitHubPagesGene(
-        config={
-            "base_url": "https://github-pages.example.test/pages/org/repo/",
-            "auth_mode": "none",
-            "sync_mode": "subtree",
-            "root_url": "https://github-pages.example.test/pages/org/repo/cloud-native-platform/",
-            "sitemap_authoritative": True,
-        },
-        source_id="src-pages",
+async def test_subtree_rejects_duplicate_canonical_sitemap_urls():
+    duplicate = f"{SITE}cloud-native-platform/locking/"
+    site = sitemap_site(f"<urlset><url><loc>{duplicate}</loc></url><url><loc>{duplicate}</loc></url></urlset>")
+    gene = await site.connect(
+        {**SUBTREE_NONE, "root_url": f"{SITE}cloud-native-platform/", "sitemap_authoritative": True}
     )
 
-    await gene.authenticate()
     with pytest.raises(RuntimeError, match="duplicate canonical URLs"):
         _ = [item async for item in gene.discover()]
     with pytest.raises(RuntimeError, match="duplicate canonical URLs"):
@@ -733,18 +577,41 @@ async def test_subtree_rejects_duplicate_canonical_sitemap_urls(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_closed_gene_does_not_reconnect_on_its_own():
+    site = published_site()
+    gene = await site.connect({"auth_mode": "none", "sync_mode": "single_page", "page_url": f"{SITE}page/"})
+    await gene.close()
+
+    with site.http.serving(github_pages_gene):
+        health = await gene.health_check()
+        with pytest.raises(RuntimeError, match="call authenticate"):
+            _ = [item async for item in gene.discover()]
+
+    assert health["healthy"] is False
+    assert "call authenticate" in health["error"]
+    assert len(site.http.clients) == 1
+    assert site.requests == []
+
+
+@pytest.mark.asyncio
+async def test_the_health_check_asks_the_site_with_head():
+    site = published_site()
+    gene = await site.connect({"auth_mode": "none", "sync_mode": "single_page", "page_url": f"{SITE}page/"})
+
+    assert await gene.health_check() == {"healthy": True, "status_code": 200}
+    assert site.requests == [("HEAD", SITE.rstrip("/"))]
+
+
+@pytest.mark.asyncio
 async def test_normalize_extracts_main_article_and_removes_page_chrome():
-    gene = GitHubPagesGene(
-        config={
+    gene = await published_site().connect(
+        {
             "base_url": "https://github-pages.example.test/pages/org/repo/",
             "auth_mode": "none",
             "sync_mode": "single_page",
             "page_url": "https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking/",
-        },
-        source_id="src-pages",
+        }
     )
-    await gene.authenticate()
-    gene._client = RecordingAsyncClient()
     item = await gene._content_item_for_url(
         "https://github-pages.example.test/pages/org/repo/cloud-native-platform/process-tracking/",
     )
@@ -855,20 +722,11 @@ async def test_authoritative_empty_repository_backed_page_preserves_repo_identif
 
 
 @pytest.mark.asyncio
-async def test_incremental_github_pat_subtree_lists_every_page_the_branch_holds(monkeypatch):
-    RunbooksRepoApiClient.instances.clear()
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RunbooksRepoApiClient)
-    config = {
-        "auth_mode": "github_pat",
-        "pat": "github-secret",
-        "sync_mode": "subtree",
-        "root_url": "https://github.example.test/pages/example-org/runbooks/runbooks/Process%20Tracking",
-    }
-    full = GitHubPagesGene(config=dict(config), source_id="src-pages")
-    await full.authenticate()
+async def test_incremental_github_pat_subtree_lists_every_page_the_branch_holds():
+    config = {**SUBTREE_PAT, "root_url": RUNBOOKS_ROOT}
+    full = await runbooks_site().connect(dict(config))
     every_page = {item.item_id async for item in full.discover()}
-    gene = GitHubPagesGene(config=dict(config), source_id="src-pages")
-    await gene.authenticate()
+    gene = await runbooks_site().connect(dict(config))
 
     changed = [item async for item in gene.discover(since=datetime(2100, 1, 1, tzinfo=timezone.utc))]
     listing = await gene.list_scope()
@@ -904,48 +762,33 @@ def test_configured_pages_and_a_subtree_read_from_a_complete_inventory_list_thei
     assert GitHubPagesGene.lists_scope(config) is lists
 
 
-SITE = "https://github-pages.example.test/pages/org/repo/"
-
-
-class FailingSitemapClient(RecordingAsyncClient):
-    """Answers the sitemap with ``failure``; any other request is the link crawl, which must never run."""
-
-    failure = "missing"
-
-    async def get(self, url: str, **_kwargs):
-        self.calls.append(("GET", url))
-        if not url.endswith("/sitemap.xml"):
-            raise AssertionError(f"the link crawl read {url}")
-        if self.failure == "missing":
-            return HtmlResponse("missing", status_code=404, url=url)
-        if self.failure == "transport":
-            raise requests.ConnectionError("connection reset")
-        return HtmlResponse(
-            '<?xml version="1.0"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
-            f"<sitemap><loc>{SITE}sitemap-1.xml</loc></sitemap></sitemapindex>",
-            url=url,
+def _failing_sitemap(failure: str) -> Answer:
+    def answer(request: httpx.Request) -> httpx.Response:
+        if failure == "missing":
+            return httpx.Response(404, text="missing")
+        if failure == "transport":
+            raise httpx.ConnectError("connection reset", request=request)
+        return httpx.Response(
+            200,
+            text=(
+                '<?xml version="1.0"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                f"<sitemap><loc>{SITE}sitemap-1.xml</loc></sitemap></sitemapindex>"
+            ),
         )
+
+    return answer
+
+
+def _no_crawl(request: httpx.Request) -> httpx.Response:
+    raise AssertionError(f"the link crawl read {request.url}")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["missing", "transport", "not-a-urlset"])
 @pytest.mark.parametrize("step", ["list_scope", "discover"])
-async def test_an_authoritative_sitemap_that_cannot_be_read_fails_and_never_falls_back_to_the_crawl(
-    monkeypatch, failure, step,
-):
-    client = type("Client", (FailingSitemapClient,), {"failure": failure})
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", client)
-    gene = GitHubPagesGene(
-        config={
-            "base_url": SITE,
-            "auth_mode": "none",
-            "sync_mode": "subtree",
-            "root_url": SITE,
-            "sitemap_authoritative": True,
-        },
-        source_id="src-pages",
-    )
-    await gene.authenticate()
+async def test_an_authoritative_sitemap_that_cannot_be_read_fails_and_never_falls_back_to_the_crawl(failure, step):
+    site = Site({SITEMAP_URL: _failing_sitemap(failure)}, fallback=_no_crawl)
+    gene = await site.connect({**SUBTREE_NONE, "root_url": SITE, "sitemap_authoritative": True})
 
     with pytest.raises(Exception) as raised:
         if step == "list_scope":
@@ -954,17 +797,16 @@ async def test_an_authoritative_sitemap_that_cannot_be_read_fails_and_never_fall
             _ = [item async for item in gene.discover()]
 
     assert not isinstance(raised.value, AssertionError)
-    assert gene._client.calls == [("GET", f"{SITE}sitemap.xml")]
+    # Only the sitemap is read; a refused connection is tried again before the run fails.
+    assert {url for _, url in site.requests} == {SITEMAP_URL}
+    assert len(site.requests) == (4 if failure == "transport" else 1)
 
 
-class ConfiguredPagesClient(RecordingAsyncClient):
+def _configured_pages(request: httpx.Request) -> httpx.Response:
     """Serves every configured page except ``missing``."""
-
-    async def get(self, url: str, **_kwargs):
-        self.calls.append(("GET", url))
-        if url.rstrip("/").endswith("missing"):
-            return HtmlResponse("missing", status_code=404, url=url)
-        return HtmlResponse("<html><body><h1>Page</h1></body></html>", url=url)
+    if str(request.url).rstrip("/").endswith("missing"):
+        return httpx.Response(404, text="missing")
+    return httpx.Response(200, text="<html><body><h1>Page</h1></body></html>")
 
 
 @pytest.mark.asyncio
@@ -976,15 +818,12 @@ class ConfiguredPagesClient(RecordingAsyncClient):
     ],
     ids=["single-page", "explicit-list"],
 )
-async def test_configured_pages_are_an_existence_listing_with_or_without_discovery(monkeypatch, config):
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", ConfiguredPagesClient)
+async def test_configured_pages_are_an_existence_listing_with_or_without_discovery(config):
     config = {"base_url": SITE, "auth_mode": "none", **config}
-    discovered = GitHubPagesGene(config=dict(config), source_id="src-pages")
-    await discovered.authenticate()
+    discovered = await Site(fallback=_configured_pages).connect(dict(config))
     every_page = {item.item_id async for item in discovered.discover()}
     after_discovery = await discovered.list_scope()
-    standalone = GitHubPagesGene(config=dict(config), source_id="src-pages")
-    await standalone.authenticate()
+    standalone = await Site(fallback=_configured_pages).connect(dict(config))
 
     assert after_discovery.kind.value == "existence"
     assert after_discovery.doc_ids == every_page
@@ -992,13 +831,10 @@ async def test_configured_pages_are_an_existence_listing_with_or_without_discove
 
 
 @pytest.mark.asyncio
-async def test_a_configured_page_that_cannot_be_read_fails_the_listing(monkeypatch):
-    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", ConfiguredPagesClient)
-    gene = GitHubPagesGene(
-        config={"base_url": SITE, "auth_mode": "none", "sync_mode": "explicit_list", "pages": [f"{SITE}a/", f"{SITE}missing/"]},
-        source_id="src-pages",
+async def test_a_configured_page_that_cannot_be_read_fails_the_listing():
+    gene = await Site(fallback=_configured_pages).connect(
+        {"base_url": SITE, "auth_mode": "none", "sync_mode": "explicit_list", "pages": [f"{SITE}a/", f"{SITE}missing/"]}
     )
-    await gene.authenticate()
 
-    with pytest.raises(requests.HTTPError):
+    with pytest.raises(httpx.HTTPStatusError):
         await gene.list_scope()
