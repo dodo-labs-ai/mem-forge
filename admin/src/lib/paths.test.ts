@@ -1,5 +1,7 @@
 import { expect, test } from "vitest";
 import {
+  entityPath,
+  entitySearchPath,
   memoryPath,
   newSourcePath,
   projectMemoriesPath,
@@ -30,4 +32,10 @@ test("opens the type picker, a new Source of one type, and a Source's settings a
   expect(newSourcePath("github_pages")).toBe("/sources/new/github_pages");
   expect(sourceSettingsPath("src-wiki")).toBe("/sources/src-wiki/settings");
   expect(sourceSettingsPath("src wiki", "project")).toBe("/sources/src%20wiki/settings?step=project");
+});
+
+test("opens one entity by its id, and the Entities list searched for a name", () => {
+  expect(entityPath(42)).toBe("/entities/42");
+  expect(entitySearchPath("Cut-off")).toBe("/entities?search=Cut-off");
+  expect(entitySearchPath("R&D team")).toBe("/entities?search=R%26D+team");
 });

@@ -68,6 +68,15 @@
   ones included. `GET /api/v1/sources/{id}/agent-evaluation` is deprecated
   and is removed with the V1 admin UI.
 
+- The admin UI V2 has an Entities page under Knowledge (`/entities`): a
+  searchable, paged list of the entities the caller can discover, and a
+  detail page with the entity's aliases and how many memories it is linked
+  to. A workspace admin adds and removes aliases there, and merges the
+  entity into another chosen by name, after a confirmation that shows each
+  entity's current linked memory count; the merge then opens the target.
+  The entity chips on a memory's detail open the Entities list searched for
+  that name.
+
 - A local-agent Jira collection reads each listed issue with a one-issue
   search in the Source's scope, `issuekey = <id> AND (<scope>)`, and, when
   its comments are read apart, confirms its revision with another such

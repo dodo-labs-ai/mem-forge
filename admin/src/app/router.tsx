@@ -16,6 +16,7 @@ const PRODUCT_ROUTES: ProductRoute[] = [
   { segment: "review", load: () => import("@/features/review").then((module) => module.ReviewPage) },
   { segment: "sources", load: () => import("@/features/sources").then((module) => module.SourcesRoutes) },
   { segment: "settings", load: () => import("@/features/settings").then((module) => module.SettingsPage) },
+  { segment: "entities", load: () => import("@/features/entities").then((module) => module.EntitiesRoutes) },
   { segment: "evaluation", load: () => import("@/features/evaluation").then((module) => module.EvaluationPage) },
   { segment: "projects", load: () => import("@/features/projects").then((module) => module.ProjectsRoutes) },
 ];

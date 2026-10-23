@@ -1,4 +1,4 @@
-import { Activity, Brain, Files, KanbanSquare, Settings, ShieldCheck, type LucideIcon } from "lucide-react";
+import { Activity, Brain, Files, KanbanSquare, Settings, ShieldCheck, Tags, type LucideIcon } from "lucide-react";
 import { useOpenReviewCount } from "@/api";
 import type { ReservedRouteSegment } from "./extension/contract";
 
@@ -16,7 +16,13 @@ export interface NavGroup {
 }
 
 export const NAV_GROUPS: NavGroup[] = [
-  { title: "Knowledge", items: [{ segment: "memories", label: "Memories", icon: Brain }] },
+  {
+    title: "Knowledge",
+    items: [
+      { segment: "memories", label: "Memories", icon: Brain },
+      { segment: "entities", label: "Entities", icon: Tags },
+    ],
+  },
   {
     title: "Curate",
     items: [
