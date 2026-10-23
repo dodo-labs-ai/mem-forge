@@ -229,6 +229,8 @@ export interface SourceScopeChangePreview {
     | "returns_to_previous_scope"
     | "refused";
   open_transition: boolean;
+  /** When a change that opens removes what its new scope leaves out: at completion (documents) or by the next sync (conversations). */
+  removes: "at_completion" | "next_sync";
   refusal: { code: string; mode?: string | null; message?: string | null } | null;
 }
 

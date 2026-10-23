@@ -49,6 +49,14 @@ export interface ScopeChangeWarning {
   message: string;
 }
 
+/**
+ * What a conversation source's replacing change removes. Its next sync removes
+ * the deselected conversations, and messages beyond the history it reads cannot
+ * be collected again, so the form never says that nothing is removed.
+ */
+const CONVERSATION_REMOVAL =
+  "The next sync removes the conversations the new selection leaves out; the change completes once every selected conversation is synced.";
+
 /** What the form says before saving, from the server's preview of the change; null when there is nothing to say. */
 export function scopeChangeWarning(preview: SourceScopeChangePreview | undefined): ScopeChangeWarning | null {
   if (!preview) return null;
@@ -81,8 +89,11 @@ export function scopeChangeWarning(preview: SourceScopeChangePreview | undefined
       return {
         tone: "info",
         title: "This replaces the scope change in progress",
-        message:
-          "The source changes from the scope it had before that change to this one. Nothing is removed until every item of the new scope is synced.",
+        message: `The source changes from the scope it had before that change to this one. ${
+          preview.removes === "next_sync"
+            ? CONVERSATION_REMOVAL
+            : "Nothing is removed until every item of the new scope is synced."
+        }`,
       };
     case "restores_previous_scope":
       return {
@@ -94,8 +105,11 @@ export function scopeChangeWarning(preview: SourceScopeChangePreview | undefined
       return {
         tone: "info",
         title: "This replaces the scope change in progress",
-        message:
-          "The source returns to its previous scope. Nothing the previous scope synced is removed. Once a sync lists the previous scope in full, items only the replaced change added are removed.",
+        message: `The source returns to its previous scope. ${
+          preview.removes === "next_sync"
+            ? CONVERSATION_REMOVAL
+            : "Nothing the previous scope synced is removed. Once a sync lists the previous scope in full, items only the replaced change added are removed."
+        }`,
       };
     default:
       return null;
