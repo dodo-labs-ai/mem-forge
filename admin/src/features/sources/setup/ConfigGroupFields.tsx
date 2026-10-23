@@ -46,6 +46,7 @@ export function ConfigGroupFields({ schema, group, state, sourceType, sourceId, 
   const advanced = fields.filter((field) => field.advanced);
   const advancedShown = advancedOpen || advanced.some((field) => issues[field.key]);
   const panels = group.panels.filter((panel) => conditionsHoldFor(schema, panel.visible_when, state));
+  const config = serializeConfig(schema, state.values);
 
   function control(field: ConfigField) {
     return (
@@ -62,6 +63,7 @@ export function ConfigGroupFields({ schema, group, state, sourceType, sourceId, 
         secretConfigured={state.stored?.[`${field.key}_configured`] === true}
         sourceType={sourceType}
         sourceId={sourceId}
+        config={config}
       />
     );
   }
@@ -81,7 +83,7 @@ export function ConfigGroupFields({ schema, group, state, sourceType, sourceId, 
       ) : null}
       {panels.map((panel) => (
         <Suspense key={panel.name} fallback={null}>
-          {configPanel(panel.name, { sourceType, sourceId, config: serializeConfig(schema, state.values) })}
+          {configPanel(panel.name, { sourceType, sourceId, config })}
         </Suspense>
       ))}
     </div>

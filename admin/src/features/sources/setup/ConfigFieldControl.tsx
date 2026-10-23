@@ -5,7 +5,7 @@ import { Input } from "@/ui/input";
 import { Skeleton } from "@/ui/skeleton";
 import { Switch } from "@/ui/switch";
 import { TagInput } from "@/ui/tag-input";
-import type { ConfigField, ConfigOption, FieldValue } from "./model/configForm";
+import type { ConfigField, ConfigOption, FieldValue, ServerConfig } from "./model/configForm";
 import { configWidget, type ConfigControlProps } from "./widgets";
 
 interface ConfigFieldControlProps {
@@ -23,6 +23,8 @@ interface ConfigFieldControlProps {
   secretConfigured?: boolean;
   sourceType: string;
   sourceId?: string;
+  /** The configuration the form would save, which a widget may read. */
+  config: ServerConfig;
   /** Prefix of the ids, so two forms on one page do not share them. */
   idPrefix?: string;
 }
@@ -46,6 +48,7 @@ export function ConfigFieldControl({
   secretConfigured,
   sourceType,
   sourceId,
+  config,
   idPrefix = "config",
 }: ConfigFieldControlProps) {
   const id = `${idPrefix}-${field.key}`;
@@ -68,6 +71,7 @@ export function ConfigFieldControl({
     secretConfigured,
     sourceType,
     sourceId,
+    config,
   };
   const widget = configWidget(field.widget, props);
 

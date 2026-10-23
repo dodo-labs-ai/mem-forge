@@ -3,10 +3,11 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tansta
 import { projectQueryKeys, unwrap, useApi, type components } from "@/api";
 import { localSyncKeys } from "@/features/local-sync";
 import { sourceKeys } from "../api";
+import { useLocalSetupJob } from "../useLocalSetupJob";
+import type { CheckSetupKind } from "./model/checkSetup";
 
 type Schemas = components["schemas"];
 export type ConfigCheck = Schemas["ConfigCheckResponse"];
-export type DiscoveryPreview = Schemas["DiscoveryPreviewResponse"];
 export type CreateSourceBody = Schemas["CreateSourceRequest"];
 export type UpdateSourceBody = Schemas["UpdateSourceRequest"];
 export type ScopeChangePreview = Schemas["SourceScopeChangePreviewResponse"];
@@ -45,17 +46,57 @@ export function useConfigCheck(sourceType: string, sourceId: string | undefined)
   return { result, check };
 }
 
-/** "Check setup": the first items the configuration would sync, read from the provider without saving anything. */
-export function usePreviewDiscovery(sourceType: string, sourceId: string | undefined) {
+/** What "Check setup" found: how many items, and the first few, each with a link when the provider has one. */
+export interface SetupPreview {
+  count: number;
+  truncated: boolean;
+  items: { id: string; title: string; href: string | null }[];
+}
+
+/**
+ * The identity a local folder's preview files its Documents under. An
+ * existing Source has one; a new Source is given one when it is created, so
+ * its preview uses a placeholder, which changes no file it lists.
+ */
+function previewVaultId(stored: Readonly<Record<string, unknown>>): string {
+  return typeof stored.vault_id === "string" && stored.vault_id.trim() ? stored.vault_id.trim() : "preview";
+}
+
+/**
+ * "Check setup": the first items the configuration would sync, read without
+ * saving anything. The server reads the provider through preview-discovery,
+ * with `sourceId` supplying what the form leaves out, such as a kept
+ * secret; a local folder is listed by local sync on the person's computer
+ * (`local_markdown_preview_tree`).
+ */
+export function useCheckSetup(sourceType: string, kind: CheckSetupKind | null, source?: { id: string; config: Readonly<Record<string, unknown>> }) {
   const api = useApi();
+  const previewFolder = useLocalSetupJob("local_markdown_preview_tree");
   return useMutation({
-    mutationFn: (config: Record<string, unknown>) =>
-      unwrap(
+    mutationFn: async (config: Record<string, unknown>): Promise<SetupPreview> => {
+      if (kind === "local_folder") {
+        const result = await previewFolder({
+          sourceId: source?.id,
+          payload: { ...config, vault_id: previewVaultId(source?.config ?? {}), limit: CHECK_SETUP_LIMIT },
+        });
+        return {
+          count: result.counts.included,
+          truncated: result.counts.included > result.items.length,
+          items: result.items.map((item) => ({ id: item.relative_path, title: item.title || item.relative_path, href: null })),
+        };
+      }
+      const preview = await unwrap(
         api.POST("/api/v1/genes/{name}/preview-discovery", {
           params: { path: { name: sourceType } },
-          body: { config, limit: CHECK_SETUP_LIMIT, source_id: sourceId ?? null },
+          body: { config, limit: CHECK_SETUP_LIMIT, source_id: source?.id ?? null },
         }),
-      ),
+      );
+      return {
+        count: preview.count,
+        truncated: preview.truncated,
+        items: preview.items.map((item) => ({ id: item.item_id, title: item.title || item.item_id, href: item.source_url })),
+      };
+    },
   });
 }
 

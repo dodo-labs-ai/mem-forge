@@ -14,7 +14,7 @@ import type { Source } from "../model/types";
 import {
   useConfigCheck,
   useCreateSource,
-  usePreviewDiscovery,
+  useCheckSetup,
   useDebouncedScopeChangePreview,
   useUpdateSource,
   type CreateSourceBody,
@@ -22,7 +22,7 @@ import {
 } from "./api";
 import { CheckSetupPanel } from "./CheckSetupPanel";
 import { ConfigGroupFields } from "./ConfigGroupFields";
-import { offersDiscoveryPreview } from "./model/checkSetup";
+import { checkSetupKind } from "./model/checkSetup";
 import {
   comparisonString,
   defaultValues,
@@ -133,10 +133,11 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
   const [saved, setSaved] = useState(false);
 
   const configCheck = useConfigCheck(gene.name, sourceId);
-  const discovery = usePreviewDiscovery(gene.name, sourceId);
   const createSource = useCreateSource();
   const updateSource = useUpdateSource(sourceId ?? "");
   const state: ConfigFormState = { values, derived: configCheck.result?.derived, stored };
+  const previewKind = checkSetupKind(gene.name, schema, state);
+  const discovery = useCheckSetup(gene.name, previewKind, source);
   const config = serializeConfig(schema, values);
   const steps = setupSteps(schema, { mode: source ? "edit" : "create", sharedWorkspace });
   const currentKey = steps.find((step) => step.key === searchParams.get(SOURCE_SETTINGS_STEP_PARAM))?.key ?? steps[0]!.key;
@@ -371,7 +372,7 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
             onChange={changeField}
             onBlur={leaveField}
             checkSetup={
-              step.key === checkSetupGroup(schema) && offersDiscoveryPreview(gene.name, schema, state) ? (
+              step.key === checkSetupGroup(schema) && previewKind ? (
                 <CheckSetupPanel
                   ready={missing.length === 0}
                   pending={discovery.isPending}

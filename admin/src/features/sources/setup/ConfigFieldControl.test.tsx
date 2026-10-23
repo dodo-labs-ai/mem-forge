@@ -36,6 +36,7 @@ function Controlled({
         onChange(next);
       }}
       sourceType="test"
+      config={{}}
       {...rest}
     />
   );

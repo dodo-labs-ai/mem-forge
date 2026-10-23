@@ -1,4 +1,4 @@
-import type { ConfigField, ConfigOption, FieldValue } from "./model/configForm";
+import type { ConfigField, ConfigOption, FieldValue, ServerConfig } from "./model/configForm";
 import { lazyRegistry, type ComponentLoader } from "./lazyRegistry";
 
 /** What a field's control, plain or interactive, is given. */
@@ -23,9 +23,15 @@ export interface ConfigControlProps {
   /** The Source's type and, on an edit page, its id, for a widget that asks the server. */
   sourceType: string;
   sourceId?: string;
+  /** The configuration the form would save, for a widget that reads other fields, such as the repository URL. */
+  config: ServerConfig;
 }
 
-const LOADERS: Record<string, ComponentLoader<ConfigControlProps>> = {};
+const LOADERS: Record<string, ComponentLoader<ConfigControlProps>> = {
+  github_repo_paths: () => import("./widgets/GitHubRepoPathsPicker"),
+  local_folder: () => import("./widgets/LocalFolderPicker"),
+  teams_conversations: () => import("./widgets/TeamsConversationPicker"),
+};
 
 /**
  * Draws the interactive control a field's `widget` names, such as a repository

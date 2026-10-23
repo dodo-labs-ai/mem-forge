@@ -10,7 +10,10 @@ export interface ConfigPanelProps {
   config: ServerConfig;
 }
 
-const LOADERS: Record<string, ComponentLoader<ConfigPanelProps>> = {};
+const LOADERS: Record<string, ComponentLoader<ConfigPanelProps>> = {
+  jira_session: () => import("./panels/JiraSessionPanel"),
+  teams_session: () => import("./panels/TeamsSessionPanel"),
+};
 
 /** Draws the panel a group's `panels` entry names. A name with no entry draws nothing. */
 export const configPanel = lazyRegistry(LOADERS);
