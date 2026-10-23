@@ -1,11 +1,14 @@
 """A fake Confluence: one page tree in space PAY, a page in space OPS, and the REST API v1 over them.
 
-Space PAY holds root 100 with children 101 and 102; 102 carries the excluded
-label ``draft`` and has a child 103. Discovery of the page tree therefore
-visits 100, 101 and 102 and yields 100 and 101; discovery of the space visits
-every PAY page and yields all but 102. Page 200 is in space OPS, outside both
-scopes, 150 is a blog post in PAY, which no page listing returns, and page 300
-is gone.
+Space PAY holds root 100 with children 101, 102 and 104; 102 carries the
+excluded label ``draft`` and has a child 103. Discovery of the page tree
+therefore visits 100, 101, 102 and 104 and yields 100, 101 and 104; discovery
+of the space visits every PAY page and yields all but 102. Page 104 was edited
+in the cursor's minute. Page 200 is in space OPS, outside both scopes, 150 is
+a blog post in PAY, which no page listing returns, and page 300 is gone.
+
+Each page's ``version.when`` is a full timestamp, as Confluence answers it,
+and discovery compares it with ``since`` itself.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from memforge.genes.confluence_gene import ConfluenceGene
 from memforge.models import ContentItem
 from tests.connector_http_fixture import FakeConnectorHttp
 from tests.contracts.document_fakes import (
+    IN_THE_CURSOR_MINUTE,
     LONG_AGO,
     RECENTLY,
     DocumentConnectorFakes,
@@ -38,6 +42,7 @@ PAGES: dict[str, tuple[str, str | None, tuple[str, ...], datetime]] = {
     "101": ("PAY", "100", (), RECENTLY),
     "102": ("PAY", "100", ("draft",), LONG_AGO),
     "103": ("PAY", "102", (), RECENTLY),
+    "104": ("PAY", "100", (), IN_THE_CURSOR_MINUTE),
     "150": ("PAY", "100", (), RECENTLY),
     "200": ("OPS", None, (), RECENTLY),
 }
@@ -130,8 +135,16 @@ class ConfluenceFakes(DocumentConnectorFakes):
     # 30 s in seconds on 429; an HTTP date 30 s ahead on 503, read to the whole second.
     retry_waits = {429: (30.0, 30.0), 503: (29.0, 30.0)}
     listing_configs = {
-        "page-tree": ListingConfig({**_CONNECTION, "page_tree_root": "100", "include_children": True}, walks_scope=True),
-        "space": ListingConfig({**_CONNECTION, "sync_mode": "space", "spaces": ["PAY"]}, walks_scope=True),
+        "page-tree": ListingConfig(
+            {**_CONNECTION, "page_tree_root": "100", "include_children": True},
+            walks_scope=True,
+            edited_in_the_cursor_minute="confluence-104",
+        ),
+        "space": ListingConfig(
+            {**_CONNECTION, "sync_mode": "space", "spaces": ["PAY"]},
+            walks_scope=True,
+            edited_in_the_cursor_minute="confluence-104",
+        ),
     }
 
     @asynccontextmanager

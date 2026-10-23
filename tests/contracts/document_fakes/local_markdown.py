@@ -1,13 +1,14 @@
 """A local folder collected only on its owner's device; the server never reads it.
 
-Its listing is the snapshot manifest the device submits: here two notes.
+Its listing is the snapshot manifest the device submits: here three notes,
+one edited in the cursor's minute.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 
-from tests.contracts.document_fakes import LONG_AGO, RECENTLY, DocumentConnectorFakes
+from tests.contracts.document_fakes import IN_THE_CURSOR_MINUTE, LONG_AGO, RECENTLY, DocumentConnectorFakes
 
 
 class LocalMarkdownFakes(DocumentConnectorFakes):
@@ -23,7 +24,7 @@ class LocalMarkdownFakes(DocumentConnectorFakes):
                 "last_modified": changed_at.isoformat(),
                 "change_kind": "upsert",
             }
-            for name, changed_at in (("ideas", LONG_AGO), ("plans", RECENTLY))
+            for name, changed_at in (("ideas", LONG_AGO), ("plans", RECENTLY), ("standup", IN_THE_CURSOR_MINUTE))
         ]
 
 

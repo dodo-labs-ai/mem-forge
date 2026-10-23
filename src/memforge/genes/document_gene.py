@@ -67,7 +67,9 @@ Unit, which is kept, even unlisted, until the renamed item commits.
 Implementing a document connector
 ---------------------------------
 
-Besides ``authenticate``, ``discover``, ``fetch`` and ``normalize``:
+Besides ``authenticate``, ``discover``, ``fetch`` and ``normalize``, where
+``discover(since)`` must never hide an item edited in ``since``'s own minute
+(:meth:`DocumentGene.discover` says how):
 
 1. Declare :attr:`~DocumentGene.listing_kinds`.
 2. Answer :meth:`~DocumentGene.lists_scope` for each configuration. Answer
@@ -109,7 +111,8 @@ the items answered ``absent``.
 from __future__ import annotations
 
 from abc import abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
+from datetime import datetime
 from typing import Any, ClassVar
 
 from memforge.genes.base import Gene
@@ -157,6 +160,37 @@ class DocumentGene(Gene):
         """Forget the listing an earlier discovery walk recorded, before a run discovers again."""
 
         self._discovered_scope = None
+
+    @abstractmethod
+    async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
+        """Yield the items in scope that changed since ``since``, or every item when it is ``None``.
+
+        ``since`` is an aware UTC instant: the Source's incremental cursor
+        less a ten-minute overlap for clock skew. Whatever the provider can
+        compare, discovery must yield every item edited after ``since``.
+        Yielding more is safe, because a fetched item whose content did not
+        change is not extracted again; yielding fewer loses that edit for good.
+
+        Compare at the provider's own precision, never finer, and round
+        ``since`` down to it. Most of all, **an item edited in ``since``'s own
+        minute, after its seconds, is yielded.** For example, with ``since``
+        at 09:30:10 UTC an issue edited at 09:30:40 must be yielded:
+
+        - A provider that compares full timestamps, such as a Confluence
+          page's ``version.when``, is compared with ``since`` itself, in UTC.
+        - A provider whose query is minute-granular, such as a Jira JQL date
+          ``updated >= '2026-03-01 09:30'``, gets ``since`` rounded down to
+          the minute, written in the timezone the provider reads it in (Jira:
+          the account's profile timezone, so 01:30 for a profile in Los
+          Angeles).
+        - A connector that walks the whole scope and lets change detection
+          pick, such as a GitHub repository tree, yields every item and
+          meets the rule trivially.
+
+        Checked by ``test_discover_never_hides_an_item_edited_in_the_cursor_minute``
+        and, for a device-collected configuration, by
+        ``test_a_device_manifest_never_hides_an_item_edited_in_the_cursor_minute``.
+        """
 
     @classmethod
     @abstractmethod

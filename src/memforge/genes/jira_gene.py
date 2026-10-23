@@ -11,10 +11,11 @@ import logging
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -84,6 +85,11 @@ JIRA_INVENTORY_MAX_RESULTS = 100
 # every search result, and one small field keeps the response minimal.
 JIRA_IDENTITY_FIELDS = ["updated"]
 _ISSUE_DOC_ID_PREFIX = "jira-"
+JIRA_MYSELF_PATH = "/rest/api/2/myself"
+# The westernmost UTC offset in use. A JQL date literal written at it is read,
+# in any profile timezone, as the intended instant or earlier: up to 26 hours
+# earlier for a profile at UTC+14.
+_WESTERNMOST_ZONE = timezone(timedelta(hours=-12), "UTC-12")
 LOCAL_AGENT_JIRA_PACKAGE_KIND = "jira_document"
 
 JIRA_QUERY_MODE_SIMPLE = "simple"
@@ -104,8 +110,66 @@ _SEARCH_PAGING_ERRORS = PagingErrors(
 )
 
 
-def _delta_clause(since: datetime) -> str:
-    return f"updated >= '{since.strftime('%Y-%m-%d %H:%M')}'"
+def _delta_clause(since: datetime, profile_zone: tzinfo) -> str:
+    """The incremental filter: every issue updated at or after ``since``, and possibly a little earlier.
+
+    Jira reads a JQL date literal as a wall-clock minute in the searching
+    account's profile timezone, so the literal is ``since`` in that timezone,
+    rounded down to the minute::
+
+        _delta_clause(datetime(2026, 3, 1, 9, 30, 40, tzinfo=timezone.utc), ZoneInfo("America/Los_Angeles"))
+        # "updated >= '2026-03-01 01:30'"   (01:30 PST is 09:30 UTC)
+
+    The same instant written in UTC, ``'2026-03-01 09:30'``, would be read
+    as 09:30 PST, eight hours later, and would hide every issue updated in
+    between. A ``since`` without a timezone is read as UTC.
+    """
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    return f"updated >= '{_jql_wall_minute(since, profile_zone):%Y-%m-%d %H:%M}'"
+
+
+def _jql_wall_minute(since: datetime, zone: tzinfo) -> datetime:
+    """The latest wall-clock minute in ``zone`` that Jira reads as ``since`` or earlier, without a timezone.
+
+    The minute is ``since`` converted to ``zone`` and rounded down. Around a
+    daylight-saving change a wall-clock minute may not name exactly one
+    instant, and Jira may read it as a later one than ``since``, which would
+    hide the edits in between. So the minute is kept only when every instant
+    it can name is at or before ``since``, and otherwise steps back an hour:
+
+    - **Ambiguous** (clocks go back): 01:30 on 2026-11-01 in New York is
+      05:30 UTC (EDT) and again 06:30 UTC (EST). For ``since`` 05:30 UTC the
+      minute becomes 00:30 EDT, 04:30 UTC, so one more hour is read again and
+      nothing is hidden whichever reading Jira picks. For ``since`` 06:30 UTC
+      01:30 is kept: both its readings are at or before it.
+    - **Non-existent** (clocks go forward): 02:30 on 2026-03-08 in New York
+      never happens, and Jira may move it forward to 03:30 EDT, 07:30 UTC.
+      Such a minute becomes 01:30 EST, 06:30 UTC. A conversion from UTC never names a
+      non-existent time, so this guards only the rounding.
+
+    One hour crosses the shift of any daylight-saving change, which is an
+    hour or less.
+    """
+    wall = since.astimezone(zone).replace(tzinfo=None, second=0, microsecond=0)
+    return _readable_no_later_than(wall, zone, since)
+
+
+def _readable_no_later_than(wall: datetime, zone: tzinfo, instant: datetime) -> datetime:
+    """``wall``, stepped back an hour at a time until every instant it names in ``zone`` is at or before ``instant``."""
+    while _latest_reading(wall, zone) > instant:
+        wall -= timedelta(hours=1)
+    return wall
+
+
+def _latest_reading(wall: datetime, zone: tzinfo) -> datetime:
+    """The latest instant a wall-clock time names in ``zone``.
+
+    ``fold`` picks the reading: for an ambiguous time ``fold=1`` is the later
+    one, and for a non-existent time ``fold=0`` reads it with the offset in
+    force before the change, which is also the later one (PEP 495).
+    """
+    return max(wall.replace(tzinfo=zone, fold=fold).astimezone(timezone.utc) for fold in (0, 1))
 
 
 def _split_order_by(raw_jql: str) -> tuple[str, str | None]:
@@ -117,17 +181,16 @@ def _split_order_by(raw_jql: str) -> tuple[str, str | None]:
     return query[: match.start()].strip(), query[match.start():].strip()
 
 
-def _augment_advanced_jql(raw_jql: str, since: datetime | None, order_by: str | None = None) -> str:
+def _augment_advanced_jql(raw_jql: str, delta: str | None, order_by: str | None = None) -> str:
     """Use a user-authored JQL as-is, injecting the delta clause before ORDER BY.
 
     The user's query is authoritative: its ORDER BY (or a default) is preserved
-    unless ``order_by`` replaces it, and the incremental ``updated >=`` filter
-    is AND-ed onto the where clause (wrapped in parentheses so a top-level OR
-    keeps its meaning).
+    unless ``order_by`` replaces it, and the incremental ``delta`` clause
+    (:func:`_delta_clause`) is AND-ed onto the where clause (wrapped in
+    parentheses so a top-level OR keeps its meaning).
     """
     where, order = _split_order_by(raw_jql)
-    if since:
-        delta = _delta_clause(since)
+    if delta:
         where = f"({where}) AND {delta}" if where else delta
     return f"{where} {order_by or order or _DEFAULT_ORDER_BY}".strip()
 
@@ -160,19 +223,21 @@ class JiraQueryRejected(SourceConfigurationError):
     """Jira refused the configured JQL (HTTP 400): the query itself is wrong, so retrying cannot help."""
 
 
-def _build_jql(config: dict, since: datetime | None, *, order_by: str | None = None) -> str:
+def _build_jql(config: dict, delta: str | None, *, order_by: str | None = None) -> str:
     """Build the effective JQL for a sync from the source config.
 
     In ``advanced`` query mode the configured ``jql`` is authoritative. In
     ``simple`` mode the query is assembled from projects, issue types, and an
-    optional refine filter. ``order_by`` replaces the query's order.
+    optional refine filter. ``delta``, the incremental filter from
+    :func:`_delta_clause`, narrows either; ``None`` selects the whole scope.
+    ``order_by`` replaces the query's order.
     """
     if str(config.get("query_mode") or JIRA_QUERY_MODE_SIMPLE).strip().lower() == JIRA_QUERY_MODE_ADVANCED:
-        return _augment_advanced_jql(str(config.get("jql") or ""), since, order_by)
+        return _augment_advanced_jql(str(config.get("jql") or ""), delta, order_by)
 
     jql = _scope_where(config)
-    if since:
-        jql += f" AND {_delta_clause(since)}"
+    if delta:
+        jql += f" AND {delta}"
     jql += f" {order_by or _DEFAULT_ORDER_BY}"
     return jql
 
@@ -397,6 +462,9 @@ class JiraGene(DocumentGene):
 
     listing_kinds = frozenset({ScopeListingKind.QUERY})
 
+    _profile_zone: tzinfo | None = None
+    """The timezone this connection's JQL date literals are written in; see :meth:`_jql_profile_zone`."""
+
     @classmethod
     def metadata(cls) -> GeneMetadata:
         return GeneMetadata(
@@ -551,8 +619,18 @@ class JiraGene(DocumentGene):
         self._hydrated_issues: dict[str, dict] = {}
         logger.info("Jira client prepared with %s auth: %s", mode, base_url)
 
+    async def close(self) -> None:
+        """Release the client and forget the profile timezone read through it."""
+        await super().close()
+        self._profile_zone = None
+
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
-        """Discover issues via JQL search."""
+        """Discover issues via JQL search, narrowed to those updated since ``since``.
+
+        An incremental search writes ``since`` in the account's profile
+        timezone, rounded down to the minute (:func:`_delta_clause`), so the
+        first incremental search of a connection also reads ``/myself``.
+        """
         if _read_by_local_agent(self.config):
             async for item in self._discover_local_agent_packages(since):
                 yield item
@@ -715,8 +793,13 @@ class JiraGene(DocumentGene):
         max_results: int,
         cache_hydrated: bool,
     ) -> AsyncIterator[ContentItem]:
+        delta = None
+        if since is not None:
+            profile_zone = await self._jql_profile_zone()
+            delta = _delta_clause(since, profile_zone)
+            logger.info("Jira incremental search of %s in profile timezone %s: %s", self.source_id, profile_zone, delta)
         async for issue in self._search_issues(
-            _build_jql(self.config, since),
+            _build_jql(self.config, delta),
             fields=fields,
             expand=expand,
             max_results=max_results,
@@ -727,6 +810,46 @@ class JiraGene(DocumentGene):
             else:
                 item.extra["attest_materialized_revision"] = True
             yield item
+
+    async def _jql_profile_zone(self) -> tzinfo:
+        """The timezone Jira reads this account's JQL date literals in, read once per connection.
+
+        It is the ``timeZone`` of ``GET /rest/api/2/myself``, such as
+        ``"America/Los_Angeles"``. Only an incremental search needs it, so
+        ``authenticate`` asks nothing, and ``authenticate`` and ``close``
+        forget it.
+
+        A profile without a ``timeZone``, or with one this host does not know,
+        gets UTC-12, logged as a warning: a literal written there is read in
+        any profile timezone as the intended instant or earlier, so the search
+        reads more again and hides nothing. A ``/myself`` that fails raises
+        ``RuntimeError``, as a failed search does, never ``ValueError``,
+        which callers read as a configuration Jira refuses.
+        """
+        if self._profile_zone is None:
+            self._profile_zone = await self._read_profile_zone()
+        return self._profile_zone
+
+    async def _read_profile_zone(self) -> tzinfo:
+        try:
+            profile = (await self._request("GET", JIRA_MYSELF_PATH)).json()
+        except Exception as exc:
+            raise RuntimeError(f"Jira could not read the account's profile timezone from /myself: {exc}") from exc
+        if not isinstance(profile, dict):
+            raise RuntimeError("Jira /myself did not answer with the account's profile")
+        name = profile.get("timeZone")
+        if isinstance(name, str) and name.strip():
+            try:
+                return ZoneInfo(name.strip())
+            except (ZoneInfoNotFoundError, ValueError):
+                pass
+        logger.warning(
+            "Jira profile timezone %r of %s is missing or unknown; incremental searches are written at UTC-12, "
+            "which reads up to a day more again",
+            name,
+            self.source_id,
+        )
+        return _WESTERNMOST_ZONE
 
     async def _search_issues(
         self,

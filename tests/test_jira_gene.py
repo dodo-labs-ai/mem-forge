@@ -115,7 +115,7 @@ def _recording_http() -> tuple[list[str], FakeConnectorHttp]:
 
 
 class RecordingAsyncClient(AnsweringClient):
-    """A Jira answering searches with no issues and each issue read with that issue; it records every call."""
+    """A Jira in UTC answering searches with no issues and each issue read with that issue; it records every call."""
 
     def __init__(self, base_url: str = "https://jira.example.test") -> None:
         super().__init__(base_url=base_url)
@@ -123,6 +123,8 @@ class RecordingAsyncClient(AnsweringClient):
 
     async def answer(self, method: str, url: str, **kwargs):
         self.calls.append((method, url, kwargs))
+        if url.endswith("/myself"):
+            return JsonResponse({"name": "me", "timeZone": "UTC"})
         if url.endswith("/comment"):
             return JsonResponse({"startAt": 0, "comments": [], "total": 0})
         if "/issue/" in url:
@@ -435,8 +437,8 @@ async def test_discover_uses_configured_project_filter_and_issue_types():
     ]
 
     assert items == []
-    assert client.calls[0][1] == "/rest/api/2/search"
-    jql = client.calls[0][2]["json"]["jql"]
+    assert [call[1] for call in client.calls] == ["/rest/api/2/myself", "/rest/api/2/search"]
+    jql = client.calls[1][2]["json"]["jql"]
     assert "project in (PAY)" in jql
     assert "issuetype in (Story,Bug)" in jql
     assert '("Agile Team" = "ExampleTeam-DeliveryBoard")' in jql
