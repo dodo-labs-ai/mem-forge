@@ -180,7 +180,7 @@ async def test_cloud_pull_syncs_the_file_without_a_time_when_github_refuses_the_
 
 
 @pytest.mark.asyncio
-async def test_a_permission_refusal_of_the_tree_fails_discovery_as_before_without_retrying():
+async def test_a_permission_refusal_of_the_tree_fails_discovery_without_retrying():
     refused = httpx.Response(403, json={"message": "Resource not accessible by integration"})
     github = FakeGitHub(API, files=FILES, answers={"/git/trees/tree-main?recursive=1": refused})
     gene = await _connected(github, dict(CLOUD_PULL))
@@ -354,8 +354,8 @@ async def test_cloud_pull_stops_reading_a_truncated_tree_once_it_selects_more_th
     with pytest.raises(RuntimeError) as raised:
         await gene.list_scope()
 
-    # The message both admin UIs parse; reading stopped at the folder that passed the limit.
-    assert re.fullmatch(r"GitHub Repository discovery matched 4 files, exceeding max_files=3", str(raised.value))
+    # The message both admin UIs parse; reading stopped at the folder that passed the limit, so 4 is a lower bound.
+    assert re.fullmatch(r"GitHub Repository discovery matched at least 4 files, exceeding max_files=3", str(raised.value))
     assert not any(github.tree_sha("area-2") in request for request in github.requests)
 
 

@@ -378,8 +378,9 @@ class GitHubRepoGene(DocumentGene):
         try:
             entries = await github.tree(commit.tree_sha, selects=selects, max_selected=max_files)
         except GitHubTreeSelectionExceeded as exc:
+            count = str(exc.selected) if exc.exact else f"at least {exc.selected}"
             raise RuntimeError(
-                f"GitHub Repository discovery matched {exc.selected} files, exceeding max_files={max_files}"
+                f"GitHub Repository discovery matched {count} files, exceeding max_files={max_files}"
             ) from exc
         return _ScopeTree(
             repo_ref=repo_ref,

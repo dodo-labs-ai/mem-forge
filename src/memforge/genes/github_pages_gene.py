@@ -82,6 +82,8 @@ class GitHubPagesGene(DocumentGene):
     listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
     # Opened by ``authenticate``; reads the published site and, with a token, its repository.
     _client: ConnectorHttpClient | None = None
+    # Each repository's branch and tree, by API URL, read once per connection.
+    _branch_trees: dict[str, tuple[str, list[dict]]]
 
     @classmethod
     def metadata(cls) -> GeneMetadata:
@@ -247,9 +249,27 @@ class GitHubPagesGene(DocumentGene):
             raise RuntimeError("GitHub Pages is not connected: call authenticate() first")
         return self._client
 
+    async def close(self) -> None:
+        """Release the client and forget the branch trees read through it, so the next run reads them afresh."""
+        await super().close()
+        self._branch_trees = {}
+
     def _github(self, ref: _RepoRef) -> GitHubApi:
         """The REST API of the repository a Pages URL is published from."""
         return GitHubApi(self._connected_client(), ref.repository, label="GitHub Pages repository")
+
+    async def _branch_tree(self, ref: _RepoRef) -> tuple[str, list[dict]]:
+        """The configured branch, else the default one, of the repository a Pages URL is published from, and its tree.
+
+        Each repository's tree is read once per connection, however many
+        configured pages it publishes; ``authenticate`` and ``close`` forget it.
+        """
+        github = self._github(ref)
+        api_url = ref.repository.api_url
+        if api_url not in self._branch_trees:
+            branch = str(self.config.get("branch") or "").strip() or await github.default_branch()
+            self._branch_trees[api_url] = (branch, await github.tree(branch))
+        return self._branch_trees[api_url]
 
     @classmethod
     def lists_scope(cls, config: Mapping[str, Any]) -> bool:
@@ -540,11 +560,7 @@ class GitHubPagesGene(DocumentGene):
         ref = _repo_ref_from_pages_url(canonical_url)
         if ref is None:
             raise ValueError(_repository_backed_pages_url_error())
-        branch = str(self.config.get("branch") or "").strip()
-        github = self._github(ref)
-        if not branch:
-            branch = await github.default_branch()
-        tree = await github.tree(branch)
+        branch, tree = await self._branch_tree(ref)
         repo_path, blob_sha = _resolve_repo_markdown_path(ref.page_path, tree)
         if not repo_path:
             raise RuntimeError(
@@ -564,11 +580,7 @@ class GitHubPagesGene(DocumentGene):
         ref = _repo_ref_from_pages_url(root_url)
         if ref is None:
             raise ValueError(_repository_backed_pages_url_error())
-        branch = str(self.config.get("branch") or "").strip()
-        github = self._github(ref)
-        if not branch:
-            branch = await github.default_branch()
-        tree = await github.tree(branch)
+        branch, tree = await self._branch_tree(ref)
         entries = _repo_markdown_entries_under_page_path(ref.page_path, tree)
 
         page_urls: list[str] = []

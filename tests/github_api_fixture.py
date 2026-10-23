@@ -1,7 +1,8 @@
 """A fake GitHub REST API for one repository, answered through ``httpx.MockTransport``.
 
-Describe the repository by its files; the fake serves what a GitHub
-connector reads, with real Git blob shas so blob reads verify::
+Describe the repository by its files, and any symbolic links and submodules
+(``submodules`` maps a path to the commit it pins); the fake serves what a
+GitHub connector reads, with real Git blob shas so blob reads verify::
 
     github = FakeGitHub(
         "https://github.example.test/api/v3/repos/payroll/architecture",
@@ -60,6 +61,7 @@ class FakeGitHub:
         *,
         files: Mapping[str, bytes],
         symlinks: Iterable[str] = (),
+        submodules: Mapping[str, str] | None = None,
         default_branch: str = "main",
         truncated: Iterable[str] = (),
         commit_times: Mapping[str, str] | None = None,
@@ -68,6 +70,7 @@ class FakeGitHub:
         self.api_url = api_url.rstrip("/")
         self.files = dict(files)
         self.symlinks = set(symlinks)
+        self.submodules = dict(submodules or {})
         self.default_branch = default_branch
         self.truncated = set(truncated)
         self.commit_times = dict(commit_times or {})
@@ -90,7 +93,7 @@ class FakeGitHub:
 
     def _list_folders(self) -> list[str]:
         found = {""}
-        for path in self.files:
+        for path in [*self.files, *self.submodules]:
             parts = path.split("/")[:-1]
             found.update("/".join(parts[:index]) for index in range(1, len(parts) + 1))
         return sorted(found)
@@ -102,6 +105,9 @@ class FakeGitHub:
         for child in self._folders:
             if child and child.startswith(prefix) and "/" not in child[len(prefix):]:
                 entries.append({"path": child[len(prefix):], "type": "tree", "sha": self.tree_sha(child), "mode": "040000"})
+        for path, commit_sha in sorted(self.submodules.items()):
+            if path.startswith(prefix) and "/" not in path[len(prefix):]:
+                entries.append({"path": path[len(prefix):], "type": "commit", "sha": commit_sha, "mode": "160000"})
         for path, body in sorted(self.files.items()):
             if path.startswith(prefix) and "/" not in path[len(prefix):]:
                 entries.append({
