@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertCircle, Check, CircleStop, Clock, Loader2, RotateCw } from "lucide-react";
+import { AlertCircle, Check, CircleStop, Clock, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { SourceSyncActivity } from "@/views/sources/sourceSyncActivity";
 import {
@@ -8,7 +8,8 @@ import {
   sourceSyncCanStop,
 } from "@/views/sources/sourceSyncActivity";
 
-// The card's actions read as small buttons: a tinted background on hover, no underline.
+// The card's Stop action reads as a small button: a tinted background on hover, no underline.
+// Retrying is the row's primary button, so the card offers no second retry.
 const INLINE_ACTION_CLASS =
   "flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 transition-colors hover:bg-background/70 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
 
@@ -16,14 +17,12 @@ export function SourceSyncStatusCard({
   activity,
   sourceName,
   itemLabel,
-  onRetry,
   onStop,
   onConfigureScope,
 }: {
   activity: SourceSyncActivity | undefined;
   sourceName: string;
   itemLabel: string;
-  onRetry?: () => void;
   /** Stops the sync in progress; offered while it can be stopped. */
   onStop?: () => void;
   onConfigureScope?: () => void;
@@ -80,12 +79,6 @@ export function SourceSyncStatusCard({
           >
             <CircleStop className="size-3.5" />
             Stop sync
-          </button>
-        )}
-        {(failed || (queued && activity.retryTarget)) && onRetry && (
-          <button type="button" onClick={onRetry} className={cn(INLINE_ACTION_CLASS, "ml-auto")} aria-label={queued ? "Retry now" : "Retry sync"}>
-            <RotateCw className="size-3.5" />
-            {queued && "Retry now"}
           </button>
         )}
       </div>
