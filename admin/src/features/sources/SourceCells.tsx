@@ -1,6 +1,7 @@
-import { Clock, Lock, Users } from "lucide-react";
+import { Clock } from "lucide-react";
 import { formatCount, formatInterval, formatRelative, formatUntil, pluralize } from "@/lib/format";
 import { StatusBadge } from "@/patterns";
+import { SourceAccessLabel } from "./SourceAccess";
 import { retryingAfterUpgradeTitle } from "./model/sourceFailedItems";
 import { presentSourceSyncActivity, sourceSyncActivityIsVisible } from "./model/sourceSyncActivity";
 import type { SourceRow } from "./model/sourceRows";
@@ -38,14 +39,7 @@ export function RunsCell({ row }: { row: SourceRow }) {
 }
 
 export function AccessCell({ row }: { row: SourceRow }) {
-  const personal = row.source.access_policy === "private";
-  const Icon = personal ? Lock : Users;
-  return (
-    <span className="inline-flex items-center gap-1.5 text-sm text-subtle-foreground">
-      <Icon aria-hidden className="size-3.5 text-muted-foreground" />
-      {personal ? "Only me" : "Workspace"}
-    </span>
-  );
+  return <SourceAccessLabel source={row.source} />;
 }
 
 export function MemoriesCell({ row }: { row: SourceRow }) {

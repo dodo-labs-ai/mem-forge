@@ -9,6 +9,7 @@ import { Notice, PropertyList, StepRail, useUnsavedChangesGuard, type Property, 
 import { Button } from "@/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/ui/dialog";
 import { sourceProjectBinding } from "../model/projectBinding";
+import { ACCESS_CHOICES, type AccessPolicy } from "../model/sourceAccess";
 import { scopeChangeErrorMessage } from "../model/sourceScopeTransition";
 import type { Source } from "../model/types";
 import {
@@ -41,9 +42,7 @@ import {
   fixedProjectBinding,
   initialSchedule,
   PERSONAL_ACCESS_POLICY,
-  ACCESS_CHOICES,
   scheduleSummary,
-  type AccessPolicy,
   type SyncSchedule,
 } from "./model/productSteps";
 import { activeSyncRunOf, runningSyncOfRefusedSave } from "./model/runningSyncSave";

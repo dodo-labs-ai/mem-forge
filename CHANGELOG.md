@@ -48,6 +48,14 @@
   local sync finds. Sign in renews a Teams or Jira browser session in place
   and opens the connection step for a token, so V2 no longer links to V1.
 
+- The admin UI V2 changes who can use a Source in a shared workspace. The
+  row and drawer menus offer "Change who can use this source" to someone
+  who manages it; the change runs through
+  `POST /api/v1/sources/{id}/access-transitions`, and the row and drawer
+  follow it while it runs, with how many memories are updated. A failed
+  change shows its reason, and its owner can retry it or revert it to the
+  previous policy.
+
 - A local-agent Jira collection reads each listed issue with a one-issue
   search in the Source's scope, `issuekey = <id> AND (<scope>)`, and, when
   its comments are read apart, confirms its revision with another such

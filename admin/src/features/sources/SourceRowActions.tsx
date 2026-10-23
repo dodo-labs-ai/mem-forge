@@ -1,5 +1,6 @@
 import { MoreHorizontal } from "lucide-react";
 import { useNavigate } from "react-router-dom";
+import { useSharedWorkspace } from "@/api";
 import { sourceEvaluationPath, sourceSettingsPath } from "@/lib/paths";
 import { Button } from "@/ui/button";
 import {
@@ -11,6 +12,7 @@ import {
   DropdownMenuTrigger,
 } from "@/ui/dropdown-menu";
 import { canDeleteSourceType, canConfigureSourceType } from "./model/managedSources";
+import { canChangeSourceAccess } from "./model/sourceAccess";
 import type { SourceRow } from "./model/sourceRows";
 import type { Source } from "./model/types";
 import type { SourceActions } from "./useSourceActions";
@@ -21,11 +23,13 @@ interface SourceRowActionsProps {
   onViewDetails: (source: Source) => void;
   onDelete: (source: Source) => void;
   onReRead: (source: Source) => void;
+  onChangeAccess: (source: Source) => void;
 }
 
 /** One primary button (the fix when the source needs the user) and a menu of the rest. */
-export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRead }: SourceRowActionsProps) {
+export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRead, onChangeAccess }: SourceRowActionsProps) {
   const navigate = useNavigate();
+  const sharedWorkspace = useSharedWorkspace();
   const { source, attention, activity } = row;
   const capabilities = source.capabilities;
   const sync = actions.syncControl(source, activity);
@@ -103,8 +107,11 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRe
             <>
               <DropdownMenuItem
                 className="items-start"
-                // Pausing stops a sync, so it stays available during one; resuming waits for the sync to end.
-                disabled={!capabilities?.can_configure || (source.status === "paused" && syncIsLive)}
+                // Pausing stops a sync, so it stays available during one; resuming waits for a sync or an access change to end.
+                disabled={
+                  !capabilities?.can_configure ||
+                  (source.status === "paused" && (syncIsLive || source.access_state === "changing"))
+                }
                 onClick={() => actions.togglePaused(source)}
               >
                 {source.status === "paused" ? (
@@ -122,6 +129,9 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRe
                 Configure
               </DropdownMenuItem>
             </>
+          ) : null}
+          {canChangeSourceAccess(source, sharedWorkspace) ? (
+            <DropdownMenuItem onClick={() => onChangeAccess(source)}>Change who can use this source</DropdownMenuItem>
           ) : null}
           {canDeleteSourceType(source.type) ? (
             <>
