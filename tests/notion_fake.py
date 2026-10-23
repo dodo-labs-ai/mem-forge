@@ -25,6 +25,14 @@ archived and trashed pages, queued failures (:meth:`fail`), and cursors
 that stop working (``cursors_expire``). Ids are 32-hex internally and
 written with dashes in answers, as Notion writes them. ``requests`` records
 every request.
+
+For fetch it also answers the Markdown endpoint (:meth:`set_markdown`, for a
+page or a block read again), full property values (:meth:`set_property_items`)
+and Notion's file host (:meth:`add_file`), which serves a file only to its
+current signature and refuses any ``Authorization`` header::
+
+    url = fake.add_file("diagram.png", b"PNG…")
+    fake.set_markdown(root, f"![Diagram]({url})")
 """
 
 from __future__ import annotations
@@ -34,11 +42,14 @@ import uuid
 from collections import defaultdict
 from datetime import datetime
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 
 TOKEN = "notion-test-token"
 DEFAULT_TIME = "2026-03-01T09:00:00.000Z"
+FILE_HOST = "prod-files-secure.s3.us-west-2.amazonaws.com"
+SPACE_ID = "4c1e2f3a-5b6c-4d7e-8f90-a1b2c3d4e5f6"
 
 
 def dashed(id32: str) -> str:
@@ -64,6 +75,10 @@ class NotionFake:
         self.result_cap = 10_000
         self.incomplete_reason: str | None = None
         self.cursors_expire = False
+        self.markdown: dict[str, dict[str, Any]] = {}
+        self.property_items: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self.files: dict[str, tuple[bytes, str]] = {}
+        self.signatures: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Building the workspace
@@ -107,10 +122,12 @@ class NotionFake:
         synced_from: str | None = None,
         block_id: str | None = None,
         has_children: bool | None = None,
+        content: dict[str, Any] | None = None,
     ) -> str:
-        """A block appended to page or block ``parent``. ``has_children`` follows its children unless given."""
+        """A block appended to page or block ``parent``. ``has_children`` follows its children unless given;
+        ``content`` is the block's own object, such as ``{"url": …}`` for a bookmark."""
         block_id = block_id or new_id()
-        body: dict[str, Any] = {}
+        body: dict[str, Any] = dict(content or {})
         if block_type == "synced_block":
             body = {"synced_from": {"type": "block_id", "block_id": dashed(synced_from)} if synced_from else None}
         self.blocks[block_id] = {
@@ -250,6 +267,46 @@ class NotionFake:
             "parent": {"type": "database_id", "database_id": dashed(database_id)},
         }
 
+    def set_markdown(
+        self,
+        block_id: str,
+        markdown: str,
+        *,
+        truncated: bool = False,
+        unknown_block_ids: list[str] | None = None,
+    ) -> None:
+        """What the Markdown endpoint answers for page ``block_id``, or for block ``block_id`` read again.
+
+        A page without one answers an empty body; any other id answers 404.
+        """
+        self.markdown[block_id] = {
+            "object": "page_markdown",
+            "id": dashed(block_id),
+            "markdown": markdown,
+            "truncated": truncated,
+            "unknown_block_ids": [dashed(unknown) for unknown in unknown_block_ids or []],
+        }
+
+    def set_property_items(self, page_id: str, property_id: str, items: list[dict[str, Any]]) -> None:
+        """The full items of one page property, as ``GET /v1/pages/{id}/properties/{property id}`` lists them."""
+        self.property_items[(page_id, unquote(property_id))] = [{"object": "property_item", **item} for item in items]
+
+    def add_file(self, filename: str, content: bytes, *, content_type: str = "image/png") -> str:
+        """A file on Notion's file host; returns a freshly signed URL, as each read of a page gives one."""
+        path = f"/{SPACE_ID}/{dashed(new_id())}/{filename}"
+        self.files[path] = (content, content_type)
+        return self.sign(path)
+
+    def sign(self, path: str) -> str:
+        """A new signed URL for file ``path``; earlier signatures stop working."""
+        signature = new_id()
+        self.signatures[path] = signature
+        return (
+            f"https://{FILE_HOST}{path}?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+            f"&X-Amz-Credential=ASIA%2F20260301%2Fus-west-2%2Fs3%2Faws4_request&X-Amz-Expires=3600"
+            f"&X-Amz-Signature={signature}&X-Amz-SignedHeaders=host&x-id=GetObject"
+        )
+
     def fail(
         self,
         method: str,
@@ -284,6 +341,8 @@ class NotionFake:
         queued = self.failures.get((request.method, path))
         if queued:
             return queued.pop(0)
+        if request.url.host == FILE_HOST:
+            return self._file(request)
         if request.headers.get("Authorization") != f"Bearer {TOKEN}":
             return httpx.Response(401, json={"object": "error", "code": "unauthorized"})
         parts = path.strip("/").split("/")
@@ -300,6 +359,10 @@ class NotionFake:
                     },
                 )
             return self._object(self.pages.get(notion_id32(parts[2])))
+        if request.method == "GET" and len(parts) == 4 and parts[1] == "pages" and parts[3] == "markdown":
+            return self._markdown(notion_id32(parts[2]))
+        if request.method == "GET" and len(parts) == 5 and parts[1] == "pages" and parts[3] == "properties":
+            return self._property_items(notion_id32(parts[2]), parts[4], request)
         if request.method == "GET" and len(parts) == 3 and parts[1] == "blocks":
             return self._object(self._block(notion_id32(parts[2])))
         if request.method == "GET" and len(parts) == 4 and parts[1] == "blocks" and parts[3] == "children":
@@ -311,6 +374,45 @@ class NotionFake:
         if request.method == "POST" and len(parts) == 4 and parts[1] == "data_sources" and parts[3] == "query":
             return self._query(notion_id32(parts[2]), json.loads(request.content or b"{}"))
         return httpx.Response(400, json={"object": "error", "code": "invalid_request_url"})
+
+    def _markdown(self, block_id: str) -> httpx.Response:
+        if block_id in self.markdown:
+            return httpx.Response(200, json=self.markdown[block_id])
+        if block_id in self.databases:
+            return httpx.Response(400, json={"object": "error", "code": "validation_error"})
+        if block_id in self.pages:
+            return httpx.Response(
+                200,
+                json={"object": "page_markdown", "id": dashed(block_id), "markdown": "", "truncated": False, "unknown_block_ids": []},
+            )
+        return httpx.Response(404, json={"object": "error", "code": "object_not_found"})
+
+    def _property_items(self, page_id: str, property_id: str, request: httpx.Request) -> httpx.Response:
+        items = self.property_items.get((page_id, unquote(property_id)))
+        if items is None:
+            return httpx.Response(404, json={"object": "error", "code": "object_not_found"})
+        start = int(request.url.params.get("start_cursor", "0"))
+        size = int(request.url.params.get("page_size", "100"))
+        more = start + size < len(items)
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "results": items[start : start + size],
+                "has_more": more,
+                "next_cursor": str(start + size) if more else None,
+                "type": "property_item",
+            },
+        )
+
+    def _file(self, request: httpx.Request) -> httpx.Response:
+        if "Authorization" in request.headers:
+            return httpx.Response(400, text="<Error><Code>InvalidArgument</Code></Error>")
+        path = request.url.path
+        if path not in self.files or request.url.params.get("X-Amz-Signature") != self.signatures.get(path):
+            return httpx.Response(403, text="<Error><Code>SignatureDoesNotMatch</Code></Error>")
+        content, content_type = self.files[path]
+        return httpx.Response(200, content=content, headers={"content-type": content_type})
 
     @staticmethod
     def _object(record: dict[str, Any] | None) -> httpx.Response:
