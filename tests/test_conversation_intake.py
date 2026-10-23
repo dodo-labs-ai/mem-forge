@@ -269,7 +269,7 @@ async def test_a_poll_stopped_early_must_be_complete_from_inside_its_interval(da
     late = backfill.end if complete_from == "at_end" else backfill.end + timedelta(hours=1)
     payload, _ = _polled(regular, backfill, outcome=PollOutcome.STOPPED_EARLY, complete_from=late, returned=True)
 
-    with pytest.raises(CollectionRejected, match="that stopped early is complete from at or after its requested end; upgrade"):
+    with pytest.raises(CollectionRejected, match="is complete from at or after its requested end; upgrade"):
         await _receive(database, payload)
 
 
