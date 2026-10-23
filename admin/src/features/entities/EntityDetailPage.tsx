@@ -26,8 +26,8 @@ function parseEntityId(raw: string): number | null {
 
 interface AliasesProps {
   entity: EntityDetail;
-  /** Receives a failed alias change; null hides the add and remove controls. */
-  curation: { onError: (error: unknown) => void } | null;
+  /** Told when an alias change starts and when one fails; null hides the add and remove controls. */
+  curation: { onStart: () => void; onError: (error: unknown) => void } | null;
 }
 
 interface AliasRowProps {
@@ -69,11 +69,15 @@ function Aliases({ entity, curation }: AliasesProps) {
   function add(event: FormEvent) {
     event.preventDefault();
     if (!alias || !curation) return;
+    curation.onStart();
     addAlias.mutate(alias, { onSuccess: () => setDraft(""), onError: curation.onError });
   }
 
   const remove = curation
-    ? (name: string) => removeAlias.mutate(name, { onError: curation.onError })
+    ? (name: string) => {
+        curation.onStart();
+        removeAlias.mutate(name, { onError: curation.onError });
+      }
     : null;
 
   return (
@@ -130,6 +134,9 @@ function EntityDetailView({ entity, onRefetch }: EntityDetailViewProps) {
   const [changeError, setChangeError] = useState<string | null>(null);
   const canonical = canonicalNameHint(entity);
 
+  // A notice describes the last change only, so a new alias change or merge clears it.
+  const clearChangeError = () => setChangeError(null);
+
   function onChangeError(error: unknown) {
     setChangeError(errorMessage(error));
     // A refusal for curation means the role changed elsewhere; the detail then hides the controls.
@@ -150,7 +157,13 @@ function EntityDetailView({ entity, onRefetch }: EntityDetailViewProps) {
           ) : null}
         </div>
         {entity.can_curate ? (
-          <Button variant="outline" onClick={() => setMerging(true)}>
+          <Button
+            variant="outline"
+            onClick={() => {
+              clearChangeError();
+              setMerging(true);
+            }}
+          >
             <GitMerge />
             Merge into…
           </Button>
@@ -172,7 +185,10 @@ function EntityDetailView({ entity, onRefetch }: EntityDetailViewProps) {
         />
       </div>
 
-      <Aliases entity={entity} curation={entity.can_curate ? { onError: onChangeError } : null} />
+      <Aliases
+        entity={entity}
+        curation={entity.can_curate ? { onStart: clearChangeError, onError: onChangeError } : null}
+      />
 
       {entity.can_curate ? (
         <MergeEntityDialog entity={entity} open={merging} onOpenChange={setMerging} onForbidden={onChangeError} />
