@@ -39,8 +39,9 @@ function PluginSetupDialog({
         <DialogHeader>
           <DialogTitle>Set up {setup.name}</DialogTitle>
           <DialogDescription>
-            The MemForge plugin runs on your computer, records each coding session and sends it to MemForge when the
-            session ends. Its source appears on the Sources page after the first upload; nothing else is set up here.
+            The MemForge plugin runs on your computer, records your coding sessions and sends redacted session windows
+            to MemForge as you work. Its source appears on the Sources page after the first upload; nothing else is set
+            up here.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
