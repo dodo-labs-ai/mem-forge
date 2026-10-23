@@ -343,8 +343,8 @@ class NotionApi:
                     cut_at_cap = True
                 return _cursor_page(data, f"query of data source {data_source_id}")
 
-            results = paged_by_cursor(fetch, errors=_paging_errors(f"query of data source {data_source_id}"))
-            async with aclosing(results):
+            errors = _paging_errors(f"query of data source {data_source_id}")
+            async with aclosing(paged_by_cursor(fetch, errors=errors)) as results:
                 async for result in results:
                     result_id = notion_id(result.get("id"))
                     if result.get("object") not in {"page", "data_source"} or result_id is None:
