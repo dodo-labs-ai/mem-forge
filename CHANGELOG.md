@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- A Teams poll that runs out of history names the time its read is complete
+  from: the oldest page's oldest message, or the last certificate before an
+  empty final page. The server now refuses conversation poll evidence that
+  returned messages without a complete time, whatever its outcome, and a poll
+  that ran out of history or stopped early whose complete time lies before its
+  requested start, or, for a stopped poll, at or after its requested end.
+  Agents installed before this release are refused for Teams, with a message
+  that asks for the agent to be upgraded.
+
 - A local-agent Jira collection reads each listed issue with a one-issue
   search in the Source's scope, `issuekey = <id> AND (<scope>)`, and, when
   its comments are read apart, confirms its revision with another such

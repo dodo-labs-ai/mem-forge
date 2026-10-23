@@ -12,9 +12,11 @@ from memforge.conversations.intake import CollectionIntake, CollectionRejected
 from memforge.conversations.layer import ConversationLayer, ConversationSelection
 from memforge.conversations.manifest import (
     CollectionManifest,
+    CollectionRequest,
     ConversationEvidence,
     ManifestMessage,
     PollEvidence,
+    RequestedConversation,
     manifest_to_payload,
 )
 from memforge.conversations.port import (
@@ -194,6 +196,108 @@ async def test_a_poll_names_as_its_earliest_message_only_one_it_could_have_retur
 
     with pytest.raises(CollectionRejected, match="earliest message the manifest does not list inside its interval"):
         await _receive(database, _payload(claimed, _readable("c2", *c2.intervals), messages=(listed,)))
+
+
+NOT_REACHING_START = (PollOutcome.HISTORY_EXHAUSTED, PollOutcome.STOPPED_EARLY)
+
+
+def _outcome_id(outcome: PollOutcome) -> str:
+    return outcome.value
+
+
+async def _issue_with_backfill(db: Database) -> tuple[Interval, Interval]:
+    """Issue a request whose c1 carries a regular poll and a backfill below it, and return both intervals."""
+
+    regular = Interval(start=NOW - timedelta(days=10))
+    backfill = Interval(start=NOW - timedelta(days=30), end=NOW - timedelta(days=10))
+    request = CollectionRequest(
+        conversations=(
+            RequestedConversation(conversation_id="c1", intervals=(regular, backfill)),
+            RequestedConversation(conversation_id="c2", intervals=(regular,)),
+        )
+    )
+    await _collections(db).issue_request(SOURCE, ATTEMPT, request, issued_at=NOW)
+    return regular, backfill
+
+
+def _polled(
+    regular: Interval, backfill: Interval, *, outcome: PollOutcome, complete_from: datetime | None, returned: bool
+) -> tuple[dict, ManifestMessage | None]:
+    """A manifest whose c1 backfill poll ended with ``outcome`` and names ``complete_from``."""
+
+    message = _message("m1", backfill.start + timedelta(days=1)) if returned else None
+    c1 = _readable("c1", regular, backfill)
+    c1 = replace(
+        c1,
+        polls=(
+            c1.polls[0],
+            replace(
+                c1.polls[1],
+                outcome=outcome,
+                earliest_complete_page_time=complete_from,
+                earliest_returned_at=message.created_at if message else None,
+            ),
+        ),
+    )
+    return _payload(c1, _readable("c2", regular), messages=(message,) if message else ()), message
+
+
+@pytest.mark.parametrize("outcome", list(PollOutcome), ids=_outcome_id)
+async def test_a_poll_that_returned_a_message_must_name_the_time_its_read_is_complete_from(database, outcome):
+    regular, backfill = await _issue_with_backfill(database)
+    payload, _ = _polled(regular, backfill, outcome=outcome, complete_from=None, returned=True)
+
+    with pytest.raises(CollectionRejected, match="complete .*; upgrade the MemForge agent that collected it"):
+        await _receive(database, payload)
+
+
+@pytest.mark.parametrize("outcome", NOT_REACHING_START, ids=_outcome_id)
+async def test_a_poll_that_ran_out_of_history_or_stopped_early_cannot_be_complete_from_before_its_start(
+    database, outcome
+):
+    regular, backfill = await _issue_with_backfill(database)
+    before = backfill.start - timedelta(milliseconds=1)
+    payload, _ = _polled(regular, backfill, outcome=outcome, complete_from=before, returned=True)
+
+    with pytest.raises(CollectionRejected, match="is complete from before its start; upgrade"):
+        await _receive(database, payload)
+
+
+@pytest.mark.parametrize("complete_from", ["at_end", "after_end"])
+async def test_a_poll_stopped_early_must_be_complete_from_inside_its_interval(database, complete_from):
+    regular, backfill = await _issue_with_backfill(database)
+    late = backfill.end if complete_from == "at_end" else backfill.end + timedelta(hours=1)
+    payload, _ = _polled(regular, backfill, outcome=PollOutcome.STOPPED_EARLY, complete_from=late, returned=True)
+
+    with pytest.raises(CollectionRejected, match="stopped early complete from at or after its end; upgrade"):
+        await _receive(database, payload)
+
+
+@pytest.mark.parametrize(
+    "outcome, complete_from",
+    [
+        (PollOutcome.HISTORY_EXHAUSTED, "start"),
+        (PollOutcome.STOPPED_EARLY, "start"),
+        (PollOutcome.STOPPED_EARLY, "just_before_end"),
+    ],
+    ids=["history exhausted from its start", "stopped early from its start", "stopped early just before its end"],
+)
+async def test_a_poll_complete_from_inside_its_interval_is_accepted(database, outcome, complete_from):
+    regular, backfill = await _issue_with_backfill(database)
+    at = backfill.start if complete_from == "start" else backfill.end - timedelta(milliseconds=1)
+    payload, message = _polled(regular, backfill, outcome=outcome, complete_from=at, returned=True)
+
+    received = await _receive(database, payload)
+
+    assert [item.identity for item in received] == [message.identity]
+
+
+@pytest.mark.parametrize("outcome", NOT_REACHING_START, ids=_outcome_id)
+async def test_a_poll_that_returned_nothing_may_name_no_complete_time(database, outcome):
+    regular, backfill = await _issue_with_backfill(database)
+    payload, _ = _polled(regular, backfill, outcome=outcome, complete_from=None, returned=False)
+
+    assert await _receive(database, payload) == ()
 
 
 async def test_an_attempt_keeps_its_first_manifest_and_refuses_another(database):
