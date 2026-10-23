@@ -37,12 +37,13 @@ from memforge.source_adapters.teams import MESSAGE_SCHEMA, message_record, teams
 __all__ = ["TeamsGene"]
 
 
-def _refused(key: str, message: str) -> SourceConfigInvalid:
-    return SourceConfigInvalid([FieldIssue(key, message)])
-
 # A Teams Unit's stored input in window-package form: one window's messages
 # with its conversation's framing, as a local agent uploaded it.
 TEAMS_WINDOW_PACKAGE_KIND = "teams_window_document"
+
+
+def _refused(key: str, message: str) -> SourceConfigInvalid:
+    return SourceConfigInvalid([FieldIssue(key, message)])
 
 
 class TeamsGene(ConversationGene):

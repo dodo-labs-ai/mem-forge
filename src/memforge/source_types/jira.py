@@ -84,10 +84,7 @@ def _facts(config: Mapping[str, Any]) -> list[tuple[str, str]]:
     projects = list_config(config.get("projects"))
     if not (str(config.get("jql") or "").strip() if advanced else projects):
         return []
-    scoped = {**config, "projects": projects}
-    if "issue_types" in config:
-        scoped["issue_types"] = list_config(config["issue_types"])
-    return [("Effective query at sync", _build_jql(scoped, "updated >= '<last sync>'"))]
+    return [("Effective query at sync", _build_jql({**config, "projects": projects}, "updated >= '<last sync>'"))]
 
 
 def _store_config(config: dict[str, Any], local_inbox: LocalInbox) -> dict[str, Any]:
