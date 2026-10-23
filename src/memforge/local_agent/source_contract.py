@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any
 
+from memforge.conversations.time_scope import MAX_INITIAL_HISTORY_DAYS
 from memforge.local_agent.snapshot_manifest import UPSERT
 from memforge.source_types import registered_source_types, source_type_descriptor
 
@@ -50,13 +51,13 @@ The manifest response then names the items to confirm, and the agent posts
 its answers before it asks for processing.
 """
 TEAMS_ROLLING_RETENTION_PRESETS = (365, 730, 1095)
-# Every sync polls the whole Initial History, so it is bounded, and by the
-# shortest Rolling Retention, so collection never reaches what retention removes.
-TEAMS_MAX_INITIAL_HISTORY_DAYS = min(TEAMS_ROLLING_RETENTION_PRESETS)
 
 
 def teams_config_within_history_bound(config: Mapping[str, Any]) -> dict[str, Any] | None:
     """A stored Teams configuration with its Initial History cut to the bound, or ``None`` when it is within it.
+
+    The bound is the one every conversation Source shares
+    (:data:`~memforge.conversations.time_scope.MAX_INITIAL_HISTORY_DAYS`).
 
     Initial History is read as the Teams Gene reads it: ``initial_history_days``,
     otherwise a stored ``max_age_days``.
@@ -66,9 +67,9 @@ def teams_config_within_history_bound(config: Mapping[str, Any]) -> dict[str, An
         days = int(config.get("initial_history_days", config.get("max_age_days")))
     except (TypeError, ValueError):
         return None
-    if days <= TEAMS_MAX_INITIAL_HISTORY_DAYS:
+    if days <= MAX_INITIAL_HISTORY_DAYS:
         return None
-    return {**config, "initial_history_days": TEAMS_MAX_INITIAL_HISTORY_DAYS}
+    return {**config, "initial_history_days": MAX_INITIAL_HISTORY_DAYS}
 TEAMS_CONVERSATION_SELECTOR_FIELDS = (
     "conversation_ids",
     "channels",

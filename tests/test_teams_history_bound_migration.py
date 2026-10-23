@@ -6,7 +6,7 @@ import json
 
 import aiosqlite
 
-from memforge.local_agent.source_contract import TEAMS_MAX_INITIAL_HISTORY_DAYS
+from memforge.conversations.time_scope import MAX_INITIAL_HISTORY_DAYS
 from memforge.memory.evidence import EVIDENCE_UNIT_SUPPORT_SCOPE
 from memforge.storage.database import MIGRATIONS, SCHEMA, Database
 
@@ -54,6 +54,6 @@ async def test_an_initial_history_beyond_the_bound_is_cut_to_it_and_others_are_l
     finally:
         await database.close()
 
-    assert stored["src-long"]["initial_history_days"] == TEAMS_MAX_INITIAL_HISTORY_DAYS
-    assert stored["src-legacy"]["initial_history_days"] == TEAMS_MAX_INITIAL_HISTORY_DAYS
+    assert stored["src-long"]["initial_history_days"] == MAX_INITIAL_HISTORY_DAYS
+    assert stored["src-legacy"]["initial_history_days"] == MAX_INITIAL_HISTORY_DAYS
     assert stored["src-short"] == CONFIGS["src-short"]
