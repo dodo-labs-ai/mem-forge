@@ -47,6 +47,8 @@ function openApp(path: string, extension?: AdminExtension) {
 }
 
 test("the standalone app serves the Settings page", async () => {
+  // Load the lazy route's module first, so the heading query waits on rendering, not on the import.
+  await import("@/features/settings");
   const router = openApp("/settings");
 
   expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
