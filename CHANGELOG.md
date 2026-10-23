@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- A scope change of a conversation Source during an open change supersedes
+  it, as for documents, instead of answering 409
+  `projection_scope_transition_active`, a code no longer produced: the open
+  change becomes `superseded` through the same compare-and-set, and the new
+  one runs from the last applied selection to the new one. Every sync of the
+  change, starting with the first, removes as `removed_from_scope` each
+  conversation the Source holds that the new selection leaves out, so a chain
+  of changes, or a return to the previous selection, removes what only a
+  replaced selection added. A conversation Source offers `restore_config`.
+  The scope-change preview and the scope change in progress carry `removes`:
+  `at_completion` for a document Source, which removes what its new scope
+  leaves out once the change completes, and `next_sync` for a conversation
+  Source, whose next sync removes the deselected conversations. The V2 Source
+  drawer and its restore confirmation, and the V1 warnings for a change that
+  replaces or returns from the change in progress, say so for a conversation
+  Source.
+
 - A conversation Source requests at most two backfills per conversation: the
   lowest range the previous attempt left unread after the history floor, and
   one spanning the rest, instead of one backfill per interrupted poll. No
