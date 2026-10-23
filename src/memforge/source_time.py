@@ -29,6 +29,27 @@ itself or earlier.
 """
 
 
+def utc_minute_floor(moment: datetime) -> datetime:
+    """The start of the UTC minute holding ``moment``.
+
+    A provider that compares times only to the minute, such as a filter that
+    takes ``on_or_after`` a minute, is asked from this floor, so nothing
+    within that minute is skipped. An aware time is converted to UTC, a naive
+    time is read as UTC, and the seconds and microseconds are dropped::
+
+        plus_two = timezone(timedelta(hours=2))
+        utc_minute_floor(datetime(2026, 3, 1, 9, 30, 40, tzinfo=timezone.utc))  # 2026-03-01 09:30 UTC
+        utc_minute_floor(datetime(2026, 3, 1, 11, 30, 40, tzinfo=plus_two))     # 2026-03-01 09:30 UTC
+        utc_minute_floor(datetime(2026, 3, 1, 9, 30, 40))                       # 2026-03-01 09:30 UTC
+    """
+
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        utc = moment.replace(tzinfo=timezone.utc)
+    else:
+        utc = moment.astimezone(timezone.utc)
+    return utc.replace(second=0, microsecond=0)
+
+
 def parse_source_time(value: object) -> datetime | None:
     """Parse a source time into UTC; ``None`` when the source gave none.
 
