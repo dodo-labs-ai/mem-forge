@@ -7,7 +7,7 @@ import type { AccessPolicy } from "./model/sourceAccess";
 import type { SourceSyncRetryTarget } from "./model/sourceSyncActivity";
 import { sourceProjectBinding } from "./model/projectBinding";
 import { sourcesByProjectKey, type ResolvedBySource } from "./model/projectGrouping";
-import type { LocalAgentJob } from "./model/types";
+import type { LocalAgentJob, SourceEvaluationHealth } from "./model/types";
 
 export const sourceKeys = {
   all: ["sources"] as const,
@@ -17,6 +17,12 @@ export const sourceKeys = {
   types: ["genes"] as const,
   configSchema: (sourceType: string) => ["genes", sourceType, "config-schema"] as const,
 };
+
+/** The days of online evaluation the rows and the drawer summarize. */
+const EVALUATION_HEALTH_DAYS = 1;
+/** How long that evaluation is reused before it is read again. */
+const EVALUATION_HEALTH_STALE_MS = 60_000;
+const EMPTY_HEALTH: ReadonlyMap<string, SourceEvaluationHealth> = new Map();
 
 const EMPTY_SOURCES: Source[] = [];
 const EMPTY_JOBS: LocalAgentJob[] = [];
@@ -133,6 +139,24 @@ export function useProjectSources() {
   const sourcesQuery = useSources();
   const resolved = useResolvedProjects(sourcesQuery.sources);
   return { ...sourcesQuery, byProject: sourcesByProjectKey(sourcesQuery.sources, resolved) };
+}
+
+/**
+ * The online evaluation of each source the viewer can discover over the last
+ * day, by source id. A source without an entry, or one the evaluation cannot
+ * be read for, shows nothing.
+ */
+export function useSourceEvaluationHealth(): ReadonlyMap<string, SourceEvaluationHealth> {
+  const api = useApi();
+  const query = useQuery({
+    // Kept apart from the source keys, which every source write refreshes.
+    queryKey: ["source-evaluation-health", EVALUATION_HEALTH_DAYS] as const,
+    queryFn: () =>
+      unwrap(api.GET("/api/v1/agent-evaluations/online-overview", { params: { query: { days: EVALUATION_HEALTH_DAYS } } })),
+    select: (overview) => new Map(overview.sources.map((health) => [health.source_id, health])),
+    staleTime: EVALUATION_HEALTH_STALE_MS,
+  });
+  return query.data ?? EMPTY_HEALTH;
 }
 
 export function useSourceListPreferences() {
@@ -333,6 +357,18 @@ export function useSyncSource() {
       }),
     );
   });
+}
+
+/**
+ * Starts a full sync: the server, or the device of a source that runs on
+ * one, lists the whole source again and processes every document, unchanged
+ * ones included.
+ */
+export function useFullSync() {
+  const api = useApi();
+  return useSourceMutation((sourceId: string) =>
+    unwrap(api.POST("/api/v1/sources/{source_id}/force-resync", { params: { path: { source_id: sourceId } } })),
+  );
 }
 
 /**

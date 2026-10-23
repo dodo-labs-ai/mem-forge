@@ -1,5 +1,6 @@
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import { useLocation } from "react-router-dom";
 import { toast } from "sonner";
 import { afterEach, expect, test, vi } from "vitest";
@@ -8,7 +9,10 @@ import { renderRoutes } from "@/test/renderRoutes";
 import { setupJobRoutes } from "@/test/setupJobs";
 import { makeSource } from "@/test/sourceFixtures";
 import { SOURCE_TYPE_FORMS, sourceTypeSchema } from "@/test/sourceTypeForms";
+import { FullSyncDialog } from "./FullSyncDialog";
 import type { SourceAttentionAction } from "./model/sourceAttention";
+import type { SourceRow } from "./model/sourceRows";
+import { SourceRowActions } from "./SourceRowActions";
 import { useSourceActions } from "./useSourceActions";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -116,4 +120,72 @@ test.each(ACTIONS)("no action navigates outside the app (%s)", async (action) =>
 
   await waitFor(() => expect(router.state.location.pathname.startsWith("/sources")).toBe(true));
   expect(attempts).toEqual([]);
+});
+
+/** A source's row menu wired to the Full sync confirmation, as the Sources page wires them. */
+function FullSyncHarness({ source }: { source: Source }) {
+  const actions = useSourceActions({ onViewDetails: () => undefined });
+  const [pending, setPending] = useState<Source | null>(null);
+  const row: SourceRow = { key: source.id, source, memoryCount: 0, activity: undefined, readiness: null, attention: null, failedItems: null };
+  const ignore = () => undefined;
+  return (
+    <>
+      <SourceRowActions row={row} actions={actions} onViewDetails={ignore} onDelete={ignore} onReRead={ignore} onFullSync={setPending} onChangeAccess={ignore} />
+      <FullSyncDialog source={pending} onOpenChange={(open) => !open && setPending(null)} />
+    </>
+  );
+}
+
+function renderFullSync(source: Source) {
+  return renderRoutes([{ path: "*", element: <FullSyncHarness source={source} /> }], {
+    path: "/sources",
+    api: {
+      "POST /api/v1/sources/src-wiki/force-resync": () => ({
+        ok: true,
+        message: "Sync enqueued",
+        source_id: "src-wiki",
+        run_id: "run-9",
+        status: "pending",
+        created_at: "2026-10-24T00:00:00Z",
+        coalesced: false,
+      }),
+    },
+  });
+}
+
+test("Full sync asks first and names the model cost", async () => {
+  const { calls } = renderFullSync(makeSource());
+
+  await userEvent.click(screen.getByRole("button", { name: "More actions for Payroll wiki" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: /Full sync/ }));
+
+  const dialog = await screen.findByRole("dialog", { name: "Run a full sync of Payroll wiki?" });
+  expect(dialog).toHaveTextContent("unchanged ones included");
+  expect(dialog).toHaveTextContent("as many model calls as the source's first sync");
+  expect(dialog).toHaveTextContent("use Re-read all documents instead");
+  expect(calls.some((request) => request.method === "POST")).toBe(false);
+
+  await userEvent.click(within(dialog).getByRole("button", { name: "Start full sync" }));
+
+  await waitFor(() => expect(toast.success).toHaveBeenCalledWith("Full sync started for Payroll wiki"));
+  expect(calls.filter((request) => request.method === "POST").map((request) => new URL(request.url).pathname)).toEqual([
+    "/api/v1/sources/src-wiki/force-resync",
+  ]);
+});
+
+test("Full sync is hidden without can_force_resync", async () => {
+  renderFullSync(makeSource({ capabilities: { ...makeSource().capabilities!, can_force_resync: false } }));
+
+  await userEvent.click(screen.getByRole("button", { name: "More actions for Payroll wiki" }));
+
+  expect(await screen.findByRole("menuitem", { name: /Re-read all documents/ })).toBeInTheDocument();
+  expect(screen.queryByRole("menuitem", { name: /Full sync/ })).not.toBeInTheDocument();
+});
+
+test("Full sync waits while the source is paused", async () => {
+  renderFullSync(makeSource({ status: "paused" }));
+
+  await userEvent.click(screen.getByRole("button", { name: "More actions for Payroll wiki" }));
+
+  expect(await screen.findByRole("menuitem", { name: /Full sync/ })).toHaveAttribute("aria-disabled", "true");
 });

@@ -8,6 +8,7 @@ interface SourceTableContextValue {
   onViewDetails: (source: Source) => void;
   onDelete: (source: Source) => void;
   onReRead: (source: Source) => void;
+  onFullSync: (source: Source) => void;
   onChangeAccess: (source: Source) => void;
 }
 

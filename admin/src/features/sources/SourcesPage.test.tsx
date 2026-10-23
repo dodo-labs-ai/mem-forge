@@ -5,6 +5,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { toast } from "sonner";
 import { STANDALONE_TARGET, type WorkspaceTarget } from "@/api";
 import { errorResponse, type Route } from "@/test/fakeApi";
+import { makeOverview, makeSourceHealth } from "@/test/evaluationFixtures";
 import { renderRoutes } from "@/test/renderRoutes";
 import { makeFailedItem, makeLocalAgentJob, makeScopeTransition, makeSource } from "@/test/sourceFixtures";
 import { sourceTypeSchema } from "@/test/sourceTypeForms";
@@ -39,6 +40,7 @@ function renderPage(
     "GET /api/v1/source-list/preferences": () => ({ sort_mode: "name" }),
     "GET /api/cloud/local-agent/status": () => ({ status: "online", last_seen_at: null, checked_at: "", stale_after_seconds: 60 }),
     "GET /api/cloud/local-agent/jobs/current": () => ({ data: [] }),
+    "GET /api/v1/agent-evaluations/online-overview": () => makeOverview({ sources: [] }),
     "POST /api/v1/sources/src-wiki/sync": () => ({ status: "pending", run_id: "run-2" }),
     ...routes,
   };
@@ -710,4 +712,47 @@ test("a viewer who cannot read the configuration sees the progress, but neither 
   expect(within(section).queryByText("ENG")).not.toBeInTheDocument();
   expect(within(section).queryByText("ENG, OPS")).not.toBeInTheDocument();
   expect(within(section).queryByRole("button", { name: "Restore the previous scope" })).not.toBeInTheDocument();
+});
+
+test("a source with issues links to its evaluation", async () => {
+  const { calls, router } = renderPage(undefined, {
+    "GET /api/v1/agent-evaluations/online-overview": () =>
+      makeOverview({
+        sources: [
+          makeSourceHealth({ source_id: "src-wiki", name: "Payroll wiki", evaluation_status: "attention", action_issue_group_count: 2 }),
+          makeSourceHealth({ source_id: "src-jira", name: "Payroll Jira", evaluation_status: "healthy", action_issue_group_count: 0 }),
+        ],
+      }),
+  });
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  const chip = await within(table).findByRole("link", { name: "Open the pipeline checks of Payroll wiki: 2 issues" });
+  expect(within(table).queryByRole("link", { name: /pipeline checks of Payroll Jira/ })).not.toBeInTheDocument();
+  const overview = new URL(calls.find((request) => request.url.includes("/online-overview"))!.url);
+  expect(overview.searchParams.get("days")).toBe("1");
+
+  await userEvent.click(chip);
+
+  expect(router.state.location.pathname + router.state.location.search).toBe("/evaluation?source_id=src-wiki");
+});
+
+test("the drawer shows the evaluation chip and offers Full sync", async () => {
+  renderPage([makeSource()], {
+    "GET /api/v1/agent-evaluations/online-overview": () =>
+      makeOverview({
+        sources: [makeSourceHealth({ source_id: "src-wiki", evaluation_status: "review", action_issue_group_count: 0, review_issue_group_count: 1 })],
+      }),
+  });
+
+  await userEvent.click(await within(await screen.findByRole("table", { name: "Sources" })).findByText("Payroll wiki"));
+  const drawer = await screen.findByRole("dialog", { name: "Payroll wiki" });
+  expect(await within(drawer).findByRole("link", { name: "Open the pipeline checks of Payroll wiki: 1 review pattern" })).toHaveAttribute(
+    "href",
+    "/evaluation?source_id=src-wiki",
+  );
+
+  await userEvent.click(within(drawer).getByRole("button", { name: "More actions for Payroll wiki" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: /Full sync/ }));
+
+  expect(await screen.findByRole("dialog", { name: "Run a full sync of Payroll wiki?" })).toBeInTheDocument();
 });
