@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
+from memforge.conversations.layer import _returned
+from memforge.conversations.manifest import ManifestMessage
 from memforge.conversations.membership import PlannedUnit
 from memforge.conversations.port import ConversationLabel
 from memforge.conversations.projection import normalize_unit, unit_content_item, unit_payload, unit_raw_content
@@ -71,3 +74,20 @@ def test_a_unit_of_dated_members_carries_no_undated_times():
     payload, _item, _normalized = _projected(_dated("a", 9))
 
     assert UNDATED_MEMBER_TIMES_KEY not in payload
+
+
+def test_whether_a_member_is_undated_is_derived_from_its_record_when_it_is_built():
+    dated, undated = _dated("a", 9), _undated("b", 10)
+
+    assert not dated.undated
+    assert undated.undated
+    assert replace(dated, record=undated.record).undated
+    assert not replace(undated, record=dated.record).undated
+    assert dated == replace(dated)
+
+    # A message returned at the revision a Unit holds reuses the stored undated record.
+    message = ManifestMessage(identity=undated.identity, revision=undated.revision, created_at=undated.created_at)
+    reused = _returned(message, {}, {}, {undated.identity: undated})
+
+    assert reused is not None and reused.member.record is undated.record
+    assert reused.member.undated
