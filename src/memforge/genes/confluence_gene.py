@@ -77,6 +77,11 @@ _ATTACHMENT_PAGING_ERRORS = PagingErrors(
 )
 
 
+def _to_milliseconds(moment: datetime) -> datetime:
+    """``moment`` without the microseconds below Confluence's millisecond ``version.when``."""
+    return moment.replace(microsecond=moment.microsecond // 1000 * 1000)
+
+
 def _page_doc_id(page_id: str) -> str:
     return f"{_PAGE_DOC_ID_PREFIX}{page_id}"
 
@@ -573,7 +578,12 @@ class ConfluenceGene(DocumentGene):
     def _parse_page(
         self, page: dict, since: datetime | None, exclude_labels: set
     ) -> ContentItem | None:
-        """Parse a Confluence page JSON into a ContentItem."""
+        """Parse a Confluence page JSON into a ContentItem, or ``None`` when it is excluded or unchanged since ``since``.
+
+        A page is unchanged when its ``version.when`` is earlier than
+        ``since`` at Confluence's millisecond precision, so a page edited at
+        09:30:10.250 is yielded for ``since`` 09:30:10.250999.
+        """
         page_id = str(page.get("id") or "").strip()
         if not page_id:
             raise RuntimeError("Confluence page record is missing a stable page id")
@@ -607,7 +617,7 @@ class ConfluenceGene(DocumentGene):
         if exclude_labels and set(labels) & exclude_labels:
             return None
 
-        if since and last_modified <= since:
+        if since and last_modified < _to_milliseconds(since):
             return None
 
         space_key = page.get("space", {}).get("key", self.config.get("spaces", [""])[0] if self.config.get("spaces") else "")

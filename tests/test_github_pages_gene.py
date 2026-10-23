@@ -501,6 +501,79 @@ async def test_subtree_discovery_prefers_sitemap_and_filters_to_root():
     assert GitHubPagesGene.lists_scope(gene.config) is False
 
 
+def _sitemap_with_lastmod(lastmod: str) -> str:
+    return (
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        f"<url><loc>{SITE}guide/</loc><lastmod>{lastmod}</lastmod></url></urlset>"
+    )
+
+
+async def _sitemap_discovery(lastmod: str, since: datetime) -> list[ContentItem]:
+    gene = await sitemap_site(_sitemap_with_lastmod(lastmod)).connect({**SUBTREE_NONE, "root_url": SITE})
+    try:
+        return [item async for item in gene.discover(since)]
+    finally:
+        await gene.close()
+
+
+@pytest.mark.asyncio
+async def test_a_date_only_lastmod_is_found_by_a_cursor_later_that_day():
+    # A run at 09:30 UTC read the page; MkDocs rebuilt it at 14:00, still
+    # stamping 2026-05-25. The next run reads from 14:00 minus the overlap.
+    items = await _sitemap_discovery("2026-05-25", datetime(2026, 5, 25, 13, 50, tzinfo=timezone.utc))
+
+    assert [item.title for item in items] == ["guide"]
+    # The marker is the latest instant the date can name: its end at UTC-12.
+    assert items[0].last_modified == datetime(2026, 5, 26, 11, 59, 59, 999_999, tzinfo=timezone.utc)
+    # The source time is the date read as UTC, unchanged.
+    assert items[0].extra["content_updated_at"] == "2026-05-25T00:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_a_date_only_lastmod_is_skipped_once_no_timezone_can_still_be_on_that_day():
+    assert await _sitemap_discovery("2026-05-25", datetime(2026, 5, 26, 12, 0, tzinfo=timezone.utc)) == []
+
+
+@pytest.mark.asyncio
+async def test_a_lastmod_without_an_offset_is_compared_at_utc_minus_12():
+    items = await _sitemap_discovery("2026-05-25T14:00:00", datetime(2026, 5, 25, 20, 0, tzinfo=timezone.utc))
+
+    assert [item.title for item in items] == ["guide"]
+    assert items[0].last_modified == datetime(2026, 5, 26, 2, 0, tzinfo=timezone.utc)
+    assert items[0].extra["content_updated_at"] == "2026-05-25T14:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_a_lastmod_with_an_offset_is_its_own_marker():
+    items = await _sitemap_discovery("2026-05-25T16:00:00+02:00", datetime(2026, 5, 25, 14, 0, tzinfo=timezone.utc))
+
+    assert items[0].last_modified == datetime(2026, 5, 25, 14, 0, tzinfo=timezone.utc)
+    assert items[0].extra["content_updated_at"] == "2026-05-25T14:00:00+00:00"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("since", "yielded"),
+    [
+        (datetime(2026, 5, 26, 14, 51, 21, 500_000, tzinfo=timezone.utc), True),  # the page's own second
+        (datetime(2026, 5, 26, 14, 51, 21, tzinfo=timezone.utc), True),  # exactly the page's time
+        (datetime(2026, 5, 26, 14, 51, 22, tzinfo=timezone.utc), False),  # the next second
+    ],
+    ids=["same-second", "same-instant", "next-second"],
+)
+async def test_a_last_modified_header_is_compared_with_since_at_whole_seconds(since, yielded):
+    gene = await published_site().connect(
+        {"auth_mode": "none", "sync_mode": "single_page", "page_url": f"{SITE}cloud-native-platform/process-tracking/"}
+    )
+    try:
+        items = [item async for item in gene.discover(since)]
+    finally:
+        await gene.close()
+
+    # PAGE_HEADERS: Last-Modified: Tue, 26 May 2026 14:51:21 GMT
+    assert bool(items) is yielded
+
+
 @pytest.mark.asyncio
 async def test_subtree_bfs_never_grants_source_wide_absence_authority():
     site = Site({SITEMAP_URL: not_found}, fallback=page("<main><p>Reachable page</p></main>"))

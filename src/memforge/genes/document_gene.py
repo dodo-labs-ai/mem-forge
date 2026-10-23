@@ -176,8 +176,12 @@ class DocumentGene(Gene):
         minute, after its seconds, is yielded.** For example, with ``since``
         at 09:30:10 UTC an issue edited at 09:30:40 must be yielded:
 
-        - A provider that compares full timestamps, such as a Confluence
-          page's ``version.when``, is compared with ``since`` itself, in UTC.
+        - A provider time with seconds or finer is compared with ``since``
+          cut to the same precision: a Confluence page's ``version.when`` at
+          milliseconds, a GitHub Pages ``Last-Modified`` at whole seconds.
+        - A provider time that names no exact instant, such as a sitemap
+          ``lastmod`` of ``2026-03-01`` with no time or offset, is compared
+          as the latest instant it can name: the end of that day at UTC-12.
         - A provider whose query is minute-granular, such as a Jira JQL date
           ``updated >= '2026-03-01 09:30'``, gets ``since`` rounded down to
           the minute, written in the timezone the provider reads it in (Jira:
