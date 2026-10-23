@@ -392,8 +392,9 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
   }
 
   /**
-   * config-check's facts, which state the whole configuration and so show once, on the
-   * last group; and on an edit page the fixed execution choice of this group.
+   * config-check's facts, which state the whole configuration and so show once: on the
+   * last content group, the Check setup step, or on the last group when the type has no
+   * content group; and on an edit page the fixed execution choice of this group.
    */
   function groupFacts(step: SetupStep): Property[] {
     const facts: Property[] =
