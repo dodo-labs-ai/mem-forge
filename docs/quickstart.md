@@ -487,6 +487,10 @@ works the same self-hosted and hosted.
    choose **•••** → **Connections**, and add the connection.
 4. Paste each root's URL, or its ID, into **Root pages** or **Databases**.
 
+Until the admin UI's new Add Source dialog offers Notion, create the source
+through the API instead: `POST /api/v1/sources` with `"type": "notion"`, a
+`name`, and a `config` holding `token`, `root_pages` and `databases`.
+
 MemForge collects every page under those roots: child pages, pages inside
 toggles and columns, and the rows of each database, with a row's properties
 kept apart from its body. It never uses Notion's search. A full sync reads
