@@ -6050,8 +6050,11 @@ export interface components {
          *     - ``unchanged``: the scope stays as it is.
          *     - ``opens_transition``: a scope change opens; nothing is removed until it completes.
          *     - ``supersedes_transition``: the change replaces the scope change in progress.
-         *     - ``restores_previous_scope``: the change returns to the last applied scope and replaces the
-         *       change in progress; nothing that scope synced is removed.
+         *     - ``restores_previous_scope``: the change returns to the last applied scope, which the
+         *       configuration cannot list. The change in progress closes, none opens, and nothing is removed.
+         *     - ``returns_to_previous_scope``: the change returns to the last applied scope and replaces the
+         *       change in progress with a change back to it. Nothing that scope synced is removed; once a
+         *       sync lists it in full, what only the replaced change added is removed.
          *     - ``refused``: saving answers 409, as ``refusal`` says.
          *
          *     ``open_transition`` says whether a scope change is in progress now.
@@ -6063,7 +6066,7 @@ export interface components {
              * Outcome
              * @enum {string}
              */
-            outcome: "unchanged" | "opens_transition" | "supersedes_transition" | "restores_previous_scope" | "refused";
+            outcome: "unchanged" | "opens_transition" | "supersedes_transition" | "restores_previous_scope" | "returns_to_previous_scope" | "refused";
             refusal?: components["schemas"]["SourceScopeChangeRefusalResponse"] | null;
         };
         /**
@@ -6094,13 +6097,18 @@ export interface components {
          *     the new scope leaves out is removed. Until then nothing is removed.
          *     ``members_committed`` of ``listed_count`` items have committed; the
          *     count is ``null`` until a sync lists the new scope in full.
-         *     ``failing_items`` keep the change open until a sync commits them.
+         *     ``failing_items`` are the failed items not yet committed under the
+         *     change; one the new scope lists keeps it open until a sync commits it,
+         *     and one only the previous scope held is settled when the change
+         *     completes.
          *
-         *     Saving ``restore_config`` with ``PUT /sources/{id}`` returns to the
+         *     Saving ``restore_config`` with ``PUT /sources/{id}``, with this
+         *     transition's ``id`` as ``expected_scope_transition_id``, returns to the
          *     previous scope: it replaces the change in progress, and nothing the
          *     previous scope synced is removed. It is ``null`` when the viewer cannot
-         *     change the configuration, or the Source cannot replace a change in
-         *     progress and waits for it to complete.
+         *     change the configuration, the Source cannot replace a change in progress
+         *     and waits for it to complete, or the change already returns to the
+         *     previous scope.
          */
         SourceScopeTransitionResponse: {
             /** Created At */
@@ -6124,11 +6132,11 @@ export interface components {
             members_committed: number;
             /**
              * Previous Scope
-             * @description The canonical scope fields of the last applied scope.
+             * @description The canonical scope fields of the last applied scope; null when the viewer cannot read the configuration.
              */
             previous_scope: {
                 [key: string]: unknown;
-            };
+            } | null;
             /** Restore Config */
             restore_config: {
                 [key: string]: unknown;
@@ -6141,11 +6149,11 @@ export interface components {
             status: "pending" | "running" | "failed";
             /**
              * Target Scope
-             * @description The canonical scope fields of the new scope.
+             * @description The canonical scope fields of the new scope; null when the viewer cannot read the configuration. Equal to ``previous_scope`` while the Source returns to its previous scope.
              */
             target_scope: {
                 [key: string]: unknown;
-            };
+            } | null;
             /** Updated At */
             updated_at: string;
         };
@@ -6486,6 +6494,11 @@ export interface components {
             config?: {
                 [key: string]: unknown;
             } | null;
+            /**
+             * Expected Scope Transition Id
+             * @description The scope change the caller saw in progress. The save answers 409 ``projection_scope_transition_stale`` when another one, or none, is in progress.
+             */
+            expected_scope_transition_id?: string | null;
             /** Name */
             name?: string | null;
             /** Project Binding */
