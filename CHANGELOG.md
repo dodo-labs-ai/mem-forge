@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Initial History is at most 365 days for every conversation Source, whatever
+  its Rolling Retention, and never more than a finite retention. The bound
+  belongs to the conversation layer; the Teams Gene no longer derives it from
+  its retention presets, and stored Teams values are already within it.
+
 - A Teams poll that runs out of history names the time its read is complete
   from: the oldest page's oldest message, or the last certificate before an
   empty final page. The server now refuses conversation poll evidence that

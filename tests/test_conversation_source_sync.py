@@ -155,15 +155,21 @@ class TeamsWorkspace:
         self.documents = documents
         self.attempts = 0
 
-    async def collect_and_sync(self, teams: FakeTeams, *, dry_run: bool = False):
-        """One device job attempt and the sync run it starts, or with ``dry_run`` the plan it would apply."""
+    async def collect_and_sync(self, teams: FakeTeams, *, dry_run: bool = False, requested_at: datetime | None = None):
+        """One device job attempt and the sync run it starts, or with ``dry_run`` the plan it would apply.
+
+        ``requested_at`` is when the server issued the attempt's request, now
+        unless given.
+        """
 
         self.attempts += 1
         attempt_id = f"job-{self.attempts}:attempt:1"
         gene = TeamsGene(dict(self.config), SOURCE_ID)
         reader = SourceProjectionUnitReader(self.db)
         collections = StoredCollections(self.db, workspace_id=WORKSPACE_ID)
-        request = await gene.issue_collection_request(collections, attempt_id, now=datetime.now(timezone.utc))
+        request = await gene.issue_collection_request(
+            collections, attempt_id, now=requested_at or datetime.now(timezone.utc)
+        )
         collection = await collect(
             teams, request, source_id=SOURCE_ID, collection_attempt_id=attempt_id, config_revision="cfg"
         )
@@ -504,15 +510,15 @@ async def test_a_dry_run_reports_the_plan_and_changes_nothing(workspace):
     assert set(await workspace.units()) == {f"{UnitKind.WINDOW.value}:m1", f"{UnitKind.WINDOW.value}:m3"}
 
 
-async def test_rolling_retention_removes_a_window_once_its_latest_message_ages_out(workspace, monkeypatch):
+async def test_rolling_retention_removes_a_window_once_its_latest_message_ages_out(workspace):
     teams = FakeTeams()
     teams.post(CHAT, "old", NOW - timedelta(days=400), "old")
     teams.post(CHAT, "new", _ago(2), "new")
-    # The old window stands for one collected while it was still within Initial History.
-    monkeypatch.setattr("memforge.genes.teams_gene.TEAMS_MAX_INITIAL_HISTORY_DAYS", 500)
-    workspace.config = {"conversation_ids": [CHAT], "initial_history_days": 500}
-    await workspace.collect_and_sync(teams)
-    monkeypatch.undo()
+    # The old window was collected by an attempt requested 40 days ago, while
+    # it was still within Initial History.
+    workspace.config = {"conversation_ids": [CHAT], "initial_history_days": 365}
+    await workspace.collect_and_sync(teams, requested_at=NOW - timedelta(days=40))
+    assert f"{UnitKind.WINDOW.value}:old" in await workspace.units()
 
     workspace.config = {"conversation_ids": [CHAT], "initial_history_days": 365, "rolling_retention_days": 365}
     report, _missing = await workspace.collect_and_sync(teams, dry_run=True)

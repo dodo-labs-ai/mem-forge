@@ -28,6 +28,7 @@ from memforge.conversations.port import (
     ThreadingModel,
 )
 from memforge.conversations.records import MessageIdentity, record_revision
+from memforge.conversations.time_scope import MAX_INITIAL_HISTORY_DAYS
 from memforge.conversations.units import Member, Span, StoredUnit, UnitKind, UnitRef
 from memforge.source_projection import UnitRemovalReason
 
@@ -283,6 +284,14 @@ async def test_a_manifest_conversation_outside_the_selection_is_refused():
 def test_initial_history_cannot_exceed_rolling_retention():
     with pytest.raises(ValueError, match="cannot exceed"):
         _selection("c1", retention=30, history=60)
+
+
+@pytest.mark.parametrize("retention", [None, 365, 730, 1095])
+def test_initial_history_is_bounded_to_one_year_whatever_the_retention(retention):
+    assert _selection("c1", retention=retention, history=MAX_INITIAL_HISTORY_DAYS).initial_history_days == 365
+    for history in (0, MAX_INITIAL_HISTORY_DAYS + 1):
+        with pytest.raises(ValueError, match="between 1 and 365 days|cannot exceed"):
+            _selection("c1", retention=retention, history=history)
 
 
 def test_the_request_polls_initial_history_within_the_ceiling_and_retention():

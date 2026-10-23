@@ -44,6 +44,7 @@ from memforge.conversations.membership import (
 from memforge.conversations.port import ConversationAccess, Interval, PollOutcome
 from memforge.conversations.reader import ConversationUnitReader
 from memforge.conversations.records import MessageIdentity, record_revision
+from memforge.conversations.time_scope import MAX_INITIAL_HISTORY_DAYS
 from memforge.conversations.units import Member, MemberArtifact, Span
 from memforge.conversations.windows import GAP_WINDOW_V1, WindowPolicy
 from memforge.source_projection import UnitRemovalReason
@@ -53,8 +54,10 @@ from memforge.source_projection import UnitRemovalReason
 class ConversationSelection:
     """What the Source's configuration says about collection.
 
-    ``regular_ceiling`` bounds a regular poll; ``None`` polls the whole of
-    Initial History on every run.
+    Initial History is between one day and
+    :data:`~memforge.conversations.time_scope.MAX_INITIAL_HISTORY_DAYS`, and
+    no longer than a finite Rolling Retention. ``regular_ceiling`` bounds a
+    regular poll; ``None`` polls the whole of Initial History on every run.
     """
 
     conversation_ids: tuple[str, ...]
@@ -63,8 +66,8 @@ class ConversationSelection:
     regular_ceiling: timedelta | None = None
 
     def __post_init__(self) -> None:
-        if self.initial_history_days <= 0:
-            raise ValueError("initial history must be at least one day")
+        if not 1 <= self.initial_history_days <= MAX_INITIAL_HISTORY_DAYS:
+            raise ValueError(f"initial history must be between 1 and {MAX_INITIAL_HISTORY_DAYS} days")
         if self.rolling_retention_days and self.initial_history_days > self.rolling_retention_days:
             raise ValueError("initial history cannot exceed rolling retention")
 
