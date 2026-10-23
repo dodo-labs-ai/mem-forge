@@ -38,7 +38,7 @@ from memforge.genes.toolkit.http import ConnectorHttpClient
 from memforge.genes.toolkit.local_packages import device_packages
 from memforge.genes.toolkit.paging import OffsetPage, PagingErrors, paged_by_offset
 from memforge.local_agent.jira_contract import validate_jira_observation_identities
-from memforge.source_time import SOURCE_UPDATED_AT_KEY, source_time_iso
+from memforge.source_time import SOURCE_UPDATED_AT_KEY, WESTERNMOST_ZONE, source_time_iso
 from memforge.models import (
     AbsenceAnswer,
     ConfigField,
@@ -86,10 +86,6 @@ JIRA_INVENTORY_MAX_RESULTS = 100
 JIRA_IDENTITY_FIELDS = ["updated"]
 _ISSUE_DOC_ID_PREFIX = "jira-"
 JIRA_MYSELF_PATH = "/rest/api/2/myself"
-# The westernmost UTC offset in use. A JQL date literal written at it is read,
-# in any profile timezone, as the intended instant or earlier: up to 26 hours
-# earlier for a profile at UTC+14.
-_WESTERNMOST_ZONE = timezone(timedelta(hours=-12), "UTC-12")
 LOCAL_AGENT_JIRA_PACKAGE_KIND = "jira_document"
 
 JIRA_QUERY_MODE_SIMPLE = "simple"
@@ -849,7 +845,9 @@ class JiraGene(DocumentGene):
             name,
             self.source_id,
         )
-        return _WESTERNMOST_ZONE
+        # Any profile timezone reads a literal written at UTC-12 as the
+        # intended instant or earlier: up to 26 hours earlier at UTC+14.
+        return WESTERNMOST_ZONE
 
     async def _search_issues(
         self,
