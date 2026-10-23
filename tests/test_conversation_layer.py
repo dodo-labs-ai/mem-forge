@@ -456,4 +456,3 @@ async def test_the_layer_reads_exactly_the_units_the_read_set_names():
     )
     assert projection.reads[0] == {unit.provider_key for unit in named}
     assert projection.reads[0] == {"w-rooted", "t-rooted", "w-lending", "t-rootless", "w-edited"}
-
