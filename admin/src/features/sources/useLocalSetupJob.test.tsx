@@ -97,6 +97,35 @@ test("admits a different request once the admitted job has finished", async () =
   expect(reads).toBe(2);
 });
 
+test("a call still reading the job another request took over from leaves the new admitted job in place", async () => {
+  let created = 0;
+  let reads = 0;
+  let finishFirstRead: () => void = () => undefined;
+  const firstRead = new Promise<void>((resolve) => {
+    finishFirstRead = resolve;
+  });
+  let laj2Reads = 0;
+  const amer = { ...BROWSED, region: "amer" };
+  const { run, calls } = renderJob("teams_browse", {
+    [CREATE]: () => ({ job_id: `laj-${++created}`, status: "queued" }),
+    [READ]: async () => {
+      if (++reads === 1) await firstRead;
+      return { job_id: "laj-1", status: "succeeded", result: BROWSED };
+    },
+    "GET /api/cloud/local-agent/jobs/laj-2": () =>
+      ++laj2Reads === 1 ? errorResponse(503, "Service unavailable") : { job_id: "laj-2", status: "succeeded", result: amer },
+  });
+
+  const emea = run({ payload: { region: "emea" } });
+  await vi.waitFor(() => expect(reads).toBe(1));
+  await expect(run({ payload: { region: "amer" } })).rejects.toThrow();
+  finishFirstRead();
+  await expect(emea).resolves.toEqual(BROWSED);
+
+  await expect(run({ payload: { region: "amer" } })).resolves.toEqual(amer);
+  expect(requested(calls, CREATE)).toBe(2);
+});
+
 test("a failed job result is reported, not treated as success", async () => {
   const { run } = renderJob("teams_auth_check", {
     [READ]: () => ({

@@ -145,7 +145,7 @@ export function useLocalSetupJob<Op extends SetupJobOperation>(operation: Op, op
               signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
             }),
           );
-          if (FINISHED.has(job.status)) admitted.current = null;
+          if (FINISHED.has(job.status) && admitted.current?.jobId === jobId) admitted.current = null;
           if (job.status === "succeeded") return job.result as SetupJobResults[Op];
           if (job.status === "failed") {
             const result = job.result as Partial<SetupJobResults[Op]>;
