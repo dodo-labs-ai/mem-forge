@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -37,6 +38,7 @@ __all__ = [
     "NOTION_REQUESTS_PER_MINUTE",
     "NOTION_VERSION",
     "NotionApi",
+    "NotionMarkdown",
     "NotionRequestBlockedError",
     "notion_blocked_integration",
     "notion_error_code",
@@ -58,6 +60,21 @@ _PAGE_SIZE = 100
 _RESULT_LIMIT_REACHED = "query_result_limit_reached"
 _REQUEST_BLOCKED = "public_api_request_blocked"
 _DASHED_OR_PLAIN_ID = re.compile(r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$")
+
+
+@dataclass(frozen=True)
+class NotionMarkdown:
+    """One answer of the Markdown endpoint for a page or block.
+
+    ``truncated`` is Notion's own flag, and ``unknown_block_ids`` the 32-hex
+    ids it names for blocks the answer left out, each written in
+    ``markdown`` as an ``<unknown>`` tag. What they mean for the page's
+    coverage is the Gene's to decide.
+    """
+
+    markdown: str
+    truncated: bool
+    unknown_block_ids: tuple[str, ...]
 
 
 class NotionRequestBlockedError(RuntimeError):
@@ -177,6 +194,54 @@ class NotionApi:
             if block.get("object") != "block" or notion_id(block.get("id")) is None or not block.get("type"):
                 raise RuntimeError(f"Notion listed a child of block {block_id} that is not a block")
             yield block
+
+    async def page_markdown(self, block_id: str) -> NotionMarkdown | None:
+        """The enhanced Markdown of a page, or of one block read again, or ``None`` when Notion answers 404.
+
+        The Markdown version is pinned (``markdown_version=v1``), and meeting
+        note transcripts are left out (``include_transcript=false``), rather
+        than left to Notion's defaults. Any other error status raises
+        ``httpx.HTTPStatusError``; an answer of another shape raises
+        ``RuntimeError``.
+        """
+        response = await self.get(
+            f"/v1/pages/{block_id}/markdown",
+            params={"markdown_version": "v1", "include_transcript": "false"},
+        )
+        if response.status_code == httpx.codes.NOT_FOUND:
+            return None
+        response.raise_for_status()
+        data = _json_object(response, f"Markdown of {block_id}")
+        markdown, truncated, unknown = data.get("markdown"), data.get("truncated"), data.get("unknown_block_ids")
+        if not isinstance(markdown, str) or not isinstance(truncated, bool) or not isinstance(unknown, list):
+            raise RuntimeError(f"Notion answered the read of the Markdown of {block_id} in another shape")
+        ids = tuple(notion_id(value) for value in unknown)
+        if any(value is None for value in ids):
+            raise RuntimeError(f"Notion named an unknown block of {block_id} without a block id")
+        return NotionMarkdown(markdown=markdown, truncated=truncated, unknown_block_ids=ids)  # type: ignore[arg-type]
+
+    async def property_items(self, page_id: str, property_id: str) -> AsyncIterator[dict[str, Any]]:
+        """Every item of one page property, a hundred at a time.
+
+        A page object holds at most 25 references of a ``title``,
+        ``rich_text``, ``people`` or ``relation`` value; this reads them
+        all. Each item names its value under its ``type``, as
+        ``{"type": "relation", "relation": {"id": "…"}}``.
+        """
+        what = f"property {property_id} of page {page_id}"
+
+        async def fetch(cursor: str | None) -> CursorPage[dict[str, Any]]:
+            params: dict[str, Any] = {"page_size": _PAGE_SIZE}
+            if cursor:
+                params["start_cursor"] = cursor
+            response = await self.get(f"/v1/pages/{page_id}/properties/{property_id}", params=params)
+            response.raise_for_status()
+            return _cursor_page(_json_object(response, what), what)
+
+        async for item in paged_by_cursor(fetch, errors=_paging_errors(what)):
+            if item.get("object") != "property_item" or not item.get("type"):
+                raise RuntimeError(f"Notion listed an item of {what} that is not a property item")
+            yield item
 
     async def query_data_source(self, data_source_id: str) -> AsyncIterator[dict[str, Any]]:
         """Every result of a data source, past Notion's 10,000-result cap, each yielded once.

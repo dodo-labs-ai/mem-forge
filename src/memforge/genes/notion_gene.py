@@ -25,14 +25,29 @@ answers for one page by climbing its parents to a configured root:
   no data sources, so it adds nothing;
 - a trashed or archived page is neither listed nor descended. Notion's
   data-source queries leave archived rows out too, so both paths agree.
+
+:meth:`NotionGene.fetch` reads a page's body from Notion's Markdown endpoint
+and keeps it, with a row's properties, in a versioned JSON envelope that
+:meth:`NotionGene.normalize` and the projection read::
+
+    {"notion_raw": 1, "markdown": "…", "properties": [{"name": "Status", "type": "status", "value": "Done"}],
+     "truncated": false, "unknown_not_found": 0}
+
+``properties`` is present only for a row. Files Notion hosts are named in
+the envelope by stable ``notion-file:`` references and streamed by
+:meth:`NotionGene.open_source_artifact` while the item is processed, inside
+the hour their signed URLs live.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import mimetypes
+import re
 from collections import Counter
 from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import aclosing
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -47,6 +62,7 @@ from memforge.genes.notion_api import (
     NOTION_REQUESTS_PER_MINUTE,
     NOTION_VERSION,
     NotionApi,
+    NotionMarkdown,
     notion_blocked_integration,
     notion_error_code,
     notion_id,
@@ -54,6 +70,9 @@ from memforge.genes.notion_api import (
     notion_parent,
     notion_time,
 )
+from memforge.genes.notion_files import NotionFiles, split_signed_url
+from memforge.genes.notion_markdown import notion_markdown
+from memforge.genes.notion_properties import render_properties
 from memforge.genes.toolkit.config import list_config, tls_verify
 from memforge.genes.toolkit.http import ConnectorHttpClient
 from memforge.genes.toolkit.pacing import shared_rate_limiter
@@ -70,9 +89,16 @@ from memforge.models import (
     ScopeListing,
     ScopeListingKind,
 )
-from memforge.source_time import utc_minute_floor
+from memforge.source_artifacts import (
+    SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
+    RawSourceArtifact,
+    SourceArtifactDownload,
+    normalize_source_artifact_media_type,
+    parse_source_artifact_content_length,
+)
+from memforge.source_time import SOURCE_UPDATED_AT_KEY, utc_minute_floor
 
-__all__ = ["NotionGene", "notion_token"]
+__all__ = ["NOTION_RAW_VERSION", "NotionGene", "notion_raw_envelope", "notion_token"]
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +112,18 @@ _READ_PATHS = {
     "database": "/v1/databases/{}",
     "data_source": "/v1/data_sources/{}",
 }
+NOTION_RAW_VERSION = 1
+"""The version of the JSON envelope :meth:`NotionGene.fetch` stores as a page's raw body."""
+_EMPTY_EVIDENCE = "notion_markdown_api_successful_empty_page_body"
+# A page's body reads at most this many left-out blocks again; beyond it the page is partial.
+_REREAD_BOUND = 200
+# Unsupported blocks whose target the block API names, rendered as links to it.
+_LINK_BLOCK_TYPES = frozenset({"bookmark", "link_preview", "external_object_instance"})
+# Property types a page object cuts at 25 references.
+_CUT_PROPERTY_TYPES = frozenset({"title", "rich_text", "people", "relation"})
+_CUT_AT = 25
+_UNKNOWN_TAG = re.compile(r"<unknown\b([^>]*?)(?:/>|>.*?</unknown>)", re.DOTALL)
+_TAG_ATTRIBUTE = re.compile(r'([\w-]+)="([^"]*)"')
 
 
 def notion_token(config: Mapping[str, Any]) -> str:
@@ -168,6 +206,8 @@ class NotionGene(DocumentGene):
         self._api: NotionApi | None = None
         self._file_client: ConnectorHttpClient | None = None
         self._walked_page_ids: set[str] = set()
+        # file key -> the signed URL its item's fetch read; never stored
+        self._signed_files: dict[str, str] = {}
         # (kind, id32) -> (reaches a configured root, nearest page or database at or above it)
         self._ancestor_verdicts: dict[tuple[str, str], tuple[bool, tuple[str, str] | None]] = {}
 
@@ -218,9 +258,10 @@ class NotionGene(DocumentGene):
         logger.info("Notion connection authenticated for source %s", self.source_id)
 
     async def close(self) -> None:
-        """Close the file client and forget this connection's ancestor verdicts, then close the API client."""
+        """Close the file client, forget the connection's signed file URLs and ancestor verdicts, then close the API client."""
         file_client, self._file_client = self._file_client, None
         self._api = None
+        self._signed_files.clear()
         self._ancestor_verdicts.clear()
         if file_client is not None:
             await file_client.aclose()
@@ -594,10 +635,188 @@ class NotionGene(DocumentGene):
     # ------------------------------------------------------------------
 
     async def fetch(self, item: ContentItem) -> RawContent:
-        raise NotImplementedError("NotionGene does not fetch page content yet")
+        """Read one page: its object, its body as Markdown, a row's properties and the files they name.
+
+        The page object decides whether the page is in the trash, never the
+        Markdown endpoint, which still serves a trashed page's body; a page
+        trashed since discovery fails the item, and the next run's listing
+        and confirmation decide. Blocks the Markdown left out are resolved
+        (:meth:`_page_body`), so ``truncated`` in the envelope means content
+        is still missing. A row's properties are read in full and rendered
+        as text records, never into the body.
+
+        Each Notion-hosted file becomes one artifact, owned by the body when
+        the body names it and by the properties otherwise. A blank body that
+        is complete is attested empty, as a row with only properties often
+        is; a truncated one never is.
+        """
+        page_id = _item_page_id(item)
+        page = notion_object(await self._notion().get(f"/v1/pages/{page_id}"), "page", page_id)
+        if page.get("in_trash") is True:
+            raise RuntimeError(f"Notion page {page_id} was moved to the trash after discovery")
+        markdown, truncated, not_found = await self._page_body(page_id)
+        files = NotionFiles()
+        envelope: dict[str, Any] = {"notion_raw": NOTION_RAW_VERSION, "markdown": files.stabilize(markdown, "page_body")}
+        if notion_parent(page, f"page {page_id}")[0] == "database":
+            properties = await self._full_properties(page_id, page.get("properties"))
+            envelope["properties"] = render_properties(
+                properties, file_text=lambda entry: _file_text(entry, files)
+            )
+        envelope["truncated"] = truncated
+        envelope["unknown_not_found"] = not_found
+        self._signed_files.update(files.signed_urls)
+        empty = not truncated and not notion_markdown(envelope["markdown"]).strip()
+        return RawContent(
+            item=item,
+            body=json.dumps(envelope, ensure_ascii=False).encode("utf-8"),
+            content_type="application/json",
+            authoritative_empty=empty,
+            empty_evidence=_EMPTY_EVIDENCE if empty else None,
+            artifacts=_artifacts(page_id, files),
+        )
+
+    async def _page_body(self, page_id: str) -> tuple[str, bool, int]:
+        """A page's Markdown with every left-out block resolved, as ``(markdown, truncated, not_found)``.
+
+        Notion writes a block its answer left out as an ``<unknown>`` tag
+        whose ``url`` names the block in its fragment:
+
+        - a tag with an ``alt`` is a block type the Markdown cannot show. A
+          bookmark or link preview is read through the block API and becomes
+          a link to its target; any other type becomes a placeholder naming
+          it. Neither is ever partial;
+        - a tag without an ``alt`` is a block cut for size or permission. It
+          is read again through the Markdown endpoint and spliced in place,
+          and so are the cut blocks of that answer. One that answers 404 is a
+          block the connection cannot see: left out and counted in
+          ``not_found``, not partial.
+
+        The page is partial (``truncated``) when a cut block is still cut
+        after its re-read, more than 200 re-reads would be needed, Notion
+        names a cut block it gave no tag for, or an answer says
+        ``truncated`` while naming no block at all. Unsupported blocks set
+        Notion's ``truncated`` on their own, so an answer whose named blocks
+        are all unsupported is complete.
+        """
+        answer = await self._notion().page_markdown(page_id)
+        if answer is None:
+            raise RuntimeError(f"Notion page {page_id} answered 404 for its Markdown")
+        state = _BodyState()
+        markdown = await self._resolved(answer, page_id, state)
+        return markdown, state.truncated, state.not_found
+
+    async def _resolved(self, answer: NotionMarkdown, read_id: str, state: _BodyState) -> str:
+        tags = [
+            (match, _unknown_block_id(match, read_id), _tag_attribute(match.group(1), "alt"))
+            for match in _UNKNOWN_TAG.finditer(answer.markdown)
+        ]
+        unsupported = {block_id for _match, block_id, alt in tags if alt}
+        cut = {block_id for _match, block_id, alt in tags if not alt}
+        # Unsupported blocks set Notion's flag and are listed on their own; only the rest is missing content.
+        listed = set(answer.unknown_block_ids) - unsupported
+        if (answer.truncated and not answer.unknown_block_ids and not cut) or listed - cut:
+            state.truncated = True
+        pieces: list[str] = []
+        position = 0
+        for match, block_id, alt in tags:
+            pieces.append(answer.markdown[position : match.start()])
+            if alt:
+                pieces.append(await self._unsupported_block(block_id, alt, state))
+            elif block_id == read_id:
+                state.truncated = True  # the block's own re-read cut it again
+            else:
+                line_start = answer.markdown.rfind("\n", 0, match.start()) + 1
+                indent = re.match(r"\t*", answer.markdown[line_start:]).group(0)
+                pieces.append((await self._reread(block_id, state)).replace("\n", "\n" + indent))
+            position = match.end()
+        pieces.append(answer.markdown[position:])
+        return "".join(pieces)
+
+    async def _reread(self, block_id: str, state: _BodyState) -> str:
+        if state.rereads >= _REREAD_BOUND:
+            state.truncated = True
+            return ""
+        state.rereads += 1
+        answer = await self._notion().page_markdown(block_id)
+        if answer is None:
+            state.not_found += 1
+            return ""
+        return (await self._resolved(answer, block_id, state)).strip("\n")
+
+    async def _unsupported_block(self, block_id: str, block_type: str, state: _BodyState) -> str:
+        """A link to a bookmark's or link preview's target, or a placeholder naming the block type."""
+        if block_type not in _LINK_BLOCK_TYPES:
+            return _placeholder(block_type)
+        response = await self._notion().get(f"/v1/blocks/{block_id}")
+        if response.status_code == httpx.codes.NOT_FOUND:
+            state.not_found += 1
+            return _placeholder(block_type)
+        block = notion_object(response, "block", block_id)
+        content = block.get(str(block.get("type")))
+        content = content if isinstance(content, dict) else {}
+        url = str(content.get("url") or "").strip()
+        if not url:
+            return _placeholder(str(content.get("block_type") or block_type))
+        caption = "".join(
+            str(part.get("plain_text") or "") for part in content.get("caption") or [] if isinstance(part, dict)
+        ).strip()
+        label = (caption or url).replace("[", "\\[").replace("]", "\\]")
+        return f"[{label}]({url})"
+
+    async def _full_properties(self, page_id: str, properties: object) -> dict[str, Any]:
+        """A row's properties, each value Notion cut at 25 references read in full."""
+        if not isinstance(properties, dict):
+            raise RuntimeError(f"Notion row {page_id} has no properties")
+        full = dict(properties)
+        for name, value in properties.items():
+            if not isinstance(value, dict) or value.get("type") not in _CUT_PROPERTY_TYPES:
+                continue
+            kind = value["type"]
+            references = value.get(kind)
+            if value.get("has_more") is not True and not (isinstance(references, list) and len(references) >= _CUT_AT):
+                continue
+            items = [item async for item in self._notion().property_items(page_id, str(value.get("id") or ""))]
+            full[name] = {**value, kind: [item.get(kind) for item in items], "has_more": False}
+        return full
+
+    @asynccontextmanager
+    async def open_source_artifact(self, artifact: RawSourceArtifact) -> AsyncIterator[SourceArtifactDownload]:
+        """Stream one Notion-hosted file from the signed URL its item's fetch read.
+
+        The request goes through the file client, which sends no
+        ``Authorization`` header (Notion's file host refuses one), and names
+        the signature only in its query, so no log or error shows it. A file
+        this connection's fetch did not read, or one the file host refuses
+        (an expired signature answers 400 or 403), fails the item, and the
+        next run fetches it again with fresh URLs.
+        """
+        key = artifact.provider_key
+        signed = self._signed_files.get(key)
+        if signed is None or self._file_client is None:
+            raise RuntimeError(f"Notion file {key} has no signed URL from this connection's fetch")
+        address, query = split_signed_url(signed)
+        async with self._file_client.stream("GET", address, params=httpx.QueryParams(query)) as response:
+            if response.status_code >= httpx.codes.BAD_REQUEST:
+                raise RuntimeError(f"Notion's file host answered {response.status_code} for file {key}")
+            yield SourceArtifactDownload(
+                chunks=response.aiter_bytes(),
+                media_type=response.headers.get("content-type"),
+                content_length=parse_source_artifact_content_length(response.headers.get("content-length")),
+                content_encoding=response.headers.get("content-encoding"),
+            )
 
     async def normalize(self, raw: RawContent) -> NormalizedContent:
-        raise NotImplementedError("NotionGene does not normalize page content yet")
+        """The page body as CommonMark, from the envelope's Markdown alone.
+
+        Properties stay in their own Observation, so the body is the page's
+        body only, and a row with no body text normalizes to ``""``.
+        """
+        envelope = notion_raw_envelope(raw)
+        return NormalizedContent(
+            item=raw.item,
+            markdown_body=notion_markdown(envelope["markdown"]),
+            source_semantics={SOURCE_UPDATED_AT_KEY: raw.item.last_modified.isoformat()},
+        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -651,6 +870,89 @@ class NotionGene(DocumentGene):
         except (TypeError, ValueError):
             return None
         return limit if limit > 0 else None
+
+
+@dataclass
+class _BodyState:
+    """What resolving one page body found: whether content is still missing, the re-reads spent, and the 404s."""
+
+    truncated: bool = False
+    rereads: int = 0
+    not_found: int = 0
+
+
+def notion_raw_envelope(raw: RawContent) -> dict[str, Any]:
+    """The envelope a Notion fetch stored, checked to be version 1 in its documented shape.
+
+    An envelope of another version or shape raises ``ValueError``, so the
+    item fails rather than projects a body it cannot read.
+    """
+    try:
+        envelope = json.loads(raw.body.decode("utf-8")) if raw.content_type == "application/json" else None
+    except (UnicodeDecodeError, ValueError):
+        envelope = None
+    if not isinstance(envelope, dict) or envelope.get("notion_raw") != NOTION_RAW_VERSION:
+        raise ValueError(f"Notion raw body of {raw.item.item_id} is not a version {NOTION_RAW_VERSION} envelope")
+    properties = envelope.get("properties", [])
+    if (
+        not isinstance(envelope.get("markdown"), str)
+        or not isinstance(envelope.get("truncated"), bool)
+        or not isinstance(envelope.get("unknown_not_found"), int)
+        or not isinstance(properties, list)
+        or not all(
+            isinstance(record, dict) and all(isinstance(record.get(key), str) for key in ("name", "type", "value"))
+            for record in properties
+        )
+    ):
+        raise ValueError(f"Notion raw body of {raw.item.item_id} has an envelope of another shape")
+    return envelope
+
+
+def _unknown_block_id(tag: re.Match[str], read_id: str) -> str:
+    """The block an ``<unknown>`` tag names: the id in its ``url``'s fragment, else the URL's last path id."""
+    url = _tag_attribute(tag.group(1), "url")
+    address, _hash, fragment = url.partition("#")
+    block_id = notion_id(fragment) or notion_id(address.rstrip("/").rsplit("/", 1)[-1].rsplit("-", 1)[-1])
+    if block_id is None:
+        raise RuntimeError(f"Notion's Markdown of {read_id} names a left-out block without a readable block id")
+    return block_id
+
+
+def _tag_attribute(attributes: str, name: str) -> str:
+    return next((value for key, value in _TAG_ATTRIBUTE.findall(attributes) if key == name), "")
+
+
+def _placeholder(block_type: str) -> str:
+    return f"[Notion block not shown: {block_type}]"
+
+
+def _file_text(entry: Mapping[str, Any], files: NotionFiles) -> str:
+    """One entry of a ``files`` property: a Notion-hosted file's stable reference, or an external file's URL."""
+    target = entry.get(str(entry.get("type")))
+    url = str(target.get("url") or "").strip() if isinstance(target, Mapping) else ""
+    return files.stabilize(url, "properties") if url else str(entry.get("name") or "")
+
+
+def _artifacts(page_id: str, files: NotionFiles) -> tuple[RawSourceArtifact, ...]:
+    """One artifact per Notion-hosted file of a media type MemForge stores, under the Observation that first names it."""
+    artifacts = []
+    for key, owner in files.owners.items():
+        filename = NotionFiles.filename(key)
+        media_type = normalize_source_artifact_media_type(mimetypes.guess_type(filename)[0])
+        if media_type not in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES:
+            continue
+        artifacts.append(
+            RawSourceArtifact(
+                provider_key=key,
+                parent_observation_type=owner,
+                parent_provider_key=f"{page_id}:{'body' if owner == 'page_body' else 'properties'}",
+                provider_revision=key,
+                filename=filename,
+                media_type=media_type,
+                locator={"file_key": key},
+            )
+        )
+    return tuple(artifacts)
 
 
 def _listable_state(page: dict[str, Any]) -> bool:
