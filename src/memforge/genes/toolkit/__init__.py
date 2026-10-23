@@ -9,7 +9,8 @@ you need from its module::
 - :mod:`memforge.genes.toolkit.http` sends a connector's HTTP requests,
   retrying and pacing them by one policy.
 - :mod:`memforge.genes.toolkit.config` reads configuration values: booleans,
-  integers, lists, personal access tokens, TLS trust and HTTPS base URLs.
+  integers, lists, personal access tokens, TLS trust and HTTPS base URLs, and
+  refuses a configuration field by field (``SourceConfigInvalid``).
 - :mod:`memforge.genes.toolkit.local_packages` reads the packages a device
   submitted for a Source, from the run's manifest or the Source's inbox.
 - :mod:`memforge.genes.toolkit.paging` walks a paged provider listing to its
