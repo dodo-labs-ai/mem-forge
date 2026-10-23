@@ -1266,12 +1266,115 @@
         "title": "ComponentHealth",
         "type": "object"
       },
+      "ConfigCheckRequest": {
+        "properties": {
+          "config": {
+            "additionalProperties": true,
+            "title": "Config",
+            "type": "object"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          }
+        },
+        "required": [
+          "config"
+        ],
+        "title": "ConfigCheckRequest",
+        "type": "object"
+      },
+      "ConfigCheckResponse": {
+        "properties": {
+          "derived": {
+            "additionalProperties": true,
+            "description": "Declared non-secret fields whose effective value the save would change, as it would store them.",
+            "title": "Derived",
+            "type": "object"
+          },
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/ConfigFactResponse"
+            },
+            "title": "Facts",
+            "type": "array"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/FieldIssueResponse"
+            },
+            "title": "Issues",
+            "type": "array"
+          }
+        },
+        "required": [
+          "derived",
+          "facts",
+          "issues"
+        ],
+        "title": "ConfigCheckResponse",
+        "type": "object"
+      },
+      "ConfigConditionResponse": {
+        "properties": {
+          "field": {
+            "title": "Field",
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Values",
+            "type": "array"
+          }
+        },
+        "required": [
+          "field",
+          "values"
+        ],
+        "title": "ConfigConditionResponse",
+        "type": "object"
+      },
+      "ConfigFactResponse": {
+        "properties": {
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "value"
+        ],
+        "title": "ConfigFactResponse",
+        "type": "object"
+      },
       "ConfigFieldResponse": {
         "properties": {
           "advanced": {
             "default": false,
             "title": "Advanced",
             "type": "boolean"
+          },
+          "choices": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ConfigOptionResponse"
+            },
+            "title": "Choices",
+            "type": "array"
           },
           "default": {
             "default": "",
@@ -1281,6 +1384,12 @@
           "field_type": {
             "title": "Field Type",
             "type": "string"
+          },
+          "fixed_after_create": {
+            "default": false,
+            "description": "Chooses the executor; a stored Source keeps it.",
+            "title": "Fixed After Create",
+            "type": "boolean"
           },
           "group": {
             "default": "general",
@@ -1302,6 +1411,8 @@
           },
           "options": {
             "default": [],
+            "deprecated": true,
+            "description": "The values of `choices`.",
             "items": {
               "type": "string"
             },
@@ -1320,8 +1431,34 @@
           },
           "required": {
             "default": true,
+            "description": "Required while the field is visible.",
             "title": "Required",
             "type": "boolean"
+          },
+          "scope": {
+            "default": false,
+            "description": "Changing it changes which items the Source holds.",
+            "title": "Scope",
+            "type": "boolean"
+          },
+          "visible_when": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ConfigConditionResponse"
+            },
+            "title": "Visible When",
+            "type": "array"
+          },
+          "widget": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Widget"
           }
         },
         "required": [
@@ -1334,6 +1471,11 @@
       },
       "ConfigGroupResponse": {
         "properties": {
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
           "key": {
             "title": "Key",
             "type": "string"
@@ -1346,6 +1488,24 @@
             "default": 0,
             "title": "Order",
             "type": "integer"
+          },
+          "panels": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ConfigPanelResponse"
+            },
+            "title": "Panels",
+            "type": "array"
+          },
+          "purpose": {
+            "default": "content",
+            "enum": [
+              "connection",
+              "content",
+              "options"
+            ],
+            "title": "Purpose",
+            "type": "string"
           }
         },
         "required": [
@@ -1353,6 +1513,58 @@
           "label"
         ],
         "title": "ConfigGroupResponse",
+        "type": "object"
+      },
+      "ConfigOptionResponse": {
+        "properties": {
+          "help_text": {
+            "default": "",
+            "title": "Help Text",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          },
+          "visible_when": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ConfigConditionResponse"
+            },
+            "title": "Visible When",
+            "type": "array"
+          }
+        },
+        "required": [
+          "value",
+          "label"
+        ],
+        "title": "ConfigOptionResponse",
+        "type": "object"
+      },
+      "ConfigPanelResponse": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "visible_when": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ConfigConditionResponse"
+            },
+            "title": "Visible When",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ConfigPanelResponse",
         "type": "object"
       },
       "ConversationArtifactLinkRequest": {
@@ -2271,6 +2483,31 @@
         "title": "EntityResponse",
         "type": "object"
       },
+      "FieldIssueResponse": {
+        "properties": {
+          "key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "message"
+        ],
+        "title": "FieldIssueResponse",
+        "type": "object"
+      },
       "GeneConfigSchemaResponse": {
         "properties": {
           "fields": {
@@ -2288,6 +2525,17 @@
             },
             "title": "Groups",
             "type": "array"
+          },
+          "project_field": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Field"
           }
         },
         "title": "GeneConfigSchemaResponse",
@@ -2326,6 +2574,11 @@
             "title": "Execution Kinds",
             "type": "array"
           },
+          "managed": {
+            "description": "Managed capture, created by the service; the type picker leaves it out.",
+            "title": "Managed",
+            "type": "boolean"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -2338,7 +2591,8 @@
           "default_sync_interval_minutes",
           "auth_method",
           "data_shape",
-          "execution_kinds"
+          "execution_kinds",
+          "managed"
         ],
         "title": "GeneMetadataResponse",
         "type": "object"
@@ -12493,9 +12747,62 @@
         ]
       }
     },
+    "/api/v1/genes/{name}/config-check": {
+      "post": {
+        "description": "What saving this configuration would store and refuse, without saving it.\n\nIt runs save's own steps (``complete`` and every configuration check)\non a copy, and writes nothing: no Source, no inbox, no encrypted\nsecret. ``derived`` holds the declared non-secret fields whose\neffective value the steps change, such as the page tree a pasted\nConfluence page URL names; ``facts`` states what the type can tell\nabout the configuration; ``issues`` holds every refusal. With\n``source_id``, the stored configuration completes the copy as it does\non update, and the caller needs the access that update needs.",
+        "operationId": "check_gene_config_api_v1_genes__name__config_check_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfigCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigCheckResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Gene Config",
+        "tags": [
+          "genes"
+        ]
+      }
+    },
     "/api/v1/genes/{name}/config-schema": {
       "get": {
-        "description": "Get the configuration schema for a gene type (for dynamic UI rendering).",
+        "description": "The form description of a source type, which the admin UI draws without per-type code.\n\nBesides what the Gene declares, each field says whether it is a scope\nfield and whether it is fixed after create, from the type's descriptor.",
         "operationId": "get_gene_config_schema_api_v1_genes__name__config_schema_get",
         "parameters": [
           {
