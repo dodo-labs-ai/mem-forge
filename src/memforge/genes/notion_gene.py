@@ -472,8 +472,9 @@ class NotionGene(DocumentGene):
         """A configured root, as ``(kind, record)``; one Notion cannot find, or one in the trash, is a configuration error.
 
         A root page that has since been turned into a wiki is a database now,
-        and is walked as a database root. A 401 or 403 raises as an ordinary
-        error, like one below a root.
+        and is walked as a database root. A page listed under ``databases``
+        answers 400 ``validation_error`` and names the field to move it from.
+        A 401 or 403 raises as an ordinary error, like one below a root.
         """
         label = "root page" if kind == "page" else "database"
         response = await self._notion().get(_READ_PATHS[kind].format(object_id))
@@ -481,6 +482,15 @@ class NotionGene(DocumentGene):
             raise SourceConfigurationError(
                 f"Notion {label} {object_id} does not exist or is not shared with the connection. "
                 "Share it with the connection (••• → Connections) or remove it from the Source."
+            )
+        if (
+            kind == "database"
+            and response.status_code == httpx.codes.BAD_REQUEST
+            and notion_error_code(response) == "validation_error"
+        ):
+            raise SourceConfigurationError(
+                f"Notion databases holds {object_id}, which Notion does not read as a database. "
+                "If it is a page, move it to Root pages."
             )
         database = await self._database_behind(response, object_id) if kind == "page" else None
         if database is not None:

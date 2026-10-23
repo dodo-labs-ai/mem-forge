@@ -369,6 +369,15 @@ class NotionFake:
         if request.method == "GET" and len(parts) == 4 and parts[1] == "blocks" and parts[3] == "children":
             return self._children(notion_id32(parts[2]), request)
         if request.method == "GET" and len(parts) == 3 and parts[1] == "databases":
+            if notion_id32(parts[2]) in self.pages:
+                return httpx.Response(
+                    400,
+                    json={
+                        "object": "error",
+                        "code": "validation_error",
+                        "message": f"Provided ID {parts[2]} is a page, not a database. Use the retrieve page API instead.",
+                    },
+                )
             return self._object(self.databases.get(notion_id32(parts[2])))
         if request.method == "GET" and len(parts) == 3 and parts[1] == "data_sources":
             return self._object(self.data_sources.get(notion_id32(parts[2])))
