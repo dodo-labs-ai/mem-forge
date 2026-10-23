@@ -18,7 +18,7 @@ those links.
 |---|---|
 | `npm run lint` | ESLint, including the layer import rules |
 | `npm test` | Vitest unit and component tests |
-| `npm run test:e2e` | Playwright smoke tests against the production build, API stubbed; `ADMIN_E2E_PORT` moves the preview server off port 4175 |
+| `npm run test:e2e` | Playwright smoke tests against the production build, API stubbed; it builds in `--mode e2e`, which adds the harness pages of `e2e/harness/` (such as a shared workspace) in a directory of its own; `ADMIN_E2E_PORT` moves the preview server off port 4175 |
 | `npm run storybook` | The catalogue of `ui` and `patterns` |
 | `npm run gen:api` | Regenerate API types and the source type form fixture after a backend change |
 
