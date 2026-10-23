@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
@@ -45,7 +45,7 @@ from memforge.models import (
 )
 from memforge.pipeline.normalizer_utils import annotate_code_blocks, html_to_markdown, strip_boilerplate
 from memforge.repo_identity import normalize_repo_identifier
-from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time
+from memforge.source_time import SOURCE_UPDATED_AT_KEY, WESTERNMOST_ZONE, parse_source_time
 
 logger = logging.getLogger(__name__)
 
@@ -60,10 +60,10 @@ DEFAULT_MAX_DEPTH = 5
 DEFAULT_MAX_PAGES = 200
 # ``ContentItem.extra`` key for the page's source time: its commit time in
 # repository mode, else its sitemap ``lastmod`` or HTTP ``Last-Modified``.
+# ``ContentItem.last_modified`` is the discovery marker compared with
+# ``since``: the source time, except that a sitemap page's marker is the later
+# of its ``lastmod`` marker (see ``_Lastmod``) and its HTTP ``Last-Modified``.
 CONTENT_UPDATED_AT_KEY = "content_updated_at"
-# The westernmost UTC offset in use: a date or time without an offset ends
-# there last.
-_WESTERNMOST_ZONE = timezone(timedelta(hours=-12), "UTC-12")
 
 
 @dataclass(frozen=True)
@@ -676,7 +676,10 @@ class GitHubPagesGene(DocumentGene):
             item = await self._content_item_for_url(url)
             lastmod = _lastmod_for_url(sitemap_xml, url)
             if lastmod is not None:
-                item.last_modified = lastmod.discovery_marker
+                # A lastmod may be the commit time, which a deploy can follow
+                # by hours; the page's own Last-Modified is the deploy time.
+                served_at = parse_source_time(item.extra.get(CONTENT_UPDATED_AT_KEY))
+                item.last_modified = max(lastmod.discovery_marker, served_at or lastmod.discovery_marker)
                 item.extra[CONTENT_UPDATED_AT_KEY] = lastmod.source_time.isoformat()
             items.append(item)
         return items
@@ -981,17 +984,36 @@ def _last_modified_from_headers(headers: dict[str, str]) -> datetime | None:
 class _Lastmod:
     """A sitemap ``lastmod``, as the page's source time and as its discovery marker.
 
-    W3C Datetime lets ``lastmod`` name only a date, or a time without an
-    offset, which places it nowhere exact on the timeline. MkDocs, for
-    example, stamps every page with the build date: ``2026-03-01``.
+    W3C Datetime lets ``lastmod`` stop at the date or the minute, and leave
+    out the offset, so it may name a span of time rather than one instant.
+    MkDocs, for example, stamps every page with the build date: ``2026-03-01``.
 
-    - ``source_time`` reads it as UTC: ``2026-03-01T00:00:00+00:00``.
+    - ``source_time`` reads it as written, at UTC when it has no offset:
+      ``2026-03-01T00:00:00+00:00``.
     - ``discovery_marker``, compared with ``since``, is the latest instant it
-      can name in any timezone, its end at UTC-12: ``2026-03-02T11:59:59.999999+00:00``.
-      Read as midnight UTC, a page rebuilt at 14:00 UTC after a 09:30 run
-      would compare earlier than the next ``since`` and be hidden.
+      can name: the end of the span it states, at UTC-12 when it has no offset.
 
-    A ``lastmod`` with an offset is one instant, and both are that instant.
+    ======================== ====================================
+    ``lastmod``              ``discovery_marker`` (UTC)
+    ======================== ====================================
+    ``2026-03-01``           ``2026-03-02T11:59:59.999999``
+    ``2026-03-01T15:00``     ``2026-03-02T03:00:59.999999``
+    ``2026-03-01T15:00Z``    ``2026-03-01T15:00:59.999999``
+    ``2026-03-01T15:00:30Z`` ``2026-03-01T15:00:30``
+    ======================== ====================================
+
+    Read as its start, a date-only page rebuilt at 14:00 UTC after a 09:30
+    run would compare earlier than the next ``since`` and be hidden; so would
+    an edit at 15:00:30 stamped ``15:00Z`` for ``since`` 15:00:10. A value with
+    seconds is taken as exact.
+
+    The page's item compares the later of this marker and the page's HTTP
+    ``Last-Modified``, when it has one. A generator that writes the commit
+    time as ``lastmod`` (Hugo with ``enableGitInfo``, the MkDocs git revision
+    plugin) can be deployed hours after the commit, and after a run started;
+    the deploy time, which GitHub Pages serves as ``Last-Modified``, still
+    finds the page. Without ``Last-Modified`` the marker alone stays the
+    same from run to run, so an unchanged page reads as the same revision.
     """
 
     source_time: datetime
@@ -1020,18 +1042,31 @@ def _parse_lastmod(value: str) -> _Lastmod | None:
     source_time = _parse_datetime(value)
     if source_time is None:
         return None
-    try:
-        day = date.fromisoformat(value)
-    except ValueError:
-        day = None
-    if day is not None:
-        next_day_at_westernmost = datetime(day.year, day.month, day.day, tzinfo=_WESTERNMOST_ZONE) + timedelta(days=1)
-        marker = next_day_at_westernmost - timedelta(microseconds=1)
-    elif datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is None:
-        marker = source_time.replace(tzinfo=_WESTERNMOST_ZONE)
-    else:
-        marker = source_time
+    start = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=WESTERNMOST_ZONE)
+    span = _stated_span(value)
+    marker = start + span - timedelta(microseconds=1) if span else start
     return _Lastmod(source_time=source_time, discovery_marker=marker.astimezone(timezone.utc))
+
+
+# The clock of an ISO 8601 time: hours, then minutes and seconds when stated.
+_ISO_CLOCK = re.compile(r"\d{2}(?::?(\d{2}))?(?::?(\d{2}))?")
+
+
+def _stated_span(value: str) -> timedelta:
+    """How long the time an ISO 8601 value states lasts, at the precision it states it.
+
+    A day for ``2026-03-01``, an hour for ``…T15``, a minute for ``…T15:00``,
+    and nothing for a value with seconds, which is exact.
+    """
+    parts = re.split(r"[T ]", value, maxsplit=1)
+    if len(parts) == 1:
+        return timedelta(days=1)
+    clock = _ISO_CLOCK.match(parts[1])
+    if clock is None or clock.group(2) is not None:
+        return timedelta(0)
+    return timedelta(minutes=1) if clock.group(1) is not None else timedelta(hours=1)
 
 
 def _parse_datetime(value: str) -> datetime | None:

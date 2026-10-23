@@ -495,7 +495,8 @@ async def test_subtree_discovery_prefers_sitemap_and_filters_to_root():
 
     assert [item.title for item in items] == ["locking", "process tracking"]
     assert all("/cloud-native-platform/" in item.source_url for item in items)
-    assert items[0].last_modified == datetime(2026, 5, 25, 0, 0, tzinfo=timezone.utc)
+    # The page's Last-Modified (PAGE_HEADERS) is later than its lastmod.
+    assert items[0].last_modified == datetime(2026, 5, 26, 14, 51, 21, tzinfo=timezone.utc)
     assert items[0].extra["content_updated_at"] == "2026-05-25T00:00:00+00:00"
     assert items[0].version.startswith("sha256:")
     assert GitHubPagesGene.lists_scope(gene.config) is False
@@ -508,8 +509,12 @@ def _sitemap_with_lastmod(lastmod: str) -> str:
     )
 
 
-async def _sitemap_discovery(lastmod: str, since: datetime) -> list[ContentItem]:
-    gene = await sitemap_site(_sitemap_with_lastmod(lastmod)).connect({**SUBTREE_NONE, "root_url": SITE})
+async def _sitemap_discovery(
+    lastmod: str, since: datetime, *, page_headers: dict[str, str] | None = None
+) -> list[ContentItem]:
+    """Discover a sitemap page stamped ``lastmod``, whose response has ``page_headers`` (none by default)."""
+    site = Site({SITEMAP_URL: page(_sitemap_with_lastmod(lastmod))}, fallback=page(headers=page_headers or {}))
+    gene = await site.connect({**SUBTREE_NONE, "root_url": SITE})
     try:
         return [item async for item in gene.discover(since)]
     finally:
@@ -541,6 +546,58 @@ async def test_a_lastmod_without_an_offset_is_compared_at_utc_minus_12():
     assert [item.title for item in items] == ["guide"]
     assert items[0].last_modified == datetime(2026, 5, 26, 2, 0, tzinfo=timezone.utc)
     assert items[0].extra["content_updated_at"] == "2026-05-25T14:00:00+00:00"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lastmod", "marker", "source_time"),
+    [
+        ("2026-03-01T15:00+00:00", datetime(2026, 3, 1, 15, 0, 59, 999_999, tzinfo=timezone.utc), "2026-03-01T15:00:00+00:00"),
+        ("2026-03-01T15:00", datetime(2026, 3, 2, 3, 0, 59, 999_999, tzinfo=timezone.utc), "2026-03-01T15:00:00+00:00"),
+    ],
+    ids=["with-offset", "without-offset"],
+)
+async def test_a_lastmod_to_the_minute_finds_an_edit_later_in_that_minute(lastmod, marker, source_time):
+    # Edited at 15:00:30 and stamped to the minute; the cursor is 15:00:10.
+    items = await _sitemap_discovery(lastmod, datetime(2026, 3, 1, 15, 0, 10, tzinfo=timezone.utc))
+
+    assert [item.title for item in items] == ["guide"]
+    assert items[0].last_modified == marker
+    assert items[0].extra["content_updated_at"] == source_time
+
+
+@pytest.mark.asyncio
+async def test_a_lastmod_with_seconds_is_exact():
+    items = await _sitemap_discovery("2026-03-01T15:00:30Z", datetime(2026, 3, 1, 15, 0, 10, tzinfo=timezone.utc))
+
+    assert items[0].last_modified == datetime(2026, 3, 1, 15, 0, 30, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_a_page_deployed_after_its_lastmod_is_found_by_its_last_modified():
+    # Hugo wrote the 09:00 commit time; GitHub Pages deployed the page at
+    # 11:00, after a run started at 10:00.
+    items = await _sitemap_discovery(
+        "2026-05-25T09:00:00Z",
+        datetime(2026, 5, 25, 9, 50, tzinfo=timezone.utc),
+        page_headers={"Last-Modified": "Mon, 25 May 2026 11:00:00 GMT"},
+    )
+
+    assert [item.title for item in items] == ["guide"]
+    assert items[0].last_modified == datetime(2026, 5, 25, 11, 0, tzinfo=timezone.utc)
+    assert items[0].extra["content_updated_at"] == "2026-05-25T09:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_a_lastmod_after_the_last_modified_header_is_the_marker():
+    items = await _sitemap_discovery(
+        "2026-05-25T12:00:00Z",
+        datetime(2026, 5, 25, 11, 30, tzinfo=timezone.utc),
+        page_headers={"Last-Modified": "Mon, 25 May 2026 11:00:00 GMT"},
+    )
+
+    assert items[0].last_modified == datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc)
+    assert items[0].extra["content_updated_at"] == "2026-05-25T12:00:00+00:00"
 
 
 @pytest.mark.asyncio
