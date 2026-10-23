@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A local-agent Jira collection reads each listed issue with a one-issue
+  search in the Source's scope, `issuekey = <id> AND (<scope>)`, and, when
+  its comments are read apart, confirms its revision with another such
+  search. A search can write an issue's `updated` at a coarser precision
+  than an issue read, so a listed revision is compared only with another
+  search.
+
 - The Admin UI shows a Source's scope change in progress and offers a way
   back. Each row of `GET /sources` carries `scope_transition`: both scopes
   as canonical scope fields (`null` for a viewer who cannot read the
