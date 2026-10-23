@@ -21,6 +21,7 @@ export { Notice } from "./Notice";
 export { PageHeader } from "./PageHeader";
 export { Pagination } from "./Pagination";
 export { PropertyList, type Property } from "./PropertyList";
+export { SearchBox } from "./SearchBox";
 export { SegmentedControl, type SegmentedOption } from "./SegmentedControl";
 export { StatCard } from "./StatCard";
 export { StatusBadge } from "./StatusBadge";

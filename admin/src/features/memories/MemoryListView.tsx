@@ -1,13 +1,12 @@
-import { Info, Search } from "lucide-react";
-import { useEffect, useEffectEvent, useState, type ReactNode } from "react";
+import { Info } from "lucide-react";
+import type { ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import { pluralize } from "@/lib/format";
 import { errorMessage } from "@/lib/errors";
-import { DataTable, EmptyState, ErrorNotice, Pagination } from "@/patterns";
+import { DataTable, EmptyState, ErrorNotice, Pagination, SearchBox } from "@/patterns";
 import { Button } from "@/ui/button";
-import { Input } from "@/ui/input";
 import { useMemoryList } from "./api";
-import { LIST_PAGE_SIZE, SEARCH_DEBOUNCE_MS, SEARCH_RESULT_LIMIT } from "./constants";
+import { LIST_PAGE_SIZE, SEARCH_RESULT_LIMIT } from "./constants";
 import { MEMORY_COLUMNS } from "./memoryColumns";
 import { ActiveFilterChips, MemoryFiltersPopover } from "./MemoryFilters";
 import {
@@ -23,41 +22,6 @@ import { isHistorical, memoryStatusLabel, memoryTypeLabel } from "./model/memory
 import type { MemoryRow } from "./model/memoryRows";
 import { projectFilterOptions, projectName } from "./model/projects";
 import type { Project, SourceOption } from "./model/types";
-
-interface SearchBoxProps {
-  value: string;
-  onCommit: (value: string) => void;
-}
-
-/** Search text that reaches the URL once the user pauses typing. */
-function SearchBox({ value, onCommit }: SearchBoxProps) {
-  const [text, setText] = useState(value);
-  const [committed, setCommitted] = useState(value);
-  if (value !== committed) {
-    setCommitted(value);
-    setText(value);
-  }
-  const commit = useEffectEvent((next: string) => onCommit(next));
-  useEffect(() => {
-    if (text === committed) return;
-    const timer = setTimeout(() => commit(text), SEARCH_DEBOUNCE_MS);
-    return () => clearTimeout(timer);
-  }, [text, committed]);
-
-  return (
-    <div className="relative w-full max-w-sm">
-      <Search aria-hidden className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-      <Input
-        type="search"
-        value={text}
-        onChange={(event) => setText(event.target.value)}
-        placeholder="Search memories"
-        aria-label="Search memories"
-        className="pl-8"
-      />
-    </div>
-  );
-}
 
 function rankedSearchNotice(state: MemoriesPageState, project: string): string {
   const scope =
@@ -101,6 +65,7 @@ export function MemoryListView({ state, onStateChange, viewSwitch, projects, sou
       <div className="flex flex-wrap items-center gap-2">
         {viewSwitch}
         <SearchBox
+          label="Search memories"
           value={state.query}
           onCommit={(query) => onStateChange(changePageState(state, { query }), { replace: true })}
         />
