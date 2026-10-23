@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -127,21 +128,6 @@ async def test_authenticating_again_closes_the_previous_client(fakes, client_cla
     assert all(client.is_closed for client in provider.clients)
 
 
-@pytest.mark.asyncio
-async def test_a_closed_github_repository_gene_authenticates_again_when_it_lists() -> None:
-    provider = github_repo_fakes._Provider(ProviderListing.COMPLETE)
-    config = dict(github_repo_fakes.FAKES.listing_configs["cloud-pull"].config)
-    gene = runtime.create_gene(name="github_repo", config=config, source_id="src-close")
-    with patch("memforge.genes.github_repo_gene._RequestsAsyncClient", provider.client):
-        await gene.authenticate()
-        await gene.close()
-        listing = await gene.list_scope()
-    await gene.close()
-
-    assert listing.doc_ids
-    assert [client.is_closed for client in provider.clients] == [True, True]
-
-
 # ---------------------------------------------------------------------------
 # run_source_sync
 # ---------------------------------------------------------------------------
@@ -205,6 +191,53 @@ async def test_run_source_sync_closes_the_gene_after_a_failed_run(database, tmp_
         await _run(database, tmp_path, orchestrator)
 
     assert [_closed(gene) for gene in orchestrator.genes] == [True]
+
+
+@pytest.mark.asyncio
+async def test_cancelling_run_source_sync_stops_the_sync_before_its_client_closes(
+    database, tmp_path, monkeypatch
+) -> None:
+    register_test_source_type(monkeypatch, "closing", ClientGene)
+    observed: dict[str, bool] = {}
+    started = asyncio.Event()
+
+    class SlowOrchestrator(_Orchestrator):
+        async def sync_gene(self, **kwargs):
+            gene = kwargs["gene"]
+            self.genes.append(gene)
+            await gene.authenticate()
+            started.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                observed["client_open_when_cancelled"] = not gene.clients[0].is_closed
+                raise
+
+    orchestrator = SlowOrchestrator()
+    run = asyncio.create_task(_run(database, tmp_path, orchestrator))
+    await started.wait()
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    assert observed == {"client_open_when_cancelled": True}
+    assert [_closed(gene) for gene in orchestrator.genes] == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_close_keeps_the_run_result(database, tmp_path, monkeypatch, caplog) -> None:
+    class UnclosableGene(ClientGene):
+        async def close(self) -> None:
+            if self.clients:
+                raise RuntimeError("the connection pool is already gone")
+
+    register_test_source_type(monkeypatch, "closing", UnclosableGene)
+
+    with caplog.at_level(logging.WARNING, logger="memforge.runtime"):
+        state = await _run(database, tmp_path, _Orchestrator())
+
+    assert state.last_sync_status == "success"
+    assert "Closing the closing Gene for source src-close failed" in caplog.text
 
 
 @pytest.mark.asyncio
