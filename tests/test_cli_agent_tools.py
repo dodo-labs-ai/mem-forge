@@ -12,6 +12,7 @@ from click.testing import CliRunner
 
 import memforge.main as main
 from memforge.api_target import MemForgeTarget, build_target
+from memforge.genes.jira_gene import JiraGene
 from memforge.local_agent import folder_picker
 from memforge.local_agent.runner import CloudJobLeaseLost
 from memforge.main import cli
@@ -2190,6 +2191,8 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
     built: list = []
 
     class FakeJiraGene:
+        config_schema = JiraGene.config_schema
+
         def __init__(self, config, source_id):
             self.config = config
             self.source_id = source_id
@@ -2352,6 +2355,8 @@ def test_local_agent_cloud_jira_sync_rejects_issue_changed_after_inventory(monke
     built: list = []
 
     class ConcurrentUpdateJiraGene:
+        config_schema = JiraGene.config_schema
+
         def __init__(self, config, source_id):
             self.config = config
             self.source_id = source_id
@@ -2444,6 +2449,83 @@ def test_local_agent_cloud_jira_sync_rejects_pat_payload():
     assert not [call for call in FakeToolClient.calls if call[0] == "push_jira_package"]
 
 
+def _jira_sync_job(**payload) -> dict:
+    return {
+        "job_id": "laj-jira-sync",
+        "attempt_count": 1,
+        "workspace_id": "ws-from-cloud",
+        "operation": "jira_sync",
+        "source_id": "src-jira",
+        "payload": {
+            "base_url": "https://jira.example.test",
+            "auth_mode": "browser_cookie",
+            "sync_mode": "local_agent",
+            "projects": ["PAY"],
+            **payload,
+        },
+    }
+
+
+def test_local_agent_cloud_jira_sync_refuses_an_odd_boolean_before_capturing_a_session(monkeypatch):
+    from memforge.auth import jira_capture
+
+    captures: list[str] = []
+
+    async def fake_capture(base_url, *, browser=None, tls_config=None):
+        captures.append(base_url)
+        raise AssertionError("a configuration no run can use must not capture a browser session")
+
+    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
+    FakeToolClient.reset({"doc_id": "jira-doc", "document_hash": "hash"})
+
+    payload = main._run_cloud_local_agent_job(
+        _jira_sync_job(include_comments="sometimes"), _cloud_test_client(), browser="chrome"
+    )
+
+    assert payload["error_type"] == "SourceConfigurationError"
+    assert "include_comments" in payload["error"]
+    assert payload["retryable"] is False
+    assert captures == []
+    assert not [call for call in FakeToolClient.calls if call[0] == "upload_jira_session"]
+
+
+def test_local_agent_cloud_jira_sync_does_not_retry_a_rejected_jql(monkeypatch):
+    from memforge.auth import jira_capture
+    import memforge.genes.jira_gene as jira_gene
+    from memforge.genes.jira_gene import JiraQueryRejected
+
+    async def fake_capture(base_url, *, browser=None, tls_config=None):
+        return jira_capture.JiraCaptureResult(
+            origin=base_url, cookie_header="JSESSIONID=local", browser=browser, principal={"name": "tester"}
+        )
+
+    class RejectingJiraGene:
+        config_schema = JiraGene.config_schema
+
+        def __init__(self, config, source_id):
+            self.closed = False
+
+        async def authenticate(self):
+            return None
+
+        async def discover_inventory(self):
+            raise JiraQueryRejected("Jira rejected the JQL (HTTP 400): project 'GONE' does not exist")
+            yield
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
+    monkeypatch.setattr(jira_gene, "JiraGene", RejectingJiraGene)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "jira-doc", "document_hash": "hash"})
+
+    payload = main._run_cloud_local_agent_job(_jira_sync_job(), _cloud_test_client(), browser="chrome")
+
+    assert payload["error_type"] == "JiraQueryRejected"
+    assert payload["retryable"] is False
+
+
 def test_local_agent_cloud_jira_noop_uses_inventory_without_hydrating_issues(monkeypatch):
     from datetime import datetime, timezone
 
@@ -2451,6 +2533,8 @@ def test_local_agent_cloud_jira_noop_uses_inventory_without_hydrating_issues(mon
     from memforge.models import ContentItem
 
     class FakeJiraGene:
+        config_schema = JiraGene.config_schema
+
         def __init__(self, config, source_id):
             self.config = config
             self.source_id = source_id
@@ -2530,6 +2614,7 @@ def _confirming_jira_gene(
     from memforge.models import AbsenceAnswer, ContentItem
 
     class ConfirmingJiraGene:
+        config_schema = JiraGene.config_schema
         configs: list[dict] = []
 
         def __init__(self, config, source_id):
@@ -2864,6 +2949,8 @@ def test_local_agent_cloud_jira_sync_does_not_publish_partial_snapshot(monkeypat
     from memforge.models import ContentItem, RawContent
 
     class FakeJiraGene:
+        config_schema = JiraGene.config_schema
+
         def __init__(self, config, source_id):
             self.config = config
             self.source_id = source_id

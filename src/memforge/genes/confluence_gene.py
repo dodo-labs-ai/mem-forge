@@ -24,7 +24,7 @@ from memforge.genes.atlassian_auth import (
 )
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.document_gene import DocumentGene
-from memforge.genes.toolkit.config import bearer_headers, bool_config, require_https_base_url, tls_verify
+from memforge.genes.toolkit.config import bearer_headers, bool_config, list_config, require_https_base_url, tls_verify
 from memforge.genes.confluence_artifacts import resolve_current_confluence_artifacts
 from memforge.genes.confluence_pdf import export_confluence_page_pdf
 from memforge.source_time import SOURCE_UPDATED_AT_KEY
@@ -202,7 +202,7 @@ class ConfluenceGene(DocumentGene):
         elif "api_prefix" in config:
             config["api_prefix"] = cls._normalize_api_prefix(config.get("api_prefix"))
 
-        if parsed.get("space_key") and not cls._space_keys(config.get("spaces")):
+        if parsed.get("space_key") and not list_config(config.get("spaces")):
             config["spaces"] = [parsed["space_key"]]
         if parsed.get("page_id") and not str(config.get("page_tree_root") or "").strip():
             config["page_tree_root"] = parsed["page_id"]
@@ -274,14 +274,6 @@ class ConfluenceGene(DocumentGene):
         if not text or text == "/":
             return ""
         return "/" + text.strip("/")
-
-    @staticmethod
-    def _space_keys(value: object) -> list[str]:
-        if isinstance(value, list):
-            return [str(item).strip() for item in value if str(item).strip()]
-        if isinstance(value, str):
-            return [part.strip() for part in value.split(",") if part.strip()]
-        return []
 
     @classmethod
     def _effective_sync_mode(cls, config: dict) -> str:
@@ -368,7 +360,7 @@ class ConfluenceGene(DocumentGene):
                 yield item
             return
 
-        spaces = self._space_keys(self.config.get("spaces"))
+        spaces = list_config(self.config.get("spaces"))
         if not spaces:
             raise SourceConfigurationError("Confluence Spaces to Sync is required when syncing whole spaces")
         for space_key in spaces:
@@ -445,7 +437,7 @@ class ConfluenceGene(DocumentGene):
             if page_tree
             else self._is_page(page)
             and self._page_status(page) == _CURRENT_PAGE_STATUS
-            and str((page.get("space") or {}).get("key") or "") in self._space_keys(self.config.get("spaces"))
+            and str((page.get("space") or {}).get("key") or "") in list_config(self.config.get("spaces"))
         )
         if not listed:
             return None
