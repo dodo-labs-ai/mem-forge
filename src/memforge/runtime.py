@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from memforge.config import AppConfig
 from memforge.evals.agent_evaluation import (
@@ -970,10 +970,13 @@ def excluded_scope_gene_factory(source: Mapping[str, Any], source_config: Mappin
     @contextlib.asynccontextmanager
     async def excluded_scope_gene(scope: Mapping[str, object]) -> AsyncIterator[DocumentGene]:
         try:
-            gene = create_gene(
-                name=source_type,
-                config=excluded_scope_config(source_type, source_config, scope),
-                source_id=str(source["id"]),
+            gene = cast(
+                DocumentGene,
+                create_gene(
+                    name=source_type,
+                    config=excluded_scope_config(source_type, source_config, scope),
+                    source_id=str(source["id"]),
+                ),
             )
         except ValueError as exc:
             raise SourceConfigurationError(f"The excluded scope {dict(scope)} cannot be configured: {exc}") from exc
@@ -1052,6 +1055,7 @@ async def run_source_sync(
             config=source_config,
             source_id=source["id"],
         )
+        sync_task: asyncio.Task[Any] | None = None
         try:
             sync_kwargs: dict[str, Any] = {
                 "gene": gene,
@@ -1087,7 +1091,16 @@ async def run_source_sync(
                 raise SourceSyncActivityConflict(f"source activity heartbeat stopped: {activity_id}")
             return await sync_task
         finally:
-            await gene.close()
+            # A cancelled caller leaves the sync task running; stop it before its client closes.
+            if sync_task is not None and not sync_task.done():
+                sync_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await sync_task
+            try:
+                await gene.close()
+            except Exception:
+                # The run's own result or error is what callers act on; a failed release must not replace it.
+                logger.warning("Closing the %s Gene for source %s failed", source["type"], source["id"], exc_info=True)
     finally:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
