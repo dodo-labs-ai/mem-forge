@@ -19,10 +19,9 @@ from urllib.parse import urlsplit
 import httpx
 
 from memforge.genes.atlassian_auth import (
+    atlassian_fail_fast,
     atlassian_record_state,
     atlassian_request_limiter,
-    request_with_rate_limit_retry,
-    stream_with_rate_limit_retry,
 )
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.document_gene import DocumentGene
@@ -34,6 +33,7 @@ from memforge.genes.local_adapter_packages import (
     source_artifacts_from_package,
 )
 from memforge.genes.toolkit.config import bearer_headers, bool_config, require_https_base_url, tls_verify
+from memforge.genes.toolkit.http import ConnectorHttpClient
 from memforge.genes.toolkit.local_packages import device_packages
 from memforge.genes.toolkit.paging import OffsetPage, PagingErrors, paged_by_offset
 from memforge.local_agent.jira_contract import validate_jira_observation_identities
@@ -525,29 +525,28 @@ class JiraGene(DocumentGene):
         if sync_mode == "local_agent":
             if has_package_manifest(self.config):
                 self._client = None
-                self._request_limiter = None
                 self._hydrated_issues = {}
                 logger.info("Jira client using local-agent package manifest")
                 return
             local_documents_dir = self._local_agent_documents_dir()
             local_documents_dir.mkdir(parents=True, exist_ok=True)
             self._client = None
-            self._request_limiter = None
             self._hydrated_issues = {}
             logger.info("Jira client using local-agent package inbox: %s", local_documents_dir)
             return
-        client = httpx.AsyncClient(
+        self._client = ConnectorHttpClient(
+            product_name="Jira",
             base_url=base_url,
             headers=_jira_headers(self.config),
             timeout=httpx.Timeout(JIRA_READ_TIMEOUT_SECONDS, connect=JIRA_CONNECT_TIMEOUT_SECONDS),
-            follow_redirects=True,
             verify=tls_verify(self.config),
-        )
-        self._client = client
-        self._request_limiter = atlassian_request_limiter(
-            base_url,
-            min_interval_seconds=_request_interval_seconds(self.config),
-            owner_id=self.source_id,
+            follow_redirects=True,
+            limiter=atlassian_request_limiter(
+                base_url,
+                min_interval_seconds=_request_interval_seconds(self.config),
+                owner_id=self.source_id,
+            ),
+            fail_fast=atlassian_fail_fast("Jira", _zero_quota_message(mode)),
         )
         self._hydrated_issues: dict[str, dict] = {}
         logger.info("Jira client prepared with %s auth: %s", mode, base_url)
@@ -758,7 +757,7 @@ class JiraGene(DocumentGene):
             if not validate_query:
                 request_body["validateQuery"] = False
             try:
-                resp = await self._request("POST", "/rest/api/2/search", json_body=request_body)
+                resp = await self._request("POST", "/rest/api/2/search", json_body=request_body, safe_read=True)
                 data = resp.json()
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 400:
@@ -780,18 +779,18 @@ class JiraGene(DocumentGene):
         *,
         params: dict | None = None,
         json_body: dict | None = None,
+        safe_read: bool = False,
     ) -> httpx.Response:
+        """Send one Jira REST request, raising ``httpx.HTTPStatusError`` for an error status.
+
+        A search is sent as ``POST`` but only reads, so it passes
+        ``safe_read=True`` and a server error is retried as for ``GET``. An
+        expired browser session (401 in cookie mode) raises ``RuntimeError``
+        asking for a fresh cookie.
+        """
+        resp = await self._client.request(method, url, params=params, json=json_body, safe_read=safe_read)
         try:
-            return await request_with_rate_limit_retry(
-                self._client,
-                method,
-                url,
-                product_name="Jira",
-                params=params,
-                json_body=json_body,
-                limiter=getattr(self, "_request_limiter", None),
-                zero_quota_message=_zero_quota_message(getattr(self, "_auth_mode", _auth_mode(self.config))),
-            )
+            resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             if (
                 getattr(self, "_auth_mode", _auth_mode(self.config)) == JIRA_AUTH_MODE_COOKIE
@@ -799,6 +798,7 @@ class JiraGene(DocumentGene):
             ):
                 raise RuntimeError("Jira browser session cookie expired or is not accepted. Refresh the cookie.") from exc
             raise
+        return resp
 
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full issue data with comments and links."""
@@ -958,16 +958,8 @@ class JiraGene(DocumentGene):
         request_path = str(artifact.locator.get("request_path") or "").strip()
         if not request_path:
             raise SourceArtifactContractError("Jira attachment locator is incomplete")
-        async with stream_with_rate_limit_retry(
-            self._client,
-            "GET",
-            request_path,
-            product_name="Jira",
-            limiter=getattr(self, "_request_limiter", None),
-            zero_quota_message=_zero_quota_message(
-                getattr(self, "_auth_mode", _auth_mode(self.config))
-            ),
-        ) as response:
+        async with self._client.stream("GET", request_path) as response:
+            response.raise_for_status()
             yield SourceArtifactDownload(
                 chunks=response.aiter_bytes(),
                 media_type=response.headers.get("content-type"),

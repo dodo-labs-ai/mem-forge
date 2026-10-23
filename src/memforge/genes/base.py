@@ -182,7 +182,15 @@ class Gene(ABC):
 
             async def authenticate(self) -> None:
                 await self.close()
-                self._client = httpx.AsyncClient(base_url=self.config["base_url"])
+                self._client = ConnectorHttpClient(
+                    product_name="Wiki",
+                    base_url=self.config["base_url"],
+                    timeout=30.0,
+                    follow_redirects=True,
+                )
+
+        :class:`memforge.genes.toolkit.http.ConnectorHttpClient` retries and
+        paces the requests the same way for every connector.
 
         Raises
         ------
@@ -298,8 +306,8 @@ class Gene(ABC):
             finally:
                 await gene.close()
 
-        The client is anything with an async ``aclose()``, such as an
-        ``httpx.AsyncClient``. A Gene without one, like ``local_markdown``,
+        The client is anything with an async ``aclose()``, such as a
+        ``ConnectorHttpClient``. A Gene without one, like ``local_markdown``,
         has nothing to release. Calling ``close()`` twice, or before
         ``authenticate``, does nothing.
 

@@ -50,6 +50,9 @@ STATUSES_THAT_RAISE = (
     httpx.codes.INTERNAL_SERVER_ERROR,
     httpx.codes.SERVICE_UNAVAILABLE,
 )
+# Statuses that ask the client to wait: it retries them for any method, then
+# raises once its attempts run out.
+STATUSES_RETRIED = (httpx.codes.TOO_MANY_REQUESTS, httpx.codes.SERVICE_UNAVAILABLE)
 
 
 def _gene_class(source_type: str) -> type[DocumentGene]:
@@ -97,8 +100,8 @@ QUERY_TYPES = [
 
 
 @pytest.fixture(autouse=True)
-def unpaced_requests(monkeypatch):
-    """Give each test its own Atlassian origin limiters, without a gap between requests."""
+def own_origin_limiters(monkeypatch):
+    """Give each test its own Atlassian origin limiters; the fakes' stub sleep skips their gaps."""
     monkeypatch.setattr("memforge.genes.atlassian_auth._ATLASSIAN_REQUEST_LIMITERS", {})
 
 
@@ -261,14 +264,28 @@ async def test_a_device_collected_configuration_lists_through_its_manifest(sourc
 @pytest.mark.parametrize("status", [*STATUS_ANSWERS, *STATUSES_THAT_RAISE], ids=str)
 @pytest.mark.parametrize("source_type", QUERY_TYPES)
 async def test_confirm_absent_maps_each_provider_status(source_type, status) -> None:
-    async with fakes_for(source_type).reading_by_id(status) as (gene, items):
+    async with fakes_for(source_type).reading_by_id(status) as (connection, items):
         assert items
         if status in STATUS_ANSWERS:
-            answers = await gene.confirm_absent(items)
+            answers = await connection.gene.confirm_absent(items)
             assert answers == {item.item_id: STATUS_ANSWERS[status] for item in items}
         else:
             with pytest.raises(Exception):  # noqa: B017 - any error leaves the run's absence unproven
-                await gene.confirm_absent(items)
+                await connection.gene.confirm_absent(items)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", STATUSES_RETRIED, ids=str)
+@pytest.mark.parametrize("source_type", QUERY_TYPES)
+async def test_confirm_absent_retries_a_provider_that_asks_to_wait_then_raises(source_type, status) -> None:
+    async with fakes_for(source_type).reading_by_id(status) as (connection, items):
+        with pytest.raises(Exception):  # noqa: B017 - any error leaves the run's absence unproven
+            await connection.gene.confirm_absent(items)
+
+    # The read was sent again after a wait, and the retries ended.
+    read = connection.requests[-1]
+    assert connection.requests.count(read) > 1
+    assert connection.waits
 
 
 # ---------------------------------------------------------------------------

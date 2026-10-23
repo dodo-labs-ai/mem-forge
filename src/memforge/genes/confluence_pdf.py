@@ -1,4 +1,17 @@
-"""Local Confluence HTML-to-PDF export for PAT-authenticated pages."""
+"""Local Confluence HTML-to-PDF export for PAT-authenticated pages.
+
+The export reads the page's export HTML through the Gene's
+``ConnectorHttpClient``, downloads the page's same-origin images, and renders
+the result locally. Images and rendering share one budget of
+``PDF_EXPORT_TIMEOUT_SECONDS``; an export that outlasts it produces no PDF.
+
+Image downloads go past the Atlassian origin limiter: a page may carry up to
+``MAX_IMAGE_ASSETS`` images, and pacing them at the origin's interval (2 s for
+Confluence) would spend the whole budget on 60 images. They keep their own
+short retry (``IMAGE_RETRY``), and no retry wait may end after the budget
+does; an image that still fails is left blank, and the page renders without
+it.
+"""
 
 from __future__ import annotations
 
@@ -9,14 +22,14 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from memforge.genes.atlassian_auth import get_with_rate_limit_retry
+from memforge.genes.toolkit.http import ConnectorHttpClient, RetryPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -29,39 +42,35 @@ IMAGE_FETCH_TIMEOUT_SECONDS = 10.0
 IMAGE_STREAM_CHUNK_BYTES = 64 * 1024
 IMAGE_DOWNLOAD_CONCURRENCY = 4
 PDF_EXPORT_TIMEOUT_SECONDS = 120.0
+# An image is worth less than the page it illustrates: a few quick attempts,
+# and a long Retry-After costs an image rather than the export budget.
+IMAGE_RETRY = RetryPolicy(attempts=3, backoff_seconds=1.0, max_wait_seconds=10.0)
 
 
 async def export_confluence_page_pdf(
     *,
-    client,
+    client: ConnectorHttpClient,
     base_url: str,
     api_prefix: str,
     page_id: str,
     title: str,
     render_pdf: RenderPdf | None = None,
     work_dir: Path | None = None,
-    limiter: Any | None = None,
 ) -> bytes | None:
-    """Render a Confluence page's REST export HTML to a local PDF."""
+    """Render a Confluence page's REST export HTML to a local PDF.
+
+    The page itself is read like any other Confluence request, through the
+    client's limiter and retries; its images are not (module docstring).
+    """
     renderer = render_pdf if render_pdf is not None else default_pdf_renderer()
     if renderer is None:
         logger.warning("PDF renderer not found; skipping PDF export for %s", title)
         return None
 
-    request_url = f"{api_prefix}/rest/api/content/{page_id}"
-    if limiter is not None:
-        resp = await get_with_rate_limit_retry(
-            client,
-            request_url,
-            product_name="Confluence",
-            params={"expand": "body.export_view,body.view"},
-            limiter=limiter,
-        )
-    else:
-        resp = await client.get(
-            request_url,
-            params={"expand": "body.export_view,body.view"},
-        )
+    resp = await client.get(
+        f"{api_prefix}/rest/api/content/{page_id}",
+        params={"expand": "body.export_view,body.view"},
+    )
     resp.raise_for_status()
     data = resp.json()
     html = (
@@ -99,7 +108,7 @@ async def export_confluence_page_pdf(
 
 async def _render_with_timeout(
     *,
-    client,
+    client: ConnectorHttpClient,
     html: str,
     title: str,
     base_url: str,
@@ -107,6 +116,7 @@ async def _render_with_timeout(
     renderer: RenderPdf,
     work_dir: Path,
 ) -> bytes | None:
+    deadline = time.monotonic() + PDF_EXPORT_TIMEOUT_SECONDS
     try:
         return await asyncio.wait_for(
             _render_with_assets(
@@ -117,6 +127,7 @@ async def _render_with_timeout(
                 api_prefix=api_prefix,
                 renderer=renderer,
                 work_dir=work_dir,
+                deadline=deadline,
             ),
             timeout=PDF_EXPORT_TIMEOUT_SECONDS,
         )
@@ -176,13 +187,14 @@ def _looks_like_complete_pdf(pdf_bytes: bytes) -> bool:
 
 async def _render_with_assets(
     *,
-    client,
+    client: ConnectorHttpClient,
     html: str,
     title: str,
     base_url: str,
     api_prefix: str,
     renderer: RenderPdf,
     work_dir: Path,
+    deadline: float,
 ) -> bytes | None:
     assets_dir = work_dir / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
@@ -192,6 +204,7 @@ async def _render_with_assets(
         base_url=base_url,
         api_prefix=api_prefix,
         assets_dir=assets_dir,
+        deadline=deadline,
     )
     html_path = work_dir / "page.html"
     html_path.write_text(_wrap_html(title, html), encoding="utf-8")
@@ -200,11 +213,12 @@ async def _render_with_assets(
 
 async def _rewrite_image_sources(
     *,
-    client,
+    client: ConnectorHttpClient,
     html: str,
     base_url: str,
     api_prefix: str,
     assets_dir: Path,
+    deadline: float,
 ) -> str:
     soup = BeautifulSoup(html, "html.parser")
     _remove_active_content(soup)
@@ -226,7 +240,7 @@ async def _rewrite_image_sources(
         if url is None:
             return src, "", None
         async with semaphore:
-            image = await _download_image_asset(client=client, url=url, budget=budget)
+            image = await _download_image_asset(client=client, url=url, budget=budget, deadline=deadline)
         return src, url, image
 
     replacements: dict[str, str] = {}
@@ -258,7 +272,9 @@ async def _rewrite_image_sources(
     return str(soup)
 
 
-async def _download_image_asset(client, url: str, budget: "_AssetBudget") -> tuple[bytes, str] | None:
+async def _download_image_asset(
+    client: ConnectorHttpClient, url: str, budget: "_AssetBudget", deadline: float
+) -> tuple[bytes, str] | None:
     reserved_bytes = 0
     committed = False
     content = bytearray()
@@ -269,6 +285,9 @@ async def _download_image_asset(client, url: str, budget: "_AssetBudget") -> tup
             url,
             headers={"Accept": "*/*"},
             timeout=IMAGE_FETCH_TIMEOUT_SECONDS,
+            limited=False,
+            retry=IMAGE_RETRY,
+            deadline=deadline,
         ) as resp:
             resp.raise_for_status()
             declared_size = _content_length(resp.headers.get("content-length"))

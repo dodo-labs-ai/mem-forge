@@ -6,6 +6,8 @@ you need from its module::
 
     from memforge.genes.toolkit.config import bool_config, tls_verify
 
+- :mod:`memforge.genes.toolkit.http` sends a connector's HTTP requests,
+  retrying and pacing them by one policy.
 - :mod:`memforge.genes.toolkit.config` reads configuration values: booleans,
   integers, lists, personal access tokens, TLS trust and HTTPS base URLs.
 - :mod:`memforge.genes.toolkit.local_packages` reads the packages a device

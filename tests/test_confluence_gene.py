@@ -7,10 +7,12 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from memforge.genes import confluence_gene
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.confluence_gene import ConfluenceGene, PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY
 from memforge.models import AbsenceAnswer, ContentItem
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
+from tests.connector_http_fixture import FakeConnectorHttp
 from tests.tls_bundle_fixture import BUNDLE_CA_COUNT, trusted_ca_count, write_ca_bundle
 
 
@@ -126,40 +128,6 @@ class BinaryResponse:
 class NotFoundClient:
     async def request(self, _method: str, _url: str, **_kwargs):
         return JsonResponse({}, status_code=404)
-
-    async def get(self, url: str, **kwargs):
-        return await self.request("GET", url, **kwargs)
-
-
-class RateLimitedThenSuccessClient:
-    def __init__(self):
-        self.calls: list[str] = []
-
-    async def request(self, _method: str, url: str, **_kwargs):
-        self.calls.append(url)
-        if len(self.calls) == 1:
-            return JsonResponse({}, status_code=429, headers={"Retry-After": "1"})
-        return JsonResponse(
-            {
-                "id": "123",
-                "title": "Root Page",
-                "space": {"key": "PAY"},
-                "version": {"number": 7, "when": "2026-05-24T00:00:00Z"},
-                "_links": {"webui": "/display/PAY/Root+Page"},
-            }
-        )
-
-    async def get(self, url: str, **kwargs):
-        return await self.request("GET", url, **kwargs)
-
-
-class AlwaysRateLimitedClient:
-    def __init__(self):
-        self.calls: list[str] = []
-
-    async def request(self, _method: str, url: str, **_kwargs):
-        self.calls.append(url)
-        return JsonResponse({}, status_code=429, headers={"Retry-After": "1"})
 
     async def get(self, url: str, **kwargs):
         return await self.request("GET", url, **kwargs)
@@ -457,7 +425,6 @@ async def test_open_source_artifact_streams_confluence_attachment():
         base_url="https://wiki.example.test",
         transport=httpx.MockTransport(handler),
     )
-    gene._request_limiter = None
     artifact = RawSourceArtifact(
         provider_key="att-42",
         parent_observation_type="page_body",
@@ -930,67 +897,85 @@ async def test_a_page_tree_root_confluence_does_not_return_is_a_configuration_er
         ]
 
 
-@pytest.mark.asyncio
-async def test_page_tree_discovery_retries_confluence_rate_limit(monkeypatch):
-    sleep_calls: list[float] = []
+async def _authenticated_root_page_gene(*root_answers: httpx.Response) -> tuple[ConfluenceGene, FakeConnectorHttp, list[str]]:
+    """A page-tree Gene authenticated through its real client; reads of root page 123 answer ``root_answers`` in turn."""
+    answers = list(root_answers)
+    reads: list[str] = []
 
-    async def fake_sleep(delay: float) -> None:
-        sleep_calls.append(delay)
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/wiki/rest/api/space":
+            return httpx.Response(200, json={"results": []})
+        reads.append(request.url.path)
+        return answers.pop(0) if len(answers) > 1 else answers[0]
 
-    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", fake_sleep)
-    client = RateLimitedThenSuccessClient()
+    http = FakeConnectorHttp(handle)
     gene = ConfluenceGene(
-        config={
-            "base_url": "https://wiki.example.com",
-            "page_tree_root": "123",
-            "include_children": False,
-        },
+        config={"base_url": "https://wiki.example.com", "page_tree_root": "123", "include_children": False, "pat": "t"},
         source_id="src-confluence",
     )
-    gene._base_url = "https://wiki.example.com"
-    gene._api_prefix = "/wiki"
-    gene._client = client
+    with http.serving(confluence_gene):
+        await gene.authenticate()
+    return gene, http, reads
 
-    items = [
-        item
-        async for item in gene.discover(
-            since=datetime(2026, 5, 20, tzinfo=timezone.utc),
-        )
-    ]
+
+@pytest.mark.asyncio
+async def test_page_tree_discovery_retries_confluence_rate_limit():
+    root = {
+        "id": "123",
+        "title": "Root Page",
+        "space": {"key": "PAY"},
+        "version": {"number": 7, "when": "2026-05-24T00:00:00Z"},
+        "_links": {"webui": "/display/PAY/Root+Page"},
+    }
+    gene, http, reads = await _authenticated_root_page_gene(
+        httpx.Response(429, headers={"Retry-After": "1"}), httpx.Response(200, json=root)
+    )
+    try:
+        items = [item async for item in gene.discover(since=datetime(2026, 5, 20, tzinfo=timezone.utc))]
+    finally:
+        await gene.close()
 
     assert [item.title for item in items] == ["Root Page"]
-    assert client.calls == ["/wiki/rest/api/content/123", "/wiki/rest/api/content/123"]
-    assert sleep_calls == [1.0]
+    assert reads == ["/wiki/rest/api/content/123", "/wiki/rest/api/content/123"]
+    assert http.waits[0] == 1.0
 
 
 @pytest.mark.asyncio
-async def test_page_tree_discovery_reports_confluence_rate_limit_after_retries(monkeypatch):
-    async def fake_sleep(_delay: float) -> None:
-        return None
+async def test_page_tree_discovery_reports_confluence_rate_limit_after_retries():
+    gene, _http, reads = await _authenticated_root_page_gene(httpx.Response(429, headers={"Retry-After": "1"}))
+    try:
+        with pytest.raises(RuntimeError, match="Confluence rate limit persisted"):
+            _ = [item async for item in gene.discover(since=datetime(2026, 5, 20, tzinfo=timezone.utc))]
+    finally:
+        await gene.close()
 
-    monkeypatch.setattr("memforge.genes.atlassian_auth.asyncio.sleep", fake_sleep)
-    client = AlwaysRateLimitedClient()
-    gene = ConfluenceGene(
-        config={
-            "base_url": "https://wiki.example.com",
-            "page_tree_root": "123",
-            "include_children": False,
-        },
-        source_id="src-confluence",
-    )
-    gene._base_url = "https://wiki.example.com"
-    gene._api_prefix = "/wiki"
-    gene._client = client
+    assert len(reads) == 4
 
-    with pytest.raises(RuntimeError, match="Confluence rate limit persisted"):
-        [
-            item
-            async for item in gene.discover(
-                since=datetime(2026, 5, 20, tzinfo=timezone.utc),
-            )
-        ]
 
-    assert len(client.calls) == 4
+@pytest.mark.asyncio
+async def test_page_tree_discovery_retries_a_confluence_server_error():
+    root = _page("123", "Root Page", "2026-05-24T00:00:00Z")
+    gene, http, reads = await _authenticated_root_page_gene(httpx.Response(502), httpx.Response(200, json=root))
+    try:
+        items = [item async for item in gene.discover(since=datetime(2026, 5, 20, tzinfo=timezone.utc))]
+    finally:
+        await gene.close()
+
+    assert [item.title for item in items] == ["Root Page"]
+    assert len(reads) == 2
+
+
+@pytest.mark.asyncio
+async def test_confluence_reports_zero_rest_quota_without_retrying():
+    zero_quota = httpx.Response(429, headers={"X-RateLimit-Limit": "0", "X-RateLimit-FillRate": "0"})
+    gene, _http, reads = await _authenticated_root_page_gene(zero_quota)
+    try:
+        with pytest.raises(RuntimeError, match="Confluence REST API quota is zero"):
+            _ = [item async for item in gene.discover(since=datetime(2026, 5, 20, tzinfo=timezone.utc))]
+    finally:
+        await gene.close()
+
+    assert len(reads) == 1
 
 
 @pytest.mark.asyncio
@@ -1174,7 +1159,6 @@ async def test_confirming_unlisted_pages_keeps_a_page_moved_out_of_the_tree():
         return httpx.Response(status, json=_page(page_id, "Page", "2026-05-20T00:00:00Z") if status == httpx.codes.OK else {})
 
     gene = _page_tree_gene(httpx.AsyncClient(base_url="https://wiki.example.com", transport=httpx.MockTransport(handler)))
-    gene._request_limiter = None
     items = [
         ContentItem(
             item_id=f"confluence-{page_id}",
@@ -1204,7 +1188,6 @@ async def test_confirming_unlisted_pages_fails_when_confluence_rejects_the_crede
         return httpx.Response(httpx.codes.UNAUTHORIZED, json={})
 
     gene = _page_tree_gene(httpx.AsyncClient(base_url="https://wiki.example.com", transport=httpx.MockTransport(handler)))
-    gene._request_limiter = None
     item = ContentItem(
         item_id="confluence-page",
         title="Page",

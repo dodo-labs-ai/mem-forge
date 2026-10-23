@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from memforge import runtime
 from memforge.config import AppConfig
 from memforge.storage.database import Database
+from memforge.genes import confluence_gene, jira_gene
 from memforge.genes.base import SourceConfigurationError
 from memforge.models import ContentItem, SyncState
 from tests.contracts.document_fakes import ProviderListing
@@ -100,32 +101,46 @@ async def test_close_releases_the_client_once_and_logs_it(caplog) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _serving_connector_http(gene_module):
+    """Serve the Gene's ``ConnectorHttpClient`` from the fake provider; it lists the clients it built."""
+
+    def serve(provider):
+        return provider.http.serving(gene_module), provider.http.clients
+
+    return serve
+
+
+def _serving_requests_client(client_class: str):
+    def serve(provider):
+        return patch(client_class, provider.client), provider.clients
+
+    return serve
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("fakes", "client_class"),
+    ("fakes", "serve"),
     [
-        (confluence_fakes, "httpx.AsyncClient"),
-        (jira_fakes, "httpx.AsyncClient"),
-        (github_repo_fakes, "memforge.genes.github_repo_gene._RequestsAsyncClient"),
-        (github_pages_fakes, "memforge.genes.github_pages_gene._RequestsAsyncClient"),
+        (confluence_fakes, _serving_connector_http(confluence_gene)),
+        (jira_fakes, _serving_connector_http(jira_gene)),
+        (github_repo_fakes, _serving_requests_client("memforge.genes.github_repo_gene._RequestsAsyncClient")),
+        (github_pages_fakes, _serving_requests_client("memforge.genes.github_pages_gene._RequestsAsyncClient")),
     ],
     ids=["confluence", "jira", "github_repo", "github_pages"],
 )
-async def test_authenticating_again_closes_the_previous_client(fakes, client_class) -> None:
+async def test_authenticating_again_closes_the_previous_client(fakes, serve) -> None:
     provider = fakes._Provider(ProviderListing.COMPLETE)
     config = dict(next(iter(fakes.FAKES.listing_configs.values())).config)
     gene = runtime.create_gene(name=fakes.__name__.rsplit(".", 1)[-1], config=config, source_id="src-close")
-    with (
-        patch(client_class, provider.client),
-        patch("memforge.genes.confluence_gene.CONFLUENCE_REQUEST_INTERVAL_SECONDS", 0.0),
-    ):
+    serving, clients = serve(provider)
+    with serving:
         await gene.authenticate()
         await gene.authenticate()
     try:
-        assert [client.is_closed for client in provider.clients] == [True, False]
+        assert [client.is_closed for client in clients] == [True, False]
     finally:
         await gene.close()
-    assert all(client.is_closed for client in provider.clients)
+    assert all(client.is_closed for client in clients)
 
 
 # ---------------------------------------------------------------------------

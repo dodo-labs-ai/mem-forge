@@ -18,12 +18,13 @@ import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from unittest.mock import patch
 
 import httpx
 
+from memforge.genes import jira_gene
 from memforge.genes.jira_gene import JiraGene
 from memforge.models import ContentItem
+from tests.connector_http_fixture import FakeConnectorHttp
 from tests.contracts.document_fakes import (
     LONG_AGO,
     RECENTLY,
@@ -34,7 +35,6 @@ from tests.contracts.document_fakes import (
 )
 
 BASE_URL = "https://jira.example.test"
-_REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 # issue key -> (issue id, labels, updated)
 ISSUES: dict[str, tuple[str, tuple[str, ...], datetime]] = {
@@ -84,13 +84,10 @@ class _Provider:
         self.listing = listing
         self.read_status = read_status
         self.requests: list[str] = []
-        self.clients: list[httpx.AsyncClient] = []
+        self.http = FakeConnectorHttp(self.handle)
 
-    def client(self, *args, **kwargs) -> httpx.AsyncClient:
-        """The client the Gene builds in ``authenticate``, answered by this provider."""
-        built = _REAL_ASYNC_CLIENT(*args, transport=httpx.MockTransport(self.handle), **kwargs)
-        self.clients.append(built)
-        return built
+    def connection(self, gene: JiraGene) -> FakeConnection:
+        return FakeConnection(gene=gene, requests=self.requests, clients=self.http.clients, waits=self.http.waits)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(f"{request.method} {request.url.path}")
@@ -98,7 +95,8 @@ class _Provider:
             return self._search(json.loads(request.content))
         ref = request.url.path.removeprefix("/rest/api/2/issue/")
         if self.read_status is not None:
-            headers = {"Retry-After": "0"} if self.read_status == 429 else {}
+            # A wait over the client's cap on 429, and none on 503, which then backs off.
+            headers = {"Retry-After": "600"} if self.read_status == httpx.codes.TOO_MANY_REQUESTS else {}
             body = _issue("PAY-1") if self.read_status == 200 else {"errorMessages": []}
             return httpx.Response(self.read_status, json=body, headers=headers)
         key = _by_ref(ref)
@@ -167,7 +165,7 @@ class JiraFakes(DocumentConnectorFakes):
         provider = _Provider(listing)
         gene = await _authenticated(dict(config), provider)
         try:
-            yield FakeConnection(gene=gene, requests=provider.requests, clients=provider.clients)
+            yield provider.connection(gene)
         finally:
             await gene.close()
 
@@ -191,21 +189,19 @@ class JiraFakes(DocumentConnectorFakes):
         ]
 
     @asynccontextmanager
-    async def reading_by_id(self, status: int) -> AsyncIterator[tuple[JiraGene, Sequence[ContentItem]]]:
+    async def reading_by_id(self, status: int) -> AsyncIterator[tuple[FakeConnection, Sequence[ContentItem]]]:
         provider = _Provider(ProviderListing.COMPLETE, read_status=status)
         gene = await _authenticated(dict(SIMPLE), provider)
         try:
-            yield gene, [_stored_issue("PAY-1", "100001")]
+            yield provider.connection(gene), [_stored_issue("PAY-1", "100001")]
         finally:
             await gene.close()
 
 
 async def _authenticated(config: dict, provider: _Provider) -> JiraGene:
     gene = JiraGene(config=config, source_id="src-contract")
-    client = provider.client
-    with patch("httpx.AsyncClient", client):
+    with provider.http.serving(jira_gene):
         await gene.authenticate()
-    gene._request_limiter = None
     return gene
 
 
