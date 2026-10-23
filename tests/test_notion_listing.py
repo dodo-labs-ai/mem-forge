@@ -459,7 +459,7 @@ async def test_a_page_listed_as_a_database_is_a_configuration_error() -> None:
     page = fake.add_page("A page pasted under databases")
     gene, _http = await connect(fake, databases=[page])
 
-    with pytest.raises(SourceConfigurationError, match=f"databases holds {page}.*move it to Root pages"):
+    with pytest.raises(SourceConfigurationError, match=f"The Databases field holds {page}.*move it to Root pages"):
         await gene.list_scope()
 
 
