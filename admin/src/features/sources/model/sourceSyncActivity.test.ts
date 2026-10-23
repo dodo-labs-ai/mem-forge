@@ -527,8 +527,8 @@ test("a sync a person stops reads Stopping until it ends, then Stopped, and is n
 });
 
 test("says what to do when the source cannot be reached or its sign-in is no longer valid", () => {
-  const detail = (message: string, executor?: "local_agent" | "server") =>
-    presentSourceSyncActivity({ state: "failed", error: { message }, executor }, "Source", "items").detail;
+  const detail = (message: string, collectedBy?: "local_agent" | "server") =>
+    presentSourceSyncActivity({ state: "failed", error: { message }, collectedBy }, "Source", "items").detail;
   const unreachable = "GitHub CLI request failed: error connecting to git.example.internal\ncheck your internet connection";
 
   assert.equal(
@@ -539,17 +539,21 @@ test("says what to do when the source cannot be reached or its sign-in is no lon
     detail("All connection attempts failed", "server"),
     "The server could not reach the source. Check its address, or use Local sync if it is on your network.",
   );
-  assert.equal(
-    detail("could not resolve host: wiki.example.internal"),
-    "The source could not be reached. Check the network connection, then retry.",
-  );
-  assert.equal(
-    detail("Jira browser session expired for https://jira.example.com. Sign in to Jira in your browser, then run `memforge adapter auth jira refresh`.", "server"),
-    "The Jira browser session has expired. Sign in to Jira, then refresh it in Configure.",
-  );
+  for (const message of [
+    "Jira browser session expired for https://jira.example.com. Sign in to Jira in your browser, then run `memforge adapter auth jira refresh`.",
+    "Jira browser session cookie expired or is not accepted. Refresh the cookie.",
+    "Jira browser session is expired or not accepted",
+    "No Jira browser session is available for https://jira.example.com",
+  ]) {
+    assert.equal(detail(message, "server"), "The Jira browser session has expired. Sign in to Jira, then refresh it in Configure.");
+  }
   assert.equal(
     detail("GitHub CLI request failed: HTTP 401: Bad credentials (https://api.github.com/user)", "local_agent"),
     "Sign in to the GitHub CLI on this device, then retry sync.",
+  );
+  assert.equal(
+    detail("Client error '401 Unauthorized' for url 'https://jira.example.com/rest/api/2/search'", "local_agent"),
+    "The source rejected the sign-in on this device. Sign in again, then retry.",
   );
   assert.equal(
     detail("Client error '401 Unauthorized' for url 'https://wiki.example.com/rest/api/space'", "server"),
@@ -561,10 +565,42 @@ test("says what to do when the source cannot be reached or its sign-in is no lon
   }
 });
 
-test("records where a sync ran", () => {
-  assert.equal(sourceSyncActivityFromLocalJob(makeLocalAgentJob({ status: "failed", last_error: "x" })).executor, "local_agent");
+test("blames the AI provider, not the source, for provider errors and does not describe a source a run never read", () => {
+  const detail = (message: string, collectedBy?: "local_agent" | "server", items?: string[]) =>
+    presentSourceSyncActivity({
+      state: "failed",
+      error: { message, items: items?.map((error, index) => ({ doc_id: `doc-${index}`, title: "Doc", error })) },
+      collectedBy,
+    }, "Source", "items").detail;
+  const aiUnavailable = "The AI provider is unavailable. Check its connection, then retry.";
+
+  assert.equal(detail("litellm.APIConnectionError: AnthropicException - [Errno -2] Name or service not known", "server"), aiUnavailable);
   assert.equal(
-    sourceSyncActivityFromStatus({ status: "failed", run_id: "ssr-1", error_message: "x" } as SyncStatus).executor,
+    detail("2 documents could not be synced.", "server", ["litellm.APIConnectionError: OllamaException - Temporary failure in name resolution"]),
+    aiUnavailable,
+  );
+  assert.equal(detail("LLM provider was unreachable for 2 documents", "server"), aiUnavailable);
+  assert.equal(
+    detail("Embedding provider request failed: AuthenticationError: litellm.AuthenticationError: Client error '401 Unauthorized' for url 'https://gw/v1/embeddings'", "server"),
+    "Sync failed. Retry when ready.",
+  );
+  assert.equal(detail("ProxyError: 407 Proxy Authentication Required", "server"), "Sync failed. Retry when ready.");
+  // A run that only processed what a local sync collected never contacted the source.
+  assert.equal(detail("All connection attempts failed"), "Sync failed. Retry when ready.");
+  assert.equal(
+    detail("Teams session expired: sign in again", "local_agent"),
+    "Sign in to Teams in Chrome, then retry sync.",
+  );
+});
+
+test("records who read the source", () => {
+  assert.equal(sourceSyncActivityFromLocalJob(makeLocalAgentJob({ status: "failed", last_error: "x" })).collectedBy, "local_agent");
+  assert.equal(
+    sourceSyncActivityFromStatus({ status: "failed", run_id: "ssr-1", error_message: "x" } as SyncStatus).collectedBy,
     "server",
+  );
+  assert.equal(
+    sourceSyncActivityFromStatus({ status: "failed", run_id: "ssr-2", trigger: "local_agent", error_message: "x" } as SyncStatus).collectedBy,
+    undefined,
   );
 });
