@@ -38,11 +38,13 @@ from memforge.conversations.membership import (
     PlannedUnit,
     ReturnedMessage,
     plan_conversation,
+    rooted_threads,
+    units_to_read,
 )
 from memforge.conversations.port import ConversationAccess, Interval, PollOutcome
 from memforge.conversations.reader import ConversationUnitReader
 from memforge.conversations.records import MessageIdentity, record_revision
-from memforge.conversations.units import Member, MemberArtifact, Span, UnitKind, UnitRef
+from memforge.conversations.units import Member, MemberArtifact, Span
 from memforge.conversations.windows import GAP_WINDOW_V1, WindowPolicy
 from memforge.source_projection import UnitRemovalReason
 
@@ -214,7 +216,13 @@ class ConversationLayer:
         intervals: Sequence[ProvenInterval],
         messages: Sequence[ManifestMessage],
     ) -> ConversationState:
-        """Read the Units of one conversation this attempt may change, with their members."""
+        """Read the Units of one conversation this attempt may change, with their members.
+
+        It reads exactly the Units
+        :func:`~memforge.conversations.membership.units_to_read` names for the
+        manifest's messages, then every Unit in this attempt's reach
+        (:meth:`_reach`).
+        """
 
         threads = {
             unit.thread_root_id: unit
@@ -224,30 +232,17 @@ class ConversationLayer:
         message_ids = {message.identity.message_id for message in messages}
         replied_roots = {message.thread_root_id for message in messages if message.thread_root_id is not None}
         holders = await self._reader.holders(source_id, conversation_id, message_ids | replied_roots | set(threads))
-        rooted = frozenset(
-            root_id for root_id, thread in threads.items() if thread in holders.get(root_id, ())
-        )
-        wanted: dict[str, UnitRef] = {}
-        for message_id in message_ids | replied_roots:
-            wanted.update((unit.provider_key, unit) for unit in holders.get(message_id, ()))
-            if message_id in threads:
-                wanted[threads[message_id].provider_key] = threads[message_id]
-        for root_id, thread in threads.items():
-            windows = [unit for unit in holders.get(root_id, ()) if unit.kind is UnitKind.WINDOW]
-            # A window holding a thread's root gives the root up once the
-            # thread holds it, and lends it to a thread that lacks it.
-            wanted.update((unit.provider_key, unit) for unit in windows)
-            if windows and root_id not in rooted:
-                wanted[thread.provider_key] = thread
-        units = {unit.provider_key: unit for unit in await self._reader.read(tuple(wanted.values()))}
+        wanted = units_to_read(threads=threads, holders=holders, message_ids=message_ids, replied_roots=replied_roots)
+        units = {unit.provider_key: unit for unit in await self._reader.read(wanted)}
         for start, end in self._reach(intervals, messages):
             for unit in await self._reader.units_spanning(source_id, conversation_id, start, end):
                 units.setdefault(unit.provider_key, unit)
         return ConversationState(
             conversation_id=conversation_id,
             units=tuple(units.values()),
+            holders=holders,
             threads=threads,
-            rooted_threads=rooted,
+            rooted_threads=rooted_threads(threads=threads, holders=holders),
         )
 
     def _reach(

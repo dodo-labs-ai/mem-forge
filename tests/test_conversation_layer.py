@@ -17,6 +17,7 @@ from memforge.conversations.manifest import (
     request_from_payload,
     request_to_payload,
 )
+from memforge.conversations.membership import units_to_read
 from memforge.conversations.port import (
     ConversationAccess,
     ConversationLabel,
@@ -396,3 +397,59 @@ async def test_a_message_whose_waived_body_is_no_longer_held_is_kept_until_the_n
     )
 
     assert plan.units == () and plan.removals == ()
+
+
+def _thread(key: str, conversation_id: str, root_id: str, *members: Member) -> StoredUnit:
+    return StoredUnit(
+        ref=UnitRef(unit_id=key, document_id=f"doc-{key}", provider_key=key, kind=UnitKind.THREAD,
+                    conversation_id=conversation_id, thread_root_id=root_id),
+        members=members,
+    )
+
+
+class SpyProjection(InMemoryProjection):
+    """Records the Units each ``read`` asks for."""
+
+    def __init__(self, *units: StoredUnit) -> None:
+        super().__init__(*units)
+        self.reads: list[set[str]] = []
+
+    async def read(self, units: Collection[UnitRef]):
+        self.reads.append({unit.provider_key for unit in units})
+        return await super().read(units)
+
+
+async def test_the_layer_reads_exactly_the_units_the_read_set_names():
+    hour = timedelta(hours=1)
+    root_r, root_q = _member("c1", "r", NOW - 9 * hour), _member("c1", "q", NOW - 8 * hour)
+    projection = SpyProjection(
+        _window("w-rooted", "c1", root_r),
+        _thread("t-rooted", "c1", "r", root_r, _member("c1", "x", NOW - 7 * hour)),
+        _window("w-lending", "c1", root_q),
+        _thread("t-rootless", "c1", "q", _member("c1", "z", NOW - 6 * hour)),
+        _window("w-edited", "c1", _member("c1", "a", NOW - 5 * hour)),
+        _window("w-elsewhere", "c1", _member("c1", "b", NOW - 4 * hour)),
+    )
+    edited, edited_record = _manifest_message("c1", "a", NOW - 5 * hour, "edited")
+    reply, reply_record = _manifest_message("c1", "y", NOW - 3 * hour)
+    reply = ManifestMessage(
+        identity=reply.identity, revision=reply.revision, created_at=reply.created_at, thread_root_id="r"
+    )
+
+    await ConversationLayer(projection).plan(
+        manifest=_manifest(_readable("c1"), messages=[edited, reply]),
+        bodies={edited.identity: edited_record, reply.identity: reply_record},
+        selection=_selection("c1"),
+        attempt_started_at=NOW,
+    )
+
+    threads = {unit.thread_root_id: unit for unit in await projection.thread_units(SOURCE, "c1")}
+    named = units_to_read(
+        threads=threads,
+        holders=await projection.holders(SOURCE, "c1", {"a", "y", "r", *threads}),
+        message_ids={"a", "y"},
+        replied_roots={"r"},
+    )
+    assert projection.reads[0] == {unit.provider_key for unit in named}
+    assert projection.reads[0] == {"w-rooted", "t-rooted", "w-lending", "t-rootless", "w-edited"}
+
