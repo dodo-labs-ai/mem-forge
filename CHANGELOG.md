@@ -42,8 +42,9 @@
   returned messages without a complete time, whatever its outcome, and a poll
   that ran out of history or stopped early whose complete time lies before its
   requested start, or, for a stopped poll, at or after its requested end.
-  Agents installed before this release are refused for Teams, with a message
-  that asks for the agent to be upgraded.
+  A Teams manifest from an agent installed before this release is refused
+  whenever one of its polls ran out of history after returning messages, with
+  a message that asks for the agent to be upgraded.
 
 - A local-agent Jira collection reads each listed issue with a one-issue
   search in the Source's scope, `issuekey = <id> AND (<scope>)`, and, when
