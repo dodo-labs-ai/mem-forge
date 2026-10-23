@@ -19,14 +19,12 @@ from memforge.genes.atlassian_auth import (
     ATLASSIAN_ABSENT_STATUS_CODES,
     atlassian_record_state,
     atlassian_request_limiter,
-    bearer_headers,
     get_with_rate_limit_retry,
-    require_https_base_url,
     stream_with_rate_limit_retry,
-    tls_verify,
 )
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.document_gene import DocumentGene
+from memforge.genes.toolkit.config import bearer_headers, bool_config, require_https_base_url, tls_verify
 from memforge.genes.confluence_artifacts import resolve_current_confluence_artifacts
 from memforge.genes.confluence_pdf import export_confluence_page_pdf
 from memforge.source_time import SOURCE_UPDATED_AT_KEY
@@ -361,7 +359,7 @@ class ConfluenceGene(DocumentGene):
         self._discovered_page_ids: set[str] = set()
         sync_mode = self._effective_sync_mode(self.config)
         page_tree_root = str(self.config.get("page_tree_root") or "").strip()
-        include_children = self.config.get("include_children", True)
+        include_children = bool_config(self.config, "include_children", default=True)
 
         if sync_mode == "page_tree":
             if not page_tree_root:
@@ -459,7 +457,7 @@ class ConfluenceGene(DocumentGene):
         if str(page.get("id") or "").strip() == root_id:
             return True
         if (
-            not self.config.get("include_children", True)
+            not bool_config(self.config, "include_children", default=True)
             or not self._is_page(page)
             or self._page_status(page) != _CURRENT_PAGE_STATUS
         ):

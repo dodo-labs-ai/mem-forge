@@ -113,6 +113,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
 from memforge.genes.base import Gene
+from memforge.genes.toolkit.config import validate_bool_fields
 from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, ScopeListingKind, UnlistedScopeMode
 
 __all__ = ["AbsenceAnswer", "DocumentGene"]
@@ -140,6 +141,15 @@ class DocumentGene(Gene):
     """
 
     def __init__(self, config: dict, source_id: str) -> None:
+        """Create the Gene, refusing a boolean field whose value is not a boolean.
+
+        Every field ``config_schema()`` declares as ``ConfigFieldType.BOOLEAN``
+        is checked with :func:`~memforge.genes.toolkit.config.bool_config`, so
+        ``{"include_comments": "maybe"}`` raises ``SourceConfigurationError``
+        here, before anything reaches the provider, and the run is not
+        retried. Read those fields with ``bool_config`` too.
+        """
+        validate_bool_fields(config, self.config_schema().fields)
         super().__init__(config, source_id)
         self._discovered_scope: ScopeListing | None = None
 

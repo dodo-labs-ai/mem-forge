@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import ssl
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock
 
+import certifi
 import httpx
 import pytest
 
@@ -323,7 +326,7 @@ async def test_authenticate_uses_configured_jira_ca_bundle(monkeypatch, tmp_path
     RecordingAsyncClient.instances.clear()
     monkeypatch.setattr("memforge.genes.jira_gene.httpx.AsyncClient", RecordingAsyncClient)
     ca_bundle = tmp_path / "corp-ca.pem"
-    ca_bundle.write_text("test-ca", encoding="utf-8")
+    ca_bundle.write_bytes(Path(certifi.where()).read_bytes())
     gene = JiraGene(
         config={
             "base_url": "https://jira.example.test/",
@@ -337,7 +340,9 @@ async def test_authenticate_uses_configured_jira_ca_bundle(monkeypatch, tmp_path
 
     await gene.authenticate()
 
-    assert RecordingAsyncClient.instances[-1].kwargs["verify"] == str(ca_bundle)
+    verify = RecordingAsyncClient.instances[-1].kwargs["verify"]
+    assert isinstance(verify, ssl.SSLContext)
+    assert verify.verify_mode == ssl.CERT_REQUIRED
 
 
 @pytest.mark.asyncio

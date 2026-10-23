@@ -335,14 +335,6 @@ def github_content_paths(relative_path: str, resolved_relative_path: object) -> 
     return (relative_path,) if not resolved or resolved == relative_path else (relative_path, resolved)
 
 
-def list_config(value: object) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
-    return []
-
-
 def parse_github_repo_url(repo_url: str) -> dict[str, str]:
     parts = urlsplit(str(repo_url or "").strip())
     if parts.scheme.lower() != "https" or not parts.hostname:
@@ -374,10 +366,14 @@ def normalize_github_relative_path(value: str) -> str:
 
 
 def github_include_paths(config: dict) -> list[str]:
+    from memforge.genes.toolkit.config import list_config
+
     return normalize_github_scope_paths(list_config(config.get("include_paths")))
 
 
 def github_exclude_paths(config: dict) -> list[str]:
+    from memforge.genes.toolkit.config import list_config
+
     return normalize_github_scope_paths(list_config(config.get("exclude_paths")))
 
 
@@ -393,6 +389,8 @@ def normalize_github_scope_paths(paths: list[str]) -> list[str]:
 
 
 def github_include_extensions(config: dict) -> set[str]:
+    from memforge.genes.toolkit.config import list_config
+
     value = config.get("include_extensions")
     if value is None:
         values = DEFAULT_INCLUDE_EXTENSION_LIST

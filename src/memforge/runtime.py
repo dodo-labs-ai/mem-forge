@@ -1699,7 +1699,7 @@ class SourceSyncWorker:
             retryable = (
                 not isinstance(
                     exc,
-                    (SourcePausedError, SourceNotActiveError, SourceSyncBoundaryError),
+                    (SourcePausedError, SourceNotActiveError, SourceSyncBoundaryError, SourceConfigurationError),
                 )
                 and next_attempt_at is not None
                 and not run.reprocess_document_ids

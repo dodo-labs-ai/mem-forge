@@ -72,11 +72,9 @@ from memforge.genes import (
 )
 from memforge.genes.conversation_gene import ConversationGene
 from memforge.genes.family import CollectionFamilyKind
-from memforge.genes.atlassian_auth import (
-    release_atlassian_request_limiter,
-    require_https_base_url,
-    validate_tls_ca_bundle,
-)
+from memforge.genes.atlassian_auth import release_atlassian_request_limiter
+from memforge.genes.base import SourceConfigurationError
+from memforge.genes.toolkit.config import require_https_base_url, validate_bool_fields, validate_tls_ca_bundle
 from memforge.github_repo_utils import github_extension_allowed, github_include_extensions
 from memforge.memory.audit import AuditContext
 from memforge.memory.cross_document_relation import (
@@ -3681,6 +3679,13 @@ def _validate_source_config(
     config: dict[str, Any],
     existing_config: dict[str, Any] | None = None,
 ) -> None:
+    """Raise ``ValueError``, which the routes answer with 400, for a configuration the source type cannot use.
+
+    Besides the source type's own checks, every required field the Gene
+    declares must have a value, and every field it declares as
+    ``ConfigFieldType.BOOLEAN`` must hold a boolean value
+    (:func:`~memforge.genes.toolkit.config.bool_config`).
+    """
     policy = _config_policy(source_type)
     if policy.validate_input is not None:
         policy.validate_input(config, existing_config or {})
@@ -3701,12 +3706,17 @@ def _validate_source_config(
 
     if gene_cls:
         product_name = gene_cls.metadata().display_name
+        fields = gene_cls.config_schema().fields
         _validate_required_source_fields(
             product_name,
-            gene_cls.config_schema().fields,
+            fields,
             config,
             existing_config=existing_config,
         )
+        try:
+            validate_bool_fields(config, fields)
+        except SourceConfigurationError as exc:
+            raise ValueError(f"{product_name} {exc}") from exc
     if policy.validate is not None:
         policy.validate(config, existing_config or {})
 
@@ -8913,7 +8923,7 @@ def create_admin_app(
                     ),
                     source_id=source_id,
                 )
-            except ValueError as exc:
+            except (SourceConfigurationError, ValueError) as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             gene.bind_document_store(artifact_store)
             return asdict(await reprocess_preview(
