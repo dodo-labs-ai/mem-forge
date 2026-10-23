@@ -1206,3 +1206,22 @@ async def test_confirming_unlisted_pages_fails_when_confluence_rejects_the_crede
             await gene.confirm_absent([item])
     finally:
         await gene.close()
+
+
+@pytest.mark.asyncio
+async def test_space_discovery_rejects_a_repeated_next_link():
+    gene = ConfluenceGene(
+        config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"},
+        source_id="src-confluence",
+    )
+    gene._api_prefix = "/wiki"
+    gene._base_url = "https://wiki.example.test"
+    gene._get = AsyncMock(
+        side_effect=[
+            JsonResponse(_page_batch([_page("1", "One", "2026-05-20T00:00:00Z")], next_link="/content?next")),
+            JsonResponse(_page_batch([_page("2", "Two", "2026-05-20T00:00:00Z")], start=1, next_link="/content?next")),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="Confluence space PAY response repeats a next link"):
+        _ = [item async for item in gene.discover()]

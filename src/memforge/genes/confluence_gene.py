@@ -7,7 +7,7 @@ wiki pages into comprehensive markdown for memory extraction.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -25,6 +25,7 @@ from memforge.genes.atlassian_auth import (
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.toolkit.config import bearer_headers, bool_config, list_config, require_https_base_url, tls_verify
+from memforge.genes.toolkit.paging import OffsetPage, PagingErrors, paged_by_offset
 from memforge.genes.confluence_artifacts import resolve_current_confluence_artifacts
 from memforge.genes.confluence_pdf import export_confluence_page_pdf
 from memforge.source_time import SOURCE_UPDATED_AT_KEY
@@ -64,6 +65,15 @@ _PAGE_METADATA_EXPAND = "version,metadata.labels,space"
 # The only page status discovery lists; archived and trashed pages are not current.
 _CURRENT_PAGE_STATUS = "current"
 _PAGE_DOC_ID_PREFIX = "confluence-"
+# A page's attachments are listed this many at a time after the first ones,
+# which arrive inside the page itself.
+_ATTACHMENT_PAGE_LIMIT = 100
+_ATTACHMENT_PAGING_ERRORS = PagingErrors(
+    error_type=SourceArtifactContractError,
+    start_mismatch="Confluence attachment pagination is inconsistent",
+    early_end="Confluence attachment response cannot advance pagination",
+    repeated_next="Confluence attachment pagination contains a cursor cycle",
+)
 
 
 def _page_doc_id(page_id: str) -> str:
@@ -518,43 +528,25 @@ class ConfluenceGene(DocumentGene):
             if parent_id in traversed_parent_ids:
                 raise RuntimeError(f"Confluence page tree contains a traversal cycle at page {parent_id}")
             traversed_parent_ids.add(parent_id)
-            start = 0
-            limit = self._page_request_limit(preview_limit, emitted)
-            while True:
-                try:
-                    resp = await self._get(
-                        f"{self._api_prefix}/rest/api/content/{parent_id}/child/page",
-                        params={"start": start, "limit": limit, "expand": _PAGE_METADATA_EXPAND},
-                    )
-                    data = self._json_response(resp, f"listing children of page {parent_id}")
-                except Exception as e:
-                    logger.error("Failed to list children of page %s: %s", parent_id, e)
-                    raise RuntimeError(f"Failed to list Confluence children for page {parent_id}: {e}") from e
-
-                results = self._validated_page_results(
-                    data,
-                    context=f"children of page {parent_id}",
-                    expected_start=start,
-                )
-                if not results:
-                    break
-
-                for page in results:
-                    item = self._parse_page(page, since, exclude_labels)
-                    if item:
-                        yield item
-                        emitted += 1
-                        if preview_limit is not None and emitted >= preview_limit:
-                            return
-                    if not self._has_excluded_label(page, exclude_labels):
-                        page_id = page.get("id", "")
-                        if page_id:
-                            queue.append(page_id)
-
-                if not self._has_next_page(data):
-                    break
-                start += len(results)
-                limit = self._page_request_limit(preview_limit, emitted)
+            children = self._listed_pages(
+                f"{self._api_prefix}/rest/api/content/{parent_id}/child/page",
+                {},
+                context=f"children of page {parent_id}",
+                action=f"listing children of page {parent_id}",
+                failure=f"Failed to list Confluence children for page {parent_id}",
+                page_limit=lambda: self._page_request_limit(preview_limit, emitted),
+            )
+            async for page in children:
+                item = self._parse_page(page, since, exclude_labels)
+                if item:
+                    yield item
+                    emitted += 1
+                    if preview_limit is not None and emitted >= preview_limit:
+                        return
+                if not self._has_excluded_label(page, exclude_labels):
+                    page_id = page.get("id", "")
+                    if page_id:
+                        queue.append(page_id)
 
     async def _get_page_as_content_item(
         self, page_id: str, since: datetime | None, exclude_labels: set
@@ -636,46 +628,61 @@ class ConfluenceGene(DocumentGene):
         emitted = 0
 
         logger.info("Discovering pages in space: %s", space_key)
-        start = 0
-        limit = self._page_request_limit(preview_limit, emitted)
+        pages = self._listed_pages(
+            f"{self._api_prefix}/rest/api/content",
+            {"spaceKey": space_key, "type": "page"},
+            context=f"space {space_key}",
+            action=f"listing pages in space {space_key}",
+            failure=f"Failed to list Confluence pages in space {space_key}",
+            page_limit=lambda: self._page_request_limit(preview_limit, emitted),
+        )
+        async for page in pages:
+            item = self._parse_page(page, since, exclude_labels)
+            if item:
+                yield item
+                emitted += 1
+                if preview_limit is not None and emitted >= preview_limit:
+                    return
 
-        while True:
+    def _listed_pages(
+        self,
+        url: str,
+        params: dict[str, str],
+        *,
+        context: str,
+        action: str,
+        failure: str,
+        page_limit: Callable[[], int],
+    ) -> AsyncIterator[dict]:
+        """Every page record of one listing, a page's children or a space, walked to its last next link.
+
+        ``page_limit`` gives the ``limit`` of each request when it is sent, so
+        a preview asks for no more pages than it still needs. A request that
+        fails, or a response that is not JSON, raises ``RuntimeError`` worded
+        as ``failure``.
+        """
+
+        async def fetch(start: int) -> OffsetPage[dict]:
             try:
                 resp = await self._get(
-                    f"{self._api_prefix}/rest/api/content",
-                    params={
-                        "spaceKey": space_key,
-                        "type": "page",
-                        "start": start,
-                        "limit": limit,
-                        "expand": _PAGE_METADATA_EXPAND,
-                    },
+                    url,
+                    params={**params, "start": start, "limit": page_limit(), "expand": _PAGE_METADATA_EXPAND},
                 )
-                data = self._json_response(resp, f"listing pages in space {space_key}")
+                data = self._json_response(resp, action)
             except Exception as e:
-                logger.error("Failed to list pages in space %s: %s", space_key, e)
-                raise RuntimeError(f"Failed to list Confluence pages in space {space_key}: {e}") from e
+                logger.error("%s: %s", failure, e)
+                raise RuntimeError(f"{failure}: {e}") from e
+            results = self._validated_page_results(data, context=context, expected_start=start)
+            return OffsetPage(start=data["start"], items=results, next_link=self._next_link(data))
 
-            results = self._validated_page_results(
-                data,
-                context=f"space {space_key}",
-                expected_start=start,
-            )
-            if not results:
-                break
-
-            for page in results:
-                item = self._parse_page(page, since, exclude_labels)
-                if item:
-                    yield item
-                    emitted += 1
-                    if preview_limit is not None and emitted >= preview_limit:
-                        return
-
-            if not self._has_next_page(data):
-                break
-            start += len(results)
-            limit = self._page_request_limit(preview_limit, emitted)
+        return paged_by_offset(
+            fetch,
+            errors=PagingErrors(
+                start_mismatch=f"Confluence {context} response has inconsistent pagination start",
+                early_end=f"Confluence {context} response has a next link without results",
+                repeated_next=f"Confluence {context} response repeats a next link",
+            ),
+        )
 
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full page content (XHTML body)."""
@@ -748,33 +755,35 @@ class ConfluenceGene(DocumentGene):
         page_title: str,
         space_key: str,
     ) -> tuple[RawSourceArtifact, ...]:
-        """Resolve current body references against complete attachment inventory."""
+        """Resolve current body references against the page's complete attachment inventory.
 
-        descriptors: list[dict] = []
-        seen_next_links: set[str] = set()
-        start = 0
-        payload = first_page
-        while True:
+        The page response carries the first attachments (``first_page``); the
+        rest are listed by ``start`` until the last next link.
+        """
+
+        def attachment_page(payload: dict, start: int) -> OffsetPage[dict]:
             results = self._validated_attachment_results(payload, expected_start=start)
-            descriptors.extend(results)
-            if not self._has_next_page(payload):
-                break
-            next_link = str(payload["_links"]["next"]).strip()
-            if next_link in seen_next_links:
-                raise SourceArtifactContractError(
-                    "Confluence attachment pagination contains a cursor cycle"
-                )
-            seen_next_links.add(next_link)
-            start += len(results)
+            return OffsetPage(start=payload["start"], items=results, next_link=self._next_link(payload))
+
+        async def fetch(start: int) -> OffsetPage[dict]:
             response = await self._get(
                 f"{self._api_prefix}/rest/api/content/{page_id}/child/attachment",
                 params={
                     "start": start,
-                    "limit": 100,
+                    "limit": _ATTACHMENT_PAGE_LIMIT,
                     "expand": "version,extensions",
                 },
             )
-            payload = self._json_response(response, f"listing attachments for page {page_id}")
+            return attachment_page(self._json_response(response, f"listing attachments for page {page_id}"), start)
+
+        descriptors = [
+            descriptor
+            async for descriptor in paged_by_offset(
+                fetch,
+                first=attachment_page(first_page, 0),
+                errors=_ATTACHMENT_PAGING_ERRORS,
+            )
+        ]
 
         selected_descriptors = resolve_current_confluence_artifacts(
             body_html=body_html,
@@ -850,14 +859,17 @@ class ConfluenceGene(DocumentGene):
             raise SourceArtifactContractError("Confluence attachment pagination is inconsistent")
         if not isinstance(data.get("_links"), dict):
             raise SourceArtifactContractError("Confluence attachment response is missing pagination links")
-        if not results and ConfluenceGene._has_next_page(data):
+        if not results and ConfluenceGene._next_link(data):
             raise SourceArtifactContractError("Confluence attachment response cannot advance pagination")
         return results
 
     @staticmethod
-    def _has_next_page(data: dict) -> bool:
+    def _next_link(data: dict) -> str | None:
+        """The response's ``_links.next``, or ``None`` when it names no next page."""
         links = data.get("_links")
-        return isinstance(links, dict) and bool(str(links.get("next") or "").strip())
+        if not isinstance(links, dict):
+            return None
+        return str(links.get("next") or "").strip() or None
 
     @classmethod
     def _validated_page_results(
@@ -884,7 +896,7 @@ class ConfluenceGene(DocumentGene):
         next_link = links.get("next")
         if next_link is not None and (not isinstance(next_link, str) or not next_link.strip()):
             raise RuntimeError(f"Confluence {context} response has an invalid next link")
-        if not results and cls._has_next_page(data):
+        if not results and cls._next_link(data):
             raise RuntimeError(f"Confluence {context} response has a next link without results")
         return results
 
