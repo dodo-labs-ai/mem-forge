@@ -14,10 +14,11 @@ picks a folder, and the daemon completes the job with::
     LocalMarkdownPickRootResult(operation="local_markdown_pick_root", root="/Users/me/notes")
 
 The admin UI reads the job back and finds ``{"operation": ..., "root": ...,
-"cancelled": null, "error": null, ...}`` in its ``result``. ``SETUP_RESULT_MODELS`` maps every setup operation to its
-model, and the admin API publishes each model in its OpenAPI document so the
-admin UI's generated types describe ``result`` per operation. Sync jobs keep
-their free-form result.
+"cancelled": null, "error": null, ...}`` in its ``result``.
+``SETUP_RESULT_MODELS`` maps every setup operation to its model, and the
+admin API publishes each model in its OpenAPI document so the admin UI's
+generated types describe ``result`` per operation. Sync jobs keep their
+free-form result.
 
 A job whose result carries ``error`` failed. A handler that raises instead
 completes the job as failed with only ``retryable`` in its result and the
