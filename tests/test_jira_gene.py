@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from memforge.genes.jira_gene import JiraGene
+from memforge.genes.jira_gene import JiraGene, JiraQueryRejected
 from memforge.models import AbsenceAnswer, ContentItem
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
 from tests.tls_bundle_fixture import BUNDLE_CA_COUNT, trusted_ca_count, write_ca_bundle
@@ -2070,3 +2070,48 @@ async def test_an_issue_reference_that_is_not_an_id_or_key_never_reaches_jql(iss
         await gene.close()
 
     assert searches == []
+
+
+@pytest.mark.asyncio
+async def test_search_refuses_a_page_whose_start_at_does_not_continue_the_walk():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        start = json.loads(request.content)["startAt"]
+        # The second page claims to start at 0 again, overlapping the first.
+        issues = [_jira_issue("PAY-1")] if start == 0 else [_jira_issue("PAY-2")]
+        return httpx.Response(200, json=_search_page(issues, total=2, start_at=0))
+
+    gene = _transport_gene(handler)
+    try:
+        with pytest.raises(RuntimeError, match="Jira search response startAt does not match the requested page"):
+            await gene.list_scope()
+    finally:
+        await gene.close()
+
+
+@pytest.mark.asyncio
+async def test_search_refuses_issues_beyond_the_total_before_yielding_that_page():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_search_page([_jira_issue("PAY-1"), _jira_issue("PAY-2")], total=1))
+
+    gene = _transport_gene(handler)
+    yielded: list[dict] = []
+    try:
+        with pytest.raises(RuntimeError, match="Jira search unique issue count did not match total"):
+            async for issue in gene._search_issues("project = PAY", fields=["updated"], expand=None, max_results=50):
+                yielded.append(issue)
+    finally:
+        await gene.close()
+    assert yielded == []
+
+
+@pytest.mark.asyncio
+async def test_search_refused_by_jira_raises_query_rejected():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"errorMessages": ["The value 'NOPE' does not exist for the field 'project'."]})
+
+    gene = _transport_gene(handler)
+    try:
+        with pytest.raises(JiraQueryRejected, match="Jira rejected the JQL"):
+            await gene.list_scope()
+    finally:
+        await gene.close()

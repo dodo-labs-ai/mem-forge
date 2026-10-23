@@ -672,8 +672,8 @@ class ConfluenceGene(DocumentGene):
             except Exception as e:
                 logger.error("%s: %s", failure, e)
                 raise RuntimeError(f"{failure}: {e}") from e
-            results = self._validated_page_results(data, context=context, expected_start=start)
-            return OffsetPage(start=data["start"], items=results, next_link=self._next_link(data))
+            results = self._validated_page_results(data, context=context)
+            return OffsetPage(start=data.get("start"), items=results, next_link=self._next_link(data))
 
         return paged_by_offset(
             fetch,
@@ -761,9 +761,9 @@ class ConfluenceGene(DocumentGene):
         rest are listed by ``start`` until the last next link.
         """
 
-        def attachment_page(payload: dict, start: int) -> OffsetPage[dict]:
-            results = self._validated_attachment_results(payload, expected_start=start)
-            return OffsetPage(start=payload["start"], items=results, next_link=self._next_link(payload))
+        def attachment_page(payload: dict) -> OffsetPage[dict]:
+            results = self._validated_attachment_results(payload)
+            return OffsetPage(start=payload.get("start"), items=results, next_link=self._next_link(payload))
 
         async def fetch(start: int) -> OffsetPage[dict]:
             response = await self._get(
@@ -774,13 +774,13 @@ class ConfluenceGene(DocumentGene):
                     "expand": "version,extensions",
                 },
             )
-            return attachment_page(self._json_response(response, f"listing attachments for page {page_id}"), start)
+            return attachment_page(self._json_response(response, f"listing attachments for page {page_id}"))
 
         descriptors = [
             descriptor
             async for descriptor in paged_by_offset(
                 fetch,
-                first=attachment_page(first_page, 0),
+                first=attachment_page(first_page),
                 errors=_ATTACHMENT_PAGING_ERRORS,
             )
         ]
@@ -849,18 +849,20 @@ class ConfluenceGene(DocumentGene):
             )
 
     @staticmethod
-    def _validated_attachment_results(data: object, *, expected_start: int) -> list[dict]:
+    def _validated_attachment_results(data: object) -> list[dict]:
+        """The attachment records of one listing response, or raise when the response is not a listing page.
+
+        Whether the page continues the walk is the pager's to check.
+        """
         if not isinstance(data, dict) or not isinstance(data.get("results"), list):
             raise SourceArtifactContractError("Confluence attachment response is missing results")
         results = data["results"]
         if any(not isinstance(item, dict) for item in results):
             raise SourceArtifactContractError("Confluence attachment response contains an invalid record")
-        if data.get("start") != expected_start or data.get("size") != len(results):
+        if data.get("size") != len(results):
             raise SourceArtifactContractError("Confluence attachment pagination is inconsistent")
         if not isinstance(data.get("_links"), dict):
             raise SourceArtifactContractError("Confluence attachment response is missing pagination links")
-        if not results and ConfluenceGene._next_link(data):
-            raise SourceArtifactContractError("Confluence attachment response cannot advance pagination")
         return results
 
     @staticmethod
@@ -871,14 +873,16 @@ class ConfluenceGene(DocumentGene):
             return None
         return str(links.get("next") or "").strip() or None
 
-    @classmethod
+    @staticmethod
     def _validated_page_results(
-        cls,
         data: object,
         *,
         context: str,
-        expected_start: int,
     ) -> list[dict]:
+        """The page records of one listing response, or raise when the response is not a listing page.
+
+        Whether the page continues the walk is the pager's to check.
+        """
         if not isinstance(data, dict) or "results" not in data or not isinstance(data.get("results"), list):
             raise RuntimeError(f"Confluence {context} response is missing a results list")
         results = data["results"]
@@ -887,17 +891,12 @@ class ConfluenceGene(DocumentGene):
         size = data.get("size")
         if not isinstance(size, int) or isinstance(size, bool) or size != len(results):
             raise RuntimeError(f"Confluence {context} response has inconsistent pagination size")
-        start = data.get("start")
-        if not isinstance(start, int) or isinstance(start, bool) or start != expected_start:
-            raise RuntimeError(f"Confluence {context} response has inconsistent pagination start")
         links = data.get("_links")
         if not isinstance(links, dict):
             raise RuntimeError(f"Confluence {context} response is missing pagination links")
         next_link = links.get("next")
         if next_link is not None and (not isinstance(next_link, str) or not next_link.strip()):
             raise RuntimeError(f"Confluence {context} response has an invalid next link")
-        if not results and cls._next_link(data):
-            raise RuntimeError(f"Confluence {context} response has a next link without results")
         return results
 
     async def fetch_pdf(self, item: ContentItem) -> bytes | None:
