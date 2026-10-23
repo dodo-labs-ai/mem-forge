@@ -2187,12 +2187,17 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
     )
 
     image = b"\x89PNG\r\n\x1a\njira-comment-image"
+    built: list = []
 
     class FakeJiraGene:
         def __init__(self, config, source_id):
             self.config = config
             self.source_id = source_id
-            self._client = None
+            self.closed = False
+            built.append(self)
+
+        async def close(self):
+            self.closed = True
 
         async def authenticate(self):
             assert self.config["auth_mode"] == "browser_cookie"
@@ -2298,6 +2303,7 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
     assert payload["operation"] == "jira_sync"
     assert payload["counts"] == {"selected": 1, "reused": 0, "pushed": 1, "failed": 0}
     assert payload["source_sync_run_id"] == "run-test"
+    assert [gene.closed for gene in built] == [True]
     upload_calls = [call for call in FakeToolClient.calls if call[0] == "upload_jira_session"]
     assert upload_calls == [
         (
@@ -2343,11 +2349,17 @@ def test_local_agent_cloud_jira_sync_rejects_issue_changed_after_inventory(monke
 
     from memforge.models import ContentItem, RawContent
 
+    built: list = []
+
     class ConcurrentUpdateJiraGene:
         def __init__(self, config, source_id):
             self.config = config
             self.source_id = source_id
-            self._client = None
+            self.closed = False
+            built.append(self)
+
+        async def close(self):
+            self.closed = True
 
         async def authenticate(self):
             return None
@@ -2403,6 +2415,7 @@ def test_local_agent_cloud_jira_sync_rejects_issue_changed_after_inventory(monke
             )
         )
     assert not [call for call in FakeToolClient.calls if call[0] == "push_jira_package"]
+    assert [gene.closed for gene in built] == [True]
 
 
 def test_local_agent_cloud_jira_sync_rejects_pat_payload():
@@ -2441,7 +2454,10 @@ def test_local_agent_cloud_jira_noop_uses_inventory_without_hydrating_issues(mon
         def __init__(self, config, source_id):
             self.config = config
             self.source_id = source_id
-            self._client = None
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
 
         async def authenticate(self):
             return None
@@ -2513,18 +2529,16 @@ def _confirming_jira_gene(
 
     from memforge.models import AbsenceAnswer, ContentItem
 
-    class HttpClient:
-        async def aclose(self):
-            events.append("closed")
-
     class ConfirmingJiraGene:
         configs: list[dict] = []
 
         def __init__(self, config, source_id):
             self.config = config
             self.source_id = source_id
-            self._client = HttpClient()
             ConfirmingJiraGene.configs.append(dict(config))
+
+        async def close(self):
+            events.append("closed")
 
         async def list_scope(self):
             from memforge.genes.jira_gene import JiraQueryRejected
@@ -2853,7 +2867,10 @@ def test_local_agent_cloud_jira_sync_does_not_publish_partial_snapshot(monkeypat
         def __init__(self, config, source_id):
             self.config = config
             self.source_id = source_id
-            self._client = None
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
 
         async def authenticate(self):
             assert self.config["sync_mode"] == "cloud"

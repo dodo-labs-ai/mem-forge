@@ -36,7 +36,9 @@ What each fake must answer
     :attr:`ProviderListing.TRUNCATED` the provider ends or truncates the
     listing early while claiming more; with :attr:`ProviderListing.FAILED` it
     answers the listing with a server error. The connection records every
-    request the provider receives.
+    request the provider receives, and every client the Gene opened against
+    it; each client tells whether it ``is_closed``. Close the Gene with
+    ``await gene.close()`` when the connection ends.
 ``reading_by_id(status)``
     Required when ``listing_kinds`` include ``query``: a Gene and stored items
     whose read by identifier answers HTTP ``status``.
@@ -103,10 +105,14 @@ class ListingConfig:
 
 @dataclass
 class FakeConnection:
-    """A Gene connected to a fake provider, and every request the provider received, in order."""
+    """A Gene connected to a fake provider, every request the provider received, in order, and every client it opened.
+
+    Each client has an ``is_closed`` property, as ``httpx.AsyncClient`` does.
+    """
 
     gene: DocumentGene
     requests: list[str] = field(default_factory=list)
+    clients: list = field(default_factory=list)
 
 
 class DocumentConnectorFakes:

@@ -820,7 +820,7 @@ async def test_jira_secure_attachment_stream_uses_id_based_locator():
         async with gene.open_source_artifact(artifact) as download:
             assert b"".join([chunk async for chunk in download.chunks]) == image
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
 
 @pytest.mark.asyncio
@@ -907,7 +907,7 @@ async def test_open_source_artifact_streams_jira_attachment():
             assert b"".join([chunk async for chunk in download.chunks]) == image
             assert download.content_length == len(image)
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
 
 @pytest.mark.asyncio
@@ -1773,7 +1773,7 @@ async def test_scope_listing_pages_the_configured_jql_without_since_by_identifie
     try:
         listing = await gene.list_scope()
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert listing.kind.value == "query"
     assert listing.doc_ids == {"jira-PAY-1", "jira-PAY-2", "jira-PAY-3"}
@@ -1794,7 +1794,7 @@ async def test_scope_listing_that_ends_before_its_total_raises():
         with pytest.raises(RuntimeError, match="declared total"):
             await gene.list_scope()
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
 
 @pytest.mark.asyncio
@@ -1830,7 +1830,7 @@ async def test_confirming_unlisted_issues_keeps_every_issue_jira_still_has():
     try:
         answers = await gene.confirm_absent(items)
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert answers == {
         "jira-PAY-1": AbsenceAnswer.EXISTS,
@@ -1860,7 +1860,7 @@ async def test_confirming_unlisted_issues_searches_in_batches_of_one_page():
     try:
         answers = await gene.confirm_absent(items)
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert set(answers.values()) == {AbsenceAnswer.EXISTS}
     assert set(answers) == {item.item_id for item in items}
@@ -1879,7 +1879,7 @@ async def test_confirming_unlisted_issues_fails_when_jira_rejects_the_credential
         with pytest.raises(httpx.HTTPStatusError):
             await gene.confirm_absent([_stored_issue("PAY-2", "100002")])
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
 
 @pytest.mark.asyncio
@@ -1910,7 +1910,7 @@ async def test_a_device_confirms_an_issue_by_the_key_the_server_names_it_by():
     try:
         answers = await gene.confirm_absent(items)
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert answers == {"jira-src-pay-1-abc": AbsenceAnswer.EXISTS, "jira-src-pay-5-abc": AbsenceAnswer.EXISTS}
     assert searched == ["issuekey in (100001, PAY-5)"]
@@ -1973,7 +1973,7 @@ async def test_rediscovery_searches_for_the_issue_within_the_configured_jql(conf
     try:
         current = await gene.rediscover(_stored_issue("PAY-1", "100001"))
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert current.item_id == "jira-PAY-1"
     assert [body["jql"] for body in searches] == [expected_jql]
@@ -1990,7 +1990,7 @@ async def test_rediscovery_finds_an_issue_whose_key_changed_by_its_id():
     try:
         current = await gene.rediscover(_stored_issue("PAY-1", "100001"))
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert (current.item_id, current.extra["issue_id"]) == ("jira-OPS-7", "100001")
 
@@ -2002,7 +2002,7 @@ async def test_rediscovery_gives_nothing_for_an_issue_outside_the_jql():
     try:
         assert await gene.rediscover(_stored_issue("PAY-2", "100002")) is None
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert len(searches) == 1
 
@@ -2026,7 +2026,7 @@ async def test_rediscovery_raises_when_the_search_fails_or_answers_inconsistentl
         with pytest.raises(RuntimeError):
             await gene.rediscover(_stored_issue("PAY-1", "100001"))
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
 
 @pytest.mark.asyncio
@@ -2045,7 +2045,7 @@ async def test_rediscovery_by_an_old_key_accepts_the_issue_under_its_new_key():
     try:
         current = await gene.rediscover(stored)
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert [body["jql"].split(" AND ", 1)[0] for body in searches] == ["issuekey = PAY-1"]
     assert (current.item_id, current.extra["issue_id"]) == ("jira-OPS-7", "100001")
@@ -2063,6 +2063,6 @@ async def test_an_issue_reference_that_is_not_an_id_or_key_never_reaches_jql(iss
         with pytest.raises(ValueError, match="neither an issue id nor an issue key"):
             await gene.confirm_absent([stored])
     finally:
-        await gene._client.aclose()
+        await gene.close()
 
     assert searches == []

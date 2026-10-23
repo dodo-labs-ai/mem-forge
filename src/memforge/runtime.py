@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import logging
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -49,6 +49,7 @@ from memforge.memory.store import MemoryStore
 from memforge.models import SourceSyncRun, SyncState
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.conversation_gene import CollectionAttempt
+from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind
 from memforge.pipeline.collection_family import ExcludedScopeGeneFactory, SnapshotBinding
 from memforge.source_types import source_type_descriptor
@@ -955,6 +956,9 @@ def excluded_scope_gene_factory(source: Mapping[str, Any], source_config: Mappin
     with the excluded scope's fields in place of the current ones, so it
     reuses the current credential and never sees a current scope field.
 
+    Each Gene is open only inside its ``async with`` block and closed when
+    the block exits, including when ``authenticate`` fails.
+
     An excluded scope whose configuration or Gene cannot be built, before
     anything reaches the provider, raises ``SourceConfigurationError``: no
     later run could build it either. ``authenticate`` failures stay as they
@@ -963,7 +967,8 @@ def excluded_scope_gene_factory(source: Mapping[str, Any], source_config: Mappin
 
     source_type = str(source["type"])
 
-    async def excluded_scope_gene(scope: Mapping[str, object]):
+    @contextlib.asynccontextmanager
+    async def excluded_scope_gene(scope: Mapping[str, object]) -> AsyncIterator[DocumentGene]:
         try:
             gene = create_gene(
                 name=source_type,
@@ -972,8 +977,11 @@ def excluded_scope_gene_factory(source: Mapping[str, Any], source_config: Mappin
             )
         except ValueError as exc:
             raise SourceConfigurationError(f"The excluded scope {dict(scope)} cannot be configured: {exc}") from exc
-        await gene.authenticate()
-        return gene
+        try:
+            await gene.authenticate()
+            yield gene
+        finally:
+            await gene.close()
 
     return excluded_scope_gene
 
@@ -1044,39 +1052,42 @@ async def run_source_sync(
             config=source_config,
             source_id=source["id"],
         )
-        sync_kwargs: dict[str, Any] = {
-            "gene": gene,
-            "source_name": source["name"],
-            "source_id": source["id"],
-            "progress_callback": progress_callback,
-            "force_full_sync": force_full_sync,
-            "input_snapshot": input_snapshot,
-            "reprocess_doc_ids": reprocess_doc_ids,
-            "execution_mode": execution_mode,
-            "source_activity": activity_lease,
-            "lifecycle_cycle_id": lifecycle_cycle_id,
-            "scope_transition_run_id": scope_transition_run_id,
-            "reusable_projection_doc_ids": reusable_projection_doc_ids,
-            "record_terminal_result": record_terminal_result,
-            "failed_item_retry": failed_item_retry,
-            "collection_attempt": collection_attempt,
-            "excluded_scope_gene": excluded_scope_gene_factory(source, source_config),
-        }
-        sync_operation = runtime.orchestrator().sync_gene(**sync_kwargs)
-        if heartbeat_task is None:
-            return await sync_operation
-        sync_task = asyncio.create_task(sync_operation)
-        done, _ = await asyncio.wait(
-            {sync_task, heartbeat_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if heartbeat_task in done:
-            sync_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await sync_task
-            await heartbeat_task
-            raise SourceSyncActivityConflict(f"source activity heartbeat stopped: {activity_id}")
-        return await sync_task
+        try:
+            sync_kwargs: dict[str, Any] = {
+                "gene": gene,
+                "source_name": source["name"],
+                "source_id": source["id"],
+                "progress_callback": progress_callback,
+                "force_full_sync": force_full_sync,
+                "input_snapshot": input_snapshot,
+                "reprocess_doc_ids": reprocess_doc_ids,
+                "execution_mode": execution_mode,
+                "source_activity": activity_lease,
+                "lifecycle_cycle_id": lifecycle_cycle_id,
+                "scope_transition_run_id": scope_transition_run_id,
+                "reusable_projection_doc_ids": reusable_projection_doc_ids,
+                "record_terminal_result": record_terminal_result,
+                "failed_item_retry": failed_item_retry,
+                "collection_attempt": collection_attempt,
+                "excluded_scope_gene": excluded_scope_gene_factory(source, source_config),
+            }
+            sync_operation = runtime.orchestrator().sync_gene(**sync_kwargs)
+            if heartbeat_task is None:
+                return await sync_operation
+            sync_task = asyncio.create_task(sync_operation)
+            done, _ = await asyncio.wait(
+                {sync_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done:
+                sync_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await sync_task
+                await heartbeat_task
+                raise SourceSyncActivityConflict(f"source activity heartbeat stopped: {activity_id}")
+            return await sync_task
+        finally:
+            await gene.close()
     finally:
         if heartbeat_task is not None:
             heartbeat_task.cancel()

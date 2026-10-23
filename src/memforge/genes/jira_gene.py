@@ -503,6 +503,7 @@ class JiraGene(DocumentGene):
         require_https_base_url(base_url, "Jira")
 
         mode = _auth_mode(self.config)
+        await self.close()
         self._base_url = base_url
         self._auth_mode = mode
         sync_mode = str(self.config.get("sync_mode") or "cloud").strip().lower()

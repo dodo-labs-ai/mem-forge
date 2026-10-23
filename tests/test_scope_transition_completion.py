@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -347,9 +348,10 @@ class ExcludedScopes:
         self.listings = listings
         self.listed: list[dict[str, object]] = []
 
+    @asynccontextmanager
     async def __call__(self, scope):
         self.listed.append(dict(scope))
-        return _ExcludedGene(self.listings[str(scope["jql"])])
+        yield _ExcludedGene(self.listings[str(scope["jql"])])
 
 
 class _ExcludedGene:
@@ -1155,10 +1157,16 @@ async def test_a_device_jql_change_completes_end_to_end_from_job_to_listing_to_m
     payload = await local_agent_sync_job_payload(workspace.db, await workspace.db.get_source(SOURCE_ID))
 
     # 2. The device lists it with its own session: PAY-0 and PAY-1 match the old JQL.
+    built: list = []
+
     class OldQuery:
         def __init__(self, config, source_id):
             assert config["jql"] == OLD_JQL
-            self._client = None
+            self.closed = False
+            built.append(self)
+
+        async def close(self):
+            self.closed = True
 
         async def authenticate(self):
             return None
@@ -1168,6 +1176,7 @@ async def test_a_device_jql_change_completes_end_to_end_from_job_to_listing_to_m
 
     monkeypatch.setattr(jira_gene, "JiraGene", OldQuery)
     listed = await main._list_excluded_jira_scopes(payload, source_id=SOURCE_ID, jira_cookie="JSESSIONID=local")
+    assert [gene.closed for gene in built] == [True]
 
     # 3. The manifest stores the listing, and the device answers for PAY-2, which left the query earlier.
     listings = tuple(

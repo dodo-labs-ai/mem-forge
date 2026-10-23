@@ -10,7 +10,6 @@ is gone.
 
 from __future__ import annotations
 
-import functools
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -85,6 +84,13 @@ class _Provider:
         self.listing = listing
         self.read_status = read_status
         self.requests: list[str] = []
+        self.clients: list[httpx.AsyncClient] = []
+
+    def client(self, *args, **kwargs) -> httpx.AsyncClient:
+        """The client the Gene builds in ``authenticate``, answered by this provider."""
+        built = _REAL_ASYNC_CLIENT(*args, transport=httpx.MockTransport(self.handle), **kwargs)
+        self.clients.append(built)
+        return built
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(f"{request.method} {request.url}")
@@ -138,9 +144,9 @@ class ConfluenceFakes(DocumentConnectorFakes):
         provider = _Provider(listing)
         gene = await _authenticated(dict(config), provider)
         try:
-            yield FakeConnection(gene=gene, requests=provider.requests)
+            yield FakeConnection(gene=gene, requests=provider.requests, clients=provider.clients)
         finally:
-            await gene._client.aclose()
+            await gene.close()
 
     @asynccontextmanager
     async def reading_by_id(self, status: int) -> AsyncIterator[tuple[ConfluenceGene, Sequence[ContentItem]]]:
@@ -150,7 +156,7 @@ class ConfluenceFakes(DocumentConnectorFakes):
         try:
             yield gene, [_stored_page("101")]
         finally:
-            await gene._client.aclose()
+            await gene.close()
 
     def rediscover_candidates(self, config: Mapping[str, object]) -> list[ContentItem]:
         return [_stored_page(page_id) for page_id in [*PAGES, GONE_PAGE]]
@@ -158,7 +164,7 @@ class ConfluenceFakes(DocumentConnectorFakes):
 
 async def _authenticated(config: dict, provider: _Provider) -> ConfluenceGene:
     gene = ConfluenceGene(config=config, source_id="src-contract")
-    client = functools.partial(_REAL_ASYNC_CLIENT, transport=httpx.MockTransport(provider.handle))
+    client = provider.client
     # The fake answers at once, so requests need no pacing.
     with (
         patch("httpx.AsyncClient", client),
