@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -28,8 +28,6 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
-    ScopeListing,
-    ScopeListingKind,
     SourceUnitInput,
 )
 from memforge.source_artifacts import (
@@ -50,8 +48,6 @@ __all__ = [
     "ContentItem",
     "RawContent",
     "NormalizedContent",
-    "ScopeListing",
-    "ScopeListingKind",
 ]
 
 logger = logging.getLogger(__name__)
@@ -84,10 +80,14 @@ class Gene(ABC):
     Subclasses **may** override:
     - ``health_check()``  -- connectivity / credential validity probe
     - ``requires_pdf_artifact()`` -- whether a document must retain PDF provenance
-    - ``rediscovers_documents()`` and ``rediscover()`` -- read one stored
-      Document's current state from the provider by its id
-    - ``list_scope()`` and ``confirm_absent()`` -- list the configured scope
-      by identifier so a run can prove which Documents are gone
+
+    A connector subclasses one family's base rather than this class:
+    :class:`~memforge.genes.document_gene.DocumentGene` for providers whose
+    items can be listed, and
+    :class:`~memforge.genes.conversation_gene.ConversationGene` for message
+    streams collected through the conversation layer. Only a managed-capture
+    Gene, whose Source receives content as it is captured and has no sync run,
+    subclasses this class itself.
     """
 
     # ------------------------------------------------------------------
@@ -111,16 +111,6 @@ class Gene(ABC):
         Each ``ConfigField`` describes one user-editable setting (base URL,
         API token, space keys, etc.).  Fields are grouped via ``ConfigGroup``.
         """
-
-    @classmethod
-    def rediscovers_documents(cls, config: Mapping[str, Any]) -> bool:
-        """Whether a Source with this configuration can ask its provider for one Document by id.
-
-        A Gene that can implements :meth:`rediscover`. Content a local agent
-        collected or a user uploaded has no provider to ask; its only copy is
-        the stored input.
-        """
-        return False
 
     def filter_summary(self, since: datetime | None) -> str | None:
         """The filter this run's discovery applied, as source activity shows it."""
@@ -168,77 +158,7 @@ class Gene(ABC):
         """
         self.config = config
         self.source_id = source_id
-        self._discovery_complete = False
-        self._discovery_completion_reason = "discovery_not_started"
-        self._discovered_scope: ScopeListing | None = None
         self._log = logging.getLogger(f"{__name__}.{type(self).__name__}[{source_id}]")
-
-    def begin_discovery(self) -> None:
-        """Reset run-scoped collection evidence before enumeration starts."""
-
-        self._discovery_complete = False
-        self._discovery_completion_reason = "discovery_incomplete"
-        self._discovered_scope = None
-
-    def attest_discovery_complete(self, reason: str) -> None:
-        """Record validated provider enumeration completion for this run."""
-
-        normalized_reason = str(reason or "").strip()
-        if not normalized_reason:
-            raise ValueError("discovery completion reason is required")
-        self._discovery_complete = True
-        self._discovery_completion_reason = normalized_reason
-
-    @property
-    def discovery_complete(self) -> bool:
-        """Whether this exact discover call proved enumeration completion."""
-
-        return self._discovery_complete
-
-    @property
-    def discovery_completion_reason(self) -> str:
-        return self._discovery_completion_reason
-
-    def record_scope_listing(self, kind: ScopeListingKind, doc_ids: set[str] | frozenset[str]) -> None:
-        """Record that this run's discovery enumerated the whole configured scope.
-
-        A Gene whose discovery walks every item in scope on every run, and uses
-        ``since`` only to choose which items to yield, records the Document ids
-        it walked once the walk completed. :meth:`list_scope` returns them.
-        """
-
-        self._discovered_scope = ScopeListing(kind=kind, doc_ids=frozenset(doc_ids))
-
-    async def list_scope(self) -> ScopeListing | None:
-        """List every item in the configured scope by Document id, whatever ``since`` discovery used.
-
-        Called after this run's :meth:`discover`. The listing is identifiers
-        only: no content is fetched and no model is called. It is complete or
-        it is not returned: incomplete paging, a truncated result or a provider
-        error raises, and the run proves no absence. By default it is what this
-        run's discovery recorded with :meth:`record_scope_listing`; a Gene whose
-        discovery narrows by ``since`` at the provider lists its scope itself.
-
-        ``None`` means the Gene cannot list its scope, so no Document becomes
-        absent through a listing. Collected snapshots and conversation sources
-        prove absence their own way.
-        """
-
-        return self._discovered_scope
-
-    async def confirm_absent(self, items: Sequence[ContentItem]) -> frozenset[str]:
-        """Return the Document ids of the unlisted ``items`` that the provider no longer has.
-
-        Only a Gene whose listing is a :attr:`ScopeListingKind.QUERY` listing
-        implements it. Each item is rebuilt from its stored Document, as for
-        :meth:`rediscover`. An item is absent only when the provider reports it
-        not found or gone. An item the provider still returns is kept, whether
-        or not it still matches the configured query, and so is one the
-        provider refuses to show for permission reasons; authentication,
-        transport and other provider errors raise.
-        """
-
-        raise NotImplementedError(f"{type(self).__name__} cannot confirm absence by identifier")
 
     def bind_document_store(self, document_store: Any) -> None:
         """Bind the runtime document artifact store when a gene needs it."""
@@ -304,16 +224,6 @@ class Gene(ABC):
         committed revision, never from here.
         """
         return RawContent(item=item, body=body, content_type=content_type)
-
-    async def rediscover(self, item: ContentItem) -> ContentItem | None:
-        """Return the provider's current item for one stored Document.
-
-        ``item`` is rebuilt from the stored Document. The result is the item
-        discovery would yield for that Document now, so :meth:`fetch` reads its
-        current state; ``None`` means the provider no longer returns it.
-        Only Genes whose :meth:`rediscovers_documents` holds implement it.
-        """
-        raise NotImplementedError(f"{type(self).__name__} cannot rediscover one Document")
 
     @asynccontextmanager
     async def open_source_artifact(

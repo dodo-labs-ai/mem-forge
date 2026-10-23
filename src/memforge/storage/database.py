@@ -30,6 +30,17 @@ from memforge.agent_session_contract import (
     AGENT_SESSION_WINDOW_SOURCE_KIND,
     successful_agent_session_activity_at,
 )
+from memforge.local_agent.snapshot_manifest import (
+    ExcludedScopeListing,
+    SnapshotConfirmation,
+    excluded_listing_rows,
+    excluded_listings_from_rows,
+    snapshot_confirmation,
+    snapshot_confirmation_updates,
+    validate_snapshot_confirmation_submission,
+    validate_snapshot_manifest_extras,
+    validate_snapshot_manifest_values,
+)
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_SYNC_OPERATIONS,
     local_agent_completion_status,
@@ -282,6 +293,7 @@ from memforge.source_projection import (
     ProjectionCoverage,
     ProjectionIdentityConflict,
     ProjectionScopeTransition,
+    ProjectionScopeTransitionStale,
     ProjectionScopeTransitionStatus,
     SourceObservationRevision,
     SourceObservation,
@@ -1385,20 +1397,37 @@ CREATE INDEX IF NOT EXISTS idx_source_projection_runs_source
     ON source_projection_runs(source_id, created_at);
 
 CREATE TABLE IF NOT EXISTS projection_scope_transitions (
-    id                  TEXT PRIMARY KEY,
-    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    previous_scope_json TEXT NOT NULL,
-    target_scope_json   TEXT NOT NULL,
-    status              TEXT NOT NULL CHECK (status IN ('pending', 'running', 'applied', 'failed')),
-    run_id              TEXT,
-    coverage            TEXT,
-    error               TEXT,
-    created_at          TEXT NOT NULL,
-    updated_at          TEXT NOT NULL,
-    completed_at        TEXT
+    id                        TEXT PRIMARY KEY,
+    source_id                 TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    previous_scope_json       TEXT NOT NULL,
+    target_scope_json         TEXT NOT NULL,
+    status                    TEXT NOT NULL CHECK (
+        status IN ('pending', 'running', 'applied', 'failed', 'superseded')
+    ),
+    predecessor_transition_id TEXT,
+    run_id                    TEXT,
+    error                     TEXT,
+    -- Whether the latest run reached the step that lists the excluded scopes,
+    -- so the next device job carries them.
+    excluded_scopes_due       INTEGER NOT NULL DEFAULT 0 CHECK (excluded_scopes_due IN (0, 1)),
+    -- How many items the latest complete listing of the target scope holds;
+    -- NULL until a run lists it in full.
+    listed_count              INTEGER CHECK (listed_count IS NULL OR listed_count >= 0),
+    created_at                TEXT NOT NULL,
+    updated_at                TEXT NOT NULL,
+    completed_at              TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_projection_scope_transitions_source
     ON projection_scope_transitions(source_id, created_at);
+
+-- One row per listed Document committed under an open transition; the rows
+-- are deleted when the transition is applied or superseded.
+CREATE TABLE IF NOT EXISTS projection_scope_transition_members (
+    transition_id    TEXT NOT NULL REFERENCES projection_scope_transitions(id) ON DELETE CASCADE,
+    doc_id           TEXT NOT NULL,
+    unit_revision_id TEXT NOT NULL,
+    PRIMARY KEY (transition_id, doc_id)
+);
 
 CREATE TABLE IF NOT EXISTS source_units (
     id                  TEXT PRIMARY KEY,
@@ -1902,6 +1931,7 @@ CREATE TABLE IF NOT EXISTS sync_history (
     failed_docs         TEXT,                -- JSON array
     absence_check_skipped_reason TEXT,
     skipped_reading_group_count INTEGER NOT NULL DEFAULT 0,
+    unlisted_present_count INTEGER,
     started_at          TEXT NOT NULL,
     finished_at         TEXT NOT NULL,
     run_id              TEXT
@@ -2008,6 +2038,36 @@ CREATE INDEX IF NOT EXISTS idx_source_sync_manifest_item_attestation
     ON source_sync_snapshot_manifest_items(
         workspace_id, source_id, doc_id, revision, change_kind, snapshot_id
     );
+
+-- The unlisted items a snapshot asks its device to confirm, issued with the
+-- manifest; answer is NULL until the device answers.
+CREATE TABLE IF NOT EXISTS source_sync_snapshot_confirmations (
+    workspace_id        TEXT NOT NULL,
+    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    snapshot_id         TEXT NOT NULL,
+    doc_id              TEXT NOT NULL,
+    provider_key        TEXT NOT NULL,
+    answer              TEXT CHECK (answer IN ('absent', 'exists', 'hidden', 'failed')),
+    cause               TEXT,
+    answered_at         TEXT,
+    PRIMARY KEY (workspace_id, source_id, snapshot_id, doc_id)
+);
+
+-- One scope row per excluded scope a device listed (doc_id NULL; rejection
+-- NULL when the scope was listed, its cause when the provider rejected it)
+-- and one item row per Document the scope lists.
+CREATE TABLE IF NOT EXISTS source_sync_snapshot_excluded_listings (
+    workspace_id        TEXT NOT NULL,
+    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    snapshot_id         TEXT NOT NULL,
+    scope_key           TEXT NOT NULL,
+    doc_id              TEXT,
+    rejection           TEXT,
+    CHECK (doc_id IS NULL OR rejection IS NULL)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_sync_snapshot_excluded_listings_snapshot
+    ON source_sync_snapshot_excluded_listings(workspace_id, source_id, snapshot_id, scope_key);
 
 -- The collection request the server issued to each conversation collection
 -- attempt, the immutable Collection Manifest that answered it, and the message
@@ -5004,6 +5064,104 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # The worker running the sync sees the request at its next heartbeat.
         ["ALTER TABLE source_sync_runs ADD COLUMN stop_requested_at TEXT"],
     ),
+    (
+        126,
+        "Complete Projection Scope transitions by their committed members",
+        # A transition records each listed Document committed under it and
+        # completes once its listing is covered, so it keeps no coverage. A
+        # later scope change supersedes an open transition and names it as
+        # its predecessor.
+        [
+            """CREATE TABLE projection_scope_transitions_v2 (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                previous_scope_json TEXT NOT NULL,
+                target_scope_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('pending', 'running', 'applied', 'failed', 'superseded')
+                ),
+                predecessor_transition_id TEXT,
+                run_id TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            )""",
+            """INSERT INTO projection_scope_transitions_v2 (
+                    id, source_id, previous_scope_json, target_scope_json, status,
+                    predecessor_transition_id, run_id, error, created_at, updated_at,
+                    completed_at
+                ) SELECT id, source_id, previous_scope_json, target_scope_json, status,
+                    NULL, run_id, error, created_at, updated_at, completed_at
+                FROM projection_scope_transitions""",
+            "DROP TABLE projection_scope_transitions",
+            "ALTER TABLE projection_scope_transitions_v2 RENAME TO projection_scope_transitions",
+            "CREATE INDEX IF NOT EXISTS idx_projection_scope_transitions_source "
+            "ON projection_scope_transitions(source_id, created_at)",
+            """CREATE TABLE IF NOT EXISTS projection_scope_transition_members (
+                transition_id TEXT NOT NULL
+                    REFERENCES projection_scope_transitions(id) ON DELETE CASCADE,
+                doc_id TEXT NOT NULL,
+                unit_revision_id TEXT NOT NULL,
+                PRIMARY KEY (transition_id, doc_id)
+            )""",
+        ],
+    ),
+    (
+        127,
+        "Store device confirmations, device excluded-scope listings and the confirmation count",
+        # A device snapshot is issued the unlisted items it must confirm,
+        # stores the answers, and keeps what it listed in each excluded scope
+        # of a transition. A sync history row counts the unlisted items
+        # confirmed still present.
+        [
+            """CREATE TABLE IF NOT EXISTS source_sync_snapshot_confirmations (
+                workspace_id TEXT NOT NULL,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                snapshot_id TEXT NOT NULL,
+                doc_id TEXT NOT NULL,
+                provider_key TEXT NOT NULL,
+                answer TEXT CHECK (answer IN ('absent', 'exists', 'hidden', 'failed')),
+                cause TEXT,
+                answered_at TEXT,
+                PRIMARY KEY (workspace_id, source_id, snapshot_id, doc_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS source_sync_snapshot_excluded_listings (
+                workspace_id TEXT NOT NULL,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                snapshot_id TEXT NOT NULL,
+                scope_key TEXT NOT NULL,
+                doc_id TEXT,
+                rejection TEXT,
+                CHECK (doc_id IS NULL OR rejection IS NULL)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_source_sync_snapshot_excluded_listings_snapshot "
+            "ON source_sync_snapshot_excluded_listings(workspace_id, source_id, snapshot_id, scope_key)",
+            "ALTER TABLE sync_history ADD COLUMN unlisted_present_count INTEGER",
+        ],
+    ),
+    (
+        128,
+        "Record on a scope transition that its next device job carries the excluded scopes",
+        # A device lists the excluded scopes only when its job carries them; a
+        # run that reached the step that lists them marks the transition so
+        # the next job does, even when deferred commits keep listed Documents
+        # from being members.
+        [
+            "ALTER TABLE projection_scope_transitions ADD COLUMN excluded_scopes_due INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (excluded_scopes_due IN (0, 1))",
+        ],
+    ),
+    (
+        129,
+        "Record how many items a scope transition's latest listing of its target holds",
+        # Source health shows an open transition's progress: the listed items
+        # committed under it out of the items its target scope lists.
+        [
+            "ALTER TABLE projection_scope_transitions ADD COLUMN listed_count INTEGER "
+            "CHECK (listed_count IS NULL OR listed_count >= 0)",
+        ],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -5062,6 +5220,10 @@ async def _open_aiosqlite_connection(
 # The triggers of a sync a person requested, which retries every failed
 # Document of its Source.
 _REQUESTED_SYNC_TRIGGERS = frozenset({"manual", "force"})
+
+# The statuses of a Projection Scope transition that has neither completed nor
+# been superseded; a Source has at most one transition in them.
+_OPEN_SCOPE_TRANSITION_STATUSES = frozenset({"pending", "running", "failed"})
 
 # Primary result codes of a database another connection holds; the low byte of
 # an extended code is its primary code.
@@ -6695,8 +6857,7 @@ class Database:
                 raise ValueError("local agent retry target does not match source and owner")
             if target["status"] != "queued":
                 return retry_job_id, False
-            current_payload = local_agent_sync_job_payload(source)
-            if target["payload"].get("source_config_revision") != current_payload["source_config_revision"]:
+            if target["payload"].get("source_config_revision") != local_agent_source_config_revision(source):
                 raise ValueError("local agent retry target configuration is stale")
             if trigger != "manual":
                 raise ValueError("targeted retry requires manual intent")
@@ -6991,17 +7152,24 @@ class Database:
         claim_time = now or datetime.now(timezone.utc)
         due_at = _utc_iso(claim_time)
         enqueued = 0
+        # Each job's payload is read before the write transaction; the schedule
+        # update below claims a Source only while its due time and configuration are unchanged.
+        async with self.db.execute(
+            """SELECT * FROM sources s WHERE status = 'active'
+               AND sync_schedule_enabled = 1
+               AND sync_schedule_next_at IS NOT NULL
+               AND sync_schedule_next_at <= ?
+               ORDER BY s.sync_schedule_next_at, s.created_at LIMIT ?""",
+            (due_at, limit),
+        ) as cursor:
+            rows = [dict(row) async for row in cursor]
+        payloads = {
+            row["id"]: await local_agent_sync_job_payload(self, row)
+            for row in rows
+            if local_agent_sync_operation(row["type"], row["config"]) is not None
+        }
         async with self._write_lock:
             try:
-                async with self.db.execute(
-                    """SELECT * FROM sources s WHERE status = 'active'
-                       AND sync_schedule_enabled = 1
-                       AND sync_schedule_next_at IS NOT NULL
-                       AND sync_schedule_next_at <= ?
-                       ORDER BY s.sync_schedule_next_at, s.created_at LIMIT ?""",
-                    (due_at, limit),
-                ) as cursor:
-                    rows = [dict(row) async for row in cursor]
                 for row in rows:
                     operation = local_agent_sync_operation(row["type"], row["config"])
                     if operation is None:
@@ -7033,24 +7201,28 @@ class Database:
                             f"memforge:{workspace_id}:{row['id']}:{expected_due}",
                         ).hex
                     )
+                    # A configuration saved since the payload was read leaves
+                    # the Source due, for the next pass to read it again.
                     cursor = await self.db.execute(
                         """UPDATE sources SET sync_schedule_next_at = ?,
                            sync_schedule_updated_at = ?
                            WHERE id = ? AND status = 'active'
                              AND sync_schedule_enabled = 1
-                             AND sync_schedule_next_at = ?""",
+                             AND sync_schedule_next_at = ?
+                             AND config = ?""",
                         (
                             _utc_iso(claim_time + timedelta(minutes=interval)),
                             due_at,
                             row["id"],
                             expected_due,
+                            row["config"],
                         ),
                     )
                     if cursor.rowcount:
                         _, created = await self._enqueue_local_agent_job_locked(
                             job_id=job_id, workspace_id=workspace_id, source_id=row["id"],
                             source_type=row["type"], operation=operation,
-                            payload=local_agent_sync_job_payload(row), created_by_user_id=owner,
+                            payload=payloads[row["id"]], created_by_user_id=owner,
                             execution_owner_user_id=owner, now_iso=due_at, trigger="scheduled",
                         )
                         enqueued += int(created)
@@ -7084,6 +7256,21 @@ class Database:
             (source_id,),
         ) as cursor:
             return {str(row[0]) async for row in cursor}
+
+    async def list_current_document_provider_keys(self, source_id: str) -> dict[str, str]:
+        """The provider key of the current Source Unit of each Document the Source holds."""
+        rows = await self.db.execute_fetchall(
+            """SELECT lineage.document_id, su.provider_key
+                 FROM source_unit_document_lineage_history lineage
+                 JOIN source_units su ON su.id = lineage.source_unit_id
+                WHERE lineage.source_id = ? AND lineage.is_current = 1
+                ORDER BY lineage.document_id, lineage.last_seen_at DESC, su.id""",
+            (source_id,),
+        )
+        keys: dict[str, str] = {}
+        for row in rows:
+            keys.setdefault(str(row["document_id"]), str(row["provider_key"]))
+        return keys
 
     async def count_missing_pdf_uris(self, source_id: str) -> int:
         """Count the Source's non-empty Units whose current stored input has no PDF.
@@ -8050,6 +8237,7 @@ class Database:
         *,
         unit_input: SourceUnitInput | None = None,
         source_activity: SourceActivityLease | None = None,
+        scope_transition_id: str | None = None,
         _manage_transaction: bool = True,
     ) -> None:
         """Persist one complete provider-neutral projection atomically.
@@ -8064,6 +8252,13 @@ class Database:
         projected from. It is recorded in the same transaction as the revision,
         also when the run was recorded before, unless a later revision of the
         Unit is already current.
+
+        ``scope_transition_id`` names the open Projection Scope transition the
+        commit belongs to. The committed Document is then recorded as one of
+        its members, ``(doc_id, unit_revision_id)`` from ``unit_input``, in
+        the same transaction, also when the run was recorded before; the
+        commit is refused when that transition is no longer open. A tombstone
+        records no member.
         """
 
         incoming_payload = source_projection_to_payload(projection)
@@ -8117,6 +8312,10 @@ class Database:
                         raise ValueError("projection retry payload mismatch")
                     if unit_input is not None:
                         await self._record_source_unit_input_unlocked(projection, unit_input, now)
+                    if scope_transition_id is not None:
+                        await self._record_projection_scope_transition_member_unlocked(
+                            projection, unit_input, scope_transition_id
+                        )
                     await self._assert_source_activity_fence_unlocked(
                         projection.source_id,
                         source_activity,
@@ -8396,6 +8595,10 @@ class Database:
                             json.dumps(delta_payloads[index], sort_keys=True, separators=(",", ":")),
                         ),
                     )
+                if scope_transition_id is not None:
+                    await self._record_projection_scope_transition_member_unlocked(
+                        projection, unit_input, scope_transition_id
+                    )
                 await self._assert_source_activity_fence_unlocked(
                     projection.source_id,
                     source_activity,
@@ -8443,42 +8646,52 @@ class Database:
     ) -> ProjectionScopeTransition:
         if transition.status is not ProjectionScopeTransitionStatus.PENDING:
             raise ValueError("new projection scope transition must be pending")
-        now = _now_iso()
-        previous_json = json.dumps(dict(transition.previous_scope), sort_keys=True, separators=(",", ":"))
-        target_json = json.dumps(dict(transition.target_scope), sort_keys=True, separators=(",", ":"))
         async with self._write_lock:
             try:
-                await self.db.execute(
-                    """INSERT OR IGNORE INTO projection_scope_transitions (
-                        id, source_id, previous_scope_json, target_scope_json, status,
-                        run_id, coverage, error, created_at, updated_at, completed_at
-                    ) VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, ?, NULL)""",
-                    (
-                        transition.id,
-                        transition.source_id,
-                        previous_json,
-                        target_json,
-                        transition.created_at or now,
-                        now,
-                    ),
-                )
-                async with self.db.execute(
-                    "SELECT * FROM projection_scope_transitions WHERE id = ?",
-                    (transition.id,),
-                ) as cursor:
-                    row = await cursor.fetchone()
-                if (
-                    row is None
-                    or row["source_id"] != transition.source_id
-                    or row["previous_scope_json"] != previous_json
-                    or row["target_scope_json"] != target_json
-                ):
-                    raise ValueError("projection scope transition retry identity mismatch")
+                row = await self._insert_projection_scope_transition_unlocked(transition)
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
                 raise
         return self._row_to_projection_scope_transition(row)
+
+    async def _insert_projection_scope_transition_unlocked(
+        self,
+        transition: ProjectionScopeTransition,
+    ) -> aiosqlite.Row:
+        """Insert a pending transition, or accept a retry that carries the same identity."""
+        now = _now_iso()
+        previous_json = json.dumps(dict(transition.previous_scope), sort_keys=True, separators=(",", ":"))
+        target_json = json.dumps(dict(transition.target_scope), sort_keys=True, separators=(",", ":"))
+        await self.db.execute(
+            """INSERT OR IGNORE INTO projection_scope_transitions (
+                id, source_id, previous_scope_json, target_scope_json, status,
+                predecessor_transition_id, run_id, error, created_at, updated_at, completed_at
+            ) VALUES (?, ?, ?, ?, 'pending', ?, NULL, NULL, ?, ?, NULL)""",
+            (
+                transition.id,
+                transition.source_id,
+                previous_json,
+                target_json,
+                transition.predecessor_transition_id,
+                transition.created_at or now,
+                now,
+            ),
+        )
+        async with self.db.execute(
+            "SELECT * FROM projection_scope_transitions WHERE id = ?",
+            (transition.id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if (
+            row is None
+            or row["source_id"] != transition.source_id
+            or row["previous_scope_json"] != previous_json
+            or row["target_scope_json"] != target_json
+            or row["predecessor_transition_id"] != transition.predecessor_transition_id
+        ):
+            raise ValueError("projection scope transition retry identity mismatch")
+        return row
 
     async def get_open_projection_scope_transition(
         self,
@@ -8516,7 +8729,7 @@ class Database:
         async with self._write_lock:
             cursor = await self.db.execute(
                 """UPDATE projection_scope_transitions
-                   SET status = 'running', run_id = ?, coverage = NULL, error = NULL,
+                   SET status = 'running', run_id = ?, error = NULL,
                        updated_at = ?, completed_at = NULL
                    WHERE id = ? AND status IN ('pending', 'failed', 'running')
                      AND (status != 'running' OR run_id = ?)""",
@@ -8526,7 +8739,7 @@ class Database:
                 await self.db.rollback()
                 raise ValueError("projection scope transition is not startable")
             await self.db.commit()
-        stored = await self._get_projection_scope_transition(transition_id)
+        stored = await self.get_projection_scope_transition(transition_id)
         assert stored is not None
         return stored
 
@@ -8535,24 +8748,29 @@ class Database:
         transition_id: str,
         *,
         run_id: str,
-        coverage: ProjectionCoverage,
     ) -> ProjectionScopeTransition:
-        if not coverage.proves_absence:
-            raise ValueError("scope transition requires complete snapshot coverage")
+        """Apply the transition the run holds and delete its member rows in one transaction."""
         now = _now_iso()
         async with self._write_lock:
-            cursor = await self.db.execute(
-                """UPDATE projection_scope_transitions
-                   SET status = 'applied', coverage = ?, error = NULL,
-                       updated_at = ?, completed_at = ?
-                   WHERE id = ? AND status = 'running' AND run_id = ?""",
-                (coverage.value, now, now, transition_id, run_id),
-            )
-            if cursor.rowcount != 1:
+            try:
+                cursor = await self.db.execute(
+                    """UPDATE projection_scope_transitions
+                       SET status = 'applied', error = NULL, excluded_scopes_due = 0,
+                           updated_at = ?, completed_at = ?
+                       WHERE id = ? AND status = 'running' AND run_id = ?""",
+                    (now, now, transition_id, run_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("projection scope transition completion stale guard failed")
+                await self.db.execute(
+                    "DELETE FROM projection_scope_transition_members WHERE transition_id = ?",
+                    (transition_id,),
+                )
+                await self.db.commit()
+            except Exception:
                 await self.db.rollback()
-                raise ValueError("projection scope transition completion stale guard failed")
-            await self.db.commit()
-        stored = await self._get_projection_scope_transition(transition_id)
+                raise
+        stored = await self.get_projection_scope_transition(transition_id)
         assert stored is not None
         return stored
 
@@ -8561,35 +8779,142 @@ class Database:
         transition_id: str,
         *,
         run_id: str,
-        coverage: ProjectionCoverage,
         error: str,
+        excluded_scopes_due: bool = False,
+        listed_count: int | None = None,
     ) -> ProjectionScopeTransition:
+        """Mark the transition the run holds failed; it stays open and keeps its member rows.
+
+        ``excluded_scopes_due`` records whether the run reached the step that
+        lists the excluded scopes, so the next device job carries them.
+        ``listed_count`` is how many items the run's complete listing of the
+        target scope holds; a run without one keeps the count stored before.
+        """
         now = _now_iso()
         async with self._write_lock:
             cursor = await self.db.execute(
                 """UPDATE projection_scope_transitions
-                   SET status = 'failed', coverage = ?, error = ?, updated_at = ?
+                   SET status = 'failed', error = ?, excluded_scopes_due = ?,
+                       listed_count = COALESCE(?, listed_count), updated_at = ?
                    WHERE id = ? AND status = 'running' AND run_id = ?""",
-                (coverage.value, error, now, transition_id, run_id),
+                (error, int(excluded_scopes_due), listed_count, now, transition_id, run_id),
             )
             if cursor.rowcount != 1:
                 await self.db.rollback()
                 raise ValueError("projection scope transition failure stale guard failed")
             await self.db.commit()
-        stored = await self._get_projection_scope_transition(transition_id)
+        stored = await self.get_projection_scope_transition(transition_id)
         assert stored is not None
         return stored
 
-    async def _get_projection_scope_transition(
+    async def get_projection_scope_transition(
         self,
         transition_id: str,
     ) -> ProjectionScopeTransition | None:
+        """The transition with this id, whatever its status."""
         async with self.db.execute(
             "SELECT * FROM projection_scope_transitions WHERE id = ?",
             (transition_id,),
         ) as cursor:
             row = await cursor.fetchone()
         return self._row_to_projection_scope_transition(row) if row is not None else None
+
+    async def _supersede_projection_scope_transition_unlocked(self, transition_id: str) -> None:
+        """Close the open transition as superseded and delete its member rows."""
+        now = _now_iso()
+        cursor = await self.db.execute(
+            """UPDATE projection_scope_transitions
+               SET status = 'superseded', excluded_scopes_due = 0, updated_at = ?, completed_at = ?
+               WHERE id = ? AND status IN ('pending', 'running', 'failed')""",
+            (now, now, transition_id),
+        )
+        if cursor.rowcount != 1:
+            raise ProjectionScopeTransitionStale()
+        await self.db.execute(
+            "DELETE FROM projection_scope_transition_members WHERE transition_id = ?",
+            (transition_id,),
+        )
+
+    async def list_projection_scope_transition_member_doc_ids(
+        self,
+        transition_id: str,
+    ) -> tuple[str, ...]:
+        """The Documents committed under the transition, in doc id order."""
+        rows = await self.db.execute_fetchall(
+            """SELECT doc_id FROM projection_scope_transition_members
+               WHERE transition_id = ? ORDER BY doc_id""",
+            (transition_id,),
+        )
+        return tuple(str(row["doc_id"]) for row in rows)
+
+    async def count_projection_scope_transition_members(self, transition_id: str) -> int:
+        """How many Documents have committed under the transition; zero once it is closed."""
+        async with self.db.execute(
+            "SELECT COUNT(*) FROM projection_scope_transition_members WHERE transition_id = ?",
+            (transition_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row is not None else 0
+
+    async def list_projection_scope_transition_failed_member_doc_ids(
+        self,
+        transition_id: str,
+    ) -> tuple[str, ...]:
+        """The Documents committed under the transition that its Source's failure ledger still holds, in doc id order."""
+        rows = await self.db.execute_fetchall(
+            """SELECT m.doc_id
+                 FROM projection_scope_transition_members m
+                 JOIN projection_scope_transitions t ON t.id = m.transition_id
+                 JOIN source_item_failures f ON f.source_id = t.source_id AND f.document_id = m.doc_id
+                WHERE m.transition_id = ?
+                ORDER BY m.doc_id""",
+            (transition_id,),
+        )
+        return tuple(str(row["doc_id"]) for row in rows)
+
+    async def _record_projection_scope_transition_member_unlocked(
+        self,
+        projection: SourceProjection,
+        unit_input: SourceUnitInput | None,
+        scope_transition_id: str,
+    ) -> None:
+        """Record the projection's Document as a member of the open transition.
+
+        The transition must belong to the projection's Source and be open
+        (``pending``, ``running`` or ``failed``); otherwise the commit is
+        refused, a tombstone's included. A tombstone commits no listed
+        Document and records no member. A replayed run whose Unit has a later
+        current revision records none either, so a member's revision never
+        goes back. A member committed again keeps one row, holding the latest
+        Unit revision.
+        """
+        async with self.db.execute(
+            """SELECT status FROM projection_scope_transitions
+               WHERE id = ? AND source_id = ?""",
+            (scope_transition_id, projection.source_id),
+        ) as cursor:
+            transition = await cursor.fetchone()
+        if transition is None or transition["status"] not in _OPEN_SCOPE_TRANSITION_STATUSES:
+            raise ValueError("projection scope transition is not open")
+        if projection.coverage is ProjectionCoverage.TOMBSTONED_DELTA:
+            return
+        if unit_input is None:
+            raise ValueError("a scope transition member requires the committed Unit's stored input")
+        async with self.db.execute(
+            "SELECT current_revision_id FROM source_units WHERE id = ?",
+            (unit_input.source_unit_id,),
+        ) as cursor:
+            unit = await cursor.fetchone()
+        if unit is None or unit["current_revision_id"] != unit_input.unit_revision_id:
+            return
+        await self.db.execute(
+            """INSERT INTO projection_scope_transition_members (
+                transition_id, doc_id, unit_revision_id
+            ) VALUES (?, ?, ?)
+            ON CONFLICT(transition_id, doc_id) DO UPDATE SET
+                unit_revision_id = excluded.unit_revision_id""",
+            (scope_transition_id, unit_input.document_id, unit_input.unit_revision_id),
+        )
 
     async def get_current_source_unit_revision(
         self,
@@ -10286,11 +10611,14 @@ class Database:
         required_derivation_work_ids: tuple[str, ...] = (),
         source_activity: SourceActivityLease | None = None,
         runtime_bundle: AgentRuntimeBundle | None = None,
+        scope_transition_id: str | None = None,
     ) -> None:
         """Advance Source Projection and Memory lifecycle in one transaction.
 
         ``document`` updates the shared Document row and ``unit_input`` records
-        the stored input of the committed Unit revision.
+        the stored input of the committed Unit revision. ``scope_transition_id``
+        records the committed Document as a member of that open transition, as
+        ``record_source_projection`` does.
         """
 
         if required_derivation_work_ids and derivation_id is None:
@@ -10410,6 +10738,7 @@ class Database:
                     projection,
                     unit_input=unit_input,
                     source_activity=source_activity,
+                    scope_transition_id=scope_transition_id,
                     _manage_transaction=False,
                 )
                 await self._apply_lifecycle_plan(plan, _manage_transaction=False)
@@ -17029,12 +17358,24 @@ class Database:
         created_by_user_id: str | None = None,
         execution_owner_user_id: str | None = None,
         projection_scope_transition: ProjectionScopeTransition | None = None,
+        expected_open_transition_id: str | None = None,
     ) -> None:
         """Insert or update a source row.
 
         `project_binding` is the structured rule the project resolver
         consults when memories are extracted from this source. `None`
         leaves the source unbound and resolves writes to `UNSORTED`.
+
+        `projection_scope_transition` opens that pending transition in the
+        same transaction; a retry with the same transition is accepted. The
+        Source may hold no other open transition, unless
+        `expected_open_transition_id` names it: that transition is then
+        superseded and its member rows are deleted. A new transition must
+        name it as its predecessor; without one, the Source returns to the
+        superseded transition's previous scope and no transition is open.
+        When the open transition is not the one the caller expected (``None``
+        expects none), the update raises `ProjectionScopeTransitionStale`
+        and nothing is written, so the caller can read the Source again.
         """
         from memforge.source_access import memory_visibility_for_source
 
@@ -17053,6 +17394,12 @@ class Database:
             and projection_scope_transition.status is not ProjectionScopeTransitionStatus.PENDING
         ):
             raise ValueError("new projection scope transition must be pending")
+        if (
+            expected_open_transition_id is not None
+            and projection_scope_transition is not None
+            and projection_scope_transition.predecessor_transition_id != expected_open_transition_id
+        ):
+            raise ValueError("a superseding projection scope transition must name the superseded one")
         async with self._write_lock:
             try:
                 source_lock = await self.db.execute(
@@ -17151,53 +17498,24 @@ class Database:
                         status,
                     ),
                 )
-                if projection_scope_transition is not None:
-                    previous_json = json.dumps(
-                        dict(projection_scope_transition.previous_scope),
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    target_json = json.dumps(
-                        dict(projection_scope_transition.target_scope),
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
+                if projection_scope_transition is not None or expected_open_transition_id is not None:
                     async with self.db.execute(
-                        """SELECT * FROM projection_scope_transitions
+                        """SELECT id FROM projection_scope_transitions
                            WHERE source_id = ?
                              AND status IN ('pending', 'running', 'failed')
                            ORDER BY created_at, id LIMIT 1""",
                         (id,),
                     ) as cursor:
                         open_transition = await cursor.fetchone()
-                    if open_transition is not None and open_transition["id"] != projection_scope_transition.id:
-                        raise ValueError("projection_scope_transition_active")
-                    await self.db.execute(
-                        """INSERT OR IGNORE INTO projection_scope_transitions (
-                            id, source_id, previous_scope_json, target_scope_json, status,
-                            run_id, coverage, error, created_at, updated_at, completed_at
-                        ) VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, ?, NULL)""",
-                        (
-                            projection_scope_transition.id,
-                            id,
-                            previous_json,
-                            target_json,
-                            projection_scope_transition.created_at or _now_iso(),
-                            _now_iso(),
-                        ),
-                    )
-                    async with self.db.execute(
-                        "SELECT * FROM projection_scope_transitions WHERE id = ?",
-                        (projection_scope_transition.id,),
-                    ) as cursor:
-                        stored_transition = await cursor.fetchone()
-                    if (
-                        stored_transition is None
-                        or stored_transition["source_id"] != id
-                        or stored_transition["previous_scope_json"] != previous_json
-                        or stored_transition["target_scope_json"] != target_json
-                    ):
-                        raise ValueError("projection scope transition retry identity mismatch")
+                    open_transition_id = open_transition["id"] if open_transition is not None else None
+                    retried = projection_scope_transition is not None and open_transition_id == projection_scope_transition.id
+                    if not retried:
+                        if open_transition_id != expected_open_transition_id:
+                            raise ProjectionScopeTransitionStale()
+                        if open_transition_id is not None:
+                            await self._supersede_projection_scope_transition_unlocked(open_transition_id)
+                    if projection_scope_transition is not None:
+                        await self._insert_projection_scope_transition_unlocked(projection_scope_transition)
                 stale_metadata_rows = await self.db.execute_fetchall(
                     """SELECT 1
                      FROM memory_search_metadata_fts
@@ -18426,7 +18744,8 @@ class Database:
         The Source row, its Source Units with their stored input, its Evidence
         Units and their lineage stay as immutable history; its active Support
         is removed. Document rows stay: a row this Source wrote last names a
-        Source that still holds the Document, when one does.
+        Source that still holds the Document, when one does. Its Projection
+        Scope transitions and their member rows are deleted.
         """
 
         async with self._write_lock:
@@ -18587,6 +18906,12 @@ class Database:
                     "conversation_collection_requests",
                 ):
                     await self.db.execute(f"DELETE FROM {table} WHERE source_id = ?", (source_id,))
+                # A retired Source changes scope no more; its transitions and,
+                # by cascade, their member rows go with it.
+                await self.db.execute(
+                    "DELETE FROM projection_scope_transitions WHERE source_id = ?",
+                    (source_id,),
+                )
                 await self.db.execute(
                     "DELETE FROM source_subscriptions WHERE source_id = ?",
                     (source_id,),
@@ -19991,8 +20316,8 @@ class Database:
                 source, status, docs_processed, docs_updated, docs_failed,
                 memories_extracted, error_message, failed_docs,
                 absence_check_skipped_reason, skipped_reading_group_count,
-                started_at, finished_at, run_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                unlisted_present_count, started_at, finished_at, run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 state.source,
                 state.last_sync_status,
@@ -20004,6 +20329,7 @@ class Database:
                 json.dumps(failed_docs) if failed_docs else None,
                 state.absence_check_skipped_reason,
                 state.skipped_reading_group_count,
+                state.unlisted_present_count,
                 started_at,
                 finished_at,
                 run_id,
@@ -20422,9 +20748,10 @@ class Database:
         A current membership is reusable only when its immutable input was
         already attested by an earlier manifest, the item stored with its
         current Unit revision still has the manifest's revision, and that
-        revision was projected under the current access context. Scope
-        transitions retain the full projection path because they require
-        run-scoped coverage.
+        revision was projected under the current access context. Nothing is
+        reusable while the Source has an open scope transition (``pending``,
+        ``running`` or ``failed``): each listed Document must commit under the
+        transition to become one of its members.
         """
 
         normalized_snapshot_id = _non_empty_string(snapshot_id)
@@ -20467,7 +20794,7 @@ class Database:
                          SELECT 1
                          FROM projection_scope_transitions transition
                          WHERE transition.source_id = mi.source_id
-                           AND transition.status IN ('pending', 'running')
+                           AND transition.status IN ('pending', 'running', 'failed')
                      )
                      AND EXISTS (
                          SELECT 1
@@ -20514,15 +20841,25 @@ class Database:
         local_agent_job_id: str,
         local_agent_attempt_count: int,
         source_config_revision: str,
+        confirm: Sequence[SnapshotConfirmation] = (),
+        excluded_listings: Sequence[ExcludedScopeListing] = (),
     ) -> None:
-        """Persist one fenced manifest and attach its reusable immutable inputs."""
+        """Persist one fenced manifest and attach its reusable immutable inputs.
+
+        The manifest declares ``complete_snapshot`` coverage and every item an
+        ``upsert``; any other value is refused. ``confirm`` is the set of unlisted items the server asks the device to
+        confirm, issued unanswered in the manifest's transaction.
+        ``excluded_listings`` is what the device listed in each excluded scope
+        of an open transition. Both belong to the manifest: a replay must
+        carry the same ones, as it must carry the same items.
+        """
+        validate_snapshot_manifest_values(coverage, manifest_items)
+        validate_snapshot_manifest_extras(manifest_items, confirm, excluded_listings)
         normalized_snapshot_id = _non_empty_string(snapshot_id)
         if normalized_snapshot_id is None:
             raise ValueError("snapshot_id is required")
         if len({doc_id for doc_id, _input_id in memberships}) != len(memberships):
             raise ValueError("snapshot memberships contain duplicate doc_id")
-        if coverage not in {"complete_snapshot", "bounded_delta"}:
-            raise ValueError("snapshot manifest coverage is invalid")
         if manifest_count < 0 or len(memberships) > manifest_count:
             raise ValueError("snapshot manifest count is invalid")
         if manifest_count != len(manifest_items):
@@ -20616,6 +20953,16 @@ class Database:
                         ]
                     if existing_items != sorted(manifest_items):
                         raise SourceActivityConflict("source snapshot manifest changed")
+                    issued = await self._list_source_sync_snapshot_confirmations_unlocked(
+                        workspace_id, source_id, normalized_snapshot_id
+                    )
+                    listed = await self.list_source_sync_snapshot_excluded_listings(
+                        source_id=source_id, workspace_id=workspace_id, snapshot_id=normalized_snapshot_id
+                    )
+                    if [(item.doc_id, item.provider_key) for item in issued] != sorted(
+                        (item.doc_id, item.provider_key) for item in confirm
+                    ) or listed != tuple(sorted(excluded_listings, key=lambda listing: listing.scope_key)):
+                        raise SourceActivityConflict("source snapshot manifest changed")
                 else:
                     async with self.db.execute(
                         """SELECT doc_id FROM source_sync_snapshot_items
@@ -20661,6 +21008,24 @@ class Database:
                             for doc_id, revision, change_kind in manifest_items
                         ],
                     )
+                    await self.db.executemany(
+                        """INSERT INTO source_sync_snapshot_confirmations (
+                            workspace_id, source_id, snapshot_id, doc_id, provider_key
+                        ) VALUES (?, ?, ?, ?, ?)""",
+                        [
+                            (workspace_id, source_id, normalized_snapshot_id, item.doc_id, item.provider_key)
+                            for item in confirm
+                        ],
+                    )
+                    await self.db.executemany(
+                        """INSERT INTO source_sync_snapshot_excluded_listings (
+                            workspace_id, source_id, snapshot_id, scope_key, doc_id, rejection
+                        ) VALUES (?, ?, ?, ?, ?, ?)""",
+                        [
+                            (workspace_id, source_id, normalized_snapshot_id, *row)
+                            for row in excluded_listing_rows(excluded_listings)
+                        ],
+                    )
                 await self.db.executemany(
                     """INSERT INTO source_sync_snapshot_items (
                         workspace_id, source_id, snapshot_id, doc_id, input_id, created_at
@@ -20692,19 +21057,25 @@ class Database:
         workspace_id: str,
         snapshot_id: str,
     ) -> dict[str, Any] | None:
-        """Return manifest coverage and whether every declared item is materialized."""
+        """Return manifest coverage and whether the manifest is ready to process.
+
+        It is ready once every declared item is materialized and every issued
+        confirmation is answered; a manifest issued none awaits nothing.
+        """
         async with self.db.execute(
             """SELECT m.coverage, m.item_count, m.local_agent_job_id,
                       m.local_agent_attempt_count, m.source_config_revision,
-                      COUNT(si.doc_id) AS materialized_count
+                      (SELECT COUNT(*) FROM source_sync_snapshot_items si
+                        WHERE si.workspace_id = m.workspace_id
+                          AND si.source_id = m.source_id
+                          AND si.snapshot_id = m.snapshot_id) AS materialized_count,
+                      (SELECT COUNT(*) FROM source_sync_snapshot_confirmations c
+                        WHERE c.workspace_id = m.workspace_id
+                          AND c.source_id = m.source_id
+                          AND c.snapshot_id = m.snapshot_id
+                          AND c.answer IS NULL) AS unanswered_count
                FROM source_sync_snapshot_manifests m
-               LEFT JOIN source_sync_snapshot_items si
-                 ON si.workspace_id = m.workspace_id
-                AND si.source_id = m.source_id
-                AND si.snapshot_id = m.snapshot_id
-               WHERE m.workspace_id = ? AND m.source_id = ? AND m.snapshot_id = ?
-               GROUP BY m.coverage, m.item_count, m.local_agent_job_id,
-                        m.local_agent_attempt_count, m.source_config_revision""",
+               WHERE m.workspace_id = ? AND m.source_id = ? AND m.snapshot_id = ?""",
             (workspace_id, source_id, snapshot_id),
         ) as cursor:
             row = await cursor.fetchone()
@@ -20712,15 +21083,133 @@ class Database:
             return None
         materialized_count = int(row["materialized_count"] or 0)
         item_count = int(row["item_count"] or 0)
+        awaiting_confirmations = int(row["unanswered_count"] or 0) > 0
         return {
             "coverage": str(row["coverage"]),
             "item_count": item_count,
             "materialized_count": materialized_count,
-            "ready": materialized_count == item_count,
+            "awaiting_confirmations": awaiting_confirmations,
+            "ready": materialized_count == item_count and not awaiting_confirmations,
             "local_agent_job_id": str(row["local_agent_job_id"]),
             "local_agent_attempt_count": int(row["local_agent_attempt_count"]),
             "source_config_revision": str(row["source_config_revision"]),
         }
+
+    async def write_source_sync_snapshot_confirmations(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        snapshot_id: str,
+        manifest_sha256: str,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+        answers: Sequence[SnapshotConfirmation] = (),
+        failure_cause: str | None = None,
+    ) -> None:
+        """Store a device's answers to the confirmations its snapshot was issued.
+
+        The submission is bound to the manifest's collection attempt and
+        digest. It answers every issued item with ``absent``, ``exists`` or
+        ``hidden``, or, when ``confirm_absent`` raised, gives
+        ``failure_cause``, which every issued item then carries as ``failed``.
+        Repeating the stored answers is accepted; an item that was not issued,
+        a submission for another digest or attempt, and answers that differ
+        from the stored ones are refused, and nothing is written.
+        """
+        validate_snapshot_confirmation_submission(answers, failure_cause)
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    """SELECT manifest_sha256, local_agent_job_id, local_agent_attempt_count
+                       FROM source_sync_snapshot_manifests
+                       WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
+                    (workspace_id, source_id, snapshot_id),
+                ) as cursor:
+                    manifest = await cursor.fetchone()
+                issued = await self._list_source_sync_snapshot_confirmations_unlocked(
+                    workspace_id, source_id, snapshot_id
+                )
+                pending = snapshot_confirmation_updates(
+                    manifest=(
+                        (
+                            str(manifest["manifest_sha256"]),
+                            str(manifest["local_agent_job_id"]),
+                            int(manifest["local_agent_attempt_count"]),
+                        )
+                        if manifest is not None
+                        else None
+                    ),
+                    submitted=(manifest_sha256, local_agent_job_id, local_agent_attempt_count),
+                    issued=issued,
+                    answers=answers,
+                    failure_cause=failure_cause,
+                )
+                now = _now_iso()
+                cursor = await self.db.executemany(
+                    """UPDATE source_sync_snapshot_confirmations
+                       SET answer = ?, cause = ?, answered_at = ?
+                       WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ? AND doc_id = ?
+                         AND answer IS NULL""",
+                    [
+                        (item.answer.value, item.cause, now, workspace_id, source_id, snapshot_id, item.doc_id)
+                        for item in pending
+                        if item.answer is not None
+                    ],
+                )
+                # After executemany, rowcount is the total of rows the batch changed.
+                if pending and cursor.rowcount != len(pending):
+                    raise SourceActivityConflict("snapshot confirmations were answered by another submission")
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def list_source_sync_snapshot_confirmations(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        snapshot_id: str,
+    ) -> tuple[SnapshotConfirmation, ...]:
+        """The confirmations a snapshot was issued, in doc id order, with their answers once stored."""
+        return await self._list_source_sync_snapshot_confirmations_unlocked(workspace_id, source_id, snapshot_id)
+
+    async def _list_source_sync_snapshot_confirmations_unlocked(
+        self,
+        workspace_id: str,
+        source_id: str,
+        snapshot_id: str,
+    ) -> tuple[SnapshotConfirmation, ...]:
+        rows = await self.db.execute_fetchall(
+            """SELECT doc_id, provider_key, answer, cause
+               FROM source_sync_snapshot_confirmations
+               WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?
+               ORDER BY doc_id""",
+            (workspace_id, source_id, snapshot_id),
+        )
+        return tuple(
+            snapshot_confirmation(row["doc_id"], row["provider_key"], row["answer"], row["cause"])
+            for row in rows
+        )
+
+    async def list_source_sync_snapshot_excluded_listings(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        snapshot_id: str,
+    ) -> tuple[ExcludedScopeListing, ...]:
+        """What a snapshot's device listed in each excluded scope, in scope key order."""
+        rows = await self.db.execute_fetchall(
+            """SELECT scope_key, doc_id, rejection
+               FROM source_sync_snapshot_excluded_listings
+               WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
+            (workspace_id, source_id, snapshot_id),
+        )
+        return excluded_listings_from_rows(
+            (str(row["scope_key"]), row["doc_id"], row["rejection"]) for row in rows
+        )
 
     async def record_conversation_collection_request(
         self,
@@ -24131,16 +24620,17 @@ class Database:
 
     def _row_to_projection_scope_transition(self, row) -> ProjectionScopeTransition:
         d = dict(row)
-        coverage = d.get("coverage")
         return ProjectionScopeTransition(
             id=d["id"],
             source_id=d["source_id"],
             previous_scope=json.loads(d["previous_scope_json"]),
             target_scope=json.loads(d["target_scope_json"]),
             status=ProjectionScopeTransitionStatus(d["status"]),
+            predecessor_transition_id=d.get("predecessor_transition_id"),
             run_id=d.get("run_id"),
-            coverage=ProjectionCoverage(coverage) if coverage else None,
             error=d.get("error"),
+            excluded_scopes_due=bool(d.get("excluded_scopes_due")),
+            listed_count=d.get("listed_count"),
             created_at=d.get("created_at"),
             updated_at=d.get("updated_at"),
             completed_at=d.get("completed_at"),

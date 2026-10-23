@@ -8,17 +8,19 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
 
 from memforge.genes.atlassian_auth import require_https_base_url, resolve_pat, tls_verify
-from memforge.genes.base import Gene, SourceConfigurationError
+from memforge.genes.base import SourceConfigurationError
+from memforge.genes.document_gene import DocumentGene
 from memforge.github_repo_utils import (
     decode_github_contents_payload,
     github_latest_commit_time,
@@ -34,7 +36,9 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+    ScopeListing,
     ScopeListingKind,
+    UnlistedScopeMode,
 )
 from memforge.pipeline.normalizer_utils import annotate_code_blocks, html_to_markdown, strip_boilerplate
 from memforge.repo_identity import normalize_repo_identifier
@@ -65,8 +69,10 @@ class _RepoRef:
     page_path: str
 
 
-class GitHubPagesGene(Gene):
+class GitHubPagesGene(DocumentGene):
     """Rendered GitHub Pages documentation source."""
+
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
 
     @classmethod
     def metadata(cls) -> GeneMetadata:
@@ -223,22 +229,80 @@ class GitHubPagesGene(Gene):
             verify=tls_verify(self.config),
         )
 
+    @classmethod
+    def lists_scope(cls, config: Mapping[str, Any]) -> bool:
+        """The configured pages list; a subtree lists from the repository's branch tree or a sitemap declared complete.
+
+        A single page or an explicit list of pages is the scope the user
+        declared. A link crawl reaches only the pages currently linked, and a
+        sitemap the site does not declare complete may leave pages out, so
+        neither lists.
+        """
+        if _sync_mode(config) in {SYNC_MODE_SINGLE_PAGE, SYNC_MODE_EXPLICIT_LIST}:
+            return True
+        if _sync_mode(config) != SYNC_MODE_SUBTREE:
+            return False
+        return _auth_mode(config) == AUTH_MODE_GITHUB_PAT or _bool_config(config, "sitemap_authoritative", False)
+
+    @classmethod
+    def unlisted_scope_mode(cls, config: Mapping[str, Any]) -> UnlistedScopeMode:
+        """A subtree without a token or a complete sitemap is read by link crawl or by a partial sitemap."""
+
+        return UnlistedScopeMode(
+            mode="subtree read by link crawl or by a sitemap not declared complete",
+            suggestion=(
+                "Read the subtree from the repository's branch tree with a GitHub personal access token, "
+                "declare the site's sitemap complete, or list the pages explicitly."
+            ),
+        )
+
+    async def list_scope(self) -> ScopeListing:
+        """Every configured page, or every page of the subtree from the branch tree or the authoritative sitemap.
+
+        Each is everything the Source holds by definition, so this is an
+        existence listing. Discovery reads the same pages on every run, so a
+        run that discovered returns its listing. A configured page that
+        cannot be read, and a sitemap that cannot be read as a urlset, fail
+        the listing.
+        """
+        if not self.lists_scope(self.config):
+            raise ValueError("This GitHub Pages configuration does not list its scope")
+        if self._discovered_scope is not None:
+            return self._discovered_scope
+        if _sync_mode(self.config) in {SYNC_MODE_SINGLE_PAGE, SYNC_MODE_EXPLICIT_LIST}:
+            return ScopeListing(
+                kind=ScopeListingKind.EXISTENCE,
+                doc_ids=frozenset(
+                    [(await self._content_item_for_url(url)).item_id for url in self._configured_page_urls()]
+                ),
+            )
+        if _auth_mode(self.config) == AUTH_MODE_GITHUB_PAT:
+            _ref, _branch, scoped_entries = await self._repo_subtree_scope()
+            page_urls = [page_url for page_url, _repo_path, _blob_sha in scoped_entries]
+        else:
+            _text, page_urls = await self._authoritative_sitemap_scope()
+        return ScopeListing(
+            kind=ScopeListingKind.EXISTENCE,
+            doc_ids=frozenset(_page_doc_id(page_url) for page_url in page_urls),
+        )
+
+    def _configured_page_urls(self) -> list[str]:
+        """The page of a single-page Source, or the pages of an explicit list."""
+        if _sync_mode(self.config) == SYNC_MODE_SINGLE_PAGE:
+            return [str(self.config.get("page_url") or "").strip()]
+        return _list_config(self.config.get("pages"))
+
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         mode = _sync_mode(self.config)
-        if mode == SYNC_MODE_SINGLE_PAGE:
-            url = str(self.config.get("page_url") or "").strip()
-            item = await self._content_item_for_url(url)
-            if _is_modified_since(item.last_modified, since):
-                yield item
-            self.attest_discovery_complete("github_pages_single_page_resolved")
-            return
-
-        if mode == SYNC_MODE_EXPLICIT_LIST:
-            for url in _list_config(self.config.get("pages")):
+        if mode in {SYNC_MODE_SINGLE_PAGE, SYNC_MODE_EXPLICIT_LIST}:
+            listed: set[str] = set()
+            for url in self._configured_page_urls():
                 item = await self._content_item_for_url(url)
+                listed.add(item.item_id)
                 if _is_modified_since(item.last_modified, since):
                     yield item
-            self.attest_discovery_complete("github_pages_explicit_list_exhausted")
+            # Every configured page was read: the configured pages are the scope.
+            self.record_scope_listing(ScopeListingKind.EXISTENCE, listed)
             return
 
         if mode != SYNC_MODE_SUBTREE:
@@ -247,19 +311,24 @@ class GitHubPagesGene(Gene):
         if self._auth_mode == AUTH_MODE_GITHUB_PAT:
             async for item in self._repo_subtree_items(since):
                 yield item
-            self.attest_discovery_complete("github_pages_repository_tree_exhausted")
             return
 
-        sitemap_items = await self._sitemap_items()
-        if sitemap_items is not None:
+        if _bool_config(self.config, "sitemap_authoritative", False):
+            # The site declares its sitemap exhaustive: a page it no longer
+            # lists is no longer published. A sitemap that cannot be read
+            # fails discovery; the link crawl would list less.
+            sitemap_items = await self._sitemap_items(await self._authoritative_sitemap_scope())
             for item in sitemap_items:
                 if _is_modified_since(item.last_modified, since):
                     yield item
-            if _bool_config(self.config, "sitemap_authoritative", False):
-                self.attest_discovery_complete("github_pages_authoritative_sitemap_exhausted")
-                # The site declares its sitemap exhaustive: a page it no
-                # longer lists is no longer published.
-                self.record_scope_listing(ScopeListingKind.EXISTENCE, {item.item_id for item in sitemap_items})
+            self.record_scope_listing(ScopeListingKind.EXISTENCE, {item.item_id for item in sitemap_items})
+            return
+
+        sitemap = await self._sitemap_scope()
+        if sitemap is not None:
+            for item in await self._sitemap_items(sitemap):
+                if _is_modified_since(item.last_modified, since):
+                    yield item
             return
 
         async for item in self._discover_bfs(since):
@@ -467,7 +536,8 @@ class GitHubPagesGene(Gene):
             blob_sha=blob_sha,
         )
 
-    async def _repo_subtree_items(self, since: datetime | None) -> AsyncIterator[ContentItem]:
+    async def _repo_subtree_scope(self) -> tuple[_RepoRef, str, list[tuple[str, str, str]]]:
+        """The branch tree's Markdown pages under the subtree root: page URL, repository path and blob sha."""
         root_url = self._require_in_site(str(self.config.get("root_url") or ""))
         ref = _repo_ref_from_pages_url(root_url)
         if ref is None:
@@ -486,7 +556,10 @@ class GitHubPagesGene(Gene):
                 page_urls.append(page_url)
                 scoped_entries.append((page_url, repo_path, blob_sha))
         _limit_urls(page_urls, _max_pages(self.config))
+        return ref, branch, scoped_entries
 
+    async def _repo_subtree_items(self, since: datetime | None) -> AsyncIterator[ContentItem]:
+        ref, branch, scoped_entries = await self._repo_subtree_scope()
         for page_url, repo_path, blob_sha in scoped_entries:
             item = await self._repo_content_item(
                 canonical_url=page_url,
@@ -499,7 +572,10 @@ class GitHubPagesGene(Gene):
                 yield item
         # The branch tree is everything the repository publishes under the
         # subtree: a page whose file it no longer holds is gone.
-        self.record_scope_listing(ScopeListingKind.EXISTENCE, {_page_doc_id(page_url) for page_url in page_urls})
+        self.record_scope_listing(
+            ScopeListingKind.EXISTENCE,
+            {_page_doc_id(page_url) for page_url, _repo_path, _blob_sha in scoped_entries},
+        )
 
     async def _default_branch(self, ref: "_RepoRef") -> str:
         response = await self._client.get(_repo_api_url(ref))
@@ -528,8 +604,24 @@ class GitHubPagesGene(Gene):
             return None
         return parse_source_time(github_latest_commit_time(response.json()))
 
-    async def _sitemap_items(self) -> list[ContentItem] | None:
-        sitemap_url = urljoin(self._base_url.rstrip("/") + "/", "sitemap.xml")
+    async def _authoritative_sitemap_scope(self) -> tuple[str, list[str]]:
+        """The sitemap a site declares complete, read as :meth:`_sitemap_scope` reads it, or raise.
+
+        A missing sitemap, one that cannot be fetched or parsed, and one that
+        is not a urlset each raise, so a run never lists less than the site
+        publishes.
+        """
+        sitemap_url = self._sitemap_url()
+        response = await self._client.get(sitemap_url)
+        response.raise_for_status()
+        sitemap_kind, urls = _urls_from_sitemap(response.text)
+        if sitemap_kind != "urlset":
+            raise RuntimeError(f"The GitHub Pages sitemap at {sitemap_url} is a {sitemap_kind}, not a urlset")
+        return response.text, self._scoped_sitemap_urls(urls)
+
+    async def _sitemap_scope(self) -> tuple[str, list[str]] | None:
+        """The sitemap's text and its page URLs in scope; ``None`` when the site has no urlset sitemap."""
+        sitemap_url = self._sitemap_url()
         try:
             response = await self._client.get(sitemap_url)
             if response.status_code >= 400:
@@ -545,14 +637,24 @@ class GitHubPagesGene(Gene):
                 sitemap_url,
             )
             return None
+        return response.text, self._scoped_sitemap_urls(urls)
 
+    def _sitemap_url(self) -> str:
+        return urljoin(self._base_url.rstrip("/") + "/", "sitemap.xml")
+
+    def _scoped_sitemap_urls(self, urls: list[str]) -> list[str]:
+        """The sitemap's page URLs in scope, canonical and bounded by Max Pages."""
         canonical_urls = [_canonicalize_url(url) for url in urls]
         if len(canonical_urls) != len(set(canonical_urls)):
             raise RuntimeError("GitHub Pages sitemap contains duplicate canonical URLs")
         scoped = sorted(url for url in canonical_urls if self._url_is_in_scope(url))
+        return _limit_urls(scoped, _max_pages(self.config))
+
+    async def _sitemap_items(self, sitemap: tuple[str, list[str]]) -> list[ContentItem]:
+        sitemap_text, page_urls = sitemap
         items: list[ContentItem] = []
-        for url in _limit_urls(scoped, _max_pages(self.config)):
-            lastmod = _lastmod_for_url(response.text, url)
+        for url in page_urls:
+            lastmod = _lastmod_for_url(sitemap_text, url)
             if lastmod:
                 item = await self._content_item_for_url(url)
                 item.last_modified = lastmod

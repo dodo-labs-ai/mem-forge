@@ -215,3 +215,35 @@ it("asks before saving a Teams source during a sync", async () => {
   expect(screen.getByText("A sync is running. Saving will stop it first.")).toBeTruthy();
   expect(resourceClient.put).not.toHaveBeenCalled();
 });
+
+it.each([
+  [{ code: "scope_change_requires_listing", mode: "link crawl", message: "The mode 'link crawl' cannot list its scope." },
+    "The mode 'link crawl' cannot list its scope."],
+  [{ code: "transition_requires_listing", mode: "link crawl", message: "Keep a configuration that lists." },
+    "Keep a configuration that lists."],
+  ["projection_scope_transition_stale",
+    "The scope change in progress changed while you were editing. Close this dialog, open the source again, and save."],
+])("a save refused for its scope shows why, not the running-sync question (%o)", async (detail, message) => {
+  vi.mocked(resourceClient.put).mockRejectedValueOnce({ response: { status: 409, data: { detail } } });
+  mount(<SchemaSourceSetup open onOpenChange={() => {}} sourceType="github_pages" source={idleSource} />);
+  await screen.findByPlaceholderText("Source name");
+
+  fireEvent.click(screen.getByRole("button", { name: "Save Changes" }));
+
+  expect(await screen.findByText(message)).toBeTruthy();
+  expect(screen.queryByRole("dialog", { name: "Stop the sync and save?" })).toBeNull();
+  expect(stopCalls()).toHaveLength(0);
+});
+
+it("a save after stopping the sync that is refused for its scope shows why", async () => {
+  vi.mocked(resourceClient.put).mockRejectedValueOnce({
+    response: { status: 409, data: { detail: { code: "scope_change_requires_listing", message: "Choose a listing mode." } } },
+  });
+
+  const confirmation = await askToStopAndSave();
+
+  expect(await screen.findByText("Choose a listing mode.")).toBeTruthy();
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: "Stop the sync and save?" })).toBeNull());
+  expect(confirmation.isConnected).toBe(false);
+  expect(stopCalls()).toHaveLength(1);
+});

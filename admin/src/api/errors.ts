@@ -68,12 +68,15 @@ interface ValidationIssue {
   msg?: string;
 }
 
-/** The code of a coded refusal, which a FastAPI error body carries as `{ detail: { error, message } }`. */
+/**
+ * The code of a coded refusal, which a FastAPI error body carries as
+ * `{ detail: { error, message } }` or `{ detail: { code, message } }`.
+ */
 export function errorCodeOf(body: unknown): string | null {
   if (!body || typeof body !== "object" || !("detail" in body)) return null;
   const detail = (body as { detail: unknown }).detail;
-  if (!detail || typeof detail !== "object" || !("error" in detail)) return null;
-  const code = (detail as { error: unknown }).error;
+  if (!detail || typeof detail !== "object") return null;
+  const code = "error" in detail ? (detail as { error: unknown }).error : (detail as { code?: unknown }).code;
   return typeof code === "string" && code !== "" ? code : null;
 }
 

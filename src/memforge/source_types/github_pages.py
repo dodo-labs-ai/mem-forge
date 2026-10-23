@@ -11,6 +11,15 @@ from memforge.source_types.config import SourceConfigPolicy, secret_has_value
 from memforge.source_types.descriptor import SourceTypeDescriptor
 
 
+def _canonical_scope(scope: dict[str, object]) -> dict[str, object]:
+    # A branch selects which pages a subtree lists. A single page or an
+    # explicit list names its pages, so there the branch only chooses where
+    # their content is read.
+    if str(scope.get("sync_mode") or "single_page").strip().lower() != "subtree":
+        scope.pop("branch", None)
+    return scope
+
+
 def _validate_config(config: dict[str, Any], existing_config: Mapping[str, Any]) -> None:
     from memforge.genes.atlassian_auth import require_https_base_url
 
@@ -112,7 +121,12 @@ DESCRIPTOR = SourceTypeDescriptor(
     source_type="github_pages",
     gene="memforge.genes.github_pages_gene:GitHubPagesGene",
     unit_noun="page",
-    scope_fields=("sync_mode", "page_url", "root_url", "pages", "max_depth", "exclude_url_patterns"),
+    # ``branch`` selects the repository tree a subtree lists, and has no
+    # default: without it the run reads the repository's default branch.
+    # ``sitemap_authoritative``, ``auth_mode`` and ``max_pages`` only choose
+    # how the same pages are listed, so they are not scope fields.
+    scope_fields=("sync_mode", "page_url", "root_url", "pages", "max_depth", "exclude_url_patterns", "branch"),
+    canonical_scope=_canonical_scope,
     project_native=adapter.project_native,
     evidence_profiles={"page_content": MARKDOWN_STRUCTURAL_PROFILE},
     config=SourceConfigPolicy(validate_input=_validate_config),

@@ -31,19 +31,27 @@ from memforge.llm.embedding_profile import EmbeddingIdentity, EmbeddingProfile
 from memforge.llm.providers import ModelConfigError, ResolvedInvocation, provider_descriptor
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
 from memforge.local_agent.source_contract import (
-    local_agent_collection_is_authoritative,
     local_agent_source_config_revision,
     local_agent_sync_operation,
+    snapshot_document_ids,
     source_with_sync_inputs,
 )
-from memforge.source_projection_config import projection_access_fingerprint, source_access_context
+from memforge.source_projection_config import (
+    excluded_scope_config,
+    projection_access_fingerprint,
+    source_access_context,
+)
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.health import MemoryIndexHealthChecker, MemoryIndexHealthReport
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.store import MemoryStore
 from memforge.models import SourceSyncRun, SyncState
-from memforge.genes.conversation_gene import CollectionAttempt, ConversationGene
+from memforge.genes.base import SourceConfigurationError
+from memforge.genes.conversation_gene import CollectionAttempt
+from memforge.genes.family import CollectionFamilyKind
+from memforge.pipeline.collection_family import ExcludedScopeGeneFactory, SnapshotBinding
+from memforge.source_types import source_type_descriptor
 from memforge.conversations.collections import StoredCollections
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.sync_memory import SyncMemoryObserver
@@ -288,7 +296,7 @@ class RuntimeProvider(Protocol):
         runtime: SyncRuntime | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
-        authoritative_snapshot: bool = False,
+        input_snapshot: SnapshotBinding | None = None,
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_cycle_id: str | None = None,
@@ -434,7 +442,7 @@ class DefaultRuntimeProvider:
         runtime: SyncRuntime | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
-        authoritative_snapshot: bool = False,
+        input_snapshot: SnapshotBinding | None = None,
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_cycle_id: str | None = None,
@@ -452,7 +460,7 @@ class DefaultRuntimeProvider:
             runtime=runtime,
             progress_callback=progress_callback,
             force_full_sync=force_full_sync,
-            authoritative_snapshot=authoritative_snapshot,
+            input_snapshot=input_snapshot,
             reprocess_doc_ids=reprocess_doc_ids,
             execution_mode=execution_mode,
             lifecycle_cycle_id=lifecycle_cycle_id,
@@ -939,6 +947,37 @@ def _build_default_sync_runtime(
     )
 
 
+def excluded_scope_gene_factory(source: Mapping[str, Any], source_config: Mapping[str, Any]) -> ExcludedScopeGeneFactory:
+    """Authenticated Genes that list the scopes a Source's scope change excluded.
+
+    ``source_config`` is the Source's configuration as the run uses it:
+    decrypted, with any browser session cookie injected. Each Gene reads it
+    with the excluded scope's fields in place of the current ones, so it
+    reuses the current credential and never sees a current scope field.
+
+    An excluded scope whose configuration or Gene cannot be built, before
+    anything reaches the provider, raises ``SourceConfigurationError``: no
+    later run could build it either. ``authenticate`` failures stay as they
+    are, because a credential or a network can recover.
+    """
+
+    source_type = str(source["type"])
+
+    async def excluded_scope_gene(scope: Mapping[str, object]):
+        try:
+            gene = create_gene(
+                name=source_type,
+                config=excluded_scope_config(source_type, source_config, scope),
+                source_id=str(source["id"]),
+            )
+        except ValueError as exc:
+            raise SourceConfigurationError(f"The excluded scope {dict(scope)} cannot be configured: {exc}") from exc
+        await gene.authenticate()
+        return gene
+
+    return excluded_scope_gene
+
+
 async def run_source_sync(
     db: "Database",
     config: AppConfig,
@@ -946,7 +985,7 @@ async def run_source_sync(
     runtime: SyncRuntime | None = None,
     progress_callback: Callable[[dict], None] | None = None,
     force_full_sync: bool = False,
-    authoritative_snapshot: bool = False,
+    input_snapshot: SnapshotBinding | None = None,
     reprocess_doc_ids: frozenset[str] | None = None,
     execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
     lifecycle_cycle_id: str | None = None,
@@ -960,7 +999,8 @@ async def run_source_sync(
     """Run one Source sync under a Source activity lease.
 
     ``collection_attempt`` names the collection attempt a conversation Source
-    syncs within; a document Source ignores it.
+    syncs within; a document Source ignores it. ``input_snapshot`` binds a
+    document Source's run to the complete snapshot its device submitted.
     """
     activity_id = source_activity.id if source_activity is not None else None
     owns_activity = False
@@ -1004,21 +1044,13 @@ async def run_source_sync(
             config=source_config,
             source_id=source["id"],
         )
-        if isinstance(gene, ConversationGene):
-            if collection_attempt is None:
-                raise ValueError("a conversation Source syncs only within a collection attempt")
-            gene.bind_conversation_run(
-                projection_store=db,
-                collections=StoredCollections(db, workspace_id=collection_attempt.workspace_id),
-                collection_attempt_id=collection_attempt.collection_attempt_id,
-            )
         sync_kwargs: dict[str, Any] = {
             "gene": gene,
             "source_name": source["name"],
             "source_id": source["id"],
             "progress_callback": progress_callback,
             "force_full_sync": force_full_sync,
-            "authoritative_snapshot": authoritative_snapshot,
+            "input_snapshot": input_snapshot,
             "reprocess_doc_ids": reprocess_doc_ids,
             "execution_mode": execution_mode,
             "source_activity": activity_lease,
@@ -1027,6 +1059,8 @@ async def run_source_sync(
             "reusable_projection_doc_ids": reusable_projection_doc_ids,
             "record_terminal_result": record_terminal_result,
             "failed_item_retry": failed_item_retry,
+            "collection_attempt": collection_attempt,
+            "excluded_scope_gene": excluded_scope_gene_factory(source, source_config),
         }
         sync_operation = runtime.orchestrator().sync_gene(**sync_kwargs)
         if heartbeat_task is None:
@@ -1481,7 +1515,7 @@ class SourceSyncWorker:
 
             # An operator reprocess reads the provider or stored Documents, not collected input.
             reprocessing = bool(run.reprocess_document_ids)
-            authoritative_collection = False
+            input_snapshot: SnapshotBinding | None = None
             reusable_projection_doc_ids: frozenset[str] = frozenset()
             if not reprocessing:
                 inputs = await self.db.list_source_sync_inputs(
@@ -1499,9 +1533,26 @@ class SourceSyncWorker:
                             for source_input in inputs
                             if source_input.input_generation <= run.input_generation_watermark
                         ]
-                authoritative_collection = run.input_snapshot_id is not None and local_agent_collection_is_authoritative(
-                    source["type"]
-                )
+                descriptor = source_type_descriptor(str(source.get("type") or ""))
+                if (
+                    run.input_snapshot_id is not None
+                    and descriptor is not None
+                    and descriptor.family is CollectionFamilyKind.DOCUMENT
+                ):
+                    input_snapshot = SnapshotBinding(
+                        snapshot_id=run.input_snapshot_id,
+                        doc_ids=snapshot_document_ids(inputs),
+                        confirmations=await self.db.list_source_sync_snapshot_confirmations(
+                            source_id=run.source_id,
+                            workspace_id=run.workspace_id,
+                            snapshot_id=run.input_snapshot_id,
+                        ),
+                        excluded_listings=await self.db.list_source_sync_snapshot_excluded_listings(
+                            source_id=run.source_id,
+                            workspace_id=run.workspace_id,
+                            snapshot_id=run.input_snapshot_id,
+                        ),
+                    )
                 if run.input_snapshot_id is not None and not run.force_full_sync:
                     reusable_projection_doc_ids = await self.db.find_reusable_source_projection_memberships(
                         source_id=run.source_id,
@@ -1513,7 +1564,6 @@ class SourceSyncWorker:
                     source,
                     inputs,
                     input_snapshot_supplied=run.input_snapshot_id is not None,
-                    authoritative_snapshot=authoritative_collection,
                 )
 
             runtime = await self._build_runtime()
@@ -1530,7 +1580,7 @@ class SourceSyncWorker:
                 runtime=runtime,
                 progress_callback=None,
                 force_full_sync=run.force_full_sync and not reprocessing,
-                authoritative_snapshot=authoritative_collection,
+                input_snapshot=input_snapshot,
                 reprocess_doc_ids=frozenset(run.reprocess_document_ids) or None,
                 execution_mode=(SourceSyncMode.REPROCESS if reprocessing else SourceSyncMode.NORMAL),
                 lifecycle_cycle_id=(f"{run.run_id}:attempt:{run.lease_attempt_count}"),
@@ -1670,8 +1720,12 @@ class SourceSyncWorker:
         older than itself.
         """
 
-        gene_class = GENE_REGISTRY.get(str(source.get("type") or ""))
-        if run.input_snapshot_id is None or gene_class is None or not issubclass(gene_class, ConversationGene):
+        descriptor = source_type_descriptor(str(source.get("type") or ""))
+        if (
+            run.input_snapshot_id is None
+            or descriptor is None
+            or descriptor.family is not CollectionFamilyKind.CONVERSATION
+        ):
             return
         try:
             await StoredCollections(self.db, workspace_id=run.workspace_id).prune(

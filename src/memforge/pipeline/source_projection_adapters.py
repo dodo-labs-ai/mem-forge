@@ -31,6 +31,7 @@ from memforge.source_projection import (
     SourceRelation,
     SourceUnit,
     SourceUnitRevision,
+    incarnated_provider_key,
 )
 from memforge.source_time import (
     SOURCE_UPDATED_AT_KEY,
@@ -50,31 +51,6 @@ from memforge.source_artifacts import (
     source_artifact_observation_metadata,
     source_artifact_observation_provider_key,
 )
-
-
-def source_run_projection_coverage(
-    *,
-    authoritative_snapshot: bool,
-    scope_transition: bool,
-    discovery_complete: bool,
-) -> ProjectionCoverage:
-    """What a run's discovery alone proves about the Documents it did not return.
-
-    A submitted authoritative snapshot is the whole Source. A complete discovery
-    of a newly configured scope is the whole new scope: the user changed the
-    scope, so a Unit outside it is removed. Any other discovery is
-    partial, whether or not ``since`` narrowed it, because a query result is
-    not proof that the provider no longer has an item; such a run removes only
-    what its scope listing proves absent.
-    """
-
-    if authoritative_snapshot:
-        return ProjectionCoverage.COMPLETE_SNAPSHOT
-    if scope_transition and discovery_complete:
-        return ProjectionCoverage.COMPLETE_SNAPSHOT
-    return ProjectionCoverage.PARTIAL_PROJECTION
-
-
 
 
 _REVISION_SEMANTIC_METADATA_KEYS = ("claim_evidence_scope",)
@@ -189,7 +165,7 @@ def project_source_item(
     if persisted_provider_key is not None:
         provider_key = str(persisted_provider_key)
     elif incarnation is not None:
-        provider_key = f"{provider_key}#incarnation:{incarnation}"
+        provider_key = incarnated_provider_key(provider_key, str(incarnation))
     unit_id = (
         str(persisted_unit_id)
         if persisted_unit_id is not None

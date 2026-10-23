@@ -339,7 +339,7 @@ def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
             assert workspace_id == "workspace-a"
             return self
 
-    monkeypatch.setattr(main, "_collect_teams_on_device", fake_collect)
+    monkeypatch.setattr(main, "_collect_conversation_on_device", fake_collect)
     monkeypatch.setattr(main, "_run_cloud_teams_auth_job", fake_auth)
     monkeypatch.setattr(main, "_current_teams_chat_token_hashes", lambda: set())
 

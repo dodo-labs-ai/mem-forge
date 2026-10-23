@@ -15,12 +15,14 @@ import importlib
 
 from memforge.source_types.config import SourceConfigPolicy
 from memforge.source_types.descriptor import (
+    ConversationProviderReference,
     LocalAgentCollection,
     SourceTypeDescriptor,
     load_reference,
 )
 
 __all__ = [
+    "ConversationProviderReference",
     "LocalAgentCollection",
     "SourceConfigPolicy",
     "SourceTypeDescriptor",

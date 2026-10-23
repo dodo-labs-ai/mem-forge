@@ -181,7 +181,7 @@ async def test_cookie_header_for_sync_marks_expired_without_rescrape(db, monkeyp
         raise JiraAuthSessionMissingError("expired")
 
     expiring = JiraAuthSessionService(db, session_validator=dead_validator)
-    with pytest.raises(JiraAuthSessionMissingError):
+    with pytest.raises(JiraAuthSessionMissingError, match=r"jira refresh --base-url https://jira\.example\.test"):
         await expiring.cookie_header_for_sync("https://jira.example.test")
     status = await expiring.get_status("https://jira.example.test")
     assert status["status"] == "expired"
@@ -194,7 +194,7 @@ async def test_cookie_header_for_sync_without_stored_session_raises_missing(db):
     # Sync runs on the server, which never scrapes a browser; with no stored
     # session there is simply nothing to use.
     service = JiraAuthSessionService(db)
-    with pytest.raises(JiraAuthSessionMissingError):
+    with pytest.raises(JiraAuthSessionMissingError, match=r"jira refresh --base-url https://jira\.example\.test"):
         await service.cookie_header_for_sync("https://jira.example.test")
 
 
@@ -393,7 +393,7 @@ async def test_runtime_resolves_jira_browser_session_without_persisting_cookie(d
             source_id,
             progress_callback=None,
             force_full_sync=False,
-            authoritative_snapshot=False,
+            input_snapshot=None,
             reprocess_doc_ids=None,
             execution_mode=None,
             source_activity=None,
@@ -402,10 +402,13 @@ async def test_runtime_resolves_jira_browser_session_without_persisting_cookie(d
             reusable_projection_doc_ids=frozenset(),
             record_terminal_result=True,
             failed_item_retry=None,
+            collection_attempt=None,
+            excluded_scope_gene=None,
         ):
             del (
+                excluded_scope_gene,
                 failed_item_retry,
-                authoritative_snapshot,
+                input_snapshot,
                 reprocess_doc_ids,
                 execution_mode,
                 source_activity,
@@ -502,7 +505,7 @@ async def test_runtime_keeps_legacy_jira_pat_source_in_pat_mode(db, tmp_path, mo
             source_id,
             progress_callback=None,
             force_full_sync=False,
-            authoritative_snapshot=False,
+            input_snapshot=None,
             reprocess_doc_ids=None,
             execution_mode=None,
             source_activity=None,
@@ -511,10 +514,13 @@ async def test_runtime_keeps_legacy_jira_pat_source_in_pat_mode(db, tmp_path, mo
             reusable_projection_doc_ids=frozenset(),
             record_terminal_result=True,
             failed_item_retry=None,
+            collection_attempt=None,
+            excluded_scope_gene=None,
         ):
             del (
+                excluded_scope_gene,
                 failed_item_retry,
-                authoritative_snapshot,
+                input_snapshot,
                 reprocess_doc_ids,
                 execution_mode,
                 source_activity,

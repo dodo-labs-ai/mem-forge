@@ -1564,8 +1564,11 @@ def test_github_repo_manifest_reuses_unchanged_input_without_another_package(tmp
             "snapshot_id": "test-local-agent-job-2:attempt:1",
             "coverage": "complete_snapshot",
             "manifest_count": 1,
+            "manifest_sha256": planned.json()["manifest_sha256"],
             "reused_count": 1,
             "required_doc_ids": [],
+            # A repository tree is an existence listing: nothing is confirmed.
+            "confirm": [],
         }
         [first_input] = asyncio.run(
             database.list_source_sync_inputs(
@@ -1759,26 +1762,25 @@ def test_local_source_manifest_requests_changed_body_and_accepts_complete_remova
                     "local_agent_attempt_count": 1,
                 },
             )
-            incomplete = client.post(
-                f"/api/v1/sources/{source_id}/adapter/manifest",
-                json={
-                    "items": [{"doc_id": doc_id, "revision": "blob-sha-1", "change_kind": "upsert"}],
-                    "coverage": "partial",
-                    "sync_snapshot_id": "incomplete-job:attempt:1",
-                    "local_agent_job_id": "incomplete-job",
-                    "local_agent_attempt_count": 1,
-                },
-            )
-            bounded = client.post(
-                f"/api/v1/sources/{source_id}/adapter/manifest",
-                json={
-                    "items": [{"doc_id": doc_id, "revision": "blob-sha-1", "change_kind": "upsert"}],
-                    "coverage": "bounded_delta",
-                    "sync_snapshot_id": "bounded-job:attempt:1",
-                    "local_agent_job_id": "bounded-job",
-                    "local_agent_attempt_count": 1,
-                },
-            )
+            # A device manifest is a complete snapshot of upserts; no other
+            # coverage or change kind is accepted.
+            refused = {
+                (coverage, change_kind): client.post(
+                    f"/api/v1/sources/{source_id}/adapter/manifest",
+                    json={
+                        "items": [{"doc_id": doc_id, "revision": "blob-sha-1", "change_kind": change_kind}],
+                        "coverage": coverage,
+                        "sync_snapshot_id": "refused-job:attempt:1",
+                        "local_agent_job_id": "refused-job",
+                        "local_agent_attempt_count": 1,
+                    },
+                )
+                for coverage, change_kind in (
+                    ("partial", "upsert"),
+                    ("bounded_delta", "upsert"),
+                    ("complete_snapshot", "tombstone"),
+                )
+            }
 
         assert first.status_code == 200, first.text
         assert changed.status_code == 200, changed.text
@@ -1796,10 +1798,17 @@ def test_local_source_manifest_requests_changed_body_and_accepts_complete_remova
                 input_snapshot_id="removed-job:attempt:1",
             )
         ) == []
-        assert incomplete.status_code == 400, incomplete.text
-        assert incomplete.json()["detail"] == "partial collection cannot be planned"
-        assert bounded.status_code == 409, bounded.text
-        assert bounded.json()["detail"] == "authoritative collection requires complete_snapshot coverage"
+        assert {key: response.status_code for key, response in refused.items()} == {
+            key: 422 for key in refused
+        }
+        assert (
+            asyncio.run(
+                database.get_source_sync_snapshot_manifest_status(
+                    source_id=source_id, workspace_id="local", snapshot_id="refused-job:attempt:1"
+                )
+            )
+            is None
+        )
     finally:
         asyncio.run(database.close())
 

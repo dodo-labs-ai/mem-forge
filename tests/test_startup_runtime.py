@@ -1977,7 +1977,7 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             source_id,
             progress_callback=None,
             force_full_sync=False,
-            authoritative_snapshot=False,
+            input_snapshot=None,
             reprocess_doc_ids=None,
             execution_mode=None,
             source_activity=None,
@@ -1986,10 +1986,13 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             reusable_projection_doc_ids=frozenset(),
             record_terminal_result=True,
             failed_item_retry=None,
+            collection_attempt=None,
+            excluded_scope_gene=None,
         ):
             del (
+                excluded_scope_gene,
                 failed_item_retry,
-                authoritative_snapshot,
+                input_snapshot,
                 reprocess_doc_ids,
                 execution_mode,
                 source_activity,
@@ -2034,7 +2037,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
 ):
     from memforge import runtime
     from tests.source_type_fixture import register_test_source_type
-    from memforge.genes.base import Gene
+    from memforge.genes.document_gene import DocumentGene
     from memforge.models import (
         ConfigField,
         ConfigFieldType,
@@ -2048,7 +2051,16 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
     )
     from memforge.source_secrets import prepare_source_config_for_storage
 
-    class ApiKeyGene(Gene):
+    class ApiKeyGene(DocumentGene):
+        listing_kinds = frozenset()
+
+        @classmethod
+        def lists_scope(cls, config) -> bool:
+            return False
+
+        async def list_scope(self):
+            raise NotImplementedError
+
         @classmethod
         def metadata(cls) -> GeneMetadata:
             return GeneMetadata(
@@ -2101,7 +2113,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             source_id,
             progress_callback=None,
             force_full_sync=False,
-            authoritative_snapshot=False,
+            input_snapshot=None,
             reprocess_doc_ids=None,
             execution_mode=None,
             source_activity=None,
@@ -2110,10 +2122,13 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             reusable_projection_doc_ids=frozenset(),
             record_terminal_result=True,
             failed_item_retry=None,
+            collection_attempt=None,
+            excluded_scope_gene=None,
         ):
             del (
+                excluded_scope_gene,
                 failed_item_retry,
-                authoritative_snapshot,
+                input_snapshot,
                 reprocess_doc_ids,
                 execution_mode,
                 source_activity,
@@ -2163,7 +2178,7 @@ async def test_gene_discovery_preview_runs_configured_gene_without_saving_source
     from datetime import datetime, timezone
 
     from tests.source_type_fixture import register_test_source_type
-    from memforge.genes.base import Gene
+    from memforge.genes.document_gene import DocumentGene
     from memforge.models import (
         ConfigField,
         ConfigFieldType,
@@ -2176,7 +2191,16 @@ async def test_gene_discovery_preview_runs_configured_gene_without_saving_source
     )
     from memforge.server.admin_api import create_admin_app
 
-    class PreviewGene(Gene):
+    class PreviewGene(DocumentGene):
+        listing_kinds = frozenset()
+
+        @classmethod
+        def lists_scope(cls, config) -> bool:
+            return False
+
+        async def list_scope(self):
+            raise NotImplementedError
+
         @classmethod
         def metadata(cls) -> GeneMetadata:
             return GeneMetadata(
@@ -2243,7 +2267,7 @@ async def test_gene_discovery_preview_runs_configured_gene_without_saving_source
 @pytest.mark.asyncio
 async def test_gene_discovery_preview_reuses_existing_source_secret(db, tmp_path, monkeypatch):
     from tests.source_type_fixture import register_test_source_type
-    from memforge.genes.base import Gene
+    from memforge.genes.document_gene import DocumentGene
     from memforge.models import (
         ConfigField,
         ConfigFieldType,
@@ -2256,7 +2280,16 @@ async def test_gene_discovery_preview_reuses_existing_source_secret(db, tmp_path
     )
     from memforge.server.admin_api import create_admin_app
 
-    class SecretPreviewGene(Gene):
+    class SecretPreviewGene(DocumentGene):
+        listing_kinds = frozenset()
+
+        @classmethod
+        def lists_scope(cls, config) -> bool:
+            return False
+
+        async def list_scope(self):
+            raise NotImplementedError
+
         @classmethod
         def metadata(cls) -> GeneMetadata:
             return GeneMetadata(
@@ -2453,7 +2486,9 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
 
 
 @pytest.mark.asyncio
-async def test_source_config_update_resets_incremental_sync_cursor(db, tmp_path, monkeypatch):
+async def test_a_document_scope_change_opens_a_transition_and_keeps_the_sync_cursor_and_history(
+    db, tmp_path, monkeypatch
+):
     from datetime import datetime, timezone
 
     from memforge.models import SyncState
@@ -2479,10 +2514,11 @@ async def test_source_config_update_resets_incremental_sync_cursor(db, tmp_path,
         access_policy="workspace",
         owner_user_id="dev",
     )
+    last_sync_at = datetime.now(timezone.utc)
     await db.upsert_sync_state(
         SyncState(
             source=source_id,
-            last_sync_at=datetime.now(timezone.utc),
+            last_sync_at=last_sync_at,
             last_sync_status="success",
             docs_processed=10,
             docs_updated=10,
@@ -2513,22 +2549,43 @@ async def test_source_config_update_resets_incremental_sync_cursor(db, tmp_path,
                 },
             },
         )
+        first_transition = await db.get_open_projection_scope_transition(source_id)
+        # A second change while the first is open supersedes it.
+        superseding = client.put(
+            f"/api/v1/sources/{source_id}",
+            json={
+                "name": "Delivery Board",
+                "config": {
+                    **old_config,
+                    "jql_filter": "updated >= -30d",
+                },
+            },
+        )
         sources_response = client.get("/api/v1/sources")
 
     assert response.status_code == 200
-    assert await db.get_sync_state(source_id) is None
+    assert superseding.status_code == 200, superseding.text
+    # The transition runs discover the whole new scope; the run that
+    # completes the transition moves the cursor.
+    state = await db.get_sync_state(source_id)
+    assert state is not None and state.last_sync_at == last_sync_at
+    assert len(await db.get_sync_history(source_id)) == 1
     updated = await db.get_source(source_id)
-    assert updated["last_sync"] is None
+    assert updated["last_sync"] == last_sync_at.isoformat()
     source_payload = next(s for s in sources_response.json()["data"] if s["id"] == source_id)
-    assert source_payload["sync"] is None
+    assert source_payload["sync"] is not None
+    assert first_transition is not None
+    assert first_transition.previous_scope["jql_filter"] == "updated >= -180d"
+    assert first_transition.target_scope["jql_filter"] == "updated >= -90d"
     transition = await db.get_open_projection_scope_transition(source_id)
     assert transition is not None
     assert transition.previous_scope["jql_filter"] == "updated >= -180d"
-    assert transition.target_scope["jql_filter"] == "updated >= -90d"
+    assert transition.target_scope["jql_filter"] == "updated >= -30d"
+    assert transition.predecessor_transition_id == first_transition.id
 
 
 @pytest.mark.asyncio
-async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path, monkeypatch):
+async def test_source_scope_update_cancels_active_sync(db, tmp_path, monkeypatch):
     from datetime import datetime, timezone
 
     from memforge.models import SyncState
@@ -2603,7 +2660,6 @@ async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path
 
     assert response.status_code == 200
     assert fake_sync_service.cancelled == [source_id]
-    assert await db.get_sync_state(source_id) is None
     transition = await db.get_open_projection_scope_transition(source_id)
     assert transition is not None
     assert transition.previous_scope["page_tree_root"] == "5695886009"
@@ -2726,7 +2782,6 @@ async def test_repeated_source_scope_update_creates_a_new_transition_cycle(
     monkeypatch,
 ):
     from memforge.server.admin_api import create_admin_app
-    from memforge.source_projection import ProjectionCoverage
     from memforge.source_secrets import prepare_source_config_for_storage
 
     monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
@@ -2759,11 +2814,7 @@ async def test_repeated_source_scope_update_creates_a_new_transition_cycle(
         transition = await db.get_open_projection_scope_transition(source_id)
         assert transition is not None
         await db.start_projection_scope_transition(transition.id, run_id=run_id)
-        await db.complete_projection_scope_transition(
-            transition.id,
-            run_id=run_id,
-            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
-        )
+        await db.complete_projection_scope_transition(transition.id, run_id=run_id)
         return transition.id
 
     with TestClient(app) as client:

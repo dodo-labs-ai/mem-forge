@@ -14,13 +14,19 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 from memforge.genes.base import Gene
+from memforge.genes.contract import validate_registered_source_types
+from memforge.genes.document_gene import DocumentGene
+from memforge.genes.family import CollectionFamilyKind, gene_family
 from memforge.models import GeneMetadata, SourceExecutionKind
 from memforge.source_types import registered_source_types, source_type_descriptor
 
 __all__ = [
     "GENE_REGISTRY",
+    "DocumentGene",
     "create_gene",
+    "gene_exports_pdf",
     "list_available_genes",
+    "source_lists_scope",
     "source_rediscovers_documents",
     "source_type_execution_kinds",
     "source_type_supports_sync",
@@ -81,13 +87,35 @@ def source_type_supports_sync(source_type: str) -> bool:
     return bool(source_type_execution_kinds(source_type))
 
 
+def gene_exports_pdf(gene: Gene) -> bool:
+    """Whether the Gene's source type renders a PDF of each Unit."""
+    descriptor = source_type_descriptor(gene.metadata().name)
+    return descriptor is not None and descriptor.exports_pdf
+
+
 def source_rediscovers_documents(source_type: str, config: Mapping[str, Any]) -> bool:
     """Whether a configured Source can ask its provider for one Document by id."""
     gene_cls = GENE_REGISTRY.get(str(source_type or "").strip())
-    return gene_cls is not None and gene_cls.rediscovers_documents(config)
+    return (
+        gene_cls is not None
+        and gene_family(gene_cls) is CollectionFamilyKind.DOCUMENT
+        and gene_cls.rediscovers_documents(config)
+    )
 
 
-# Every registered Gene loads with this package, so a connector that cannot
-# load fails startup instead of going missing.
+def source_lists_scope(source_type: str, config: Mapping[str, Any]) -> bool:
+    """Whether a configured document Source can list its whole scope (``DocumentGene.lists_scope``)."""
+    gene_cls = GENE_REGISTRY.get(str(source_type or "").strip())
+    return (
+        gene_cls is not None
+        and gene_family(gene_cls) is CollectionFamilyKind.DOCUMENT
+        and gene_cls.lists_scope(config)
+    )
+
+
+# Every registered Gene loads with this package, and every source type is
+# checked against its family's contract, so a connector that cannot load or
+# leaves out part of its contract fails startup instead of going missing.
 for _descriptor in registered_source_types():
     _descriptor.gene_class()
+validate_registered_source_types()

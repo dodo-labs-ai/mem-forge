@@ -8,6 +8,7 @@ from dataclasses import replace
 from typing import Mapping
 
 from memforge.conversations.units import UnitKind
+from memforge.source_projection import provider_item_key
 from memforge.source_adapters.contracts import CanonicalRecordField, CanonicalRecordSchema, canonical_record_profile
 
 
@@ -42,11 +43,10 @@ def teams_unit_shape(provider_key: str) -> tuple[UnitKind, str | None]:
     Teams keys a thread ``teams-thread:v1:`` and a window ``teams-block:v1:``,
     each followed by the base64url JSON of its source, conversation and root
     or anchor message. A Unit that came back after its removal carries its
-    incarnation after ``#incarnation:``.
+    incarnation (:func:`~memforge.source_projection.provider_item_key`).
     """
 
-    key, _, _incarnation = provider_key.partition("#incarnation:")
-    prefix, _, token = key.partition(":v1:")
+    prefix, _, token = provider_item_key(provider_key).partition(":v1:")
     if prefix == "teams-block":
         return UnitKind.WINDOW, None
     if prefix != "teams-thread" or not token:

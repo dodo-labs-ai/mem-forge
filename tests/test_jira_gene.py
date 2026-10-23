@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from memforge.genes.jira_gene import JiraGene
-from memforge.models import ContentItem
+from memforge.models import AbsenceAnswer, ContentItem
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
 
 
@@ -153,7 +153,8 @@ async def test_discovery_rejects_malformed_or_early_terminal_search_page(payload
 
     with pytest.raises(RuntimeError, match="Jira search"):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError, match="Jira search"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -168,7 +169,8 @@ async def test_discovery_rejects_duplicate_issue_identity_before_completion():
 
     with pytest.raises(RuntimeError, match="duplicate issue identity"):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError, match="duplicate issue identity"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -611,7 +613,7 @@ async def _read_per_issue(gene: JiraGene):
     ("read_issue", "expected_calls"),
     [
         (_read_hydrated_by_search, [("POST", "/rest/api/2/search")]),
-        (_read_rediscovered, [("GET", "/rest/api/2/issue/100007")]),
+        (_read_rediscovered, [("POST", "/rest/api/2/search")]),
         (
             _read_per_issue,
             [("GET", "/rest/api/2/issue/PAY-7"), ("GET", "/rest/api/2/issue/PAY-7/comment")],
@@ -1365,7 +1367,6 @@ async def test_discover_inventory_uses_lightweight_complete_search_without_hydra
 
     assert [item.extra["issue_key"] for item in items] == ["PAY-1"]
     assert items[0].extra["attest_materialized_revision"] is True
-    assert gene.discovery_complete is True
     assert gene._hydrated_issues == {}
     request = gene._request.await_args.kwargs["json_body"]
     assert request["fields"] == ["summary", "updated", "project"]
@@ -1723,10 +1724,13 @@ async def test_scope_listing_that_ends_before_its_total_raises():
 
 
 @pytest.mark.asyncio
-async def test_local_agent_jira_cannot_list_its_scope():
-    gene = JiraGene(config={"base_url": "https://jira.example.test", "sync_mode": "local_agent"}, source_id="src-jira")
+async def test_local_agent_jira_is_listed_by_its_device_manifest():
+    config = {"base_url": "https://jira.example.test", "sync_mode": "local_agent"}
+    gene = JiraGene(config=config, source_id="src-jira")
 
-    assert await gene.list_scope() is None
+    assert JiraGene.lists_scope(config) is True
+    with pytest.raises(ValueError, match="snapshot manifest"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -1750,11 +1754,16 @@ async def test_confirming_unlisted_issues_keeps_every_issue_jira_still_has():
     gene = _transport_gene(handler)
     items = [_stored_issue(f"PAY-{number}", str(100000 + number)) for number in range(1, 5)]
     try:
-        absent = await gene.confirm_absent(items)
+        answers = await gene.confirm_absent(items)
     finally:
         await gene._client.aclose()
 
-    assert absent == {"jira-PAY-2"}
+    assert answers == {
+        "jira-PAY-1": AbsenceAnswer.EXISTS,
+        "jira-PAY-2": AbsenceAnswer.ABSENT,
+        "jira-PAY-3": AbsenceAnswer.HIDDEN,
+        "jira-PAY-4": AbsenceAnswer.EXISTS,
+    }
     assert [body["jql"] for body in searches] == ["issuekey in (100001, 100002, 100003, 100004)"]
     assert searches[0]["validateQuery"] is False
     assert reads == ["100002", "100003", "100004"]
@@ -1775,11 +1784,12 @@ async def test_confirming_unlisted_issues_searches_in_batches_of_one_page():
     gene = _transport_gene(handler)
     items = [_stored_issue(f"PAY-{number}", str(100000 + number)) for number in range(1, JIRA_INVENTORY_MAX_RESULTS + 2)]
     try:
-        absent = await gene.confirm_absent(items)
+        answers = await gene.confirm_absent(items)
     finally:
         await gene._client.aclose()
 
-    assert absent == frozenset()
+    assert set(answers.values()) == {AbsenceAnswer.EXISTS}
+    assert set(answers) == {item.item_id for item in items}
     assert batch_sizes == [JIRA_INVENTORY_MAX_RESULTS, 1]
 
 
@@ -1796,6 +1806,42 @@ async def test_confirming_unlisted_issues_fails_when_jira_rejects_the_credential
             await gene.confirm_absent([_stored_issue("PAY-2", "100002")])
     finally:
         await gene._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_device_confirms_an_issue_by_the_key_the_server_names_it_by():
+    searched: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        searched.append(json.loads(request.content)["jql"])
+        return httpx.Response(200, json=_search_page([_jira_issue("PAY-1"), _jira_issue("PAY-5")]))
+
+    # A device names its Documents by Source and issue key, not by the server's ``jira-KEY``.
+    stored_with_id = _stored_issue("PAY-1", "100001")
+    stored_by_key = ContentItem(
+        item_id="jira-src-pay-5-abc",
+        title="PAY-5",
+        source_url="https://jira.example.test/browse/PAY-5",
+        last_modified=datetime(2026, 10, 23, tzinfo=timezone.utc),
+        extra={"issue_key": "PAY-5"},
+    )
+    assert JiraGene.provider_key(stored_with_id) == "100001"
+    assert JiraGene.provider_key(stored_by_key) == "PAY-5"
+
+    gene = _transport_gene(handler)
+    items = [
+        JiraGene.confirmation_item("jira-src-pay-1-abc", "100001"),
+        JiraGene.confirmation_item("jira-src-pay-5-abc", "PAY-5"),
+    ]
+    try:
+        answers = await gene.confirm_absent(items)
+    finally:
+        await gene._client.aclose()
+
+    assert answers == {"jira-src-pay-1-abc": AbsenceAnswer.EXISTS, "jira-src-pay-5-abc": AbsenceAnswer.EXISTS}
+    assert searched == ["issuekey in (100001, PAY-5)"]
+    with pytest.raises(ValueError, match="neither an issue id nor an issue key"):
+        JiraGene.confirmation_item("jira-src-x", "PAY-1) OR (project = SECRET")
 
 
 @pytest.mark.asyncio
@@ -1816,3 +1862,133 @@ async def test_complete_hydrated_comments_without_rendering_fetch_attested_comme
     raw = await gene.fetch(item)
     assert json.loads(raw.body)["_comments"] == [rendered]
     assert len(gene._client.calls) == 1
+
+
+def _rediscovery_handler(searches: list[dict], issues_by_id: dict[str, dict]):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/rest/api/2/search"
+        body = json.loads(request.content)
+        searches.append(body)
+        issue_ref = body["jql"].removeprefix("issuekey = ").split(" ", 1)[0]
+        issues = [issues_by_id[issue_ref]] if issue_ref in issues_by_id else []
+        return httpx.Response(200, json=_search_page(issues))
+
+    return handler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "expected_jql"),
+    [
+        (
+            {"projects": ["PAY"], "issue_types": ["Story"], "jql_filter": "labels = important"},
+            "issuekey = 100001 AND (project in (PAY) AND issuetype in (Story) AND (labels = important))",
+        ),
+        (
+            {"query_mode": "advanced", "jql": "project = PAY OR labels = payroll ORDER BY Rank ASC"},
+            "issuekey = 100001 AND (project = PAY OR labels = payroll)",
+        ),
+        ({"query_mode": "advanced", "jql": "ORDER BY created DESC"}, "issuekey = 100001"),
+        ({"query_mode": "advanced", "jql": ""}, "issuekey = 100001"),
+    ],
+    ids=["simple-with-filter", "advanced-with-order-and-top-level-or", "advanced-order-only", "advanced-empty"],
+)
+async def test_rediscovery_searches_for_the_issue_within_the_configured_jql(config, expected_jql):
+    searches: list[dict] = []
+    gene = _transport_gene(_rediscovery_handler(searches, {"100001": _jira_issue("PAY-1", issue_id="100001")}), config)
+    try:
+        current = await gene.rediscover(_stored_issue("PAY-1", "100001"))
+    finally:
+        await gene._client.aclose()
+
+    assert current.item_id == "jira-PAY-1"
+    assert [body["jql"] for body in searches] == [expected_jql]
+    assert searches[0]["validateQuery"] is False
+    # Fetch reads the issue the search returned instead of asking again.
+    assert set(gene._hydrated_issues) == {"PAY-1"}
+
+
+@pytest.mark.asyncio
+async def test_rediscovery_finds_an_issue_whose_key_changed_by_its_id():
+    searches: list[dict] = []
+    moved = _jira_issue("OPS-7", issue_id="100001")
+    gene = _transport_gene(_rediscovery_handler(searches, {"100001": moved}), {"projects": ["PAY", "OPS"]})
+    try:
+        current = await gene.rediscover(_stored_issue("PAY-1", "100001"))
+    finally:
+        await gene._client.aclose()
+
+    assert (current.item_id, current.extra["issue_id"]) == ("jira-OPS-7", "100001")
+
+
+@pytest.mark.asyncio
+async def test_rediscovery_gives_nothing_for_an_issue_outside_the_jql():
+    searches: list[dict] = []
+    gene = _transport_gene(_rediscovery_handler(searches, {}), {"projects": ["PAY"]})
+    try:
+        assert await gene.rediscover(_stored_issue("PAY-2", "100002")) is None
+    finally:
+        await gene._client.aclose()
+
+    assert len(searches) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(500, json={"errorMessages": ["Internal server error"]}),
+        httpx.Response(200, json=_search_page([], total=1)),
+        httpx.Response(200, json=_search_page([_jira_issue("PAY-5", issue_id="100005")])),
+    ],
+    ids=["search-error", "ends-before-total", "another-issue"],
+)
+async def test_rediscovery_raises_when_the_search_fails_or_answers_inconsistently(response):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return response
+
+    gene = _transport_gene(handler, {"projects": ["PAY"]})
+    try:
+        with pytest.raises(RuntimeError):
+            await gene.rediscover(_stored_issue("PAY-1", "100001"))
+    finally:
+        await gene._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rediscovery_by_an_old_key_accepts_the_issue_under_its_new_key():
+    # Jira resolves the key an issue had before it moved, and answers with its current key.
+    searches: list[dict] = []
+    moved = _jira_issue("OPS-7", issue_id="100001")
+    gene = _transport_gene(_rediscovery_handler(searches, {"PAY-1": moved}), {"projects": ["PAY", "OPS"]})
+    stored = ContentItem(
+        item_id="jira-PAY-1",
+        title="PAY-1",
+        source_url="https://jira.example.test/browse/PAY-1",
+        last_modified=datetime(2026, 5, 21, tzinfo=timezone.utc),
+        extra={"issue_key": "PAY-1"},
+    )
+    try:
+        current = await gene.rediscover(stored)
+    finally:
+        await gene._client.aclose()
+
+    assert [body["jql"].split(" AND ", 1)[0] for body in searches] == ["issuekey = PAY-1"]
+    assert (current.item_id, current.extra["issue_id"]) == ("jira-OPS-7", "100001")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("issue_ref", ["PAY-1) OR (project = HR", "pay-1", "PAY-", "1 OR 2"])
+async def test_an_issue_reference_that_is_not_an_id_or_key_never_reaches_jql(issue_ref):
+    searches: list[dict] = []
+    gene = _transport_gene(_rediscovery_handler(searches, {}), {"projects": ["PAY"]})
+    stored = _stored_issue("PAY-1", issue_ref)
+    try:
+        with pytest.raises(ValueError, match="neither an issue id nor an issue key"):
+            await gene.rediscover(stored)
+        with pytest.raises(ValueError, match="neither an issue id nor an issue key"):
+            await gene.confirm_absent([stored])
+    finally:
+        await gene._client.aclose()
+
+    assert searches == []

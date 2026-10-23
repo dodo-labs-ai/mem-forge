@@ -413,6 +413,12 @@ class ContentItem:
     input of the Document's Source Unit, empty for a Document the Source has
     not stored. A Gene may reuse a provider fact it recorded for an unchanged
     provider revision instead of asking again.
+
+    ``renamed_from`` is the Document id this item was renamed from, set only
+    when the provider attests the rename. For example, a GitHub file moved
+    from ``docs/a.md`` names the Document of ``docs/a.md``. The item commits
+    to that Document's current Unit, and until it commits, the Unit is kept
+    even when the scope listing no longer names it.
     """
 
     item_id: str  # becomes doc_id
@@ -426,6 +432,7 @@ class ContentItem:
     labels: list[str] = field(default_factory=list)
     extra: dict = field(default_factory=dict)  # source-specific metadata
     stored_extra: dict = field(default_factory=dict)
+    renamed_from: str | None = None
 
     def to_doc_ref(self, source_id: str) -> DocRef:
         return DocRef(
@@ -439,9 +446,12 @@ class ContentItem:
         )
 
     def to_payload(self) -> dict[str, object]:
-        """The item as discovery produced it, for storing with a Unit's input."""
+        """The item as discovery produced it, for storing with a Unit's input.
 
-        return {
+        ``renamed_from`` appears only when it is set.
+        """
+
+        payload: dict[str, object] = {
             "item_id": self.item_id,
             "title": self.title,
             "source_url": self.source_url,
@@ -453,12 +463,16 @@ class ContentItem:
             "labels": list(self.labels),
             "extra": dict(self.extra),
         }
+        if self.renamed_from is not None:
+            payload["renamed_from"] = self.renamed_from
+        return payload
 
     @classmethod
     def from_payload(cls, payload: dict[str, object]) -> ContentItem:
         author = payload.get("author")
         labels = payload.get("labels")
         extra = payload.get("extra")
+        renamed_from = payload.get("renamed_from")
         return cls(
             item_id=str(payload["item_id"]),
             title=str(payload.get("title") or ""),
@@ -470,6 +484,7 @@ class ContentItem:
             author=str(author) if author is not None else None,
             labels=[str(label) for label in labels] if isinstance(labels, list) else [],
             extra=dict(extra) if isinstance(extra, dict) else {},
+            renamed_from=str(renamed_from) if renamed_from is not None else None,
         )
 
 
@@ -519,6 +534,31 @@ class ScopeListing:
 
     kind: ScopeListingKind
     doc_ids: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class UnlistedScopeMode:
+    """The mode of a configuration that cannot list its whole scope, and what would list it.
+
+    A scope change into such a configuration is refused, because its
+    transition could never complete; the refusal names ``mode`` and offers
+    ``suggestion``. For example, GitHub Pages names a subtree read by link
+    crawl and suggests reading it from the repository with a token.
+    """
+
+    mode: str
+    suggestion: str
+
+
+class AbsenceAnswer(str, Enum):
+    """What the provider answers when one item a query listing left out is read by its identifier."""
+
+    # Not found or deleted (HTTP 404 or 410, or a page in the trash): the item is gone.
+    ABSENT = "absent"
+    # The provider returned the item: it left the query but still exists.
+    EXISTS = "exists"
+    # The provider refuses to show this one item (HTTP 403): it may still exist.
+    HIDDEN = "hidden"
 
 
 def require_attested_content(raw: RawContent, normalized: NormalizedContent) -> None:
@@ -607,9 +647,14 @@ class FailedDoc:
 
 
 # Why a sync run removed nothing although its scope listing was due: the
-# Gene's scope listing did not complete, or the provider could not confirm
-# which unlisted Documents are gone.
-AbsenceCheckSkippedReason = Literal["scope_listing_failed", "absence_confirmation_failed"]
+# Gene's scope listing did not complete, the provider could not confirm which
+# unlisted Documents are gone, or the device that listed a query scope has not
+# confirmed them.
+AbsenceCheckSkippedReason = Literal[
+    "scope_listing_failed",
+    "absence_confirmation_failed",
+    "absence_confirmation_missing",
+]
 
 
 @dataclass
@@ -628,6 +673,10 @@ class SyncState:
     failed_docs: list[FailedDoc] = field(default_factory=list)
     failure_retryable: bool = True
     absence_check_skipped_reason: AbsenceCheckSkippedReason | None = None
+    # Unlisted Units of a query listing confirmed still present (``exists`` or
+    # ``hidden``); each is confirmed again every run. ``None`` when the run
+    # confirmed nothing.
+    unlisted_present_count: int | None = None
     runtime_bundles: tuple[AgentRuntimeBundle, ...] = field(
         default=(),
         repr=False,

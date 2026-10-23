@@ -1295,7 +1295,7 @@ async def test_tombstone_preserves_unit_history_and_clears_removed_observation_c
 
 
 @pytest.mark.asyncio
-async def test_scope_transition_requires_complete_snapshot_before_apply(db: Database) -> None:
+async def test_a_failed_scope_transition_stays_open_until_a_later_run_applies_it(db: Database) -> None:
     transition = ProjectionScopeTransition(
         id="scope-transition-1",
         source_id="src-1",
@@ -1309,22 +1309,19 @@ async def test_scope_transition_requires_complete_snapshot_before_apply(db: Data
     failed = await db.fail_projection_scope_transition(
         running.id,
         run_id="run-1",
-        coverage=ProjectionCoverage.PARTIAL_PROJECTION,
         error="provider polling is partial",
     )
 
     assert failed.status is ProjectionScopeTransitionStatus.FAILED
+    assert failed.error == "provider polling is partial"
     assert (await db.get_open_projection_scope_transition("src-1")) == failed
 
     await db.start_projection_scope_transition(failed.id, run_id="run-2")
-    applied = await db.complete_projection_scope_transition(
-        failed.id,
-        run_id="run-2",
-        coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
-    )
+    applied = await db.complete_projection_scope_transition(failed.id, run_id="run-2")
 
     assert applied.status is ProjectionScopeTransitionStatus.APPLIED
-    assert applied.coverage is ProjectionCoverage.COMPLETE_SNAPSHOT
+    assert applied.error is None
+    assert applied.completed_at is not None
     assert await db.get_open_projection_scope_transition("src-1") is None
     assert await db.list_projection_scope_transitions("src-1") == [applied]
 

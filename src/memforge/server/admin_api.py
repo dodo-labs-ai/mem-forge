@@ -23,7 +23,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal, cast
 from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, Request
@@ -63,12 +63,15 @@ from memforge.conversations.report import plan_report
 from memforge.source_artifact_inputs import retain_artifact_input
 from memforge.genes import (
     GENE_REGISTRY,
+    DocumentGene,
     create_gene,
     list_available_genes,
+    source_lists_scope,
     source_rediscovers_documents,
     source_type_supports_sync,
 )
 from memforge.genes.conversation_gene import ConversationGene
+from memforge.genes.family import CollectionFamilyKind
 from memforge.genes.atlassian_auth import (
     release_atlassian_request_limiter,
     require_https_base_url,
@@ -153,6 +156,7 @@ from memforge.memory.store import MemoryStore
 from memforge.models import (
     AbsenceCheckSkippedReason,
     ConfigField,
+    ScopeListingKind,
     ConfigFieldType,
     Entity,
     Memory,
@@ -224,8 +228,15 @@ from memforge.source_secrets import (
 )
 from memforge.source_projection import (
     ProjectionScopeTransition,
+    ProjectionScopeTransitionStale,
+    provider_item_key,
 )
-from memforge.source_projection_config import projection_scope_transition_id, source_access_context
+from memforge.source_projection_config import (
+    canonical_scope_transition,
+    excluded_scope_config,
+    projection_scope_transition_id,
+    source_access_context,
+)
 from memforge.source_types import (
     LocalAgentCollection,
     SourceConfigPolicy,
@@ -263,18 +274,31 @@ from memforge.local_agent.readiness import (
     SourceConnectionState,
     connection_status_from_browser_session,
 )
+from memforge.local_agent.snapshot_manifest import (
+    COMPLETE_SNAPSHOT,
+    SNAPSHOT_MANIFEST_MAX_ITEMS,
+    UPSERT,
+    ExcludedScopeListing,
+    SnapshotConfirmation,
+    SnapshotConfirmationAnswer,
+    SnapshotManifestItem,
+    plan_snapshot_manifest,
+    snapshot_manifest_sha256,
+    validate_excluded_listings_for_job,
+)
 from memforge.local_agent.source_contract import (
+    LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
     LOCAL_AGENT_SYNC_OPERATIONS,
     execution_owner_user_id,
     is_local_agent_backed_source,
     local_agent_collection_attempt_id,
-    local_agent_collection_is_authoritative,
     local_agent_semantic_input_sha256,
     local_agent_completion_status,
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
     local_agent_sync_operation,
     local_agent_sync_snapshot_id,
+    local_package_confirms_absence,
     local_package_requires_source_time,
     validate_local_agent_replay_package,
 )
@@ -1855,9 +1879,12 @@ class SourceSyncStatusResponse(BaseModel):
     ``docs_*``, ``memories_*``, ``current_title``). The last recorded sync
     carries its totals, ``run_id``, ``failed_docs``,
     ``absence_check_skipped_reason``, which names the step that kept that run
-    from removing anything although its scope listing was due, and
-    ``skipped_reading_group_count``, the parts of its Documents the generation
-    model could not read. Fields outside the chosen shape are absent.
+    from removing anything although its scope listing was due,
+    ``unlisted_present_count``, the Documents its scope listing left out that
+    the provider confirmed it still has or hides (``null`` when the run
+    confirmed none), and ``skipped_reading_group_count``, the parts of its
+    Documents the generation model could not read. Fields outside the chosen
+    shape are absent.
     """
 
     status: SourceSyncStatus
@@ -1885,6 +1912,7 @@ class SourceSyncStatusResponse(BaseModel):
     memories_stored: int | None = None
     failed_docs: list[SourceSyncFailedDocResponse] | None = None
     absence_check_skipped_reason: AbsenceCheckSkippedReason | None = None
+    unlisted_present_count: int | None = None
     skipped_reading_group_count: int | None = None
 
 
@@ -1946,6 +1974,57 @@ class UnrecognizedSessionLinesResponse(BaseModel):
     last_seen_at: str | None
 
 
+class SourceScopeTransitionResponse(BaseModel):
+    """The scope change a Source is applying.
+
+    A change of what a Source syncs opens a transition from the last applied
+    scope to the new one. Its syncs commit the items the new scope lists,
+    and once every listed item has committed, the change completes and what
+    the new scope leaves out is removed. Until then nothing is removed.
+    ``members_committed`` of ``listed_count`` items have committed; the
+    count is ``null`` until a sync lists the new scope in full.
+    ``failing_items`` are the failed items not yet committed under the
+    change; one the new scope lists keeps it open until a sync commits it,
+    and one only the previous scope held is settled when the change
+    completes.
+
+    Saving ``restore_config`` with ``PUT /sources/{id}``, with this
+    transition's ``id`` as ``expected_scope_transition_id``, returns to the
+    previous scope: it replaces the change in progress, and nothing the
+    previous scope synced is removed. It is ``null`` when the viewer cannot
+    change the configuration, the Source cannot replace a change in progress
+    and waits for it to complete, or the change already returns to the
+    previous scope.
+    """
+
+    id: str
+    status: Literal["pending", "running", "failed"] = Field(
+        description=(
+            "pending: no sync has worked on the change yet; running: a sync is working on it; "
+            "failed: the latest sync left it open, as ``error`` says."
+        ),
+    )
+    previous_scope: dict[str, Any] | None = Field(
+        description="The canonical scope fields of the last applied scope; null when the viewer cannot read the configuration.",
+    )
+    target_scope: dict[str, Any] | None = Field(
+        description=(
+            "The canonical scope fields of the new scope; null when the viewer cannot read the configuration. "
+            "Equal to ``previous_scope`` while the Source returns to its previous scope."
+        ),
+    )
+    created_at: str
+    updated_at: str
+    members_committed: int
+    listed_count: int | None
+    excluded_scopes_due: bool = Field(
+        description="Every listed item has committed, and the next sync lists what the previous scope held.",
+    )
+    error: str | None = Field(description="Why the latest sync left the change open; null before one did.")
+    failing_items: SourceFailedItemsResponse
+    restore_config: dict[str, Any] | None
+
+
 class SourceResponse(BaseModel):
     """One Source as the viewer sees it in the Source List."""
 
@@ -1972,6 +2051,9 @@ class SourceResponse(BaseModel):
     sync: SourceSyncStatusResponse | None
     failed_items: SourceFailedItemsResponse | None = Field(
         description="The Source's failed Documents; null for a Source that does not sync.",
+    )
+    scope_transition: SourceScopeTransitionResponse | None = Field(
+        description="The scope change the Source is applying; null when none is in progress.",
     )
     client: str | None = Field(
         description="The agent client (for example codex or claude-code) of an agent-session Source; null otherwise.",
@@ -2342,6 +2424,59 @@ class UpdateSourceRequest(BaseModel):
     status: str | None = None
     project_binding: dict | None = None
     sync_schedule: SourceSyncScheduleRequest | None = None
+    expected_scope_transition_id: str | None = Field(
+        default=None,
+        description=(
+            "The scope change the caller saw in progress. The save answers 409 "
+            "``projection_scope_transition_stale`` when another one, or none, is in progress."
+        ),
+    )
+
+
+class SourceScopeChangePreviewRequest(BaseModel):
+    config: dict[str, Any] = Field(description="The configuration the Source would be saved with.")
+
+
+class SourceScopeChangeRefusalResponse(BaseModel):
+    """Why saving the configuration would be refused (409)."""
+
+    code: str = Field(
+        description=(
+            "scope_change_requires_listing, transition_requires_listing, "
+            "projection_scope_transition_active, source_provider_namespace_immutable or "
+            "source_execution_mode_immutable."
+        ),
+    )
+    mode: str | None = Field(default=None, description="The configured mode that cannot list its scope.")
+    message: str | None = None
+
+
+class SourceScopeChangePreviewResponse(BaseModel):
+    """What saving a configuration would do to the Source's scope, decided as ``PUT /sources/{id}`` decides it.
+
+    - ``unchanged``: the scope stays as it is.
+    - ``opens_transition``: a scope change opens; nothing is removed until it completes.
+    - ``supersedes_transition``: the change replaces the scope change in progress.
+    - ``restores_previous_scope``: the change returns to the last applied scope, which the
+      configuration cannot list. The change in progress closes, none opens, and nothing is removed.
+    - ``returns_to_previous_scope``: the change returns to the last applied scope and replaces the
+      change in progress with a change back to it. Nothing that scope synced is removed; once a
+      sync lists it in full, what only the replaced change added is removed.
+    - ``refused``: saving answers 409, as ``refusal`` says.
+
+    ``open_transition`` says whether a scope change is in progress now.
+    """
+
+    outcome: Literal[
+        "unchanged",
+        "opens_transition",
+        "supersedes_transition",
+        "restores_previous_scope",
+        "returns_to_previous_scope",
+        "refused",
+    ]
+    open_transition: bool
+    refusal: SourceScopeChangeRefusalResponse | None = None
 
 
 def _request_includes_field(model: BaseModel, field_name: str) -> bool:
@@ -2525,25 +2660,81 @@ async def _resolve_local_source_artifact_inputs(
 
 
 class LocalSourceManifestItemRequest(BaseModel):
+    """One item of a device manifest: the item as the device read it."""
+
     doc_id: str = Field(min_length=1, max_length=512)
     revision: str = Field(min_length=1, max_length=512)
-    change_kind: Literal["upsert", "tombstone"]
+    change_kind: Literal["upsert"]
+
+
+LOCAL_SOURCE_MANIFEST_MAX_ITEMS = SNAPSHOT_MANIFEST_MAX_ITEMS
+
+
+class LocalSourceExcludedListingRequest(BaseModel):
+    """What the device listed in one scope its job's open transition excludes, or that the provider rejected it.
+
+    ``scope_key`` is the key the job named the scope by. A listing holds the
+    Document ids the scope lists, up to the manifest's item bound. A
+    definitive rejection, such as a JQL the provider refuses, gives its cause
+    in ``rejection`` and lists nothing.
+    """
+
+    scope_key: str = Field(min_length=1, max_length=128)
+    doc_ids: list[str] = Field(default_factory=list, max_length=LOCAL_SOURCE_MANIFEST_MAX_ITEMS)
+    rejection: str | None = Field(default=None, min_length=1, max_length=2_000)
+
+    @model_validator(mode="after")
+    def _listed_or_rejected(self) -> "LocalSourceExcludedListingRequest":
+        if self.rejection is not None and self.doc_ids:
+            raise ValueError("a rejected excluded scope lists nothing")
+        return self
 
 
 class LocalSourceManifestRequest(BaseModel):
-    """One covered local collection, planned against the retained packages.
+    """One complete local collection, planned against the retained packages.
 
+    A device manifest lists the complete item set of its scope, so it declares
+    ``complete_snapshot`` coverage and every item an ``upsert``.
     ``package_contract_version`` is the package contract the local agent
     collects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates
-    the numbered contract sends none.
+    the numbered contract sends none. ``excluded_listings`` answers the
+    excluded scopes the job carried, one entry per scope at most.
     """
 
-    items: list[LocalSourceManifestItemRequest] = Field(max_length=10_000)
-    coverage: Literal["complete_snapshot", "bounded_delta", "partial"]
+    items: list[LocalSourceManifestItemRequest] = Field(max_length=LOCAL_SOURCE_MANIFEST_MAX_ITEMS)
+    coverage: Literal["complete_snapshot"]
     sync_snapshot_id: str
     local_agent_job_id: str
     local_agent_attempt_count: int = Field(ge=1)
     package_contract_version: int | None = Field(default=None, ge=1)
+    excluded_listings: list[LocalSourceExcludedListingRequest] = Field(default_factory=list, max_length=100)
+
+
+class LocalSourceConfirmationAnswerRequest(BaseModel):
+    """The device's answer for one item its manifest response asked it to confirm."""
+
+    doc_id: str = Field(min_length=1, max_length=512)
+    provider_key: str = Field(min_length=1, max_length=512)
+    answer: Literal["absent", "exists", "hidden"]
+
+
+class LocalSourceConfirmationsRequest(BaseModel):
+    """A device's answers for the items its query manifest left out, bound to that manifest.
+
+    ``manifest_sha256`` is the digest the manifest response returned, and the
+    job attempt is the one that submitted the manifest. The request answers
+    every item the response named in ``confirm``, or, when the device could
+    not confirm them, gives ``failure_cause`` and no answers.
+    """
+
+    sync_snapshot_id: str
+    local_agent_job_id: str
+    local_agent_attempt_count: int = Field(ge=1)
+    manifest_sha256: str = Field(min_length=64, max_length=64)
+    answers: list[LocalSourceConfirmationAnswerRequest] = Field(
+        default_factory=list, max_length=LOCAL_SOURCE_MANIFEST_MAX_ITEMS
+    )
+    failure_cause: str | None = Field(default=None, min_length=1, max_length=2_000)
 
 
 CONVERSATION_MANIFEST_MAX_MESSAGES = 200_000
@@ -2603,7 +2794,11 @@ async def _require_ready_snapshot_manifest(
     req: Any,
     lease_payload: Mapping[str, Any],
 ) -> None:
-    """Require the document snapshot manifest of this job attempt, with every declared item materialized."""
+    """Require the document snapshot manifest of this job attempt, materialized and answered.
+
+    Every declared item must be materialized, and every item the manifest
+    asked its device to confirm must be answered.
+    """
 
     manifest_status = await db.get_source_sync_snapshot_manifest_status(
         source_id=source_id,
@@ -2618,22 +2813,349 @@ async def _require_ready_snapshot_manifest(
         or manifest_status["source_config_revision"] != str(lease_payload["source_config_revision"])
     ):
         raise HTTPException(status_code=409, detail="source_snapshot_manifest_stale")
-    if not manifest_status["ready"]:
+    if manifest_status["materialized_count"] != manifest_status["item_count"]:
         raise HTTPException(status_code=409, detail="source_snapshot_materialization_incomplete")
-    if (
-        local_agent_collection_is_authoritative(source.get("type"))
-        and manifest_status["coverage"] != "complete_snapshot"
-    ):
+    if manifest_status["awaiting_confirmations"]:
+        raise HTTPException(status_code=409, detail="source_snapshot_confirmations_pending")
+    if manifest_status["coverage"] != COMPLETE_SNAPSHOT:
         raise HTTPException(status_code=409, detail="authoritative_snapshot_coverage_required")
+
+
+def _is_document_source_type(source_type: str) -> bool:
+    """Whether Sources of this type belong to the document collection family."""
+
+    descriptor = source_type_descriptor(source_type)
+    return descriptor is not None and descriptor.family is CollectionFamilyKind.DOCUMENT
+
+
+async def _snapshot_confirm_set(
+    db: Database,
+    *,
+    source: Mapping[str, Any],
+    workspace_id: str,
+    snapshot_id: str,
+    listed_doc_ids: frozenset[str],
+    excluded_listings: Sequence[ExcludedScopeListing],
+    package_contract_version: int | None,
+) -> tuple[SnapshotConfirmation, ...]:
+    """The items a device manifest asks its device to confirm by identifier.
+
+    Only a document Source whose device listing is a query asks, and only an
+    agent that confirms is asked. It asks about every Document with a current
+    Unit the manifest does not list, by the provider's key of the Unit's item
+    (without the incarnation a Unit that came back carries), and every
+    failed Document the manifest does not list that never became a Unit, by
+    the provider key of its stored item. A replay of a stored manifest returns
+    the set the manifest was issued, without asking again. When the manifest
+    lists the excluded scopes of a transition and none was rejected, an item
+    an excluded listing names is not asked about: completing the transition
+    removes it on that listing.
+
+    A set larger than a manifest is issued empty: the run then records
+    ``absence_confirmation_missing`` and removes nothing.
+    """
+
+    source_type = str(source.get("type") or "")
+    descriptor = source_type_descriptor(source_type)
+    if (
+        not local_package_confirms_absence(package_contract_version)
+        or descriptor is None
+        or descriptor.family is not CollectionFamilyKind.DOCUMENT
+    ):
+        return ()
+    gene_cls = cast(type[DocumentGene], descriptor.gene_class())
+    if gene_cls.snapshot_listing_kind() is not ScopeListingKind.QUERY:
+        return ()
+    source_id = str(source["id"])
+    stored = await db.get_source_sync_snapshot_manifest_status(
+        source_id=source_id, workspace_id=workspace_id, snapshot_id=snapshot_id
+    )
+    if stored is not None:
+        issued = await db.list_source_sync_snapshot_confirmations(
+            source_id=source_id, workspace_id=workspace_id, snapshot_id=snapshot_id
+        )
+        return tuple(SnapshotConfirmation(item.doc_id, item.provider_key) for item in issued)
+    held = await db.list_current_document_provider_keys(source_id)
+    if excluded_listings and all(listing.rejection is None for listing in excluded_listings):
+        listed_doc_ids = listed_doc_ids.union(*(listing.doc_ids for listing in excluded_listings))
+    unlisted_units = sorted(set(held) - listed_doc_ids)
+    unlisted_failures = sorted(
+        (
+            failure
+            for failure in await db.list_source_item_failures(source_id=source_id)
+            if failure.document_id not in listed_doc_ids and failure.document_id not in held
+        ),
+        key=lambda failure: failure.document_id,
+    )
+    if len(unlisted_units) + len(unlisted_failures) > LOCAL_SOURCE_MANIFEST_MAX_ITEMS:
+        logger.warning(
+            "Source %s has %d unlisted Documents, more than a manifest holds; none is issued for confirmation",
+            source_id,
+            len(unlisted_units) + len(unlisted_failures),
+        )
+        return ()
+    confirm = [SnapshotConfirmation(doc_id, provider_item_key(held[doc_id])) for doc_id in unlisted_units]
+    confirm.extend(
+        SnapshotConfirmation(failure.document_id, gene_cls.provider_key(failure.item))
+        for failure in unlisted_failures
+        if failure.item is not None
+    )
+    return tuple(sorted(confirm, key=lambda item: item.doc_id))
+
+
+@dataclass(frozen=True)
+class _ScopeChange:
+    """What a scope change writes with the Source: the transition it opens and the one it supersedes.
+
+    A change while no transition is open supersedes nothing. A return to the
+    last applied scope of a configuration that cannot list supersedes the
+    open transition and opens none.
+    """
+
+    transition: ProjectionScopeTransition | None
+    superseded_transition_id: str | None = None
+
+
+async def _plan_scope_change(
+    db: Database,
+    source: Mapping[str, Any],
+    config: Mapping[str, Any],
+    current_scope: dict[str, object],
+    target_scope: dict[str, object],
+) -> _ScopeChange:
+    """Plan the transition of one scope change from the Source's last applied scope to ``target_scope``.
+
+    The last applied scope is the open transition's previous scope, or the
+    current scope when no transition is open. The new transition runs from
+    it to the target, and supersedes the open transition of a document
+    Source, which becomes its predecessor. For example, A→B open and a change
+    to C opens A→C after A→B; a change back to A opens A→A, which removes
+    what B added when it completes. A conversation Source cannot supersede
+    its open transition (409 ``projection_scope_transition_active``).
+
+    A document change into a configuration that cannot list is refused (409
+    ``scope_change_requires_listing``), because its transition could never
+    complete. Returning to exactly the last applied scope is the exception:
+    the open transition is superseded and none opens, since that scope has no
+    listing to remove anything by.
+    """
+
+    source_id = str(source["id"])
+    source_type = str(source["type"])
+    open_transition = await db.get_open_projection_scope_transition(source_id)
+    if open_transition is not None:
+        open_transition = canonical_scope_transition(source_type, open_transition, current_scope)
+    document = _is_document_source_type(source_type)
+    if open_transition is not None and not document:
+        raise HTTPException(status_code=409, detail="projection_scope_transition_active")
+    last_applied_scope = dict(open_transition.previous_scope) if open_transition is not None else current_scope
+    superseded_transition_id = open_transition.id if open_transition is not None else None
+    if document and not source_lists_scope(source_type, config):
+        if open_transition is not None and target_scope == last_applied_scope:
+            return _ScopeChange(transition=None, superseded_transition_id=superseded_transition_id)
+        raise _scope_change_requires_listing_http_error(source_type, config)
+    latest_transitions = await db.list_projection_scope_transitions(source_id, limit=1)
+    return _ScopeChange(
+        transition=ProjectionScopeTransition(
+            id=projection_scope_transition_id(
+                source_id,
+                last_applied_scope,
+                target_scope,
+                previous_cycle_transition_id=latest_transitions[0].id if latest_transitions else None,
+            ),
+            source_id=source_id,
+            previous_scope=last_applied_scope,
+            target_scope=target_scope,
+            predecessor_transition_id=superseded_transition_id,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        ),
+        superseded_transition_id=superseded_transition_id,
+    )
+
+
+def _scope_change_requires_listing_http_error(source_type: str, config: Mapping[str, Any]) -> HTTPException:
+    """The answer to a document scope change into a configuration that cannot list its whole scope."""
+
+    unlisted = cast(type[DocumentGene], GENE_REGISTRY[source_type]).unlisted_scope_mode(config)
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "scope_change_requires_listing",
+            "mode": unlisted.mode,
+            "message": (
+                f"A scope change needs a configuration that lists its whole scope, and the mode "
+                f"'{unlisted.mode}' cannot, so the change could never complete. "
+                f"{unlisted.suggestion} Or create a new Source for this scope."
+            ),
+        },
+    )
+
+
+async def _require_listing_while_a_transition_is_open(
+    db: Database,
+    source: Mapping[str, Any],
+    config: Mapping[str, Any],
+) -> None:
+    """Refuse a change that keeps the scope but leaves a document Source unable to finish its open transition.
+
+    A transition completes only by listing its new scope. A configuration
+    change outside the scope, such as GitHub Pages turning off its token or
+    its complete sitemap, can make a listing configuration one that cannot
+    list; while a transition is open that answers 409
+    ``transition_requires_listing``.
+    """
+
+    source_type = str(source["type"])
+    if (
+        not _is_document_source_type(source_type)
+        or not source_lists_scope(source_type, source["config"])
+        or source_lists_scope(source_type, config)
+        or await db.get_open_projection_scope_transition(str(source["id"])) is None
+    ):
+        return
+    unlisted = cast(type[DocumentGene], GENE_REGISTRY[source_type]).unlisted_scope_mode(config)
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "transition_requires_listing",
+            "mode": unlisted.mode,
+            "message": (
+                f"A scope change in progress completes only by listing its new scope, and the mode "
+                f"'{unlisted.mode}' cannot list it. {unlisted.suggestion} Keep a configuration that lists "
+                f"until the change completes, or return to the previous scope."
+            ),
+        },
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfigChange:
+    """A requested configuration as the Source would store it, and the scope change saving it makes."""
+
+    config: dict[str, Any]
+    scope_changed: bool
+    scope_change: _ScopeChange
+
+
+async def _plan_config_change(
+    db: Database,
+    source: Mapping[str, Any],
+    requested: Mapping[str, Any],
+    app_config: AppConfig,
+    *,
+    preview: bool = False,
+) -> _ConfigChange:
+    """Prepare ``requested`` as the Source would store it, and plan the scope change saving it makes.
+
+    Saving and previewing a configuration decide alike; a ``preview``
+    writes nothing, not even the Source's local inbox. A configuration the
+    source type rejects answers 400. A change the Source refuses answers
+    409: another execution mode or provider namespace, or a scope change it
+    cannot apply (:func:`_plan_scope_change`,
+    :func:`_require_listing_while_a_transition_is_open`).
+    """
+
+    source_id = str(source["id"])
+    source_type = str(source["type"])
+    try:
+        incoming_config = _complete_source_config(source_type, dict(requested), source_id, source["config"])
+        _validate_source_config(source_type, incoming_config, existing_config=source["config"])
+        config = prepare_source_config_for_storage(
+            incoming_config,
+            existing_config=source["config"],
+            secret_fields=_source_secret_fields(source_type),
+        )
+        config = _store_source_config(source_type, config, source_id, app_config, create_inbox=not preview)
+    except (SecretConfigurationError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if is_local_agent_backed_source(source) != is_local_agent_backed_source({"type": source_type, "config": config}):
+        raise HTTPException(status_code=409, detail="source_execution_mode_immutable")
+    if _provider_namespace_config(source_type, config) != _provider_namespace_config(source_type, source["config"]):
+        raise HTTPException(status_code=409, detail="source_provider_namespace_immutable")
+    current_scope = _sync_scope_config(source_type, source["config"])
+    target_scope = _sync_scope_config(source_type, config)
+    if target_scope == current_scope:
+        await _require_listing_while_a_transition_is_open(db, source, config)
+        return _ConfigChange(config=config, scope_changed=False, scope_change=_ScopeChange(transition=None))
+    return _ConfigChange(
+        config=config,
+        scope_changed=True,
+        scope_change=await _plan_scope_change(db, source, config, current_scope, target_scope),
+    )
+
+
+def _scope_change_outcome(change: _ConfigChange) -> str:
+    """How a planned configuration change moves the Source's scope (``SourceScopeChangePreviewResponse``)."""
+
+    if not change.scope_changed:
+        return "unchanged"
+    scope_change = change.scope_change
+    if scope_change.superseded_transition_id is None:
+        return "opens_transition"
+    transition = scope_change.transition
+    if transition is None:
+        return "restores_previous_scope"
+    if dict(transition.target_scope) == dict(transition.previous_scope):
+        return "returns_to_previous_scope"
+    return "supersedes_transition"
+
+
+def _scope_change_refusal(detail: Any) -> dict[str, Any]:
+    """The refusal a 409 of a configuration change carries, as its code, mode and message."""
+
+    if isinstance(detail, Mapping):
+        return {"code": str(detail.get("code")), "mode": detail.get("mode"), "message": detail.get("message")}
+    return {"code": str(detail)}
+
+
+def _restore_previous_scope_config(source: Mapping[str, Any], previous_scope: Mapping[str, object]) -> dict[str, Any] | None:
+    """The configuration that returns a Source to the last applied scope of its open transition.
+
+    It is the configuration the viewer reads, with its scope fields replaced
+    by the previous scope's (:func:`excluded_scope_config`); secrets stay
+    redacted and are kept when it is saved. Saving it replaces the change in
+    progress. ``None`` when the viewer cannot change the configuration, or
+    the Source is not a document Source: a conversation Source's open change
+    cannot be replaced.
+    """
+
+    capabilities = source.get("capabilities") or {}
+    source_type = str(source.get("type") or "")
+    if not (capabilities.get("can_configure") and capabilities.get("can_configure_connection")):
+        return None
+    if not _is_document_source_type(source_type):
+        return None
+    return excluded_scope_config(source_type, source.get("config") or {}, previous_scope)
+
+
+def _viewed_scope_transition(source: Mapping[str, Any], transition: dict[str, Any]) -> dict[str, Any]:
+    """The open transition as the viewer may read it.
+
+    Both scopes are configuration, so a viewer who cannot read the
+    configuration reads neither; the status and the counts stay. A
+    transition back to the previous scope, which a restore opens, offers
+    no restore of its own.
+    """
+
+    if not (source.get("capabilities") or {}).get("can_configure"):
+        return {**transition, "previous_scope": None, "target_scope": None, "restore_config": None}
+    returning = transition["previous_scope"] == transition["target_scope"]
+    return {
+        **transition,
+        "restore_config": None if returning else _restore_previous_scope_config(source, transition["previous_scope"]),
+    }
 
 
 def _conversation_gene(source: Mapping[str, Any]) -> ConversationGene | None:
     """The conversation Gene of a Source, or ``None`` for a Source of another family."""
 
-    gene_class = GENE_REGISTRY.get(str(source.get("type") or ""))
-    if gene_class is None or not issubclass(gene_class, ConversationGene):
+    descriptor = source_type_descriptor(str(source.get("type") or ""))
+    if descriptor is None or descriptor.family is not CollectionFamilyKind.CONVERSATION:
         return None
-    return create_gene(str(source["type"]), dict(source.get("config") or {}), str(source["id"]))
+    return cast(
+        ConversationGene,
+        create_gene(str(source["type"]), dict(source.get("config") or {}), str(source["id"])),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -3098,8 +3620,14 @@ def _store_source_config(
     config: dict[str, Any],
     source_id: str,
     app_config: AppConfig,
+    *,
+    create_inbox: bool = True,
 ) -> dict[str, Any]:
-    """Adjust a configuration whose secrets are encrypted before it is stored."""
+    """Adjust a configuration whose secrets are encrypted before it is stored.
+
+    A configuration that names the Source's local inbox creates it, unless
+    ``create_inbox`` is false, as for a preview that stores nothing.
+    """
 
     policy = _config_policy(source_type)
     if policy.store is None:
@@ -3109,7 +3637,8 @@ def _store_source_config(
         from memforge.local_adapter import default_local_adapter_inbox
 
         inbox = default_local_adapter_inbox(app_config, source_id)
-        inbox.mkdir(parents=True, exist_ok=True)
+        if create_inbox:
+            inbox.mkdir(parents=True, exist_ok=True)
         return str(inbox)
 
     return policy.store(dict(config), local_inbox)
@@ -6370,6 +6899,8 @@ def create_admin_app(
                 s["config"] = _public_source_config(s["type"], s["config"])
             else:
                 s["config"] = {}
+            if s.get("scope_transition") is not None:
+                s["scope_transition"] = _viewed_scope_transition(s, s["scope_transition"])
             # Surface the originating client for agent-session sources so the UI
             # can pick a per-client brand mark without decoding opaque source ids.
             if s["type"] == AGENT_SESSION_SOURCE_TYPE:
@@ -7148,7 +7679,6 @@ def create_admin_app(
                     "target_scope": dict(transition.target_scope),
                     "status": transition.status.value,
                     "run_id": transition.run_id,
-                    "coverage": transition.coverage.value if transition.coverage else None,
                     "error": transition.error,
                     "created_at": transition.created_at,
                     "updated_at": transition.updated_at,
@@ -7844,6 +8374,36 @@ def create_admin_app(
             "access_policy": req.access_policy,
         }
 
+    @source_router.post("/{source_id}/scope-change-preview", response_model=SourceScopeChangePreviewResponse)
+    async def preview_source_scope_change(
+        request: Request,
+        source_id: str,
+        req: SourceScopeChangePreviewRequest,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
+        """What saving this configuration would do to the Source's scope, without saving it.
+
+        The configuration form reads it before saving, to warn about a mode
+        that cannot list a scope change and about replacing the change in
+        progress. It decides as ``PUT /sources/{id}`` does, from the same
+        stored facts; a configuration the source type rejects answers 400.
+        """
+
+        existing = await db.get_source(source_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, existing)
+        _require_local_agent_connection_management(request, existing)
+        open_transition = await db.get_open_projection_scope_transition(source_id) is not None
+        try:
+            change = await _plan_config_change(db, existing, req.config, config, preview=True)
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            return {"outcome": "refused", "open_transition": open_transition, "refusal": _scope_change_refusal(exc.detail)}
+        return {"outcome": _scope_change_outcome(change), "open_transition": open_transition}
+
     @source_router.put("/{source_id}")
     async def update_source(
         request: Request,
@@ -7864,56 +8424,26 @@ def create_admin_app(
         _validate_source_status(req.status)
         name = req.name or existing["name"]
         if req.config is not None:
-            try:
-                incoming_config = _complete_source_config(existing["type"], req.config, source_id, existing["config"])
-                _validate_source_config(existing["type"], incoming_config, existing_config=existing["config"])
-                src_config = prepare_source_config_for_storage(
-                    incoming_config,
-                    existing_config=existing["config"],
-                    secret_fields=_source_secret_fields(existing["type"]),
-                )
-                src_config = _store_source_config(existing["type"], src_config, source_id, config)
-            except (SecretConfigurationError, ValueError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            existing_is_local = is_local_agent_backed_source(existing)
-            updated_is_local = is_local_agent_backed_source({"type": existing["type"], "config": src_config})
-            if existing_is_local != updated_is_local:
-                raise HTTPException(
-                    status_code=409,
-                    detail="source_execution_mode_immutable",
-                )
+            change = await _plan_config_change(db, existing, req.config, config)
         else:
-            src_config = existing["config"]
-        previous_projection_scope = _sync_scope_config(existing["type"], existing["config"])
-        target_projection_scope = _sync_scope_config(existing["type"], src_config)
-        scope_changed = req.config is not None and (target_projection_scope != previous_projection_scope)
-        namespace_changed = req.config is not None and (
-            _provider_namespace_config(existing["type"], src_config)
-            != _provider_namespace_config(existing["type"], existing["config"])
-        )
-        if namespace_changed:
-            raise HTTPException(
-                status_code=409,
-                detail="source_provider_namespace_immutable",
+            change = _ConfigChange(
+                config=existing["config"],
+                scope_changed=False,
+                scope_change=_ScopeChange(transition=None),
             )
-        if scope_changed:
-            open_scope_transition = await db.get_open_projection_scope_transition(source_id)
-            if (
-                open_scope_transition is not None
-                and dict(open_scope_transition.target_scope) != target_projection_scope
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="projection_scope_transition_active",
-                )
-        predecessor_scope_transition_id = None
-        if scope_changed:
-            previous_scope_transitions = await db.list_projection_scope_transitions(
-                source_id,
-                limit=1,
-            )
-            if previous_scope_transitions:
-                predecessor_scope_transition_id = previous_scope_transitions[0].id
+        src_config = change.config
+        scope_changed = change.scope_changed
+        scope_change = change.scope_change
+        if req.expected_scope_transition_id is not None:
+            # A scope change supersedes the transition it read, compared and
+            # set when it is written; any other save compares what it reads.
+            if scope_changed:
+                seen = scope_change.superseded_transition_id
+            else:
+                open_transition = await db.get_open_projection_scope_transition(source_id)
+                seen = open_transition.id if open_transition is not None else None
+            if seen != req.expected_scope_transition_id:
+                raise HTTPException(status_code=409, detail="projection_scope_transition_stale")
         auth_secret_changed = req.config is not None and _source_credentials_changed(
             existing["type"],
             req.config,
@@ -7928,22 +8458,6 @@ def create_admin_app(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        scope_transition = (
-            ProjectionScopeTransition(
-                id=projection_scope_transition_id(
-                    source_id,
-                    previous_projection_scope,
-                    target_projection_scope,
-                    predecessor_transition_id=predecessor_scope_transition_id,
-                ),
-                source_id=source_id,
-                previous_scope=previous_projection_scope,
-                target_scope=target_projection_scope,
-                created_at=datetime.now(timezone.utc).isoformat(),
-            )
-            if scope_changed
-            else None
-        )
         try:
             await db.upsert_source(
                 id=source_id,
@@ -7959,10 +8473,15 @@ def create_admin_app(
                     if _request_includes_field(req, "project_binding")
                     else existing.get("project_binding")
                 ),
-                projection_scope_transition=scope_transition,
+                projection_scope_transition=scope_change.transition,
+                expected_open_transition_id=scope_change.superseded_transition_id,
             )
         except SourceSyncRunActive as exc:
             raise _source_sync_running_http_error(source_id, exc.run_id) from exc
+        except ProjectionScopeTransitionStale as exc:
+            # The open transition changed after this change read it: read
+            # the Source again and decide with fresh facts.
+            raise HTTPException(status_code=409, detail="projection_scope_transition_stale") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if _request_includes_field(req, "status") and req.status == SOURCE_PAUSED_STATUS:
@@ -7975,7 +8494,21 @@ def create_admin_app(
                 enabled=schedule.enabled,
                 interval_minutes=schedule.interval_minutes,
             )
-        if scope_changed or auth_secret_changed:
+        reverted_to_last_applied_scope = scope_change.superseded_transition_id is not None and (
+            scope_change.transition is None
+        )
+        if (
+            auth_secret_changed
+            or reverted_to_last_applied_scope
+            or (scope_changed and not _is_document_source_type(existing["type"]))
+        ):
+            # The next run reads everything. A new credential may read what
+            # the old one could not. A return to the last applied scope opens
+            # no transition, while the superseded transition's runs may have
+            # moved the cursor and settled failed Documents of that scope. A
+            # document Source otherwise keeps its cursor through a scope
+            # change: its transition runs discover the whole new scope, and
+            # the run that completes it moves the cursor.
             await db.reset_source_sync_cursor(source_id)
         return {"ok": True, "id": source_id}
 
@@ -8061,17 +8594,11 @@ def create_admin_app(
                 detail="local_agent_sync_execution_owner_required",
             )
         job_id = f"laj-{uuid.uuid4().hex}"
-        payload = local_agent_sync_job_payload(
+        payload = await local_agent_sync_job_payload(
+            db,
             source,
             {"force_full_sync": force_full_sync, "retry_failed_items": True, **({"dry_run": True} if dry_run else {})},
         )
-        transition = await db.get_open_projection_scope_transition(source["id"])
-        if transition is not None:
-            payload["projection_scope_transition"] = {
-                "id": transition.id,
-                "previous_scope": dict(transition.previous_scope),
-                "target_scope": dict(transition.target_scope),
-            }
         job_id, created = await _enqueue_sync_local_agent_job(
             request,
             db,
@@ -8788,6 +9315,10 @@ def create_admin_app(
         )
         transition = await db.get_open_projection_scope_transition(source_id)
         if transition is not None:
+            source_type = upload.gene.metadata().name
+            transition = canonical_scope_transition(
+                source_type, transition, _sync_scope_config(source_type, upload.gene.config)
+            )
             upload.gene.begin_scope_transition(
                 previous_scope=transition.previous_scope, target_scope=transition.target_scope
             )
@@ -8884,13 +9415,7 @@ def create_admin_app(
         db: Database = Depends(get_db),
         workspace_id: str = Depends(get_workspace_id),
     ):
-        """Reuse unchanged immutable packages in one covered, fenced collection."""
-        from memforge.local_agent.snapshot_manifest import (
-            CollectionChangeKind,
-            CollectionCoverage,
-            SnapshotManifestItem,
-            plan_snapshot_manifest,
-        )
+        """Reuse unchanged immutable packages in one complete, fenced collection."""
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
@@ -8900,17 +9425,6 @@ def create_admin_app(
             raise HTTPException(status_code=409, detail="local_agent_upgrade_required")
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
-        coverage = CollectionCoverage(req.coverage)
-        if coverage is CollectionCoverage.PARTIAL:
-            raise HTTPException(status_code=400, detail="partial collection cannot be planned")
-        if (
-            local_agent_collection_is_authoritative(source.get("type"))
-            and coverage is not CollectionCoverage.COMPLETE_SNAPSHOT
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="authoritative collection requires complete_snapshot coverage",
-            )
         lease_payload = await _require_current_local_agent_lease(
             request,
             db,
@@ -8925,63 +9439,129 @@ def create_admin_app(
                 req.local_agent_attempt_count,
                 req.sync_snapshot_id,
             )
-            manifest_items = [(item.doc_id, item.revision, item.change_kind) for item in req.items]
+            items = [SnapshotManifestItem(doc_id=item.doc_id, revision=item.revision) for item in req.items]
+            manifest_items = [(item.doc_id, item.revision, UPSERT) for item in items]
             retained_inputs = await db.find_source_sync_input_attestations(
                 source_id=source_id,
                 workspace_id=workspace_id,
                 manifest_items=manifest_items,
             )
             plan = plan_snapshot_manifest(
-                [
-                    SnapshotManifestItem(
-                        doc_id=item.doc_id,
-                        revision=item.revision,
-                        change_kind=CollectionChangeKind(item.change_kind),
-                    )
-                    for item in req.items
-                ],
+                items,
                 retained_inputs,
-                coverage=coverage,
                 require_source_time=local_package_requires_source_time(
                     source.get("type"),
                     req.package_contract_version,
                 ),
             )
-            manifest_sha256 = hashlib.sha256(
-                json.dumps(
-                    {
-                        "coverage": req.coverage,
-                        "items": sorted(
-                            (item.model_dump() for item in req.items),
-                            key=lambda item: item["doc_id"],
-                        ),
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
+            excluded_listings = tuple(
+                ExcludedScopeListing(
+                    scope_key=listing.scope_key, doc_ids=frozenset(listing.doc_ids), rejection=listing.rejection
+                )
+                for listing in req.excluded_listings
+            )
+            validate_excluded_listings_for_job(
+                excluded_listings,
+                (
+                    str(entry.get("scope_key") or "")
+                    for entry in lease_payload.get(LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD) or ()
+                    if isinstance(entry, Mapping)
+                ),
+            )
+            manifest_sha256 = snapshot_manifest_sha256(items, excluded_listings)
+            confirm = await _snapshot_confirm_set(
+                db,
+                source=source,
+                workspace_id=workspace_id,
+                snapshot_id=snapshot_id,
+                listed_doc_ids=frozenset(item.doc_id for item in items),
+                excluded_listings=excluded_listings,
+                package_contract_version=req.package_contract_version,
+            )
             await db.attach_source_sync_inputs_to_snapshot(
                 source_id=source_id,
                 workspace_id=workspace_id,
                 snapshot_id=snapshot_id,
                 memberships=list(plan.reused_memberships),
-                coverage=req.coverage,
+                coverage=COMPLETE_SNAPSHOT,
                 manifest_count=len(req.items),
                 manifest_sha256=manifest_sha256,
                 manifest_items=manifest_items,
                 local_agent_job_id=req.local_agent_job_id,
                 local_agent_attempt_count=req.local_agent_attempt_count,
                 source_config_revision=str(lease_payload["source_config_revision"]),
+                confirm=confirm,
+                excluded_listings=excluded_listings,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
             "source_id": source_id,
             "snapshot_id": snapshot_id,
-            "coverage": req.coverage,
+            "coverage": COMPLETE_SNAPSHOT,
             "manifest_count": len(req.items),
+            "manifest_sha256": manifest_sha256,
             "reused_count": len(plan.reused_memberships),
             "required_doc_ids": list(plan.required_doc_ids),
+            "confirm": [{"doc_id": item.doc_id, "provider_key": item.provider_key} for item in confirm],
+        }
+
+    @source_router.post("/{source_id}/adapter/manifest/confirmations")
+    async def submit_local_source_confirmations(
+        source_id: str,
+        req: LocalSourceConfirmationsRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """Store a device's answers for the items its manifest response asked it to confirm.
+
+        The answers bind to the job attempt and the digest of the manifest. An
+        identical replay is accepted; an item the manifest did not ask about,
+        another digest or attempt, and answers that differ from the stored
+        ones are refused with 409.
+        """
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_sync_execution(request, source)
+        _require_source_sync_support(source)
+        await _require_current_local_agent_lease(
+            request,
+            db,
+            source=source,
+            job_id=req.local_agent_job_id,
+            attempt_count=req.local_agent_attempt_count,
+        )
+        try:
+            snapshot_id = local_agent_collection_attempt_id(
+                source.get("type"),
+                req.local_agent_job_id,
+                req.local_agent_attempt_count,
+                req.sync_snapshot_id,
+            )
+            await db.write_source_sync_snapshot_confirmations(
+                source_id=source_id,
+                workspace_id=workspace_id,
+                snapshot_id=snapshot_id,
+                manifest_sha256=req.manifest_sha256,
+                local_agent_job_id=req.local_agent_job_id,
+                local_agent_attempt_count=req.local_agent_attempt_count,
+                answers=tuple(
+                    SnapshotConfirmation(
+                        item.doc_id, item.provider_key, SnapshotConfirmationAnswer(item.answer)
+                    )
+                    for item in req.answers
+                ),
+                failure_cause=req.failure_cause,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "source_id": source_id,
+            "snapshot_id": snapshot_id,
+            "answered_count": len(req.answers),
+            "failed": req.failure_cause is not None,
         }
 
     # ===================================================================
@@ -10027,7 +10607,7 @@ def create_admin_app(
                 raise HTTPException(status_code=409, detail="local_agent_sync_execution_owner_required")
             if requester != owner:
                 raise HTTPException(status_code=403, detail="local_agent_sync_execution_owner_forbidden")
-            payload = local_agent_sync_job_payload(source, payload)
+            payload = await local_agent_sync_job_payload(db, source, payload)
         else:
             expected_type = LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES.get(req.operation)
             if expected_type is None:

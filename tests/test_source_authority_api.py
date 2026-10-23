@@ -482,13 +482,17 @@ def test_agent_session_rejects_ordinary_sync_and_hides_historical_sync_failure(t
 
 
 @pytest.mark.parametrize(
-    ("recorded", "reported"),
+    ("recorded", "reported", "unlisted_present_count"),
     [
-        ("absence_confirmation_failed", "absence_confirmation_failed"),
-        ("Jira search total changed during pagination", "scope_listing_failed"),
+        ("absence_confirmation_failed", "absence_confirmation_failed", None),
+        ("absence_confirmation_missing", "absence_confirmation_missing", None),
+        ("Jira search total changed during pagination", "scope_listing_failed", None),
+        (None, None, 1),
     ],
 )
-def test_source_list_returns_why_the_latest_sync_skipped_its_absence_check(tmp_path, recorded, reported):
+def test_source_list_returns_the_absence_check_of_the_latest_sync(
+    tmp_path, recorded, reported, unlisted_present_count,
+):
     database = _connect_database(tmp_path)
     source_id = "src-absence-check-skipped"
     owner_headers = {"x-test-user": "owner-user", "x-test-workspace-role": "member"}
@@ -512,6 +516,7 @@ def test_source_list_returns_why_the_latest_sync_skipped_its_absence_check(tmp_p
                     last_sync_at=finished_at,
                     last_sync_status="success",
                     absence_check_skipped_reason=recorded,
+                    unlisted_present_count=unlisted_present_count,
                 ),
                 started_at=started_at,
                 finished_at=finished_at,
@@ -526,6 +531,7 @@ def test_source_list_returns_why_the_latest_sync_skipped_its_absence_check(tmp_p
         source = next(row for row in listed.json()["data"] if row["id"] == source_id)
         assert source["sync"]["status"] == "success"
         assert source["sync"]["absence_check_skipped_reason"] == reported
+        assert source["sync"]["unlisted_present_count"] == unlisted_present_count
     finally:
         asyncio.run(database.close())
 
@@ -906,6 +912,51 @@ def test_non_owner_admin_can_manage_local_source_but_cannot_change_connection(tm
         asyncio.run(database.close())
 
 
+def test_a_conversation_scope_change_still_reads_everything_on_its_next_run(tmp_path):
+    """Only a document Source keeps its cursor through a scope change; a conversation Source starts over."""
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/v1/sources",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json=_teams_payload(),
+            )
+            assert created.status_code == 200, created.text
+            source_id = created.json()["id"]
+            asyncio.run(
+                database.upsert_sync_state(
+                    SyncState(
+                        source=source_id,
+                        last_sync_at=datetime.now(timezone.utc),
+                        last_sync_status="success",
+                        docs_processed=1,
+                        docs_updated=1,
+                    )
+                )
+            )
+
+            updated = client.put(
+                f"/api/v1/sources/{source_id}",
+                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
+                json={
+                    "config": {
+                        "region": "emea",
+                        "conversation_ids": ["19:conversation-b@example.test"],
+                        "initial_history_days": 14,
+                        "rolling_retention_days": None,
+                    }
+                },
+            )
+
+        assert updated.status_code == 200, updated.text
+        assert asyncio.run(database.get_open_projection_scope_transition(source_id)) is not None
+        assert asyncio.run(database.get_sync_state(source_id)) is None
+    finally:
+        asyncio.run(database.close())
+
+
 def test_non_owner_admin_cannot_trigger_local_source_sync(tmp_path):
     database = _connect_database(tmp_path)
     try:
@@ -1032,6 +1083,45 @@ def test_teams_scope_transition_is_attached_to_collection_job(tmp_path):
         asyncio.run(database.close())
 
 
+def test_a_collection_job_carries_a_stored_transition_with_its_scopes_canonicalized_again(tmp_path):
+    """A transition stored before Jira's ``query_mode`` existed reaches the device with the field's default."""
+    from memforge.source_projection import ProjectionScopeTransition
+
+    database = _connect_database(tmp_path)
+    try:
+        headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
+        with TestClient(_app(tmp_path, database)) as client:
+            source_id = client.post(
+                "/api/v1/sources", headers=headers, json=_jira_payload(sync_mode="local_agent")
+            ).json()["id"]
+            asyncio.run(
+                database.create_projection_scope_transition(
+                    ProjectionScopeTransition(
+                        id="scope-transition-stored-before-query-mode",
+                        source_id=source_id,
+                        previous_scope={"projects": ["OPS"]},
+                        target_scope={"projects": ["PAY"]},
+                        created_at="2026-10-20T09:00:00+00:00",
+                    )
+                )
+            )
+            triggered = client.post(f"/api/v1/sources/{source_id}/sync", headers=headers)
+            leased = client.post(
+                "/api/cloud/local-agent/jobs/lease",
+                headers=headers,
+                json={"limit": 1, "lease_seconds": 60},
+            )
+
+        assert triggered.status_code == 202, triggered.text
+        assert leased.json()["jobs"][0]["payload"]["projection_scope_transition"] == {
+            "id": "scope-transition-stored-before-query-mode",
+            "previous_scope": {"projects": ["OPS"], "query_mode": "simple"},
+            "target_scope": {"projects": ["PAY"], "query_mode": "simple"},
+        }
+    finally:
+        asyncio.run(database.close())
+
+
 def test_teams_initial_history_change_does_not_create_destructive_scope_transition(tmp_path):
     database = _connect_database(tmp_path)
     try:
@@ -1136,7 +1226,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
             outdated_agent = client.post(
                 f"/api/v1/sources/{source_id}/adapter/manifest",
                 headers=headers,
-                json={**context, "sync_snapshot_id": attempt_id, "coverage": "bounded_delta", "items": []},
+                json={**context, "sync_snapshot_id": attempt_id, "coverage": "complete_snapshot", "items": []},
             )
             incomplete_process = client.post(
                 f"/api/v1/sources/{source_id}/process", headers=headers, json=context

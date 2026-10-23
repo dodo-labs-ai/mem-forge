@@ -64,6 +64,21 @@ export function useSourceTypeLabels(): Record<string, string> {
   );
 }
 
+/** The labels a source type's configuration gives its fields, keyed by field, such as "Spaces" for `spaces`. */
+export function useSourceConfigLabels(sourceType: string | null): Record<string, string> {
+  const api = useApi();
+  const schema = useQuery({
+    queryKey: [...sourceKeys.types, sourceType, "config-schema"],
+    queryFn: () => unwrap(api.GET("/api/v1/genes/{name}/config-schema", { params: { path: { name: sourceType! } } })),
+    enabled: sourceType !== null,
+    staleTime: Infinity,
+  });
+  return useMemo(
+    () => Object.fromEntries((schema.data?.fields ?? []).map((field) => [field.key, field.label])),
+    [schema.data],
+  );
+}
+
 /** The projects each field-bound source has sent memories to, as the server resolved them. */
 export function useResolvedProjects(sources: Source[]): ResolvedBySource {
   const api = useApi();
@@ -215,6 +230,44 @@ export function useSetPaused() {
       }),
     ),
   );
+}
+
+/**
+ * Saves the configuration that returns a source to the scope it had before
+ * the change in progress, which replaces that change.
+ */
+export function useRestorePreviousScope() {
+  const api = useApi();
+  return useSourceMutation(
+    ({ sourceId, transitionId, config }: { sourceId: string; transitionId: string; config: Record<string, unknown> }) =>
+      unwrap(
+        api.PUT("/api/v1/sources/{source_id}", {
+          params: { path: { source_id: sourceId } },
+          // The server refuses the save when another change, or none, is in progress by then.
+          body: { config, expected_scope_transition_id: transitionId },
+        }),
+      ),
+  );
+}
+
+/** What saving `config` would do to the source's scope, read while `enabled`; it saves nothing. */
+export function useScopeChangePreview(sourceId: string, config: Record<string, unknown> | null, enabled: boolean) {
+  const api = useApi();
+  return useQuery({
+    // Kept apart from the source keys, which every source write refreshes.
+    queryKey: ["source-scope-change-preview", sourceId, config] as const,
+    queryFn: () =>
+      unwrap(
+        api.POST("/api/v1/sources/{source_id}/scope-change-preview", {
+          params: { path: { source_id: sourceId } },
+          body: { config: config! },
+        }),
+      ),
+    enabled: enabled && config !== null,
+    staleTime: 0,
+    gcTime: 0,
+    retry: false,
+  });
 }
 
 /**

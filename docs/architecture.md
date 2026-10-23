@@ -53,10 +53,82 @@ describes the procedure.
 
 ## Adding a source
 
-A connector implements the interface in `src/memforge/genes/base.py`: it
-describes itself and its configuration fields, authenticates, discovers the
-content in scope, fetches each item and normalizes it into the common form. The
-existing connectors in the same directory are the reference.
+A source type is two pieces: a connector (a Gene) in `src/memforge/genes`, and
+a descriptor in `src/memforge/source_types`. Every connector describes itself
+and its configuration fields, authenticates, discovers the content in scope,
+fetches each item and normalizes it into the common form
+(`src/memforge/genes/base.py`). The module docstrings named below are the
+full guide, and the existing connectors are the reference.
+
+**Choose the family.** The Gene's base class decides how a sync run collects
+the source and how it learns that something is gone:
+
+- `DocumentGene` (`genes/document_gene.py`) is for a provider whose items have
+  their own identifiers and can be listed: pages, issues, files. Each run
+  fetches the items changed since the last run, then lists the configured
+  scope to find the Documents that are gone. Confluence, Jira, GitHub and local
+  folders work this way.
+- `ConversationGene` (`genes/conversation_gene.py`) is for messages in channels
+  and chats. The shared conversation layer (`src/memforge/conversations`) cuts
+  messages into thread and window Units and decides what to remove. The
+  connector supplies a provider that implements the port in
+  `conversations/port.py`. Teams works this way.
+
+A Gene of neither family has no sync run; agent sessions are the only such type.
+
+**Write the descriptor.** A `SourceTypeDescriptor` (`source_types/descriptor.py`)
+holds every fact shared code needs about the type: its Gene, the configuration
+fields that name the provider and those that define the scope (with
+`scope_defaults` and `canonical_scope`), how items project into Units and
+Evidence, secret fields and configuration checks, whether the local daemon
+collects it, and, for a conversation type, its provider and the factory that
+opens it. Each built-in type has a module in `source_types` that exports
+`DESCRIPTOR`, and `source_types/__init__.py` registers it. Shared code reads the
+descriptor and never branches on a source type name, so a new type adds no
+`if` elsewhere.
+
+**Choose the listing kind** (document connectors). A scope listing names every
+item in the configured scope by Document id, completely and without content.
+The run compares it with the Documents the source holds. Ask what defines the
+scope:
+
+- **The listing itself: existence.** An item the listing leaves out is outside
+  the scope by definition, so its Document is removed. Examples: a repository
+  tree, where a moved file gets a new Document id; a sitemap the site declares
+  complete; pages the user lists; a folder snapshot from the local daemon.
+- **A condition over items that exist on their own: query.** An item can stop
+  matching and keep its identifier, so a Document the listing leaves out is
+  removed only when `confirm_absent` asks the provider by identifier and hears
+  that it is gone. Leaving the query is not deletion. Examples: a Jira JQL, a
+  Confluence page tree.
+
+When unsure, choose query: it never removes an item the provider still has.
+Declare the kinds in `listing_kinds`. Answer `lists_scope(config)` for each
+configuration, and answer `False` for one that cannot list completely, such as
+a bounded link crawl; its sources then never remove a Document through a
+listing. Override `unlisted_scope_mode(config)` to name that mode and suggest
+one that lists; a scope change into such a configuration is refused with that
+suggestion. `list_scope()` returns a complete listing or raises; it never returns
+less. A type the local daemon collects is listed by its snapshot manifest and
+declares exactly one kind. When that kind is query, the Gene also implements
+`provider_key` and `confirmation_item`, so the daemon can confirm items by
+identifier.
+
+**Startup validation.** Once every type has registered, loading `memforge.genes`
+checks each one against its family's contract (`genes/contract.py`). A type
+that breaks it stops the service with a `SourceTypeContractError` naming the
+type and the missing piece: a collecting Gene outside both families, an
+unimplemented abstract method, undeclared `listing_kinds`, `lists_scope` not
+declared as a class method, a query listing without `confirm_absent`,
+`rediscovers_documents` without `rediscover`, a daemon-collected Gene with more
+than one listing kind, or a conversation provider missing a member of the port.
+
+**Add the contract-suite fakes.** `tests/contracts/test_document_connector_contract.py`
+runs every registered document type against fakes of its provider, kept in
+`tests/contracts/document_fakes/<source_type>.py`. A registered type without
+that module fails the suite. The package docstring says what each fake must
+answer. The suite fakes only the provider's transport, so it checks the Gene's
+own paging, listing and error handling.
 
 ## Further reading
 

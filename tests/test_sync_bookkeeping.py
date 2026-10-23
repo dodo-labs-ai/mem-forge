@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from memforge.pipeline.collection_family import SnapshotBinding
 from memforge.pipeline.revision_assessment import revision_inference_capability_hash
 
 import asyncio
@@ -28,6 +29,8 @@ from memforge.llm.structured import (
     StructuredLlmError,
 )
 from memforge.genes.base import SourceConfigurationError
+from memforge.genes.github_repo_gene import github_renamed_from
+from memforge.github_repo_utils import build_github_repo_doc_id
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import (
     DeferredProjectedLifecycleHandle,
@@ -2042,9 +2045,8 @@ async def test_source_sync_input_attestation_lookup_is_exact_and_history_bounded
 
 
 class EmptyGene(FakeGene):
-    discovery_complete = True
-
     def __init__(self) -> None:
+        super().__init__()
         self.bound_document_store = None
 
     def bind_document_store(self, document_store) -> None:
@@ -2071,12 +2073,14 @@ class EmptyGene(FakeGene):
 class EmptyProviderGene(EmptyGene):
     """A provider whose complete listing holds nothing."""
 
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
+
+    @classmethod
+    def lists_scope(cls, config) -> bool:
+        return True
+
     async def list_scope(self):
         return ScopeListing(kind=ScopeListingKind.EXISTENCE, doc_ids=frozenset())
-
-
-class IncompleteEmptyGene(EmptyGene):
-    discovery_complete = False
 
 
 def test_failed_document_summary_identifies_embedding_provider_outage():
@@ -2537,6 +2541,7 @@ def test_failed_document_summary_preserves_mixed_failure_guidance():
 
 class SinceRecordingEmptyGene(EmptyGene):
     def __init__(self) -> None:
+        super().__init__()
         self.seen_since = None
 
     async def discover(self, since=None):
@@ -2545,8 +2550,13 @@ class SinceRecordingEmptyGene(EmptyGene):
             yield ContentItem(item_id="never", title="never", updated_at=datetime.now(timezone.utc))
 
 
+class SinceRecordingEmptyProviderGene(EmptyProviderGene, SinceRecordingEmptyGene):
+    """A provider whose complete listing holds nothing; it records the ``since`` discovery used."""
+
+
 class IncrementalNewDocumentGene(FakeGene):
     def __init__(self) -> None:
+        super().__init__()
         self.seen_since = None
 
     def requires_pdf_artifact(
@@ -2789,6 +2799,7 @@ class NoopMemoryEngine:
             document=kwargs.get("document"),
             unit_input=kwargs.get("unit_input"),
             derivation_id=kwargs.get("derivation_id"),
+            scope_transition_id=kwargs.get("scope_transition_id"),
             derivation_context_identity_hash=(
                 source_derivation_context_identity_hash(
                     SourceUnitDerivationContext(
@@ -2921,6 +2932,12 @@ class NonRetryableProjectedMemoryEngine(NoopMemoryEngine):
 
 
 class DeferredOnceMemoryEngine(NoopMemoryEngine):
+    """Defers the first commit of ``deferred_doc_id`` once.
+
+    Its blocker is the first Unit this engine committed, ``unit-external``
+    with ``external_blocker``, or the ``blocker_unit_ids`` when they are set.
+    """
+
     def __init__(
         self,
         *,
@@ -2929,6 +2946,8 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
     ) -> None:
         self.external_blocker = external_blocker
         self.prepared_attempt_count = prepared_attempt_count
+        self.deferred_doc_id = "jira-1"
+        self.blocker_unit_ids: tuple[str, ...] | None = None
         self.apply_doc_ids: list[str] = []
         self.committed_unit_ids: list[str] = []
         self.commit_only_attempts: list[int] = []
@@ -2939,14 +2958,16 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
         source_unit_id = projection.deltas[0].source_unit_id
         doc_id = kwargs["doc_id"]
         self.apply_doc_ids.append(doc_id)
-        if doc_id == "jira-1" and not self.deferred:
+        if doc_id == self.deferred_doc_id and not self.deferred:
             self.deferred = True
-            assert self.committed_unit_ids
-            blocker_unit_id = (
-                "unit-external"
-                if self.external_blocker
-                else self.committed_unit_ids[0]
-            )
+            blocker_unit_ids = self.blocker_unit_ids
+            if blocker_unit_ids is None:
+                assert self.committed_unit_ids
+                blocker_unit_ids = (
+                    "unit-external"
+                    if self.external_blocker
+                    else self.committed_unit_ids[0],
+                )
             bundle = bind_source_lifecycle_outcome(
                 source_id=projection.source_id,
                 source_type=projection.source_type,
@@ -2983,7 +3004,7 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
             )
             handle = DeferredProjectedLifecycleHandle(
                 source_unit_id=source_unit_id,
-                blocking_source_unit_ids=(blocker_unit_id,),
+                blocking_source_unit_ids=blocker_unit_ids,
                 _prepared=prepared,
                 _runtime_bundle=bundle,
             )
@@ -3562,9 +3583,14 @@ def _confluence_raw_content(item: ContentItem, markdown: str) -> RawContent:
 
 
 class BlockingFetchGene(FakeGene):
-    discovery_complete = True
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
+
+    @classmethod
+    def lists_scope(cls, config) -> bool:
+        return True
 
     def __init__(self, item_count: int, release: asyncio.Event):
+        super().__init__()
         self.item_count = item_count
         self.release = release
         self.active_fetches = 0
@@ -4052,6 +4078,7 @@ class UpdatingDocumentGene(FakeGene):
         last_modified: datetime | None = None,
         source_updated_at: str | None = None,
     ) -> None:
+        super().__init__()
         self.markdown = markdown
         self.version = version
         self.last_modified = last_modified or datetime.now(timezone.utc)
@@ -4162,6 +4189,16 @@ class LargeConfluenceGene(UpdatingDocumentGene):
         )
 
 
+MOVING_FILE_REPO_URL = "https://github.example/acme/payroll"
+
+
+def moving_file_doc_id(source_id: str, relative_path: str) -> str:
+    """The Document id GitHub discovery gives a file of the moving-file repository."""
+    return build_github_repo_doc_id(
+        source_id=source_id, repo_url=MOVING_FILE_REPO_URL, repo_ref="main", relative_path=relative_path,
+    )
+
+
 class MovingGithubFileGene(UpdatingDocumentGene):
     def __init__(
         self,
@@ -4169,15 +4206,15 @@ class MovingGithubFileGene(UpdatingDocumentGene):
         item_id: str,
         relative_path: str,
         previous_filename: str | None = None,
-        previous_document_id: str | None = None,
         file_lineage_id: str | None = "file-lineage-77",
         version: str = "blob-v1",
+        source_id: str = "src-fake",
     ) -> None:
         super().__init__("# Design\n\nKeep A7.", version=version)
+        self.source_id = source_id
         self.item_id = item_id
         self.relative_path = relative_path
         self.previous_filename = previous_filename
-        self.previous_document_id = previous_document_id
         self.file_lineage_id = file_lineage_id
 
     @classmethod
@@ -4194,17 +4231,13 @@ class MovingGithubFileGene(UpdatingDocumentGene):
     async def discover(self, since=None):
         extra = {
             "relative_path": self.relative_path,
+            "repo_url": MOVING_FILE_REPO_URL,
             "repo_owner": "acme",
             "repo_name": "payroll",
             "repo_ref": "main",
         }
         if self.file_lineage_id is not None:
             extra["file_lineage_id"] = self.file_lineage_id
-        if self.previous_filename is not None:
-            extra["previous_filename"] = self.previous_filename
-            extra["rename_evidence_authoritative"] = True
-        if self.previous_document_id is not None:
-            extra["previous_document_id"] = self.previous_document_id
         yield ContentItem(
             item_id=self.item_id,
             title="Design",
@@ -4214,7 +4247,24 @@ class MovingGithubFileGene(UpdatingDocumentGene):
             space_or_project="payroll",
             version=self.version,
             extra=extra,
+            renamed_from=github_renamed_from(
+                source_id=self.source_id,
+                repo_url=MOVING_FILE_REPO_URL,
+                repo_ref="main",
+                previous_filename=self.previous_filename,
+                rename_evidence_authoritative=True,
+            ),
         )
+
+
+class PushedGithubFileGene(MovingGithubFileGene):
+    """A repository file pushed from a device, whose snapshot manifest lists the scope."""
+
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
+
+    @classmethod
+    def lists_scope(cls, config) -> bool:
+        return True
 
 
 class BlockingMemoryExtractor(NoopMemoryExtractor):
@@ -4714,8 +4764,6 @@ async def _stage_completed_v9_recovery_attempt(
 class V9RecoveryReplayGene(FakeGene):
     """Rediscover the exact provider target retained by a recovery attempt."""
 
-    discovery_complete = False
-
     def __init__(
         self,
         attempt: SourceDerivationAttempt,
@@ -4723,6 +4771,7 @@ class V9RecoveryReplayGene(FakeGene):
         document_content: str | None = None,
         version: str | None = None,
     ) -> None:
+        super().__init__()
         self.attempt = attempt
         self.document_content = (
             document_content
@@ -5133,7 +5182,7 @@ async def test_successful_recovery_is_counted_without_provider_rediscovery(
     )
 
     state = await recovery.sync_gene(
-        gene=IncompleteEmptyGene(),
+        gene=EmptyGene(),
         source_name="Recovery counts",
         source_id=source_id,
         lifecycle_cycle_id="run-recovery-counts",
@@ -5723,7 +5772,7 @@ async def test_full_discovery_without_completion_evidence_never_deletes_existing
     )
 
     state = await orchestrator.sync_gene(
-        gene=IncompleteEmptyGene(),
+        gene=EmptyGene(),
         source_name="Incomplete provider response",
         source_id=source_id,
         force_full_sync=True,
@@ -5839,7 +5888,7 @@ async def test_force_full_sync_ignores_incremental_cursor(db: Database):
 
 
 @pytest.mark.asyncio
-async def test_authoritative_snapshot_ignores_cursor_without_forcing_reprocessing(db: Database):
+async def test_a_run_bound_to_an_input_snapshot_ignores_cursor_without_forcing_reprocessing(db: Database):
     source_id = "src-authoritative-snapshot"
     await _insert_held_source_and_doc(db, source_id)
     await db.upsert_sync_state(
@@ -5864,14 +5913,16 @@ async def test_authoritative_snapshot_ignores_cursor_without_forcing_reprocessin
         gene=gene,
         source_name="Architecture",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
     )
 
     assert gene.seen_since is None
 
 
 @pytest.mark.asyncio
-async def test_complete_source_scope_transition_forces_snapshot_and_applies(db: Database):
+async def test_a_scope_transition_run_discovers_everything_and_completes_once_its_listing_is_committed(
+    db: Database,
+):
     source_id = "src-scope-transition-complete"
     await db.upsert_source(
         id=source_id,
@@ -5889,7 +5940,7 @@ async def test_complete_source_scope_transition_forces_snapshot_and_applies(db: 
             target_scope={"sync_mode": "space", "spaces": ["NEW"]},
         )
     )
-    gene = SinceRecordingEmptyGene()
+    gene = SinceRecordingEmptyProviderGene()
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=None,
@@ -5938,7 +5989,7 @@ async def test_scope_transition_reenters_same_durable_run_on_worker_retry(db: Da
     )
 
     state = await orchestrator.sync_gene(
-        SinceRecordingEmptyGene(),
+        SinceRecordingEmptyProviderGene(),
         "Architecture",
         source_id,
         lifecycle_cycle_id="source-sync-run:attempt:2",
@@ -5952,7 +6003,7 @@ async def test_scope_transition_reenters_same_durable_run_on_worker_retry(db: Da
 
 
 @pytest.mark.asyncio
-async def test_partial_conversation_scope_transition_preserves_old_membership(db: Database):
+async def test_a_scope_transition_whose_new_scope_cannot_be_listed_stays_open_and_keeps_old_units(db: Database):
     source_id = "src-scope-transition-partial"
     await db.upsert_source(
         id=source_id,
@@ -6009,7 +6060,6 @@ async def test_partial_conversation_scope_transition_preserves_old_membership(db
         )
     )
     gene = SinceRecordingEmptyGene()
-    gene.discovery_complete = False
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=None,
@@ -6023,8 +6073,8 @@ async def test_partial_conversation_scope_transition_preserves_old_membership(db
 
     assert state.last_sync_status == "success"
     assert transition.status is ProjectionScopeTransitionStatus.FAILED
-    assert transition.coverage.value == "partial_projection"
-    assert "complete successful snapshot" in (transition.error or "")
+    assert transition.error == "the new scope cannot be listed"
+    assert await db.list_indexed_doc_ids(source_id) == {"old-window"}
 
 
 @pytest.mark.asyncio
@@ -7451,7 +7501,7 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
     class CapturingRuntimeProvider:
         def __init__(self) -> None:
             self.force_full_sync: bool | None = None
-            self.authoritative_snapshot: bool | None = None
+            self.input_snapshot: SnapshotBinding | None = None
             self.source: dict | None = None
             self.reusable_projection_doc_ids: frozenset[str] | None = None
 
@@ -7461,7 +7511,7 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
 
         async def run_source_sync(self, **kwargs):
             self.force_full_sync = kwargs["force_full_sync"]
-            self.authoritative_snapshot = kwargs["authoritative_snapshot"]
+            self.input_snapshot = kwargs["input_snapshot"]
             self.source = kwargs["source"]
             self.reusable_projection_doc_ids = kwargs["reusable_projection_doc_ids"]
             return SyncState(
@@ -7495,10 +7545,82 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
     await worker.run_once()
 
     assert provider.force_full_sync is False
-    assert provider.authoritative_snapshot is True
+    assert provider.input_snapshot == SnapshotBinding("laj-empty", frozenset())
     assert provider.source is not None
     assert provider.source["config"]["local_agent_package_manifest"] == []
     assert provider.reusable_projection_doc_ids == frozenset({"doc-reused"})
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_binds_a_device_run_to_the_answers_and_listings_its_manifest_stored(db: Database):
+    import memforge.runtime as runtime
+    from memforge.local_agent.snapshot_manifest import (
+        ExcludedScopeListing,
+        SnapshotConfirmation,
+        SnapshotConfirmationAnswer,
+    )
+
+    source_id = "src-device-jira"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Device Jira",
+        config_json='{"base_url":"https://jira.example.test","sync_mode":"local_agent"}',
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    issued = (SnapshotConfirmation("jira-doc-7", "100007"), SnapshotConfirmation("jira-doc-8", "PAY-8"))
+    listings = (ExcludedScopeListing("scope-old", frozenset({"jira-doc-7"})),)
+    await db.attach_source_sync_inputs_to_snapshot(
+        source_id=source_id,
+        workspace_id="default",
+        snapshot_id="laj-jira:attempt:1",
+        memberships=[],
+        coverage="complete_snapshot",
+        manifest_count=0,
+        manifest_sha256="d" * 64,
+        manifest_items=[],
+        local_agent_job_id="laj-jira",
+        local_agent_attempt_count=1,
+        source_config_revision="rev-1",
+        confirm=issued,
+        excluded_listings=listings,
+    )
+    answered = (
+        SnapshotConfirmation("jira-doc-7", "100007", SnapshotConfirmationAnswer.ABSENT),
+        SnapshotConfirmation("jira-doc-8", "PAY-8", SnapshotConfirmationAnswer.EXISTS),
+    )
+    await db.write_source_sync_snapshot_confirmations(
+        source_id=source_id,
+        workspace_id="default",
+        snapshot_id="laj-jira:attempt:1",
+        manifest_sha256="d" * 64,
+        local_agent_job_id="laj-jira",
+        local_agent_attempt_count=1,
+        answers=answered,
+    )
+
+    class CapturingRuntimeProvider:
+        input_snapshot: SnapshotBinding | None = None
+
+        async def build_sync_runtime(self, db, config, **kwargs):
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            self.input_snapshot = kwargs["input_snapshot"]
+            return SyncState(source=source_id, last_sync_at=datetime.now(timezone.utc), last_sync_status="success")
+
+    provider = CapturingRuntimeProvider()
+    await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="local_agent",
+        force_full_sync=False,
+        input_snapshot_id="laj-jira:attempt:1",
+    )
+
+    await runtime.SourceSyncWorker(db, AppConfig(), runtime_provider=provider, worker_id="worker-jira").run_once()
+
+    assert provider.input_snapshot == SnapshotBinding("laj-jira:attempt:1", frozenset(), answered, listings)
 
 
 @pytest.mark.asyncio
@@ -7523,7 +7645,7 @@ async def test_source_sync_worker_preserves_empty_incremental_local_snapshot(db:
     class CapturingRuntimeProvider:
         def __init__(self) -> None:
             self.source: dict | None = None
-            self.authoritative_snapshot: bool | None = None
+            self.input_snapshot: SnapshotBinding | None = None
             self.runtime_event_trace_sink = None
 
         async def build_sync_runtime(self, db, config, **kwargs):
@@ -7532,7 +7654,7 @@ async def test_source_sync_worker_preserves_empty_incremental_local_snapshot(db:
 
         async def run_source_sync(self, **kwargs):
             self.source = kwargs["source"]
-            self.authoritative_snapshot = kwargs["authoritative_snapshot"]
+            self.input_snapshot = kwargs["input_snapshot"]
             return SyncState(
                 source=source_id,
                 last_sync_at=datetime.now(timezone.utc),
@@ -7555,13 +7677,13 @@ async def test_source_sync_worker_preserves_empty_incremental_local_snapshot(db:
 
     await worker.run_once()
 
-    assert provider.authoritative_snapshot is False
+    assert provider.input_snapshot is None
     assert provider.source is not None
     assert provider.source["config"]["local_agent_package_manifest"] == []
 
 
 @pytest.mark.asyncio
-async def test_source_sync_worker_does_not_treat_direct_cloud_jira_as_authoritative_snapshot(
+async def test_source_sync_worker_binds_no_snapshot_for_direct_cloud_jira(
     db: Database,
 ):
     import memforge.runtime as runtime
@@ -7584,7 +7706,7 @@ async def test_source_sync_worker_does_not_treat_direct_cloud_jira_as_authoritat
 
     class CapturingRuntimeProvider:
         def __init__(self) -> None:
-            self.authoritative_snapshot: bool | None = None
+            self.input_snapshot: SnapshotBinding | None = None
             self.source: dict | None = None
 
         async def build_sync_runtime(self, db, config, **kwargs):
@@ -7592,7 +7714,7 @@ async def test_source_sync_worker_does_not_treat_direct_cloud_jira_as_authoritat
             return object()
 
         async def run_source_sync(self, **kwargs):
-            self.authoritative_snapshot = kwargs["authoritative_snapshot"]
+            self.input_snapshot = kwargs["input_snapshot"]
             self.source = kwargs["source"]
             return SyncState(
                 source=source_id,
@@ -7615,7 +7737,7 @@ async def test_source_sync_worker_does_not_treat_direct_cloud_jira_as_authoritat
 
     await worker.run_once()
 
-    assert provider.authoritative_snapshot is False
+    assert provider.input_snapshot is None
     assert provider.source is not None
     assert "local_agent_package_manifest" not in provider.source["config"]
 
@@ -7749,15 +7871,29 @@ async def test_source_projection_reuse_requires_prior_manifest_and_current_linea
         ),
     )
     await db.db.commit()
-    assert (
-        await db.find_reusable_source_projection_memberships(
-            source_id=source_id,
-            workspace_id="default",
-            snapshot_id="snapshot-current",
-            expected_access_hash=access_hash,
+    # Every open transition, a failed one included, needs each listed
+    # Document to commit under it; a closed one no longer holds reuse back.
+    for status, reusable in (
+        ("pending", frozenset()),
+        ("running", frozenset()),
+        ("failed", frozenset()),
+        ("applied", frozenset({doc_id})),
+        ("superseded", frozenset({doc_id})),
+    ):
+        await db.db.execute(
+            "UPDATE projection_scope_transitions SET status = ? WHERE id = 'scope-transition-reuse-plan'",
+            (status,),
         )
-        == frozenset()
-    )
+        await db.db.commit()
+        assert (
+            await db.find_reusable_source_projection_memberships(
+                source_id=source_id,
+                workspace_id="default",
+                snapshot_id="snapshot-current",
+                expected_access_hash=access_hash,
+            )
+            == reusable
+        ), status
 
 
 @pytest.mark.asyncio
@@ -9466,6 +9602,9 @@ async def test_normal_sync_reconciles_empty_revision_without_llm_extraction(
 @pytest.mark.asyncio
 async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: Database):
     source_id = "src-github-move"
+    old_doc_id = moving_file_doc_id(source_id, "old/design.md")
+    new_doc_id = moving_file_doc_id(source_id, "new/design.md")
+    final_doc_id = moving_file_doc_id(source_id, "final/design.md")
     await db.upsert_source(
         id=source_id,
         type="github_repo",
@@ -9486,7 +9625,7 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
 
     first = await orchestrator.sync_gene(
         gene=MovingGithubFileGene(
-            item_id="github-old-design",
+            item_id=old_doc_id,
             relative_path="old/design.md",
             file_lineage_id=None,
         ),
@@ -9496,10 +9635,10 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
     extraction_calls_after_first = len(extractor.fragment_calls)
     moved = await orchestrator.sync_gene(
         gene=MovingGithubFileGene(
-            item_id="github-new-design",
+            item_id=new_doc_id,
             relative_path="new/design.md",
             previous_filename="old/design.md",
-            previous_document_id="github-old-design",
+            source_id=source_id,
             file_lineage_id=None,
         ),
         source_name="Payroll Repo",
@@ -9507,7 +9646,7 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
     )
     ordinary_after_move = await orchestrator.sync_gene(
         gene=MovingGithubFileGene(
-            item_id="github-new-design",
+            item_id=new_doc_id,
             relative_path="new/design.md",
             file_lineage_id=None,
         ),
@@ -9516,10 +9655,10 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
     )
     moved_again = await orchestrator.sync_gene(
         gene=MovingGithubFileGene(
-            item_id="github-final-design",
+            item_id=final_doc_id,
             relative_path="final/design.md",
             previous_filename="new/design.md",
-            previous_document_id="github-new-design",
+            source_id=source_id,
             file_lineage_id=None,
         ),
         source_name="Payroll Repo",
@@ -9534,24 +9673,24 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
     assert (
         len(extractor.fragment_calls)
     ) == extraction_calls_after_first
-    assert await db.get_document("github-old-design") is None
-    assert await db.get_document("github-new-design") is None
-    assert await db.get_document("github-final-design") is not None
+    assert await db.get_document(old_doc_id) is None
+    assert await db.get_document(new_doc_id) is None
+    assert await db.get_document(final_doc_id) is not None
     unit_rows = await db.db.execute_fetchall(
         "SELECT id FROM source_units WHERE source_id = ?",
         (source_id,),
     )
     assert len(unit_rows) == 1
     assert await db.list_source_unit_document_ids(str(unit_rows[0]["id"])) == (
-        "github-final-design",
-        "github-new-design",
-        "github-old-design",
+        final_doc_id,
+        new_doc_id,
+        old_doc_id,
     )
     moved_unit_id = str(unit_rows[0]["id"])
 
     reused_old_path = await orchestrator.sync_gene(
         gene=MovingGithubFileGene(
-            item_id="github-old-design",
+            item_id=old_doc_id,
             relative_path="old/design.md",
             file_lineage_id=None,
         ),
@@ -9562,7 +9701,7 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
     assert reused_old_path.last_sync_status == "success"
     current_reused = await db.find_source_unit_by_document_id(
         source_id,
-        "github-old-design",
+        old_doc_id,
         current_only=True,
     )
     assert current_reused is not None
@@ -9577,6 +9716,8 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
 @pytest.mark.asyncio
 async def test_exact_version_github_file_move_a_to_b_to_a_keeps_one_lineage(db: Database):
     source_id = "src-github-move-reversion"
+    a_doc_id = moving_file_doc_id(source_id, "a/design.md")
+    b_doc_id = moving_file_doc_id(source_id, "b/design.md")
     await db.upsert_source(
         id=source_id,
         type="github_repo",
@@ -9597,24 +9738,24 @@ async def test_exact_version_github_file_move_a_to_b_to_a_keeps_one_lineage(db: 
 
     for gene in (
         MovingGithubFileGene(
-            item_id="github-a",
+            item_id=a_doc_id,
             relative_path="a/design.md",
             file_lineage_id=None,
             version="same-blob-sha",
         ),
         MovingGithubFileGene(
-            item_id="github-b",
+            item_id=b_doc_id,
             relative_path="b/design.md",
             previous_filename="a/design.md",
-            previous_document_id="github-a",
+            source_id=source_id,
             file_lineage_id=None,
             version="same-blob-sha",
         ),
         MovingGithubFileGene(
-            item_id="github-a",
+            item_id=a_doc_id,
             relative_path="a/design.md",
             previous_filename="b/design.md",
-            previous_document_id="github-b",
+            source_id=source_id,
             file_lineage_id=None,
             version="same-blob-sha",
         ),
@@ -9626,16 +9767,16 @@ async def test_exact_version_github_file_move_a_to_b_to_a_keeps_one_lineage(db: 
         )
         assert state.last_sync_status == "success"
 
-    assert await db.get_document("github-a") is not None
-    assert await db.get_document("github-b") is None
+    assert await db.get_document(a_doc_id) is not None
+    assert await db.get_document(b_doc_id) is None
     unit_rows = await db.db.execute_fetchall(
         "SELECT id FROM source_units WHERE source_id = ?",
         (source_id,),
     )
     assert len(unit_rows) == 1
     assert await db.list_source_unit_document_ids(str(unit_rows[0]["id"])) == (
-        "github-a",
-        "github-b",
+        a_doc_id,
+        b_doc_id,
     )
     assert len(extractor.fragment_calls) == 1
 
@@ -9711,7 +9852,7 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
     )
     await set_scope("ref-a", "ref-b")
     second = await orchestrator.sync_gene(
-        gene=MovingGithubFileGene(
+        gene=PushedGithubFileGene(
             item_id="github-ref-b",
             relative_path="docs/design.md",
             file_lineage_id=None,
@@ -9719,11 +9860,11 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
         ),
         source_name="Payroll Repo",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset({"github-ref-b"})),
     )
     await set_scope("ref-b", "ref-a")
     third = await orchestrator.sync_gene(
-        gene=MovingGithubFileGene(
+        gene=PushedGithubFileGene(
             item_id="github-ref-a",
             relative_path="docs/design.md",
             file_lineage_id=None,
@@ -9731,7 +9872,7 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
         ),
         source_name="Payroll Repo",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-2", frozenset({"github-ref-a"})),
     )
 
     assert first.last_sync_status == "success"
@@ -9790,7 +9931,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
                         "github_repo",
                         target_config,
                     ),
-                    predecessor_transition_id=(previous_transitions[0].id if previous_transitions else None),
+                    previous_cycle_transition_id=(previous_transitions[0].id if previous_transitions else None),
                 ),
                 source_id=source_id,
                 previous_scope=canonical_projection_scope(
@@ -9878,7 +10019,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         memory_store=memory_store,
         max_concurrent=1,
     )
-    gene = MovingGithubFileGene(
+    gene = PushedGithubFileGene(
         item_id="github-ref-a",
         relative_path="docs/design.md",
         file_lineage_id=None,
@@ -9889,16 +10030,23 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         gene=gene,
         source_name="Payroll Repo",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset({"github-ref-a"})),
     )
+    # A run bound to a complete snapshot records it in every projection's
+    # scope, which is part of the projection's stored identity.
+    async with db.db.execute(
+        "SELECT scope_json FROM source_projection_runs WHERE source_id = ?", (source_id,)
+    ) as cursor:
+        scopes = [json.loads(row[0]) async for row in cursor]
+    assert scopes and all(scope["authoritative_snapshot"] is True for scope in scopes)
     [memory] = await db.list_memories(source=source_id, status="active")
 
     await set_scope(["docs"], ["other"])
     removed = await orchestrator.sync_gene(
-        gene=EmptyGene(),
+        gene=EmptyProviderGene(),
         source_name="Payroll Repo",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-2", frozenset()),
     )
     retired = await db.get_memory(memory.id)
     assert retired is not None and retired.status == "retired"
@@ -9908,7 +10056,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         gene=gene,
         source_name="Payroll Repo",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-3", frozenset({"github-ref-a"})),
     )
 
     original_after_reentry = await db.get_memory(memory.id)
@@ -9921,10 +10069,10 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
 
     await set_scope(["docs"], ["other"])
     repeated_removal = await orchestrator.sync_gene(
-        gene=EmptyGene(),
+        gene=EmptyProviderGene(),
         source_name="Payroll Repo",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-4", frozenset()),
     )
 
     assert first.last_sync_status == "success"
@@ -10714,6 +10862,8 @@ async def test_deferred_lifecycle_converges_after_same_run_tombstone(
 class _IssueGene(BlockingFetchGene):
     """A Jira project whose issues are exactly the given numbers."""
 
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
+
     def __init__(self, *issues: int) -> None:
         release = asyncio.Event()
         release.set()
@@ -10742,7 +10892,7 @@ class _IssueGene(BlockingFetchGene):
 
 
 class _OrderRecordingMemoryEngine(DeferredOnceMemoryEngine):
-    """Records every committed Unit and removed Unit by document; ``jira-1`` may defer once."""
+    """Records every committed Unit and removed Unit by document; ``deferred_doc_id`` may defer once."""
 
     def __init__(self, *, defer: bool) -> None:
         super().__init__()
@@ -10794,7 +10944,7 @@ async def test_a_new_unit_commits_before_the_unit_it_replaces_is_removed(db: Dat
 
 
 @pytest.mark.asyncio
-async def test_a_new_unit_that_fails_for_good_keeps_the_old_unit(db: Database) -> None:
+async def test_a_new_unit_that_fails_for_good_does_not_keep_the_unit_the_listing_left_out(db: Database) -> None:
     source_id = "src-unit-identity-change-failed"
     await db.upsert_source(
         id=source_id, type="jira", name="Jira", config_json="{}", access_policy="workspace", owner_user_id="dev",
@@ -10816,14 +10966,15 @@ async def test_a_new_unit_that_fails_for_good_keeps_the_old_unit(db: Database) -
         retry_sleep=_skip_retry_delay,
     ).sync_gene(gene=_IssueGene(0, 1), source_name="Jira", source_id=source_id, force_full_sync=True)
 
-    # Absence is proven only when every returned document committed.
+    # The listing proves jira-2 gone; the failure of jira-1, which names no
+    # predecessor, says nothing about it.
     assert state.docs_failed == 1
-    assert ("tombstone", "jira-2") not in engine.events
-    assert await db.get_document("jira-2") is not None
+    assert ("tombstone", "jira-2") in engine.events
+    assert await db.get_document("jira-2") is None
 
 
 @pytest.mark.asyncio
-async def test_a_new_unit_still_deferred_by_this_run_keeps_the_old_unit(db: Database) -> None:
+async def test_a_new_unit_still_deferred_by_this_run_does_not_keep_the_unit_the_listing_left_out(db: Database) -> None:
     source_id = "src-unit-identity-change-stuck"
     await db.upsert_source(
         id=source_id, type="jira", name="Jira", config_json="{}", access_policy="workspace", owner_user_id="dev",
@@ -10845,10 +10996,11 @@ async def test_a_new_unit_still_deferred_by_this_run_keeps_the_old_unit(db: Data
         retry_sleep=_skip_retry_delay,
     ).sync_gene(gene=_IssueGene(0, 1), source_name="Jira", source_id=source_id, force_full_sync=True)
 
-    # jira-1 waits only on a Unit of this run, so no removal can unblock it: it has failed.
+    # jira-1 waits only on a Unit of this run, so no removal can unblock it:
+    # it has failed. The listing still proves jira-2 gone.
     assert state.docs_failed == 1
-    assert ("tombstone", "jira-2") not in engine.events
-    assert await db.get_document("jira-2") is not None
+    assert ("tombstone", "jira-2") in engine.events
+    assert await db.get_document("jira-2") is None
 
 
 @pytest.mark.asyncio
@@ -11872,7 +12024,7 @@ async def test_reused_projection_remains_complete_snapshot_membership_for_deleti
         gene=UnexpectedFetchGene(item_count=1, release=release),
         source_name="Jira Board",
         source_id=source_id,
-        authoritative_snapshot=True,
+        input_snapshot=SnapshotBinding("snapshot-1", frozenset({"jira-0"})),
         reusable_projection_doc_ids=frozenset({"jira-0"}),
     )
 

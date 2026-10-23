@@ -40,6 +40,7 @@ import { isImmutableExecutionModeField } from "./localAgentSources";
 import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
 import { useRunningSyncSave } from "./runningSyncSave";
+import { refusedSaveMessage, scopeChangeWarning, useScopeChangePreview } from "./scopeChange";
 import { SourceSetupShell } from "./SourceSetupShell";
 import type { SourceSetupSection, SourceSetupSectionId } from "./SourceSetupShell";
 import {
@@ -337,6 +338,11 @@ function SourceConfigForm({
   const scheduleIntervalValid = parseScheduleInterval(scheduleInterval) >= 5;
 
   const previewReady = firstMissingField === null;
+  const scopeChangePreview = useScopeChangePreview(
+    source?.id,
+    isEdit && canConfigureConnection && previewReady ? serializeConfig(schema.fields, config) : null,
+    secretFieldKeys(schema.fields),
+  );
   const showDiscoveryPreview = sourceType !== "github_repo"
     && !(sourceType === "jira" && stringValue(config.sync_mode) === "local_agent");
   const scheduleSummary = scheduleEnabled
@@ -630,6 +636,7 @@ function SourceConfigForm({
       openSection={focusSection}
       onOpenSectionChange={setFocusSection}
       error={saveSource.isError && !runningSync.refusedForRunningSync ? extractSaveError(saveSource.error) : null}
+      scopeChange={scopeChangeWarning(scopeChangePreview)}
       runningSync={{
         running: runningSync.running,
         confirming: runningSync.confirming,
@@ -1167,9 +1174,15 @@ function localMarkdownPreviewFromJob(status: LocalAgentJobStatusResponse): Disco
   };
 }
 
+function secretFieldKeys(fields: ConfigField[]): string[] {
+  return fields.filter((field) => field.field_type === "secret").map((field) => field.key);
+}
+
 function extractSaveError(error: unknown): string {
   const fallback = "Failed to save source configuration.";
   if (!error) return fallback;
+  const refused = refusedSaveMessage(error);
+  if (refused) return refused;
   if (typeof error === "object" && error !== null && "response" in error) {
     const response = (error as { response?: { data?: { detail?: unknown; error?: unknown } } }).response;
     const detail = response?.data?.detail;

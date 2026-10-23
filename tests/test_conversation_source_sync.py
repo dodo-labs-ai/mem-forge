@@ -37,6 +37,7 @@ from memforge.conversations.port import (
 from memforge.conversations.reader import SourceProjectionUnitReader
 from memforge.conversations.report import plan_report
 from memforge.conversations.units import UnitKind
+from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.genes.teams_gene import TeamsGene
 from memforge.genes.teams_provider import TeamsConversationProvider, teams_conversation_ref, teams_provider_message
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
@@ -206,22 +207,22 @@ class TeamsWorkspace:
             uploads[item.identity] = CollectedBody(record=collection.bodies[item.identity], artifacts=tuple(links))
         await intake.receive_bodies(uploads, source_id=SOURCE_ID, collection_attempt_id=attempt_id)
         assert await intake.missing_bodies_of(SOURCE_ID, attempt_id) == ()
-        gene.bind_conversation_run(projection_store=self.db, collections=collections, collection_attempt_id=attempt_id)
         if dry_run:
+            gene.bind_conversation_run(projection_store=self.db, collections=collections, collection_attempt_id=attempt_id)
             return plan_report(await gene.preview(), source_id=SOURCE_ID), missing
         self.engine.events.clear()
-        state = await self._orchestrator().sync_gene(gene=gene, source_name="Teams", source_id=SOURCE_ID)
+        state = await self._orchestrator().sync_gene(
+            gene=gene,
+            source_name="Teams",
+            source_id=SOURCE_ID,
+            collection_attempt=CollectionAttempt(WORKSPACE_ID, attempt_id),
+        )
         return state, missing
 
     async def reprocess(self, doc_ids: frozenset[str]):
         """An operator reprocess of committed Documents; it collects nothing."""
 
         gene = TeamsGene(dict(self.config), SOURCE_ID)
-        gene.bind_conversation_run(
-            projection_store=self.db,
-            collections=StoredCollections(self.db, workspace_id=WORKSPACE_ID),
-            collection_attempt_id="reprocess-run:attempt:1",
-        )
         self.engine.events.clear()
         return await self._orchestrator().sync_gene(
             gene=gene,
@@ -229,6 +230,7 @@ class TeamsWorkspace:
             source_id=SOURCE_ID,
             reprocess_doc_ids=doc_ids,
             execution_mode=SourceSyncMode.REPROCESS,
+            collection_attempt=CollectionAttempt(WORKSPACE_ID, "reprocess-run:attempt:1"),
         )
 
     def _orchestrator(self) -> GeneSyncOrchestrator:

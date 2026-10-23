@@ -13,7 +13,15 @@ import pytest
 
 from memforge.llm.structured import StructuredLlmError, failure_retryable
 from memforge.memory.engine import SourceUnitLifecycleExecutionError
-from memforge.models import ContentItem, GeneMetadata, NormalizedContent, RawContent, ScopeListing, ScopeListingKind
+from memforge.models import (
+    AbsenceAnswer,
+    ContentItem,
+    GeneMetadata,
+    NormalizedContent,
+    RawContent,
+    ScopeListing,
+    ScopeListingKind,
+)
 from memforge.source_adapters.jira import changelog_semantic_class as jira_changelog_semantic_class
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
 from memforge.source_activity import SourceActivityConflict
@@ -53,9 +61,10 @@ def authored(history: dict, author: str) -> dict:
 class JiraProvider(FakeGene):
     """A Jira provider whose issues carry changelog entries that never reach the markdown."""
 
-    discovery_complete = True
+    listing_kinds = frozenset({ScopeListingKind.QUERY})
 
     def __init__(self) -> None:
+        super().__init__()
         self.histories: dict[str, list[dict]] = {key: [authored(DOMAIN_HISTORY, "Ann")] for key in ISSUES}
         self.removed: set[str] = set()
         self.rediscovered: list[str] = []
@@ -95,6 +104,10 @@ class JiraProvider(FakeGene):
         self.rediscovered.append(issue_key)
         return None if issue_key in self.removed else self._item(issue_key)
 
+    @classmethod
+    def lists_scope(cls, config) -> bool:
+        return True
+
     async def list_scope(self):
         return ScopeListing(
             kind=ScopeListingKind.QUERY,
@@ -102,7 +115,10 @@ class JiraProvider(FakeGene):
         )
 
     async def confirm_absent(self, items):
-        return frozenset(item.item_id for item in items if item.extra["issue_key"] in self.removed)
+        return {
+            item.item_id: AbsenceAnswer.ABSENT if item.extra["issue_key"] in self.removed else AbsenceAnswer.EXISTS
+            for item in items
+        }
 
     def payload(self, issue_key: str) -> bytes:
         histories = self.histories[issue_key]
@@ -370,6 +386,37 @@ async def test_recovery_ends_a_derivation_that_cannot_commit_before_any_model_ca
         for catalog in harness.extractor.fragment_calls
         for fragment in catalog.fragments
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("listing_kind", [ScopeListingKind.EXISTENCE, ScopeListingKind.QUERY])
+async def test_a_document_whose_recovery_ended_leaves_the_ledger_once_it_is_removed(db, monkeypatch, listing_kind):
+    harness = await synced(db)
+    staged = await _staged_changes(harness)
+    projection = staged["PAY-1"].projection
+    observations = {observation.id: observation for observation in projection.observations}
+    [issue_core] = [
+        revision.id
+        for revision in projection.observation_revisions
+        if observations[revision.observation_id].observation_type == "issue_core"
+    ]
+    await _conflict_with_stored_identity(db, issue_core)
+    harness.provider.removed.add("PAY-1")
+
+    async def list_scope(self):
+        return ScopeListing(
+            kind=listing_kind,
+            doc_ids=frozenset(doc_id(key) for key in ISSUES if key not in self.removed),
+        )
+
+    monkeypatch.setattr(JiraProvider, "list_scope", list_scope)
+
+    state = await harness.sync()
+
+    # PAY-1's resumed derivation failed for good, and the listing proved it gone.
+    assert [failed.doc_id for failed in state.failed_docs] == [doc_id("PAY-1")]
+    assert await db.get_document(doc_id("PAY-1")) is None
+    assert await _ledger(db) == {}
 
 
 class _FailingLifecycleEngine(RecordingMemoryEngine):
@@ -687,7 +734,9 @@ async def test_the_migration_supersedes_unapplied_derivations_staged_with_a_sour
 def _jira_gene(handler):
     from memforge.genes.jira_gene import JiraGene
 
-    gene = JiraGene(config={"base_url": "https://jira.example.test", "pat": "token"}, source_id=SOURCE_ID)
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "pat": "token", "projects": ["PAY"]}, source_id=SOURCE_ID,
+    )
     gene._client = httpx.AsyncClient(base_url="https://jira.example.test", transport=httpx.MockTransport(handler))
     gene._request_limiter = None
     gene._auth_mode = "pat"
@@ -698,21 +747,23 @@ def _jira_gene(handler):
 
 @pytest.mark.asyncio
 async def test_jira_rediscovers_one_issue_by_its_id_and_fetches_it_as_discovered():
-    requests: list[str] = []
+    searches: list[dict] = []
+    pay_1 = {
+        "id": ISSUES["PAY-1"], "key": "PAY-1",
+        "fields": {
+            "summary": "Payroll run", "description": "Body", "status": None, "priority": None,
+            "assignee": None, "resolution": None, "updated": "2026-09-21T08:00:00.000+0000",
+            "project": {"key": "PAY"}, "labels": [], "comment": {"startAt": 0, "total": 0, "comments": []},
+        },
+        "changelog": {"startAt": 0, "total": 1, "histories": [DOMAIN_HISTORY]},
+    }
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request.url.path)
-        if request.url.path != f"/rest/api/2/issue/{ISSUES['PAY-1']}":
-            return httpx.Response(httpx.codes.NOT_FOUND, json={"errorMessages": ["Issue does not exist"]})
-        return httpx.Response(httpx.codes.OK, json={
-            "id": ISSUES["PAY-1"], "key": "PAY-1",
-            "fields": {
-                "summary": "Payroll run", "description": "Body", "status": None, "priority": None,
-                "assignee": None, "resolution": None, "updated": "2026-09-21T08:00:00.000+0000",
-                "project": {"key": "PAY"}, "labels": [], "comment": {"startAt": 0, "total": 0, "comments": []},
-            },
-            "changelog": {"startAt": 0, "total": 1, "histories": [DOMAIN_HISTORY]},
-        })
+        assert request.url.path == "/rest/api/2/search"
+        body = json.loads(request.content)
+        searches.append(body)
+        issues = [pay_1] if body["jql"].startswith(f"issuekey = {ISSUES['PAY-1']} ") else []
+        return httpx.Response(httpx.codes.OK, json={"startAt": 0, "total": len(issues), "issues": issues})
 
     gene = _jira_gene(handler)
     stored = ContentItem(
@@ -735,7 +786,11 @@ async def test_jira_rediscovers_one_issue_by_its_id_and_fetches_it_as_discovered
     )
     assert [history["id"] for history in json.loads(raw.body)["changelog"]["histories"]] == ["9001"]
     # The fetch reads the issue rediscovery returned; the provider is asked once per Document.
-    assert requests == [f"/rest/api/2/issue/{ISSUES['PAY-1']}", f"/rest/api/2/issue/{ISSUES['PAY-2']}"]
+    assert [body["jql"] for body in searches] == [
+        f"issuekey = {issue_id} AND (project in (PAY) AND issuetype in (Epic,Story,Bug,Task))"
+        for issue_id in (ISSUES["PAY-1"], ISSUES["PAY-2"])
+    ]
+    assert all(body["validateQuery"] is False for body in searches)
 
 
 def _confluence_page(page_id: str, **fields) -> dict:
@@ -791,11 +846,12 @@ async def test_confluence_rediscovers_the_current_pages_of_its_spaces():
             "43": _confluence_page("43", status="archived"),
             "44": _confluence_page("44", space={"key": "HR"}),
             "45": _confluence_page("45", metadata={"labels": {"results": [{"name": "draft"}]}}),
+            "47": _confluence_page("47", type="blogpost"),
         },
     )
 
     assert (found["42"].item_id, found["42"].version, found["42"].space_or_project) == ("confluence-42", "4", "PAY")
-    assert {page_id for page_id, item in found.items() if item is None} == {"43", "44", "45", "404"}
+    assert {page_id for page_id, item in found.items() if item is None} == {"43", "44", "45", "47", "404"}
 
 
 @pytest.mark.asyncio
@@ -810,6 +866,7 @@ async def test_confluence_rediscovers_the_pages_its_tree_discovery_reaches():
             "44": _confluence_page("44", ancestors=[_labelled(root), _labelled("9", "draft")]),
             "45": _confluence_page("45", ancestors=[_labelled(root), {**_labelled("10"), "status": "archived"}]),
             "46": _confluence_page("46", status="trashed", ancestors=[_labelled(root)]),
+            "47": _confluence_page("47", type="blogpost", ancestors=[_labelled(root)]),
         },
     )
 

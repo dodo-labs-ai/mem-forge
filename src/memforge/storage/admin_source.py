@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 from memforge.source_item_failures import SourceItemFailure
+from memforge.source_projection import ProjectionScopeTransition
 
 
 SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES = 1440
@@ -112,6 +113,29 @@ class SourceAdminReader(Protocol):
     async def get_active_source_access_transition(
         self, source_id: str
     ) -> dict[str, Any] | None: ...
+
+    async def get_open_projection_scope_transition(
+        self,
+        source_id: str,
+    ) -> ProjectionScopeTransition | None:
+        """The Source's scope change in progress (``pending``, ``running`` or ``failed``), or ``None``."""
+        ...
+
+    async def count_projection_scope_transition_members(self, transition_id: str) -> int:
+        """How many Documents have committed under the transition; zero once it is closed."""
+        ...
+
+    async def list_projection_scope_transition_failed_member_doc_ids(
+        self,
+        transition_id: str,
+    ) -> tuple[str, ...]:
+        """The Documents committed under the transition that its Source's failure ledger still holds.
+
+        For example, with ``doc-a`` and ``doc-b`` committed and the ledger
+        holding ``doc-b`` and ``doc-c``, it returns ``("doc-b",)``: a failure
+        the Source recorded before the Document committed under the change.
+        """
+        ...
 
     async def list_source_projects(
         self,

@@ -568,11 +568,13 @@ class SqliteRelationalStore:
         *,
         unit_input: SourceUnitInput | None = None,
         source_activity: SourceActivityLease | None = None,
+        scope_transition_id: str | None = None,
     ) -> None:
         await self._db.record_source_projection(
             projection,
             unit_input=unit_input,
             source_activity=source_activity,
+            scope_transition_id=scope_transition_id,
         )
 
     async def get_source_projection(self, run_id: str) -> SourceProjection | None:
@@ -587,16 +589,34 @@ class SqliteRelationalStore:
     async def list_projection_scope_transitions(self, source_id: str, *, limit: int = 20):
         return await self._db.list_projection_scope_transitions(source_id, limit=limit)
 
+    async def get_projection_scope_transition(self, transition_id: str):
+        return await self._db.get_projection_scope_transition(transition_id)
+
     async def start_projection_scope_transition(self, transition_id: str, *, run_id: str):
         return await self._db.start_projection_scope_transition(transition_id, run_id=run_id)
 
-    async def complete_projection_scope_transition(self, transition_id: str, *, run_id: str, coverage):
-        return await self._db.complete_projection_scope_transition(transition_id, run_id=run_id, coverage=coverage)
+    async def complete_projection_scope_transition(self, transition_id: str, *, run_id: str):
+        return await self._db.complete_projection_scope_transition(transition_id, run_id=run_id)
 
-    async def fail_projection_scope_transition(self, transition_id: str, *, run_id: str, coverage, error: str):
+    async def fail_projection_scope_transition(
+        self,
+        transition_id: str,
+        *,
+        run_id: str,
+        error: str,
+        excluded_scopes_due: bool = False,
+        listed_count: int | None = None,
+    ):
         return await self._db.fail_projection_scope_transition(
-            transition_id, run_id=run_id, coverage=coverage, error=error
+            transition_id,
+            run_id=run_id,
+            error=error,
+            excluded_scopes_due=excluded_scopes_due,
+            listed_count=listed_count,
         )
+
+    async def list_projection_scope_transition_member_doc_ids(self, transition_id: str) -> tuple[str, ...]:
+        return await self._db.list_projection_scope_transition_member_doc_ids(transition_id)
 
     async def get_current_source_unit_revision(
         self,
@@ -854,6 +874,7 @@ class SqliteRelationalStore:
         required_derivation_work_ids: tuple[str, ...] = (),
         source_activity: SourceActivityLease | None = None,
         runtime_bundle: AgentRuntimeBundle | None = None,
+        scope_transition_id: str | None = None,
     ) -> None:
         await self._db.apply_source_projection_lifecycle(
             projection,
@@ -865,6 +886,7 @@ class SqliteRelationalStore:
             required_derivation_work_ids=required_derivation_work_ids,
             source_activity=source_activity,
             runtime_bundle=runtime_bundle,
+            scope_transition_id=scope_transition_id,
         )
 
     async def apply_agent_claim_source_projection_lifecycle(

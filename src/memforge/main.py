@@ -21,7 +21,7 @@ from http import HTTPStatus
 from importlib import metadata
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import quote
 
 try:
@@ -67,7 +67,10 @@ from memforge.local_agent.document_identity import (
     build_jira_doc_id,
     build_local_markdown_doc_id,
 )
+from memforge.local_agent.snapshot_manifest import SNAPSHOT_MANIFEST_MAX_ITEMS
 from memforge.local_agent.source_contract import (
+    LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
+    LOCAL_AGENT_TRANSITION_PAYLOAD_FIELDS,
     GitHubProviderConnectionError,
     local_agent_sync_snapshot_id,
     source_processing_receipt,
@@ -92,6 +95,9 @@ from memforge.workspace_bindings import (
     WorkspaceBindingError,
     resolve_workspace_binding,
 )
+
+if TYPE_CHECKING:
+    from memforge.genes.jira_gene import JiraGene
 
 console = Console()
 log_console = Console(stderr=True)
@@ -2046,9 +2052,9 @@ def sync(ctx, source: str | None):
 
     async def _run():
         config: AppConfig = ctx.obj["config"]
-        from memforge.genes.conversation_gene import ConversationGene
-        from memforge.genes import GENE_REGISTRY
+        from memforge.genes.family import CollectionFamilyKind
         from memforge.runtime import build_sync_runtime, run_source_sync
+        from memforge.source_types import source_type_descriptor
 
         db = await _get_db(config)
         try:
@@ -2072,12 +2078,19 @@ def sync(ctx, source: str | None):
                 continue
 
             source_type = src["type"]
-            gene_class = GENE_REGISTRY.get(source_type)
-            if gene_class is not None and issubclass(gene_class, ConversationGene):
+            descriptor = source_type_descriptor(source_type)
+            family = descriptor.family if descriptor is not None else None
+            if family is CollectionFamilyKind.CONVERSATION:
                 # Its local agent collects each attempt; the server processes what was uploaded.
                 console.print(
                     f"\n[yellow]Skipping {src['name']}[/] (type={source_type}): "
                     "a conversation Source is collected by its local agent; sync it from the Admin UI."
+                )
+                continue
+            if descriptor is not None and family is None:
+                console.print(
+                    f"\n[yellow]Skipping {src['name']}[/] (type={source_type}): "
+                    "it receives content as it is captured and has no sync run."
                 )
                 continue
 
@@ -3178,7 +3191,7 @@ def _push_github_profile_to_source(
         and local_agent_attempt_count is not None
     ):
         try:
-            required_doc_ids = _required_local_source_doc_ids(
+            required_doc_ids = _plan_local_source_manifest(
                 client,
                 source_id=source_id,
                 items=manifest_items,
@@ -3187,7 +3200,7 @@ def _push_github_profile_to_source(
                 sync_snapshot_id=sync_snapshot_id,
                 local_agent_job_id=local_agent_job_id,
                 local_agent_attempt_count=local_agent_attempt_count,
-            )
+            ).required_doc_ids
         except RuntimeError as exc:
             return {
                 "profile": name,
@@ -3432,7 +3445,22 @@ def _raise_if_local_agent_lease_not_current(response: object) -> None:
     raise CloudJobLeaseLost(LOCAL_AGENT_LEASE_NOT_CURRENT)
 
 
-def _required_local_source_doc_ids(
+@dataclass(frozen=True)
+class _LocalSourceManifestPlan:
+    """The server's answer to one fenced manifest.
+
+    ``required_doc_ids`` are the items whose bodies the agent uploads.
+    ``confirm`` names the unlisted items, as ``{"doc_id", "provider_key"}``,
+    that the agent confirms by identifier before it asks for processing,
+    bound to the manifest by ``manifest_sha256``.
+    """
+
+    required_doc_ids: set[str]
+    manifest_sha256: str
+    confirm: tuple[dict[str, str], ...]
+
+
+def _plan_local_source_manifest(
     client: ToolClient,
     *,
     source_id: str,
@@ -3442,8 +3470,9 @@ def _required_local_source_doc_ids(
     sync_snapshot_id: str,
     local_agent_job_id: str,
     local_agent_attempt_count: int,
-) -> set[str]:
-    """Plan one fenced collection and validate the returned materialization set."""
+    excluded_listings: list[dict[str, Any]] | None = None,
+) -> _LocalSourceManifestPlan:
+    """Plan one fenced collection and validate the returned materialization and confirmation sets."""
     plan = client.prepare_local_source_snapshot(
         source_id=source_id,
         items=items,
@@ -3451,6 +3480,7 @@ def _required_local_source_doc_ids(
         sync_snapshot_id=sync_snapshot_id,
         local_agent_job_id=local_agent_job_id,
         local_agent_attempt_count=local_agent_attempt_count,
+        excluded_listings=excluded_listings,
     )
     _raise_if_local_agent_lease_not_current(plan)
     if plan.get("error"):
@@ -3462,7 +3492,20 @@ def _required_local_source_doc_ids(
     }
     if required_doc_ids - known_doc_ids:
         raise RuntimeError("source manifest comparison returned unknown document identities")
-    return required_doc_ids
+    confirm = tuple(
+        {"doc_id": str(entry.get("doc_id") or ""), "provider_key": str(entry.get("provider_key") or "")}
+        for entry in plan.get("confirm") or []
+        if isinstance(entry, dict)
+    )
+    if any(not entry["doc_id"] or not entry["provider_key"] for entry in confirm):
+        raise RuntimeError("source manifest comparison returned an incomplete confirmation")
+    if {entry["doc_id"] for entry in confirm} & known_doc_ids:
+        raise RuntimeError("source manifest comparison asked to confirm a listed document")
+    return _LocalSourceManifestPlan(
+        required_doc_ids=required_doc_ids,
+        manifest_sha256=str(plan.get("manifest_sha256") or ""),
+        confirm=confirm,
+    )
 
 
 def _run_cloud_github_preview_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -3749,10 +3792,11 @@ def _run_cloud_jira_sync_job(
 
 def _run_cloud_teams_auth_job(job: dict[str, Any]) -> dict[str, Any]:
     from memforge.auth import teams_auth
+    from memforge.genes.teams_provider import teams_region
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    region = _teams_region_from_payload(payload)
+    region = teams_region(payload)
     try:
         token_data = teams_auth.TeamsAuthenticator().authenticate(
             region=region,
@@ -3787,22 +3831,24 @@ def _run_cloud_teams_auth_job(job: dict[str, Any]) -> dict[str, Any]:
 
 def _run_cloud_teams_auth_check_job(job: dict[str, Any]) -> dict[str, Any]:
     from memforge.local_agent.teams_browse import teams_auth_status
+    from memforge.genes.teams_provider import teams_region
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     return {
         "operation": operation,
-        "region": _teams_region_from_payload(payload),
+        "region": teams_region(payload),
         **teams_auth_status(),
     }
 
 
 def _run_cloud_teams_browse_job(job: dict[str, Any]) -> dict[str, Any]:
     from memforge.local_agent.teams_browse import browse_teams_conversations
+    from memforge.genes.teams_provider import teams_region
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    region = _teams_region_from_payload(payload)
+    region = teams_region(payload)
     try:
         data = asyncio.run(browse_teams_conversations(region=region))
     except Exception as exc:
@@ -3876,11 +3922,6 @@ def _teams_rejected_token_hashes_from_payload(payload: dict[str, Any]) -> set[st
     return {str(item) for item in value if str(item).strip()}
 
 
-def _teams_region_from_payload(payload: dict[str, Any]) -> str:
-    region = str(payload.get("region") or "emea").strip().lower()
-    return region if region in {"emea", "amer", "apac"} else "emea"
-
-
 def _run_cloud_teams_sync_job(
     job: dict[str, Any],
     client: ToolClient,
@@ -3904,7 +3945,7 @@ def _run_cloud_teams_sync_job(
     _report_local_agent_progress(report_progress, _sync_progress_snapshot(phase="connecting"))
     try:
         try:
-            result = asyncio.run(_collect_teams_on_device(job, payload, source_id, client, report_progress))
+            result = asyncio.run(_collect_conversation_on_device(job, payload, source_id, client, report_progress))
         except ConversationUploadError:
             # The server refused an upload; a new Teams session would not change its answer.
             raise
@@ -3924,7 +3965,7 @@ def _run_cloud_teams_sync_job(
             )
             if reauth.get("error"):
                 raise RuntimeError(str(reauth.get("error") or "Teams authentication failed.")) from exc
-            result = asyncio.run(_collect_teams_on_device(job, payload, source_id, client, report_progress))
+            result = asyncio.run(_collect_conversation_on_device(job, payload, source_id, client, report_progress))
     except ConversationUploadError as exc:
         _raise_if_local_agent_lease_not_current(exc.response)
         return {"operation": operation, "source_id": source_id, "error": str(exc), "retryable": True}
@@ -3942,16 +3983,21 @@ def _run_cloud_teams_sync_job(
     return {**outcome, "sync_started": True, **source_processing_receipt(result.processing)}
 
 
-async def _collect_teams_on_device(
+async def _collect_conversation_on_device(
     job: dict[str, Any],
     payload: dict[str, Any],
     source_id: str,
     client: ToolClient,
     report_progress: Callable[[dict[str, Any]], None] | None,
 ):
-    from memforge.genes.teams_client import TeamsChatClient
-    from memforge.genes.teams_provider import TeamsConversationProvider
+    """Collect one attempt of a conversation Source through the provider its descriptor names."""
+
     from memforge.local_agent.conversation_executor import run_device_collection
+    from memforge.source_types import source_type_descriptor
+
+    descriptor = source_type_descriptor(str(job.get("source_type") or ""))
+    if descriptor is None or descriptor.conversation_provider is None:
+        raise ValueError(f"source type {job.get('source_type')!r} has no conversation provider")
 
     def report(phase: str, completed: int, total: int) -> None:
         unit = "conversation" if phase == "fetching" else "message"
@@ -3960,11 +4006,9 @@ async def _collect_teams_on_device(
             _sync_progress_snapshot(phase=phase, completed=completed, total=total, unit=unit),
         )
 
-    teams = TeamsChatClient(region=_teams_region_from_payload(payload))
-    try:
-        await teams.validate()
+    async with descriptor.conversation_provider.open(payload) as provider:
         return await run_device_collection(
-            TeamsConversationProvider(teams),
+            provider,
             client,
             source_id=source_id,
             local_agent_job_id=str(job["job_id"]),
@@ -3974,8 +4018,6 @@ async def _collect_teams_on_device(
             force_full_sync=bool(payload.get("force_full_sync", False)),
             report=report,
         )
-    finally:
-        await teams.close()
 
 
 def _github_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -4053,13 +4095,13 @@ async def _collect_jira_documents_from_cloud_job(
     config["jira_cookie"] = jira_cookie
 
     gene = JiraGene(config, source_id)
-    await gene.authenticate()
     documents: list[dict[str, Any]] = []
-    _report_local_agent_progress(
-        report_progress,
-        _sync_progress_snapshot(phase="discovering", completed=0, unit="issue"),
-    )
     try:
+        await gene.authenticate()
+        _report_local_agent_progress(
+            report_progress,
+            _sync_progress_snapshot(phase="discovering", completed=0, unit="issue"),
+        )
         inventory_items = []
         async for item in gene.discover_inventory():
             if limit and len(inventory_items) >= limit:
@@ -4085,25 +4127,36 @@ async def _collect_jira_documents_from_cloud_job(
             ): item
             for item in inventory_items
         }
-        required_doc_ids = set(items_by_doc_id)
-        if not limit:
-            required_doc_ids = _required_local_source_doc_ids(
-                client,
+        excluded_listings = await _list_excluded_jira_scopes(payload, source_id=source_id, jira_cookie=jira_cookie)
+        manifest = _plan_local_source_manifest(
+            client,
+            source_id=source_id,
+            items=[
+                {
+                    "doc_id": doc_id,
+                    "revision": str(item.version),
+                    "change_kind": "upsert",
+                }
+                for doc_id, item in items_by_doc_id.items()
+            ],
+            coverage="complete_snapshot",
+            known_doc_ids=set(items_by_doc_id),
+            sync_snapshot_id=sync_snapshot_id,
+            local_agent_job_id=local_agent_job_id,
+            local_agent_attempt_count=local_agent_attempt_count,
+            excluded_listings=excluded_listings,
+        )
+        if manifest.confirm:
+            await _confirm_unlisted_jira_issues(
+                gene,
+                manifest,
+                client=client,
                 source_id=source_id,
-                items=[
-                    {
-                        "doc_id": doc_id,
-                        "revision": str(item.version),
-                        "change_kind": "upsert",
-                    }
-                    for doc_id, item in items_by_doc_id.items()
-                ],
-                coverage="complete_snapshot",
-                known_doc_ids=set(items_by_doc_id),
                 sync_snapshot_id=sync_snapshot_id,
                 local_agent_job_id=local_agent_job_id,
                 local_agent_attempt_count=local_agent_attempt_count,
             )
+        required_doc_ids = manifest.required_doc_ids
         items_to_fetch = [
             item
             for doc_id, item in items_by_doc_id.items()
@@ -4189,20 +4242,128 @@ async def _collect_jira_documents_from_cloud_job(
                 ),
             )
     finally:
-        client = getattr(gene, "_client", None)
-        if client is not None:
-            await client.aclose()
+        http_client = getattr(gene, "_client", None)
+        if http_client is not None:
+            await http_client.aclose()
     return {
         "documents": documents,
         "inventory_count": len(inventory_items),
         "reused_count": len(inventory_items) - len(items_to_fetch),
+        "confirmed_count": len(manifest.confirm),
     }
+
+
+async def _list_excluded_jira_scopes(
+    payload: dict[str, Any],
+    *,
+    source_id: str,
+    jira_cookie: str,
+) -> list[dict[str, Any]]:
+    """List each scope the job's open transition excludes, as the manifest's ``excluded_listings``.
+
+    Each scope runs its own JQL with this session, and its issues are named by
+    this Source's device Document ids. A scope whose configuration cannot be
+    built, whose JQL Jira rejects, or which lists more issues than a manifest
+    holds, is reported rejected with the cause. A
+    scope that fails for any other reason, such as the network, is left out,
+    so the transition stays open until a later collection lists it.
+    """
+    from memforge.genes.base import SourceConfigurationError
+    from memforge.genes.jira_gene import JiraGene
+
+    listings: list[dict[str, Any]] = []
+    for scope in payload.get(LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD) or ():
+        scope_key = str(scope.get("scope_key") or "")
+        gene = None
+        try:
+            config = _jira_cloud_config_from_job_payload(dict(scope.get("config") or {}))
+            config["jira_cookie"] = jira_cookie
+            gene = JiraGene(config, source_id)
+            await gene.authenticate()
+            listing = await gene.list_scope()
+        except (SourceConfigurationError, ValueError, click.ClickException) as exc:
+            listings.append({"scope_key": scope_key, "rejection": f"{type(exc).__name__}: {exc}"[:2_000]})
+            continue
+        except Exception as exc:
+            logger.warning("Listing an excluded Jira scope of %s failed: %s", source_id, exc)
+            continue
+        finally:
+            http_client = getattr(gene, "_client", None)
+            if http_client is not None:
+                await http_client.aclose()
+        if len(listing.doc_ids) > SNAPSHOT_MANIFEST_MAX_ITEMS:
+            # The scope can never be listed within a manifest, so it is as
+            # definitive as a JQL Jira refuses.
+            listings.append(
+                {
+                    "scope_key": scope_key,
+                    "rejection": (
+                        f"The excluded scope lists {len(listing.doc_ids)} issues, more than the "
+                        f"{SNAPSHOT_MANIFEST_MAX_ITEMS} a manifest holds"
+                    ),
+                }
+            )
+            continue
+        listings.append(
+            {
+                "scope_key": scope_key,
+                "doc_ids": sorted(
+                    build_jira_doc_id(source_id=source_id, issue_key=doc_id.removeprefix("jira-"))
+                    for doc_id in listing.doc_ids
+                ),
+            }
+        )
+    return listings
+
+
+async def _confirm_unlisted_jira_issues(
+    gene: JiraGene,
+    manifest: _LocalSourceManifestPlan,
+    *,
+    client: ToolClient,
+    source_id: str,
+    sync_snapshot_id: str,
+    local_agent_job_id: str,
+    local_agent_attempt_count: int,
+) -> None:
+    """Read each issue the manifest left out by its id, and post the answers bound to the manifest.
+
+    When an issue cannot be rebuilt or ``confirm_absent`` raises, the agent
+    posts the cause instead, so the run removes nothing. A post the server
+    refuses fails the collection.
+    """
+    answers: list[dict[str, str]] = []
+    failure_cause: str | None = None
+    try:
+        items = [gene.confirmation_item(entry["doc_id"], entry["provider_key"]) for entry in manifest.confirm]
+        confirmed = await gene.confirm_absent(items)
+        answers = [
+            {"doc_id": entry["doc_id"], "provider_key": entry["provider_key"], "answer": confirmed[entry["doc_id"]].value}
+            for entry in manifest.confirm
+        ]
+    except Exception as exc:
+        logger.warning("Confirming the unlisted Jira issues of %s failed: %s", source_id, exc)
+        failure_cause = f"{type(exc).__name__}: {exc}"[:2_000]
+    response = client.submit_local_source_confirmations(
+        source_id=source_id,
+        manifest_sha256=manifest.manifest_sha256,
+        sync_snapshot_id=sync_snapshot_id,
+        local_agent_job_id=local_agent_job_id,
+        local_agent_attempt_count=local_agent_attempt_count,
+        answers=answers,
+        failure_cause=failure_cause,
+    )
+    _raise_if_local_agent_lease_not_current(response)
+    if response.get("error"):
+        raise RuntimeError(
+            str(response.get("detail") or response.get("error") or "Jira confirmation upload failed")
+        )
 
 
 def _jira_cloud_config_from_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
     from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE
 
-    config = dict(payload)
+    config = {key: value for key, value in payload.items() if key not in LOCAL_AGENT_TRANSITION_PAYLOAD_FIELDS}
     config.pop("local_agent_documents_dir", None)
     config.pop("pat", None)
     config.pop("pat_encrypted", None)
@@ -4365,7 +4526,7 @@ def _push_kb_profile_to_source(
     fallback_reason: str | None = None
     if not limit and sync_snapshot_id and local_agent_job_id and local_agent_attempt_count is not None:
         try:
-            required_doc_ids = _required_local_source_doc_ids(
+            required_doc_ids = _plan_local_source_manifest(
                 client,
                 source_id=source_id,
                 items=manifest_items,
@@ -4374,7 +4535,7 @@ def _push_kb_profile_to_source(
                 sync_snapshot_id=sync_snapshot_id,
                 local_agent_job_id=local_agent_job_id,
                 local_agent_attempt_count=local_agent_attempt_count,
-            )
+            ).required_doc_ids
         except RuntimeError as exc:
             return {
                 "profile": name,

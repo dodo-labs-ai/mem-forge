@@ -19,8 +19,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from memforge.genes.atlassian_auth import (
-    ATLASSIAN_ABSENT_STATUS_CODES,
-    atlassian_record_is_gone,
+    atlassian_record_state,
     atlassian_request_limiter,
     bearer_headers,
     request_with_rate_limit_retry,
@@ -28,7 +27,8 @@ from memforge.genes.atlassian_auth import (
     stream_with_rate_limit_retry,
     tls_verify,
 )
-from memforge.genes.base import Gene
+from memforge.genes.base import SourceConfigurationError
+from memforge.genes.document_gene import DocumentGene
 from memforge.genes.local_adapter_packages import (
     decode_package,
     has_package_manifest,
@@ -40,6 +40,7 @@ from memforge.genes.local_adapter_packages import (
 from memforge.local_agent.jira_contract import validate_jira_observation_identities
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, source_time_iso
 from memforge.models import (
+    AbsenceAnswer,
     ConfigField,
     ConfigFieldType,
     ConfigGroup,
@@ -93,10 +94,21 @@ _DEFAULT_ORDER_BY = "ORDER BY updated DESC"
 # keeps its place, so paging neither repeats nor skips it.
 _LISTING_ORDER_BY = "ORDER BY key ASC"
 _ORDER_BY_RE = re.compile(r"\border\s+by\b", re.IGNORECASE)
+# An issue id (digits) or an issue key (project key, hyphen, number).
+_ISSUE_REF_RE = re.compile(r"\d+|[A-Z][A-Z0-9_]*-\d+")
 
 
 def _delta_clause(since: datetime) -> str:
     return f"updated >= '{since.strftime('%Y-%m-%d %H:%M')}'"
+
+
+def _split_order_by(raw_jql: str) -> tuple[str, str | None]:
+    """A user-authored JQL's where clause and its ORDER BY, or ``None`` when it has none."""
+    query = raw_jql.strip()
+    match = _ORDER_BY_RE.search(query)
+    if match is None:
+        return query, None
+    return query[: match.start()].strip(), query[match.start():].strip()
 
 
 def _augment_advanced_jql(raw_jql: str, since: datetime | None, order_by: str | None = None) -> str:
@@ -107,18 +119,39 @@ def _augment_advanced_jql(raw_jql: str, since: datetime | None, order_by: str | 
     is AND-ed onto the where clause (wrapped in parentheses so a top-level OR
     keeps its meaning).
     """
-    query = raw_jql.strip()
-    match = _ORDER_BY_RE.search(query)
-    if match:
-        where = query[: match.start()].strip()
-        order = query[match.start():].strip()
-    else:
-        where = query
-        order = _DEFAULT_ORDER_BY
+    where, order = _split_order_by(raw_jql)
     if since:
         delta = _delta_clause(since)
         where = f"({where}) AND {delta}" if where else delta
-    return f"{where} {order_by or order}".strip()
+    return f"{where} {order_by or order or _DEFAULT_ORDER_BY}".strip()
+
+
+def _scope_where(config: Mapping[str, Any]) -> str:
+    """The configured scope as a JQL where clause, without the ``since`` filter or an ORDER BY.
+
+    Empty when an advanced JQL has no condition, which selects every issue the
+    credential can see.
+    """
+    if str(config.get("query_mode") or JIRA_QUERY_MODE_SIMPLE).strip().lower() == JIRA_QUERY_MODE_ADVANCED:
+        where, _order = _split_order_by(str(config.get("jql") or ""))
+        return where
+
+    projects = config.get("projects", [])
+    if isinstance(projects, str):
+        projects = [p.strip() for p in projects.split(",") if p.strip()]
+    issue_types = config.get("issue_types", DEFAULT_ISSUE_TYPES)
+    if isinstance(issue_types, str):
+        issue_types = [t.strip() for t in issue_types.split(",") if t.strip()]
+    jql_filter = config.get("jql_filter", "")
+
+    where = f"project in ({','.join(projects)}) AND issuetype in ({','.join(issue_types)})"
+    if jql_filter:
+        where += f" AND ({jql_filter})"
+    return where
+
+
+class JiraQueryRejected(SourceConfigurationError):
+    """Jira refused the configured JQL (HTTP 400): the query itself is wrong, so retrying cannot help."""
 
 
 def _build_jql(config: dict, since: datetime | None, *, order_by: str | None = None) -> str:
@@ -131,21 +164,29 @@ def _build_jql(config: dict, since: datetime | None, *, order_by: str | None = N
     if str(config.get("query_mode") or JIRA_QUERY_MODE_SIMPLE).strip().lower() == JIRA_QUERY_MODE_ADVANCED:
         return _augment_advanced_jql(str(config.get("jql") or ""), since, order_by)
 
-    projects = config.get("projects", [])
-    if isinstance(projects, str):
-        projects = [p.strip() for p in projects.split(",") if p.strip()]
-    issue_types = config.get("issue_types", DEFAULT_ISSUE_TYPES)
-    if isinstance(issue_types, str):
-        issue_types = [t.strip() for t in issue_types.split(",") if t.strip()]
-    jql_filter = config.get("jql_filter", "")
-
-    jql = f"project in ({','.join(projects)}) AND issuetype in ({','.join(issue_types)})"
-    if jql_filter:
-        jql += f" AND ({jql_filter})"
+    jql = _scope_where(config)
     if since:
         jql += f" AND {_delta_clause(since)}"
     jql += f" {order_by or _DEFAULT_ORDER_BY}"
     return jql
+
+
+def _jql_issue_ref(issue_ref: str) -> str:
+    """An issue id or key, checked to be safe to place unquoted in JQL; anything else raises."""
+    if not _ISSUE_REF_RE.fullmatch(issue_ref):
+        raise ValueError(f"Jira issue reference {issue_ref!r} is neither an issue id nor an issue key")
+    return issue_ref
+
+
+def _single_issue_jql(config: Mapping[str, Any], issue_ref: str) -> str:
+    """Search for one issue, by id or key, only within the configured scope.
+
+    The scope's where clause is parenthesized, so a top-level OR in an
+    advanced JQL cannot widen the search beyond the one issue.
+    """
+    clause = f"issuekey = {_jql_issue_ref(issue_ref)}"
+    where = _scope_where(config)
+    return f"{clause} AND ({where})" if where else clause
 
 
 def _issue_doc_id(issue_key: str) -> str:
@@ -156,6 +197,11 @@ def _issue_ref(item: ContentItem) -> str:
     """The stored issue's stable id, or its key when the stored item does not record the id."""
     ref = str(item.extra.get("issue_id") or item.extra.get("issue_key") or "").strip()
     return ref or item.item_id.removeprefix(_ISSUE_DOC_ID_PREFIX)
+
+
+def _read_by_local_agent(config: Mapping[str, Any]) -> bool:
+    """Whether the owner's local agent reads this Source's issues, instead of the server."""
+    return str(config.get("sync_mode") or "cloud").strip().lower() == "local_agent"
 
 
 def _request_interval_seconds(config: dict) -> float:
@@ -327,12 +373,14 @@ def _issue_content_item(issue: dict, base_url: str) -> ContentItem:
     )
 
 
-class JiraGene(Gene):
+class JiraGene(DocumentGene):
     """Jira data source gene.
 
     Discovers issues via JQL, fetches full issue data including comments
     and linked issues, normalizes to comprehensive markdown.
     """
+
+    listing_kinds = frozenset({ScopeListingKind.QUERY})
 
     @classmethod
     def metadata(cls) -> GeneMetadata:
@@ -492,7 +540,7 @@ class JiraGene(Gene):
 
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         """Discover issues via JQL search."""
-        if str(self.config.get("sync_mode") or "cloud").strip().lower() == "local_agent":
+        if _read_by_local_agent(self.config):
             manifest = self._local_agent_package_manifest()
             if has_package_manifest(self.config):
                 async for item in self._discover_local_agent_package_manifest(manifest, since):
@@ -517,7 +565,7 @@ class JiraGene(Gene):
 
     @classmethod
     def rediscovers_documents(cls, config: Mapping[str, Any]) -> bool:
-        return str(config.get("sync_mode") or "cloud").strip().lower() != "local_agent"
+        return not _read_by_local_agent(config)
 
     def filter_summary(self, since: datetime | None) -> str | None:
         jql_filter = str(self.config.get("jql_filter") or "").strip()
@@ -525,30 +573,41 @@ class JiraGene(Gene):
         return " AND ".join(parts) or None
 
     async def rediscover(self, item: ContentItem) -> ContentItem | None:
-        """Read one issue as discovery does, by its stable id when the stored item has it."""
+        """Search for one issue within the configured JQL, as a full discovery would list it.
+
+        The search is ``issuekey = <id> AND (<where clause>)``, by the stored
+        issue's stable id when the stored item has it, so an issue moved to
+        another project is still found while it matches. ``None`` means a full
+        discovery would not list the issue now: it is deleted, no longer
+        visible to the credential, or no longer matches the JQL. The search
+        is not validated, so an unknown id gives no result instead of an
+        error; a search that fails or pages inconsistently raises.
+        """
         issue_ref = _issue_ref(item)
-        try:
-            resp = await self._request(
-                "GET",
-                f"/rest/api/2/issue/{issue_ref}",
-                params={"fields": ",".join(JIRA_SEARCH_FIELDS), "expand": ",".join(JIRA_SEARCH_EXPAND)},
+        issues = [
+            issue
+            async for issue in self._search_issues(
+                _single_issue_jql(self.config, issue_ref),
+                fields=JIRA_SEARCH_FIELDS,
+                expand=JIRA_SEARCH_EXPAND,
+                max_results=1,
+                validate_query=False,
             )
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in ATLASSIAN_ABSENT_STATUS_CODES:
-                return None
-            raise
-        issue = resp.json()
-        if not isinstance(issue, dict) or not str(issue.get("id") or "").strip().isdigit():
-            raise RuntimeError("Jira issue response is missing a stable id")
-        if not str(issue.get("key") or "").strip() or not isinstance(issue.get("fields"), dict):
-            raise RuntimeError("Jira issue response is missing its key or fields")
+        ]
+        if not issues:
+            return None
+        # The issuekey predicate binds the identity: Jira also resolves a key
+        # the issue had before it moved, and answers with its current key.
+        if len(issues) > 1 or (issue_ref.isdigit() and str(issues[0]["id"]) != issue_ref):
+            raise RuntimeError(f"Jira search for issue {issue_ref} returned another issue")
+        issue = issues[0]
         current = _issue_content_item(issue, self._base_url)
         self._hydrated_issues[current.extra["issue_key"]] = issue
         return current
 
     async def discover_inventory(self) -> AsyncIterator[ContentItem]:
         """Discover a complete lightweight issue inventory for daemon planning."""
-        if str(self.config.get("sync_mode") or "cloud").strip().lower() == "local_agent":
+        if _read_by_local_agent(self.config):
             raise ValueError("Jira inventory discovery requires direct provider access")
         self._hydrated_issues = {}
         async for item in self._discover_remote_search(
@@ -560,7 +619,12 @@ class JiraGene(Gene):
         ):
             yield item
 
-    async def list_scope(self) -> ScopeListing | None:
+    @classmethod
+    def lists_scope(cls, config: Mapping[str, Any]) -> bool:
+        """The JQL is listed by an identifier-only search, or by the device's snapshot manifest."""
+        return True
+
+    async def list_scope(self) -> ScopeListing:
         """List every issue the configured JQL matches now, without the ``since`` filter.
 
         Discovery narrows the JQL by ``since`` at the provider, so the scope is
@@ -568,8 +632,11 @@ class JiraGene(Gene):
         ``JIRA_INVENTORY_MAX_RESULTS`` issues. The JQL is a query: an issue it
         no longer matches may still exist (:meth:`confirm_absent`).
         """
-        if str(self.config.get("sync_mode") or "cloud").strip().lower() == "local_agent":
-            return None
+        if _read_by_local_agent(self.config):
+            raise ValueError(
+                "A Jira Source read through the local agent is listed by its device's snapshot manifest, "
+                "not by the server"
+            )
         doc_ids = {
             _issue_doc_id(str(issue["key"]))
             async for issue in self._search_issues(
@@ -581,19 +648,38 @@ class JiraGene(Gene):
         }
         return ScopeListing(kind=ScopeListingKind.QUERY, doc_ids=frozenset(doc_ids))
 
-    async def confirm_absent(self, items: Sequence[ContentItem]) -> frozenset[str]:
+    @classmethod
+    def provider_key(cls, item: ContentItem) -> str:
+        """The issue id, as an issue's Unit records it, or the issue key when the item does not record the id."""
+        return _issue_ref(item)
+
+    @classmethod
+    def confirmation_item(cls, document_id: str, provider_key: str) -> ContentItem:
+        """An issue to read by its id or key, answered under ``document_id``."""
+        issue_ref = _jql_issue_ref(provider_key.strip())
+        return ContentItem(
+            item_id=document_id,
+            title=issue_ref,
+            source_url="",
+            last_modified=datetime.fromtimestamp(0, tz=timezone.utc),
+            content_type="application/json",
+            extra={"issue_id": issue_ref} if issue_ref.isdigit() else {"issue_key": issue_ref},
+        )
+
+    async def confirm_absent(self, items: Sequence[ContentItem]) -> Mapping[str, AbsenceAnswer]:
         """Search the unlisted issues by id in batches; read each one the search does not return.
 
         The batch search is not validated, so an id Jira does not know is
         dropped from the result rather than failing the batch. Every issue the
         search returns exists. One it does not return is read by id: Jira
         answers not found both for a deleted issue and for one the credential
-        may no longer view, and either is absent to this Source.
+        may no longer view, and either is absent to this Source; a refusal
+        for this one issue is hidden.
         """
-        absent: set[str] = set()
+        answers: dict[str, AbsenceAnswer] = {}
         for start in range(0, len(items), JIRA_INVENTORY_MAX_RESULTS):
             batch = items[start:start + JIRA_INVENTORY_MAX_RESULTS]
-            refs = {item.item_id: _issue_ref(item) for item in batch}
+            refs = {item.item_id: _jql_issue_ref(_issue_ref(item)) for item in batch}
             found: set[str] = set()
             async for issue in self._search_issues(
                 f"issuekey in ({', '.join(refs.values())})",
@@ -604,11 +690,16 @@ class JiraGene(Gene):
             ):
                 found.update((str(issue["id"]), str(issue["key"])))
             for doc_id, ref in refs.items():
-                if ref not in found and await atlassian_record_is_gone(
-                    self._request("GET", f"/rest/api/2/issue/{ref}", params={"fields": ",".join(JIRA_IDENTITY_FIELDS)})
-                ):
-                    absent.add(doc_id)
-        return frozenset(absent)
+                answers[doc_id] = (
+                    AbsenceAnswer.EXISTS
+                    if ref in found
+                    else await atlassian_record_state(
+                        self._request(
+                            "GET", f"/rest/api/2/issue/{ref}", params={"fields": ",".join(JIRA_IDENTITY_FIELDS)}
+                        )
+                    )
+                )
+        return answers
 
     async def _discover_remote_search(
         self,
@@ -631,7 +722,6 @@ class JiraGene(Gene):
             else:
                 item.extra["attest_materialized_revision"] = True
             yield item
-        self.attest_discovery_complete("jira_search_total_exhausted")
 
     async def _search_issues(
         self,
@@ -642,7 +732,10 @@ class JiraGene(Gene):
         max_results: int,
         validate_query: bool = True,
     ) -> AsyncIterator[dict]:
-        """Page one JQL search to its declared total, yielding each issue once, or raise."""
+        """Page one JQL search to its declared total, yielding each issue once, or raise.
+
+        A JQL Jira refuses (HTTP 400) raises :class:`JiraQueryRejected`.
+        """
         seen_issue_ids: set[str] = set()
         seen_issue_keys: set[str] = set()
         expected_total: int | None = None
@@ -666,6 +759,11 @@ class JiraGene(Gene):
                     json_body=request_body,
                 )
                 data = resp.json()
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 400:
+                    raise JiraQueryRejected(f"Jira rejected the JQL {jql!r}: {e.response.text[:500]}") from e
+                logger.error("Jira search failed: %s", e)
+                raise RuntimeError(f"Jira search failed: {e}") from e
             except Exception as e:
                 logger.error("Jira search failed: %s", e)
                 raise RuntimeError(f"Jira search failed: {e}") from e
