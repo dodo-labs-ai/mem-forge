@@ -1,5 +1,6 @@
 export { ActionCard } from "./ActionCard";
 export { BackLink } from "./BackLink";
+export { ChoiceGroup, MAX_RADIO_CHOICES, type Choice } from "./ChoiceGroup";
 export { ConfirmDialog } from "./ConfirmDialog";
 export {
   DataTable,
@@ -23,5 +24,6 @@ export { PropertyList, type Property } from "./PropertyList";
 export { SegmentedControl, type SegmentedOption } from "./SegmentedControl";
 export { StatCard } from "./StatCard";
 export { StatusBadge } from "./StatusBadge";
+export { StepRail, type RailStep } from "./StepRail";
 export { toneDot, toneSurface, toneText, type Tone } from "./tone";
 export { useUnsavedChangesGuard } from "./useUnsavedChangesGuard";
