@@ -15,6 +15,9 @@ const SETUP_JOB_SOURCE_TYPES: Readonly<Record<SetupJobOperation, string>> = {
   teams_browse: "teams",
 };
 
+/** The job states a daemon does not change again. */
+const FINISHED: ReadonlySet<string> = new Set(["succeeded", "failed"]);
+
 const MINUTE_MS = 60_000;
 
 /**
@@ -47,7 +50,7 @@ export interface LocalSetupJobMessages {
   timeout: string;
   /** The person may not use local sync in this workspace. */
   forbidden: string;
-  /** Another request of this page is still admitted, so a new one would enqueue a second job. */
+  /** The job of another request of this page is still queued or leased, so a new one would enqueue a second job. */
   busy: string;
   /** The job failed without saying why. */
   failed: string;
@@ -94,7 +97,9 @@ export class LocalSetupJobError<Op extends SetupJobOperation = SetupJobOperation
  *   and read through the host job route by its id.
  * - The admitted job id is kept while the page is open, so when reading the
  *   job fails, running the same request again reads the same job instead of
- *   enqueuing another. A different request while one is admitted is refused.
+ *   enqueuing another. A different request reads the admitted job once: it is
+ *   refused while that job is still queued or leased, and admitted once that
+ *   job has finished or is gone.
  * - Success means the job completed durably. A job that completes as failed
  *   throws a `LocalSetupJobError`; it is never treated as success.
  *
@@ -111,7 +116,16 @@ export function useLocalSetupJob<Op extends SetupJobOperation>(operation: Op, op
       const messages = { ...DEFAULT_MESSAGES, ...options.messages };
       const request = JSON.stringify([sourceId ?? "", payload]);
       try {
-        if (admitted.current && admitted.current.request !== request) throw new Error(messages.busy);
+        if (admitted.current && admitted.current.request !== request) {
+          const previous = await unwrap(
+            api.GET("/api/cloud/local-agent/jobs/{job_id}", { params: { path: { job_id: admitted.current.jobId } } }),
+          ).catch((error: unknown) => {
+            if (isApiErrorStatus(error, HTTP_STATUS.notFound)) return null;
+            throw error;
+          });
+          if (previous && !FINISHED.has(previous.status)) throw new Error(messages.busy);
+          admitted.current = null;
+        }
         if (!admitted.current) {
           const daemon = await queryClient.fetchQuery(localSyncStatusQuery(api)).catch(() => null);
           if (daemon?.status !== "online") throw new Error(messages.offline);
@@ -131,7 +145,7 @@ export function useLocalSetupJob<Op extends SetupJobOperation>(operation: Op, op
               signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
             }),
           );
-          if (job.status === "succeeded" || job.status === "failed") admitted.current = null;
+          if (FINISHED.has(job.status)) admitted.current = null;
           if (job.status === "succeeded") return job.result as SetupJobResults[Op];
           if (job.status === "failed") {
             const result = job.result as Partial<SetupJobResults[Op]>;

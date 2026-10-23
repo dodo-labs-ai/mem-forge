@@ -65,9 +65,35 @@ test("resumes the admitted job after a failed read", async () => {
   });
 
   await expect(run({ payload: { region: "emea" } })).rejects.toThrow();
-  await expect(run({ payload: { region: "amer" } })).rejects.toThrow("Local sync is still working on the previous request.");
   await expect(run({ payload: { region: "emea" } })).resolves.toEqual(BROWSED);
   expect(requested(calls, CREATE)).toBe(1);
+  expect(reads).toBe(2);
+});
+
+test("refuses a different request while the admitted job is still queued or leased", async () => {
+  let reads = 0;
+  const { run, calls } = renderJob("teams_browse", {
+    [READ]: () => (++reads === 1 ? errorResponse(503, "Service unavailable") : { job_id: "laj-1", status: "leased", result: {} }),
+  });
+
+  await expect(run({ payload: { region: "emea" } })).rejects.toThrow();
+  await expect(run({ payload: { region: "amer" } })).rejects.toThrow("Local sync is still working on the previous request.");
+  expect(requested(calls, CREATE)).toBe(1);
+});
+
+test("admits a different request once the admitted job has finished", async () => {
+  let created = 0;
+  let reads = 0;
+  const amer = { ...BROWSED, region: "amer" };
+  const { run, calls } = renderJob("teams_browse", {
+    [CREATE]: () => ({ job_id: `laj-${++created}`, status: "queued" }),
+    [READ]: () => (++reads === 1 ? errorResponse(503, "Service unavailable") : { job_id: "laj-1", status: "succeeded", result: BROWSED }),
+    "GET /api/cloud/local-agent/jobs/laj-2": () => ({ job_id: "laj-2", status: "succeeded", result: amer }),
+  });
+
+  await expect(run({ payload: { region: "emea" } })).rejects.toThrow();
+  await expect(run({ payload: { region: "amer" } })).resolves.toEqual(amer);
+  expect(requested(calls, CREATE)).toBe(2);
   expect(reads).toBe(2);
 });
 
