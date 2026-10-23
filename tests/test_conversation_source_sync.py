@@ -679,7 +679,7 @@ async def test_a_transition_deselects_every_held_conversation_its_target_does_no
     target = _selection(CHAT)
     await workspace.db.upsert_source(
         id=SOURCE_ID, type="teams", name="Teams", config_json=json.dumps(target),
-        access_policy="workspace", owner_user_id="dev",
+        access_policy="workspace", owner_user_id="dev", execution_owner_user_id="dev",
     )
     workspace.config = target
     await workspace.db.create_projection_scope_transition(
