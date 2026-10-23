@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import {
   canConfigureSourceType,
   canDeleteSourceType,
+  hasSetupForm,
   isManagedSourceType,
   userConfigurableGenes,
 } from "../src/views/sources/managedSources.js";
@@ -26,6 +27,9 @@ assert.equal(canDeleteSourceType("confluence"), true);
 assert.equal(canConfigureSourceType("github_repo"), true);
 assert.equal(canDeleteSourceType("github_repo"), true);
 assert.deepEqual(userConfigurableGenes(genes).map((gene) => gene.name), ["confluence", "jira", "teams"]);
+assert.equal(hasSetupForm("teams"), true);
+assert.equal(hasSetupForm("confluence"), true);
+assert.equal(hasSetupForm("notion"), false);
 // hides a source type without a setup form
 assert.deepEqual(
   userConfigurableGenes([
