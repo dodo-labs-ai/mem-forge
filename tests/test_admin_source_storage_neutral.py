@@ -80,7 +80,10 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
         async def get_open_projection_scope_transition(self, source_id: str):
             return None
 
-        async def list_projection_scope_transition_member_doc_ids(self, transition_id: str) -> tuple:
+        async def count_projection_scope_transition_members(self, transition_id: str) -> int:
+            return 0
+
+        async def list_projection_scope_transition_failed_member_doc_ids(self, transition_id: str) -> tuple:
             return ()
 
         async def list_source_item_failures(self, *, source_id: str | None = None) -> tuple:
@@ -245,7 +248,10 @@ def test_source_list_projects_a_retried_sync_as_a_fresh_attempt(tmp_path):
         async def get_open_projection_scope_transition(self, source_id: str):
             return None
 
-        async def list_projection_scope_transition_member_doc_ids(self, transition_id: str) -> tuple:
+        async def count_projection_scope_transition_members(self, transition_id: str) -> int:
+            return 0
+
+        async def list_projection_scope_transition_failed_member_doc_ids(self, transition_id: str) -> tuple:
             return ()
 
         async def list_source_item_failures(self, *, source_id: str | None = None) -> tuple:
@@ -335,7 +341,10 @@ def test_source_projects_route_uses_storage_neutral_admin_reader(tmp_path):
         async def get_open_projection_scope_transition(self, source_id: str):
             return None
 
-        async def list_projection_scope_transition_member_doc_ids(self, transition_id: str) -> tuple:
+        async def count_projection_scope_transition_members(self, transition_id: str) -> int:
+            return 0
+
+        async def list_projection_scope_transition_failed_member_doc_ids(self, transition_id: str) -> tuple:
             return ()
 
         async def list_source_item_failures(self, *, source_id: str | None = None) -> tuple:
@@ -860,7 +869,10 @@ def test_source_schedule_routes_use_storage_neutral_store(tmp_path):
         async def get_open_projection_scope_transition(self, source_id: str):
             return None
 
-        async def list_projection_scope_transition_member_doc_ids(self, transition_id: str) -> tuple:
+        async def count_projection_scope_transition_members(self, transition_id: str) -> int:
+            return 0
+
+        async def list_projection_scope_transition_failed_member_doc_ids(self, transition_id: str) -> tuple:
             return ()
 
         async def list_source_item_failures(self, *, source_id: str | None = None) -> tuple:

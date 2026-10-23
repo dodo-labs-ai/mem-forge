@@ -4,7 +4,8 @@
 
 - The Admin UI shows a Source's scope change in progress and offers a way
   back. Each row of `GET /sources` carries `scope_transition`: both scopes
-  as canonical scope fields, `status`, `members_committed` and
+  as canonical scope fields (`null` for a viewer who cannot read the
+  configuration), `status`, `members_committed` and
   `listed_count` (the items the latest complete listing of the new scope
   holds, a new transition column in both stores, SQLite migration 129; a run
   without a complete listing keeps the stored count), `error`,
@@ -12,12 +13,16 @@
   Documents not committed under the change) and `restore_config`, the
   viewer's configuration with the previous scope's fields, which
   `PUT /sources/{id}` saves as a return to the last applied scope (`null`
-  for a conversation Source or a viewer who cannot change the
-  configuration). The new `POST /sources/{id}/scope-change-preview` answers
-  what saving a configuration would do (`unchanged`, `opens_transition`,
-  `supersedes_transition`, `restores_previous_scope` or `refused` with the
-  409's code, mode and message), decided as the update route decides it,
-  and writes nothing. The V2 Source drawer shows the change, its progress
+  for a conversation Source, a viewer who cannot change the configuration,
+  or a change that already returns there). `PUT /sources/{id}` takes an
+  optional `expected_scope_transition_id` and answers 409
+  `projection_scope_transition_stale` when another change, or none, is in
+  progress. The new `POST /sources/{id}/scope-change-preview` answers what
+  saving a configuration would do (`unchanged`, `opens_transition`,
+  `supersedes_transition`, `restores_previous_scope` when the change closes
+  and none opens, `returns_to_previous_scope` when a change back to the
+  previous scope opens, or `refused` with the 409's code, mode and
+  message), decided as the update route decides it, and writes nothing. The V2 Source drawer shows the change, its progress
   and failed items, and "Restore the previous scope" with a confirmation.
   The V1 configuration dialog, Teams included, warns before saving a change
   into a mode that cannot list or one that replaces the change in progress,

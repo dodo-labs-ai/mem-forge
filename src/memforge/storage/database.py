@@ -8847,6 +8847,31 @@ class Database:
         )
         return tuple(str(row["doc_id"]) for row in rows)
 
+    async def count_projection_scope_transition_members(self, transition_id: str) -> int:
+        """How many Documents have committed under the transition; zero once it is closed."""
+        async with self.db.execute(
+            "SELECT COUNT(*) FROM projection_scope_transition_members WHERE transition_id = ?",
+            (transition_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row is not None else 0
+
+    async def list_projection_scope_transition_failed_member_doc_ids(
+        self,
+        transition_id: str,
+    ) -> tuple[str, ...]:
+        """The Documents committed under the transition that its Source's failure ledger still holds, in doc id order."""
+        rows = await self.db.execute_fetchall(
+            """SELECT m.doc_id
+                 FROM projection_scope_transition_members m
+                 JOIN projection_scope_transitions t ON t.id = m.transition_id
+                 JOIN source_item_failures f ON f.source_id = t.source_id AND f.document_id = m.doc_id
+                WHERE m.transition_id = ?
+                ORDER BY m.doc_id""",
+            (transition_id,),
+        )
+        return tuple(str(row["doc_id"]) for row in rows)
+
     async def _record_projection_scope_transition_member_unlocked(
         self,
         projection: SourceProjection,

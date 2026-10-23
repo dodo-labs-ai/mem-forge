@@ -353,7 +353,9 @@ async def source_scope_transition_payload(
     ``members_committed`` counts the items committed under the change, and
     ``listed_count`` the items the latest complete listing of the target scope
     holds. ``failing_items`` are the failure ledger's rows of Documents not
-    committed under it, which keep it open until a sync commits them. For
+    committed under it: one the target scope lists keeps it open until a sync
+    commits it, and one only the previous scope held is settled when it
+    completes. The listing itself is not stored, so both are shown. For
     example, a Confluence Source changed from space ``ENG`` to ``ENG`` and
     ``OPS`` whose latest sync listed 120 pages, committed 117 and failed 3
     reads ``members_committed`` 117, ``listed_count`` 120 and three failing
@@ -371,8 +373,8 @@ async def source_scope_transition_payload(
         transition,
         canonical_projection_scope(source_type, source.get("config") or {}),
     )
-    members = frozenset(await reader.list_projection_scope_transition_member_doc_ids(transition.id))
-    failing = tuple(failure for failure in failures if failure.document_id not in members)
+    committed = frozenset(await reader.list_projection_scope_transition_failed_member_doc_ids(transition.id))
+    failing = tuple(failure for failure in failures if failure.document_id not in committed)
     return {
         "id": transition.id,
         "status": transition.status.value,
@@ -380,7 +382,7 @@ async def source_scope_transition_payload(
         "target_scope": dict(transition.target_scope),
         "created_at": transition.created_at,
         "updated_at": transition.updated_at,
-        "members_committed": len(members),
+        "members_committed": await reader.count_projection_scope_transition_members(transition.id),
         "listed_count": transition.listed_count,
         "excluded_scopes_due": transition.excluded_scopes_due,
         "error": transition.error,

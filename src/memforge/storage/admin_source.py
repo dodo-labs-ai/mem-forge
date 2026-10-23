@@ -121,11 +121,20 @@ class SourceAdminReader(Protocol):
         """The Source's scope change in progress (``pending``, ``running`` or ``failed``), or ``None``."""
         ...
 
-    async def list_projection_scope_transition_member_doc_ids(
+    async def count_projection_scope_transition_members(self, transition_id: str) -> int:
+        """How many Documents have committed under the transition; zero once it is closed."""
+        ...
+
+    async def list_projection_scope_transition_failed_member_doc_ids(
         self,
         transition_id: str,
     ) -> tuple[str, ...]:
-        """The Documents committed under the transition, in doc id order; empty once it is closed."""
+        """The Documents committed under the transition that its Source's failure ledger still holds.
+
+        For example, with ``doc-a`` and ``doc-b`` committed and the ledger
+        holding ``doc-b`` and ``doc-c``, it returns ``("doc-b",)``: a failure
+        the Source recorded before the Document committed under the change.
+        """
         ...
 
     async def list_source_projects(

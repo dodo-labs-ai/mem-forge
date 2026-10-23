@@ -15,8 +15,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 
+from memforge.local_adapter import default_local_adapter_inbox
 from memforge.release import current_release
 from memforge.server.admin_api import create_admin_app
 from memforge.source_item_failures import SourceItemFailure
@@ -70,9 +72,23 @@ def _client(tmp_path: Path, db: Database) -> TestClient:
     return TestClient(create_admin_app(db=db, config=_config(tmp_path)))
 
 
-def _save(tmp_path: Path, db: Database, config: dict[str, object]):
+def _member_client(tmp_path: Path, db: Database) -> TestClient:
+    """A workspace member who is not the Source's owner, so cannot read or change its configuration."""
+
+    def principal(request: Request) -> str:
+        return "member-b"
+
+    def role(request: Request) -> str:
+        return "member"
+
+    return TestClient(
+        create_admin_app(db=db, config=_config(tmp_path), principal_resolver=principal, workspace_role_resolver=role)
+    )
+
+
+def _save(tmp_path: Path, db: Database, config: dict[str, object], **fields: object):
     with _client(tmp_path, db) as client:
-        return client.put(f"/api/v1/sources/{SOURCE_ID}", json={"config": config})
+        return client.put(f"/api/v1/sources/{SOURCE_ID}", json={"config": config, **fields})
 
 
 def _preview(tmp_path: Path, db: Database, config: dict[str, object]) -> dict:
@@ -179,13 +195,14 @@ async def test_saving_the_restore_configuration_returns_a_listing_source_to_its_
     restore = _row(tmp_path, db)["scope_transition"]["restore_config"]
 
     assert _preview(tmp_path, db, restore) == {
-        "outcome": "restores_previous_scope",
+        "outcome": "returns_to_previous_scope",
         "open_transition": True,
         "refusal": None,
     }
-    response = _save(tmp_path, db, restore)
+    response = _save(tmp_path, db, restore, expected_scope_transition_id=stuck.id)
     back = await db.get_open_projection_scope_transition(SOURCE_ID)
     stored = await db.get_source(SOURCE_ID)
+    returning = _row(tmp_path, db)["scope_transition"]
 
     assert response.status_code == 200, response.text
     assert back.previous_scope == back.target_scope == stuck.previous_scope
@@ -193,6 +210,9 @@ async def test_saving_the_restore_configuration_returns_a_listing_source_to_its_
     assert stored["config"]["page_tree_root"] == "root-a"
     # The redacted secret is kept, not replaced.
     assert stored["config"]["pat_encrypted"] == stored_secret
+    # A change back to the previous scope offers no restore of its own.
+    assert returning["previous_scope"] == returning["target_scope"]
+    assert returning["restore_config"] is None
 
 
 @pytest.mark.asyncio
@@ -225,7 +245,7 @@ async def test_saving_the_restore_configuration_of_a_source_that_cannot_list_clo
     restore = _row(tmp_path, db)["scope_transition"]["restore_config"]
 
     assert _preview(tmp_path, db, restore)["outcome"] == "restores_previous_scope"
-    response = _save(tmp_path, db, restore)
+    response = _save(tmp_path, db, restore, expected_scope_transition_id="scope-transition-into-a-crawl")
 
     assert response.status_code == 200, response.text
     assert await db.get_open_projection_scope_transition(SOURCE_ID) is None
@@ -268,7 +288,7 @@ async def test_the_preview_decides_as_saving_would_and_writes_nothing(db, tmp_pa
         "refusal": None,
     }
     assert _preview(tmp_path, db, _confluence("root-c"))["outcome"] == "supersedes_transition"
-    assert _preview(tmp_path, db, _confluence("root-a"))["outcome"] == "restores_previous_scope"
+    assert _preview(tmp_path, db, _confluence("root-a"))["outcome"] == "returns_to_previous_scope"
     assert [transition.id for transition in await db.list_projection_scope_transitions(SOURCE_ID)] == [opened.id]
 
 
@@ -302,3 +322,86 @@ async def test_a_run_without_a_complete_listing_keeps_the_latest_listed_count(db
     await db.fail_projection_scope_transition(transition.id, run_id="run-2", error="the listing failed")
 
     assert (await db.get_projection_scope_transition(transition.id)).listed_count == 40
+
+
+@pytest.mark.asyncio
+async def test_a_viewer_who_cannot_read_the_configuration_sees_the_progress_but_not_the_scopes(db, tmp_path):
+    await _source(db, "confluence", {**_confluence("root-a"), "pat": "secret"})
+    _save(tmp_path, db, _confluence("root-b"))
+    transition = await db.get_open_projection_scope_transition(SOURCE_ID)
+    await db.start_projection_scope_transition(transition.id, run_id="run-1")
+    await _commit_member(db, transition.id, "page-1")
+    await db.fail_projection_scope_transition(transition.id, run_id="run-1", error="waiting", listed_count=2)
+
+    with _member_client(tmp_path, db) as client:
+        response = client.get("/api/v1/sources")
+    row = next(row for row in response.json()["data"] if row["id"] == SOURCE_ID)
+    summary = row["scope_transition"]
+
+    assert row["capabilities"]["can_configure"] is False
+    assert row["config"] == {}
+    assert (summary["previous_scope"], summary["target_scope"], summary["restore_config"]) == (None, None, None)
+    assert (summary["status"], summary["members_committed"], summary["listed_count"]) == ("failed", 1, 2)
+    assert "root-a" not in response.text and "root-b" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_a_save_that_expects_another_scope_change_is_refused_and_writes_nothing(db, tmp_path):
+    await _source(db, "confluence", {**_confluence("root-a"), "pat": "secret"})
+    _save(tmp_path, db, _confluence("root-b"))
+    seen = await db.get_open_projection_scope_transition(SOURCE_ID)
+    restore = _row(tmp_path, db)["scope_transition"]["restore_config"]
+    # The change completes before the restore is confirmed.
+    await db.start_projection_scope_transition(seen.id, run_id="run-1")
+    await db.complete_projection_scope_transition(seen.id, run_id="run-1")
+
+    restored = _save(tmp_path, db, restore, expected_scope_transition_id=seen.id)
+    renamed = _save(tmp_path, db, _confluence("root-b"), expected_scope_transition_id=seen.id)
+
+    assert (restored.status_code, restored.json()["detail"]) == (409, "projection_scope_transition_stale")
+    assert (renamed.status_code, renamed.json()["detail"]) == (409, "projection_scope_transition_stale")
+    assert (await db.get_source(SOURCE_ID))["config"]["page_tree_root"] == "root-b"
+    assert await db.get_open_projection_scope_transition(SOURCE_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_a_save_that_expects_the_open_scope_change_is_saved(db, tmp_path):
+    await _source(db, "confluence", {**_confluence("root-a"), "pat": "secret"})
+    _save(tmp_path, db, _confluence("root-b"))
+    seen = await db.get_open_projection_scope_transition(SOURCE_ID)
+
+    unchanged = _save(tmp_path, db, _confluence("root-b"), name="Renamed", expected_scope_transition_id=seen.id)
+    superseding = _save(tmp_path, db, _confluence("root-c"), expected_scope_transition_id=seen.id)
+
+    assert unchanged.status_code == superseding.status_code == 200
+    assert (await db.get_open_projection_scope_transition(SOURCE_ID)).predecessor_transition_id == seen.id
+
+
+@pytest.mark.asyncio
+async def test_a_preview_creates_no_local_inbox(db, tmp_path):
+    await _source(
+        db,
+        "local_markdown",
+        {"root": "/vault", "vault_id": "vault-1", "include": ["notes/**"]},
+        execution_owner_user_id="dev",
+    )
+    inbox = default_local_adapter_inbox(_config(tmp_path), SOURCE_ID)
+
+    preview = _preview(tmp_path, db, {"root": "/vault", "vault_id": "vault-1", "include": ["docs/**"]})
+
+    assert preview["outcome"] == "opens_transition"
+    assert not inbox.exists()
+
+
+@pytest.mark.asyncio
+async def test_member_counts_and_failed_members_are_read_without_listing_every_member(db, tmp_path):
+    await _source(db, "confluence", {**_confluence("root-a"), "pat": "secret"})
+    _save(tmp_path, db, _confluence("root-b"))
+    transition = await db.get_open_projection_scope_transition(SOURCE_ID)
+    for doc_id in ("doc-a", "doc-b"):
+        await _commit_member(db, transition.id, doc_id)
+    await _fail_item(db, "doc-b", "timed out")
+    await _fail_item(db, "doc-c", "403 Forbidden")
+
+    assert await db.count_projection_scope_transition_members(transition.id) == 2
+    assert await db.list_projection_scope_transition_failed_member_doc_ids(transition.id) == ("doc-b",)

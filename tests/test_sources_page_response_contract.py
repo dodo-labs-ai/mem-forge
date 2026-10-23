@@ -342,7 +342,10 @@ def test_source_list_validates_rows_shaped_like_the_hana_workspace_store(tmp_pat
         async def get_open_projection_scope_transition(self, source_id: str):
             return None
 
-        async def list_projection_scope_transition_member_doc_ids(self, transition_id: str) -> tuple:
+        async def count_projection_scope_transition_members(self, transition_id: str) -> int:
+            return 0
+
+        async def list_projection_scope_transition_failed_member_doc_ids(self, transition_id: str) -> tuple:
             return ()
 
         async def list_source_item_failures(self, *, source_id: str | None = None) -> tuple:
