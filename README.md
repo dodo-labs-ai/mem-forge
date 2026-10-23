@@ -51,7 +51,7 @@ codex plugin marketplace add dodo-labs-ai/mem-forge
 codex plugin add memory@memforge
 ```
 
-Open **Sources** in the admin UI to connect Confluence, Jira, Notion or another source,
+Open **Sources** in the admin UI to connect Confluence, Jira or another source,
 then start a new agent session and ask:
 
 ```text
