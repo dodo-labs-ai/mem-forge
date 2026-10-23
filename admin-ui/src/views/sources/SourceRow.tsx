@@ -19,6 +19,7 @@ import { formatDuration, timeAgo } from "@/utils/date";
 import { sourceActionLayout } from "./sourceActions";
 import { SourceReadinessAlert } from "./SourceReadinessAlert";
 import { isLocalAgentBackedSource } from "./localAgentSources";
+import { hasSetupForm } from "./managedSources";
 import type { SourceSyncActivity } from "./sourceSyncActivity";
 import {
   sourceSyncActivityBlocksActions,
@@ -35,10 +36,11 @@ import { teamsConversationCount } from "./teamsSourceConfig";
  * menu lives outside this component because its kebab affordance is shared
  * styling that other tests depend on staying in the page module.
  *
- * Action visibility is driven entirely by `source.capabilities` returned by
- * the backend. When the viewer can only subscribe (a non-manager looking at
- * a shared source), the row collapses to a subscription-oriented card
- * without management controls.
+ * Action visibility is driven by `source.capabilities` returned by the
+ * backend. When the viewer can only subscribe (a non-manager looking at a
+ * shared source), the row collapses to a subscription-oriented card without
+ * management controls. Configure is offered only for a source type this UI
+ * has a setup form for; a type set up only in the newer admin UI shows none.
  */
 
 export interface SourceRowLabels {
@@ -115,6 +117,7 @@ export function SourceRow({
 }) {
   const isPaused = source.status === "paused";
   const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
+  const canConfigure = capabilities.can_configure && hasSetupForm(source.type);
   const sharedWorkspace = useSharedWorkspace();
   const localExecution = isLocalAgentBackedSource(source);
   const connectionRequiresAction = source.connection_status?.state === "action_required";
@@ -253,7 +256,7 @@ export function SourceRow({
               <span className="hidden lg:inline">Details</span>
             </Button>
           )}
-          {capabilities.can_configure && (
+          {canConfigure && (
             <Button
               type="button"
               variant="outline"
@@ -335,7 +338,7 @@ export function SourceRow({
       )}
 
       <SourceSyncStatusCard
-        onConfigureScope={capabilities.can_configure && capabilities.can_configure_connection ? () => onConfigure("content") : undefined}
+        onConfigureScope={canConfigure && capabilities.can_configure_connection ? () => onConfigure("content") : undefined}
         activity={actionableSyncActivity}
         sourceName={sourceLabel.name}
         itemLabel={itemLabel}
