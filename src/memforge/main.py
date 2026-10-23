@@ -3373,8 +3373,8 @@ def _run_cloud_local_agent_job(
 
 
 def _setup_result(result: LocalSetupJobResult) -> dict[str, Any]:
-    """Complete a setup job with the fields its handler set, as its model shapes them."""
-    return result.model_dump(exclude_unset=True)
+    """Complete a setup job with every field its model declares, null where the handler set none."""
+    return result.model_dump()
 
 
 def _run_cloud_jira_auth_job(
