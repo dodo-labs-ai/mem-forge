@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- Source setup is described by the server and checked by it in one place.
+  `GET /api/v1/genes/{type}/config-schema` adds each field's labelled
+  `choices`, the `visible_when` conditions that show a field or a choice,
+  an interactive `widget`, `scope` and `fixed_after_create`, each group's
+  `description`, `purpose` and `panels`, and the schema's `project_field`;
+  `GET /api/v1/genes` marks `managed` types. `options` stays, derived from
+  `choices` and deprecated, until the V1 admin UI is removed. The new
+  `POST /api/v1/genes/{type}/config-check` runs save's own steps on a copy
+  and returns the values save would derive (a pasted Confluence page URL
+  names its page tree), facts such as the effective Jira query, and field
+  issues; with `source_id` it needs the access an update needs. Every
+  refused source configuration, on create, update, scope-change preview,
+  discovery preview and repository browse, answers 400 with `detail`
+  `{"code": "config_invalid", "message", "fields": [{"key", "message"}]}`
+  instead of a string. A field is required only while it is visible, so a
+  partial update that omits a required field, and a value its mode hides,
+  are now refused. A save writes the mode the server infers: Confluence
+  `sync_mode` (`page_tree` with a root, else `space`) and Jira `auth_mode`
+  (`pat` when a token is supplied or stored); `GET /sources` shows the
+  effective Jira `auth_mode` of a Source stored without one.
+  For source type authors: `ConfigField.options` is replaced by `choices`
+  (`ConfigOption`), with `ConfigCondition`, `ConfigPanel`, `widget` and
+  group `purpose`, which registration checks; `validate_input` checks only
+  the input as given and may no longer derive a value; hooks refuse a field
+  with `SourceConfigInvalid` and `FieldIssue`
+  (`memforge.genes.toolkit.config`); and `SourceConfigPolicy` gains `facts`.
+
 - A local-agent Jira collection reads each listed issue with a one-issue
   search in the Source's scope, `issuekey = <id> AND (<scope>)`, and, when
   its comments are read apart, confirms its revision with another such
