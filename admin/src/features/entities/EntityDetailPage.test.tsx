@@ -166,6 +166,30 @@ test("a 403 entity_curation_forbidden shows the server message", async () => {
   expect(requestsTo(calls, "GET", "/api/v1/entities/7").length).toBeGreaterThanOrEqual(2);
 });
 
+test("a failed alias change's notice clears when the next change starts", async () => {
+  let failAdd = true;
+  renderAt("/entities/7", {
+    "POST /api/v1/entities/7/aliases": async (request) => {
+      if (failAdd) {
+        failAdd = false;
+        return errorResponse(409, "Alias already belongs to another entity");
+      }
+      const body = (await request.json()) as { alias: string };
+      return { ok: true, alias: body.alias, alias_normalized: body.alias.toLowerCase() };
+    },
+  });
+
+  const input = await screen.findByRole("textbox", { name: "New alias" });
+  await userEvent.type(input, "Payroll cutoff");
+  await userEvent.click(screen.getByRole("button", { name: "Add" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Could not change the entity");
+
+  await userEvent.clear(input);
+  await userEvent.type(input, "Cut off date");
+  await userEvent.click(screen.getByRole("button", { name: "Add" }));
+  await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+});
+
 test("a 403 entity_curation_forbidden on merge closes the dialog and shows the server message", async () => {
   let canCurate = true;
   renderAt("/entities/7", {
