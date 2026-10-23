@@ -9126,6 +9126,17 @@
             "description": "Project routing rule; null leaves the Source's Memories unmapped.",
             "title": "Project Binding"
           },
+          "scope_transition": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceScopeTransitionResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The scope change the Source is applying; null when none is in progress."
+          },
           "status": {
             "enum": [
               "active",
@@ -9187,6 +9198,7 @@
           "memory_count",
           "sync",
           "failed_items",
+          "scope_transition",
           "client",
           "ownership",
           "capabilities",
@@ -9196,6 +9208,197 @@
           "pinned_for_me"
         ],
         "title": "SourceResponse",
+        "type": "object"
+      },
+      "SourceScopeChangePreviewRequest": {
+        "properties": {
+          "config": {
+            "additionalProperties": true,
+            "description": "The configuration the Source would be saved with.",
+            "title": "Config",
+            "type": "object"
+          }
+        },
+        "required": [
+          "config"
+        ],
+        "title": "SourceScopeChangePreviewRequest",
+        "type": "object"
+      },
+      "SourceScopeChangePreviewResponse": {
+        "description": "What saving a configuration would do to the Source's scope, decided as ``PUT /sources/{id}`` decides it.\n\n- ``unchanged``: the scope stays as it is.\n- ``opens_transition``: a scope change opens; nothing is removed until it completes.\n- ``supersedes_transition``: the change replaces the scope change in progress.\n- ``restores_previous_scope``: the change returns to the last applied scope and replaces the\n  change in progress; nothing that scope synced is removed.\n- ``refused``: saving answers 409, as ``refusal`` says.\n\n``open_transition`` says whether a scope change is in progress now.",
+        "properties": {
+          "open_transition": {
+            "title": "Open Transition",
+            "type": "boolean"
+          },
+          "outcome": {
+            "enum": [
+              "unchanged",
+              "opens_transition",
+              "supersedes_transition",
+              "restores_previous_scope",
+              "refused"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "refusal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceScopeChangeRefusalResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "outcome",
+          "open_transition"
+        ],
+        "title": "SourceScopeChangePreviewResponse",
+        "type": "object"
+      },
+      "SourceScopeChangeRefusalResponse": {
+        "description": "Why saving the configuration would be refused (409).",
+        "properties": {
+          "code": {
+            "description": "scope_change_requires_listing, transition_requires_listing, projection_scope_transition_active, source_provider_namespace_immutable or source_execution_mode_immutable.",
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The configured mode that cannot list its scope.",
+            "title": "Mode"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "SourceScopeChangeRefusalResponse",
+        "type": "object"
+      },
+      "SourceScopeTransitionResponse": {
+        "description": "The scope change a Source is applying.\n\nA change of what a Source syncs opens a transition from the last applied\nscope to the new one. Its syncs commit the items the new scope lists,\nand once every listed item has committed, the change completes and what\nthe new scope leaves out is removed. Until then nothing is removed.\n``members_committed`` of ``listed_count`` items have committed; the\ncount is ``null`` until a sync lists the new scope in full.\n``failing_items`` keep the change open until a sync commits them.\n\nSaving ``restore_config`` with ``PUT /sources/{id}`` returns to the\nprevious scope: it replaces the change in progress, and nothing the\nprevious scope synced is removed. It is ``null`` when the viewer cannot\nchange the configuration, or the Source cannot replace a change in\nprogress and waits for it to complete.",
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the latest sync left the change open; null before one did.",
+            "title": "Error"
+          },
+          "excluded_scopes_due": {
+            "description": "Every listed item has committed, and the next sync lists what the previous scope held.",
+            "title": "Excluded Scopes Due",
+            "type": "boolean"
+          },
+          "failing_items": {
+            "$ref": "#/components/schemas/SourceFailedItemsResponse"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "listed_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Listed Count"
+          },
+          "members_committed": {
+            "title": "Members Committed",
+            "type": "integer"
+          },
+          "previous_scope": {
+            "additionalProperties": true,
+            "description": "The canonical scope fields of the last applied scope.",
+            "title": "Previous Scope",
+            "type": "object"
+          },
+          "restore_config": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Restore Config"
+          },
+          "status": {
+            "description": "pending: no sync has worked on the change yet; running: a sync is working on it; failed: the latest sync left it open, as ``error`` says.",
+            "enum": [
+              "pending",
+              "running",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "target_scope": {
+            "additionalProperties": true,
+            "description": "The canonical scope fields of the new scope.",
+            "title": "Target Scope",
+            "type": "object"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "previous_scope",
+          "target_scope",
+          "created_at",
+          "updated_at",
+          "members_committed",
+          "listed_count",
+          "excluded_scopes_due",
+          "error",
+          "failing_items",
+          "restore_config"
+        ],
+        "title": "SourceScopeTransitionResponse",
         "type": "object"
       },
       "SourceSubscriptionRequest": {
@@ -16644,6 +16847,59 @@
           }
         },
         "summary": "Update Source Sync Schedule",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/api/v1/sources/{source_id}/scope-change-preview": {
+      "post": {
+        "description": "What saving this configuration would do to the Source's scope, without saving it.\n\nThe configuration form reads it before saving, to warn about a mode\nthat cannot list a scope change and about replacing the change in\nprogress. It decides as ``PUT /sources/{id}`` does, from the same\nstored facts; a configuration the source type rejects answers 400.",
+        "operationId": "preview_source_scope_change_api_v1_sources__source_id__scope_change_preview_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceScopeChangePreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceScopeChangePreviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Source Scope Change",
         "tags": [
           "sources"
         ]

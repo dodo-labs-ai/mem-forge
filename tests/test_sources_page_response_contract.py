@@ -37,6 +37,7 @@ SOURCE_KEYS = {
     "sync_schedule",
     "sync",
     "failed_items",
+    "scope_transition",
     "client",
     "ownership",
     "capabilities",
@@ -337,6 +338,12 @@ def test_source_list_validates_rows_shaped_like_the_hana_workspace_store(tmp_pat
 
         async def claim_due_scheduled_sources(self, **_: object) -> list[dict]:
             return []
+
+        async def get_open_projection_scope_transition(self, source_id: str):
+            return None
+
+        async def list_projection_scope_transition_member_doc_ids(self, transition_id: str) -> tuple:
+            return ()
 
         async def list_source_item_failures(self, *, source_id: str | None = None) -> tuple:
             return ()

@@ -533,11 +533,15 @@ class RelationalStore(Protocol):
         run_id: str,
         error: str,
         excluded_scopes_due: bool = False,
+        listed_count: int | None = None,
     ) -> ProjectionScopeTransition:
         """Mark the transition held by ``run_id`` failed; it stays open and keeps its member rows.
 
         ``excluded_scopes_due`` records whether the run reached the step that
         lists the excluded scopes; completion and supersession clear it.
+        ``listed_count`` is how many items the run's complete listing of the
+        target scope holds. ``None``, for a run that did not list it in full,
+        keeps the stored count, so Source health shows the latest progress.
         """
         ...
     async def list_projection_scope_transition_member_doc_ids(

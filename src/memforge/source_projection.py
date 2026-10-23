@@ -409,7 +409,8 @@ class ProjectionScopeTransition:
     superseded, or is ``None`` when the change found no open transition.
     ``excluded_scopes_due`` is set while the latest run reached the step that
     lists the excluded scopes and stayed open, so the next device job carries
-    them.
+    them. ``listed_count`` is how many items the latest complete listing of
+    the target scope holds, or ``None`` before a run listed it in full.
     The two scopes differ, except in a transition that supersedes another to
     return to the last applied scope: it lists that scope again, so Units the
     superseded target added are removed when it completes. ``completed_at``
@@ -428,6 +429,7 @@ class ProjectionScopeTransition:
     updated_at: str | None = None
     completed_at: str | None = None
     excluded_scopes_due: bool = False
+    listed_count: int | None = None
 
     def __post_init__(self) -> None:
         if not self.id or not self.source_id:

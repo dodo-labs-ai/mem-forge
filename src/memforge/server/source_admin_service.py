@@ -21,6 +21,7 @@ from memforge.source_access import (
 from memforge.release import current_release
 from memforge.source_artifacts import source_artifact_inference_eligibility
 from memforge.source_item_failures import SourceItemFailure
+from memforge.source_projection_config import canonical_projection_scope, canonical_scope_transition
 from memforge.sync_progress import source_progress_unit, source_sync_progress_from_pipeline
 from memforge.storage.admin_source import SourceAdminReader
 
@@ -231,12 +232,12 @@ async def list_source_admin_rows(
         if not source_type_supports_sync(str(row.get("type") or "")):
             row["sync"] = None
             row["failed_items"] = None
+            row["scope_transition"] = None
             rows.append(row)
             continue
-        row["failed_items"] = source_failed_items_payload(
-            await reader.list_source_item_failures(source_id=source_id),
-            release=current_release(),
-        )
+        failures = await reader.list_source_item_failures(source_id=source_id)
+        row["failed_items"] = source_failed_items_payload(failures, release=current_release())
+        row["scope_transition"] = await source_scope_transition_payload(reader, row, failures)
         durable_run = await reader.get_latest_source_sync_run(
             source_id=source_id,
             workspace_id=workspace_id,
@@ -337,6 +338,54 @@ def source_failed_items_payload(failures: tuple[SourceItemFailure, ...], *, rele
             }
             for failure in listed[:MAX_LISTED_FAILED_ITEMS]
         ],
+    }
+
+
+async def source_scope_transition_payload(
+    reader: SourceAdminReader,
+    source: dict[str, Any],
+    failures: tuple[SourceItemFailure, ...],
+) -> dict[str, Any] | None:
+    """The scope change the Source is applying, as Source health shows it; ``None`` when none is open.
+
+    Both scopes are canonical scope fields, read as the sync reads them
+    (:func:`canonical_scope_transition`), and hold no credential.
+    ``members_committed`` counts the items committed under the change, and
+    ``listed_count`` the items the latest complete listing of the target scope
+    holds. ``failing_items`` are the failure ledger's rows of Documents not
+    committed under it, which keep it open until a sync commits them. For
+    example, a Confluence Source changed from space ``ENG`` to ``ENG`` and
+    ``OPS`` whose latest sync listed 120 pages, committed 117 and failed 3
+    reads ``members_committed`` 117, ``listed_count`` 120 and three failing
+    items. ``restore_config`` is filled by the route, which alone holds the
+    configuration the viewer may read.
+    """
+
+    source_id = str(source.get("id") or "")
+    source_type = str(source.get("type") or "")
+    transition = await reader.get_open_projection_scope_transition(source_id)
+    if transition is None:
+        return None
+    transition = canonical_scope_transition(
+        source_type,
+        transition,
+        canonical_projection_scope(source_type, source.get("config") or {}),
+    )
+    members = frozenset(await reader.list_projection_scope_transition_member_doc_ids(transition.id))
+    failing = tuple(failure for failure in failures if failure.document_id not in members)
+    return {
+        "id": transition.id,
+        "status": transition.status.value,
+        "previous_scope": dict(transition.previous_scope),
+        "target_scope": dict(transition.target_scope),
+        "created_at": transition.created_at,
+        "updated_at": transition.updated_at,
+        "members_committed": len(members),
+        "listed_count": transition.listed_count,
+        "excluded_scopes_due": transition.excluded_scopes_due,
+        "error": transition.error,
+        "failing_items": source_failed_items_payload(failing, release=current_release()),
+        "restore_config": None,
     }
 
 

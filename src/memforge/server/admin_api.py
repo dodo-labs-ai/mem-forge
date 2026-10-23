@@ -233,6 +233,7 @@ from memforge.source_projection import (
 )
 from memforge.source_projection_config import (
     canonical_scope_transition,
+    excluded_scope_config,
     projection_scope_transition_id,
     source_access_context,
 )
@@ -1973,6 +1974,45 @@ class UnrecognizedSessionLinesResponse(BaseModel):
     last_seen_at: str | None
 
 
+class SourceScopeTransitionResponse(BaseModel):
+    """The scope change a Source is applying.
+
+    A change of what a Source syncs opens a transition from the last applied
+    scope to the new one. Its syncs commit the items the new scope lists,
+    and once every listed item has committed, the change completes and what
+    the new scope leaves out is removed. Until then nothing is removed.
+    ``members_committed`` of ``listed_count`` items have committed; the
+    count is ``null`` until a sync lists the new scope in full.
+    ``failing_items`` keep the change open until a sync commits them.
+
+    Saving ``restore_config`` with ``PUT /sources/{id}`` returns to the
+    previous scope: it replaces the change in progress, and nothing the
+    previous scope synced is removed. It is ``null`` when the viewer cannot
+    change the configuration, or the Source cannot replace a change in
+    progress and waits for it to complete.
+    """
+
+    id: str
+    status: Literal["pending", "running", "failed"] = Field(
+        description=(
+            "pending: no sync has worked on the change yet; running: a sync is working on it; "
+            "failed: the latest sync left it open, as ``error`` says."
+        ),
+    )
+    previous_scope: dict[str, Any] = Field(description="The canonical scope fields of the last applied scope.")
+    target_scope: dict[str, Any] = Field(description="The canonical scope fields of the new scope.")
+    created_at: str
+    updated_at: str
+    members_committed: int
+    listed_count: int | None
+    excluded_scopes_due: bool = Field(
+        description="Every listed item has committed, and the next sync lists what the previous scope held.",
+    )
+    error: str | None = Field(description="Why the latest sync left the change open; null before one did.")
+    failing_items: SourceFailedItemsResponse
+    restore_config: dict[str, Any] | None
+
+
 class SourceResponse(BaseModel):
     """One Source as the viewer sees it in the Source List."""
 
@@ -1999,6 +2039,9 @@ class SourceResponse(BaseModel):
     sync: SourceSyncStatusResponse | None
     failed_items: SourceFailedItemsResponse | None = Field(
         description="The Source's failed Documents; null for a Source that does not sync.",
+    )
+    scope_transition: SourceScopeTransitionResponse | None = Field(
+        description="The scope change the Source is applying; null when none is in progress.",
     )
     client: str | None = Field(
         description="The agent client (for example codex or claude-code) of an agent-session Source; null otherwise.",
@@ -2369,6 +2412,48 @@ class UpdateSourceRequest(BaseModel):
     status: str | None = None
     project_binding: dict | None = None
     sync_schedule: SourceSyncScheduleRequest | None = None
+
+
+class SourceScopeChangePreviewRequest(BaseModel):
+    config: dict[str, Any] = Field(description="The configuration the Source would be saved with.")
+
+
+class SourceScopeChangeRefusalResponse(BaseModel):
+    """Why saving the configuration would be refused (409)."""
+
+    code: str = Field(
+        description=(
+            "scope_change_requires_listing, transition_requires_listing, "
+            "projection_scope_transition_active, source_provider_namespace_immutable or "
+            "source_execution_mode_immutable."
+        ),
+    )
+    mode: str | None = Field(default=None, description="The configured mode that cannot list its scope.")
+    message: str | None = None
+
+
+class SourceScopeChangePreviewResponse(BaseModel):
+    """What saving a configuration would do to the Source's scope, decided as ``PUT /sources/{id}`` decides it.
+
+    - ``unchanged``: the scope stays as it is.
+    - ``opens_transition``: a scope change opens; nothing is removed until it completes.
+    - ``supersedes_transition``: the change replaces the scope change in progress.
+    - ``restores_previous_scope``: the change returns to the last applied scope and replaces the
+      change in progress; nothing that scope synced is removed.
+    - ``refused``: saving answers 409, as ``refusal`` says.
+
+    ``open_transition`` says whether a scope change is in progress now.
+    """
+
+    outcome: Literal[
+        "unchanged",
+        "opens_transition",
+        "supersedes_transition",
+        "restores_previous_scope",
+        "refused",
+    ]
+    open_transition: bool
+    refusal: SourceScopeChangeRefusalResponse | None = None
 
 
 def _request_includes_field(model: BaseModel, field_name: str) -> bool:
@@ -2918,6 +3003,101 @@ async def _require_listing_while_a_transition_is_open(
             ),
         },
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfigChange:
+    """A requested configuration as the Source would store it, and the scope change saving it makes."""
+
+    config: dict[str, Any]
+    scope_changed: bool
+    scope_change: _ScopeChange
+
+
+async def _plan_config_change(
+    db: Database,
+    source: Mapping[str, Any],
+    requested: Mapping[str, Any],
+    app_config: AppConfig,
+) -> _ConfigChange:
+    """Prepare ``requested`` as the Source would store it, and plan the scope change saving it makes.
+
+    Saving and previewing a configuration decide alike. A configuration the
+    source type rejects answers 400. A change the Source refuses answers
+    409: another execution mode or provider namespace, or a scope change it
+    cannot apply (:func:`_plan_scope_change`,
+    :func:`_require_listing_while_a_transition_is_open`).
+    """
+
+    source_id = str(source["id"])
+    source_type = str(source["type"])
+    try:
+        incoming_config = _complete_source_config(source_type, dict(requested), source_id, source["config"])
+        _validate_source_config(source_type, incoming_config, existing_config=source["config"])
+        config = prepare_source_config_for_storage(
+            incoming_config,
+            existing_config=source["config"],
+            secret_fields=_source_secret_fields(source_type),
+        )
+        config = _store_source_config(source_type, config, source_id, app_config)
+    except (SecretConfigurationError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if is_local_agent_backed_source(source) != is_local_agent_backed_source({"type": source_type, "config": config}):
+        raise HTTPException(status_code=409, detail="source_execution_mode_immutable")
+    if _provider_namespace_config(source_type, config) != _provider_namespace_config(source_type, source["config"]):
+        raise HTTPException(status_code=409, detail="source_provider_namespace_immutable")
+    current_scope = _sync_scope_config(source_type, source["config"])
+    target_scope = _sync_scope_config(source_type, config)
+    if target_scope == current_scope:
+        await _require_listing_while_a_transition_is_open(db, source, config)
+        return _ConfigChange(config=config, scope_changed=False, scope_change=_ScopeChange(transition=None))
+    return _ConfigChange(
+        config=config,
+        scope_changed=True,
+        scope_change=await _plan_scope_change(db, source, config, current_scope, target_scope),
+    )
+
+
+def _scope_change_outcome(change: _ConfigChange) -> str:
+    """How a planned configuration change moves the Source's scope (``SourceScopeChangePreviewResponse``)."""
+
+    if not change.scope_changed:
+        return "unchanged"
+    scope_change = change.scope_change
+    if scope_change.superseded_transition_id is None:
+        return "opens_transition"
+    transition = scope_change.transition
+    if transition is None or dict(transition.target_scope) == dict(transition.previous_scope):
+        return "restores_previous_scope"
+    return "supersedes_transition"
+
+
+def _scope_change_refusal(detail: Any) -> dict[str, Any]:
+    """The refusal a 409 of a configuration change carries, as its code, mode and message."""
+
+    if isinstance(detail, Mapping):
+        return {"code": str(detail.get("code")), "mode": detail.get("mode"), "message": detail.get("message")}
+    return {"code": str(detail)}
+
+
+def _restore_previous_scope_config(source: Mapping[str, Any], previous_scope: Mapping[str, object]) -> dict[str, Any] | None:
+    """The configuration that returns a Source to the last applied scope of its open transition.
+
+    It is the configuration the viewer reads, with its scope fields replaced
+    by the previous scope's (:func:`excluded_scope_config`); secrets stay
+    redacted and are kept when it is saved. Saving it replaces the change in
+    progress. ``None`` when the viewer cannot change the configuration, or
+    the Source is not a document Source: a conversation Source's open change
+    cannot be replaced.
+    """
+
+    capabilities = source.get("capabilities") or {}
+    source_type = str(source.get("type") or "")
+    if not (capabilities.get("can_configure") and capabilities.get("can_configure_connection")):
+        return None
+    if not _is_document_source_type(source_type):
+        return None
+    return excluded_scope_config(source_type, source.get("config") or {}, previous_scope)
 
 
 def _conversation_gene(source: Mapping[str, Any]) -> ConversationGene | None:
@@ -6666,6 +6846,10 @@ def create_admin_app(
                 s["config"] = _public_source_config(s["type"], s["config"])
             else:
                 s["config"] = {}
+            if s.get("scope_transition") is not None:
+                s["scope_transition"]["restore_config"] = _restore_previous_scope_config(
+                    s, s["scope_transition"]["previous_scope"]
+                )
             # Surface the originating client for agent-session sources so the UI
             # can pick a per-client brand mark without decoding opaque source ids.
             if s["type"] == AGENT_SESSION_SOURCE_TYPE:
@@ -8139,6 +8323,36 @@ def create_admin_app(
             "access_policy": req.access_policy,
         }
 
+    @source_router.post("/{source_id}/scope-change-preview", response_model=SourceScopeChangePreviewResponse)
+    async def preview_source_scope_change(
+        request: Request,
+        source_id: str,
+        req: SourceScopeChangePreviewRequest,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
+        """What saving this configuration would do to the Source's scope, without saving it.
+
+        The configuration form reads it before saving, to warn about a mode
+        that cannot list a scope change and about replacing the change in
+        progress. It decides as ``PUT /sources/{id}`` does, from the same
+        stored facts; a configuration the source type rejects answers 400.
+        """
+
+        existing = await db.get_source(source_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, existing)
+        _require_local_agent_connection_management(request, existing)
+        open_transition = await db.get_open_projection_scope_transition(source_id) is not None
+        try:
+            change = await _plan_config_change(db, existing, req.config, config)
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            return {"outcome": "refused", "open_transition": open_transition, "refusal": _scope_change_refusal(exc.detail)}
+        return {"outcome": _scope_change_outcome(change), "open_transition": open_transition}
+
     @source_router.put("/{source_id}")
     async def update_source(
         request: Request,
@@ -8159,46 +8373,16 @@ def create_admin_app(
         _validate_source_status(req.status)
         name = req.name or existing["name"]
         if req.config is not None:
-            try:
-                incoming_config = _complete_source_config(existing["type"], req.config, source_id, existing["config"])
-                _validate_source_config(existing["type"], incoming_config, existing_config=existing["config"])
-                src_config = prepare_source_config_for_storage(
-                    incoming_config,
-                    existing_config=existing["config"],
-                    secret_fields=_source_secret_fields(existing["type"]),
-                )
-                src_config = _store_source_config(existing["type"], src_config, source_id, config)
-            except (SecretConfigurationError, ValueError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            existing_is_local = is_local_agent_backed_source(existing)
-            updated_is_local = is_local_agent_backed_source({"type": existing["type"], "config": src_config})
-            if existing_is_local != updated_is_local:
-                raise HTTPException(
-                    status_code=409,
-                    detail="source_execution_mode_immutable",
-                )
+            change = await _plan_config_change(db, existing, req.config, config)
         else:
-            src_config = existing["config"]
-        current_projection_scope = _sync_scope_config(existing["type"], existing["config"])
-        target_projection_scope = _sync_scope_config(existing["type"], src_config)
-        scope_changed = req.config is not None and (target_projection_scope != current_projection_scope)
-        namespace_changed = req.config is not None and (
-            _provider_namespace_config(existing["type"], src_config)
-            != _provider_namespace_config(existing["type"], existing["config"])
-        )
-        if namespace_changed:
-            raise HTTPException(
-                status_code=409,
-                detail="source_provider_namespace_immutable",
+            change = _ConfigChange(
+                config=existing["config"],
+                scope_changed=False,
+                scope_change=_ScopeChange(transition=None),
             )
-        if scope_changed:
-            scope_change = await _plan_scope_change(
-                db, existing, src_config, current_projection_scope, target_projection_scope
-            )
-        else:
-            scope_change = _ScopeChange(transition=None)
-            if req.config is not None:
-                await _require_listing_while_a_transition_is_open(db, existing, src_config)
+        src_config = change.config
+        scope_changed = change.scope_changed
+        scope_change = change.scope_change
         auth_secret_changed = req.config is not None and _source_credentials_changed(
             existing["type"],
             req.config,

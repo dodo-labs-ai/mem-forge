@@ -1789,6 +1789,7 @@ class GeneSyncOrchestrator:
                         run_id=transition_run_id,
                         error=outstanding,
                         excluded_scopes_due=family.excluded_scopes_due,
+                        listed_count=family.transition_listed_count,
                     )
                 transition_started = False
 
