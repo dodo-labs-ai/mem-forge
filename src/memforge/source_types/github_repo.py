@@ -18,7 +18,7 @@ def _pushed_by_local_agent(config: Mapping[str, Any]) -> bool:
 def validate_config(config: dict[str, Any], existing_config: Mapping[str, Any] | None = None) -> None:
     from urllib.parse import urlsplit
 
-    from memforge.genes.atlassian_auth import require_https_base_url
+    from memforge.genes.toolkit.config import require_https_base_url
 
     existing_config = existing_config or {}
     if "repo_path" in config:

@@ -21,11 +21,8 @@ import httpx
 from memforge.genes.atlassian_auth import (
     atlassian_record_state,
     atlassian_request_limiter,
-    bearer_headers,
     request_with_rate_limit_retry,
-    require_https_base_url,
     stream_with_rate_limit_retry,
-    tls_verify,
 )
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.document_gene import DocumentGene
@@ -37,6 +34,7 @@ from memforge.genes.local_adapter_packages import (
     read_package_body,
     source_artifacts_from_package,
 )
+from memforge.genes.toolkit.config import bearer_headers, bool_config, require_https_base_url, tls_verify
 from memforge.local_agent.jira_contract import validate_jira_observation_identities
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, source_time_iso
 from memforge.models import (
@@ -212,13 +210,6 @@ def _request_interval_seconds(config: dict) -> float:
         return DEFAULT_REQUEST_INTERVAL_MS / 1000.0
 
 
-def _bool_config(config: dict, key: str, default: bool) -> bool:
-    value = config.get(key, default)
-    if isinstance(value, str):
-        return value.strip().lower() not in {"false", "0", "no", "off"}
-    return bool(value)
-
-
 def _auth_mode(config: dict) -> str:
     configured = config.get("auth_mode")
     if configured is None and (config.get("pat") or config.get("pat_encrypted")):
@@ -270,7 +261,7 @@ def _issue_payload_from_search(issue: dict, config: dict) -> dict:
     fields = payload.get("fields")
     if not isinstance(fields, dict):
         raise RuntimeError("Jira issue response is missing fields")
-    include_comments = _bool_config(config, "include_comments", True)
+    include_comments = bool_config(config, "include_comments", default=True)
 
     if include_comments:
         comments = fields.get("comment")
@@ -887,7 +878,7 @@ class JiraGene(DocumentGene):
         _mark_changelog_completeness(data)
 
         # Fetch comments separately if configured
-        include_comments = _bool_config(self.config, "include_comments", True)
+        include_comments = bool_config(self.config, "include_comments", default=True)
         if include_comments:
             comments_resp = await self._request(
                 "GET",

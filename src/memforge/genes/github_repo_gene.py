@@ -26,6 +26,7 @@ from memforge.genes.local_adapter_packages import (
     source_artifacts_from_package,
 )
 from memforge.genes.local_markdown_gene import _parse_dt, _to_markdown
+from memforge.genes.toolkit.config import int_config, list_config
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSIONS,
     GITHUB_SYMLINK_MODE,
@@ -44,7 +45,6 @@ from memforge.github_repo_utils import (
     github_latest_commit_time,
     github_path_commits_query,
     github_path_in_scope,
-    list_config,
     normalize_github_scope_paths,
     normalize_github_relative_path,
     parse_github_repo_url,
@@ -335,7 +335,7 @@ class GitHubRepoGene(DocumentGene):
         include_paths = github_include_paths(self.config)
         exclude_paths = github_exclude_paths(self.config)
         include_exts = github_include_extensions(self.config)
-        max_files = _int_config(self.config, "max_files", DEFAULT_MAX_FILES)
+        max_files = int_config(self.config, "max_files", default=DEFAULT_MAX_FILES)
         selected = [
             entry
             for entry in entries
@@ -719,7 +719,7 @@ class GitHubRepoGene(DocumentGene):
             if not _package_matches_config(package, self.config):
                 continue
             selected.append((package_path, package))
-        max_files = _int_config(self.config, "max_files", DEFAULT_MAX_FILES)
+        max_files = int_config(self.config, "max_files", default=DEFAULT_MAX_FILES)
         if len(selected) > max_files:
             raise RuntimeError(
                 f"GitHub Repository Internal network / VPN sync matched {len(selected)} files, exceeding max_files={max_files}"
@@ -753,7 +753,7 @@ class GitHubRepoGene(DocumentGene):
             entry for entry in manifest
             if str(entry.get("package_uri") or "").strip() and _package_matches_config(entry, self.config)
         ]
-        max_files = _int_config(self.config, "max_files", DEFAULT_MAX_FILES)
+        max_files = int_config(self.config, "max_files", default=DEFAULT_MAX_FILES)
         if len(selected) > max_files:
             raise RuntimeError(
                 f"GitHub Repository Internal network / VPN sync matched {len(selected)} files, exceeding max_files={max_files}"
@@ -870,13 +870,6 @@ async def _iter_response_chunks(response: requests.Response) -> AsyncIterator[by
             return
         if chunk:
             yield chunk
-
-
-def _int_config(config: dict, key: str, default: int) -> int:
-    try:
-        return max(int(config.get(key, default)), 1)
-    except (TypeError, ValueError):
-        return default
 
 
 def _package_matches_config(package: dict, config: dict) -> bool:

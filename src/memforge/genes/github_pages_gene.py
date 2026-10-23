@@ -18,9 +18,16 @@ from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 import requests
 from bs4 import BeautifulSoup
 
-from memforge.genes.atlassian_auth import require_https_base_url, resolve_pat, tls_verify
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.document_gene import DocumentGene
+from memforge.genes.toolkit.config import (
+    bool_config,
+    int_config,
+    list_config,
+    require_https_base_url,
+    resolve_pat,
+    tls_ca_bundle,
+)
 from memforge.github_repo_utils import (
     decode_github_contents_payload,
     github_latest_commit_time,
@@ -227,7 +234,7 @@ class GitHubPagesGene(DocumentGene):
             headers=headers,
             timeout=30.0,
             follow_redirects=True,
-            verify=tls_verify(self.config),
+            verify=tls_ca_bundle(self.config) or True,
         )
 
     @classmethod
@@ -243,7 +250,7 @@ class GitHubPagesGene(DocumentGene):
             return True
         if _sync_mode(config) != SYNC_MODE_SUBTREE:
             return False
-        return _auth_mode(config) == AUTH_MODE_GITHUB_PAT or _bool_config(config, "sitemap_authoritative", False)
+        return _auth_mode(config) == AUTH_MODE_GITHUB_PAT or bool_config(config, "sitemap_authoritative", default=False)
 
     @classmethod
     def unlisted_scope_mode(cls, config: Mapping[str, Any]) -> UnlistedScopeMode:
@@ -291,7 +298,7 @@ class GitHubPagesGene(DocumentGene):
         """The page of a single-page Source, or the pages of an explicit list."""
         if _sync_mode(self.config) == SYNC_MODE_SINGLE_PAGE:
             return [str(self.config.get("page_url") or "").strip()]
-        return _list_config(self.config.get("pages"))
+        return list_config(self.config.get("pages"))
 
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         mode = _sync_mode(self.config)
@@ -314,7 +321,7 @@ class GitHubPagesGene(DocumentGene):
                 yield item
             return
 
-        if _bool_config(self.config, "sitemap_authoritative", False):
+        if bool_config(self.config, "sitemap_authoritative", default=False):
             # The site declares its sitemap exhaustive: a page it no longer
             # lists is no longer published. A sitemap that cannot be read
             # fails discovery; the link crawl would list less.
@@ -667,7 +674,7 @@ class GitHubPagesGene(DocumentGene):
 
     async def _discover_bfs(self, since: datetime | None) -> AsyncIterator[ContentItem]:
         root_url = self._require_in_site(str(self.config.get("root_url") or ""))
-        max_depth = _int_config(self.config, "max_depth", DEFAULT_MAX_DEPTH)
+        max_depth = int_config(self.config, "max_depth", default=DEFAULT_MAX_DEPTH)
         max_pages = _max_pages(self.config)
         queue: deque[tuple[str, int]] = deque([(root_url, 0)])
         seen: set[str] = set()
@@ -721,7 +728,7 @@ class GitHubPagesGene(DocumentGene):
         if mode == SYNC_MODE_SUBTREE and root:
             if not _path_is_under(canonical_url, root):
                 return False
-        return not _matches_any(canonical_url, _list_config(self.config.get("exclude_url_patterns")))
+        return not _matches_any(canonical_url, list_config(self.config.get("exclude_url_patterns")))
 
 
 class _RequestsAsyncClient:
@@ -773,7 +780,7 @@ def _scope_url_for_config(config: dict) -> str:
     if mode == SYNC_MODE_SUBTREE:
         return str(config.get("root_url") or "")
     if mode == SYNC_MODE_EXPLICIT_LIST:
-        pages = _list_config(config.get("pages"))
+        pages = list_config(config.get("pages"))
         return pages[0] if pages else ""
     return str(config.get("page_url") or "")
 
@@ -783,29 +790,7 @@ def _sync_mode(config: dict) -> str:
 
 
 def _max_pages(config: dict) -> int:
-    return _int_config(config, "max_pages", DEFAULT_MAX_PAGES)
-
-
-def _int_config(config: dict, key: str, default: int) -> int:
-    try:
-        return max(int(config.get(key, default)), 1)
-    except (TypeError, ValueError):
-        return default
-
-
-def _list_config(value: object) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
-    return []
-
-
-def _bool_config(config: dict, key: str, default: bool) -> bool:
-    value = config.get(key, default)
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    return int_config(config, "max_pages", default=DEFAULT_MAX_PAGES)
 
 
 def _canonicalize_url(url: str) -> str:

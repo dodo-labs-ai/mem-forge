@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 from threading import Lock
 from urllib.parse import urlsplit
 
@@ -147,48 +145,6 @@ def release_atlassian_request_limiter(base_url: str, *, owner_id: str) -> None:
             limiter.release(owner_id)
             if not limiter.has_owners:
                 _ATLASSIAN_REQUEST_LIMITERS.pop(key, None)
-
-
-def resolve_pat(config: dict, product_name: str) -> str:
-    """Return a PAT from config or an optional environment-variable reference."""
-    pat = str(config.get("pat") or "").strip()
-    if pat:
-        return pat
-
-    env_var = str(config.get("pat_env_var") or "").strip()
-    if env_var:
-        env_pat = os.environ.get(env_var, "").strip()
-        if env_pat:
-            return env_pat
-
-    raise ValueError(f"{product_name} PAT is required")
-
-
-def bearer_headers(config: dict, product_name: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {resolve_pat(config, product_name)}",
-        "Accept": "application/json",
-    }
-
-
-def tls_verify(config: dict) -> bool | str:
-    validate_tls_ca_bundle(config)
-    ca_bundle = str(config.get("tls_ca_bundle") or "").strip()
-    return ca_bundle or True
-
-
-def validate_tls_ca_bundle(config: dict) -> None:
-    ca_bundle = str(config.get("tls_ca_bundle") or "").strip()
-    if not ca_bundle:
-        return
-    path = Path(ca_bundle).expanduser()
-    if not path.is_file() or not os.access(path, os.R_OK):
-        raise ValueError(f"TLS CA bundle does not exist or is not readable: {ca_bundle}")
-
-
-def require_https_base_url(base_url: str, product_name: str) -> None:
-    if urlsplit(base_url).scheme != "https":
-        raise ValueError(f"{product_name} base_url must use HTTPS when storing authenticated source credentials")
 
 
 async def get_with_rate_limit_retry(

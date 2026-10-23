@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ssl
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock
 
+import certifi
 import httpx
 import pytest
 
@@ -820,7 +823,7 @@ async def test_authenticate_uses_configured_confluence_ca_bundle(monkeypatch, tm
     RecordingAsyncClient.instances.clear()
     monkeypatch.setattr("memforge.genes.confluence_gene.httpx.AsyncClient", RecordingAsyncClient)
     ca_bundle = tmp_path / "corp-ca.pem"
-    ca_bundle.write_text("test-ca", encoding="utf-8")
+    ca_bundle.write_bytes(Path(certifi.where()).read_bytes())
 
     gene = ConfluenceGene(
         config={
@@ -834,7 +837,9 @@ async def test_authenticate_uses_configured_confluence_ca_bundle(monkeypatch, tm
 
     await gene.authenticate()
 
-    assert RecordingAsyncClient.instances[-1].kwargs["verify"] == str(ca_bundle)
+    verify = RecordingAsyncClient.instances[-1].kwargs["verify"]
+    assert isinstance(verify, ssl.SSLContext)
+    assert verify.verify_mode == ssl.CERT_REQUIRED
 
 
 @pytest.mark.asyncio
