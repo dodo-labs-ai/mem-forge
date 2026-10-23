@@ -41,6 +41,11 @@ export interface SourceSyncActivity {
   finishedAt?: string | null;
   nextAttemptAt?: string | null;
   retryTarget?: SourceSyncRetryTarget;
+  /**
+   * Who read the source in this sync: the person's device through the local agent, or the server.
+   * Absent for a server run that only processed what a local sync collected.
+   */
+  collectedBy?: "local_agent" | "server";
   /** Why a finished run removed nothing although it was due to check for deleted items. */
   absenceCheckSkippedReason?: AbsenceCheckSkippedReason | null;
   /** Items a finished run found outside its scope that the source confirmed it still has; they are kept. */
@@ -87,6 +92,7 @@ export function sourceSyncActivityFromLocalJob(job: LocalAgentJob): SourceSyncAc
     nextAttemptAt: job.next_attempt_at,
     retryTarget: job.status === "queued"
       ? { execution_kind: "local_agent_job", execution_id: job.job_id } : undefined,
+    collectedBy: "local_agent",
   };
 }
 
@@ -108,6 +114,7 @@ export function sourceSyncActivityFromStatus(sync: SyncStatus): SourceSyncActivi
     nextAttemptAt: sync.next_attempt_at,
     retryTarget: sync.status === "pending" && sync.run_id
       ? { execution_kind: "source_sync_run", execution_id: sync.run_id } : undefined,
+    collectedBy: sync.trigger === "local_agent" ? undefined : "server",
     absenceCheckSkippedReason: sync.absence_check_skipped_reason,
     unlistedPresentCount: sync.unlisted_present_count,
     skippedReadingGroupCount: sync.skipped_reading_group_count,
@@ -242,7 +249,7 @@ export function presentSourceSyncActivity(
       return {
         message: "Waiting to retry",
         detail: `Next retry ${new Date(activity.nextAttemptAt!).toLocaleString()}`
-          + (activity.error?.message ? `. ${safeFailureDetail(activity.error)}` : ""),
+          + (activity.error?.message ? `. ${safeFailureDetail(activity.error, activity.collectedBy)}` : ""),
       };
     }
     if (activity.retryTarget?.execution_kind === "local_agent_job") {
@@ -260,7 +267,7 @@ export function presentSourceSyncActivity(
       detail: `Last sync matched ${limit.count} files, exceeding its configured limit of ${limit.limit}. Adjust Max Files or narrow the scope, then retry.`,
       configureScope: true,
     };
-    return { message: "Action needed", detail: safeFailureDetail(activity.error) };
+    return { message: "Action needed", detail: safeFailureDetail(activity.error, activity.collectedBy) };
   }
   if (activity.state === "partial" || activity.state === "success") {
     const presentation = withProgress(
@@ -396,11 +403,36 @@ function currentSourceDate(snapshot: SyncProgressSnapshot): string {
 
 // How rate-limit failures read; a bare "429" is not matched, since identifiers in other errors contain those digits.
 const RATE_LIMIT_MARKERS = ["rate limit", "ratelimit", "too many requests"];
+// Errors raised by the AI or embedding provider rather than by the source, as the server labels them.
+const MODEL_PROVIDER_MARKERS = ["litellm", "anthropicexception", "openaiexception", "llm provider", "embedding provider"];
+// A host that cannot be reached: refused or timed-out connections and failed name resolution.
+const CONNECTIVITY_MARKERS = [
+  "all connection attempts failed",
+  "cannot connect to host",
+  "connect call failed",
+  "connect timeout",
+  "connection refused",
+  "connection timed out",
+  "failed to connect",
+  "network is unreachable",
+  "no route to host",
+  "error connecting to",
+  "could not resolve host",
+  "no such host",
+  "name or service not known",
+  "nodename nor servname",
+  "temporary failure in name resolution",
+  "i/o timeout",
+];
+// A sign-in the source rejects; a bare "401" is not matched, for the same reason as "429".
+const SIGN_IN_REJECTED_MARKERS = ["bad credentials", "401 unauthorized", "http 401", "status code 401", "gh auth login"];
 
-function safeFailureDetail(error: SourceSyncActivity["error"]): string {
+function safeFailureDetail(error: SourceSyncActivity["error"], collectedBy?: SourceSyncActivity["collectedBy"]): string {
   const messages = [error?.message, ...(error?.items ?? []).map((item) => item.error)]
     .filter((value): value is string => Boolean(value?.trim()));
   const normalized = messages.join(" ").toLowerCase();
+  const connectivity = CONNECTIVITY_MARKERS.some((marker) => normalized.includes(marker));
+  const modelProvider = MODEL_PROVIDER_MARKERS.some((marker) => normalized.includes(marker));
   if (normalized.includes("teams") && (
     normalized.includes("session expired")
     || normalized.includes("no teams session")
@@ -415,12 +447,12 @@ function safeFailureDetail(error: SourceSyncActivity["error"]): string {
       + "scope, then retry."
     );
   }
-  if (normalized.includes("embedding provider unreachable")) {
+  if (normalized.includes("embedding provider unreachable") || normalized.includes("embedding provider was unreachable")
+    || (normalized.includes("embedding provider") && connectivity)) {
     return "The embedding provider is unavailable. Check its connection, then retry.";
   }
-  if (normalized.includes("llm provider unreachable") || (
-    normalized.includes("litellm") && isConnectivityFailure(normalized)
-  )) {
+  if (normalized.includes("llm provider unreachable") || normalized.includes("llm provider was unreachable")
+    || (modelProvider && connectivity)) {
     return "The AI provider is unavailable. Check its connection, then retry.";
   }
   if (RATE_LIMIT_MARKERS.some((marker) => normalized.includes(marker))) {
@@ -432,20 +464,29 @@ function safeFailureDetail(error: SourceSyncActivity["error"]): string {
   if (normalized.includes("certificate_verify_failed") || normalized.includes("certificate verify")) {
     return "The source certificate could not be verified. Check the connection, then retry.";
   }
+  // The remaining rules describe the source itself, so they apply only to a sync that read the source.
+  if (modelProvider || !collectedBy) {
+    return "Sync failed. Retry when ready.";
+  }
+  if (normalized.includes("no jira browser session") || (
+    normalized.includes("jira browser session") && (normalized.includes("expired") || normalized.includes("not accepted"))
+  )) {
+    return "The Jira browser session has expired. Sign in to Jira, then refresh it in Configure.";
+  }
+  if (SIGN_IN_REJECTED_MARKERS.some((marker) => normalized.includes(marker))) {
+    if (collectedBy === "server") {
+      return "The access token has expired or was revoked. Update it in Configure, then retry.";
+    }
+    return normalized.includes("github cli") || normalized.includes("gh auth")
+      ? "Sign in to the GitHub CLI on this device, then retry sync."
+      : "The source rejected the sign-in on this device. Sign in again, then retry.";
+  }
+  if (connectivity) {
+    return collectedBy === "local_agent"
+      ? "The source could not be reached from this device. Check your network or VPN, then retry."
+      : "The server could not reach the source. Check its address, or use Local sync if it is on your network.";
+  }
   return "Sync failed. Retry when ready.";
-}
-
-function isConnectivityFailure(value: string): boolean {
-  return [
-    "all connection attempts failed",
-    "cannot connect to host",
-    "connect call failed",
-    "connect timeout",
-    "connection refused",
-    "connection timed out",
-    "failed to connect",
-    "network is unreachable",
-  ].some((marker) => value.includes(marker));
 }
 
 function repositoryFileLimit(error: SourceSyncActivity["error"]): { count: string; limit: string } | null {
