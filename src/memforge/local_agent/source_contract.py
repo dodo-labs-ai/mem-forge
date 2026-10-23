@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any
 
+from memforge.local_agent.snapshot_manifest import UPSERT
 from memforge.source_types import registered_source_types, source_type_descriptor
 
 
@@ -30,7 +31,7 @@ LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS = frozenset(
 )
 LOCAL_AGENT_JOB_MAX_ATTEMPTS = 5
 LOCAL_AGENT_SEMANTIC_INPUT_VERSION = "canonical-v1"
-LOCAL_PACKAGE_CONTRACT_VERSION = 2
+LOCAL_PACKAGE_CONTRACT_VERSION = 3
 """The package contract this local agent collects under, declared in its manifest.
 
 An agent that declares no version predates the numbered contract.
@@ -41,6 +42,12 @@ LOCAL_PACKAGE_SOURCE_TIME_CONTRACT_VERSION = 2
 A collection under this contract or a later one does not reuse a retained file
 package without a source time, so the agent uploads that file once more with
 its time (design ``source-sync-to-memory.md`` 0.9).
+"""
+LOCAL_PACKAGE_CONFIRMATION_CONTRACT_VERSION = 3
+"""The first contract under which an agent confirms by identifier what its query manifest leaves out.
+
+The manifest response then names the items to confirm, and the agent posts
+its answers before it asks for processing.
 """
 TEAMS_ROLLING_RETENTION_PRESETS = (365, 730, 1095)
 # Every sync polls the whole Initial History, so it is bounded, and by the
@@ -219,17 +226,6 @@ def local_agent_collection_attempt_id(
     return canonical
 
 
-def local_agent_collection_is_authoritative(source_type: object) -> bool:
-    """Return whether one attempt proves the complete source collection."""
-
-    from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
-
-    try:
-        return get_local_source_replay_adapter(str(source_type or "").strip().lower()).authoritative_collection
-    except ValueError:
-        return False
-
-
 def local_agent_input_sha256(doc_id: object, document_hash: object) -> str:
     """Hash stable document identity and semantic content version."""
     normalized_doc_id = str(doc_id or "").strip()
@@ -294,6 +290,14 @@ def local_package_requires_source_time(
     except ValueError:
         return False
     return adapter.package_source_time
+
+
+def local_package_confirms_absence(package_contract_version: int | None) -> bool:
+    """Whether an agent collecting under this package contract confirms unlisted items by identifier."""
+
+    return package_contract_version is not None and (
+        package_contract_version >= LOCAL_PACKAGE_CONFIRMATION_CONTRACT_VERSION
+    )
 
 
 def _source_config(value: object) -> Mapping[str, Any]:
@@ -366,13 +370,44 @@ def local_agent_job_config(
     return {key: value for key, value in source_config.items() if key in collection.job_config_fields}
 
 
-def local_agent_sync_job_payload(
+LOCAL_AGENT_TRANSITION_PAYLOAD_FIELD = "projection_scope_transition"
+"""The job payload field naming the Source's open scope transition and its canonical scopes."""
+LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD = "excluded_scopes"
+"""The job payload field carrying the configuration of each scope an open transition excludes.
+
+Each entry is ``{"scope_key": ..., "config": ...}``: the scope's fingerprint,
+which the device's manifest names its listing by, and the job configuration
+that lists that scope. A device collector removes both transition fields
+before it configures its Gene.
+"""
+LOCAL_AGENT_TRANSITION_PAYLOAD_FIELDS = frozenset(
+    {LOCAL_AGENT_TRANSITION_PAYLOAD_FIELD, LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD}
+)
+"""The job payload fields about the open scope transition, which never reach a device Gene's configuration."""
+
+
+async def local_agent_sync_job_payload(
+    db: Any,
     source: Mapping[str, Any],
     request_payload: Mapping[str, Any] | str | None = None,
 ) -> dict[str, Any]:
-    """Return the canonical daemon sync-job payload for a saved source."""
+    """The daemon sync-job payload for a saved Source, as of the moment the job is enqueued.
+
+    Every place that enqueues a local-agent sync job builds its payload here:
+    the saved collection configuration, the request's control fields, and,
+    while a document scope transition is open, that transition. Once the
+    transition's previous run left no listed Document that is not yet a member,
+    the next run can complete it, so the payload also carries the configuration
+    of every distinct scope the transition excludes, for the device to list
+    (:data:`LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD`). Only a query listing
+    needs them; an existence listing completes from the new listing alone.
+    """
+
+    from memforge.source_projection_config import canonical_projection_scope, canonical_scope_transition
+
     source_type = str(source.get("type") or "").strip()
-    payload = local_agent_job_config(source_type, source.get("config"))
+    config = _source_config(source.get("config"))
+    payload = local_agent_job_config(source_type, config)
     payload.update(
         {
             key: value
@@ -383,7 +418,81 @@ def local_agent_sync_job_payload(
     payload["source_id"] = str(source.get("id") or "").strip()
     payload["source_type"] = source_type
     payload["source_config_revision"] = local_agent_source_config_revision(source)
+    transition = await db.get_open_projection_scope_transition(payload["source_id"])
+    if transition is None:
+        return payload
+    transition = canonical_scope_transition(source_type, transition, canonical_projection_scope(source_type, config))
+    payload[LOCAL_AGENT_TRANSITION_PAYLOAD_FIELD] = {
+        "id": transition.id,
+        "previous_scope": dict(transition.previous_scope),
+        "target_scope": dict(transition.target_scope),
+    }
+    excluded_scopes = await _excluded_scope_job_configs(db, source_type, config, transition)
+    if excluded_scopes:
+        payload[LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD] = excluded_scopes
     return payload
+
+
+async def _excluded_scope_job_configs(
+    db: Any,
+    source_type: str,
+    config: Mapping[str, Any],
+    transition: Any,
+) -> list[dict[str, Any]]:
+    """The job configuration of each scope the transition excludes, once its next run can complete it.
+
+    The next run can complete it when the transition's latest run reached the
+    step that lists the excluded scopes (``excluded_scopes_due``), or when
+    that run, bound to a device snapshot, listed only Documents that are
+    already members. Before any such run, and while a listed Document waits
+    for anything but the removals completion makes, none is carried.
+    """
+
+    from memforge.genes.family import CollectionFamilyKind
+    from memforge.models import ScopeListingKind
+    from memforge.source_projection_config import (
+        ExcludedScopesUnavailable,
+        excluded_projection_scopes,
+        excluded_scope_config,
+        projection_scope_fingerprint,
+    )
+
+    descriptor = source_type_descriptor(source_type)
+    if descriptor is None or descriptor.local_agent is None or descriptor.family is not CollectionFamilyKind.DOCUMENT:
+        return []
+    if descriptor.gene_class().snapshot_listing_kind() is not ScopeListingKind.QUERY:
+        return []
+    if not transition.excluded_scopes_due and not await _previous_run_left_none_waiting(db, transition):
+        return []
+    try:
+        scopes = await excluded_projection_scopes(db, transition, source_type=source_type, config=config)
+    except ExcludedScopesUnavailable:
+        return []
+    return [
+        {
+            "scope_key": projection_scope_fingerprint(scope),
+            "config": local_agent_job_config(source_type, excluded_scope_config(source_type, config, scope)),
+        }
+        for scope in scopes
+    ]
+
+
+async def _previous_run_left_none_waiting(db: Any, transition: Any) -> bool:
+    """Whether the transition's latest run, bound to a device snapshot, listed only Documents that are members."""
+
+    if transition.run_id is None:
+        return False
+    run = await db.get_source_sync_run(transition.run_id)
+    if run is None or run.input_snapshot_id is None:
+        return False
+    listed = snapshot_document_ids(
+        await db.list_source_sync_inputs(
+            source_id=transition.source_id,
+            workspace_id=run.workspace_id,
+            input_snapshot_id=run.input_snapshot_id,
+        )
+    )
+    return not listed - set(await db.list_projection_scope_transition_member_doc_ids(transition.id))
 
 
 def local_agent_source_config_revision(source: Mapping[str, Any]) -> str:
@@ -433,32 +542,58 @@ def source_sync_input_metadata_with_artifact_attestation(
     return result
 
 
+def _manifest_entry(source_input: Any) -> tuple[str, Mapping[str, Any]] | None:
+    """The Document id and manifest entry one raw input carries, if it names both."""
+
+    metadata = getattr(source_input, "metadata", {})
+    entry = metadata.get("manifest_entry") if isinstance(metadata, Mapping) else None
+    if not isinstance(entry, Mapping):
+        return None
+    doc_id = str(entry.get("doc_id") or "").strip()
+    raw_uri = str(getattr(source_input, "raw_uri", "") or "").strip()
+    if not doc_id or not raw_uri:
+        return None
+    return doc_id, entry
+
+
+def snapshot_document_ids(inputs: list[Any]) -> frozenset[str]:
+    """The Documents a complete input snapshot holds: every item it names.
+
+    An item stored as a tombstone, which only a manifest written before every
+    item was an upsert can hold, names a Document the snapshot does not hold.
+    """
+
+    return frozenset(
+        doc_id
+        for source_input in inputs
+        if (named := _manifest_entry(source_input)) is not None
+        for doc_id, entry in (named,)
+        if str(entry.get("change_kind") or UPSERT) == UPSERT
+    )
+
+
 def source_with_sync_inputs(
     source: Mapping[str, Any],
     inputs: list[Any],
     *,
     input_snapshot_supplied: bool = False,
-    authoritative_snapshot: bool = False,
 ) -> dict[str, Any]:
     """Project immutable raw inputs into the connector's runtime manifest.
 
-    Snapshot presence and snapshot authority are separate facts.  In
-    particular, an incremental local collection may legitimately supply an
-    empty snapshot without claiming complete provider coverage.
+    A run bound to an input snapshot gets a manifest even when the snapshot
+    is empty, because an empty complete snapshot says the scope holds nothing.
     """
     latest_entries: dict[str, dict[str, Any]] = {}
     for source_input in sorted(
         inputs,
         key=lambda item: int(getattr(item, "input_generation", 0)),
     ):
+        named = _manifest_entry(source_input)
+        if named is None:
+            continue
+        doc_id, entry = named
         metadata = getattr(source_input, "metadata", {})
-        entry = metadata.get("manifest_entry") if isinstance(metadata, Mapping) else None
-        if not isinstance(entry, Mapping):
-            continue
-        doc_id = str(entry.get("doc_id") or "").strip()
         raw_uri = str(getattr(source_input, "raw_uri", "") or "").strip()
-        if not doc_id or not raw_uri:
-            continue
         package_sha256 = str(metadata.get("package_sha256") or "").strip()
         projected_entry = {
             **entry,
@@ -468,7 +603,7 @@ def source_with_sync_inputs(
         }
         latest_entries[doc_id] = projected_entry
     projected = dict(source)
-    if latest_entries or input_snapshot_supplied or authoritative_snapshot:
+    if latest_entries or input_snapshot_supplied:
         config = dict(_source_config(source.get("config")))
         config["local_agent_package_manifest"] = list(latest_entries.values())
         projected["config"] = config

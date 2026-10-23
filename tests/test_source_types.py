@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 
 from memforge.genes import GENE_REGISTRY
-from memforge.genes.conversation_gene import ConversationGene
+from memforge.genes import source_rediscovers_documents
+from memforge.genes.base import Gene
+from memforge.genes.document_gene import DocumentGene
+from memforge.genes.family import CollectionFamilyKind
+from memforge.models import ScopeListingKind
 from memforge.source_types import (
     SourceTypeDescriptor,
     load_reference,
@@ -32,7 +36,7 @@ def test_every_builtin_source_type_has_one_complete_descriptor() -> None:
         assert gene_cls.metadata().name == source_type
         assert GENE_REGISTRY[source_type] is gene_cls
         assert descriptor.evidence_profiles, source_type
-        if issubclass(gene_cls, ConversationGene):
+        if descriptor.family is CollectionFamilyKind.CONVERSATION:
             # Conversation Units are cut by the conversation layer, not by the adapter.
             assert descriptor.project_native is None
         else:
@@ -71,3 +75,57 @@ def test_a_reference_that_cannot_load_fails_loudly() -> None:
         load_reference("memforge.genes.no_such_gene:NoSuchGene")
     with pytest.raises(ValueError, match="module:name"):
         load_reference("memforge.genes.jira_gene")
+
+
+BUILTIN_FAMILIES = {
+    "agent_session": None,
+    "confluence": CollectionFamilyKind.DOCUMENT,
+    "github_pages": CollectionFamilyKind.DOCUMENT,
+    "github_repo": CollectionFamilyKind.DOCUMENT,
+    "jira": CollectionFamilyKind.DOCUMENT,
+    "local_markdown": CollectionFamilyKind.DOCUMENT,
+    "teams": CollectionFamilyKind.CONVERSATION,
+}
+
+BUILTIN_LISTING_KINDS = {
+    "confluence": {ScopeListingKind.QUERY},
+    "github_pages": {ScopeListingKind.EXISTENCE},
+    "github_repo": {ScopeListingKind.EXISTENCE},
+    "jira": {ScopeListingKind.QUERY},
+    "local_markdown": {ScopeListingKind.EXISTENCE},
+}
+
+
+def test_a_source_types_family_follows_its_gene_class() -> None:
+    assert {d.source_type: d.family for d in registered_source_types()} == BUILTIN_FAMILIES
+
+
+def test_every_document_gene_declares_its_listing_kinds() -> None:
+    declared = {
+        d.source_type: set(d.gene_class().listing_kinds)
+        for d in registered_source_types()
+        if d.family is CollectionFamilyKind.DOCUMENT
+    }
+    assert declared == BUILTIN_LISTING_KINDS
+
+
+def test_listing_and_rediscovery_belong_to_document_genes_only() -> None:
+    document_members = {
+        "lists_scope",
+        "list_scope",
+        "confirm_absent",
+        "record_scope_listing",
+        "rediscover",
+        "rediscovers_documents",
+    }
+    assert not document_members & set(dir(Gene))
+    assert document_members <= set(dir(DocumentGene))
+    teams = source_type_descriptor("teams").gene_class()
+    assert not document_members & set(dir(teams))
+
+
+def test_only_a_document_source_rediscovers_documents() -> None:
+    assert source_rediscovers_documents("jira", {"base_url": "https://jira.example"})
+    assert not source_rediscovers_documents("teams", {})
+    assert not source_rediscovers_documents("agent_session", {})
+    assert not source_rediscovers_documents("outlook", {})

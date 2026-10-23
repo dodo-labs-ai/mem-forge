@@ -31,7 +31,7 @@ async def _queued_retry(db):
         execution_owner_user_id="owner",
         created_by_user_id="owner",
     )
-    payload = local_agent_sync_job_payload(await db.get_source("src-retry"))
+    payload = await local_agent_sync_job_payload(db, await db.get_source("src-retry"))
     await db.enqueue_local_agent_job(
         job_id="laj-retry",
         source_id="src-retry",

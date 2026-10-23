@@ -6,7 +6,11 @@ from typing import Any
 
 from memforge.source_adapters import teams as adapter
 from memforge.source_types.config import SourceConfigPolicy
-from memforge.source_types.descriptor import LocalAgentCollection, SourceTypeDescriptor
+from memforge.source_types.descriptor import (
+    ConversationProviderReference,
+    LocalAgentCollection,
+    SourceTypeDescriptor,
+)
 
 
 def _job_config_defaults(config: dict[str, Any]) -> dict[str, Any]:
@@ -54,4 +58,8 @@ DESCRIPTOR = SourceTypeDescriptor(
         job_config_defaults=_job_config_defaults,
     ),
     config=SourceConfigPolicy(public=_public_config),
+    conversation_provider=ConversationProviderReference(
+        provider="memforge.genes.teams_provider:TeamsConversationProvider",
+        factory="memforge.genes.teams_provider:open_teams_provider",
+    ),
 )

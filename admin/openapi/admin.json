@@ -3148,13 +3148,134 @@
         "title": "LocalCollectionReceiptResponse",
         "type": "object"
       },
+      "LocalSourceConfirmationAnswerRequest": {
+        "description": "The device's answer for one item its manifest response asked it to confirm.",
+        "properties": {
+          "answer": {
+            "enum": [
+              "absent",
+              "exists",
+              "hidden"
+            ],
+            "title": "Answer",
+            "type": "string"
+          },
+          "doc_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Doc Id",
+            "type": "string"
+          },
+          "provider_key": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Provider Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "doc_id",
+          "provider_key",
+          "answer"
+        ],
+        "title": "LocalSourceConfirmationAnswerRequest",
+        "type": "object"
+      },
+      "LocalSourceConfirmationsRequest": {
+        "description": "A device's answers for the items its query manifest left out, bound to that manifest.\n\n``manifest_sha256`` is the digest the manifest response returned, and the\njob attempt is the one that submitted the manifest. The request answers\nevery item the response named in ``confirm``, or, when the device could\nnot confirm them, gives ``failure_cause`` and no answers.",
+        "properties": {
+          "answers": {
+            "items": {
+              "$ref": "#/components/schemas/LocalSourceConfirmationAnswerRequest"
+            },
+            "maxItems": 10000,
+            "title": "Answers",
+            "type": "array"
+          },
+          "failure_cause": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Cause"
+          },
+          "local_agent_attempt_count": {
+            "minimum": 1.0,
+            "title": "Local Agent Attempt Count",
+            "type": "integer"
+          },
+          "local_agent_job_id": {
+            "title": "Local Agent Job Id",
+            "type": "string"
+          },
+          "manifest_sha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Manifest Sha256",
+            "type": "string"
+          },
+          "sync_snapshot_id": {
+            "title": "Sync Snapshot Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sync_snapshot_id",
+          "local_agent_job_id",
+          "local_agent_attempt_count",
+          "manifest_sha256"
+        ],
+        "title": "LocalSourceConfirmationsRequest",
+        "type": "object"
+      },
+      "LocalSourceExcludedListingRequest": {
+        "description": "What the device listed in one scope its job's open transition excludes, or that the provider rejected it.\n\n``scope_key`` is the key the job named the scope by. A listing holds the\nDocument ids the scope lists, up to the manifest's item bound. A\ndefinitive rejection, such as a JQL the provider refuses, gives its cause\nin ``rejection`` and lists nothing.",
+        "properties": {
+          "doc_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10000,
+            "title": "Doc Ids",
+            "type": "array"
+          },
+          "rejection": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rejection"
+          },
+          "scope_key": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Scope Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope_key"
+        ],
+        "title": "LocalSourceExcludedListingRequest",
+        "type": "object"
+      },
       "LocalSourceManifestItemRequest": {
+        "description": "One item of a device manifest: the item as the device read it.",
         "properties": {
           "change_kind": {
-            "enum": [
-              "upsert",
-              "tombstone"
-            ],
+            "const": "upsert",
             "title": "Change Kind",
             "type": "string"
           },
@@ -3180,16 +3301,20 @@
         "type": "object"
       },
       "LocalSourceManifestRequest": {
-        "description": "One covered local collection, planned against the retained packages.\n\n``package_contract_version`` is the package contract the local agent\ncollects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates\nthe numbered contract sends none.",
+        "description": "One complete local collection, planned against the retained packages.\n\nA device manifest lists the complete item set of its scope, so it declares\n``complete_snapshot`` coverage and every item an ``upsert``.\n``package_contract_version`` is the package contract the local agent\ncollects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates\nthe numbered contract sends none. ``excluded_listings`` answers the\nexcluded scopes the job carried, one entry per scope at most.",
         "properties": {
           "coverage": {
-            "enum": [
-              "complete_snapshot",
-              "bounded_delta",
-              "partial"
-            ],
+            "const": "complete_snapshot",
             "title": "Coverage",
             "type": "string"
+          },
+          "excluded_listings": {
+            "items": {
+              "$ref": "#/components/schemas/LocalSourceExcludedListingRequest"
+            },
+            "maxItems": 100,
+            "title": "Excluded Listings",
+            "type": "array"
           },
           "items": {
             "items": {
@@ -9001,6 +9126,17 @@
             "description": "Project routing rule; null leaves the Source's Memories unmapped.",
             "title": "Project Binding"
           },
+          "scope_transition": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceScopeTransitionResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The scope change the Source is applying; null when none is in progress."
+          },
           "status": {
             "enum": [
               "active",
@@ -9062,6 +9198,7 @@
           "memory_count",
           "sync",
           "failed_items",
+          "scope_transition",
           "client",
           "ownership",
           "capabilities",
@@ -9071,6 +9208,212 @@
           "pinned_for_me"
         ],
         "title": "SourceResponse",
+        "type": "object"
+      },
+      "SourceScopeChangePreviewRequest": {
+        "properties": {
+          "config": {
+            "additionalProperties": true,
+            "description": "The configuration the Source would be saved with.",
+            "title": "Config",
+            "type": "object"
+          }
+        },
+        "required": [
+          "config"
+        ],
+        "title": "SourceScopeChangePreviewRequest",
+        "type": "object"
+      },
+      "SourceScopeChangePreviewResponse": {
+        "description": "What saving a configuration would do to the Source's scope, decided as ``PUT /sources/{id}`` decides it.\n\n- ``unchanged``: the scope stays as it is.\n- ``opens_transition``: a scope change opens; nothing is removed until it completes.\n- ``supersedes_transition``: the change replaces the scope change in progress.\n- ``restores_previous_scope``: the change returns to the last applied scope, which the\n  configuration cannot list. The change in progress closes, none opens, and nothing is removed.\n- ``returns_to_previous_scope``: the change returns to the last applied scope and replaces the\n  change in progress with a change back to it. Nothing that scope synced is removed; once a\n  sync lists it in full, what only the replaced change added is removed.\n- ``refused``: saving answers 409, as ``refusal`` says.\n\n``open_transition`` says whether a scope change is in progress now.",
+        "properties": {
+          "open_transition": {
+            "title": "Open Transition",
+            "type": "boolean"
+          },
+          "outcome": {
+            "enum": [
+              "unchanged",
+              "opens_transition",
+              "supersedes_transition",
+              "restores_previous_scope",
+              "returns_to_previous_scope",
+              "refused"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "refusal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceScopeChangeRefusalResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "outcome",
+          "open_transition"
+        ],
+        "title": "SourceScopeChangePreviewResponse",
+        "type": "object"
+      },
+      "SourceScopeChangeRefusalResponse": {
+        "description": "Why saving the configuration would be refused (409).",
+        "properties": {
+          "code": {
+            "description": "scope_change_requires_listing, transition_requires_listing, projection_scope_transition_active, source_provider_namespace_immutable or source_execution_mode_immutable.",
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The configured mode that cannot list its scope.",
+            "title": "Mode"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "SourceScopeChangeRefusalResponse",
+        "type": "object"
+      },
+      "SourceScopeTransitionResponse": {
+        "description": "The scope change a Source is applying.\n\nA change of what a Source syncs opens a transition from the last applied\nscope to the new one. Its syncs commit the items the new scope lists,\nand once every listed item has committed, the change completes and what\nthe new scope leaves out is removed. Until then nothing is removed.\n``members_committed`` of ``listed_count`` items have committed; the\ncount is ``null`` until a sync lists the new scope in full.\n``failing_items`` are the failed items not yet committed under the\nchange; one the new scope lists keeps it open until a sync commits it,\nand one only the previous scope held is settled when the change\ncompletes.\n\nSaving ``restore_config`` with ``PUT /sources/{id}``, with this\ntransition's ``id`` as ``expected_scope_transition_id``, returns to the\nprevious scope: it replaces the change in progress, and nothing the\nprevious scope synced is removed. It is ``null`` when the viewer cannot\nchange the configuration, the Source cannot replace a change in progress\nand waits for it to complete, or the change already returns to the\nprevious scope.",
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the latest sync left the change open; null before one did.",
+            "title": "Error"
+          },
+          "excluded_scopes_due": {
+            "description": "Every listed item has committed, and the next sync lists what the previous scope held.",
+            "title": "Excluded Scopes Due",
+            "type": "boolean"
+          },
+          "failing_items": {
+            "$ref": "#/components/schemas/SourceFailedItemsResponse"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "listed_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Listed Count"
+          },
+          "members_committed": {
+            "title": "Members Committed",
+            "type": "integer"
+          },
+          "previous_scope": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The canonical scope fields of the last applied scope; null when the viewer cannot read the configuration.",
+            "title": "Previous Scope"
+          },
+          "restore_config": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Restore Config"
+          },
+          "status": {
+            "description": "pending: no sync has worked on the change yet; running: a sync is working on it; failed: the latest sync left it open, as ``error`` says.",
+            "enum": [
+              "pending",
+              "running",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "target_scope": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The canonical scope fields of the new scope; null when the viewer cannot read the configuration. Equal to ``previous_scope`` while the Source returns to its previous scope.",
+            "title": "Target Scope"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "previous_scope",
+          "target_scope",
+          "created_at",
+          "updated_at",
+          "members_committed",
+          "listed_count",
+          "excluded_scopes_due",
+          "error",
+          "failing_items",
+          "restore_config"
+        ],
+        "title": "SourceScopeTransitionResponse",
         "type": "object"
       },
       "SourceSubscriptionRequest": {
@@ -9475,14 +9818,15 @@
         "type": "object"
       },
       "SourceSyncStatusResponse": {
-        "description": "A Source's latest sync, read from one of three places.\n\nAn active durable run carries the run fields (``run_id``, ``trigger``,\n``force_full_sync``, ``created_at``, ``next_attempt_at``,\n``recovery_count``, ``progress_revision``, ``progress_updated_at``, and\n``stop_requested_at`` once a person asked to stop it). A run a person\nstopped ends ``failed`` with ``error_message`` ``cancelled_by_user``. A\nsync running in this process carries its live counters (``phase``,\n``docs_*``, ``memories_*``, ``current_title``). The last recorded sync\ncarries its totals, ``run_id``, ``failed_docs``,\n``absence_check_skipped_reason``, which names the step that kept that run\nfrom removing anything although its scope listing was due, and\n``skipped_reading_group_count``, the parts of its Documents the generation\nmodel could not read. Fields outside the chosen shape are absent.",
+        "description": "A Source's latest sync, read from one of three places.\n\nAn active durable run carries the run fields (``run_id``, ``trigger``,\n``force_full_sync``, ``created_at``, ``next_attempt_at``,\n``recovery_count``, ``progress_revision``, ``progress_updated_at``, and\n``stop_requested_at`` once a person asked to stop it). A run a person\nstopped ends ``failed`` with ``error_message`` ``cancelled_by_user``. A\nsync running in this process carries its live counters (``phase``,\n``docs_*``, ``memories_*``, ``current_title``). The last recorded sync\ncarries its totals, ``run_id``, ``failed_docs``,\n``absence_check_skipped_reason``, which names the step that kept that run\nfrom removing anything although its scope listing was due,\n``unlisted_present_count``, the Documents its scope listing left out that\nthe provider confirmed it still has or hides (``null`` when the run\nconfirmed none), and ``skipped_reading_group_count``, the parts of its\nDocuments the generation model could not read. Fields outside the chosen\nshape are absent.",
         "properties": {
           "absence_check_skipped_reason": {
             "anyOf": [
               {
                 "enum": [
                   "scope_listing_failed",
-                  "absence_confirmation_failed"
+                  "absence_confirmation_failed",
+                  "absence_confirmation_missing"
                 ],
                 "type": "string"
               },
@@ -9769,6 +10113,17 @@
               }
             ],
             "title": "Trigger"
+          },
+          "unlisted_present_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unlisted Present Count"
           }
         },
         "required": [
@@ -10051,6 +10406,18 @@
               }
             ],
             "title": "Config"
+          },
+          "expected_scope_transition_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The scope change the caller saw in progress. The save answers 409 ``projection_scope_transition_stale`` when another one, or none, is in progress.",
+            "title": "Expected Scope Transition Id"
           },
           "name": {
             "anyOf": [
@@ -15443,7 +15810,7 @@
     },
     "/api/v1/sources/{source_id}/adapter/manifest": {
       "post": {
-        "description": "Reuse unchanged immutable packages in one covered, fenced collection.",
+        "description": "Reuse unchanged immutable packages in one complete, fenced collection.",
         "operationId": "prepare_local_source_manifest_api_v1_sources__source_id__adapter_manifest_post",
         "parameters": [
           {
@@ -15487,6 +15854,57 @@
           }
         },
         "summary": "Prepare Local Source Manifest",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/api/v1/sources/{source_id}/adapter/manifest/confirmations": {
+      "post": {
+        "description": "Store a device's answers for the items its manifest response asked it to confirm.\n\nThe answers bind to the job attempt and the digest of the manifest. An\nidentical replay is accepted; an item the manifest did not ask about,\nanother digest or attempt, and answers that differ from the stored\nones are refused with 409.",
+        "operationId": "submit_local_source_confirmations_api_v1_sources__source_id__adapter_manifest_confirmations_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LocalSourceConfirmationsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Local Source Confirmations",
         "tags": [
           "sources"
         ]
@@ -16456,6 +16874,59 @@
           }
         },
         "summary": "Update Source Sync Schedule",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/api/v1/sources/{source_id}/scope-change-preview": {
+      "post": {
+        "description": "What saving this configuration would do to the Source's scope, without saving it.\n\nThe configuration form reads it before saving, to warn about a mode\nthat cannot list a scope change and about replacing the change in\nprogress. It decides as ``PUT /sources/{id}`` does, from the same\nstored facts; a configuration the source type rejects answers 400.",
+        "operationId": "preview_source_scope_change_api_v1_sources__source_id__scope_change_preview_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceScopeChangePreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceScopeChangePreviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Source Scope Change",
         "tags": [
           "sources"
         ]

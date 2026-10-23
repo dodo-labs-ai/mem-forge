@@ -199,6 +199,7 @@ class _PreparedProjectedLifecycleCommit:
     model_call_count: int
     prepared_at_attempt_count: int
     admission_rejections: tuple[CandidateRejection, ...] = ()
+    scope_transition_id: str | None = None
     retry_attempt_count: int = 0
     applied_stats: dict[str, int] | None = field(
         default=None,
@@ -412,8 +413,15 @@ class MemoryEngine:
         current_changed_ranges: tuple[tuple[int, int], ...] = (),
         lifecycle_execution_owner_id: str | None = None,
         lifecycle_attempt_count: int = 1,
+        scope_transition_id: str | None = None,
     ) -> dict[str, int]:
-        """Observe one complete Source Unit lifecycle execution."""
+        """Observe one complete Source Unit lifecycle execution.
+
+        ``scope_transition_id`` names the open Projection Scope transition the
+        commit belongs to: the commit records its Document as a member of that
+        transition. A commit deferred to later in the run records the member
+        when it commits.
+        """
 
         runtime_context = _LifecycleExecutionContext(started_at=perf_counter())
         try:
@@ -450,6 +458,7 @@ class MemoryEngine:
                     current_changed_ranges=current_changed_ranges,
                     lifecycle_execution_owner_id=lifecycle_execution_owner_id,
                     lifecycle_attempt_count=lifecycle_attempt_count,
+                    scope_transition_id=scope_transition_id,
                     _runtime_context=runtime_context,
                 )
         except SourceUnitLifecycleExecutionError:
@@ -721,6 +730,7 @@ class MemoryEngine:
                 required_derivation_work_ids=prepared.required_derivation_work_ids,
                 source_activity=prepared.source_activity,
                 runtime_bundle=runtime_bundle,
+                scope_transition_id=prepared.scope_transition_id,
             )
         except ProjectedLifecycleDeferredError as exc:
             if prepared.lifecycle_execution_owner_id is None:
@@ -875,6 +885,7 @@ class MemoryEngine:
         current_changed_ranges: tuple[tuple[int, int], ...] = (),
         lifecycle_execution_owner_id: str | None = None,
         lifecycle_attempt_count: int = 1,
+        scope_transition_id: str | None = None,
         _runtime_context: _LifecycleExecutionContext,
     ) -> dict[str, int]:
         """Reconcile a complete Source Unit ledger and atomically apply one plan."""
@@ -1544,6 +1555,7 @@ class MemoryEngine:
             ),
             prepared_at_attempt_count=lifecycle_attempt_count,
             admission_rejections=admission.rejected,
+            scope_transition_id=scope_transition_id,
         )
         _runtime_context.stage = "lifecycle_commit"
         return await self._commit_prepared_projected_lifecycle(

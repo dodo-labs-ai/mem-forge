@@ -7,13 +7,14 @@ from datetime import datetime, timezone
 
 import pytest
 
+from memforge.genes.github_repo_gene import github_renamed_from
+from memforge.github_repo_utils import build_github_repo_doc_id
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.source_projection_adapters import (
     _canonical_hash,
     _stable_id,
     project_source_item,
     project_source_unit_tombstone,
-    source_run_projection_coverage,
 )
 from memforge.source_projection import (
     DeltaAxis,
@@ -1212,94 +1213,26 @@ def test_file_move_with_provider_lineage_preserves_observation_identity(source_t
     assert moved.unit_title != first.unit_title
 
 
-def test_attested_github_compare_previous_filename_preserves_unit_without_daemon_lineage() -> None:
-    first_item = _item(
-        item_id="file-old",
-        extra={
-            "relative_path": "old/design.md",
-            "repo_owner": "acme",
-            "repo_name": "pay",
-            "repo_ref": "main",
-        },
-    )
-    first_raw, first_normalized = _inputs(first_item, b"Keep A7.", "Keep A7.")
-    first = project_source_item(
-        source_id="src-github_repo",
-        source_type="github_repo",
-        run_id="run-compare-1",
-        item=first_item,
-        raw=first_raw,
-        normalized=first_normalized,
-    )
-    moved_item = _item(
+def test_github_names_a_predecessor_only_for_an_attested_rename() -> None:
+    location = {"source_id": "src-1", "repo_url": "https://github.example/acme/pay", "repo_ref": "main"}
+
+    assert github_renamed_from(
+        **location, previous_filename="/old/design.md", rename_evidence_authoritative=True,
+    ) == build_github_repo_doc_id(**location, relative_path="old/design.md")
+    assert github_renamed_from(
+        **location, previous_filename="old/design.md", rename_evidence_authoritative=False,
+    ) is None
+    assert github_renamed_from(**location, previous_filename=None, rename_evidence_authoritative=True) is None
+
+
+def test_a_renamed_github_file_projects_its_own_path_until_the_run_binds_its_predecessor() -> None:
+    item = _item(
         item_id="file-new",
+        renamed_from="file-old",
         extra={
             "relative_path": "new/design.md",
             "previous_filename": "old/design.md",
             "rename_evidence_authoritative": True,
-            "repo_owner": "acme",
-            "repo_name": "pay",
-            "repo_ref": "main",
-        },
-    )
-    moved_raw, moved_normalized = _inputs(moved_item, b"Keep A7.", "Keep A7.")
-
-    moved = project_source_item(
-        source_id="src-github_repo",
-        source_type="github_repo",
-        run_id="run-compare-2",
-        item=moved_item,
-        raw=moved_raw,
-        normalized=moved_normalized,
-        prior_unit_revision=first.source_unit_revisions[0],
-        prior_observation_revisions={revision.observation_id: revision for revision in first.observation_revisions},
-    )
-
-    assert moved.source_units[0].id == first.source_units[0].id
-    assert moved.deltas[0].axes == frozenset({DeltaAxis.LOCATION})
-    assert moved.relations[0].from_id == moved.source_units[0].id
-    assert moved.relations[0].to_id == first.source_units[0].id
-
-    ordinary_item = _item(
-        item_id="file-new",
-        extra={
-            "relative_path": "new/design.md",
-            "repo_owner": "acme",
-            "repo_name": "pay",
-            "repo_ref": "main",
-        },
-    )
-    ordinary_raw, ordinary_normalized = _inputs(
-        ordinary_item,
-        b"Keep A7.",
-        "Keep A7.",
-    )
-    ordinary = project_source_item(
-        source_id="src-github_repo",
-        source_type="github_repo",
-        run_id="run-compare-3",
-        item=ordinary_item,
-        raw=ordinary_raw,
-        normalized=ordinary_normalized,
-        scope={
-            "source_unit_id": moved.source_units[0].id,
-            "source_unit_provider_key": moved.source_units[0].provider_key,
-        },
-        prior_unit_revision=moved.source_unit_revisions[0],
-        prior_observation_revisions={revision.observation_id: revision for revision in moved.observation_revisions},
-    )
-
-    assert ordinary.source_units[0].id == first.source_units[0].id
-    assert ordinary.source_units[0].provider_key == first.source_units[0].provider_key
-    assert ordinary.deltas[0].axes == frozenset()
-
-
-def test_unattested_github_previous_filename_keeps_path_identity() -> None:
-    item = _item(
-        item_id="file-new",
-        extra={
-            "relative_path": "new/design.md",
-            "previous_filename": "old/design.md",
             "repo_owner": "acme",
             "repo_name": "pay",
             "repo_ref": "main",
@@ -1351,34 +1284,6 @@ def test_a_conversation_unit_is_a_unit_and_its_messages_are_observations() -> No
     assert [item.locator for item in projection.observations] == [{"conversation_id": "conv-1"}] * 2
     # The conversation layer decided every member, so the Unit is a complete snapshot of them.
     assert projection.coverage is ProjectionCoverage.COMPLETE_SNAPSHOT
-
-
-@pytest.mark.parametrize(
-    ("authoritative_snapshot", "scope_transition", "discovery_complete", "expected"),
-    [
-        (True, False, False, ProjectionCoverage.COMPLETE_SNAPSHOT),
-        (False, True, True, ProjectionCoverage.COMPLETE_SNAPSHOT),
-        (False, True, False, ProjectionCoverage.PARTIAL_PROJECTION),
-        # A complete discovery of an unchanged scope, first or force-full, is a
-        # query result; absence comes from the scope listing.
-        (False, False, True, ProjectionCoverage.PARTIAL_PROJECTION),
-        (False, False, False, ProjectionCoverage.PARTIAL_PROJECTION),
-    ],
-)
-def test_run_discovery_proves_absence_only_for_a_snapshot_or_a_new_scope(
-    authoritative_snapshot: bool,
-    scope_transition: bool,
-    discovery_complete: bool,
-    expected: ProjectionCoverage,
-) -> None:
-    assert (
-        source_run_projection_coverage(
-            authoritative_snapshot=authoritative_snapshot,
-            scope_transition=scope_transition,
-            discovery_complete=discovery_complete,
-        )
-        is expected
-    )
 
 
 def test_unit_tombstone_removes_all_prior_observations_with_explicit_coverage() -> None:

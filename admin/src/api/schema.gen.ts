@@ -2016,9 +2016,34 @@ export interface paths {
         put?: never;
         /**
          * Prepare Local Source Manifest
-         * @description Reuse unchanged immutable packages in one covered, fenced collection.
+         * @description Reuse unchanged immutable packages in one complete, fenced collection.
          */
         post: operations["prepare_local_source_manifest_api_v1_sources__source_id__adapter_manifest_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/{source_id}/adapter/manifest/confirmations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit Local Source Confirmations
+         * @description Store a device's answers for the items its manifest response asked it to confirm.
+         *
+         *     The answers bind to the job attempt and the digest of the manifest. An
+         *     identical replay is accepted; an item the manifest did not ask about,
+         *     another digest or attempt, and answers that differ from the stored
+         *     ones are refused with 409.
+         */
+        post: operations["submit_local_source_confirmations_api_v1_sources__source_id__adapter_manifest_confirmations_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2411,6 +2436,31 @@ export interface paths {
          */
         put: operations["update_source_sync_schedule_api_v1_sources__source_id__schedule_put"];
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/{source_id}/scope-change-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview Source Scope Change
+         * @description What saving this configuration would do to the Source's scope, without saving it.
+         *
+         *     The configuration form reads it before saving, to warn about a mode
+         *     that cannot list a scope change and about replacing the change in
+         *     progress. It decides as ``PUT /sources/{id}`` does, from the same
+         *     stored facts; a configuration the source type rejects answers 400.
+         */
+        post: operations["preview_source_scope_change_api_v1_sources__source_id__scope_change_preview_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3798,13 +3848,71 @@ export interface components {
              */
             status: "queued";
         };
-        /** LocalSourceManifestItemRequest */
+        /**
+         * LocalSourceConfirmationAnswerRequest
+         * @description The device's answer for one item its manifest response asked it to confirm.
+         */
+        LocalSourceConfirmationAnswerRequest: {
+            /**
+             * Answer
+             * @enum {string}
+             */
+            answer: "absent" | "exists" | "hidden";
+            /** Doc Id */
+            doc_id: string;
+            /** Provider Key */
+            provider_key: string;
+        };
+        /**
+         * LocalSourceConfirmationsRequest
+         * @description A device's answers for the items its query manifest left out, bound to that manifest.
+         *
+         *     ``manifest_sha256`` is the digest the manifest response returned, and the
+         *     job attempt is the one that submitted the manifest. The request answers
+         *     every item the response named in ``confirm``, or, when the device could
+         *     not confirm them, gives ``failure_cause`` and no answers.
+         */
+        LocalSourceConfirmationsRequest: {
+            /** Answers */
+            answers?: components["schemas"]["LocalSourceConfirmationAnswerRequest"][];
+            /** Failure Cause */
+            failure_cause?: string | null;
+            /** Local Agent Attempt Count */
+            local_agent_attempt_count: number;
+            /** Local Agent Job Id */
+            local_agent_job_id: string;
+            /** Manifest Sha256 */
+            manifest_sha256: string;
+            /** Sync Snapshot Id */
+            sync_snapshot_id: string;
+        };
+        /**
+         * LocalSourceExcludedListingRequest
+         * @description What the device listed in one scope its job's open transition excludes, or that the provider rejected it.
+         *
+         *     ``scope_key`` is the key the job named the scope by. A listing holds the
+         *     Document ids the scope lists, up to the manifest's item bound. A
+         *     definitive rejection, such as a JQL the provider refuses, gives its cause
+         *     in ``rejection`` and lists nothing.
+         */
+        LocalSourceExcludedListingRequest: {
+            /** Doc Ids */
+            doc_ids?: string[];
+            /** Rejection */
+            rejection?: string | null;
+            /** Scope Key */
+            scope_key: string;
+        };
+        /**
+         * LocalSourceManifestItemRequest
+         * @description One item of a device manifest: the item as the device read it.
+         */
         LocalSourceManifestItemRequest: {
             /**
              * Change Kind
-             * @enum {string}
+             * @constant
              */
-            change_kind: "upsert" | "tombstone";
+            change_kind: "upsert";
             /** Doc Id */
             doc_id: string;
             /** Revision */
@@ -3812,18 +3920,23 @@ export interface components {
         };
         /**
          * LocalSourceManifestRequest
-         * @description One covered local collection, planned against the retained packages.
+         * @description One complete local collection, planned against the retained packages.
          *
+         *     A device manifest lists the complete item set of its scope, so it declares
+         *     ``complete_snapshot`` coverage and every item an ``upsert``.
          *     ``package_contract_version`` is the package contract the local agent
          *     collects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates
-         *     the numbered contract sends none.
+         *     the numbered contract sends none. ``excluded_listings`` answers the
+         *     excluded scopes the job carried, one entry per scope at most.
          */
         LocalSourceManifestRequest: {
             /**
              * Coverage
-             * @enum {string}
+             * @constant
              */
-            coverage: "complete_snapshot" | "bounded_delta" | "partial";
+            coverage: "complete_snapshot";
+            /** Excluded Listings */
+            excluded_listings?: components["schemas"]["LocalSourceExcludedListingRequest"][];
             /** Items */
             items: components["schemas"]["LocalSourceManifestItemRequest"][];
             /** Local Agent Attempt Count */
@@ -5905,6 +6018,8 @@ export interface components {
             project_binding?: {
                 [key: string]: unknown;
             } | null;
+            /** @description The scope change the Source is applying; null when none is in progress. */
+            scope_transition: components["schemas"]["SourceScopeTransitionResponse"] | null;
             /**
              * Status
              * @enum {string}
@@ -5917,6 +6032,130 @@ export interface components {
             type: string;
             /** @description Transcript lines the current plugin version could not recognize in recent uploads; present only for agent-session Sources, null when every line was recognized. */
             unrecognized_session_lines?: components["schemas"]["UnrecognizedSessionLinesResponse"] | null;
+        };
+        /** SourceScopeChangePreviewRequest */
+        SourceScopeChangePreviewRequest: {
+            /**
+             * Config
+             * @description The configuration the Source would be saved with.
+             */
+            config: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * SourceScopeChangePreviewResponse
+         * @description What saving a configuration would do to the Source's scope, decided as ``PUT /sources/{id}`` decides it.
+         *
+         *     - ``unchanged``: the scope stays as it is.
+         *     - ``opens_transition``: a scope change opens; nothing is removed until it completes.
+         *     - ``supersedes_transition``: the change replaces the scope change in progress.
+         *     - ``restores_previous_scope``: the change returns to the last applied scope, which the
+         *       configuration cannot list. The change in progress closes, none opens, and nothing is removed.
+         *     - ``returns_to_previous_scope``: the change returns to the last applied scope and replaces the
+         *       change in progress with a change back to it. Nothing that scope synced is removed; once a
+         *       sync lists it in full, what only the replaced change added is removed.
+         *     - ``refused``: saving answers 409, as ``refusal`` says.
+         *
+         *     ``open_transition`` says whether a scope change is in progress now.
+         */
+        SourceScopeChangePreviewResponse: {
+            /** Open Transition */
+            open_transition: boolean;
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "unchanged" | "opens_transition" | "supersedes_transition" | "restores_previous_scope" | "returns_to_previous_scope" | "refused";
+            refusal?: components["schemas"]["SourceScopeChangeRefusalResponse"] | null;
+        };
+        /**
+         * SourceScopeChangeRefusalResponse
+         * @description Why saving the configuration would be refused (409).
+         */
+        SourceScopeChangeRefusalResponse: {
+            /**
+             * Code
+             * @description scope_change_requires_listing, transition_requires_listing, projection_scope_transition_active, source_provider_namespace_immutable or source_execution_mode_immutable.
+             */
+            code: string;
+            /** Message */
+            message?: string | null;
+            /**
+             * Mode
+             * @description The configured mode that cannot list its scope.
+             */
+            mode?: string | null;
+        };
+        /**
+         * SourceScopeTransitionResponse
+         * @description The scope change a Source is applying.
+         *
+         *     A change of what a Source syncs opens a transition from the last applied
+         *     scope to the new one. Its syncs commit the items the new scope lists,
+         *     and once every listed item has committed, the change completes and what
+         *     the new scope leaves out is removed. Until then nothing is removed.
+         *     ``members_committed`` of ``listed_count`` items have committed; the
+         *     count is ``null`` until a sync lists the new scope in full.
+         *     ``failing_items`` are the failed items not yet committed under the
+         *     change; one the new scope lists keeps it open until a sync commits it,
+         *     and one only the previous scope held is settled when the change
+         *     completes.
+         *
+         *     Saving ``restore_config`` with ``PUT /sources/{id}``, with this
+         *     transition's ``id`` as ``expected_scope_transition_id``, returns to the
+         *     previous scope: it replaces the change in progress, and nothing the
+         *     previous scope synced is removed. It is ``null`` when the viewer cannot
+         *     change the configuration, the Source cannot replace a change in progress
+         *     and waits for it to complete, or the change already returns to the
+         *     previous scope.
+         */
+        SourceScopeTransitionResponse: {
+            /** Created At */
+            created_at: string;
+            /**
+             * Error
+             * @description Why the latest sync left the change open; null before one did.
+             */
+            error: string | null;
+            /**
+             * Excluded Scopes Due
+             * @description Every listed item has committed, and the next sync lists what the previous scope held.
+             */
+            excluded_scopes_due: boolean;
+            failing_items: components["schemas"]["SourceFailedItemsResponse"];
+            /** Id */
+            id: string;
+            /** Listed Count */
+            listed_count: number | null;
+            /** Members Committed */
+            members_committed: number;
+            /**
+             * Previous Scope
+             * @description The canonical scope fields of the last applied scope; null when the viewer cannot read the configuration.
+             */
+            previous_scope: {
+                [key: string]: unknown;
+            } | null;
+            /** Restore Config */
+            restore_config: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Status
+             * @description pending: no sync has worked on the change yet; running: a sync is working on it; failed: the latest sync left it open, as ``error`` says.
+             * @enum {string}
+             */
+            status: "pending" | "running" | "failed";
+            /**
+             * Target Scope
+             * @description The canonical scope fields of the new scope; null when the viewer cannot read the configuration. Equal to ``previous_scope`` while the Source returns to its previous scope.
+             */
+            target_scope: {
+                [key: string]: unknown;
+            } | null;
+            /** Updated At */
+            updated_at: string;
         };
         /** SourceSubscriptionRequest */
         SourceSubscriptionRequest: {
@@ -6081,13 +6320,16 @@ export interface components {
          *     ``docs_*``, ``memories_*``, ``current_title``). The last recorded sync
          *     carries its totals, ``run_id``, ``failed_docs``,
          *     ``absence_check_skipped_reason``, which names the step that kept that run
-         *     from removing anything although its scope listing was due, and
-         *     ``skipped_reading_group_count``, the parts of its Documents the generation
-         *     model could not read. Fields outside the chosen shape are absent.
+         *     from removing anything although its scope listing was due,
+         *     ``unlisted_present_count``, the Documents its scope listing left out that
+         *     the provider confirmed it still has or hides (``null`` when the run
+         *     confirmed none), and ``skipped_reading_group_count``, the parts of its
+         *     Documents the generation model could not read. Fields outside the chosen
+         *     shape are absent.
          */
         SourceSyncStatusResponse: {
             /** Absence Check Skipped Reason */
-            absence_check_skipped_reason?: ("scope_listing_failed" | "absence_confirmation_failed") | null;
+            absence_check_skipped_reason?: ("scope_listing_failed" | "absence_confirmation_failed" | "absence_confirmation_missing") | null;
             /** Created At */
             created_at?: string | null;
             /** Current Title */
@@ -6140,6 +6382,8 @@ export interface components {
             stop_requested_at?: string | null;
             /** Trigger */
             trigger?: string | null;
+            /** Unlisted Present Count */
+            unlisted_present_count?: number | null;
         };
         /**
          * SourceSyncStopResponse
@@ -6250,6 +6494,11 @@ export interface components {
             config?: {
                 [key: string]: unknown;
             } | null;
+            /**
+             * Expected Scope Transition Id
+             * @description The scope change the caller saw in progress. The save answers 409 ``projection_scope_transition_stale`` when another one, or none, is in progress.
+             */
+            expected_scope_transition_id?: string | null;
             /** Name */
             name?: string | null;
             /** Project Binding */
@@ -9816,6 +10065,41 @@ export interface operations {
             };
         };
     };
+    submit_local_source_confirmations_api_v1_sources__source_id__adapter_manifest_confirmations_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LocalSourceConfirmationsRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     push_local_source_package_api_v1_sources__source_id__adapter_packages_post: {
         parameters: {
             query?: never;
@@ -10476,6 +10760,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    preview_source_scope_change_api_v1_sources__source_id__scope_change_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourceScopeChangePreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceScopeChangePreviewResponse"];
                 };
             };
             /** @description Validation Error */

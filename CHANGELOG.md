@@ -2,6 +2,225 @@
 
 ## Unreleased
 
+- The Admin UI shows a Source's scope change in progress and offers a way
+  back. Each row of `GET /sources` carries `scope_transition`: both scopes
+  as canonical scope fields (`null` for a viewer who cannot read the
+  configuration), `status`, `members_committed` and
+  `listed_count` (the items the latest complete listing of the new scope
+  holds, a new transition column in both stores, SQLite migration 129; a run
+  without a complete listing keeps the stored count), `error`,
+  `excluded_scopes_due`, `failing_items` (the failure ledger's rows of
+  Documents not committed under the change) and `restore_config`, the
+  viewer's configuration with the previous scope's fields, which
+  `PUT /sources/{id}` saves as a return to the last applied scope (`null`
+  for a conversation Source, a viewer who cannot change the configuration,
+  or a change that already returns there). `PUT /sources/{id}` takes an
+  optional `expected_scope_transition_id` and answers 409
+  `projection_scope_transition_stale` when another change, or none, is in
+  progress. The new `POST /sources/{id}/scope-change-preview` answers what
+  saving a configuration would do (`unchanged`, `opens_transition`,
+  `supersedes_transition`, `restores_previous_scope` when the change closes
+  and none opens, `returns_to_previous_scope` when a change back to the
+  previous scope opens, or `refused` with the 409's code, mode and
+  message), decided as the update route decides it, and writes nothing. The V2 Source drawer shows the change, its progress
+  and failed items, and "Restore the previous scope" with a confirmation.
+  The V1 configuration dialog, Teams included, warns before saving a change
+  into a mode that cannot list or one that replaces the change in progress,
+  and explains the scope-change refusals; its sync details show the
+  skipped deletion check, the unlisted items kept, and the change in
+  progress.
+
+- A local-agent Jira scope transition now completes, removing only what the
+  user's change excluded. Every local-agent sync job is built by one async
+  `local_agent_sync_job_payload(db, source)` (the manual and explicit routes
+  and both schedulers), which carries the open transition as
+  `projection_scope_transition` and, once the transition's previous run left
+  no listed issue that is not yet a member or reached the step that lists the
+  excluded scopes (`excluded_scopes_due`, a new transition column in both
+  stores, SQLite migration 128), every distinct excluded scope as
+  `excluded_scopes` (`scope_key` and the job configuration that lists it). The
+  agent lists each with its own JQL and its session, and sends the device
+  Document ids, or the rejection of a JQL Jira refuses or of a scope larger
+  than a manifest holds, as the manifest's `excluded_listings`; a scope it
+  cannot reach is left out. An issue an excluded listing names is not asked
+  about in the manifest's `confirm` set. The SQLite scheduler claims a due
+  Source only while its configuration is the one its job payload read. The server accepts
+  only scopes the job carried, each once and within the manifest's item
+  bound, stores them with the manifest, and hashes them into the manifest
+  digest only when present, so a manifest without them keeps its digest. The
+  run that completes removes the held issues an excluded scope lists and the
+  new JQL does not as `removed_from_scope`; every other unlisted issue
+  follows the device's confirmations. A rejected scope completes the
+  transition with the ordinary rule, and a manifest without the listings
+  keeps it open.
+
+- Local-agent Jira removes an issue only when the device confirms it is gone.
+  For an agent that declares package contract 3
+  (`LOCAL_PACKAGE_CONTRACT_VERSION`), the manifest response returns
+  `manifest_sha256` and `confirm`: every held issue and every failed issue
+  the manifest does not list, by Document id and provider key, stored with
+  the manifest (a replay returns the stored set). The agent reads them with
+  its own session through `JiraGene.confirm_absent` and posts the answers
+  (`absent`, `exists` or `hidden`), or a single `failure_cause`, to the new
+  `POST /sources/{id}/adapter/manifest/confirmations`, bound to the job
+  attempt and the manifest digest; an unissued item, another digest and a
+  differing resubmission answer 409, an identical replay is accepted, and
+  the job lease must be current. Until the answers are stored, processing
+  answers 409 `source_snapshot_confirmations_pending`. The run removes only
+  issues answered `absent`, settles failed issues answered `absent`, keeps
+  the others untried until a manifest lists them again, and counts `exists`
+  and `hidden` as `unlisted_present_count`. A failed confirmation records
+  `absence_confirmation_failed`; an older agent, or a confirm set larger
+  than a manifest, records `absence_confirmation_missing`. Both remove
+  nothing. A document Gene whose device listing is a query implements
+  `DocumentGene.provider_key` and `DocumentGene.confirmation_item`; startup
+  refuses one that does not.
+
+- The device manifest route `POST /sources/{id}/adapter/manifest` accepts
+  only `coverage: complete_snapshot` and items with `change_kind: upsert`;
+  `bounded_delta`, `partial` and `tombstone` answer 422, and both stores
+  refuse them on write. Every released agent already sends these values, and
+  the manifest digest is unchanged. Stored manifests keep the values they
+  were written with: a stored `bounded_delta` manifest or `tombstone` item
+  still reads and reports its status, and is never processed as a complete
+  snapshot. `plan_snapshot_manifest` no longer takes a
+  coverage, and `snapshot_manifest_sha256` computes the digest.
+
+- A scope change saved while a document Source's transition is open
+  supersedes it, instead of answering 409 `projection_scope_transition_active`.
+  The open transition becomes `superseded` and its member rows are deleted in
+  the same transaction, and the new transition runs from the last applied
+  scope to the new target, with the superseded transition as its
+  predecessor. A return to the last applied scope is one more such change
+  (A→A), which removes at completion what the superseded target added. When
+  the open transition changed after the change read it, or one opened, the
+  save answers 409 `projection_scope_transition_stale`; two identical
+  concurrent saves open one transition. A conversation Source keeps the 409 while its transition is
+  open, and every Source keeps `source_sync_running` while a sync runs.
+  - A document scope change into a configuration that cannot list its whole
+    scope, such as a GitHub Pages subtree read by link crawl or by a sitemap
+    not declared complete, is refused with 409 `scope_change_requires_listing`,
+    which names the mode and suggests a listing mode or a new Source. A change
+    from such a mode into one that lists is allowed, and so is a return to
+    exactly the last applied scope: it supersedes the open transition, opens
+    none, removes nothing and clears the sync cursor. While a transition is
+    open, a change outside the scope that leaves a listing configuration
+    unable to list, such as turning off a GitHub Pages token or complete
+    sitemap, is refused with 409 `transition_requires_listing`.
+  - GitHub Pages `branch` is a scope field of a subtree, so changing it opens
+    a transition; a Source without a branch, and a single-page or
+    explicit-list Source, keeps its scope fingerprint.
+    `sitemap_authoritative`, `auth_mode` and `max_pages` are not scope fields.
+  - Source type descriptors declare `scope_defaults` (Jira's `query_mode` is
+    `simple`), and a stored transition's scopes are canonicalized again when
+    sync, the scope-change route and the device job read them, so a target
+    stored before a field was added still matches: a field it lacks and the
+    configuration sets reads the configured value, in both of its scopes. `DocumentGene` gains
+    `unlisted_scope_mode`, and `projection_scope_transition_id` takes
+    `previous_cycle_transition_id`; identities are unchanged.
+
+- A query listing's scope transition, such as a JQL or Confluence space
+  change, removes only what the user's change excluded. The run that can
+  complete it lists each distinct excluded scope once (the last applied scope
+  and the targets of every transition it superseded) with the current
+  credential and only that scope's fields (`excluded_scope_config`), and
+  removes the held Documents an excluded scope lists and the new one does not
+  as `removed_from_scope`. Every other unlisted Document had left the query
+  before the change and follows the ordinary rule: confirmed absent is
+  `absent_from_source`, still present is kept. A transient failure listing an
+  excluded scope keeps the transition open; an excluded scope the provider
+  rejects, or whose configuration cannot be built
+  (`SourceConfigurationError`), completes it with the ordinary rule.
+  `sync_gene` takes `excluded_scope_gene`, which `run_source_sync`
+  builds, and both stores gain `get_projection_scope_transition`.
+  - A Confluence Page Tree Root that answers 404, a Confluence scope without
+    its root or spaces, and a JQL Jira refuses (HTTP 400, `JiraQueryRejected`)
+    are configuration errors: the run fails without a retry.
+  - GitHub Pages single-page and explicit-list Sources list their configured
+    pages, so a page dropped from the configuration is removed and a page that
+    cannot be read fails the run's listing. A sitemap declared complete that
+    is missing, unreadable or not a urlset fails discovery; it no longer falls
+    back to the link crawl.
+
+- A document Source's scope transition completes by accumulated commitment.
+  Each Document that commits under an open transition, through an unchanged
+  item's projection, a lifecycle commit, deferred convergence or the
+  recovery of a derivation staged since the transition opened, is recorded as
+  one of its members in the same transaction; a deferred commit is recorded
+  only when it commits, and a tombstone never. An older recovered derivation
+  records no member, so its Document is fetched again.
+  Each transition run discovers everything, lists the new scope and fetches
+  only the listed Documents that are not members yet (`force_full_sync`
+  fetches them all). The transition completes once that listing is complete
+  and every listed Document is a member, so a large Source no longer needs a
+  whole run without failures. Only the completing run removes: every held
+  Document the new listing leaves out, as `removed_from_scope` under the
+  transition's lifecycle cycle. A listed Document whose commit waits only on
+  Units of this run and Units that completion removes counts as committed:
+  the run removes them, converges, and completes only if that Document then
+  committed; otherwise
+  the transition stays open with those removals applied. A run that cannot
+  complete removes nothing and records why in the transition's error.
+  - The run that completes a transition sets the sync cursor to the time the
+    transition opened, so the next run discovers every change made while it
+    was open. Other transition runs keep the cursor; a successful one that
+    finds none, as after a credential change, records the opening time.
+  - Changing a document Source's scope no longer resets its sync cursor or
+    wipes its sync history. A credential change, and a conversation Source's
+    scope change, still do.
+  - Projection reuse is off while a transition is open, failed included.
+  - `Gene.attest_discovery_complete`, `discovery_complete`,
+    `discovery_completion_reason` and `begin_discovery` are removed, with
+    `source_run_projection_coverage`: the listing is the only evidence.
+    `DocumentGene.reset_scope_listing()` forgets a recorded listing.
+  - Cloud: the HANA reuse predicate also excludes `failed` transitions.
+
+- A document sync run takes one listing of its scope after discovery, before
+  it retries failed Documents, and decides both absence and the failure
+  ledger from it. A device's snapshot manifest is that listing, with the
+  Gene's single listing kind.
+  - Item failures no longer suspend absence. A Document that failed to fetch,
+    normalize, project, derive or commit says nothing about one the listing
+    left out, so the unlisted one is removed in the same run. The exception
+    is a rename: `ContentItem.renamed_from` names the Document id the item
+    was renamed from. The item commits to that Document's current Unit, and
+    the Unit is kept until the item commits, while the item is in the run or
+    in an open ledger row. `renamed_from` is serialized only when set. No
+    built-in collector attests renames yet; `github_renamed_from` is the
+    mapping a GitHub collector uses for an attested `previous_filename`, and
+    the GitHub adapter no longer reads rename evidence itself.
+  - An existence listing settles every failure ledger row it does not name,
+    including a row whose Document never became a Unit and a row a scheduled
+    run would leave alone. A server query listing retries an unlisted row
+    through `rediscover` (settled when the item is gone or left the query) or,
+    without one, keeps it untried. A listing that fails settles nothing.
+  - Local-agent Jira no longer removes an issue that dropped out of its
+    manifest. Until the device confirms by identifier, such a run removes
+    nothing and records `absence_confirmation_missing`.
+  - A server query listing records how many unlisted Documents the provider
+    confirmed it still has or hides as `unlisted_present_count` in the sync
+    history; Source health returns it with the latest sync and the Admin UI
+    names those kept items.
+
+- A document connector says whether and how it lists its scope. A
+  `DocumentGene` must implement the class method `lists_scope(config)` and
+  `list_scope()`, which returns a complete `ScopeListing` or raises; startup
+  refuses a Gene, including one outside this repository, that leaves either
+  out. `confirm_absent` returns an `AbsenceAnswer` (`absent`, `exists` or
+  `hidden`) per Document id instead of the set of absent ids, and
+  `atlassian_record_state` replaces `atlassian_record_is_gone`.
+  `tests/contracts/document_fakes` holds the fakes each registered document
+  type needs for the connector contract suite.
+- Jira looks one issue up again, when a failed issue is retried or a Document
+  is reprocessed at its current revision, by searching within the Source's
+  JQL: `issuekey = <id> AND (<where clause>)`, without the incremental
+  `updated >=` filter or ORDER BY. Before, it read the issue by id whether or
+  not the JQL still matched it. An issue the JQL no longer matches, or the
+  credential can no longer see, now fails with `provider_document_missing`,
+  as a Confluence page outside its page tree or space already does, instead
+  of being refreshed from outside the Source's scope. Confluence's lookup also
+  skips content that is not a page, such as a blog post.
+
 - A Source's configuration opens while it syncs. The Admin UI's configuration
   dialog says "A sync is running. Saving will stop it first.", and saving
   asks first: "Stop sync and save" stops the sync, waits until its run has

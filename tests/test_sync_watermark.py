@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from memforge.pipeline.sync import DEFAULT_INCREMENTAL_SYNC_OVERLAP
+from memforge.pipeline.collection_family import DEFAULT_INCREMENTAL_SYNC_OVERLAP
 from tests.test_document_absence import JiraProject, workspace  # noqa: F401  (fixture)
 
 

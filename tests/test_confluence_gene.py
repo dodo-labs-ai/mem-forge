@@ -6,8 +6,9 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from memforge.genes.base import SourceConfigurationError
 from memforge.genes.confluence_gene import ConfluenceGene, PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY
-from memforge.models import ContentItem
+from memforge.models import AbsenceAnswer, ContentItem
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
 
 
@@ -787,7 +788,8 @@ async def test_space_discovery_rejects_missing_results_without_completion_eviden
 
     with pytest.raises(RuntimeError, match="missing a results list"):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError, match="missing a results list"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -902,7 +904,7 @@ async def test_authenticate_closes_confluence_client_when_pat_validation_fails(m
 
 
 @pytest.mark.asyncio
-async def test_page_tree_discovery_raises_when_root_page_cannot_be_fetched():
+async def test_a_page_tree_root_confluence_does_not_return_is_a_configuration_error():
     gene = ConfluenceGene(
         config={
             "base_url": "https://wiki.example.com",
@@ -915,7 +917,7 @@ async def test_page_tree_discovery_raises_when_root_page_cannot_be_fetched():
     gene._api_prefix = "/wiki"
     gene._client = NotFoundClient()
 
-    with pytest.raises(RuntimeError, match="Failed to fetch Confluence page 123"):
+    with pytest.raises(SourceConfigurationError, match="Page Tree Root 123 does not exist"):
         [
             item
             async for item in gene.discover(
@@ -1078,7 +1080,8 @@ async def test_page_tree_rejects_duplicate_page_identity_before_completion():
 
     with pytest.raises(RuntimeError, match="duplicate page id"):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError, match="duplicate page id"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -1105,7 +1108,8 @@ async def test_page_tree_rejects_page_without_stable_version():
 
     with pytest.raises(RuntimeError, match="version metadata"):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError, match="version metadata"):
+        await gene.list_scope()
 
 
 def _page_tree_gene(client) -> ConfluenceGene:
@@ -1122,7 +1126,6 @@ def _page_tree_gene(client) -> ConfluenceGene:
 @pytest.mark.asyncio
 async def test_incremental_page_tree_discovery_lists_every_walked_page_as_a_query():
     gene = _page_tree_gene(PageTreeClient())
-    gene.begin_discovery()
 
     _ = [item async for item in gene.discover(since=datetime(2026, 5, 25, tzinfo=timezone.utc))]
     listing = await gene.list_scope()
@@ -1135,11 +1138,11 @@ async def test_incremental_page_tree_discovery_lists_every_walked_page_as_a_quer
 async def test_preview_limited_discovery_does_not_list_the_scope():
     gene = _page_tree_gene(PreviewLimitClient())
     gene.config[PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY] = 1
-    gene.begin_discovery()
 
     _ = [item async for item in gene.discover()]
 
-    assert await gene.list_scope() is None
+    with pytest.raises(RuntimeError, match="preview"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -1168,11 +1171,15 @@ async def test_confirming_unlisted_pages_keeps_a_page_moved_out_of_the_tree():
         for page_id in status_by_page
     ]
     try:
-        absent = await gene.confirm_absent(items)
+        answers = await gene.confirm_absent(items)
     finally:
         await gene._client.aclose()
 
-    assert absent == {"confluence-deleted"}
+    assert answers == {
+        "confluence-moved": AbsenceAnswer.EXISTS,
+        "confluence-deleted": AbsenceAnswer.ABSENT,
+        "confluence-restricted": AbsenceAnswer.HIDDEN,
+    }
     assert reads == list(status_by_page)
 
 

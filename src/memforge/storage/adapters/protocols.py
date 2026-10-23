@@ -51,7 +51,6 @@ from memforge.memory.relation_discovery_contract import (
 from memforge.memory.review_decision import ReviewVectorTask
 from memforge.source_item_failures import SourceItemFailure
 from memforge.source_projection import (
-    ProjectionCoverage,
     ProjectionScopeTransition,
     SourceObservationRevision,
     SourceProjection,
@@ -379,12 +378,24 @@ class RelationalStore(Protocol):
         *,
         unit_input: SourceUnitInput | None = None,
         source_activity: SourceActivityLease | None = None,
+        scope_transition_id: str | None = None,
     ) -> None:
         """Persist one projection atomically; revisions are immutable.
 
         ``unit_input`` is recorded as the stored input of the projected Unit
         revision in the same transaction, unless a later revision of the Unit
         is already current.
+
+        ``scope_transition_id`` names the open Projection Scope transition the
+        commit belongs to. The same transaction records the committed Document
+        as one of its members: one row per ``(transition, doc_id)``, holding
+        ``unit_input``'s Unit revision, replaced when the Document commits
+        again. The commit is refused when the transition is no longer open
+        (``pending``, ``running`` or ``failed``). A tombstone records no
+        member. For example, a run of transition ``t1`` that commits
+        ``doc-a`` passes ``scope_transition_id="t1"``, and
+        ``list_projection_scope_transition_member_doc_ids("t1")`` then
+        includes ``doc-a``.
 
         Observation Revisions are content-addressed: a projected revision whose
         id is stored keeps the stored row, and only its identity (Observation,
@@ -487,6 +498,16 @@ class RelationalStore(Protocol):
         *,
         limit: int = 20,
     ) -> list[ProjectionScopeTransition]: ...
+    async def get_projection_scope_transition(
+        self,
+        transition_id: str,
+    ) -> ProjectionScopeTransition | None:
+        """The transition with this id, whatever its status; ``None`` when there is none.
+
+        A transition that superseded another names it in
+        ``predecessor_transition_id``, so the chain is walked one id at a time.
+        """
+        ...
     async def start_projection_scope_transition(
         self,
         transition_id: str,
@@ -498,16 +519,37 @@ class RelationalStore(Protocol):
         transition_id: str,
         *,
         run_id: str,
-        coverage: ProjectionCoverage,
-    ) -> ProjectionScopeTransition: ...
+    ) -> ProjectionScopeTransition:
+        """Apply the transition held by ``run_id``; its member rows are deleted in the same transaction.
+
+        The caller decides that the transition is complete. A transition that
+        is not ``running`` under ``run_id`` raises ``ValueError``.
+        """
+        ...
     async def fail_projection_scope_transition(
         self,
         transition_id: str,
         *,
         run_id: str,
-        coverage: ProjectionCoverage,
         error: str,
-    ) -> ProjectionScopeTransition: ...
+        excluded_scopes_due: bool = False,
+        listed_count: int | None = None,
+    ) -> ProjectionScopeTransition:
+        """Mark the transition held by ``run_id`` failed; it stays open and keeps its member rows.
+
+        ``excluded_scopes_due`` records whether the run reached the step that
+        lists the excluded scopes; completion and supersession clear it.
+        ``listed_count`` is how many items the run's complete listing of the
+        target scope holds. ``None``, for a run that did not list it in full,
+        keeps the stored count, so Source health shows the latest progress.
+        """
+        ...
+    async def list_projection_scope_transition_member_doc_ids(
+        self,
+        transition_id: str,
+    ) -> tuple[str, ...]:
+        """The Documents committed under the transition, in doc id order; empty once it is closed."""
+        ...
     async def count_active_source_memories_without_support(self, source_id: str) -> int: ...
     async def count_active_supported_memories_without_source_provenance(
         self,
@@ -628,7 +670,14 @@ class RelationalStore(Protocol):
         required_derivation_work_ids: tuple[str, ...] = (),
         source_activity: SourceActivityLease | None = None,
         runtime_bundle: AgentRuntimeBundle | None = None,
-    ) -> None: ...
+        scope_transition_id: str | None = None,
+    ) -> None:
+        """Commit a projection and its Lifecycle Plan in one transaction.
+
+        ``scope_transition_id`` records the committed Document as a member of
+        that open transition, as ``record_source_projection`` does.
+        """
+        ...
     async def apply_agent_claim_source_projection_lifecycle(
         self,
         projection: SourceProjection,

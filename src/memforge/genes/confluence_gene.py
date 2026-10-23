@@ -17,7 +17,7 @@ import httpx
 
 from memforge.genes.atlassian_auth import (
     ATLASSIAN_ABSENT_STATUS_CODES,
-    atlassian_record_is_gone,
+    atlassian_record_state,
     atlassian_request_limiter,
     bearer_headers,
     get_with_rate_limit_retry,
@@ -25,11 +25,13 @@ from memforge.genes.atlassian_auth import (
     stream_with_rate_limit_retry,
     tls_verify,
 )
-from memforge.genes.base import Gene
+from memforge.genes.base import SourceConfigurationError
+from memforge.genes.document_gene import DocumentGene
 from memforge.genes.confluence_artifacts import resolve_current_confluence_artifacts
 from memforge.genes.confluence_pdf import export_confluence_page_pdf
 from memforge.source_time import SOURCE_UPDATED_AT_KEY
 from memforge.models import (
+    AbsenceAnswer,
     ConfigField,
     ConfigFieldType,
     ConfigGroup,
@@ -38,6 +40,7 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+    ScopeListing,
     ScopeListingKind,
     SourceUnitInput,
 )
@@ -69,12 +72,14 @@ def _page_doc_id(page_id: str) -> str:
     return f"{_PAGE_DOC_ID_PREFIX}{page_id}"
 
 
-class ConfluenceGene(Gene):
+class ConfluenceGene(DocumentGene):
     """Confluence data source gene.
 
     Discovers and syncs wiki pages via Confluence REST API v1.
     Normalizes XHTML page content into comprehensive markdown.
     """
+
+    listing_kinds = frozenset({ScopeListingKind.QUERY})
 
     @classmethod
     def metadata(cls) -> GeneMetadata:
@@ -316,8 +321,41 @@ class ConfluenceGene(Gene):
             return exc.response.status_code == 404
         return isinstance(exc, RuntimeError) and "non-JSON response" in str(exc)
 
+    @classmethod
+    def lists_scope(cls, config: Mapping[str, Any]) -> bool:
+        """A page tree and a space are both walked completely, so every configuration lists."""
+        return True
+
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         """Discover wiki pages from configured spaces or page tree root."""
+        async for item in self._walk_scope(since):
+            yield item
+        if self._preview_discovery_limit() is None:
+            self._record_walked_pages()
+
+    async def list_scope(self) -> ScopeListing:
+        """Every page the configured page tree or spaces hold, as the walk of this run visited them.
+
+        Discovery walks the whole scope whatever ``since`` is, so a run that
+        discovered returns that walk; otherwise the scope is walked here. A
+        page carrying an excluded label is listed, though never yielded. A
+        space walk lists every page of the space. A page tree walk does not
+        descend below a page with an excluded label, so a page below one
+        leaves the listing; being a query listing, it is kept unless
+        :meth:`confirm_absent` answers ``absent``.
+        """
+
+        if self._preview_discovery_limit() is not None:
+            raise RuntimeError("A preview of a Confluence Source stops its walk early, so it cannot list the scope")
+        if self._discovered_scope is not None:
+            return self._discovered_scope
+        async for _item in self._walk_scope(None):
+            pass
+        self._record_walked_pages()
+        return self._discovered_scope
+
+    async def _walk_scope(self, since: datetime | None) -> AsyncIterator[ContentItem]:
+        """Visit every page of the configured page tree or spaces, yielding those changed since ``since``."""
         self.normalize_config(self.config)
         self._discovered_page_ids: set[str] = set()
         sync_mode = self._effective_sync_mode(self.config)
@@ -326,26 +364,20 @@ class ConfluenceGene(Gene):
 
         if sync_mode == "page_tree":
             if not page_tree_root:
-                raise ValueError("Confluence Page Tree Root is required when syncing a page tree")
+                raise SourceConfigurationError("Confluence Page Tree Root is required when syncing a page tree")
             async for item in self._discover_page_tree(page_tree_root, include_children, since):
                 yield item
-            if self._preview_discovery_limit() is None:
-                self.attest_discovery_complete("confluence_page_tree_exhausted")
-                self._record_walked_pages()
             return
 
         spaces = self._space_keys(self.config.get("spaces"))
         if not spaces:
-            raise ValueError("Confluence Spaces to Sync is required when syncing whole spaces")
+            raise SourceConfigurationError("Confluence Spaces to Sync is required when syncing whole spaces")
         for space_key in spaces:
             async for item in self._discover_space(space_key, since):
                 yield item
-        if self._preview_discovery_limit() is None:
-            self.attest_discovery_complete("confluence_spaces_exhausted")
-            self._record_walked_pages()
 
     def _record_walked_pages(self) -> None:
-        """Record every page discovery walked, whatever ``since`` it yielded by.
+        """Record every page the walk visited, whatever ``since`` it yielded by.
 
         A page tree or a space is a query: a page that was moved elsewhere, or
         below a page with an excluded label, still exists, so an unlisted page
@@ -357,31 +389,43 @@ class ConfluenceGene(Gene):
             {_page_doc_id(page_id) for page_id in self._discovered_page_ids},
         )
 
-    async def confirm_absent(self, items: Sequence[ContentItem]) -> frozenset[str]:
+    async def confirm_absent(self, items: Sequence[ContentItem]) -> Mapping[str, AbsenceAnswer]:
         """Read each unlisted page by id; a page Confluence no longer returns is absent.
 
         A page in the trash is not returned without asking for trashed content,
-        so a trashed page is absent as a deleted one is.
+        so a trashed page is absent as a deleted one is. A page moved to
+        another tree or space still exists, and one this credential may not
+        read is hidden.
         """
 
-        absent: set[str] = set()
+        answers: dict[str, AbsenceAnswer] = {}
         for item in items:
             page_id = str(item.extra.get("page_id") or item.item_id.removeprefix(_PAGE_DOC_ID_PREFIX))
-            if await atlassian_record_is_gone(self._get(f"{self._api_prefix}/rest/api/content/{page_id}")):
-                absent.add(item.item_id)
-        return frozenset(absent)
+            answers[item.item_id] = await atlassian_record_state(
+                self._get(f"{self._api_prefix}/rest/api/content/{page_id}")
+            )
+        return answers
 
     @classmethod
     def rediscovers_documents(cls, config: Mapping[str, Any]) -> bool:
         return True
 
     async def rediscover(self, item: ContentItem) -> ContentItem | None:
-        """Read one page as a full discovery would list it, or ``None`` when it would not.
+        """Read one page by id and return it only when a full discovery would yield it.
 
-        A full discovery lists a page it would keep: in space mode a current
-        page of a configured space; in page tree mode the root page, or a
-        current page reached from the root through current pages without an
-        excluded label. A page carrying an excluded label is never listed.
+        The predicates are discovery's own:
+
+        - **Space mode:** a current page (not a blog post or other content) of
+          a configured space; discovery asks each space for its pages.
+        - **Page tree mode:** the root page itself; or, with child pages
+          included, a current page whose ancestors below the root are current
+          pages without an excluded label, because discovery walks
+          ``child/page`` from the root and does not descend below such a page.
+        - **Either mode:** a page carrying an excluded label is never yielded.
+
+        ``None`` when a predicate fails or Confluence answers not found or
+        gone, which is also how a page in the trash answers. Any other error
+        raises.
         """
         self.normalize_config(self.config)
         page_id = str(item.extra.get("page_id") or item.item_id.removeprefix(_PAGE_DOC_ID_PREFIX))
@@ -400,7 +444,8 @@ class ConfluenceGene(Gene):
         listed = (
             self._page_tree_lists(page, exclude_labels)
             if page_tree
-            else self._page_status(page) == _CURRENT_PAGE_STATUS
+            else self._is_page(page)
+            and self._page_status(page) == _CURRENT_PAGE_STATUS
             and str((page.get("space") or {}).get("key") or "") in self._space_keys(self.config.get("spaces"))
         )
         if not listed:
@@ -412,7 +457,11 @@ class ConfluenceGene(Gene):
         root_id = str(self.config.get("page_tree_root") or "").strip()
         if str(page.get("id") or "").strip() == root_id:
             return True
-        if not self.config.get("include_children", True) or self._page_status(page) != _CURRENT_PAGE_STATUS:
+        if (
+            not self.config.get("include_children", True)
+            or not self._is_page(page)
+            or self._page_status(page) != _CURRENT_PAGE_STATUS
+        ):
             return False
         ancestors = page.get("ancestors") if isinstance(page.get("ancestors"), list) else []
         ancestor_ids = [str((ancestor or {}).get("id") or "") for ancestor in ancestors]
@@ -426,6 +475,11 @@ class ConfluenceGene(Gene):
             and not self._has_excluded_label(ancestor, exclude_labels)
             for ancestor in below_root
         )
+
+    @staticmethod
+    def _is_page(content: dict) -> bool:
+        """Whether a content record is a page; discovery never lists a blog post, comment or attachment."""
+        return str(content.get("type") or "page") == "page"
 
     @staticmethod
     def _page_status(page: dict) -> str:
@@ -445,8 +499,17 @@ class ConfluenceGene(Gene):
         preview_limit = self._preview_discovery_limit()
         emitted = 0
 
-        # Get the root page first
-        root_item = await self._get_page_as_content_item(root_id, since, exclude_labels)
+        # Get the root page first; a root Confluence does not return is a
+        # configuration error, not a transient one.
+        try:
+            root_item = await self._get_page_as_content_item(root_id, since, exclude_labels)
+        except RuntimeError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, httpx.HTTPStatusError) and cause.response.status_code == 404:
+                raise SourceConfigurationError(
+                    f"Confluence Page Tree Root {root_id} does not exist or this credential cannot read it"
+                ) from exc
+            raise
         if root_item:
             yield root_item
             emitted += 1

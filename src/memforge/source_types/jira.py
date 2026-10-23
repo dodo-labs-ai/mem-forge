@@ -20,7 +20,7 @@ _PAT_FIELDS = ("pat", "pat_encrypted", "pat_configured", "pat_hint", "pat_decryp
 
 
 def _canonical_scope(scope: dict[str, object]) -> dict[str, object]:
-    query_mode = "advanced" if str(scope.get("query_mode") or "simple").lower() == "advanced" else "simple"
+    query_mode = "advanced" if str(scope["query_mode"]).lower() == "advanced" else "simple"
     scope["query_mode"] = query_mode
     if query_mode == "advanced":
         scope.pop("projects", None)
@@ -145,6 +145,7 @@ DESCRIPTOR = SourceTypeDescriptor(
     unit_noun="issue",
     namespace_fields=("base_url",),
     scope_fields=("query_mode", "projects", "jql", "jql_filter", "issue_types", "include_comments"),
+    scope_defaults={"query_mode": "simple"},
     canonical_scope=_canonical_scope,
     project_native=adapter.project_native,
     evidence_profiles=adapter.CURRENT_OBSERVATION_PROFILES,

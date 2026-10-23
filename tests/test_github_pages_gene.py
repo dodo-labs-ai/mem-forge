@@ -517,7 +517,8 @@ async def test_github_pat_subtree_rejects_missing_tree_without_completion_eviden
     await gene.authenticate()
     with pytest.raises(RuntimeError, match="truncated=false"):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError, match="truncated=false"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -551,7 +552,8 @@ async def test_github_pat_subtree_rejects_duplicate_repository_paths(monkeypatch
     await gene.authenticate()
     with pytest.raises(RuntimeError, match="duplicate path"):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError, match="duplicate path"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -617,8 +619,7 @@ async def test_subtree_discovery_prefers_sitemap_and_filters_to_root(monkeypatch
     assert items[0].last_modified == datetime(2026, 5, 25, 0, 0, tzinfo=timezone.utc)
     assert items[0].extra["content_updated_at"] == "2026-05-25T00:00:00+00:00"
     assert items[0].version.startswith("sha256:")
-    assert gene.discovery_complete is False
-    assert await gene.list_scope() is None
+    assert GitHubPagesGene.lists_scope(gene.config) is False
 
 
 @pytest.mark.asyncio
@@ -645,8 +646,7 @@ async def test_subtree_bfs_never_grants_source_wide_absence_authority(monkeypatc
     items = [item async for item in gene.discover()]
 
     assert len(items) == 1
-    assert gene.discovery_complete is False
-    assert await gene.list_scope() is None
+    assert GitHubPagesGene.lists_scope(gene.config) is False
 
 
 @pytest.mark.asyncio
@@ -695,8 +695,7 @@ async def test_subtree_sitemap_requires_explicit_authoritative_contract(monkeypa
     await gene.authenticate()
     items = [item async for item in gene.discover()]
 
-    assert gene.discovery_complete is True
-    assert gene.discovery_completion_reason == "github_pages_authoritative_sitemap_exhausted"
+    assert GitHubPagesGene.lists_scope(gene.config) is True
     listing = await gene.list_scope()
     assert listing.kind.value == "existence"
     assert listing.doc_ids == {item.item_id for item in items}
@@ -729,7 +728,8 @@ async def test_subtree_rejects_duplicate_canonical_sitemap_urls(monkeypatch):
     await gene.authenticate()
     with pytest.raises(RuntimeError, match="duplicate canonical URLs"):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError, match="duplicate canonical URLs"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -869,7 +869,6 @@ async def test_incremental_github_pat_subtree_lists_every_page_the_branch_holds(
     every_page = {item.item_id async for item in full.discover()}
     gene = GitHubPagesGene(config=dict(config), source_id="src-pages")
     await gene.authenticate()
-    gene.begin_discovery()
 
     changed = [item async for item in gene.discover(since=datetime(2100, 1, 1, tzinfo=timezone.utc))]
     listing = await gene.list_scope()
@@ -878,3 +877,128 @@ async def test_incremental_github_pat_subtree_lists_every_page_the_branch_holds(
     assert listing.kind.value == "existence"
     assert listing.doc_ids == every_page
     assert len(every_page) == 2
+
+
+@pytest.mark.parametrize(
+    ("config", "lists"),
+    [
+        ({"sync_mode": "single_page"}, True),
+        ({"sync_mode": "explicit_list", "auth_mode": "none"}, True),
+        ({"sync_mode": "subtree"}, True),
+        ({"sync_mode": "subtree", "auth_mode": "github_pat"}, True),
+        ({"sync_mode": "subtree", "auth_mode": "none"}, False),
+        ({"sync_mode": "subtree", "auth_mode": "none", "sitemap_authoritative": "false"}, False),
+        ({"sync_mode": "subtree", "auth_mode": "none", "sitemap_authoritative": True}, True),
+    ],
+    ids=[
+        "single-page",
+        "explicit-list",
+        "subtree-default-auth",
+        "subtree-branch-tree",
+        "subtree-crawl-or-sitemap",
+        "subtree-sitemap-not-authoritative",
+        "subtree-authoritative-sitemap",
+    ],
+)
+def test_configured_pages_and_a_subtree_read_from_a_complete_inventory_list_their_scope(config, lists):
+    assert GitHubPagesGene.lists_scope(config) is lists
+
+
+SITE = "https://github-pages.example.test/pages/org/repo/"
+
+
+class FailingSitemapClient(RecordingAsyncClient):
+    """Answers the sitemap with ``failure``; any other request is the link crawl, which must never run."""
+
+    failure = "missing"
+
+    async def get(self, url: str, **_kwargs):
+        self.calls.append(("GET", url))
+        if not url.endswith("/sitemap.xml"):
+            raise AssertionError(f"the link crawl read {url}")
+        if self.failure == "missing":
+            return HtmlResponse("missing", status_code=404, url=url)
+        if self.failure == "transport":
+            raise requests.ConnectionError("connection reset")
+        return HtmlResponse(
+            '<?xml version="1.0"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            f"<sitemap><loc>{SITE}sitemap-1.xml</loc></sitemap></sitemapindex>",
+            url=url,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["missing", "transport", "not-a-urlset"])
+@pytest.mark.parametrize("step", ["list_scope", "discover"])
+async def test_an_authoritative_sitemap_that_cannot_be_read_fails_and_never_falls_back_to_the_crawl(
+    monkeypatch, failure, step,
+):
+    client = type("Client", (FailingSitemapClient,), {"failure": failure})
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", client)
+    gene = GitHubPagesGene(
+        config={
+            "base_url": SITE,
+            "auth_mode": "none",
+            "sync_mode": "subtree",
+            "root_url": SITE,
+            "sitemap_authoritative": True,
+        },
+        source_id="src-pages",
+    )
+    await gene.authenticate()
+
+    with pytest.raises(Exception) as raised:
+        if step == "list_scope":
+            await gene.list_scope()
+        else:
+            _ = [item async for item in gene.discover()]
+
+    assert not isinstance(raised.value, AssertionError)
+    assert gene._client.calls == [("GET", f"{SITE}sitemap.xml")]
+
+
+class ConfiguredPagesClient(RecordingAsyncClient):
+    """Serves every configured page except ``missing``."""
+
+    async def get(self, url: str, **_kwargs):
+        self.calls.append(("GET", url))
+        if url.rstrip("/").endswith("missing"):
+            return HtmlResponse("missing", status_code=404, url=url)
+        return HtmlResponse("<html><body><h1>Page</h1></body></html>", url=url)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"sync_mode": "single_page", "page_url": f"{SITE}a/"},
+        {"sync_mode": "explicit_list", "pages": [f"{SITE}a/", f"{SITE}b/"]},
+    ],
+    ids=["single-page", "explicit-list"],
+)
+async def test_configured_pages_are_an_existence_listing_with_or_without_discovery(monkeypatch, config):
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", ConfiguredPagesClient)
+    config = {"base_url": SITE, "auth_mode": "none", **config}
+    discovered = GitHubPagesGene(config=dict(config), source_id="src-pages")
+    await discovered.authenticate()
+    every_page = {item.item_id async for item in discovered.discover()}
+    after_discovery = await discovered.list_scope()
+    standalone = GitHubPagesGene(config=dict(config), source_id="src-pages")
+    await standalone.authenticate()
+
+    assert after_discovery.kind.value == "existence"
+    assert after_discovery.doc_ids == every_page
+    assert await standalone.list_scope() == after_discovery
+
+
+@pytest.mark.asyncio
+async def test_a_configured_page_that_cannot_be_read_fails_the_listing(monkeypatch):
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", ConfiguredPagesClient)
+    gene = GitHubPagesGene(
+        config={"base_url": SITE, "auth_mode": "none", "sync_mode": "explicit_list", "pages": [f"{SITE}a/", f"{SITE}missing/"]},
+        source_id="src-pages",
+    )
+    await gene.authenticate()
+
+    with pytest.raises(requests.HTTPError):
+        await gene.list_scope()

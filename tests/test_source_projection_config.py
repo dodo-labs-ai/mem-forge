@@ -113,26 +113,62 @@ def test_scope_transition_id_distinguishes_a_repeated_transition_cycle() -> None
         "src-1",
         {"include_paths": ["docs"]},
         {"include_paths": ["other"]},
-        predecessor_transition_id=None,
+        previous_cycle_transition_id=None,
     )
     b_to_a = projection_scope_transition_id(
         "src-1",
         {"include_paths": ["other"]},
         {"include_paths": ["docs"]},
-        predecessor_transition_id=first_a_to_b,
+        previous_cycle_transition_id=first_a_to_b,
     )
     second_a_to_b = projection_scope_transition_id(
         "src-1",
         {"include_paths": ["docs"]},
         {"include_paths": ["other"]},
-        predecessor_transition_id=b_to_a,
+        previous_cycle_transition_id=b_to_a,
     )
     retry = projection_scope_transition_id(
         "src-1",
         {"include_paths": ["docs"]},
         {"include_paths": ["other"]},
-        predecessor_transition_id=b_to_a,
+        previous_cycle_transition_id=b_to_a,
     )
 
     assert second_a_to_b != first_a_to_b
     assert retry == second_a_to_b
+
+
+def test_scope_transition_ids_are_fixed() -> None:
+    # Every stored transition id was computed this way; the same inputs keep
+    # naming the same cycle.
+    previous = {"include_paths": ["docs"]}
+    target = {"include_paths": ["other"]}
+
+    assert projection_scope_transition_id("src-1", previous, target) == "scope-transition-4db4114b521b37dab028"
+    assert (
+        projection_scope_transition_id(
+            "src-1",
+            previous,
+            target,
+            previous_cycle_transition_id="scope-transition-0123456789abcdef0123",
+        )
+        == "scope-transition-26888432bc3895537414"
+    )
+
+
+def test_a_stored_scope_reads_a_field_its_transition_target_predates_from_the_configuration() -> None:
+    from memforge.source_projection_config import canonical_stored_scope
+
+    configured = {"sync_mode": "subtree", "root_url": "https://pages.example/guide", "branch": "gh-pages"}
+    before_branch = {"sync_mode": "subtree", "root_url": "https://pages.example/guide"}
+    with_branch = {**before_branch, "branch": "main"}
+    superseded = {"sync_mode": "subtree", "root_url": "https://pages.example/docs"}
+
+    # The open transition's target predates ``branch``, so every older scope does too.
+    assert canonical_stored_scope(
+        "github_pages", superseded, stored_target=before_branch, configured_scope=configured
+    ) == {**superseded, "branch": "gh-pages"}
+    # A target that sets the field was stored after it existed: an older scope without it read the default branch.
+    assert canonical_stored_scope(
+        "github_pages", superseded, stored_target=with_branch, configured_scope=configured
+    ) == superseded

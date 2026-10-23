@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import timedelta
 
 import pytest
+from types import SimpleNamespace
 
 from memforge.genes.local_adapter_packages import has_package_manifest
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_SYNC_OPERATIONS,
+    snapshot_document_ids,
     SourceSyncRunReceiptError,
     execution_owner_user_id,
     is_local_agent_backed_source,
@@ -112,6 +115,13 @@ def test_local_agent_retry_delay_uses_long_bounded_schedule() -> None:
     assert local_agent_retry_delay("succeeded", retryable=True, attempt_count=1) is None
 
 
+class _NoTransitions:
+    """A store holding no open scope transition."""
+
+    async def get_open_projection_scope_transition(self, source_id):
+        return None
+
+
 def test_local_agent_job_payload_preserves_complete_collection_scope() -> None:
     jira_source = {
         "id": "src-jira",
@@ -133,8 +143,8 @@ def test_local_agent_job_payload_preserves_complete_collection_scope() -> None:
         },
     }
 
-    jira = local_agent_sync_job_payload(jira_source)
-    teams = local_agent_sync_job_payload(teams_source)
+    jira = asyncio.run(local_agent_sync_job_payload(_NoTransitions(), jira_source))
+    teams = asyncio.run(local_agent_sync_job_payload(_NoTransitions(), teams_source))
 
     assert jira["query_mode"] == "advanced"
     assert jira["jql_filter"] == "updated >= -90d"
@@ -551,7 +561,8 @@ def test_local_agent_sync_job_payload_uses_saved_config_and_request_controls_onl
         },
     }
 
-    payload = local_agent_sync_job_payload(
+    payload = asyncio.run(local_agent_sync_job_payload(
+        _NoTransitions(),
         source,
         {
             "conversation_ids": ["19:spoofed@example.test"],
@@ -562,7 +573,7 @@ def test_local_agent_sync_job_payload_uses_saved_config_and_request_controls_onl
             "force_full_sync": True,
             "limit": 25,
         },
-    )
+    ))
 
     revision = payload.pop("source_config_revision")
     assert revision
@@ -585,7 +596,7 @@ def test_source_with_sync_inputs_respects_explicit_empty_snapshot() -> None:
             "config": {"documents_dir": "/server/inbox"},
         },
         [],
-        authoritative_snapshot=True,
+        input_snapshot_supplied=True,
     )
 
     assert projected["config"]["local_agent_package_manifest"] == []
@@ -689,3 +700,26 @@ def test_server_source_admin_retains_existing_execution_capabilities() -> None:
     assert capabilities["can_configure_connection"] is True
     assert capabilities["can_sync"] is True
     assert capabilities["can_force_resync"] is True
+
+
+def test_a_complete_snapshot_holds_every_stored_document_it_names_except_legacy_tombstones() -> None:
+    def source_input(doc_id, generation, *, raw_uri="file:///package", change_kind="upsert"):
+        return SimpleNamespace(
+            input_generation=generation,
+            raw_uri=raw_uri,
+            raw_sha256="sha",
+            metadata={"manifest_entry": {"doc_id": doc_id, "change_kind": change_kind}},
+        )
+
+    inputs = [
+        source_input("doc-a", 1),
+        source_input("doc-a", 2),
+        source_input("doc-b", 1),
+        source_input("doc-unstored", 1, raw_uri=""),
+        # A manifest stored before every item was an upsert.
+        source_input("doc-gone", 1, change_kind="tombstone"),
+        SimpleNamespace(input_generation=1, raw_uri="file:///x", raw_sha256="sha", metadata={}),
+    ]
+
+    assert snapshot_document_ids(inputs) == {"doc-a", "doc-b"}
+    assert snapshot_document_ids([]) == frozenset()

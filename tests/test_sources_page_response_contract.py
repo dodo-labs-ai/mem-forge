@@ -37,6 +37,7 @@ SOURCE_KEYS = {
     "sync_schedule",
     "sync",
     "failed_items",
+    "scope_transition",
     "client",
     "ownership",
     "capabilities",
@@ -89,6 +90,7 @@ HISTORY_SYNC_KEYS = {
     "error_message",
     "failed_docs",
     "absence_check_skipped_reason",
+    "unlisted_present_count",
     "skipped_reading_group_count",
     "progress",
 }
@@ -337,6 +339,15 @@ def test_source_list_validates_rows_shaped_like_the_hana_workspace_store(tmp_pat
         async def claim_due_scheduled_sources(self, **_: object) -> list[dict]:
             return []
 
+        async def get_open_projection_scope_transition(self, source_id: str):
+            return None
+
+        async def count_projection_scope_transition_members(self, transition_id: str) -> int:
+            return 0
+
+        async def list_projection_scope_transition_failed_member_doc_ids(self, transition_id: str) -> tuple:
+            return ()
+
         async def list_source_item_failures(self, *, source_id: str | None = None) -> tuple:
             return ()
 
@@ -393,6 +404,7 @@ def test_source_list_validates_rows_shaped_like_the_hana_workspace_store(tmp_pat
                     "error_message": "auth expired",
                     "failed_docs": [],
                     "absence_check_skipped_reason": None,
+                    "unlisted_present_count": None,
                     "skipped_reading_group_count": 0,
                     "started_at": "2026-06-13T00:00:01+00:00",
                     "finished_at": "2026-06-13T00:00:02+00:00",

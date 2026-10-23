@@ -202,6 +202,18 @@ class ConversationUnavailable(RuntimeError):
         self.status = status
 
 
+REQUIRED_PROVIDER_MEMBERS = ("record_schema", "list_conversations", "get_conversation", "poll", "read_artifact")
+"""The members every conversation provider class defines; startup refuses a provider that lacks one."""
+
+THREAD_PROVIDER_MEMBERS = ("fetch_thread",)
+"""The members a provider whose polls can omit replies also defines.
+
+Such a provider sets the class attribute ``polls_omit_replies = True``. Teams'
+polls return every reply with its post, so Teams leaves it ``False`` and
+defines none of these.
+"""
+
+
 @runtime_checkable
 class ConversationProvider(Protocol):
     """What one conversation connector implements.
@@ -210,6 +222,10 @@ class ConversationProvider(Protocol):
     provider returns. ``poll`` raises :class:`ConversationUnavailable` when
     the provider refuses the conversation; any other error fails the
     collection attempt, which then removes nothing.
+
+    A source type names its provider class and the factory that opens it in
+    its descriptor (``conversation_provider``), and startup checks the class
+    for :data:`REQUIRED_PROVIDER_MEMBERS`.
     """
 
     @property

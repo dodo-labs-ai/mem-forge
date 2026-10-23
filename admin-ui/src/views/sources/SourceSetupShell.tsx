@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { AlertCircle, Check, ChevronDown, Loader2, RefreshCw } from "lucide-react";
+import { AlertCircle, Check, ChevronDown, Info, Loader2, RefreshCw } from "lucide-react";
 
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { Badge } from "@/components/ui/badge";
@@ -13,6 +13,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 
+import type { ScopeChangeWarning } from "./scopeChange";
 import type { SourceConnectionMode } from "./sourceConnectionPresentation";
 
 export type SourceSetupSectionId =
@@ -58,6 +59,7 @@ export function SourceSetupShell({
   onOpenSectionChange,
   error,
   runningSync,
+  scopeChange,
   validationMessage,
   saving,
   saveDisabled,
@@ -74,6 +76,8 @@ export function SourceSetupShell({
   onOpenSectionChange: (section: SourceSetupSectionId) => void;
   error?: string | null;
   runningSync?: RunningSyncSave | null;
+  /** What saving would do to what the source syncs, when the form should say so before saving. */
+  scopeChange?: ScopeChangeWarning | null;
   validationMessage?: string | null;
   saving: boolean;
   saveDisabled?: boolean;
@@ -157,6 +161,25 @@ export function SourceSetupShell({
             );
           })}
         </div>
+
+        {scopeChange && (
+          <div
+            role={scopeChange.tone === "warning" ? "alert" : "status"}
+            className={`mt-3 flex items-start gap-2 rounded-lg p-3 text-sm ${
+              scopeChange.tone === "warning"
+                ? "bg-amber-50 text-amber-900 dark:bg-amber-900/20 dark:text-amber-100"
+                : "bg-sky-50 text-sky-900 dark:bg-sky-900/20 dark:text-sky-100"
+            }`}
+          >
+            {scopeChange.tone === "warning"
+              ? <AlertCircle className="mt-0.5 size-4 shrink-0" />
+              : <Info className="mt-0.5 size-4 shrink-0" />}
+            <span>
+              <span className="block font-medium">{scopeChange.title}</span>
+              <span className="mt-0.5 block">{scopeChange.message}</span>
+            </span>
+          </div>
+        )}
 
         {(error || validationMessage) && (
           <div className={`mt-3 flex items-start gap-2 rounded-lg p-3 text-sm ${error ? "bg-destructive/10 text-destructive" : "bg-muted/50 text-muted-foreground"}`}>

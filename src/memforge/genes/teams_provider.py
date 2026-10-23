@@ -12,8 +12,10 @@ A poll returns replies with the posts, so threads need no fetch of their own.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import Any
 
 import httpx
 
@@ -43,6 +45,28 @@ _IMAGE_EXTENSIONS = {"image/gif": ".gif", "image/jpeg": ".jpg", "image/png": ".p
 # The Chat Service answers these when the user can no longer read a
 # conversation; neither proves the conversation was deleted.
 _REFUSED_STATUSES = frozenset({403, 404})
+
+
+TEAMS_REGIONS = frozenset({"emea", "amer", "apac"})
+
+
+def teams_region(job_config: Mapping[str, Any]) -> str:
+    """The Chat Service region a job names; EMEA when it names none it knows."""
+
+    region = str(job_config.get("region") or "emea").strip().lower()
+    return region if region in TEAMS_REGIONS else "emea"
+
+
+@asynccontextmanager
+async def open_teams_provider(job_config: Mapping[str, Any]) -> AsyncIterator[TeamsConversationProvider]:
+    """Open the Teams provider for one device collection: validate the session, then close the client."""
+
+    client = TeamsChatClient(region=teams_region(job_config))
+    try:
+        await client.validate()
+        yield TeamsConversationProvider(client)
+    finally:
+        await client.close()
 
 
 class TeamsConversationProvider:

@@ -32,5 +32,10 @@ class SourceSyncManifestStore(Protocol):
         snapshot_id: str,
         expected_access_hash: str,
     ) -> frozenset[str]:
-        """Return exact reused members whose current projection is compatible."""
+        """Return exact reused members whose current projection is compatible.
+
+        A Source with an open scope transition (``pending``, ``running`` or
+        ``failed``) has none: each listed Document must commit under the
+        transition to become one of its members.
+        """
         ...

@@ -6,16 +6,17 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 import requests
 
-from memforge.genes.base import Gene
+from memforge.genes.document_gene import DocumentGene
 from memforge.genes.local_adapter_packages import (
     decode_package,
     has_package_manifest,
@@ -59,6 +60,7 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+    ScopeListing,
     ScopeListingKind,
 )
 from memforge.repo_identity import normalize_repo_identifier
@@ -76,7 +78,7 @@ logger = logging.getLogger(__name__)
 # Why a selected binary file, an image or a PDF, has no text body: its content is its Artifact.
 _BINARY_FILE_EMPTY_EVIDENCE = "github_binary_file_has_no_text_body"
 
-__all__ = ["GitHubRepoGene"]
+__all__ = ["GitHubRepoGene", "github_renamed_from"]
 
 CONNECTION_MODE_CLOUD_PULL = "cloud_pull"
 CONNECTION_MODE_LOCAL_PUSH = "local_push"
@@ -88,6 +90,32 @@ DEFAULT_MAX_FILES = 500
 LAST_COMMIT_AT_KEY = "last_commit_at"
 
 
+def github_renamed_from(
+    *,
+    source_id: str,
+    repo_url: str,
+    repo_ref: str,
+    previous_filename: object,
+    rename_evidence_authoritative: object,
+) -> str | None:
+    """The ``renamed_from`` of a discovered file: the Document id of the path it was renamed from.
+
+    Only authoritative evidence names a predecessor, such as a validated
+    Compare API ``renamed`` record, which reports ``previous_filename`` once.
+    A matching blob SHA is never read as a rename, because a copy followed by
+    a delete looks the same.
+    """
+
+    if rename_evidence_authoritative is not True or not previous_filename:
+        return None
+    return build_github_repo_doc_id(
+        source_id=source_id,
+        repo_url=repo_url,
+        repo_ref=repo_ref,
+        relative_path=normalize_github_relative_path(str(previous_filename)),
+    )
+
+
 @dataclass(frozen=True)
 class _RepoRef:
     repo_url: str
@@ -97,7 +125,20 @@ class _RepoRef:
     repo: str
 
 
-class GitHubRepoGene(Gene):
+@dataclass(frozen=True)
+class _ScopeTree:
+    """The repository tree at the collected commit and the entries the configured scope selects."""
+
+    repo_ref: _RepoRef
+    ref: str
+    commit_sha: str
+    root_tree: str
+    selected: list[dict]
+    entries_by_path: dict[str, dict]
+    exclude_paths: list[str]
+
+
+class GitHubRepoGene(DocumentGene):
     """GitHub repository file source.
 
     The same source type supports two delivery modes:
@@ -105,6 +146,8 @@ class GitHubRepoGene(Gene):
     - ``local_push``: the user's daemon reads the remote repository with its
       local GitHub session and uploads raw file packages for server processing.
     """
+
+    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
 
     @classmethod
     def metadata(cls) -> GeneMetadata:
@@ -246,12 +289,31 @@ class GitHubRepoGene(Gene):
             headers["Authorization"] = f"Bearer {pat}"
         self._client = _RequestsAsyncClient(headers=headers, timeout=30.0)
 
-    async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
-        if _connection_mode(self.config) == CONNECTION_MODE_LOCAL_PUSH:
-            async for item in self._discover_local_push(since):
-                yield item
-            return
+    @classmethod
+    def lists_scope(cls, config: Mapping[str, Any]) -> bool:
+        """The tree at the collected commit, or the device's snapshot manifest, holds the whole scope."""
+        return True
 
+    async def list_scope(self) -> ScopeListing:
+        """Every file the branch's tree selects at its current commit, by Document id.
+
+        The tree at a commit is everything the repository holds in scope, so
+        this is an existence listing: a file it no longer names was removed or
+        renamed. Discovery reads the same tree on every run, so a run that
+        discovered returns that tree's listing.
+        """
+        if _connection_mode(self.config) == CONNECTION_MODE_LOCAL_PUSH:
+            raise ValueError(
+                "A GitHub repository pushed from the internal network is listed by its device's snapshot manifest, "
+                "not by the server"
+            )
+        if self._discovered_scope is not None:
+            return self._discovered_scope
+        tree = await self._scope_tree()
+        return ScopeListing(kind=ScopeListingKind.EXISTENCE, doc_ids=frozenset(self._listed_doc_ids(tree)))
+
+    async def _scope_tree(self) -> _ScopeTree:
+        """Read the repository tree at the ref's current commit and select the files in scope, or raise."""
         if not hasattr(self, "_client"):
             await self.authenticate()
         repo_ref = self._repo_ref
@@ -285,17 +347,48 @@ class GitHubRepoGene(Gene):
         ]
         if len(selected) > max_files:
             raise RuntimeError(f"GitHub Repository discovery matched {len(selected)} files, exceeding max_files={max_files}")
-        entries_by_path = {
-            normalize_github_relative_path(str(entry.get("path") or "")).rstrip("/"): entry
-            for entry in entries
+        return _ScopeTree(
+            repo_ref=repo_ref,
+            ref=ref,
+            commit_sha=commit_sha,
+            root_tree=root_tree,
+            selected=selected,
+            entries_by_path={
+                normalize_github_relative_path(str(entry.get("path") or "")).rstrip("/"): entry
+                for entry in entries
+            },
+            exclude_paths=exclude_paths,
+        )
+
+    def _listed_doc_ids(self, tree: _ScopeTree) -> set[str]:
+        """The Document id of every file the tree selects; a file's path is part of its id."""
+        return {
+            build_github_repo_doc_id(
+                source_id=self.source_id,
+                repo_url=tree.repo_ref.repo_url,
+                repo_ref=tree.ref,
+                relative_path=normalize_github_relative_path(str(entry.get("path") or "")).rstrip("/"),
+            )
+            for entry in tree.selected
         }
-        listed_doc_ids: set[str] = set()
-        for entry in selected:
+
+    async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
+        if _connection_mode(self.config) == CONNECTION_MODE_LOCAL_PUSH:
+            async for item in self._discover_local_push(since):
+                yield item
+            return
+
+        tree = await self._scope_tree()
+        repo_ref = tree.repo_ref
+        ref = tree.ref
+        commit_sha = tree.commit_sha
+        root_tree = tree.root_tree
+        for entry in tree.selected:
             resolved = await self._resolve_repo_entry(
                 repo_ref,
                 entry,
-                entries_by_path=entries_by_path,
-                exclude_paths=exclude_paths,
+                entries_by_path=tree.entries_by_path,
+                exclude_paths=tree.exclude_paths,
             )
             path = resolved.logical_path
             content_entry = resolved.content_entry
@@ -315,7 +408,6 @@ class GitHubRepoGene(Gene):
                 repo_ref=ref,
                 relative_path=path,
             )
-            listed_doc_ids.add(doc_id)
             yield ContentItem(
                 item_id=doc_id,
                 title=_title_from_path(path),
@@ -346,10 +438,7 @@ class GitHubRepoGene(Gene):
                     "repo_blob_url": _blob_url(repo_ref, blob_sha),
                 },
             )
-        self.attest_discovery_complete("github_recursive_tree_exhausted")
-        # The tree at the collected commit is everything the repository holds
-        # in scope: a file it no longer lists was removed or renamed.
-        self.record_scope_listing(ScopeListingKind.EXISTENCE, listed_doc_ids)
+        self.record_scope_listing(ScopeListingKind.EXISTENCE, self._listed_doc_ids(tree))
 
     async def fetch(self, item: ContentItem) -> RawContent:
         if item.extra.get("package_uri") or item.extra.get("package_path"):

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Collection, Mapping, Protocol, runtime_checkable
 
@@ -63,12 +64,19 @@ class SourceRemoval:
 
 
 class ProjectionScopeTransitionStatus(str, Enum):
-    """Durable state of one configured-source membership transition."""
+    """Durable state of one configured-source membership transition.
+
+    ``pending``, ``running`` and ``failed`` are open: a Source has at most one
+    open transition. ``applied`` and ``superseded`` are closed: an applied
+    transition completed, and a superseded one was replaced by a later scope
+    change before it could complete.
+    """
 
     PENDING = "pending"
     RUNNING = "running"
     APPLIED = "applied"
     FAILED = "failed"
+    SUPERSEDED = "superseded"
 
 
 class DeltaAxis(str, Enum):
@@ -217,6 +225,18 @@ class SourceObservationRevision:
     evidence_profile: EvidenceRepresentationProfile | None = None
 
 
+class ProjectionScopeTransitionStale(ValueError):
+    """The Source's open transition is not the one a scope change expected to supersede.
+
+    The open transition changed after the caller read it: it completed, was
+    superseded, or another change opened one. Nothing was written; the caller
+    reads the Source again and decides with fresh facts.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("projection_scope_transition_stale")
+
+
 class ProjectionIdentityConflict(ValueError):
     """A projected immutable row has the id of a stored row with a different identity.
 
@@ -255,6 +275,25 @@ def require_stored_revision_identity(
             or stored.evidence_profile not in {None, revision.evidence_profile}
         ):
             raise ProjectionIdentityConflict("source_observation_revisions", revision.id)
+
+
+UNIT_INCARNATION_SEPARATOR = "#incarnation:"
+
+
+def incarnated_provider_key(provider_key: str, incarnation: str) -> str:
+    """The provider key of a Unit that came back after its removal: the provider's key and its incarnation.
+
+    The removed Unit keeps the provider's key, so the one that comes back
+    takes a key of its own, such as ``"100007#incarnation:unit-1:2"``.
+    """
+
+    return f"{provider_key}{UNIT_INCARNATION_SEPARATOR}{incarnation}"
+
+
+def provider_item_key(provider_key: str) -> str:
+    """The provider's own key of a Unit's item, without the incarnation a Unit that came back carries."""
+
+    return provider_key.partition(UNIT_INCARNATION_SEPARATOR)[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,25 +403,54 @@ class ProjectionRequest:
 
 @dataclass(frozen=True, slots=True)
 class ProjectionScopeTransition:
-    """Old and target Projection Scope plus its complete-snapshot proof state."""
+    """One change of a Source's Projection Scope, from its last applied scope to a target.
+
+    ``predecessor_transition_id`` names the open transition this one
+    superseded, or is ``None`` when the change found no open transition.
+    ``excluded_scopes_due`` is set while the latest run reached the step that
+    lists the excluded scopes and stayed open, so the next device job carries
+    them. ``listed_count`` is how many items the latest complete listing of
+    the target scope holds, or ``None`` before a run listed it in full.
+    The two scopes differ, except in a transition that supersedes another to
+    return to the last applied scope: it lists that scope again, so Units the
+    superseded target added are removed when it completes. ``completed_at``
+    is when the transition closed, as ``applied`` or ``superseded``.
+    """
 
     id: str
     source_id: str
     previous_scope: Mapping[str, object]
     target_scope: Mapping[str, object]
     status: ProjectionScopeTransitionStatus = ProjectionScopeTransitionStatus.PENDING
+    predecessor_transition_id: str | None = None
     run_id: str | None = None
-    coverage: ProjectionCoverage | None = None
     error: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
     completed_at: str | None = None
+    excluded_scopes_due: bool = False
+    listed_count: int | None = None
 
     def __post_init__(self) -> None:
         if not self.id or not self.source_id:
             raise ValueError("scope transition requires id and source_id")
-        if dict(self.previous_scope) == dict(self.target_scope):
+        if self.predecessor_transition_id is None and dict(self.previous_scope) == dict(self.target_scope):
             raise ValueError("scope transition requires distinct old and target scopes")
+
+    @property
+    def opened_at(self) -> datetime:
+        """When the user's scope change opened the transition."""
+
+        if self.created_at is None:
+            raise ValueError(f"scope transition {self.id} records no opening time")
+        return utc_datetime(self.created_at)
+
+
+def utc_datetime(value: str) -> datetime:
+    """An ISO 8601 timestamp a store recorded, in UTC when it names no zone."""
+
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True, slots=True)

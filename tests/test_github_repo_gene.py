@@ -458,7 +458,8 @@ async def test_cloud_pull_rejects_missing_git_tree_without_completion_evidence(m
     await gene.authenticate()
     with pytest.raises(RuntimeError, match="truncated=false"):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError, match="truncated=false"):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -499,7 +500,8 @@ async def test_cloud_pull_rejects_tree_without_unique_stable_inventory(monkeypat
     await gene.authenticate()
     with pytest.raises(RuntimeError):
         _ = [item async for item in gene.discover()]
-    assert gene.discovery_complete is False
+    with pytest.raises(RuntimeError):
+        await gene.list_scope()
 
 
 @pytest.mark.asyncio
@@ -847,7 +849,6 @@ async def test_incremental_cloud_pull_lists_the_whole_tree_as_an_existence_listi
     )
 
     await gene.authenticate()
-    gene.begin_discovery()
     _ = [item async for item in gene.discover(since=datetime(2026, 9, 30, tzinfo=timezone.utc))]
     listing = await gene.list_scope()
 
@@ -864,7 +865,7 @@ async def test_incremental_cloud_pull_lists_the_whole_tree_as_an_existence_listi
 
 
 @pytest.mark.asyncio
-async def test_cloud_pull_with_a_truncated_tree_lists_nothing(monkeypatch):
+async def test_cloud_pull_with_a_truncated_tree_fails_the_listing(monkeypatch):
     class TruncatedTreeClient(RepoApiClient):
         async def get(self, url: str):
             if url.endswith("/git/trees/tree-main?recursive=1"):
@@ -878,8 +879,8 @@ async def test_cloud_pull_with_a_truncated_tree_lists_nothing(monkeypatch):
     )
 
     await gene.authenticate()
-    gene.begin_discovery()
     with pytest.raises(RuntimeError, match="truncated"):
         _ = [item async for item in gene.discover()]
 
-    assert await gene.list_scope() is None
+    with pytest.raises(RuntimeError, match="truncated"):
+        await gene.list_scope()
