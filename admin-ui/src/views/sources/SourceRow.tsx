@@ -25,6 +25,7 @@ import {
   sourceSyncActivityIsActionable,
   sourceSyncActivityPolicy,
 } from "./sourceSyncActivity";
+import { lastSyncAbsenceNotes, scopeTransitionSummary } from "./scopeChange";
 import { teamsConversationCount } from "./teamsSourceConfig";
 
 /**
@@ -582,6 +583,12 @@ function LastSyncDetails({
                   {failedItemCount === 1 ? "1 item still fails" : `${failedItemCount} items still fail`}. Sync
                   retries every failed item.
                 </p>
+              )}
+              {lastSyncAbsenceNotes(sync).map((note) => (
+                <p key={note} className="text-xs text-muted-foreground">{note}</p>
+              ))}
+              {source.scope_transition && (
+                <p className="text-xs text-muted-foreground">{scopeTransitionSummary(source.scope_transition)}</p>
               )}
             </div>
           </PopoverPrimitive.Popup>

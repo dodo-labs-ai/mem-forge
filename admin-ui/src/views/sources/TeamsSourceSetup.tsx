@@ -4,6 +4,7 @@ import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 import { AlertCircle, Check, Hash, Info, Loader2, MessageSquare, Search, User, X } from "lucide-react";
 
 import { resourceClient } from "@/api/client";
+import { apiErrorMessage } from "@/api/errors";
 import { createLocalAgentJob, getLocalAgentJob } from "@/api/localAgentJobs";
 import type {
   GeneConfigSchema,
@@ -24,6 +25,7 @@ import { useSharedWorkspace } from "@/state/sharedWorkspace";
 import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
 import { useStopRunningSyncAndSave } from "./runningSyncSave";
+import { refusedSaveMessage, scopeChangeWarning, useScopeChangePreview } from "./scopeChange";
 import { SourceSetupShell } from "./SourceSetupShell";
 import type { SourceSetupSection, SourceSetupSectionId } from "./SourceSetupShell";
 import {
@@ -173,6 +175,12 @@ export function TeamsSourceSetup({
   });
 
   const runningSync = useStopRunningSyncAndSave(source?.id, saveSource.error, () => saveSource.mutate());
+  const scopeChangePreview = useScopeChangePreview(
+    source?.id,
+    source && resolvedSelections.size > 0
+      ? buildTeamsSourceUpdatePayload({ selections: [...resolvedSelections.values()], config }).config
+      : null,
+  );
 
   const handleSave = () => {
     if (!config.name.trim()) {
@@ -463,6 +471,7 @@ export function TeamsSourceSetup({
       openSection={focusSection}
       onOpenSectionChange={setFocusSection}
       error={saveSource.isError ? errorMessage(saveSource.error) : null}
+      scopeChange={scopeChangeWarning(scopeChangePreview)}
       runningSync={runningSync.runId ? {
         stopping: runningSync.pending,
         error: runningSync.error ? errorMessage(runningSync.error) : null,
@@ -586,11 +595,11 @@ function cleanTeamsAuthMessage(value: string | null | undefined): string | null 
 }
 
 function errorMessage(error: unknown): string {
+  const refused = refusedSaveMessage(error);
+  if (refused) return refused;
+  const apiMessage = apiErrorMessage(error);
+  if (apiMessage) return apiMessage;
   if (error instanceof Error && error.message) return error.message;
-  if (typeof error === "object" && error && "response" in error) {
-    const detail = (error as { response?: { data?: { detail?: unknown } } }).response?.data?.detail;
-    if (typeof detail === "string") return detail;
-  }
   return "Could not save the Teams source.";
 }
 
