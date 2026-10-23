@@ -339,7 +339,6 @@ export function SourceRow({
         activity={actionableSyncActivity}
         sourceName={sourceLabel.name}
         itemLabel={itemLabel}
-        onRetry={isPaused || !capabilities.can_sync ? undefined : onSync}
         onStop={capabilities.can_sync ? onStopSync : undefined}
       />
     </div>

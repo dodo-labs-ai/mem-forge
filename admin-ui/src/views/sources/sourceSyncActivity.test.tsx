@@ -12,16 +12,16 @@ import {
 
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
-it("shows a static retry date and a usable exact-job retry while queued", () => {
+it("shows a static retry date while queued and leaves retrying to the row", () => {
   vi.useFakeTimers();
   vi.setSystemTime(new Date("2026-09-03T00:00:00Z"));
   const activity = sourceSyncActivityFromLocalJob({
     job_id: "laj-1", status: "queued", result: null, last_error: "VPN unavailable",
     next_attempt_at: "2026-09-03T12:00:00Z",
   });
-  render(<SourceSyncStatusCard activity={activity} sourceName="GitHub" itemLabel="files" onRetry={() => {}} />);
+  render(<SourceSyncStatusCard activity={activity} sourceName="GitHub" itemLabel="files" />);
   expect(screen.getByText("Waiting to retry")).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Retry now" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Retry now" })).toBeNull();
   expect(screen.queryByRole("progressbar")).toBeNull();
   expect(document.querySelector(".animate-spin")).toBeNull();
   expect(sourceSyncActivityPolicy(activity).activeRowLabel).toBe("Waiting to retry");
@@ -40,15 +40,13 @@ it("shows eligible but unclaimed work as waiting for device, not syncing", () =>
 
 it.each(["discovery", "Internal network / VPN sync"])("shows bounded file-limit details and configuration action for %s", (mode) => {
   const onConfigureScope = vi.fn();
-  const onRetry = vi.fn();
   render(<SourceSyncStatusCard activity={{ state: "failed", error: {
     message: `GitHub Repository ${mode} matched 571 files, exceeding max_files=500`,
-  } }} sourceName="Cookbook" itemLabel="files" onConfigureScope={onConfigureScope} onRetry={onRetry} />);
+  } }} sourceName="Cookbook" itemLabel="files" onConfigureScope={onConfigureScope} />);
   expect(screen.getByText("Sync scope exceeds file limit")).toBeTruthy();
   expect(screen.getByText(/Last sync matched 571 files, exceeding its configured limit of 500/)).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Configure file scope" }));
   expect(onConfigureScope).toHaveBeenCalledOnce();
-  expect(onRetry).not.toHaveBeenCalled();
 });
 
 it("does not expose arbitrary raw errors or offer unavailable configuration", () => {
@@ -101,7 +99,7 @@ it("offers Stop sync while a sync runs, reads Stopping once asked, and Stopped o
   });
   expect(stopped.state).toBe("stopped");
   expect(sourceSyncCanStop(stopped)).toBe(false);
-  render(<SourceSyncStatusCard activity={stopped} sourceName="Wiki" itemLabel="pages" onRetry={() => {}} />);
+  render(<SourceSyncStatusCard activity={stopped} sourceName="Wiki" itemLabel="pages" />);
   expect(screen.getByText("Stopped")).toBeTruthy();
   expect(screen.queryByRole("alert")).toBeNull();
   expect(sourceSyncActivityFromLocalJob({
