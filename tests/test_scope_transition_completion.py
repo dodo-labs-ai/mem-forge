@@ -138,6 +138,7 @@ async def test_a_scope_change_with_one_failed_fetch_stays_open_removes_nothing_a
     assert await workspace.held() == {"jira-0", "jira-1", "jira-2"}
     assert transition.status is ProjectionScopeTransitionStatus.FAILED
     assert transition.error == "1 listed Documents have not committed under the transition"
+    assert transition.listed_count == 2
     assert await _members(workspace) == ("jira-2",)
     assert await _cursor(workspace) == cursor
 

@@ -1410,6 +1410,9 @@ CREATE TABLE IF NOT EXISTS projection_scope_transitions (
     -- Whether the latest run reached the step that lists the excluded scopes,
     -- so the next device job carries them.
     excluded_scopes_due       INTEGER NOT NULL DEFAULT 0 CHECK (excluded_scopes_due IN (0, 1)),
+    -- How many items the latest complete listing of the target scope holds;
+    -- NULL until a run lists it in full.
+    listed_count              INTEGER CHECK (listed_count IS NULL OR listed_count >= 0),
     created_at                TEXT NOT NULL,
     updated_at                TEXT NOT NULL,
     completed_at              TEXT
@@ -5149,6 +5152,16 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "CHECK (excluded_scopes_due IN (0, 1))",
         ],
     ),
+    (
+        129,
+        "Record how many items a scope transition's latest listing of its target holds",
+        # Source health shows an open transition's progress: the listed items
+        # committed under it out of the items its target scope lists.
+        [
+            "ALTER TABLE projection_scope_transitions ADD COLUMN listed_count INTEGER "
+            "CHECK (listed_count IS NULL OR listed_count >= 0)",
+        ],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -8768,19 +8781,23 @@ class Database:
         run_id: str,
         error: str,
         excluded_scopes_due: bool = False,
+        listed_count: int | None = None,
     ) -> ProjectionScopeTransition:
         """Mark the transition the run holds failed; it stays open and keeps its member rows.
 
         ``excluded_scopes_due`` records whether the run reached the step that
         lists the excluded scopes, so the next device job carries them.
+        ``listed_count`` is how many items the run's complete listing of the
+        target scope holds; a run without one keeps the count stored before.
         """
         now = _now_iso()
         async with self._write_lock:
             cursor = await self.db.execute(
                 """UPDATE projection_scope_transitions
-                   SET status = 'failed', error = ?, excluded_scopes_due = ?, updated_at = ?
+                   SET status = 'failed', error = ?, excluded_scopes_due = ?,
+                       listed_count = COALESCE(?, listed_count), updated_at = ?
                    WHERE id = ? AND status = 'running' AND run_id = ?""",
-                (error, int(excluded_scopes_due), now, transition_id, run_id),
+                (error, int(excluded_scopes_due), listed_count, now, transition_id, run_id),
             )
             if cursor.rowcount != 1:
                 await self.db.rollback()
@@ -24588,6 +24605,7 @@ class Database:
             run_id=d.get("run_id"),
             error=d.get("error"),
             excluded_scopes_due=bool(d.get("excluded_scopes_due")),
+            listed_count=d.get("listed_count"),
             created_at=d.get("created_at"),
             updated_at=d.get("updated_at"),
             completed_at=d.get("completed_at"),

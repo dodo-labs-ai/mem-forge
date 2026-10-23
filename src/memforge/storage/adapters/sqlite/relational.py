@@ -598,8 +598,22 @@ class SqliteRelationalStore:
     async def complete_projection_scope_transition(self, transition_id: str, *, run_id: str):
         return await self._db.complete_projection_scope_transition(transition_id, run_id=run_id)
 
-    async def fail_projection_scope_transition(self, transition_id: str, *, run_id: str, error: str):
-        return await self._db.fail_projection_scope_transition(transition_id, run_id=run_id, error=error)
+    async def fail_projection_scope_transition(
+        self,
+        transition_id: str,
+        *,
+        run_id: str,
+        error: str,
+        excluded_scopes_due: bool = False,
+        listed_count: int | None = None,
+    ):
+        return await self._db.fail_projection_scope_transition(
+            transition_id,
+            run_id=run_id,
+            error=error,
+            excluded_scopes_due=excluded_scopes_due,
+            listed_count=listed_count,
+        )
 
     async def list_projection_scope_transition_member_doc_ids(self, transition_id: str) -> tuple[str, ...]:
         return await self._db.list_projection_scope_transition_member_doc_ids(transition_id)

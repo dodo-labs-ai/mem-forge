@@ -204,6 +204,13 @@ class CollectionFamily(ABC):
         A transition that stays open records it, so the next device job
         carries the excluded scopes for the device to list.
         """
+        self.transition_listed_count: int | None = None
+        """How many items this run's complete listing of the open transition's target scope holds.
+
+        ``None`` when the run has no such listing. A transition that stays
+        open records it, so Source health shows how many listed items have
+        committed under it.
+        """
         self.doc_store = doc_store
         self.source_id = source_id
         self.input_snapshot: SnapshotBinding | None = None
@@ -658,6 +665,7 @@ class DocumentFamily(CollectionFamily):
         if listing is None:
             self._transition_outstanding = "the new scope cannot be listed"
             return AbsenceOutcome()
+        self.transition_listed_count = len(listing.doc_ids)
         waiting = listing.doc_ids - set(await self.db.list_projection_scope_transition_member_doc_ids(transition.id))
         blocked = {doc_id for doc_id in waiting if deferred_blockers.get(doc_id)}
         unlisted = indexed_doc_ids - listing.doc_ids

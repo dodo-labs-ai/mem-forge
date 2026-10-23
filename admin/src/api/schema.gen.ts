@@ -2442,6 +2442,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sources/{source_id}/scope-change-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview Source Scope Change
+         * @description What saving this configuration would do to the Source's scope, without saving it.
+         *
+         *     The configuration form reads it before saving, to warn about a mode
+         *     that cannot list a scope change and about replacing the change in
+         *     progress. It decides as ``PUT /sources/{id}`` does, from the same
+         *     stored facts; a configuration the source type rejects answers 400.
+         */
+        post: operations["preview_source_scope_change_api_v1_sources__source_id__scope_change_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sources/{source_id}/subscription": {
         parameters: {
             query?: never;
@@ -5993,6 +6018,8 @@ export interface components {
             project_binding?: {
                 [key: string]: unknown;
             } | null;
+            /** @description The scope change the Source is applying; null when none is in progress. */
+            scope_transition: components["schemas"]["SourceScopeTransitionResponse"] | null;
             /**
              * Status
              * @enum {string}
@@ -6005,6 +6032,122 @@ export interface components {
             type: string;
             /** @description Transcript lines the current plugin version could not recognize in recent uploads; present only for agent-session Sources, null when every line was recognized. */
             unrecognized_session_lines?: components["schemas"]["UnrecognizedSessionLinesResponse"] | null;
+        };
+        /** SourceScopeChangePreviewRequest */
+        SourceScopeChangePreviewRequest: {
+            /**
+             * Config
+             * @description The configuration the Source would be saved with.
+             */
+            config: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * SourceScopeChangePreviewResponse
+         * @description What saving a configuration would do to the Source's scope, decided as ``PUT /sources/{id}`` decides it.
+         *
+         *     - ``unchanged``: the scope stays as it is.
+         *     - ``opens_transition``: a scope change opens; nothing is removed until it completes.
+         *     - ``supersedes_transition``: the change replaces the scope change in progress.
+         *     - ``restores_previous_scope``: the change returns to the last applied scope and replaces the
+         *       change in progress; nothing that scope synced is removed.
+         *     - ``refused``: saving answers 409, as ``refusal`` says.
+         *
+         *     ``open_transition`` says whether a scope change is in progress now.
+         */
+        SourceScopeChangePreviewResponse: {
+            /** Open Transition */
+            open_transition: boolean;
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "unchanged" | "opens_transition" | "supersedes_transition" | "restores_previous_scope" | "refused";
+            refusal?: components["schemas"]["SourceScopeChangeRefusalResponse"] | null;
+        };
+        /**
+         * SourceScopeChangeRefusalResponse
+         * @description Why saving the configuration would be refused (409).
+         */
+        SourceScopeChangeRefusalResponse: {
+            /**
+             * Code
+             * @description scope_change_requires_listing, transition_requires_listing, projection_scope_transition_active, source_provider_namespace_immutable or source_execution_mode_immutable.
+             */
+            code: string;
+            /** Message */
+            message?: string | null;
+            /**
+             * Mode
+             * @description The configured mode that cannot list its scope.
+             */
+            mode?: string | null;
+        };
+        /**
+         * SourceScopeTransitionResponse
+         * @description The scope change a Source is applying.
+         *
+         *     A change of what a Source syncs opens a transition from the last applied
+         *     scope to the new one. Its syncs commit the items the new scope lists,
+         *     and once every listed item has committed, the change completes and what
+         *     the new scope leaves out is removed. Until then nothing is removed.
+         *     ``members_committed`` of ``listed_count`` items have committed; the
+         *     count is ``null`` until a sync lists the new scope in full.
+         *     ``failing_items`` keep the change open until a sync commits them.
+         *
+         *     Saving ``restore_config`` with ``PUT /sources/{id}`` returns to the
+         *     previous scope: it replaces the change in progress, and nothing the
+         *     previous scope synced is removed. It is ``null`` when the viewer cannot
+         *     change the configuration, or the Source cannot replace a change in
+         *     progress and waits for it to complete.
+         */
+        SourceScopeTransitionResponse: {
+            /** Created At */
+            created_at: string;
+            /**
+             * Error
+             * @description Why the latest sync left the change open; null before one did.
+             */
+            error: string | null;
+            /**
+             * Excluded Scopes Due
+             * @description Every listed item has committed, and the next sync lists what the previous scope held.
+             */
+            excluded_scopes_due: boolean;
+            failing_items: components["schemas"]["SourceFailedItemsResponse"];
+            /** Id */
+            id: string;
+            /** Listed Count */
+            listed_count: number | null;
+            /** Members Committed */
+            members_committed: number;
+            /**
+             * Previous Scope
+             * @description The canonical scope fields of the last applied scope.
+             */
+            previous_scope: {
+                [key: string]: unknown;
+            };
+            /** Restore Config */
+            restore_config: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Status
+             * @description pending: no sync has worked on the change yet; running: a sync is working on it; failed: the latest sync left it open, as ``error`` says.
+             * @enum {string}
+             */
+            status: "pending" | "running" | "failed";
+            /**
+             * Target Scope
+             * @description The canonical scope fields of the new scope.
+             */
+            target_scope: {
+                [key: string]: unknown;
+            };
+            /** Updated At */
+            updated_at: string;
         };
         /** SourceSubscriptionRequest */
         SourceSubscriptionRequest: {
@@ -10604,6 +10747,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    preview_source_scope_change_api_v1_sources__source_id__scope_change_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourceScopeChangePreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceScopeChangePreviewResponse"];
                 };
             };
             /** @description Validation Error */
