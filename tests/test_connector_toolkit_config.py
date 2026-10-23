@@ -5,7 +5,6 @@ from __future__ import annotations
 import ssl
 from pathlib import Path
 
-import certifi
 import pytest
 
 from memforge.genes.base import SourceConfigurationError
@@ -22,6 +21,7 @@ from memforge.genes.toolkit.config import (
     validate_tls_ca_bundle,
 )
 from memforge.models import ConfigField, ConfigFieldType
+from tests.tls_bundle_fixture import BUNDLE_CA_COUNT, trusted_ca_count, write_ca_bundle
 
 
 @pytest.mark.parametrize(
@@ -142,9 +142,7 @@ def test_require_https_base_url():
 
 
 def _ca_bundle(directory: Path) -> Path:
-    bundle = directory / "corp-ca.pem"
-    bundle.write_bytes(Path(certifi.where()).read_bytes())
-    return bundle
+    return write_ca_bundle(directory / "corp-ca.pem")
 
 
 def test_validate_tls_ca_bundle_refuses_a_missing_file(tmp_path):
@@ -168,6 +166,7 @@ def test_tls_verify_trusts_the_configured_bundle(tmp_path):
     verify = tls_verify({"tls_ca_bundle": str(bundle)})
     assert isinstance(verify, ssl.SSLContext)
     assert verify.verify_mode == ssl.CERT_REQUIRED
+    assert trusted_ca_count(verify) == BUNDLE_CA_COUNT
 
 
 def test_tls_verify_expands_the_home_directory(tmp_path, monkeypatch):
@@ -191,5 +190,5 @@ def test_requests_ca_bundle_is_honoured_only_when_asked_and_after_the_configured
 
     assert tls_ca_bundle({}, honor_requests_ca_bundle=True) == str(env_bundle)
     assert tls_ca_bundle({"tls_ca_bundle": str(configured)}, honor_requests_ca_bundle=True) == str(configured)
-    assert isinstance(tls_verify({}, honor_requests_ca_bundle=True), ssl.SSLContext)
+    assert trusted_ca_count(tls_verify({}, honor_requests_ca_bundle=True)) == BUNDLE_CA_COUNT
     assert tls_verify({}) is True

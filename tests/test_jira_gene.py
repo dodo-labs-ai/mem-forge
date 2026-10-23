@@ -3,16 +3,15 @@ from __future__ import annotations
 import json
 import ssl
 from datetime import datetime, timezone
-from pathlib import Path
 from unittest.mock import AsyncMock
 
-import certifi
 import httpx
 import pytest
 
 from memforge.genes.jira_gene import JiraGene
 from memforge.models import AbsenceAnswer, ContentItem
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
+from tests.tls_bundle_fixture import BUNDLE_CA_COUNT, trusted_ca_count, write_ca_bundle
 
 
 def _search_page(issues: list[dict], *, total: int | None = None, start_at: int = 0) -> dict:
@@ -325,8 +324,7 @@ async def test_authenticate_prepares_cookie_client_without_bearer_header(monkeyp
 async def test_authenticate_uses_configured_jira_ca_bundle(monkeypatch, tmp_path):
     RecordingAsyncClient.instances.clear()
     monkeypatch.setattr("memforge.genes.jira_gene.httpx.AsyncClient", RecordingAsyncClient)
-    ca_bundle = tmp_path / "corp-ca.pem"
-    ca_bundle.write_bytes(Path(certifi.where()).read_bytes())
+    ca_bundle = write_ca_bundle(tmp_path / "corp-ca.pem")
     gene = JiraGene(
         config={
             "base_url": "https://jira.example.test/",
@@ -343,6 +341,7 @@ async def test_authenticate_uses_configured_jira_ca_bundle(monkeypatch, tmp_path
     verify = RecordingAsyncClient.instances[-1].kwargs["verify"]
     assert isinstance(verify, ssl.SSLContext)
     assert verify.verify_mode == ssl.CERT_REQUIRED
+    assert trusted_ca_count(verify) == BUNDLE_CA_COUNT
 
 
 @pytest.mark.asyncio

@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import ssl
 from datetime import datetime, timezone
-from pathlib import Path
 from unittest.mock import AsyncMock
 
-import certifi
 import httpx
 import pytest
 
@@ -13,6 +11,7 @@ from memforge.genes.base import SourceConfigurationError
 from memforge.genes.confluence_gene import ConfluenceGene, PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY
 from memforge.models import AbsenceAnswer, ContentItem
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
+from tests.tls_bundle_fixture import BUNDLE_CA_COUNT, trusted_ca_count, write_ca_bundle
 
 
 @pytest.fixture(autouse=True)
@@ -822,8 +821,7 @@ async def test_authenticate_uses_bearer_pat_and_normalizes_ui_confluence_wiki_ur
 async def test_authenticate_uses_configured_confluence_ca_bundle(monkeypatch, tmp_path):
     RecordingAsyncClient.instances.clear()
     monkeypatch.setattr("memforge.genes.confluence_gene.httpx.AsyncClient", RecordingAsyncClient)
-    ca_bundle = tmp_path / "corp-ca.pem"
-    ca_bundle.write_bytes(Path(certifi.where()).read_bytes())
+    ca_bundle = write_ca_bundle(tmp_path / "corp-ca.pem")
 
     gene = ConfluenceGene(
         config={
@@ -840,6 +838,7 @@ async def test_authenticate_uses_configured_confluence_ca_bundle(monkeypatch, tm
     verify = RecordingAsyncClient.instances[-1].kwargs["verify"]
     assert isinstance(verify, ssl.SSLContext)
     assert verify.verify_mode == ssl.CERT_REQUIRED
+    assert trusted_ca_count(verify) == BUNDLE_CA_COUNT
 
 
 @pytest.mark.asyncio

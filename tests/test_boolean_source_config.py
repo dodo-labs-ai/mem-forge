@@ -219,6 +219,20 @@ async def test_admin_source_update_refuses_an_odd_boolean_naming_the_field(tmp_p
     assert (await db.get_source("src-pages"))["config"]["sitemap_authoritative"] == "YES"
 
 
+@pytest.mark.asyncio
+async def test_reprocess_dry_run_refuses_a_stored_odd_boolean(tmp_path, db):
+    await _pages_source(db, "src-odd-pages", sitemap_authoritative="sometimes")
+
+    with TestClient(create_admin_app(db=db, config=_config(tmp_path))) as client:
+        response = client.post(
+            "/api/v1/sources/src-odd-pages/reprocess",
+            json={"document_ids": ["github-pages-guide"], "dry_run": True},
+        )
+
+    assert response.status_code == 409
+    assert "sitemap_authoritative" in response.json()["detail"]
+
+
 # ---------------------------------------------------------------------------
 # Sync worker
 # ---------------------------------------------------------------------------

@@ -3636,8 +3636,12 @@ def _run_cloud_jira_sync_job(
     )
     try:
         from memforge.auth.jira_capture import capture_and_prevalidate
+        from memforge.genes.jira_gene import JiraGene
+        from memforge.genes.toolkit.config import validate_bool_fields
 
         session_config = _jira_cloud_config_from_job_payload(payload)
+        # A configuration no run can use fails before the browser session is captured.
+        validate_bool_fields(session_config, JiraGene.config_schema().fields)
         base_url = str(session_config["base_url"])
         captured = asyncio.run(
             capture_and_prevalidate(
@@ -3684,13 +3688,16 @@ def _run_cloud_jira_sync_job(
         )
     except Exception as exc:
         from memforge.auth.jira_auth import JiraAuthSessionMissingError
+        from memforge.genes.base import SourceConfigurationError
 
         return {
             "operation": operation,
             "source_id": source_id,
             "error": str(exc),
             "error_type": type(exc).__name__,
-            "retryable": not isinstance(exc, JiraAuthSessionMissingError),
+            # A configuration Jira cannot run, such as an odd boolean or a JQL it
+            # rejects, fails every attempt alike.
+            "retryable": not isinstance(exc, (JiraAuthSessionMissingError, SourceConfigurationError)),
         }
 
     pushed: list[dict[str, Any]] = []
