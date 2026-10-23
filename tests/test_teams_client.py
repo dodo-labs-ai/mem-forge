@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -16,7 +15,16 @@ from memforge.genes.teams_client import (
     TeamsMessagePaginationError,
 )
 from memforge.source_artifacts import SourceArtifactContractError
-from tests.contracts.conversation_fakes.teams import CHAT, chat_message, message_page, milliseconds, serving
+from memforge.auth.teams_browser_session import CHAT_API_AUDIENCE
+from tests.contracts.conversation_fakes.teams import (
+    CHAT,
+    TOKENS,
+    FakeChatService,
+    chat_message,
+    message_page,
+    milliseconds,
+    serving,
+)
 
 NOW = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
 
@@ -49,54 +57,27 @@ def test_parse_conversations_preserves_channel_team_identity():
     assert conversation["team_id"] == "team-1"
 
 
-@pytest.mark.asyncio
 async def test_request_raises_auth_error_without_retry_on_401():
-    client = TeamsChatClient(region="emea")
-    calls = 0
-
-    class FakeClient:
-        async def request(self, method: str, url: str, **kwargs):
-            nonlocal calls
-            calls += 1
-            request = httpx.Request(method, f"https://teams.cloud.microsoft{url}")
-            return httpx.Response(
-                401,
-                json={"errorCode": 911, "message": "Authentication failed."},
-                request=request,
-            )
+    service = serving(httpx.Response(401, json={"errorCode": 911, "message": "Authentication failed."}))
 
     with pytest.raises(AuthenticationError, match="Teams session expired"):
-        await client._request(FakeClient(), "GET", "/conversations")
+        await service.client().validate()
 
-    assert calls == 1
+    assert len(service.requests) == 1
 
 
-@pytest.mark.asyncio
-async def test_request_retries_remote_protocol_error(monkeypatch):
-    client = TeamsChatClient(region="emea")
-    calls = 0
+async def test_request_retries_remote_protocol_error():
+    def answer(request: httpx.Request) -> httpx.Response:
+        if len(service.requests) == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
+        return httpx.Response(200, json={"conversations": []})
 
-    async def no_sleep(_delay: float) -> None:
-        return None
+    service = FakeChatService(answer)
 
-    monkeypatch.setattr("memforge.pipeline.retry.asyncio.sleep", no_sleep)
+    await service.client().validate()
 
-    class FakeClient:
-        async def request(self, method: str, url: str, **kwargs):
-            nonlocal calls
-            calls += 1
-            request = httpx.Request(method, f"https://teams.cloud.microsoft{url}")
-            if calls == 1:
-                raise httpx.RemoteProtocolError(
-                    "Server disconnected without sending a response.",
-                    request=request,
-                )
-            return httpx.Response(200, json={"conversations": []}, request=request)
-
-    response = await client._request(FakeClient(), "GET", "/conversations")
-
-    assert response.status_code == 200
-    assert calls == 2
+    assert len(service.requests) == 2
+    assert len(service.waits) == 1
 
 
 async def test_validate_retries_a_failed_probe():
@@ -204,71 +185,11 @@ async def test_get_hosted_content_uses_exact_graph_value_route(
     assert request.headers["Authorization"] == "Bearer graph-token"
 
 
-@pytest.mark.asyncio
-async def test_get_hosted_content_requires_graph_capability_before_network_request(
-    monkeypatch,
-):
-    from memforge.auth.teams_auth import CHAT_API_AUDIENCE, TeamsAuthenticator
+async def test_reading_an_inline_image_requires_graph_access_before_any_request():
+    service = serving()
+    client = service.client(tokens={CHAT_API_AUDIENCE: TOKENS[CHAT_API_AUDIENCE]})
 
-    monkeypatch.setattr(
-        TeamsAuthenticator,
-        "load_tokens",
-        staticmethod(
-            lambda: {
-                CHAT_API_AUDIENCE: {
-                    "token": "chat-token",
-                    "expiresAt": 4_102_444_800,
-                }
-            }
-        ),
-    )
-    client = TeamsChatClient(region="emea")
-    client._request_bytes = AsyncMock(
-        side_effect=AssertionError(
-            "hosted-content retrieval must not send a Chat token to Microsoft Graph"
-        )
-    )
-
-    with pytest.raises(
-        AuthenticationError,
-        match="requires Microsoft Graph access",
-    ):
-        await client.get_hosted_content(
-            conversation_id="19:chat@example",
-            message_id="message-1",
-            hosted_content_id="hosted-1",
-            conversation_type="group_chat",
-            team_id=None,
-        )
-
-    client._request_bytes.assert_not_awaited()
-    await client.close()
-
-
-@pytest.mark.asyncio
-async def test_reading_an_inline_image_requires_graph_access(
-    monkeypatch,
-):
-    from memforge.auth.teams_auth import CHAT_API_AUDIENCE, TeamsAuthenticator
-
-    monkeypatch.setattr(
-        TeamsAuthenticator,
-        "load_tokens",
-        staticmethod(
-            lambda: {
-                CHAT_API_AUDIENCE: {
-                    "token": "chat-token",
-                    "expiresAt": 4_102_444_800,
-                }
-            }
-        ),
-    )
-    client = TeamsChatClient(region="emea")
-
-    with pytest.raises(
-        AuthenticationError,
-        match="Teams hosted-content requires Microsoft Graph access",
-    ):
+    with pytest.raises(AuthenticationError, match="Teams hosted-content requires Microsoft Graph access"):
         await client.get_hosted_content(
             conversation_id="19:chat@thread.v2",
             message_id="m1",
@@ -277,6 +198,7 @@ async def test_reading_an_inline_image_requires_graph_access(
             team_id=None,
         )
 
+    assert service.requests == []
     await client.close()
 
 
