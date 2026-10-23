@@ -411,7 +411,10 @@ class _Membership:
         return ConversationPlan(units=tuple(planned), removals=tuple(removals))
 
     def _proven_absent(self, identity: MessageIdentity, member: Member, *, is_reply: bool) -> bool:
-        """Whether a committed member is proven absent: not returned, dated, and inside a proven interval."""
+        """Whether a committed member is proven absent.
+
+        It is not returned (with or without its record), it is dated, and it lies inside a proven interval.
+        """
 
         if identity in self._returned or identity in self._seen_without_record or member.undated:
             return False
