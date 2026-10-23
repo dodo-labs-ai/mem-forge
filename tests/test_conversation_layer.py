@@ -39,7 +39,9 @@ class InMemoryProjection:
     """The current Units of one Source, answering the reads the conversation layer makes.
 
     A Unit's recorded span is its members' span, and every span bound is
-    inclusive, as the Source Projection records them.
+    inclusive, as the Source Projection records them. Reading a Unit it does
+    not hold fails, as the reader contract requires of a listed Unit without
+    a current revision.
     """
 
     def __init__(self, *units: StoredUnit) -> None:
@@ -61,6 +63,8 @@ class InMemoryProjection:
 
     async def read(self, units: Collection[UnitRef]):
         wanted = {unit.unit_id for unit in units}
+        if missing := sorted(wanted - {unit.ref.unit_id for unit in self.units}):
+            raise ValueError(f"conversation Units {missing} were listed as current but have no current revision")
         return tuple(unit for unit in self.units if unit.ref.unit_id in wanted)
 
     async def units_spanning(self, source_id: str, conversation_id: str, start: datetime, end: datetime):
