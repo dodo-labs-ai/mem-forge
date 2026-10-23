@@ -141,6 +141,10 @@ export function useProjectSources() {
   return { ...sourcesQuery, byProject: sourcesByProjectKey(sourcesQuery.sources, resolved) };
 }
 
+// One reference for every caller, so the map is built once per response.
+const healthBySource = (overview: { sources: readonly SourceEvaluationHealth[] }) =>
+  new Map(overview.sources.map((health) => [health.source_id, health]));
+
 /**
  * The online evaluation of each source the viewer can discover over the last
  * day, by source id. A source without an entry, or one the evaluation cannot
@@ -153,7 +157,7 @@ export function useSourceEvaluationHealth(): ReadonlyMap<string, SourceEvaluatio
     queryKey: ["source-evaluation-health", EVALUATION_HEALTH_DAYS] as const,
     queryFn: () =>
       unwrap(api.GET("/api/v1/agent-evaluations/online-overview", { params: { query: { days: EVALUATION_HEALTH_DAYS } } })),
-    select: (overview) => new Map(overview.sources.map((health) => [health.source_id, health])),
+    select: healthBySource,
     staleTime: EVALUATION_HEALTH_STALE_MS,
   });
   return query.data ?? EMPTY_HEALTH;
