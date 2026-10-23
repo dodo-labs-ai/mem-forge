@@ -384,7 +384,10 @@ class TeamsChatClient:
 
         Paging stops when a page is complete from before ``start``, when the
         conversation has nothing older, or when the time budget runs out; the
-        result says which, so the reader knows what the poll proved. Each page
+        result says which, so the reader knows what the poll proved, and names
+        the time its read is complete from whenever a page certified one: the
+        oldest page's oldest message, or the last certificate before an empty
+        final page, when the conversation has nothing older. Each page
         is bounded by the time it is complete from (:class:`_TeamsMessagePage`),
         and the next page ends at that time inclusively, so messages sharing
         a page boundary's millisecond are never skipped.
@@ -427,6 +430,7 @@ class TeamsChatClient:
                                             stop_reason="reached_start")
             if page.oldest or page.complete_from is None:
                 return TeamsMessagePoll(messages=tuple(messages.values()), outcome=PollOutcome.HISTORY_EXHAUSTED,
+                                        earliest_complete_page_time=earliest_complete_page_time,
                                         stop_reason="history_exhausted")
             next_end_time = _next_teams_message_end_time(page.complete_from, previous_end_time=previous_end_time)
             previous_end_time = next_end_time
