@@ -21,8 +21,9 @@ Image downloads go past the Atlassian origin limiter: a page may carry up to
 Confluence) would spend the image budget on 30 images. They keep their own
 short retry (``IMAGE_RETRY``).
 
-Times are read from the client's ``clock``, so tests can run the export on a
-fake one.
+The start and retry checks read the client's ``clock``, so tests can run them
+on a fake one. The cut at the image deadline waits on the event loop's own
+clock; both are monotonic in production.
 """
 
 from __future__ import annotations
@@ -340,13 +341,20 @@ async def _download_image_asset(
 
 
 async def _finished_by(tasks: list[asyncio.Future], seconds: float) -> list:
-    """The results of the tasks done within ``seconds``; the rest are cancelled."""
+    """The results of the tasks done within ``seconds``.
+
+    The rest are cancelled, also when the export itself is cancelled while
+    waiting, so no download outlives the export.
+    """
     if not tasks:
         return []
-    done, pending = await asyncio.wait(tasks, timeout=max(seconds, 0.0))
-    for task in pending:
-        task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    try:
+        done, _pending = await asyncio.wait(tasks, timeout=max(seconds, 0.0))
+    finally:
+        unfinished = [task for task in tasks if not task.done()]
+        for task in unfinished:
+            task.cancel()
+        await asyncio.gather(*unfinished, return_exceptions=True)
     return [task.result() for task in tasks if task in done]
 
 

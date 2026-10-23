@@ -252,11 +252,14 @@ class ConnectorHttpClient:
         - ``limited=False`` sends it past the client's limiter.
         - ``retry`` replaces the client's :class:`RetryPolicy` for this
           request.
-        - ``deadline`` is an instant on :attr:`clock` by which every retry
-          must be over: a retry is made only when its wait plus the
-          request's timeout ends by then, and otherwise the client gives up
-          as if the attempts had run out. The first attempt is always sent;
-          a caller that must not start one late checks the clock itself.
+        - ``deadline`` is an instant on :attr:`clock` after which no retry
+          is started: a retry is made only when its wait plus the request's
+          timeout ends by then, and otherwise the client gives up as if the
+          attempts had run out. httpx applies a timeout to each phase of a
+          request (connect, write, read), so an attempt can outlast it; a
+          caller that needs a hard limit enforces it around the call, as
+          the PDF image phase does. The first attempt is always sent; a
+          caller that must not start one late checks the clock itself.
 
         ``params``, ``json``, ``headers`` and ``timeout`` are passed to httpx.
         """
@@ -429,7 +432,10 @@ class ConnectorHttpClient:
         return deadline is not None and self.clock() + seconds > deadline
 
     def _attempt_seconds(self, timeout: httpx.Timeout | float | Any) -> float:
-        """How long one attempt may last before one of its timeouts ends it: the largest of them, or infinity."""
+        """The longest single phase timeout of one attempt, or infinity.
+
+        A lower bound on the attempt: httpx times each phase separately.
+        """
         if timeout is httpx.USE_CLIENT_DEFAULT:
             timeout = self._http.timeout
         if isinstance(timeout, (int, float)):
