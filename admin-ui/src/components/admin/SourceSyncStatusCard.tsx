@@ -8,6 +8,10 @@ import {
   sourceSyncCanStop,
 } from "@/views/sources/sourceSyncActivity";
 
+// The card's actions read as small buttons: a tinted background on hover, no underline.
+const INLINE_ACTION_CLASS =
+  "flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 transition-colors hover:bg-background/70 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+
 export function SourceSyncStatusCard({
   activity,
   sourceName,
@@ -71,7 +75,7 @@ export function SourceSyncStatusCard({
           <button
             type="button"
             onClick={onStop}
-            className="ml-auto flex shrink-0 items-center gap-1 text-foreground underline-offset-2 hover:underline"
+            className={cn(INLINE_ACTION_CLASS, "ml-auto text-foreground")}
             aria-label={`Stop the sync of ${sourceName}`}
           >
             <CircleStop className="size-3.5" />
@@ -79,7 +83,7 @@ export function SourceSyncStatusCard({
           </button>
         )}
         {(failed || (queued && activity.retryTarget)) && onRetry && (
-          <button type="button" onClick={onRetry} className="ml-auto flex items-center gap-1" aria-label={queued ? "Retry now" : "Retry sync"}>
+          <button type="button" onClick={onRetry} className={cn(INLINE_ACTION_CLASS, "ml-auto")} aria-label={queued ? "Retry now" : "Retry sync"}>
             <RotateCw className="size-3.5" />
             {queued && "Retry now"}
           </button>
