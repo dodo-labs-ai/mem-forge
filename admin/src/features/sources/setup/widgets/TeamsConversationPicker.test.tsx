@@ -93,3 +93,13 @@ test("without a Teams session it asks to connect and keeps what is selected", as
   await userEvent.click(screen.getByRole("button", { name: /^Remove Existing conversation/ }));
   expect(onChange).toHaveBeenLastCalledWith([]);
 });
+
+test("when the session check fails it names the failure instead of asking to connect", async () => {
+  renderWithApi(<Picker initial={[]} onChange={vi.fn()} />, {
+    ...setupJobRoutes({}),
+    "GET /api/cloud/local-agent/status": () => ({ status: "offline" }),
+  });
+
+  expect(await screen.findByText(/^Could not check the Teams session\. Start local sync on your computer, then try again\./)).toBeInTheDocument();
+  expect(screen.queryByText(/Connect the Teams session/)).not.toBeInTheDocument();
+});
