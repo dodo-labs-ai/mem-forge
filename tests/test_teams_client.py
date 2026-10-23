@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from memforge.conversations.port import PollOutcome
+from memforge.genes import teams_client
 from memforge.genes.teams_client import (
     AuthenticationError,
     TeamsChatClient,
@@ -135,7 +136,6 @@ def test_parse_message_preserves_only_official_hosted_content_ids():
     assert parsed["hosted_content_ids"] == ["hosted-1", "hosted-2"]
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("conversation_type", "team_id", "root_message_id", "expected_path"),
     [
@@ -202,40 +202,26 @@ async def test_reading_an_inline_image_requires_graph_access_before_any_request(
     await client.close()
 
 
-@pytest.mark.asyncio
-async def test_request_bytes_stops_before_buffering_oversized_body():
-    client = TeamsChatClient(region="emea")
+async def test_reading_an_oversized_inline_image_stops_before_buffering_the_rest(monkeypatch):
+    monkeypatch.setattr(teams_client, "MAX_SOURCE_ARTIFACT_STORAGE_BYTES", 6)
     chunks_read = 0
 
-    class FakeResponse:
-        status_code = 200
-        headers = {"content-type": "image/png"}
-        request = httpx.Request("GET", "https://graph.microsoft.com/hosted")
+    async def body():
+        nonlocal chunks_read
+        for chunk in (b"1234", b"5678", b"not-read"):
+            chunks_read += 1
+            yield chunk
 
-        async def aiter_bytes(self):
-            nonlocal chunks_read
-            for chunk in (b"1234", b"5678", b"not-read"):
-                chunks_read += 1
-                yield chunk
-
-        def raise_for_status(self):
-            return None
-
-    class FakeStream:
-        async def __aenter__(self):
-            return FakeResponse()
-
-        async def __aexit__(self, exc_type, exc, traceback):
-            return None
-
-    class FakeClient:
-        def stream(self, method: str, url: str):
-            assert method == "GET"
-            assert url == "/hosted"
-            return FakeStream()
+    service = serving(httpx.Response(200, content=body(), headers={"content-type": "image/png"}))
 
     with pytest.raises(SourceArtifactContractError, match="storage limit"):
-        await client._request_bytes(FakeClient(), "/hosted", max_bytes=6)
+        await service.client().get_hosted_content(
+            conversation_id="19:chat@thread.v2",
+            message_id="m1",
+            hosted_content_id="h1",
+            conversation_type="group_chat",
+            team_id=None,
+        )
 
     assert chunks_read == 2
 
