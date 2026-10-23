@@ -121,9 +121,14 @@ async def test_a_retry_after_over_the_cap_waits_only_the_cap(retry_after) -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("retry_after", [None, "soon"], ids=["absent", "unreadable"])
+@pytest.mark.parametrize(
+    "retry_after",
+    [None, "soon", "\u00b2", "\u0661\u0662"],
+    ids=["absent", "unreadable", "superscript-digit", "arabic-indic-digits"],
+)
 async def test_without_a_readable_retry_after_the_wait_backs_off(retry_after) -> None:
-    headers = {"Retry-After": retry_after} if retry_after else {}
+    # Raw header bytes, as a server sends them; httpx decodes them as UTF-8.
+    headers = [(b"Retry-After", retry_after.encode())] if retry_after else []
     http, requests = _http(httpx.Response(429, headers=headers))
 
     async with http.client(BASE_URL) as client:
@@ -288,6 +293,60 @@ async def test_a_request_policy_replaces_the_clients_for_that_request() -> None:
 
     assert len(requests) == 2
     assert http.waits == [0.5]
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_retry_after_still_paces_the_limiter_and_closes_the_stream() -> None:
+    clock = FakeClock()
+    limiter = AtlassianRequestLimiter(min_interval_seconds=0.5, clock=clock)
+    handle, requests = _answers(httpx.Response(503, headers=[(b"Retry-After", "\u00b2".encode())]), httpx.Response(200, content=b"ok"))
+    client = ConnectorHttpClient(
+        product_name="Confluence",
+        base_url=BASE_URL,
+        timeout=5.0,
+        follow_redirects=True,
+        limiter=limiter,
+        sleep=clock.sleep,
+        clock=clock,
+        transport=httpx.MockTransport(handle),
+    )
+
+    async with client:
+        async with client.stream("GET", "/download/1") as response:
+            assert await response.aread() == b"ok"
+
+    # Read as absent: the backoff, then the next attempt spaced only by the limiter's interval.
+    assert clock.waits == [2.0]
+    assert len(requests) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("seconds_to_deadline", "retried"), [(6.0, False), (8.0, True)])
+async def test_a_retry_is_made_only_when_its_wait_and_timeout_fit_before_the_deadline(
+    seconds_to_deadline, retried
+) -> None:
+    clock = FakeClock()
+    handle, requests = _answers(httpx.Response(429, headers={"Retry-After": "2"}), httpx.Response(200))
+    client = ConnectorHttpClient(
+        product_name="Test",
+        base_url=BASE_URL,
+        timeout=5.0,
+        follow_redirects=True,
+        sleep=clock.sleep,
+        clock=clock,
+        transport=httpx.MockTransport(handle),
+    )
+
+    async with client:
+        deadline = clock() + seconds_to_deadline
+        if retried:
+            assert (await client.get("/items", deadline=deadline)).status_code == 200
+        else:
+            with pytest.raises(httpx.HTTPStatusError, match="after 1 attempt "):
+                await client.get("/items", deadline=deadline)
+
+    # A 2 s wait and a 5 s timeout need 7 s.
+    assert len(requests) == (2 if retried else 1)
 
 
 @pytest.mark.asyncio

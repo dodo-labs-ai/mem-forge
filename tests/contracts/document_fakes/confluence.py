@@ -127,6 +127,8 @@ class _Provider:
 
 
 class ConfluenceFakes(DocumentConnectorFakes):
+    # 30 s in seconds on 429; an HTTP date 30 s ahead on 503, read to the whole second.
+    retry_waits = {429: (30.0, 30.0), 503: (29.0, 30.0)}
     listing_configs = {
         "page-tree": ListingConfig({**_CONNECTION, "page_tree_root": "100", "include_children": True}, walks_scope=True),
         "space": ListingConfig({**_CONNECTION, "sync_mode": "space", "spaces": ["PAY"]}, walks_scope=True),

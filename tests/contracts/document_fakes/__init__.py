@@ -44,6 +44,11 @@ What each fake must answer
     Required when ``listing_kinds`` include ``query``: a connection and stored
     items whose read by identifier answers HTTP ``status``, every time it is
     asked.
+``retry_waits``
+    Required with ``reading_by_id``: for 429 and 503, the range of seconds,
+    ``(low, high)``, that the fake's answer asks the client to wait before
+    retrying, which proves the Gene's client read ``Retry-After`` (or backed
+    off without it).
 ``rediscover_candidates(config)``
     Required for a configuration ``rediscovers_documents`` answers ``True``
     for: stored items to rediscover against ``connect(config)``'s provider,
@@ -125,6 +130,7 @@ class DocumentConnectorFakes:
     listing_configs: Mapping[str, ListingConfig] = {}
     non_listing_configs: Mapping[str, Mapping[str, object]] = {}
     device_configs: Mapping[str, Mapping[str, object]] = {}
+    retry_waits: Mapping[int, tuple[float, float]] = {}
 
     def connect(
         self,

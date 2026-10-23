@@ -148,6 +148,8 @@ def _page(issues: list[dict], start: int, total: int) -> httpx.Response:
 
 
 class JiraFakes(DocumentConnectorFakes):
+    # Retry-After: 600 is capped at 60 s; a 503 without it backs off 2 s.
+    retry_waits = {429: (60.0, 60.0), 503: (2.0, 2.0)}
     listing_configs = {
         "simple": ListingConfig(SIMPLE, walks_scope=False),
         "advanced": ListingConfig(ADVANCED, walks_scope=False),
