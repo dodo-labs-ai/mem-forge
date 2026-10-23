@@ -490,7 +490,7 @@ class NotionGene(DocumentGene):
             and notion_error_code(response) == "validation_error"
         ):
             raise SourceConfigurationError(
-                f"Notion databases holds {object_id}, which Notion does not read as a database. "
+                f"The Databases field holds {object_id}, which Notion does not read as a database. "
                 "If it is a page, move it to Root pages."
             )
         database = await self._database_behind(response, object_id) if kind == "page" else None
