@@ -30,7 +30,14 @@ interface AliasesProps {
   curation: { onError: (error: unknown) => void } | null;
 }
 
-function AliasRow({ alias, onRemove }: { alias: EntityAlias; onRemove: ((alias: string) => void) | null }) {
+interface AliasRowProps {
+  alias: EntityAlias;
+  onRemove: ((alias: string) => void) | null;
+  /** True while this alias's removal is in flight, so a second click cannot send it again. */
+  removing: boolean;
+}
+
+function AliasRow({ alias, onRemove, removing }: AliasRowProps) {
   return (
     <li className="flex items-center gap-3 px-4 py-2.5">
       <span className="min-w-0 flex-1 truncate text-sm text-foreground">{alias.alias}</span>
@@ -39,7 +46,13 @@ function AliasRow({ alias, onRemove }: { alias: EntityAlias; onRemove: ((alias: 
         {alias.created_at ? formatDate(alias.created_at) : "—"}
       </span>
       {onRemove ? (
-        <Button size="icon-sm" variant="ghost" aria-label={`Remove alias ${alias.alias}`} onClick={() => onRemove(alias.alias)}>
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          aria-label={`Remove alias ${alias.alias}`}
+          disabled={removing}
+          onClick={() => onRemove(alias.alias)}
+        >
           <Trash2 />
         </Button>
       ) : null}
@@ -93,7 +106,12 @@ function Aliases({ entity, curation }: AliasesProps) {
       ) : (
         <ul aria-label="Aliases" className="divide-y">
           {entity.aliases.map((item) => (
-            <AliasRow key={item.alias_normalized} alias={item} onRemove={remove} />
+            <AliasRow
+              key={item.alias_normalized}
+              alias={item}
+              onRemove={remove}
+              removing={removeAlias.isPending && removeAlias.variables === item.alias}
+            />
           ))}
         </ul>
       )}

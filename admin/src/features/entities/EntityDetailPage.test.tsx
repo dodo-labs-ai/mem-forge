@@ -55,6 +55,10 @@ test("shows aliases and the linked memory count", async () => {
 test("adds and removes an alias", async () => {
   let entity = CUT_OFF;
   const added: unknown[] = [];
+  let finishRemoval!: () => void;
+  const removal = new Promise<void>((resolve) => {
+    finishRemoval = resolve;
+  });
   const { calls } = renderAt("/entities/7", {
     "GET /api/v1/entities/7": () => entity,
     "POST /api/v1/entities/7/aliases": async (request) => {
@@ -64,7 +68,8 @@ test("adds and removes an alias", async () => {
       entity = { ...entity, aliases: [...entity.aliases, alias] };
       return { ok: true, alias: alias.alias, alias_normalized: alias.alias_normalized };
     },
-    "DELETE /api/v1/entities/7/aliases/Payroll%20cut-off": () => {
+    "DELETE /api/v1/entities/7/aliases/Payroll%20cut-off": async () => {
+      await removal;
       entity = { ...entity, aliases: entity.aliases.filter((alias) => alias.alias !== "Payroll cut-off") };
       return { ok: true };
     },
@@ -78,7 +83,10 @@ test("adds and removes an alias", async () => {
   expect(added).toEqual([{ alias: "Cut off date" }]);
   expect(input).toHaveValue("");
 
-  await userEvent.click(screen.getByRole("button", { name: "Remove alias Payroll cut-off" }));
+  const remove = screen.getByRole("button", { name: "Remove alias Payroll cut-off" });
+  await userEvent.click(remove);
+  await waitFor(() => expect(remove).toBeDisabled());
+  finishRemoval();
   await waitFor(() => expect(within(aliases).queryByText("Payroll cut-off")).not.toBeInTheDocument());
   expect(requestsTo(calls, "DELETE", "/api/v1/entities/7/aliases/Payroll%20cut-off")).toHaveLength(1);
 });
