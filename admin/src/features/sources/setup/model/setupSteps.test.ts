@@ -1,8 +1,8 @@
 import { expect, test } from "vitest";
 import { sourceTypeSchema } from "@/test/sourceTypeForms";
+import { firstGroupWithPurpose } from "../../model/configGroups";
 import {
   checkSetupGroup,
-  firstGroupWithPurpose,
   groupComplete,
   groupFields,
   groupSummary,

@@ -1,3 +1,4 @@
+import { inDeclaredOrder } from "../../model/configGroups";
 import {
   comparisonString,
   displayValue,
@@ -44,20 +45,13 @@ export interface SetupStepOptions {
   managed?: boolean;
 }
 
-function byOrder<T extends { order: number }>(items: readonly T[]): T[] {
-  return items
-    .map((item, index) => ({ item, index }))
-    .sort((a, b) => a.item.order - b.item.order || a.index - b.index)
-    .map(({ item }) => item);
-}
-
 /** The steps of the setup page, in order. */
 export function setupSteps(schema: ConfigSchema, options: SetupStepOptions): SetupStep[] {
   const project: SetupStep = { key: "project", label: "Project", kind: "project" };
   if (options.managed) return [project];
   return [
     { key: "basics", label: "Basics", kind: "basics" },
-    ...byOrder(schema.groups).map((group): SetupStep => ({ key: group.key, label: group.label, kind: "group", group })),
+    ...inDeclaredOrder(schema.groups).map((group): SetupStep => ({ key: group.key, label: group.label, kind: "group", group })),
     ...(options.mode === "create" && options.sharedWorkspace ? [{ key: "access", label: "Access", kind: "access" as const }] : []),
     project,
     { key: "schedule", label: "Schedule", kind: "schedule" },
@@ -66,17 +60,12 @@ export function setupSteps(schema: ConfigSchema, options: SetupStepOptions): Set
 
 /** The declared fields of a group, in the order the step draws them. */
 export function groupFields(schema: ConfigSchema, groupKey: string): ConfigField[] {
-  return byOrder(schema.fields.filter((field) => field.group === groupKey));
-}
-
-/** The key of the first group with this purpose, such as the step "Configure" opens. */
-export function firstGroupWithPurpose(schema: ConfigSchema, purpose: ConfigGroup["purpose"]): string | null {
-  return byOrder(schema.groups).find((group) => group.purpose === purpose)?.key ?? null;
+  return inDeclaredOrder(schema.fields.filter((field) => field.group === groupKey));
 }
 
 /** The key of the last content group, which "Check setup" follows. */
 export function checkSetupGroup(schema: ConfigSchema): string | null {
-  return byOrder(schema.groups).findLast((group) => group.purpose === "content")?.key ?? null;
+  return inDeclaredOrder(schema.groups).findLast((group) => group.purpose === "content")?.key ?? null;
 }
 
 /** Whether every visible required field of the group has a value. */

@@ -1,6 +1,6 @@
 import { useMemo } from "react";
-import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { unwrap, useApi, type Source, type SourceListSortMode } from "@/api";
+import { queryOptions, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { unwrap, useApi, type ApiClient, type Source, type SourceListSortMode } from "@/api";
 import { localSyncKeys } from "@/features/local-sync";
 import { ACTIVE_POLL_MS } from "./constants";
 import type { SourceSyncRetryTarget } from "./model/sourceSyncActivity";
@@ -14,6 +14,7 @@ export const sourceKeys = {
   imageDocuments: ["sources", "image-documents"] as const,
   preferences: ["sources", "preferences"] as const,
   types: ["genes"] as const,
+  configSchema: (sourceType: string) => ["genes", sourceType, "config-schema"] as const,
 };
 
 const EMPTY_SOURCES: Source[] = [];
@@ -54,25 +55,34 @@ export function useLocalSyncJobs() {
   return { ...query, jobs: query.data ?? EMPTY_JOBS };
 }
 
+/** The registered source types, with their display names, where they run and whether the service manages them. */
+export function useSourceTypes() {
+  const api = useApi();
+  return useQuery({ queryKey: sourceKeys.types, queryFn: () => unwrap(api.GET("/api/v1/genes")) });
+}
+
 /** Display names of source types, such as "Confluence" for `confluence`. */
 export function useSourceTypeLabels(): Record<string, string> {
-  const api = useApi();
-  const genes = useQuery({ queryKey: sourceKeys.types, queryFn: () => unwrap(api.GET("/api/v1/genes")) });
+  const genes = useSourceTypes();
   return useMemo(
     () => Object.fromEntries((genes.data ?? []).map((gene) => [gene.name, gene.display_name])),
     [genes.data],
   );
 }
 
+/** A source type's form description, which does not change while the app runs. */
+export function configSchemaQuery(api: ApiClient, sourceType: string) {
+  return queryOptions({
+    queryKey: sourceKeys.configSchema(sourceType),
+    queryFn: () => unwrap(api.GET("/api/v1/genes/{name}/config-schema", { params: { path: { name: sourceType } } })),
+    staleTime: Infinity,
+  });
+}
+
 /** The labels a source type's configuration gives its fields, keyed by field, such as "Spaces" for `spaces`. */
 export function useSourceConfigLabels(sourceType: string | null): Record<string, string> {
   const api = useApi();
-  const schema = useQuery({
-    queryKey: [...sourceKeys.types, sourceType, "config-schema"],
-    queryFn: () => unwrap(api.GET("/api/v1/genes/{name}/config-schema", { params: { path: { name: sourceType! } } })),
-    enabled: sourceType !== null,
-    staleTime: Infinity,
-  });
+  const schema = useQuery({ ...configSchemaQuery(api, sourceType ?? ""), enabled: sourceType !== null });
   return useMemo(
     () => Object.fromEntries((schema.data?.fields ?? []).map((field) => [field.key, field.label])),
     [schema.data],

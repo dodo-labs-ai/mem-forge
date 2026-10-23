@@ -1,4 +1,4 @@
-export { SourcesPage } from "./SourcesPage";
+export { SourcesRoutes } from "./SourcesRoutes";
 export { SourceIcon } from "./SourceIcon";
 export {
   sourceKeys,
