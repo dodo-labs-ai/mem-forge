@@ -15,7 +15,7 @@ import {
   useConfigCheck,
   useCreateSource,
   usePreviewDiscovery,
-  useScopeChangePreview,
+  useDebouncedScopeChangePreview,
   useUpdateSource,
   type CreateSourceBody,
   type UpdateSourceBody,
@@ -142,6 +142,7 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
   const currentKey = steps.find((step) => step.key === searchParams.get(SOURCE_SETTINGS_STEP_PARAM))?.key ?? steps[0]!.key;
   const currentIndex = steps.findIndex((step) => step.key === currentKey);
   const current = steps[currentIndex]!;
+  const factsGroup = checkSetupGroup(schema) ?? steps.findLast((step) => step.kind === "group")?.key;
 
   const { check } = configCheck;
   useEffect(() => {
@@ -169,8 +170,8 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
   const scopeChanged =
     source !== undefined && canEditConfig && schema.fields.some((field) => field.scope && !sameJson(config[field.key], initial.config[field.key]));
   const missing = missingRequired(schema, state);
-  const scopePreview = useScopeChangePreview(sourceId ?? "", scopeChanged && missing.length === 0 ? config : null, secretKeys);
-  const scopeNotice = scopeChanged ? scopeChangeNotice(scopePreview.preview) : null;
+  const scopePreview = useDebouncedScopeChangePreview(sourceId ?? "", scopeChanged && missing.length === 0 ? config : null, secretKeys);
+  const scopeNotice = scopeChanged ? scopeChangeNotice(scopePreview) : null;
   const scopeRefused = scopeNotice?.tone === "danger";
 
   async function persist(payload: SavePayload) {
@@ -389,9 +390,13 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
     }
   }
 
-  /** config-check's facts, and on an edit page the fixed execution choice of this group. */
+  /**
+   * config-check's facts, which state the whole configuration and so show once, on the
+   * last group; and on an edit page the fixed execution choice of this group.
+   */
   function groupFacts(step: SetupStep): Property[] {
-    const facts: Property[] = (configCheck.result?.facts ?? []).map((fact) => ({ label: fact.label, value: fact.value }));
+    const facts: Property[] =
+      step.key === factsGroup ? (configCheck.result?.facts ?? []).map((fact) => ({ label: fact.label, value: fact.value })) : [];
     if (!source) return facts;
     for (const field of schema.fields) {
       if (!field.fixed_after_create || field.group !== step.key) continue;

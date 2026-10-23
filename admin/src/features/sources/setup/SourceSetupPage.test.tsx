@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useLocation } from "react-router-dom";
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, beforeAll, expect, test, vi } from "vitest";
 import type { Source } from "@/api";
 import { errorResponse, type Route } from "@/test/fakeApi";
 import { renderRoutes } from "@/test/renderRoutes";
@@ -10,6 +10,11 @@ import { SOURCE_TYPE_FORMS, sourceTypeSchema } from "@/test/sourceTypeForms";
 import { NewSourcePage, SourceSettingsPage } from "./SourceSetupPage";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
+// The New project dialog loads with the Projects feature when it opens; loading it first keeps that out of each test's wait.
+beforeAll(async () => {
+  await import("@/features/projects");
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -171,11 +176,12 @@ test("a pasted Confluence page URL fills the page tree root and switches an unch
 
   await userEvent.type(await screen.findByLabelText("Wiki URL"), pageUrl);
   await userEvent.tab();
-  expect(await screen.findByText("wiki.example.com")).toBeInTheDocument();
+  await waitFor(() => expect(requestsTo(calls, "POST", "/api/v1/genes/confluence/config-check")).not.toHaveLength(0));
   expect(screen.getByLabelText("Wiki URL")).toHaveValue(pageUrl);
   await next();
 
   expect(await screen.findByRole("radio", { name: "This page tree" })).toBeChecked();
+  expect(within(screen.getByRole("region", { name: "Detected settings" })).getByText("wiki.example.com")).toBeInTheDocument();
   expect(screen.getByLabelText("Page Tree Root")).toHaveValue("12345");
   expect(screen.getByLabelText("Page Tree Root")).toHaveAccessibleDescription(expect.stringContaining("Filled from the URL"));
   expect(screen.queryByLabelText("Spaces to Sync")).not.toBeInTheDocument();

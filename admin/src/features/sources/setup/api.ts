@@ -115,7 +115,7 @@ function previewKey(config: Record<string, unknown>, secretKeys: readonly string
  * way, the last one stays. A configuration the server refuses yields no
  * preview; config-check and save report it.
  */
-export function useScopeChangePreview(sourceId: string, config: Record<string, unknown> | null, secretKeys: readonly string[]) {
+export function useDebouncedScopeChangePreview(sourceId: string, config: Record<string, unknown> | null, secretKeys: readonly string[]) {
   const api = useApi();
   const serialized = useDebouncedValue(config ? JSON.stringify(config) : null, SCOPE_PREVIEW_DELAY_MS);
   const debounced = useMemo(() => (serialized ? (JSON.parse(serialized) as Record<string, unknown>) : null), [serialized]);
@@ -136,9 +136,5 @@ export function useScopeChangePreview(sourceId: string, config: Record<string, u
     gcTime: 0,
     retry: false,
   });
-  return {
-    preview: key !== null ? preview.data : undefined,
-    /** The preview of the configuration as it stands is still on its way. */
-    pending: config !== null && (serialized !== JSON.stringify(config) || preview.isFetching),
-  };
+  return key !== null ? preview.data : undefined;
 }
