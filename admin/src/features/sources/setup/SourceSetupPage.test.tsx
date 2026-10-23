@@ -5,6 +5,7 @@ import { afterEach, beforeAll, expect, test, vi } from "vitest";
 import type { Source } from "@/api";
 import { errorResponse, type Route } from "@/test/fakeApi";
 import { renderRoutes } from "@/test/renderRoutes";
+import { setupJobRoutes } from "@/test/setupJobs";
 import { makeScopeTransition, makeSource } from "@/test/sourceFixtures";
 import { SOURCE_TYPE_FORMS, sourceTypeSchema } from "@/test/sourceTypeForms";
 import { NewSourcePage, SourceSettingsPage } from "./SourceSetupPage";
@@ -160,6 +161,47 @@ test("Check setup lists the first five items", async () => {
     limit: 5,
     source_id: null,
   });
+});
+
+test("Check setup for a local folder lists the files local sync finds there", async () => {
+  const created: Parameters<typeof setupJobRoutes>[1] = [];
+  renderSetup("/sources/new/local_markdown?step=connection", {
+    routes: {
+      "POST /api/v1/genes/local_markdown/config-check": () => NO_ISSUES,
+      ...setupJobRoutes(
+        {
+          local_markdown_preview_tree: {
+            status: "succeeded",
+            result: {
+              operation: "local_markdown_preview_tree",
+              counts: { included: 12, ignored: 3, too_large: 0, invalid_utf8: 0, unreadable: 0 },
+              items: [
+                { relative_path: "payroll/runbook.md", title: "Payroll runbook" },
+                { relative_path: "notes.md", title: "" },
+              ],
+            },
+          },
+        },
+        created,
+      ),
+    },
+  });
+
+  await userEvent.type(await screen.findByLabelText("Folder Path"), "/Users/me/notes");
+  await next();
+  await userEvent.click(await screen.findByRole("button", { name: "Check setup" }));
+
+  const found = await screen.findByRole("list", { name: "First items found" });
+  expect(within(found).getAllByRole("listitem").map((item) => item.textContent)).toEqual(["Payroll runbook", "notes.md"]);
+  expect(screen.getByText("The first 2 items found")).toBeInTheDocument();
+  expect(created).toEqual([
+    {
+      source_id: "",
+      source_type: "local_markdown",
+      operation: "local_markdown_preview_tree",
+      payload: { root: "/Users/me/notes", vault_id: "preview", limit: 5 },
+    },
+  ]);
 });
 
 test("a pasted Confluence page URL fills the page tree root and switches an unchosen sync scope to page tree", async () => {

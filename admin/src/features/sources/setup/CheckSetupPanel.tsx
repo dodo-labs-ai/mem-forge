@@ -2,13 +2,13 @@ import { ExternalLink } from "lucide-react";
 import { errorMessage } from "@/lib/errors";
 import { pluralize } from "@/lib/format";
 import { Button } from "@/ui/button";
-import type { DiscoveryPreview } from "./api";
+import type { SetupPreview } from "./api";
 
 interface CheckSetupPanelProps {
   /** Every required field has a value, so the server can be asked. */
   ready: boolean;
   pending: boolean;
-  preview: DiscoveryPreview | undefined;
+  preview: SetupPreview | undefined;
   /** Why the check failed; a refused configuration is shown on its fields instead. */
   error: unknown;
   onCheck: () => void;
@@ -51,16 +51,15 @@ export function CheckSetupPanel({ ready, pending, preview, error, onCheck }: Che
             </p>
             <ul aria-label="First items found" className="space-y-1">
               {preview.items.map((item) => (
-                <li key={item.item_id} className="text-sm">
-                  <a
-                    href={item.source_url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1 text-foreground hover:underline"
-                  >
-                    {item.title || item.item_id}
-                    <ExternalLink aria-hidden className="size-3 text-muted-foreground" />
-                  </a>
+                <li key={item.id} className="text-sm">
+                  {item.href ? (
+                    <a href={item.href} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-foreground hover:underline">
+                      {item.title}
+                      <ExternalLink aria-hidden className="size-3 text-muted-foreground" />
+                    </a>
+                  ) : (
+                    <span className="font-mono text-xs">{item.title}</span>
+                  )}
                 </li>
               ))}
             </ul>
