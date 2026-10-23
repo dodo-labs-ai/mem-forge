@@ -742,6 +742,11 @@ export interface paths {
         /**
          * Browse Github Repo Tree
          * @description List selectable repository paths for the GitHub Repository source UI.
+         *
+         *     The tree is read with the Source's own client and TLS. A tree GitHub
+         *     truncates is walked folder by folder within
+         *     ``BROWSE_TREE_REQUEST_BUDGET`` requests; a larger repository answers
+         *     400, and its paths are typed instead.
          */
         post: operations["browse_github_repo_tree_api_v1_genes_github_repo_browse_tree_post"];
         delete?: never;
