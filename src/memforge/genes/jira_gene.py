@@ -849,16 +849,22 @@ class JiraGene(DocumentGene):
             )
 
         key = item.extra.get("issue_key", item.item_id.removeprefix(_ISSUE_DOC_ID_PREFIX))
+        attested = item.extra.get("attest_materialized_revision") is True
+        if attested:
+            await self._hydrate_inventory_issue(item, key)
         hydrated_issue = getattr(self, "_hydrated_issues", {}).get(key)
         if isinstance(hydrated_issue, dict):
             payload = _issue_payload_from_search(hydrated_issue, self.config)
             from memforge.source_adapters.jira import comment_requires_rendering
 
-            if payload.get("_comments_truncated") or any(
+            comments_read_apart = bool(payload.get("_comments_truncated")) or any(
                 comment_requires_rendering(comment) for comment in payload.get("_comments", [])
-            ):
+            )
+            if comments_read_apart:
                 await self._fetch_comment_snapshot(key, payload)
             getattr(self, "_hydrated_issues", {}).pop(key, None)
+            if attested and comments_read_apart:
+                await self._attest_materialized_revision(key, str(item.version or ""))
             artifacts = await self._fetch_source_artifacts(payload)
             return RawContent(
                 item=item,
@@ -901,8 +907,6 @@ class JiraGene(DocumentGene):
             data["_comments"] = []
             data["_comments_total"] = 0
             data["_comments_included"] = False
-        if item.extra.get("attest_materialized_revision") is True:
-            await self._attest_materialized_revision(key, str(item.version or ""))
         validate_jira_observation_identities(data)
         artifacts = await self._fetch_source_artifacts(data)
 
@@ -1056,22 +1060,42 @@ class JiraGene(DocumentGene):
             return "comment", matches[0]
         return "issue_core", f"{issue_id}:core"
 
+    async def _hydrate_inventory_issue(self, item: ContentItem, key: str) -> None:
+        """Read a listed issue in full with a one-issue search in the scope, at the listed revision.
+
+        Jira writes ``updated`` per endpoint: a search can answer it at a
+        coarser precision than an issue read, so a listed revision is
+        compared only with another search.
+        """
+        current = await self.rediscover(item)
+        if current is None or current.extra["issue_key"] != key or current.version != item.version:
+            if current is not None:
+                self._hydrated_issues.pop(current.extra["issue_key"], None)
+            raise RuntimeError(
+                f"Jira issue {key} changed during materialization; retry inventory"
+            )
+
     async def _attest_materialized_revision(self, key: str, expected_revision: str) -> None:
-        response = await self._request(
-            "GET",
-            f"/rest/api/2/issue/{key}",
-            params={"fields": "updated"},
-        )
-        payload = response.json()
-        fields = payload.get("fields") if isinstance(payload, dict) else None
+        """Search the issue again after its comments are read apart, and require the listed revision."""
+        issues = [
+            issue
+            async for issue in self._search_issues(
+                _single_issue_jql(self.config, key),
+                fields=JIRA_IDENTITY_FIELDS,
+                expand=None,
+                max_results=1,
+                validate_query=False,
+            )
+        ]
+        fields = issues[0].get("fields") if len(issues) == 1 else None
         current_revision = (
             str(fields.get("updated") or "").strip()
             if isinstance(fields, dict)
             else ""
         )
         if (
-            not isinstance(payload, dict)
-            or str(payload.get("key") or "").strip() != key
+            len(issues) != 1
+            or str(issues[0].get("key") or "").strip() != key
             or not current_revision
             or current_revision != expected_revision
         ):
