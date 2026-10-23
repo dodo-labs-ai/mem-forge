@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, TypeAdapter
 
+from memforge.agent_sessions import ensure_agent_session_source
 from memforge.server.admin_api import (
     AgentSessionCompletenessResponse,
     EntityAliasAddedResponse,
@@ -212,16 +213,25 @@ def test_force_resync_answers_a_server_receipt_or_a_local_collection_receipt(cli
 
 
 def test_agent_session_completeness_answers_its_model(client, database):
-    async def seed():
+    async def seed() -> str:
+        source = await ensure_agent_session_source(database, client="codex", owner_user_id=OWNER["x-test-user"])
         for index, outcome in enumerate(["knowledge_patched", "no_output", "failed"]):
             await database.upsert_agent_session_receipt(
-                _make_receipt(doc_id=f"window-{index}", session_id="sess-1", outcome=outcome, reason="timeout")
+                _make_receipt(
+                    doc_id=f"window-{index}",
+                    session_id="sess-1",
+                    outcome=outcome,
+                    reason="timeout",
+                    source_id=source["id"],
+                )
             )
+        return source["id"]
 
-    asyncio.run(seed())
+    source_id = asyncio.run(seed())
 
-    summary = client.get("/api/v1/agent-sessions/completeness", params={"session_id": "sess-1"}, headers=OWNER)
-    empty = client.get("/api/v1/agent-sessions/completeness", params={"session_id": "none"}, headers=OWNER)
+    url = "/api/v1/agent-sessions/completeness"
+    summary = client.get(url, params={"source_id": source_id, "session_id": "sess-1"}, headers=OWNER)
+    empty = client.get(url, params={"source_id": source_id, "session_id": "none"}, headers=OWNER)
 
     body = _valid(AgentSessionCompletenessResponse, summary)
     assert body.latest_failure is not None and body.latest_failure.reason == "timeout"
