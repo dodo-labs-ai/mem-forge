@@ -2663,19 +2663,24 @@ def test_agent_session_completeness_endpoint(tmp_path):
     asyncio.run(database.connect())
     try:
 
-        async def _seed():
+        async def _seed() -> str:
+            source = await ensure_agent_session_source(database, client="codex", owner_user_id="dev")
             for index, outcome in enumerate(["knowledge_patched", "no_output"]):
                 await database.upsert_agent_session_receipt(
-                    _make_receipt(doc_id=f"ep-{index}", session_id="sess-ep", outcome=outcome)
+                    _make_receipt(doc_id=f"ep-{index}", session_id="sess-ep", outcome=outcome, source_id=source["id"])
                 )
+            return source["id"]
 
-        asyncio.run(_seed())
+        source_id = asyncio.run(_seed())
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
-            response = client.get("/api/v1/agent-sessions/completeness", params={"session_id": "sess-ep"})
+            response = client.get(
+                "/api/v1/agent-sessions/completeness", params={"source_id": source_id, "session_id": "sess-ep"}
+            )
 
         assert response.status_code == 200
         body = response.json()
+        assert body["source_id"] == source_id
         assert body["total"] == 2
         assert body["processed_total"] == 2
         assert body["counts"] == {"knowledge_patched": 1, "no_output": 1, "failed": 0}

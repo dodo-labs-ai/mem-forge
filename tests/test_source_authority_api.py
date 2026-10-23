@@ -83,6 +83,41 @@ def test_exact_sync_receipt_read_preserves_state_and_source_visibility(tmp_path)
         asyncio.run(database.close())
 
 
+def test_agent_session_completeness_answers_only_for_a_discoverable_source(tmp_path):
+    from memforge.agent_sessions import ensure_agent_session_source
+    from tests.test_agent_session_api import _make_receipt
+
+    database = _connect_database(tmp_path)
+    try:
+        source = asyncio.run(ensure_agent_session_source(database, client="codex", owner_user_id="owner-user"))
+        receipt = _make_receipt(
+            doc_id="window-1",
+            session_id="sess-1",
+            outcome="failed",
+            reason="owner's private failure",
+            source_id=source["id"],
+        )
+        asyncio.run(database.upsert_agent_session_receipt(receipt))
+        url = "/api/v1/agent-sessions/completeness"
+        other = {"x-test-user": "other"}
+        with TestClient(_app(tmp_path, database)) as client:
+            own = client.get(url, params={"source_id": source["id"]})
+            hidden = client.get(url, params={"source_id": source["id"]}, headers=other)
+            hidden_session = client.get(url, params={"source_id": source["id"], "session_id": "sess-1"}, headers=other)
+            unknown = client.get(url, params={"source_id": "src-missing"}, headers=other)
+            without_source = client.get(url, params={"session_id": "sess-1"}, headers=other)
+
+        assert own.status_code == 200, own.text
+        assert own.json()["latest_failure"]["reason"] == "owner's private failure"
+        assert unknown.status_code == 404
+        for response in (hidden, hidden_session):
+            assert response.status_code == 404
+            assert response.json() == unknown.json()
+        assert without_source.status_code == 422
+    finally:
+        asyncio.run(database.close())
+
+
 def _confluence_payload(
     name: str = "Architecture Wiki",
     *,
