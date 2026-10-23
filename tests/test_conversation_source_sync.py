@@ -23,7 +23,9 @@ import pytest
 
 from memforge.conversations.collect import collect
 from memforge.conversations.collections import ArtifactLink, CollectedBody, StoredCollections
+from memforge.conversations.coverage import proven_interval
 from memforge.conversations.intake import CollectionIntake
+from memforge.conversations.layer import ConversationLayer
 from memforge.conversations.port import (
     ArtifactBody,
     ConversationAccess,
@@ -47,6 +49,7 @@ from memforge.source_projection import ProjectionScopeTransition, ProjectionScop
 from memforge.source_projection_config import canonical_projection_scope
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
+from tests.conversation_attempts_fixture import without
 from tests.test_sync_bookkeeping import (
     NoopMemoryEngine,
     ProjectionFragmentRecordingExtractor,
@@ -548,6 +551,50 @@ async def test_a_poll_that_stops_early_is_continued_by_the_next_attempt_without_
     await workspace.collect_and_sync(teams)
 
     assert "m0" not in {member for members in (await workspace.units()).values() for member in members}
+
+
+async def test_a_backfill_poll_that_stops_early_is_continued_without_removing_anything_unread(workspace):
+    teams = FakeTeams()
+    for index, hours in enumerate((200, 150, 100, 50, 40, 30, 20)):
+        teams.post(CHAT, f"m{index}", _ago(hours), f"message {index}")
+    await workspace.collect_and_sync(teams)
+    teams.delete(CHAT, "m0")
+    # Every poll stops after one page of two messages.
+    teams.poll_limit = 2
+    collections = StoredCollections(workspace.db, workspace_id=WORKSPACE_ID)
+    read: list[tuple[datetime, datetime]] = []
+
+    for _attempt in range(3):
+        state, _missing = await workspace.collect_and_sync(teams)
+
+        assert state.last_sync_status == "success"
+        manifest = await collections.latest_manifest(SOURCE_ID)
+        request = await collections.request(SOURCE_ID, manifest.collection_attempt_id)
+        assert len(request.conversations[0].intervals) <= 3
+        read.extend(_read_by(manifest))
+        following = ConversationLayer.collection_request(
+            selection=TeamsGene(dict(workspace.config), SOURCE_ID).conversation_selection(),
+            now=datetime.now(timezone.utc),
+            previous=manifest,
+        )
+        floor, *backfills = following.conversations[0].intervals
+        regular_end = _read_by(manifest)[0][1]
+        assert without([(floor.start, regular_end)], [*read, *((b.start, b.end) for b in backfills)]) == []
+        # m0 never lay inside a proven interval of a poll that stopped early.
+        assert "m0" in {member for members in (await workspace.units()).values() for member in members}
+    assert any(len(conversation.intervals) == 3 for conversation in request.conversations)
+
+
+def _read_by(manifest) -> list[tuple[datetime, datetime]]:
+    """What each poll of the manifest read: its proven interval, from its requested start unless it stopped early."""
+
+    (evidence,) = manifest.conversations
+    reads = []
+    for poll in evidence.polls:
+        proven = proven_interval(poll, evidence.ref, received_at=manifest.received_at)
+        start = proven.start if poll.outcome is PollOutcome.STOPPED_EARLY else poll.requested.start
+        reads.append((start, proven.end))
+    return reads
 
 
 async def test_a_reprocess_reads_each_unit_from_its_committed_input(workspace):

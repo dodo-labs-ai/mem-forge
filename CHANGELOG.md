@@ -2,10 +2,22 @@
 
 ## Unreleased
 
-- Initial History is at most 365 days for every conversation Source, whatever
+- A conversation Source requests at most two backfills per conversation: the
+  lowest range the previous attempt left unread after the history floor, and
+  one spanning the rest, instead of one backfill per interrupted poll. No
+  range after the floor is left unrequested, including the range an Initial
+  History expansion adds, and a chat whose sync keeps stopping on its time
+  budget reads further back on every attempt without re-reading its history.
+  Initial History is at most 365 days for every conversation Source, whatever
   its Rolling Retention, and never more than a finite retention. The bound
   belongs to the conversation layer; the Teams Gene no longer derives it from
   its retention presets, and stored Teams values are already within it.
+
+  Upgrade note: if a conversation Source's Initial History was widened, let
+  one more sync run after the first sync that used the new value before
+  upgrading, with Initial History unchanged. Otherwise, in a chat whose sync
+  keeps stopping on its time budget, the history the widening added may not
+  be collected until a sync reads the chat to its start.
 
 - A Teams poll that runs out of history names the time its read is complete
   from: the oldest page's oldest message, or the last certificate before an
