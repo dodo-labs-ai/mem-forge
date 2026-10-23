@@ -26,7 +26,6 @@ from memforge.genes.base import SourceConfigurationError
 from memforge.models import ConfigField, ConfigFieldType
 
 
-
 @dataclass(frozen=True)
 class FieldIssue:
     """Why one configuration field is refused; ``key`` is ``None`` when no single field is at fault."""

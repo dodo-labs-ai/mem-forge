@@ -159,6 +159,19 @@ def check_config(
     return issues
 
 
+def _issue_name(product_name: str, label: str) -> str:
+    """Name a field after its product, sharing the words the two have in common.
+
+    ``("GitHub Repository", "Repository URL")`` reads "GitHub Repository URL",
+    and ``("Jira", "Jira Base URL")`` reads "Jira Base URL".
+    """
+    product_words, label_words = product_name.split(), label.split()
+    for overlap in range(min(len(product_words), len(label_words)), 0, -1):
+        if product_words[-overlap:] == label_words[:overlap]:
+            return " ".join(product_words + label_words[overlap:])
+    return f"{product_name} {label}"
+
+
 def _field_issue(
     field: ConfigField,
     fields: Mapping[str, ConfigField],
@@ -175,7 +188,7 @@ def _field_issue(
     if not conditions_hold(field.visible_when, fields, config, descriptor):
         return None
     value = config.get(field.key)
-    name = field.label if field.label.startswith(f"{product_name} ") else f"{product_name} {field.label}"
+    name = _issue_name(product_name, field.label)
     if field.field_type in _LIST_FIELD_TYPES and value is not None and not isinstance(value, (list, str)):
         return FieldIssue(field.key, f"{name} must be a list or a comma-separated string")
     if field.required and not _has_value(field, config, existing_config, descriptor):

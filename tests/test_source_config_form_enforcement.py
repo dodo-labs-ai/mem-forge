@@ -224,10 +224,20 @@ def test_github_pages_base_url_is_derived_from_the_scope_url_and_kept_on_update(
     assert _stored_config(database, source_id)["base_url"] == PAGES
 
 
+def test_github_pages_single_page_url_is_read_as_one_url(client, database):
+    created = _create(client, "github_pages", {"auth_mode": "none", "page_url": f"{PAGES}/guide/a,b/"})
+    assert created.status_code == 200, created.text
+    assert _stored_config(database, created.json()["id"])["page_url"] == f"{PAGES}/guide/a,b/"
+
+    response = _create(client, "github_pages", {"auth_mode": "none", "page_url": 5})
+
+    assert [key for key, _ in _issues(response)] == ["page_url"]
+
+
 def test_github_repo_missing_repo_url_is_refused_on_its_field(client):
     response = _create(client, "github_repo", {"connection_mode": "cloud_pull"})
 
-    assert _issues(response) == [("repo_url", "GitHub Repository Repository URL is required")]
+    assert _issues(response) == [("repo_url", "GitHub Repository URL is required")]
 
 
 def test_secret_origin_guard_runs_after_the_form_check(client):
@@ -330,7 +340,7 @@ def test_browse_tree_answers_config_invalid(client):
         (
             "github_repo",
             {"repo_url": "https://github.example.test/org/repo", "connection_mode": "ssh"},
-            ("connection_mode", "GitHub Repository Repository Access must be one of: Cloud access, Local sync"),
+            ("connection_mode", "GitHub Repository Access must be one of: Cloud access, Local sync"),
         ),
     ],
 )

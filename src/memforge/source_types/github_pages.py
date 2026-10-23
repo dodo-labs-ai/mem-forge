@@ -44,7 +44,14 @@ def _validate_config(config: dict[str, Any], existing_config: Mapping[str, Any])
     base_url = str(config.get("base_url") or "").strip()
     sync_mode = str(config.get("sync_mode") or "single_page").strip().lower()
     key, label = _SCOPE_URL_FIELDS[sync_mode]
-    for url in list_config(config.get(key)):
+    # A single page or a subtree root is one URL, which may itself hold a
+    # comma; only an explicit list names several.
+    if key == "pages":
+        urls = list_config(config.get(key))
+    else:
+        single_url = str(config.get(key) or "").strip()
+        urls = [single_url] if single_url else []
+    for url in urls:
         _validate_scope_url(base_url, url, key, label)
 
 
