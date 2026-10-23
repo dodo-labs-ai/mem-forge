@@ -218,6 +218,20 @@ async def test_rediscover_returns_none_for_an_archived_row() -> None:
     assert {f"notion-{archived}", f"notion-{under_archived}"}.isdisjoint((await gene.list_scope()).doc_ids)
 
 
+async def test_rediscover_returns_none_below_an_archived_or_trashed_root() -> None:
+    fake = NotionFake()
+    archived_root = fake.add_page("Archived root", is_archived=True)
+    under_archived = fake.add_page("Under the archived root", parent=("page", archived_root))
+    trashed_root = fake.add_page("Trashed root", in_trash=True)
+    under_trashed = fake.add_page("Under the trashed root", parent=("page", trashed_root))
+    gene = await connect(fake, root_pages=[archived_root, trashed_root])
+
+    assert await gene.rediscover(stored(under_archived)) is None
+    assert await gene.rediscover(stored(under_trashed)) is None
+    archived_only = await connect(fake, root_pages=[archived_root])
+    assert (await archived_only.list_scope()).doc_ids == set()
+
+
 async def test_rediscover_matches_the_walk_for_a_page_shown_through_a_synced_duplicate() -> None:
     fake = NotionFake()
     outside = fake.add_page("Outside")

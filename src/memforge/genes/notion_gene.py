@@ -583,7 +583,8 @@ class NotionGene(DocumentGene):
         ends outside every root: at the workspace, or at an
         ancestor that is trashed, archived or answers 404 (an ancestor
         between a shared root and the page is always visible). A configured
-        root is in scope. Verdicts on ancestors are kept for the connection,
+        root is read like any other ancestor, so a page below a trashed or
+        archived root is out of scope, as it is for the walk. Verdicts on ancestors are kept for the connection,
         so pages under one ancestor read it once. A chain longer than 64
         ancestors raises.
         """
@@ -619,14 +620,14 @@ class NotionGene(DocumentGene):
             if len(chain) >= _ANCESTOR_BOUND:
                 raise RuntimeError(f"Notion page's parent chain is longer than {_ANCESTOR_BOUND} ancestors")
             chain.append((kind, node_id))
-            if node_id in roots:
-                verdict = (True, None)
-                break
             found = await self._ancestor(kind, node_id)
             if found is None:
                 verdict = (False, None)
                 break
             chain[-1] = (found[0], node_id)
+            if node_id in roots:
+                verdict = (True, None)
+                break
             node = notion_parent(found[1], f"{found[0]} {node_id}")
 
         in_scope, nearest = verdict
