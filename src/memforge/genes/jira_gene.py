@@ -11,21 +11,18 @@ import logging
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
 from memforge.genes.atlassian_auth import (
+    atlassian_fail_fast,
     atlassian_record_state,
     atlassian_request_limiter,
-    bearer_headers,
-    request_with_rate_limit_retry,
-    require_https_base_url,
-    stream_with_rate_limit_retry,
-    tls_verify,
 )
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.document_gene import DocumentGene
@@ -33,12 +30,15 @@ from memforge.genes.local_adapter_packages import (
     decode_package,
     has_package_manifest,
     open_packaged_source_artifact,
-    package_manifest,
     read_package_body,
     source_artifacts_from_package,
 )
+from memforge.genes.toolkit.config import bearer_headers, bool_config, require_https_base_url, tls_verify
+from memforge.genes.toolkit.http import ConnectorHttpClient
+from memforge.genes.toolkit.local_packages import device_packages
+from memforge.genes.toolkit.paging import OffsetPage, PagingErrors, paged_by_offset
 from memforge.local_agent.jira_contract import validate_jira_observation_identities
-from memforge.source_time import SOURCE_UPDATED_AT_KEY, source_time_iso
+from memforge.source_time import SOURCE_UPDATED_AT_KEY, WESTERNMOST_ZONE, source_time_iso
 from memforge.models import (
     AbsenceAnswer,
     ConfigField,
@@ -85,6 +85,7 @@ JIRA_INVENTORY_MAX_RESULTS = 100
 # every search result, and one small field keeps the response minimal.
 JIRA_IDENTITY_FIELDS = ["updated"]
 _ISSUE_DOC_ID_PREFIX = "jira-"
+JIRA_MYSELF_PATH = "/rest/api/2/myself"
 LOCAL_AGENT_JIRA_PACKAGE_KIND = "jira_document"
 
 JIRA_QUERY_MODE_SIMPLE = "simple"
@@ -96,10 +97,75 @@ _LISTING_ORDER_BY = "ORDER BY key ASC"
 _ORDER_BY_RE = re.compile(r"\border\s+by\b", re.IGNORECASE)
 # An issue id (digits) or an issue key (project key, hyphen, number).
 _ISSUE_REF_RE = re.compile(r"\d+|[A-Z][A-Z0-9_]*-\d+")
+_SEARCH_PAGING_ERRORS = PagingErrors(
+    start_mismatch="Jira search response startAt does not match the requested page",
+    total_changed="Jira search total changed during pagination",
+    early_end="Jira search ended before the declared total was reached",
+    repeated_item="Jira search returned duplicate issue identity",
+    count_mismatch="Jira search unique issue count did not match total",
+)
 
 
-def _delta_clause(since: datetime) -> str:
-    return f"updated >= '{since.strftime('%Y-%m-%d %H:%M')}'"
+def _delta_clause(since: datetime, profile_zone: tzinfo) -> str:
+    """The incremental filter: every issue updated at or after ``since``, and possibly a little earlier.
+
+    Jira reads a JQL date literal as a wall-clock minute in the searching
+    account's profile timezone, so the literal is ``since`` in that timezone,
+    rounded down to the minute::
+
+        _delta_clause(datetime(2026, 3, 1, 9, 30, 40, tzinfo=timezone.utc), ZoneInfo("America/Los_Angeles"))
+        # "updated >= '2026-03-01 01:30'"   (01:30 PST is 09:30 UTC)
+
+    The same instant written in UTC, ``'2026-03-01 09:30'``, would be read
+    as 09:30 PST, eight hours later, and would hide every issue updated in
+    between. A ``since`` without a timezone is read as UTC.
+    """
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    return f"updated >= '{_jql_wall_minute(since, profile_zone):%Y-%m-%d %H:%M}'"
+
+
+def _jql_wall_minute(since: datetime, zone: tzinfo) -> datetime:
+    """The latest wall-clock minute in ``zone`` that Jira reads as ``since`` or earlier, without a timezone.
+
+    The minute is ``since`` converted to ``zone`` and rounded down. Around a
+    daylight-saving change a wall-clock minute may not name exactly one
+    instant, and Jira may read it as a later one than ``since``, which would
+    hide the edits in between. So the minute is kept only when every instant
+    it can name is at or before ``since``, and otherwise steps back an hour:
+
+    - **Ambiguous** (clocks go back): 01:30 on 2026-11-01 in New York is
+      05:30 UTC (EDT) and again 06:30 UTC (EST). For ``since`` 05:30 UTC the
+      minute becomes 00:30 EDT, 04:30 UTC, so one more hour is read again and
+      nothing is hidden whichever reading Jira picks. For ``since`` 06:30 UTC
+      01:30 is kept: both its readings are at or before it.
+    - **Non-existent** (clocks go forward): 02:30 on 2026-03-08 in New York
+      never happens, and Jira may move it forward to 03:30 EDT, 07:30 UTC.
+      Such a minute becomes 01:30 EST, 06:30 UTC. A conversion from UTC never names a
+      non-existent time, so this guards only the rounding.
+
+    One hour crosses the shift of any daylight-saving change, which is an
+    hour or less.
+    """
+    wall = since.astimezone(zone).replace(tzinfo=None, second=0, microsecond=0)
+    return _readable_no_later_than(wall, zone, since)
+
+
+def _readable_no_later_than(wall: datetime, zone: tzinfo, instant: datetime) -> datetime:
+    """``wall``, stepped back an hour at a time until every instant it names in ``zone`` is at or before ``instant``."""
+    while _latest_reading(wall, zone) > instant:
+        wall -= timedelta(hours=1)
+    return wall
+
+
+def _latest_reading(wall: datetime, zone: tzinfo) -> datetime:
+    """The latest instant a wall-clock time names in ``zone``.
+
+    ``fold`` picks the reading: for an ambiguous time ``fold=1`` is the later
+    one, and for a non-existent time ``fold=0`` reads it with the offset in
+    force before the change, which is also the later one (PEP 495).
+    """
+    return max(wall.replace(tzinfo=zone, fold=fold).astimezone(timezone.utc) for fold in (0, 1))
 
 
 def _split_order_by(raw_jql: str) -> tuple[str, str | None]:
@@ -111,17 +177,16 @@ def _split_order_by(raw_jql: str) -> tuple[str, str | None]:
     return query[: match.start()].strip(), query[match.start():].strip()
 
 
-def _augment_advanced_jql(raw_jql: str, since: datetime | None, order_by: str | None = None) -> str:
+def _augment_advanced_jql(raw_jql: str, delta: str | None, order_by: str | None = None) -> str:
     """Use a user-authored JQL as-is, injecting the delta clause before ORDER BY.
 
     The user's query is authoritative: its ORDER BY (or a default) is preserved
-    unless ``order_by`` replaces it, and the incremental ``updated >=`` filter
-    is AND-ed onto the where clause (wrapped in parentheses so a top-level OR
-    keeps its meaning).
+    unless ``order_by`` replaces it, and the incremental ``delta`` clause
+    (:func:`_delta_clause`) is AND-ed onto the where clause (wrapped in
+    parentheses so a top-level OR keeps its meaning).
     """
     where, order = _split_order_by(raw_jql)
-    if since:
-        delta = _delta_clause(since)
+    if delta:
         where = f"({where}) AND {delta}" if where else delta
     return f"{where} {order_by or order or _DEFAULT_ORDER_BY}".strip()
 
@@ -154,19 +219,21 @@ class JiraQueryRejected(SourceConfigurationError):
     """Jira refused the configured JQL (HTTP 400): the query itself is wrong, so retrying cannot help."""
 
 
-def _build_jql(config: dict, since: datetime | None, *, order_by: str | None = None) -> str:
+def _build_jql(config: dict, delta: str | None, *, order_by: str | None = None) -> str:
     """Build the effective JQL for a sync from the source config.
 
     In ``advanced`` query mode the configured ``jql`` is authoritative. In
     ``simple`` mode the query is assembled from projects, issue types, and an
-    optional refine filter. ``order_by`` replaces the query's order.
+    optional refine filter. ``delta``, the incremental filter from
+    :func:`_delta_clause`, narrows either; ``None`` selects the whole scope.
+    ``order_by`` replaces the query's order.
     """
     if str(config.get("query_mode") or JIRA_QUERY_MODE_SIMPLE).strip().lower() == JIRA_QUERY_MODE_ADVANCED:
-        return _augment_advanced_jql(str(config.get("jql") or ""), since, order_by)
+        return _augment_advanced_jql(str(config.get("jql") or ""), delta, order_by)
 
     jql = _scope_where(config)
-    if since:
-        jql += f" AND {_delta_clause(since)}"
+    if delta:
+        jql += f" AND {delta}"
     jql += f" {order_by or _DEFAULT_ORDER_BY}"
     return jql
 
@@ -199,6 +266,31 @@ def _issue_ref(item: ContentItem) -> str:
     return ref or item.item_id.removeprefix(_ISSUE_DOC_ID_PREFIX)
 
 
+def _search_page(data: object) -> OffsetPage[dict]:
+    """One search response as a page of issues, or raise when it is not a search result."""
+    if not isinstance(data, dict) or "issues" not in data or not isinstance(data.get("issues"), list):
+        raise RuntimeError("Jira search response is missing an issues list")
+    issues = data["issues"]
+    if any(not isinstance(issue, dict) for issue in issues):
+        raise RuntimeError("Jira search response contains an invalid issue record")
+    total = data.get("total")
+    if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+        raise RuntimeError("Jira search response is missing a valid total")
+    for issue in issues:
+        if (
+            not str(issue.get("id") or "").strip().isdigit()
+            or not str(issue.get("key") or "").strip()
+            or not isinstance(issue.get("fields"), dict)
+        ):
+            raise RuntimeError("Jira search issue is missing a stable id, key, or fields")
+    return OffsetPage(start=data.get("startAt"), items=issues, total=total)
+
+
+def _search_issue_identities(issue: dict) -> tuple[tuple[str, str], tuple[str, str]]:
+    """A searched issue's id and its key, neither of which may repeat within one search."""
+    return ("id", str(issue["id"]).strip()), ("key", str(issue["key"]).strip())
+
+
 def _read_by_local_agent(config: Mapping[str, Any]) -> bool:
     """Whether the owner's local agent reads this Source's issues, instead of the server."""
     return str(config.get("sync_mode") or "cloud").strip().lower() == "local_agent"
@@ -210,13 +302,6 @@ def _request_interval_seconds(config: dict) -> float:
         return max(float(raw_value), 0.0) / 1000.0
     except (TypeError, ValueError):
         return DEFAULT_REQUEST_INTERVAL_MS / 1000.0
-
-
-def _bool_config(config: dict, key: str, default: bool) -> bool:
-    value = config.get(key, default)
-    if isinstance(value, str):
-        return value.strip().lower() not in {"false", "0", "no", "off"}
-    return bool(value)
 
 
 def _auth_mode(config: dict) -> str:
@@ -255,22 +340,13 @@ def _zero_quota_message(mode: str) -> str:
     )
 
 
-def _parse_local_package_dt(value: str) -> datetime:
-    if not value:
-        return datetime.fromtimestamp(0, timezone.utc)
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
 def _issue_payload_from_search(issue: dict, config: dict) -> dict:
     """Build the issue payload used by normalization from the hydrated search result."""
     payload = dict(issue)
     fields = payload.get("fields")
     if not isinstance(fields, dict):
         raise RuntimeError("Jira issue response is missing fields")
-    include_comments = _bool_config(config, "include_comments", True)
+    include_comments = bool_config(config, "include_comments", default=True)
 
     if include_comments:
         comments = fields.get("comment")
@@ -381,6 +457,9 @@ class JiraGene(DocumentGene):
     """
 
     listing_kinds = frozenset({ScopeListingKind.QUERY})
+
+    _profile_zone: tzinfo | None = None
+    """The timezone this connection's JQL date literals are written in; see :meth:`_jql_profile_zone`."""
 
     @classmethod
     def metadata(cls) -> GeneMetadata:
@@ -503,53 +582,53 @@ class JiraGene(DocumentGene):
         require_https_base_url(base_url, "Jira")
 
         mode = _auth_mode(self.config)
+        await self.close()
         self._base_url = base_url
         self._auth_mode = mode
         sync_mode = str(self.config.get("sync_mode") or "cloud").strip().lower()
         if sync_mode == "local_agent":
             if has_package_manifest(self.config):
                 self._client = None
-                self._request_limiter = None
                 self._hydrated_issues = {}
                 logger.info("Jira client using local-agent package manifest")
                 return
             local_documents_dir = self._local_agent_documents_dir()
-            if local_documents_dir is None:
-                raise ValueError("Jira local-agent sync requires a local package inbox")
             local_documents_dir.mkdir(parents=True, exist_ok=True)
             self._client = None
-            self._request_limiter = None
             self._hydrated_issues = {}
             logger.info("Jira client using local-agent package inbox: %s", local_documents_dir)
             return
-        client = httpx.AsyncClient(
+        self._client = ConnectorHttpClient(
+            product_name="Jira",
             base_url=base_url,
             headers=_jira_headers(self.config),
             timeout=httpx.Timeout(JIRA_READ_TIMEOUT_SECONDS, connect=JIRA_CONNECT_TIMEOUT_SECONDS),
-            follow_redirects=True,
             verify=tls_verify(self.config),
-        )
-        self._client = client
-        self._request_limiter = atlassian_request_limiter(
-            base_url,
-            min_interval_seconds=_request_interval_seconds(self.config),
-            owner_id=self.source_id,
+            follow_redirects=True,
+            limiter=atlassian_request_limiter(
+                base_url,
+                min_interval_seconds=_request_interval_seconds(self.config),
+                owner_id=self.source_id,
+            ),
+            fail_fast=atlassian_fail_fast("Jira", _zero_quota_message(mode)),
         )
         self._hydrated_issues: dict[str, dict] = {}
         logger.info("Jira client prepared with %s auth: %s", mode, base_url)
 
+    async def close(self) -> None:
+        """Release the client and forget the profile timezone read through it."""
+        await super().close()
+        self._profile_zone = None
+
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
-        """Discover issues via JQL search."""
+        """Discover issues via JQL search, narrowed to those updated since ``since``.
+
+        An incremental search writes ``since`` in the account's profile
+        timezone, rounded down to the minute (:func:`_delta_clause`), so the
+        first incremental search of a connection also reads ``/myself``.
+        """
         if _read_by_local_agent(self.config):
-            manifest = self._local_agent_package_manifest()
-            if has_package_manifest(self.config):
-                async for item in self._discover_local_agent_package_manifest(manifest, since):
-                    yield item
-                return
-            local_documents_dir = self._local_agent_documents_dir()
-            if local_documents_dir is None:
-                raise ValueError("Jira local-agent sync requires a local package inbox")
-            async for item in self._discover_local_agent_packages(local_documents_dir, since):
+            async for item in self._discover_local_agent_packages(since):
                 yield item
             return
 
@@ -710,8 +789,13 @@ class JiraGene(DocumentGene):
         max_results: int,
         cache_hydrated: bool,
     ) -> AsyncIterator[ContentItem]:
+        delta = None
+        if since is not None:
+            profile_zone = await self._jql_profile_zone()
+            delta = _delta_clause(since, profile_zone)
+            logger.info("Jira incremental search of %s in profile timezone %s: %s", self.source_id, profile_zone, delta)
         async for issue in self._search_issues(
-            _build_jql(self.config, since),
+            _build_jql(self.config, delta),
             fields=fields,
             expand=expand,
             max_results=max_results,
@@ -722,6 +806,48 @@ class JiraGene(DocumentGene):
             else:
                 item.extra["attest_materialized_revision"] = True
             yield item
+
+    async def _jql_profile_zone(self) -> tzinfo:
+        """The timezone Jira reads this account's JQL date literals in, read once per connection.
+
+        It is the ``timeZone`` of ``GET /rest/api/2/myself``, such as
+        ``"America/Los_Angeles"``. Only an incremental search needs it, so
+        ``authenticate`` asks nothing, and ``authenticate`` and ``close``
+        forget it.
+
+        A profile without a ``timeZone``, or with one this host does not know,
+        gets UTC-12, logged as a warning: a literal written there is read in
+        any profile timezone as the intended instant or earlier, so the search
+        reads more again and hides nothing. A ``/myself`` that fails raises
+        ``RuntimeError``, as a failed search does, never ``ValueError``,
+        which callers read as a configuration Jira refuses.
+        """
+        if self._profile_zone is None:
+            self._profile_zone = await self._read_profile_zone()
+        return self._profile_zone
+
+    async def _read_profile_zone(self) -> tzinfo:
+        try:
+            profile = (await self._request("GET", JIRA_MYSELF_PATH)).json()
+        except Exception as exc:
+            raise RuntimeError(f"Jira could not read the account's profile timezone from /myself: {exc}") from exc
+        if not isinstance(profile, dict):
+            raise RuntimeError("Jira /myself did not answer with the account's profile")
+        name = profile.get("timeZone")
+        if isinstance(name, str) and name.strip():
+            try:
+                return ZoneInfo(name.strip())
+            except (ZoneInfoNotFoundError, ValueError):
+                pass
+        logger.warning(
+            "Jira profile timezone %r of %s is missing or unknown; incremental searches are written at UTC-12, "
+            "which reads up to a day more again",
+            name,
+            self.source_id,
+        )
+        # Any profile timezone reads a literal written at UTC-12 as the
+        # intended instant or earlier: up to 26 hours earlier at UTC+14.
+        return WESTERNMOST_ZONE
 
     async def _search_issues(
         self,
@@ -734,30 +860,25 @@ class JiraGene(DocumentGene):
     ) -> AsyncIterator[dict]:
         """Page one JQL search to its declared total, yielding each issue once, or raise.
 
-        A JQL Jira refuses (HTTP 400) raises :class:`JiraQueryRejected`.
+        Each page is asked for at the offset the previous one ended, since
+        Jira may return fewer than ``max_results`` issues. The total must stay
+        the same on every page, and no issue id or key may repeat. A JQL Jira
+        refuses (HTTP 400) raises :class:`JiraQueryRejected`.
         """
-        seen_issue_ids: set[str] = set()
-        seen_issue_keys: set[str] = set()
-        expected_total: int | None = None
-        start_at = 0
 
-        while True:
+        async def fetch(start_at: int) -> OffsetPage[dict]:
+            request_body: dict[str, Any] = {
+                "jql": jql,
+                "startAt": start_at,
+                "maxResults": max_results,
+                "fields": fields,
+            }
+            if expand:
+                request_body["expand"] = expand
+            if not validate_query:
+                request_body["validateQuery"] = False
             try:
-                request_body: dict[str, Any] = {
-                    "jql": jql,
-                    "startAt": start_at,
-                    "maxResults": max_results,
-                    "fields": fields,
-                }
-                if expand:
-                    request_body["expand"] = expand
-                if not validate_query:
-                    request_body["validateQuery"] = False
-                resp = await self._request(
-                    "POST",
-                    "/rest/api/2/search",
-                    json_body=request_body,
-                )
+                resp = await self._request("POST", "/rest/api/2/search", json_body=request_body, safe_read=True)
                 data = resp.json()
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 400:
@@ -767,45 +888,10 @@ class JiraGene(DocumentGene):
             except Exception as e:
                 logger.error("Jira search failed: %s", e)
                 raise RuntimeError(f"Jira search failed: {e}") from e
+            return _search_page(data)
 
-            if not isinstance(data, dict) or "issues" not in data or not isinstance(data.get("issues"), list):
-                raise RuntimeError("Jira search response is missing an issues list")
-            issues = data["issues"]
-            if any(not isinstance(issue, dict) for issue in issues):
-                raise RuntimeError("Jira search response contains an invalid issue record")
-            total = data.get("total")
-            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
-                raise RuntimeError("Jira search response is missing a valid total")
-            if expected_total is None:
-                expected_total = total
-            elif total != expected_total:
-                raise RuntimeError("Jira search total changed during pagination")
-            response_start = data.get("startAt")
-            if not isinstance(response_start, int) or isinstance(response_start, bool) or response_start != start_at:
-                raise RuntimeError("Jira search response startAt does not match the requested page")
-            if not issues:
-                if start_at < total:
-                    raise RuntimeError("Jira search ended before the declared total was reached")
-                break
-
-            for issue in issues:
-                issue_id = str(issue.get("id") or "").strip()
-                key = str(issue.get("key") or "").strip()
-                issue_fields = issue.get("fields")
-                if not issue_id.isdigit() or not key or not isinstance(issue_fields, dict):
-                    raise RuntimeError("Jira search issue is missing a stable id, key, or fields")
-                if issue_id in seen_issue_ids or key in seen_issue_keys:
-                    raise RuntimeError("Jira search returned duplicate issue identity")
-                seen_issue_ids.add(issue_id)
-                seen_issue_keys.add(key)
-                yield issue
-
-            # Pagination
-            if start_at + len(issues) >= total:
-                break
-            start_at += len(issues)
-        if len(seen_issue_ids) != (expected_total or 0):
-            raise RuntimeError("Jira search unique issue count did not match total")
+        async for issue in paged_by_offset(fetch, item_ids=_search_issue_identities, errors=_SEARCH_PAGING_ERRORS):
+            yield issue
 
     async def _request(
         self,
@@ -814,18 +900,18 @@ class JiraGene(DocumentGene):
         *,
         params: dict | None = None,
         json_body: dict | None = None,
+        safe_read: bool = False,
     ) -> httpx.Response:
+        """Send one Jira REST request, raising ``httpx.HTTPStatusError`` for an error status.
+
+        A search is sent as ``POST`` but only reads, so it passes
+        ``safe_read=True`` and a server error is retried as for ``GET``. An
+        expired browser session (401 in cookie mode) raises ``RuntimeError``
+        asking for a fresh cookie.
+        """
+        resp = await self._client.request(method, url, params=params, json=json_body, safe_read=safe_read)
         try:
-            return await request_with_rate_limit_retry(
-                self._client,
-                method,
-                url,
-                product_name="Jira",
-                params=params,
-                json_body=json_body,
-                limiter=getattr(self, "_request_limiter", None),
-                zero_quota_message=_zero_quota_message(getattr(self, "_auth_mode", _auth_mode(self.config))),
-            )
+            resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             if (
                 getattr(self, "_auth_mode", _auth_mode(self.config)) == JIRA_AUTH_MODE_COOKIE
@@ -833,6 +919,7 @@ class JiraGene(DocumentGene):
             ):
                 raise RuntimeError("Jira browser session cookie expired or is not accepted. Refresh the cookie.") from exc
             raise
+        return resp
 
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full issue data with comments and links."""
@@ -886,7 +973,7 @@ class JiraGene(DocumentGene):
         _mark_changelog_completeness(data)
 
         # Fetch comments separately if configured
-        include_comments = _bool_config(self.config, "include_comments", True)
+        include_comments = bool_config(self.config, "include_comments", default=True)
         if include_comments:
             comments_resp = await self._request(
                 "GET",
@@ -992,16 +1079,8 @@ class JiraGene(DocumentGene):
         request_path = str(artifact.locator.get("request_path") or "").strip()
         if not request_path:
             raise SourceArtifactContractError("Jira attachment locator is incomplete")
-        async with stream_with_rate_limit_retry(
-            self._client,
-            "GET",
-            request_path,
-            product_name="Jira",
-            limiter=getattr(self, "_request_limiter", None),
-            zero_quota_message=_zero_quota_message(
-                getattr(self, "_auth_mode", _auth_mode(self.config))
-            ),
-        ) as response:
+        async with self._client.stream("GET", request_path) as response:
+            response.raise_for_status()
             yield SourceArtifactDownload(
                 chunks=response.aiter_bytes(),
                 media_type=response.headers.get("content-type"),
@@ -1286,74 +1365,31 @@ class JiraGene(DocumentGene):
             source_semantics=source_semantics,
         )
 
-    def _local_agent_documents_dir(self) -> Path | None:
+    def _local_agent_documents_dir(self) -> Path:
         configured = str(self.config.get("local_agent_documents_dir") or "").strip()
-        return Path(configured).expanduser() if configured else None
+        if not configured:
+            raise ValueError("Jira local-agent sync requires a local package inbox")
+        return Path(configured).expanduser()
 
-    def _local_agent_package_manifest(self) -> list[dict]:
-        return package_manifest(self.config)
-
-    async def _discover_local_agent_package_manifest(
-        self,
-        manifest: list[dict],
-        since: datetime | None,
-    ) -> AsyncIterator[ContentItem]:
-        for entry in sorted(
-            manifest,
-            key=lambda item: (str(item.get("last_modified") or ""), str(item.get("doc_id") or "")),
-        ):
-            package_uri = str(entry.get("package_uri") or "").strip()
-            if not package_uri:
+    async def _discover_local_agent_packages(self, since: datetime | None) -> AsyncIterator[ContentItem]:
+        packages = device_packages(
+            self.config,
+            package_kind=LOCAL_AGENT_JIRA_PACKAGE_KIND,
+            inbox=self._local_agent_documents_dir,
+        )
+        for package in packages:
+            if not package.changed_after(since):
                 continue
-            last_modified = _parse_local_package_dt(str(entry.get("last_modified") or ""))
-            if since and last_modified <= since:
-                continue
-            issue_key = str(entry.get("issue_key") or "").strip()
+            issue_key = package.text("issue_key").strip()
             yield ContentItem(
-                item_id=str(entry.get("doc_id") or issue_key),
-                title=str(entry.get("title") or issue_key),
-                source_url=str(entry.get("source_url") or ""),
-                last_modified=last_modified,
+                item_id=package.text("doc_id", issue_key),
+                title=package.text("title", issue_key),
+                source_url=package.text("source_url"),
+                last_modified=package.last_modified,
                 content_type="application/json",
-                space_or_project=str(entry.get("space_or_project") or issue_key.split("-", 1)[0]),
-                version=str(entry.get("version") or ""),
-                author=entry.get("submitted_by"),
+                space_or_project=package.text("space_or_project", issue_key.split("-", 1)[0]),
+                version=package.text("version"),
+                author=package.fields.get("submitted_by"),
                 labels=["jira"],
-                extra={
-                    "package_uri": package_uri,
-                    "package_path": entry.get("package_path"),
-                    "package_sha256": entry.get("package_sha256"),
-                    "input_sha256": entry.get("input_sha256"),
-                    "issue_key": issue_key,
-                },
-            )
-
-    async def _discover_local_agent_packages(
-        self,
-        documents_dir: Path,
-        since: datetime | None,
-    ) -> AsyncIterator[ContentItem]:
-        for package_path in sorted(documents_dir.rglob("*.json")):
-            try:
-                package = json.loads(package_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                logger.warning("Skipping unreadable Jira local-agent package: %s", package_path)
-                continue
-            if package.get("package_kind") != LOCAL_AGENT_JIRA_PACKAGE_KIND:
-                continue
-            last_modified = _parse_local_package_dt(str(package.get("last_modified") or ""))
-            if since and last_modified <= since:
-                continue
-            issue_key = str(package.get("issue_key") or "").strip()
-            yield ContentItem(
-                item_id=str(package.get("doc_id") or issue_key),
-                title=str(package.get("title") or issue_key),
-                source_url=str(package.get("source_url") or ""),
-                last_modified=last_modified,
-                content_type="text/markdown",
-                space_or_project=str(package.get("space_or_project") or issue_key.split("-", 1)[0]),
-                version=str(package.get("version") or ""),
-                author=package.get("author"),
-                labels=["jira"],
-                extra={"package_path": str(package_path), "issue_key": issue_key},
+                extra={**package.locator, "issue_key": issue_key},
             )

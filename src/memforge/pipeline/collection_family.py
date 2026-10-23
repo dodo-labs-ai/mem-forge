@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
@@ -143,12 +144,13 @@ class LedgerPartition:
     untried: frozenset[str] = frozenset()
 
 
-ExcludedScopeGeneFactory = Callable[[Mapping[str, object]], Awaitable[DocumentGene]]
-"""Builds an authenticated Gene that lists a scope the Source's open transition excluded.
+ExcludedScopeGeneFactory = Callable[[Mapping[str, object]], AbstractAsyncContextManager[DocumentGene]]
+"""Opens an authenticated Gene that lists a scope the Source's open transition excluded.
 
 It takes the excluded canonical scope; the Gene reads the Source's current
 configuration and credential with that scope's fields in place of the current
 ones (see :func:`memforge.source_projection_config.excluded_scope_config`).
+The Gene is closed when its ``async with`` block exits.
 """
 
 
@@ -773,8 +775,8 @@ class DocumentFamily(CollectionFamily):
         listed: set[str] = set()
         for scope in scopes:
             try:
-                gene = await self._excluded_scope_gene(scope)
-                excluded_listing = await gene.list_scope()
+                async with self._excluded_scope_gene(scope) as gene:
+                    excluded_listing = await gene.list_scope()
             except SourceConfigurationError as exc:
                 logger.warning(
                     "An excluded scope of %s was rejected (%s); every unlisted Document follows the ordinary rule",

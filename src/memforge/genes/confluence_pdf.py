@@ -1,4 +1,30 @@
-"""Local Confluence HTML-to-PDF export for PAT-authenticated pages."""
+"""Local Confluence HTML-to-PDF export for PAT-authenticated pages.
+
+The export reads the page's export HTML through the Gene's
+``ConnectorHttpClient``, downloads the page's same-origin images, and renders
+the result locally. Images and rendering share one budget of
+``PDF_EXPORT_TIMEOUT_SECONDS``; an export that outlasts it produces no PDF,
+which fails the Document.
+
+The images get the budget less ``PDF_RENDER_RESERVE_SECONDS``, so the
+renderer always starts with the reserve left, whatever the images do:
+
+- A download starts only when its ``IMAGE_FETCH_TIMEOUT_SECONDS`` fits before
+  the image deadline, and a retry only when its wait and that timeout fit.
+- At the image deadline every unfinished download is cancelled, which also
+  bounds a body that trickles in under its per-read timeout.
+- An image that does not arrive is left blank, and the page renders without
+  it.
+
+Image downloads go past the Atlassian origin limiter: a page may carry up to
+``MAX_IMAGE_ASSETS`` images, and pacing them at the origin's interval (2 s for
+Confluence) would spend the image budget on 30 images. They keep their own
+short retry (``IMAGE_RETRY``).
+
+The start and retry checks read the client's ``clock``, so tests can run them
+on a fake one. The cut at the image deadline waits on the event loop's own
+clock; both are monotonic in production.
+"""
 
 from __future__ import annotations
 
@@ -11,12 +37,11 @@ import sys
 import tempfile
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from memforge.genes.atlassian_auth import get_with_rate_limit_retry
+from memforge.genes.toolkit.http import ConnectorHttpClient, RetryPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -29,39 +54,40 @@ IMAGE_FETCH_TIMEOUT_SECONDS = 10.0
 IMAGE_STREAM_CHUNK_BYTES = 64 * 1024
 IMAGE_DOWNLOAD_CONCURRENCY = 4
 PDF_EXPORT_TIMEOUT_SECONDS = 120.0
+# Rendering is never left less than this. No measurement of WeasyPrint on real
+# pages bounds it more tightly, and images had no bound of their own before
+# (one 10 s attempt each, four at a time, inside the shared budget), so half
+# of the budget is kept for the renderer.
+PDF_RENDER_RESERVE_SECONDS = PDF_EXPORT_TIMEOUT_SECONDS / 2
+# An image is worth less than the page it illustrates: a few quick attempts,
+# and a long Retry-After costs an image rather than the export budget.
+IMAGE_RETRY = RetryPolicy(attempts=3, backoff_seconds=1.0, max_wait_seconds=10.0)
 
 
 async def export_confluence_page_pdf(
     *,
-    client,
+    client: ConnectorHttpClient,
     base_url: str,
     api_prefix: str,
     page_id: str,
     title: str,
     render_pdf: RenderPdf | None = None,
     work_dir: Path | None = None,
-    limiter: Any | None = None,
 ) -> bytes | None:
-    """Render a Confluence page's REST export HTML to a local PDF."""
+    """Render a Confluence page's REST export HTML to a local PDF.
+
+    The page itself is read like any other Confluence request, through the
+    client's limiter and retries; its images are not (module docstring).
+    """
     renderer = render_pdf if render_pdf is not None else default_pdf_renderer()
     if renderer is None:
         logger.warning("PDF renderer not found; skipping PDF export for %s", title)
         return None
 
-    request_url = f"{api_prefix}/rest/api/content/{page_id}"
-    if limiter is not None:
-        resp = await get_with_rate_limit_retry(
-            client,
-            request_url,
-            product_name="Confluence",
-            params={"expand": "body.export_view,body.view"},
-            limiter=limiter,
-        )
-    else:
-        resp = await client.get(
-            request_url,
-            params={"expand": "body.export_view,body.view"},
-        )
+    resp = await client.get(
+        f"{api_prefix}/rest/api/content/{page_id}",
+        params={"expand": "body.export_view,body.view"},
+    )
     resp.raise_for_status()
     data = resp.json()
     html = (
@@ -99,7 +125,7 @@ async def export_confluence_page_pdf(
 
 async def _render_with_timeout(
     *,
-    client,
+    client: ConnectorHttpClient,
     html: str,
     title: str,
     base_url: str,
@@ -107,6 +133,7 @@ async def _render_with_timeout(
     renderer: RenderPdf,
     work_dir: Path,
 ) -> bytes | None:
+    images_deadline = client.clock() + PDF_EXPORT_TIMEOUT_SECONDS - PDF_RENDER_RESERVE_SECONDS
     try:
         return await asyncio.wait_for(
             _render_with_assets(
@@ -117,6 +144,7 @@ async def _render_with_timeout(
                 api_prefix=api_prefix,
                 renderer=renderer,
                 work_dir=work_dir,
+                images_deadline=images_deadline,
             ),
             timeout=PDF_EXPORT_TIMEOUT_SECONDS,
         )
@@ -176,13 +204,14 @@ def _looks_like_complete_pdf(pdf_bytes: bytes) -> bool:
 
 async def _render_with_assets(
     *,
-    client,
+    client: ConnectorHttpClient,
     html: str,
     title: str,
     base_url: str,
     api_prefix: str,
     renderer: RenderPdf,
     work_dir: Path,
+    images_deadline: float,
 ) -> bytes | None:
     assets_dir = work_dir / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
@@ -192,6 +221,7 @@ async def _render_with_assets(
         base_url=base_url,
         api_prefix=api_prefix,
         assets_dir=assets_dir,
+        deadline=images_deadline,
     )
     html_path = work_dir / "page.html"
     html_path.write_text(_wrap_html(title, html), encoding="utf-8")
@@ -200,11 +230,12 @@ async def _render_with_assets(
 
 async def _rewrite_image_sources(
     *,
-    client,
+    client: ConnectorHttpClient,
     html: str,
     base_url: str,
     api_prefix: str,
     assets_dir: Path,
+    deadline: float,
 ) -> str:
     soup = BeautifulSoup(html, "html.parser")
     _remove_active_content(soup)
@@ -226,11 +257,18 @@ async def _rewrite_image_sources(
         if url is None:
             return src, "", None
         async with semaphore:
-            image = await _download_image_asset(client=client, url=url, budget=budget)
+            if client.clock() + IMAGE_FETCH_TIMEOUT_SECONDS > deadline:
+                return src, url, None
+            image = await _download_image_asset(client=client, url=url, budget=budget, deadline=deadline)
         return src, url, image
 
     replacements: dict[str, str] = {}
-    downloads = await asyncio.gather(*(download(src) for src in image_sources))
+    downloads = await _finished_by(
+        [asyncio.ensure_future(download(src)) for src in image_sources], deadline - client.clock()
+    )
+    skipped = len(image_sources) - sum(1 for _src, _url, image in downloads if image is not None)
+    if skipped:
+        logger.warning("Rendering Confluence page without %d of its %d images", skipped, len(image_sources))
     for src, url, image in downloads:
         if image is None:
             continue
@@ -258,7 +296,9 @@ async def _rewrite_image_sources(
     return str(soup)
 
 
-async def _download_image_asset(client, url: str, budget: "_AssetBudget") -> tuple[bytes, str] | None:
+async def _download_image_asset(
+    client: ConnectorHttpClient, url: str, budget: "_AssetBudget", deadline: float
+) -> tuple[bytes, str] | None:
     reserved_bytes = 0
     committed = False
     content = bytearray()
@@ -269,6 +309,9 @@ async def _download_image_asset(client, url: str, budget: "_AssetBudget") -> tup
             url,
             headers={"Accept": "*/*"},
             timeout=IMAGE_FETCH_TIMEOUT_SECONDS,
+            limited=False,
+            retry=IMAGE_RETRY,
+            deadline=deadline,
         ) as resp:
             resp.raise_for_status()
             declared_size = _content_length(resp.headers.get("content-length"))
@@ -295,6 +338,24 @@ async def _download_image_asset(client, url: str, budget: "_AssetBudget") -> tup
     finally:
         if reserved_bytes and not committed:
             await budget.release(reserved_bytes)
+
+
+async def _finished_by(tasks: list[asyncio.Future], seconds: float) -> list:
+    """The results of the tasks done within ``seconds``.
+
+    The rest are cancelled, also when the export itself is cancelled while
+    waiting, so no download outlives the export.
+    """
+    if not tasks:
+        return []
+    try:
+        done, _pending = await asyncio.wait(tasks, timeout=max(seconds, 0.0))
+    finally:
+        unfinished = [task for task in tasks if not task.done()]
+        for task in unfinished:
+            task.cancel()
+        await asyncio.gather(*unfinished, return_exceptions=True)
+    return [task.result() for task in tasks if task in done]
 
 
 class _AssetBudget:

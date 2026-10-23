@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
+import time
 from pathlib import Path
 
+import httpx
 import pytest
 from bs4 import BeautifulSoup
 
 from memforge.genes import confluence_pdf
+from memforge.genes.atlassian_auth import AtlassianRequestLimiter
 from memforge.genes.confluence_pdf import (
     default_pdf_renderer,
     default_weasyprint_renderer,
     export_confluence_page_pdf,
 )
+from memforge.genes.toolkit.http import ConnectorHttpClient
 
 COMPLETE_PDF = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n"
 
@@ -47,6 +52,8 @@ class BytesResponse:
 
 
 class RecordingClient:
+    clock = staticmethod(time.monotonic)
+
     def __init__(self):
         self.calls: list[tuple[str, dict]] = []
 
@@ -557,3 +564,333 @@ async def test_export_confluence_page_pdf_times_out_slow_render(tmp_path, monkey
     )
 
     assert pdf is None
+
+
+# ---------------------------------------------------------------------------
+# Image downloads on the Gene's ConnectorHttpClient
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """A monotonic clock that only the client's sleep advances."""
+
+    def __init__(self) -> None:
+        self.now = 5000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _image_page(image_count: int) -> dict:
+    images = "".join(f'<img src="/wiki/download/attachments/123/image-{index}.png">' for index in range(image_count))
+    return {"body": {"export_view": {"value": images}}}
+
+
+@pytest.mark.asyncio
+async def test_a_page_with_many_images_exports_without_pacing_its_images_at_the_origin(tmp_path):
+    image_count = 64
+    clock = _FakeClock()
+    limiter = AtlassianRequestLimiter(min_interval_seconds=2.0, clock=clock)
+    limited_runs = 0
+    real_run = limiter.run
+
+    async def counting_run(operation, **options):
+        nonlocal limited_runs
+        limited_runs += 1
+        return await real_run(operation, **options)
+
+    limiter.run = counting_run
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/wiki/rest/api/content/123":
+            return httpx.Response(200, json=_image_page(image_count))
+        return httpx.Response(200, content=request.url.path.encode(), headers={"content-type": "image/png"})
+
+    captured_html: dict[str, str] = {}
+
+    async def render_pdf(html_path: Path) -> bytes:
+        captured_html["body"] = html_path.read_text(encoding="utf-8")
+        return b"%PDF-local"
+
+    started_at = clock.now
+    async with ConnectorHttpClient(
+        product_name="Confluence",
+        base_url="https://wiki.example.test",
+        timeout=5.0,
+        follow_redirects=True,
+        limiter=limiter,
+        sleep=clock.sleep,
+        transport=httpx.MockTransport(handle),
+    ) as client:
+        pdf = await export_confluence_page_pdf(
+            client=client,
+            base_url="https://wiki.example.test",
+            api_prefix="/wiki",
+            page_id="123",
+            title="Architecture",
+            render_pdf=render_pdf,
+            work_dir=tmp_path,
+        )
+
+    assert pdf == b"%PDF-local"
+    assert captured_html["body"].count("file://") == image_count
+    # Only the page read went through the 2 s origin limiter; paced the same
+    # way, 64 images would need 128 s, more than the whole export budget.
+    assert limited_runs == 1
+    assert image_count * 2.0 > confluence_pdf.PDF_EXPORT_TIMEOUT_SECONDS
+    assert clock.now - started_at < confluence_pdf.PDF_EXPORT_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_an_image_download_is_retried_with_its_own_short_policy(tmp_path):
+    image_answers = [httpx.Response(503), httpx.ConnectError("reset"), httpx.Response(200, content=b"png")]
+    image_requests = 0
+    waits: list[float] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal image_requests
+        if request.url.path == "/wiki/rest/api/content/123":
+            return httpx.Response(200, json=_image_page(1))
+        image_requests += 1
+        answer = image_answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    async def record_wait(seconds: float) -> None:
+        waits.append(seconds)
+
+    async def render_pdf(html_path: Path) -> bytes:
+        assert html_path.read_text(encoding="utf-8").count("file://") == 1
+        return b"%PDF-local"
+
+    async with ConnectorHttpClient(
+        product_name="Confluence",
+        base_url="https://wiki.example.test",
+        timeout=5.0,
+        follow_redirects=True,
+        sleep=record_wait,
+        transport=httpx.MockTransport(handle),
+    ) as client:
+        pdf = await export_confluence_page_pdf(
+            client=client,
+            base_url="https://wiki.example.test",
+            api_prefix="/wiki",
+            page_id="123",
+            title="Architecture",
+            render_pdf=render_pdf,
+            work_dir=tmp_path,
+        )
+
+    assert pdf == b"%PDF-local"
+    assert image_requests == confluence_pdf.IMAGE_RETRY.attempts == 3
+    assert waits == [confluence_pdf.IMAGE_RETRY.backoff_seconds, confluence_pdf.IMAGE_RETRY.transport_wait_seconds]
+
+
+class _VirtualClock:
+    """Virtual time for concurrent tasks: ``sleep`` returns once every earlier sleeper has woken, at once in real time.
+
+    When no task has run for a moment, time jumps to the earliest wake-up and
+    wakes every sleeper due then, so four downloads that each hang for 10 s
+    end together 10 s later, as they would in real time.
+    """
+
+    def __init__(self) -> None:
+        self.now = 5000.0
+        self._sleepers: list[tuple[float, int, asyncio.Future]] = []
+        self._order = 0
+        self._advance_handle: asyncio.TimerHandle | None = None
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        loop = asyncio.get_running_loop()
+        woken = loop.create_future()
+        heapq.heappush(self._sleepers, (self.now + max(seconds, 0.0), self._order, woken))
+        self._order += 1
+        self._arm(loop)
+        await woken
+
+    def _arm(self, loop: asyncio.AbstractEventLoop) -> None:
+        if self._advance_handle is None:
+            self._advance_handle = loop.call_later(0.002, self._advance, loop)
+
+    def _advance(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._advance_handle = None
+        if not self._sleepers:
+            return
+        self.now = max(self.now, self._sleepers[0][0])
+        while self._sleepers and self._sleepers[0][0] <= self.now:
+            _wake, _order, woken = heapq.heappop(self._sleepers)
+            if not woken.done():
+                woken.set_result(None)
+        if self._sleepers:
+            self._arm(loop)
+
+
+async def _export_on_virtual_clock(tmp_path, answer_image) -> tuple[bytes | None, float, int]:
+    """Export a page of 64 images whose downloads ``answer_image(request, clock)`` answers.
+
+    Returns the PDF, the export budget left when the renderer started, and the
+    number of image requests.
+    """
+    clock = _VirtualClock()
+    image_requests = 0
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal image_requests
+        if request.url.path == "/wiki/rest/api/content/123":
+            return httpx.Response(200, json=_image_page(64))
+        image_requests += 1
+        return await answer_image(request, clock)
+
+    left_at_render: list[float] = []
+
+    async def render_pdf(_html_path: Path) -> bytes:
+        left_at_render.append(started_at + confluence_pdf.PDF_EXPORT_TIMEOUT_SECONDS - clock())
+        return b"%PDF-local"
+
+    started_at = clock()
+    async with ConnectorHttpClient(
+        product_name="Confluence",
+        base_url="https://wiki.example.test",
+        timeout=5.0,
+        follow_redirects=True,
+        sleep=clock.sleep,
+        clock=clock,
+        transport=httpx.MockTransport(handle),
+    ) as client:
+        pdf = await export_confluence_page_pdf(
+            client=client,
+            base_url="https://wiki.example.test",
+            api_prefix="/wiki",
+            page_id="123",
+            title="Architecture",
+            render_pdf=render_pdf,
+            work_dir=tmp_path,
+        )
+    return pdf, left_at_render[0], image_requests
+
+
+@pytest.mark.asyncio
+async def test_images_that_keep_asking_to_wait_leave_the_renderer_its_reserve(tmp_path):
+    async def rate_limited(_request: httpx.Request, _clock: _VirtualClock) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "10"})
+
+    pdf, left, image_requests = await _export_on_virtual_clock(tmp_path, rate_limited)
+
+    assert pdf == b"%PDF-local"
+    assert left >= confluence_pdf.PDF_RENDER_RESERVE_SECONDS
+    # Some images were tried and retried; the rest were never started.
+    assert 0 < image_requests < 64 * confluence_pdf.IMAGE_RETRY.attempts
+
+
+@pytest.mark.asyncio
+async def test_images_that_hang_until_their_timeout_leave_the_renderer_its_reserve(tmp_path):
+    async def hanging(request: httpx.Request, clock: _VirtualClock) -> httpx.Response:
+        await clock.sleep(confluence_pdf.IMAGE_FETCH_TIMEOUT_SECONDS)
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    pdf, left, image_requests = await _export_on_virtual_clock(tmp_path, hanging)
+
+    assert pdf == b"%PDF-local"
+    assert left >= confluence_pdf.PDF_RENDER_RESERVE_SECONDS
+    assert 0 < image_requests < 64
+
+
+@pytest.mark.asyncio
+async def test_a_download_still_running_at_the_image_deadline_is_cancelled(tmp_path, monkeypatch):
+    monkeypatch.setattr("memforge.genes.confluence_pdf.PDF_EXPORT_TIMEOUT_SECONDS", 0.4)
+    monkeypatch.setattr("memforge.genes.confluence_pdf.PDF_RENDER_RESERVE_SECONDS", 0.3)
+    monkeypatch.setattr("memforge.genes.confluence_pdf.IMAGE_FETCH_TIMEOUT_SECONDS", 0.01)
+
+    class TrickleForever(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            while True:
+                yield b"x"
+                await asyncio.sleep(0.005)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/wiki/rest/api/content/123":
+            return httpx.Response(200, json=_image_page(1))
+        return httpx.Response(200, stream=TrickleForever(), headers={"content-type": "image/png"})
+
+    captured_html: dict[str, str] = {}
+    left_at_render: list[float] = []
+
+    async def render_pdf(html_path: Path) -> bytes:
+        left_at_render.append(started_at + 0.4 - time.monotonic())
+        captured_html["body"] = html_path.read_text(encoding="utf-8")
+        return b"%PDF-local"
+
+    started_at = time.monotonic()
+    async with ConnectorHttpClient(
+        product_name="Confluence",
+        base_url="https://wiki.example.test",
+        timeout=5.0,
+        follow_redirects=True,
+        transport=httpx.MockTransport(handle),
+    ) as client:
+        pdf = await export_confluence_page_pdf(
+            client=client,
+            base_url="https://wiki.example.test",
+            api_prefix="/wiki",
+            page_id="123",
+            title="Architecture",
+            render_pdf=render_pdf,
+            work_dir=tmp_path,
+        )
+
+    assert pdf == b"%PDF-local"
+    assert BeautifulSoup(captured_html["body"], "html.parser").find("img")["src"] == ""
+    # The cut came at the image deadline, 0.1 s in, leaving about the 0.3 s reserve.
+    assert left_at_render[0] > 0.2
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_export_cancels_its_image_downloads(tmp_path):
+    requested: list[str] = []
+    first_downloads = asyncio.Event()
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/wiki/rest/api/content/123":
+            return httpx.Response(200, json=_image_page(8))
+        requested.append(request.url.path)
+        first_downloads.set()
+        await asyncio.sleep(0.3)
+        return httpx.Response(200, content=b"png", headers={"content-type": "image/png"})
+
+    async def render_pdf(html_path: Path) -> bytes:
+        return b"%PDF-local"
+
+    async with ConnectorHttpClient(
+        product_name="Confluence",
+        base_url="https://wiki.example.test",
+        timeout=5.0,
+        follow_redirects=True,
+        transport=httpx.MockTransport(handle),
+    ) as client:
+        export = asyncio.ensure_future(
+            export_confluence_page_pdf(
+                client=client,
+                base_url="https://wiki.example.test",
+                api_prefix="/wiki",
+                page_id="123",
+                title="Architecture",
+                render_pdf=render_pdf,
+                work_dir=tmp_path,
+            )
+        )
+        await first_downloads.wait()
+        export.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await export
+        requested_at_cancel = len(requested)
+        await asyncio.sleep(0.5)
+
+    assert requested_at_cancel < 8
+    assert len(requested) == requested_at_cancel

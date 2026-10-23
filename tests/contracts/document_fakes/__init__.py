@@ -10,12 +10,21 @@ Adding a document source type
 -----------------------------
 
 Add ``document_fakes/<source_type>.py`` defining ``FAKES``, an instance of a
-:class:`DocumentConnectorFakes` subclass. Fake the provider at its transport
-(an ``httpx.MockTransport``, or the client class the Gene builds in
-``authenticate``), never the Gene's own methods, so the checks exercise the
-Gene's paging, validation and error handling. Give every item a time either
-before or after :data:`CHANGED_SINCE`, so incremental discovery yields some
-items and skips others.
+:class:`DocumentConnectorFakes` subclass. Fake the provider at its transport,
+never the Gene's own methods, so the checks exercise the Gene's paging,
+validation, retries and error handling. A Gene on ``ConnectorHttpClient`` is
+served by ``tests.connector_http_fixture.FakeConnectorHttp``, which hands the
+client the fake's ``httpx.MockTransport`` and a sleep that returns at once.
+
+Give every item a time either before or after :data:`CHANGED_SINCE`, so
+incremental discovery yields some items and skips others, and give one item in
+each scope the time :data:`IN_THE_CURSOR_MINUTE`: after ``CHANGED_SINCE``, but
+in the same minute. Model the provider's own comparison exactly, at its own
+precision and in its own timezone, never more leniently: the suite then shows
+that ``discover(CHANGED_SINCE)`` still yields that item, as
+:meth:`~memforge.genes.document_gene.DocumentGene.discover` requires. A fake
+Jira, for example, reads ``updated >= '2026-03-01 01:30'`` as a minute in the
+account's profile timezone, which ``/rest/api/2/myself`` answers.
 
 What each fake must answer
 --------------------------
@@ -24,22 +33,33 @@ What each fake must answer
     Named configurations ``lists_scope`` answers ``True`` for and the server
     lists. ``walks_scope`` says whether discovery visits the whole scope
     whatever ``since`` is, so that ``list_scope`` must reuse that walk instead
-    of asking the provider again.
+    of asking the provider again. ``edited_in_the_cursor_minute`` is the
+    Document id of the item in that scope the provider records as edited at
+    :data:`IN_THE_CURSOR_MINUTE`.
 ``non_listing_configs``
     Named configurations ``lists_scope`` answers ``False`` for.
 ``device_configs``
     Named configurations collected on a device, whose listing is the snapshot
-    manifest; ``manifest_entries`` gives the entries such a device submits.
+    manifest; ``manifest_entries`` gives the entries such a device submits,
+    one of them with ``last_modified`` at :data:`IN_THE_CURSOR_MINUTE`.
 ``connect(config, listing)``
     The Gene for one configuration, authenticated against a fake provider that
     holds a few items in the scope and at least one outside it. With
     :attr:`ProviderListing.TRUNCATED` the provider ends or truncates the
     listing early while claiming more; with :attr:`ProviderListing.FAILED` it
     answers the listing with a server error. The connection records every
-    request the provider receives.
+    request the provider receives, and every client the Gene opened against
+    it; each client tells whether it ``is_closed``. Close the Gene with
+    ``await gene.close()`` when the connection ends.
 ``reading_by_id(status)``
-    Required when ``listing_kinds`` include ``query``: a Gene and stored items
-    whose read by identifier answers HTTP ``status``.
+    Required when ``listing_kinds`` include ``query``: a connection and stored
+    items whose read by identifier answers HTTP ``status``, every time it is
+    asked.
+``retry_waits``
+    Required with ``reading_by_id``: for 429 and 503, the range of seconds,
+    ``(low, high)``, that the fake's answer asks the client to wait before
+    retrying, which proves the Gene's client read ``Retry-After`` (or backed
+    off without it).
 ``rediscover_candidates(config)``
     Required for a configuration ``rediscovers_documents`` answers ``True``
     for: stored items to rediscover against ``connect(config)``'s provider,
@@ -56,7 +76,7 @@ import pkgutil
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 from memforge.genes.document_gene import DocumentGene
@@ -66,6 +86,7 @@ from memforge.source_types import registered_source_types
 
 __all__ = [
     "CHANGED_SINCE",
+    "IN_THE_CURSOR_MINUTE",
     "RECENTLY",
     "LONG_AGO",
     "DocumentConnectorFakes",
@@ -78,9 +99,12 @@ __all__ = [
     "fakes_modules",
 ]
 
-# Incremental discovery in the suite reads from CHANGED_SINCE. Each fake item
-# changed either LONG_AGO, before it, or RECENTLY, after it.
-CHANGED_SINCE = datetime(2026, 3, 1, tzinfo=timezone.utc)
+# Incremental discovery in the suite reads from CHANGED_SINCE, the cursor,
+# ten seconds into its minute. Each fake item changed either LONG_AGO, before
+# it, or RECENTLY, after it, and one item in each scope IN_THE_CURSOR_MINUTE:
+# thirty seconds later, still in the cursor's minute.
+CHANGED_SINCE = datetime(2026, 3, 1, 9, 30, 10, tzinfo=timezone.utc)
+IN_THE_CURSOR_MINUTE = CHANGED_SINCE + timedelta(seconds=30)
 LONG_AGO = datetime(2026, 1, 1, tzinfo=timezone.utc)
 RECENTLY = datetime(2026, 6, 1, tzinfo=timezone.utc)
 
@@ -95,18 +119,29 @@ class ProviderListing(Enum):
 
 @dataclass(frozen=True)
 class ListingConfig:
-    """A configuration the server lists, and whether its discovery already walks the whole scope."""
+    """A configuration the server lists, whether its discovery already walks the whole scope, and its same-minute item.
+
+    ``edited_in_the_cursor_minute`` is the Document id of the item in scope
+    edited at :data:`IN_THE_CURSOR_MINUTE`.
+    """
 
     config: Mapping[str, object]
     walks_scope: bool
+    edited_in_the_cursor_minute: str
 
 
 @dataclass
 class FakeConnection:
-    """A Gene connected to a fake provider, and every request the provider received, in order."""
+    """A Gene connected to a fake provider, every request the provider received, in order, and every client it opened.
+
+    Each client has an ``is_closed`` property, as ``httpx.AsyncClient`` does.
+    ``waits`` lists every wait the Gene's client asked its stub sleep for.
+    """
 
     gene: DocumentGene
     requests: list[str] = field(default_factory=list)
+    clients: list = field(default_factory=list)
+    waits: list[float] = field(default_factory=list)
 
 
 class DocumentConnectorFakes:
@@ -115,6 +150,7 @@ class DocumentConnectorFakes:
     listing_configs: Mapping[str, ListingConfig] = {}
     non_listing_configs: Mapping[str, Mapping[str, object]] = {}
     device_configs: Mapping[str, Mapping[str, object]] = {}
+    retry_waits: Mapping[int, tuple[float, float]] = {}
 
     def connect(
         self,
@@ -126,7 +162,7 @@ class DocumentConnectorFakes:
     def manifest_entries(self, config: Mapping[str, object]) -> list[dict]:
         raise NotImplementedError(f"{type(self).__name__} does not fake a device manifest")
 
-    def reading_by_id(self, status: int) -> AbstractAsyncContextManager[tuple[DocumentGene, Sequence[ContentItem]]]:
+    def reading_by_id(self, status: int) -> AbstractAsyncContextManager[tuple[FakeConnection, Sequence[ContentItem]]]:
         raise NotImplementedError(f"{type(self).__name__} does not fake reads by identifier")
 
     def rediscover_candidates(self, config: Mapping[str, object]) -> list[ContentItem]:

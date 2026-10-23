@@ -22,17 +22,19 @@ describe("sourceAttention", () => {
     expect(attention?.action).toBe("start_local_sync");
   });
 
-  test("an exceeded file limit asks to narrow the scope", () => {
+  test.each([
+    ["12000", "GitHub Repository discovery matched 12000 files, exceeding max_files=5000"],
+    // A count read from a truncated repository tree is a lower bound.
+    ["at least 5001", "GitHub Repository discovery matched at least 5001 files, exceeding max_files=5000"],
+  ])("an exceeded file limit of %s files asks to narrow the scope", (count, message) => {
     const attention = sourceAttention({
       source: makeSource({ type: "github_repo" }),
       readiness: null,
-      activity: {
-        state: "failed",
-        error: { message: "GitHub Repository discovery matched 12000 files, exceeding max_files=5000" },
-      },
+      activity: { state: "failed", error: { message } },
       now: NOW,
     });
     expect(attention).toMatchObject({ reason: "file_limit_exceeded", action: "configure_scope" });
+    expect(attention?.detail).toContain(`Last sync matched ${count} files, exceeding its configured limit of 5000`);
   });
 
   test("other failures offer a retry", () => {

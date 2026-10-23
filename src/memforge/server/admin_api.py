@@ -72,11 +72,11 @@ from memforge.genes import (
 )
 from memforge.genes.conversation_gene import ConversationGene
 from memforge.genes.family import CollectionFamilyKind
-from memforge.genes.atlassian_auth import (
-    release_atlassian_request_limiter,
-    require_https_base_url,
-    validate_tls_ca_bundle,
-)
+from memforge.genes.atlassian_auth import release_atlassian_request_limiter
+from memforge.genes.base import SourceConfigurationError
+from memforge.genes.github_repo_gene import GitHubRepoGene
+from memforge.genes.toolkit.config import require_https_base_url, validate_bool_fields, validate_tls_ca_bundle
+from memforge.genes.toolkit.github_api import BROWSE_TREE_REQUEST_BUDGET, GitHubTreeBudgetExceeded
 from memforge.github_repo_utils import github_extension_allowed, github_include_extensions
 from memforge.memory.audit import AuditContext
 from memforge.memory.cross_document_relation import (
@@ -3681,6 +3681,13 @@ def _validate_source_config(
     config: dict[str, Any],
     existing_config: dict[str, Any] | None = None,
 ) -> None:
+    """Raise ``ValueError``, which the routes answer with 400, for a configuration the source type cannot use.
+
+    Besides the source type's own checks, every required field the Gene
+    declares must have a value, and every field it declares as
+    ``ConfigFieldType.BOOLEAN`` must hold a boolean value
+    (:func:`~memforge.genes.toolkit.config.bool_config`).
+    """
     policy = _config_policy(source_type)
     if policy.validate_input is not None:
         policy.validate_input(config, existing_config or {})
@@ -3701,12 +3708,17 @@ def _validate_source_config(
 
     if gene_cls:
         product_name = gene_cls.metadata().display_name
+        fields = gene_cls.config_schema().fields
         _validate_required_source_fields(
             product_name,
-            gene_cls.config_schema().fields,
+            fields,
             config,
             existing_config=existing_config,
         )
+        try:
+            validate_bool_fields(config, fields)
+        except SourceConfigurationError as exc:
+            raise ValueError(f"{product_name} {exc}") from exc
     if policy.validate is not None:
         policy.validate(config, existing_config or {})
 
@@ -6765,6 +6777,7 @@ def create_admin_app(
             )
             preview_config = {**stored_config, **preview_config}
 
+        gene = None
         try:
             _validate_source_config(name, preview_config)
             preview_config["_memforge_preview_limit"] = req.limit + 1
@@ -6797,11 +6810,8 @@ def create_admin_app(
             logger.exception("Discovery preview failed for gene %s", name)
             raise HTTPException(status_code=502, detail=f"Discovery preview failed: {exc}") from exc
         finally:
-            client = locals().get("gene") and getattr(locals()["gene"], "_client", None)
-            if client is not None:
-                close = getattr(client, "aclose", None)
-                if close:
-                    await close()
+            if gene is not None:
+                await gene.close()
 
         return DiscoveryPreviewResponse(
             source_type=name,
@@ -6816,7 +6826,14 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
     ):
-        """List selectable repository paths for the GitHub Repository source UI."""
+        """List selectable repository paths for the GitHub Repository source UI.
+
+        The tree is read with the Source's own client and TLS. A tree GitHub
+        truncates is walked folder by folder within
+        ``BROWSE_TREE_REQUEST_BUDGET`` requests; a larger repository answers
+        400, and its paths are typed instead.
+        """
+        gene = None
         try:
             config = dict(req.config)
             if req.source_id:
@@ -6835,13 +6852,13 @@ def create_admin_app(
             _validate_source_config("github_repo", config)
             if str(config.get("connection_mode") or "cloud_pull").strip().lower() != "cloud_pull":
                 raise ValueError("GitHub Repository folder browsing is available only for Public internet access")
-            gene = create_gene("github_repo", config, source_id="browse-github-repo")
+            gene = cast(GitHubRepoGene, create_gene("github_repo", config, source_id="browse-github-repo"))
             await gene.authenticate()
-            repo_ref = getattr(gene, "_repo_ref")
+            github = gene.github_api()
             ref = str(config.get("ref") or "").strip()
             if not ref:
-                ref = await gene._default_branch(repo_ref)  # noqa: SLF001 - shared source implementation.
-            entries = await gene._repo_tree(repo_ref, ref)  # noqa: SLF001 - shared source implementation.
+                ref = await github.default_branch()
+            entries = await github.tree(ref, max_requests=BROWSE_TREE_REQUEST_BUDGET)
             items = _github_repo_tree_items(
                 entries,
                 limit=req.limit,
@@ -6851,15 +6868,17 @@ def create_admin_app(
             raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except GitHubTreeBudgetExceeded as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{exc} to browse. Type the folder or file paths to sync instead.",
+            ) from exc
         except Exception as exc:
             logger.exception("GitHub Repository tree browse failed")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:
-            client = locals().get("gene") and getattr(locals()["gene"], "_client", None)
-            if client is not None:
-                close = getattr(client, "aclose", None)
-                if close:
-                    await close()
+            if gene is not None:
+                await gene.close()
 
         return GitHubRepoTreeResponse(
             ref=ref,
@@ -8917,7 +8936,7 @@ def create_admin_app(
                     ),
                     source_id=source_id,
                 )
-            except ValueError as exc:
+            except (SourceConfigurationError, ValueError) as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             gene.bind_document_store(artifact_store)
             return asdict(await reprocess_preview(

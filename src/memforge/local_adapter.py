@@ -275,7 +275,10 @@ async def submit_local_markdown_document(
     format. Conversion to markdown happens later, in the gene's ``normalize``.
     ``source_updated_at`` is the file's own time as the local agent reads it
     (its commit time, or its modification time outside a clean Git checkout);
-    without it the file has no source time. ``submitted_at`` only orders packages.
+    without it the file has no source time. ``submitted_at``, the current time
+    when omitted, is the package's time, never its source time: discovery
+    orders packages by it, an incremental run reads only packages submitted
+    after its cursor, and a package submitted again reads as changed.
     """
     if source.get("type") != LOCAL_MARKDOWN_SOURCE_TYPE:
         raise ValueError(f"source {source.get('id')} is type {source.get('type')!r}, not 'local_markdown'")
@@ -394,7 +397,10 @@ async def submit_github_repo_document(
 
     ``source_updated_at`` is the file's latest commit time at the collection
     commit as the local agent reads it; without it the file has no source
-    time. ``submitted_at`` only orders packages.
+    time. ``submitted_at``, the current time when omitted, is the package's
+    time, never its source time: discovery orders packages by it, an
+    incremental run reads only packages submitted after its cursor, and a
+    package submitted again reads as changed.
     """
     if source.get("type") != GITHUB_REPO_SOURCE_TYPE:
         raise ValueError(f"source {source.get('id')} is type {source.get('type')!r}, not 'github_repo'")
