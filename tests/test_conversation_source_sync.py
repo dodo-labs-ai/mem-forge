@@ -129,10 +129,12 @@ class FakeTeams:
                 stop_reason="budget",
             )
         before = [m["time"] for m in everything if m["time"] < interval.start]
+        # Without an older message, the oldest page is complete from the chat's oldest message.
+        complete_from = max(before) if before else (everything[-1]["time"] if everything else None)
         return ConversationPoll(
             messages=tuple(teams_provider_message(message, conversation) for message in inside),
             outcome=PollOutcome.REACHED_START if before else PollOutcome.HISTORY_EXHAUSTED,
-            earliest_complete_page_time=max(before) if before else None,
+            earliest_complete_page_time=complete_from,
         )
 
     async def read_artifact(self, conversation, message, artifact):

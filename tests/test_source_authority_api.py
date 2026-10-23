@@ -1208,6 +1208,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
                                 outcome=PollOutcome.HISTORY_EXHAUSTED,
                                 started_at=sent_at + timedelta(hours=1),
                                 earliest_returned_at=sent_at,
+                                earliest_complete_page_time=sent_at,
                             )
                             for interval in requested_conversation.intervals
                         ),
