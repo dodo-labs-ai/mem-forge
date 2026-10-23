@@ -1046,7 +1046,6 @@ async def test_page_tree_preview_limits_child_page_request_size():
     "payload",
     [
         {"results": [], "start": 0, "size": 0},
-        {"results": [], "start": 1, "size": 0, "_links": {}},
         {"results": [], "start": 0, "size": 1, "_links": {}},
     ],
 )
@@ -1055,8 +1054,20 @@ def test_confluence_pagination_envelope_is_required_for_completion(payload):
         ConfluenceGene._validated_page_results(
             payload,
             context="test",
-            expected_start=0,
         )
+
+
+@pytest.mark.asyncio
+async def test_confluence_listing_that_does_not_start_where_the_walk_asked_is_refused():
+    gene = ConfluenceGene(
+        config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"},
+        source_id="src-confluence",
+    )
+    gene._api_prefix = "/wiki"
+    gene._get = AsyncMock(return_value=JsonResponse({"results": [], "start": 1, "size": 0, "_links": {}}))
+
+    with pytest.raises(RuntimeError, match="Confluence space PAY response has inconsistent pagination start"):
+        _ = [item async for item in gene.discover()]
 
 
 @pytest.mark.asyncio
@@ -1225,3 +1236,104 @@ async def test_space_discovery_rejects_a_repeated_next_link():
 
     with pytest.raises(RuntimeError, match="Confluence space PAY response repeats a next link"):
         _ = [item async for item in gene.discover()]
+
+
+def _attachment_batch(attachments: list[dict], *, start: int, next_link: str | None) -> dict:
+    links = {} if next_link is None else {"next": next_link}
+    return {"results": attachments, "start": start, "size": len(attachments), "_links": links}
+
+
+def _paged_attachment_gene(first_page: dict, *attachment_pages: dict) -> ConfluenceGene:
+    """A gene whose page read embeds ``first_page`` and whose attachment listing answers ``attachment_pages`` in turn."""
+    gene = ConfluenceGene(
+        config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"},
+        source_id="src-confluence",
+    )
+    gene._api_prefix = "/wiki"
+    page = {
+        "id": "123",
+        "version": {"number": 7},
+        "body": {
+            "storage": {
+                "value": "".join(
+                    f'<ac:image><ri:attachment ri:filename="{name}" /></ac:image>' for name in ("a.png", "b.png", "c.png")
+                )
+            }
+        },
+        "ancestors": [],
+        "space": {"key": "PAY"},
+        "children": {"attachment": first_page},
+    }
+    gene._get = AsyncMock(side_effect=[JsonResponse(page), *(JsonResponse(listed) for listed in attachment_pages)])
+    return gene
+
+
+def _attachment_page_item() -> ContentItem:
+    return ContentItem(
+        item_id="confluence-123",
+        title="Page",
+        source_url="https://wiki.example.test/wiki/pages/123",
+        last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        space_or_project="PAY",
+        version="7",
+        extra={"page_id": "123"},
+    )
+
+
+def _attachment_requests(gene: ConfluenceGene) -> list[tuple[str, dict | None]]:
+    return [
+        (call.args[0], call.kwargs.get("params"))
+        for call in gene._get.await_args_list
+        if call.args[0].endswith("/child/attachment")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_lists_attachments_from_the_embedded_page_across_fetched_pages():
+    gene = _paged_attachment_gene(
+        _attachment_batch([_attachment("att-a", "a.png")], start=0, next_link="/attachments?start=1"),
+        _attachment_batch([_attachment("att-b", "b.png")], start=1, next_link="/attachments?start=2"),
+        _attachment_batch([_attachment("att-c", "c.png")], start=2, next_link=None),
+    )
+
+    raw = await gene.fetch(_attachment_page_item())
+
+    assert sorted(artifact.provider_key for artifact in raw.artifacts) == ["att-a", "att-b", "att-c"]
+    # The embedded first page is not asked for again.
+    assert _attachment_requests(gene) == [
+        ("/wiki/rest/api/content/123/child/attachment", {"start": 1, "limit": 100, "expand": "version,extensions"}),
+        ("/wiki/rest/api/content/123/child/attachment", {"start": 2, "limit": 100, "expand": "version,extensions"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_refuses_an_attachment_listing_that_repeats_a_next_link():
+    gene = _paged_attachment_gene(
+        _attachment_batch([_attachment("att-a", "a.png")], start=0, next_link="/attachments?page=2"),
+        _attachment_batch([_attachment("att-b", "b.png")], start=1, next_link="/attachments?page=2"),
+    )
+
+    with pytest.raises(SourceArtifactContractError, match="Confluence attachment pagination contains a cursor cycle"):
+        await gene.fetch(_attachment_page_item())
+
+
+@pytest.mark.asyncio
+async def test_fetch_refuses_an_attachment_page_that_leaves_a_gap():
+    gene = _paged_attachment_gene(
+        _attachment_batch([_attachment("att-a", "a.png")], start=0, next_link="/attachments?start=1"),
+        _attachment_batch([_attachment("att-c", "c.png")], start=2, next_link=None),
+    )
+
+    with pytest.raises(SourceArtifactContractError, match="Confluence attachment pagination is inconsistent"):
+        await gene.fetch(_attachment_page_item())
+
+
+@pytest.mark.asyncio
+async def test_fetch_refuses_an_empty_attachment_page_with_a_next_link():
+    gene = _paged_attachment_gene(
+        _attachment_batch([_attachment("att-a", "a.png")], start=0, next_link="/attachments?start=1"),
+        _attachment_batch([], start=1, next_link="/attachments?start=2"),
+    )
+
+    with pytest.raises(SourceArtifactContractError, match="Confluence attachment response cannot advance pagination"):
+        await gene.fetch(_attachment_page_item())
