@@ -8,6 +8,7 @@ and fails it until ``tests/contracts/document_fakes`` has a module for it.
 
 from __future__ import annotations
 
+from datetime import datetime
 from types import SimpleNamespace
 
 import httpx
@@ -24,6 +25,7 @@ from memforge.models import AbsenceAnswer, ScopeListingKind
 from memforge.source_types import source_type_descriptor
 from tests.contracts.document_fakes import (
     CHANGED_SINCE,
+    IN_THE_CURSOR_MINUTE,
     DocumentConnectorFakes,
     MissingDocumentFakes,
     ProviderListing,
@@ -186,6 +188,19 @@ async def test_a_standalone_listing_equals_the_listing_after_discovery(source_ty
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("source_type", "config_name"), LISTING_CASES)
+async def test_discover_never_hides_an_item_edited_in_the_cursor_minute(source_type, config_name) -> None:
+    fakes = fakes_for(source_type)
+    listing = fakes.listing_configs[config_name]
+    async with fakes.connect(listing.config) as connection:
+        changed = {item.item_id async for item in connection.gene.discover(CHANGED_SINCE)}
+
+    # Edited thirty seconds after the cursor, in its minute: a provider that
+    # compares by the minute must read the cursor's minute from its start.
+    assert listing.edited_in_the_cursor_minute in changed
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("source_type", "config_name"), WALKING_CASES)
 async def test_a_listing_reuses_the_discovery_walk(source_type, config_name) -> None:
     fakes = fakes_for(source_type)
@@ -220,27 +235,37 @@ async def test_a_failed_listing_raises(source_type, config_name) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("source_type", "config_name"), DEVICE_CASES)
-async def test_a_device_collected_configuration_lists_through_its_manifest(source_type, config_name) -> None:
+def _manifest_inputs(source_type: str, config_name: str) -> list[SimpleNamespace]:
+    """The stored inputs of a device's snapshot manifest, one per entry the fake submits."""
     fakes = fakes_for(source_type)
-    config = fakes.device_configs[config_name]
-    gene_cls = _gene_class(source_type)
-    entries = fakes.manifest_entries(config)
-    inputs = [
+    return [
         SimpleNamespace(
             metadata={"manifest_entry": entry},
             raw_uri=f"artifact://{entry['doc_id']}",
             raw_sha256=f"input-{generation}",
             input_generation=generation,
         )
-        for generation, entry in enumerate(entries)
+        for generation, entry in enumerate(fakes.manifest_entries(fakes.device_configs[config_name]))
     ]
+
+
+async def _manifest_gene(source_type: str, config_name: str, inputs: list[SimpleNamespace]) -> DocumentGene:
+    """The authenticated Gene of a run bound to the device's snapshot manifest ``inputs``."""
+    config = fakes_for(source_type).device_configs[config_name]
     projected = source_with_sync_inputs(
         {"type": source_type, "config": dict(config)}, inputs, input_snapshot_supplied=True
     )
     gene = create_gene(source_type, projected["config"], "src-contract")
     await gene.authenticate()
+    return gene
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("source_type", "config_name"), DEVICE_CASES)
+async def test_a_device_collected_configuration_lists_through_its_manifest(source_type, config_name) -> None:
+    gene_cls = _gene_class(source_type)
+    inputs = _manifest_inputs(source_type, config_name)
+    gene = await _manifest_gene(source_type, config_name, inputs)
 
     # The run lists through the manifest with the Gene's one kind, never through list_scope.
     assert len(gene_cls.listing_kinds) == 1
@@ -253,6 +278,27 @@ async def test_a_device_collected_configuration_lists_through_its_manifest(sourc
     # The device read the provider; the server holds no client to release.
     assert getattr(gene, "_client", None) is None
     await gene.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("source_type", "config_name"), DEVICE_CASES)
+async def test_a_device_manifest_never_hides_an_item_edited_in_the_cursor_minute(source_type, config_name) -> None:
+    inputs = _manifest_inputs(source_type, config_name)
+    in_the_cursor_minute = [
+        stored
+        for stored in inputs
+        if datetime.fromisoformat(stored.metadata["manifest_entry"]["last_modified"]) == IN_THE_CURSOR_MINUTE
+    ]
+    gene = await _manifest_gene(source_type, config_name, inputs)
+    try:
+        changed = {item.item_id async for item in gene.discover(CHANGED_SINCE)}
+    finally:
+        await gene.close()
+
+    assert in_the_cursor_minute
+    assert snapshot_document_ids(in_the_cursor_minute) <= changed
+    # The manifest's packages are still read incrementally: one changed before the cursor is skipped.
+    assert changed < snapshot_document_ids(inputs)
 
 
 # ---------------------------------------------------------------------------

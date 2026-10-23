@@ -1,12 +1,16 @@
 """A fake GitHub Pages site, served from a repository branch and from a published sitemap.
 
 Both read a handbook whose subtree ``guides`` holds the pages ``setup``, changed
-long ago, and ``deploy``, changed recently; ``other/faq`` is outside the
-subtree. The repository-backed site answers the GitHub REST API, and the
-public site answers ``sitemap.xml`` and each page. A truncated listing is a
-branch tree GitHub truncates whose root holds more folders than a walk may
-read, a sitemap index instead of the urlset, and ``deploy`` no longer exists;
-a failed one answers 500.
+long ago, and ``deploy``, changed in the cursor's minute; ``other/faq`` is
+outside the subtree. The repository-backed site answers the GitHub REST API,
+and the public site answers ``sitemap.xml`` and each page. A truncated listing
+is a branch tree GitHub truncates whose root holds more folders than a walk
+may read, a sitemap index instead of the urlset, and ``deploy`` no longer
+exists; a failed one answers 500.
+
+A page's time is its last commit in the repository, its sitemap ``lastmod``
+with seconds and an offset, or its HTTP ``Last-Modified``, which has whole
+seconds; discovery compares each with ``since`` itself.
 """
 
 from __future__ import annotations
@@ -14,13 +18,15 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime
+from email.utils import format_datetime
 
 import httpx
 
 from memforge.genes import github_pages_gene
-from memforge.genes.github_pages_gene import GitHubPagesGene
+from memforge.genes.github_pages_gene import GitHubPagesGene, _page_doc_id
 from memforge.genes.toolkit.github_api import TREE_REQUEST_BUDGET
 from tests.contracts.document_fakes import (
+    IN_THE_CURSOR_MINUTE,
     LONG_AGO,
     RECENTLY,
     DocumentConnectorFakes,
@@ -32,7 +38,7 @@ from tests.connector_http_fixture import FakeConnectorHttp
 from tests.github_api_fixture import FakeGitHub
 
 # page path -> changed at
-PAGES: dict[str, datetime] = {"guides/setup": LONG_AGO, "guides/deploy": RECENTLY, "other/faq": RECENTLY}
+PAGES: dict[str, datetime] = {"guides/setup": LONG_AGO, "guides/deploy": IN_THE_CURSOR_MINUTE, "other/faq": RECENTLY}
 
 REPO_SITE = "https://github.example.test/pages/org/handbook"
 API = "https://github.example.test/api/v3/repos/org/handbook"
@@ -74,7 +80,11 @@ class _Provider:
         if self.listing is ProviderListing.FAILED:
             return httpx.Response(500, text="error")
         if page_path in PAGES and not (self.listing is ProviderListing.TRUNCATED and page_path == "guides/deploy"):
-            return httpx.Response(200, text=f"<main><h1>{page_path}</h1><p>Body</p></main>")
+            return httpx.Response(
+                200,
+                text=f"<main><h1>{page_path}</h1><p>Body</p></main>",
+                headers={"Last-Modified": format_datetime(PAGES[page_path], usegmt=True)},
+            )
         return httpx.Response(404, text="missing")
 
     def _sitemap(self) -> httpx.Response:
@@ -101,6 +111,7 @@ class GitHubPagesFakes(DocumentConnectorFakes):
         "branch-tree": ListingConfig(
             {"auth_mode": "github_pat", "pat": "token", "sync_mode": "subtree", "root_url": f"{REPO_SITE}/guides/"},
             walks_scope=True,
+            edited_in_the_cursor_minute=_page_doc_id(f"{REPO_SITE}/guides/deploy"),
         ),
         "authoritative-sitemap": ListingConfig(
             {
@@ -111,6 +122,7 @@ class GitHubPagesFakes(DocumentConnectorFakes):
                 "sitemap_authoritative": True,
             },
             walks_scope=True,
+            edited_in_the_cursor_minute=_page_doc_id(f"{PUBLIC_SITE}/guides/deploy"),
         ),
         "single-page": ListingConfig(
             {
@@ -120,6 +132,7 @@ class GitHubPagesFakes(DocumentConnectorFakes):
                 "page_url": f"{PUBLIC_SITE}/guides/deploy",
             },
             walks_scope=True,
+            edited_in_the_cursor_minute=_page_doc_id(f"{PUBLIC_SITE}/guides/deploy"),
         ),
         "explicit-list": ListingConfig(
             {
@@ -129,6 +142,7 @@ class GitHubPagesFakes(DocumentConnectorFakes):
                 "pages": [f"{PUBLIC_SITE}/guides/setup", f"{PUBLIC_SITE}/guides/deploy"],
             },
             walks_scope=True,
+            edited_in_the_cursor_minute=_page_doc_id(f"{PUBLIC_SITE}/guides/deploy"),
         ),
     }
     non_listing_configs = {

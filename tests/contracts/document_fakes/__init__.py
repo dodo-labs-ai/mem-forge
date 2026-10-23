@@ -14,9 +14,17 @@ Add ``document_fakes/<source_type>.py`` defining ``FAKES``, an instance of a
 never the Gene's own methods, so the checks exercise the Gene's paging,
 validation, retries and error handling. A Gene on ``ConnectorHttpClient`` is
 served by ``tests.connector_http_fixture.FakeConnectorHttp``, which hands the
-client the fake's ``httpx.MockTransport`` and a sleep that returns at once. Give every item a time either
-before or after :data:`CHANGED_SINCE`, so incremental discovery yields some
-items and skips others.
+client the fake's ``httpx.MockTransport`` and a sleep that returns at once.
+
+Give every item a time either before or after :data:`CHANGED_SINCE`, so
+incremental discovery yields some items and skips others, and give one item in
+each scope the time :data:`IN_THE_CURSOR_MINUTE`: after ``CHANGED_SINCE``, but
+in the same minute. Model the provider's own comparison exactly, at its own
+precision and in its own timezone, never more leniently: the suite then shows
+that ``discover(CHANGED_SINCE)`` still yields that item, as
+:meth:`~memforge.genes.document_gene.DocumentGene.discover` requires. A fake
+Jira, for example, reads ``updated >= '2026-03-01 01:30'`` as a minute in the
+account's profile timezone, which ``/rest/api/2/myself`` answers.
 
 What each fake must answer
 --------------------------
@@ -25,12 +33,15 @@ What each fake must answer
     Named configurations ``lists_scope`` answers ``True`` for and the server
     lists. ``walks_scope`` says whether discovery visits the whole scope
     whatever ``since`` is, so that ``list_scope`` must reuse that walk instead
-    of asking the provider again.
+    of asking the provider again. ``edited_in_the_cursor_minute`` is the
+    Document id of the item in that scope the provider records as edited at
+    :data:`IN_THE_CURSOR_MINUTE`.
 ``non_listing_configs``
     Named configurations ``lists_scope`` answers ``False`` for.
 ``device_configs``
     Named configurations collected on a device, whose listing is the snapshot
-    manifest; ``manifest_entries`` gives the entries such a device submits.
+    manifest; ``manifest_entries`` gives the entries such a device submits,
+    one of them with ``last_modified`` at :data:`IN_THE_CURSOR_MINUTE`.
 ``connect(config, listing)``
     The Gene for one configuration, authenticated against a fake provider that
     holds a few items in the scope and at least one outside it. With
@@ -65,7 +76,7 @@ import pkgutil
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 from memforge.genes.document_gene import DocumentGene
@@ -75,6 +86,7 @@ from memforge.source_types import registered_source_types
 
 __all__ = [
     "CHANGED_SINCE",
+    "IN_THE_CURSOR_MINUTE",
     "RECENTLY",
     "LONG_AGO",
     "DocumentConnectorFakes",
@@ -87,9 +99,12 @@ __all__ = [
     "fakes_modules",
 ]
 
-# Incremental discovery in the suite reads from CHANGED_SINCE. Each fake item
-# changed either LONG_AGO, before it, or RECENTLY, after it.
-CHANGED_SINCE = datetime(2026, 3, 1, tzinfo=timezone.utc)
+# Incremental discovery in the suite reads from CHANGED_SINCE, the cursor,
+# ten seconds into its minute. Each fake item changed either LONG_AGO, before
+# it, or RECENTLY, after it, and one item in each scope IN_THE_CURSOR_MINUTE:
+# thirty seconds later, still in the cursor's minute.
+CHANGED_SINCE = datetime(2026, 3, 1, 9, 30, 10, tzinfo=timezone.utc)
+IN_THE_CURSOR_MINUTE = CHANGED_SINCE + timedelta(seconds=30)
 LONG_AGO = datetime(2026, 1, 1, tzinfo=timezone.utc)
 RECENTLY = datetime(2026, 6, 1, tzinfo=timezone.utc)
 
@@ -104,10 +119,15 @@ class ProviderListing(Enum):
 
 @dataclass(frozen=True)
 class ListingConfig:
-    """A configuration the server lists, and whether its discovery already walks the whole scope."""
+    """A configuration the server lists, whether its discovery already walks the whole scope, and its same-minute item.
+
+    ``edited_in_the_cursor_minute`` is the Document id of the item in scope
+    edited at :data:`IN_THE_CURSOR_MINUTE`.
+    """
 
     config: Mapping[str, object]
     walks_scope: bool
+    edited_in_the_cursor_minute: str
 
 
 @dataclass
