@@ -29,8 +29,8 @@ CommonMark joins consecutive lines into one paragraph and lets a paragraph
 after a quote or list item continue it. So every block is followed by a
 blank line, except that the items of one list stay together::
 
-    notion_markdown("First\nSecond\n- one\n- two")
-    # "First\n\nSecond\n\n- one\n- two"
+    notion_markdown("First\\nSecond\\n- one\\n- two")
+    # "First\\n\\nSecond\\n\\n- one\\n- two"
 
 A block equation, ``$$`` lines around its formula, is one block.
 
@@ -137,8 +137,8 @@ def _children_indented_as_commonmark(lines: list[str]) -> list[str]:
     under a heading, paragraph or quote it would start an indented code
     block, so such children move to their parent's level::
 
-        "# Heading\n\tChild"   ->  "# Heading\nChild"
-        "- Item\n\t- Nested"   ->  unchanged
+        "# Heading\\n\\tChild"   ->  "# Heading\\nChild"
+        "- Item\\n\\t- Nested"   ->  unchanged
 
     Fenced code moves with its fence and keeps its own indentation.
     """
