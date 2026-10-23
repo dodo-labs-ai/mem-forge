@@ -27,6 +27,7 @@ describe("presentSourceScopeTransition", () => {
     expect(view).toEqual({
       returning: false,
       status: "The last sync left it open",
+      summary: "Nothing is removed until every item the new scope lists is synced. Each sync retries the items that failed.",
       reason: "3 listed Documents have not committed under the transition",
       changes: [{ field: "spaces", label: "Spaces", from: "ENG", to: "ENG, OPS" }],
       progressLabel: "117 of 120 listed items synced under the new scope",
@@ -104,6 +105,33 @@ describe("presentSourceScopeTransition", () => {
     expect(view?.returning).toBe(true);
     expect(view?.changes).toEqual([]);
     expect(view?.progressLabel).toBe("3 of 40 listed items synced under the previous scope");
+    expect(view?.summary).toBe(
+      "Nothing the previous scope synced is removed. Once a sync lists it in full, items only the replaced change added are removed.",
+    );
+  });
+
+  test.each([
+    ["a change", { conversation_ids: ["19:a@thread.v2", "19:c@thread.v2"] }, false],
+    ["a change back to the previous selection", { conversation_ids: ["19:a@thread.v2"] }, true],
+  ])("%s of a conversation source says its next sync removes the deselected conversations", (_name, target, returning) => {
+    const view = presentSourceScopeTransition(
+      makeSource({
+        scope_transition: makeScopeTransition({
+          status: "pending",
+          previous_scope: { conversation_ids: ["19:a@thread.v2"] },
+          target_scope: target,
+          members_committed: 0,
+          listed_count: null,
+          error: null,
+          removes: "next_sync",
+        }),
+      }),
+      undefined,
+    );
+
+    expect(view?.returning).toBe(returning);
+    expect(view?.summary).toBe("The next sync removes the conversations the new selection leaves out.");
+    expect(view?.progressLabel).toBe("The change completes once every selected conversation is synced.");
   });
 });
 
@@ -145,9 +173,6 @@ describe("scopeChangeErrorMessage", () => {
     expect(scopeChangeErrorMessage(new ApiError(409, "projection_scope_transition_stale"))).toBe(
       "The scope change in progress changed while you were looking at it. Reload the source, then try again.",
     );
-    expect(scopeChangeErrorMessage(new ApiError(409, "projection_scope_transition_active"))).toBe(
-      "This source finishes its scope change in progress before it accepts another one. Try again once it completes.",
-    );
   });
 
   test("a mode that cannot list keeps the server's words, which name it and what to choose instead", () => {
@@ -164,9 +189,13 @@ describe("scopeChangeErrorMessage", () => {
 });
 
 describe("presentRestore", () => {
-  const preview = (outcome: ScopeChangePreview["outcome"]): ScopeChangePreview => ({
+  const preview = (
+    outcome: ScopeChangePreview["outcome"],
+    removes: ScopeChangePreview["removes"] = "at_completion",
+  ): ScopeChangePreview => ({
     outcome,
     open_transition: true,
+    removes,
     refusal: null,
   });
 
@@ -185,6 +214,15 @@ describe("presentRestore", () => {
     expect(restoring.description).toContain("items only the replaced change added are removed");
   });
 
+  test("a conversation source returns through a change whose next sync removes what only the replaced change added", () => {
+    expect(presentRestore("Team chats", preview("returns_to_previous_scope", "next_sync"), false)).toEqual({
+      description:
+        "This replaces the scope change in progress with a change back to Team chats's previous scope, keeping its other settings. "
+        + "The next sync removes the conversations the new selection leaves out. The change completes once every selected conversation is synced.",
+      ready: true,
+    });
+  });
+
   test("waits for the preview, and offers nothing when the change moved on or would be refused", () => {
     expect(presentRestore("Wiki", undefined, false).ready).toBe(false);
     expect(presentRestore("Wiki", preview("unchanged"), false)).toEqual({
@@ -192,9 +230,9 @@ describe("presentRestore", () => {
       ready: false,
     });
     expect(
-      presentRestore("Wiki", { ...preview("refused"), refusal: { code: "projection_scope_transition_active" } }, false),
+      presentRestore("Wiki", { ...preview("refused"), refusal: { code: "source_sync_running" } }, false),
     ).toEqual({
-      description: "This source finishes its scope change in progress before it accepts another one. Try again once it completes.",
+      description: "A sync of this source is running. Stop the sync, then try again.",
       ready: false,
     });
   });
