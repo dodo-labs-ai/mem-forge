@@ -88,10 +88,10 @@ def history_floor(selection: ConversationSelection, now: datetime) -> datetime:
     return floor if cutoff is None else max(floor, cutoff)
 
 
-def poll_read(poll: PollEvidence, *, received_at: datetime) -> Range:
-    """What one poll read, as the backfill rule defines it."""
+def poll_read(poll: PollEvidence, *, received_at: datetime, conversation: ConversationRef = REF) -> Range:
+    """What one poll of ``conversation`` read, as the backfill rule defines it."""
 
-    proven = proven_interval(poll, REF, received_at=received_at)
+    proven = proven_interval(poll, conversation, received_at=received_at)
     if poll.outcome is PollOutcome.STOPPED_EARLY:
         return proven.start, proven.end
     return poll.requested.start, proven.end
