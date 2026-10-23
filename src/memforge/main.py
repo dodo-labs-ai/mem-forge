@@ -68,6 +68,16 @@ from memforge.local_agent.document_identity import (
     build_local_markdown_doc_id,
 )
 from memforge.local_agent.snapshot_manifest import SNAPSHOT_MANIFEST_MAX_ITEMS
+from memforge.local_agent.setup_results import (
+    GitHubRepoPreviewTreeResult,
+    JiraAuthResult,
+    LocalMarkdownPickRootResult,
+    LocalMarkdownPreviewTreeResult,
+    LocalSetupJobResult,
+    TeamsAuthCheckResult,
+    TeamsAuthResult,
+    TeamsBrowseResult,
+)
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
     LOCAL_AGENT_TRANSITION_PAYLOAD_FIELDS,
@@ -3362,6 +3372,11 @@ def _run_cloud_local_agent_job(
     return handler()
 
 
+def _setup_result(result: LocalSetupJobResult) -> dict[str, Any]:
+    """Complete a setup job with the fields its handler set, as its model shapes them."""
+    return result.model_dump(exclude_unset=True)
+
+
 def _run_cloud_jira_auth_job(
     job: dict[str, Any],
     client: ToolClient,
@@ -3377,7 +3392,7 @@ def _run_cloud_jira_auth_job(
         client=client,
     )
     if error:
-        return {**error, "retryable": False}
+        return _setup_result(JiraAuthResult(**error, retryable=False))
 
     try:
         from memforge.auth.jira_capture import capture_and_prevalidate
@@ -3397,36 +3412,39 @@ def _run_cloud_jira_auth_job(
             browser=captured.browser,
         )
         if _is_jira_principal_change(uploaded_session):
-            return {
-                "operation": operation,
-                "source_id": source_id,
-                **_principal_change_payload(uploaded_session),
-                "error_type": "JiraPrincipalChangedError",
-                "retryable": False,
-            }
+            return _setup_result(
+                JiraAuthResult(
+                    operation=operation,
+                    source_id=source_id,
+                    **_principal_change_payload(uploaded_session),
+                    error_type="JiraPrincipalChangedError",
+                    retryable=False,
+                )
+            )
         if uploaded_session.get("error"):
-            return {
-                "operation": operation,
-                "source_id": source_id,
-                "error": "Unable to store the renewed Jira browser session",
-                "error_type": "JiraSessionUploadError",
-                "retryable": False,
-            }
+            return _setup_result(
+                JiraAuthResult(
+                    operation=operation,
+                    source_id=source_id,
+                    error="Unable to store the renewed Jira browser session",
+                    error_type="JiraSessionUploadError",
+                    retryable=False,
+                )
+            )
     except Exception as exc:
-        return {
-            "operation": operation,
-            "source_id": source_id,
-            "error": str(exc),
-            "error_type": type(exc).__name__,
-            "retryable": False,
-        }
+        return _setup_result(
+            JiraAuthResult(
+                operation=operation,
+                source_id=source_id,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                retryable=False,
+            )
+        )
 
-    return {
-        "operation": operation,
-        "source_id": source_id,
-        "authenticated": True,
-        "origin": captured.origin,
-    }
+    return _setup_result(
+        JiraAuthResult(operation=operation, source_id=source_id, authenticated=True, origin=captured.origin)
+    )
 
 
 def _local_agent_lease_not_current(response: object) -> bool:
@@ -3518,7 +3536,7 @@ def _run_cloud_github_preview_job(job: dict[str, Any]) -> dict[str, Any]:
     limit = _cloud_job_limit(payload.get("limit"), default=200)
     tree_profile = {**profile, "include_paths": [], "exclude_paths": []}
     preview = _preview_github_profile(profile_name, tree_profile, limit=limit)
-    return {"operation": operation, "source_id": source_id, **preview}
+    return _setup_result(GitHubRepoPreviewTreeResult(operation=operation, source_id=source_id, **preview))
 
 
 def _run_cloud_github_sync_job(
@@ -3562,7 +3580,7 @@ def _run_cloud_local_markdown_preview_job(job: dict[str, Any]) -> dict[str, Any]
     profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
     profile = _kb_profile_from_cloud_job(job)
     preview = _preview_kb_profile(profile_name, profile, limit=_cloud_job_limit(payload.get("limit"), default=200))
-    return {"operation": operation, "source_id": source_id, **preview}
+    return _setup_result(LocalMarkdownPreviewTreeResult(operation=operation, source_id=source_id, **preview))
 
 
 def _run_cloud_pick_root_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -3574,10 +3592,10 @@ def _run_cloud_pick_root_job(job: dict[str, Any]) -> dict[str, Any]:
             initial_directory=str(payload.get("initial_directory") or "").strip() or None,
         )
     except FolderPickerCancelled:
-        return {"operation": operation, "cancelled": True}
+        return _setup_result(LocalMarkdownPickRootResult(operation=operation, cancelled=True))
     except FolderPickerUnavailable as exc:
-        return {"operation": operation, "error": str(exc)}
-    return {"operation": operation, "root": root}
+        return _setup_result(LocalMarkdownPickRootResult(operation=operation, error=str(exc)))
+    return _setup_result(LocalMarkdownPickRootResult(operation=operation, root=root))
 
 
 def _run_cloud_local_markdown_sync_job(
@@ -3812,28 +3830,27 @@ def _run_cloud_teams_auth_job(job: dict[str, Any]) -> dict[str, Any]:
             rejected_token_hashes=_teams_rejected_token_hashes_from_payload(payload),
         )
     except RuntimeError as exc:
-        return {
-            "operation": operation,
-            "authenticated": False,
-            "region": region,
-            "error": str(exc),
-        }
+        return _setup_result(TeamsAuthResult(operation=operation, authenticated=False, region=region, error=str(exc)))
     except Exception as exc:
-        return {
-            "operation": operation,
-            "authenticated": False,
-            "region": region,
-            "error": str(exc),
-            "error_type": type(exc).__name__,
-        }
+        return _setup_result(
+            TeamsAuthResult(
+                operation=operation,
+                authenticated=False,
+                region=region,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+        )
 
     tokens = token_data.get("tokens") if isinstance(token_data, dict) else {}
-    return {
-        "operation": operation,
-        "authenticated": True,
-        "region": region,
-        "token_count": len(tokens) if isinstance(tokens, dict) else 0,
-    }
+    return _setup_result(
+        TeamsAuthResult(
+            operation=operation,
+            authenticated=True,
+            region=region,
+            token_count=len(tokens) if isinstance(tokens, dict) else 0,
+        )
+    )
 
 
 def _run_cloud_teams_auth_check_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -3842,11 +3859,7 @@ def _run_cloud_teams_auth_check_job(job: dict[str, Any]) -> dict[str, Any]:
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    return {
-        "operation": operation,
-        "region": teams_region(payload),
-        **teams_auth_status(),
-    }
+    return _setup_result(TeamsAuthCheckResult(operation=operation, region=teams_region(payload), **teams_auth_status()))
 
 
 def _run_cloud_teams_browse_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -3875,17 +3888,27 @@ def _run_cloud_teams_browse_job(job: dict[str, Any]) -> dict[str, Any]:
                 try:
                     data = asyncio.run(browse_teams_conversations(region=region))
                 except Exception as retry_exc:
-                    return {
-                        "operation": operation,
-                        "region": region,
-                        "error": str(retry_exc),
-                        "error_type": type(retry_exc).__name__,
-                    }
+                    return _setup_result(
+                        TeamsBrowseResult(
+                            operation=operation,
+                            region=region,
+                            error=str(retry_exc),
+                            error_type=type(retry_exc).__name__,
+                        )
+                    )
             else:
-                return {"operation": operation, "region": region, **reauth}
+                return _setup_result(
+                    TeamsBrowseResult(
+                        operation=operation,
+                        region=region,
+                        **{key: reauth[key] for key in ("error", "error_type") if key in reauth},
+                    )
+                )
         else:
-            return {"operation": operation, "region": region, "error": str(exc), "error_type": type(exc).__name__}
-    return {"operation": operation, "region": region, **data}
+            return _setup_result(
+                TeamsBrowseResult(operation=operation, region=region, error=str(exc), error_type=type(exc).__name__)
+            )
+    return _setup_result(TeamsBrowseResult(operation=operation, region=region, **data))
 
 
 def _teams_auth_exception(exc: Exception) -> bool:
