@@ -297,7 +297,9 @@ async def test_paging_evidence_never_claims_more_than_the_pages_read(source_type
     returned = {message.message_id for message in poll.messages}
     assert poll.outcome is shape.outcome
     assert not proven.empty
-    assert returned <= shape.scenario.live_between(shape.interval.start, shape.interval.end)
+    # A provider may return a deleted message, with its tombstone pointer set,
+    # or omit it; either way it returns nothing created outside the interval.
+    assert returned <= shape.scenario.created_between(shape.interval.start, shape.interval.end)
     assert {
         message.message_id for message in shape.scenario.messages if message.live and proven.contains(message.created_at)
     } <= returned
@@ -329,6 +331,8 @@ async def test_records_match_the_declared_record_schema(source_type) -> None:
         poll = await connection.provider.poll(ref, Interval(BEFORE_EVERY_MESSAGE))
 
     text_pointers = [field.json_pointer for field in schema.fields if field.nested_profile or field.text_format]
+    # A provider may omit the deleted message, whose absence the layer proves;
+    # the tombstone check below applies when it returns it.
     assert {message.message_id for message in poll.messages} >= {"root", "reply", "standalone"}
     for message in poll.messages:
         record, expected = message.record, truth[message.message_id]

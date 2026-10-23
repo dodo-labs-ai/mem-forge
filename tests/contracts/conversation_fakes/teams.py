@@ -97,7 +97,8 @@ class FakeChatService:
 
     ``answer`` answers every request; the service records each request, and
     each wait the client asks its stub sleep for. ``now`` is the client's
-    clock, which stands still unless a test moves it.
+    clock, which stands still unless a test moves it. A client reads
+    ``tokens`` as its keychain, by default a session with Graph access.
     """
 
     def __init__(self, answer: Answer) -> None:
@@ -106,13 +107,13 @@ class FakeChatService:
         self.waits: list[float] = []
         self.now = 0.0
 
-    def client(self, region: str = "emea") -> TeamsChatClient:
+    def client(self, region: str = "emea", *, tokens: dict = TOKENS) -> TeamsChatClient:
         return TeamsChatClient(
             region,
             transport=httpx.MockTransport(self._handle),
             sleep=self._sleep,
             clock=lambda: self.now,
-            load_tokens=lambda: TOKENS,
+            load_tokens=lambda: tokens,
         )
 
     async def _sleep(self, seconds: float) -> None:

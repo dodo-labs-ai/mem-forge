@@ -119,13 +119,13 @@ class Scenario:
     page_size: int = 200
     ends_on_empty_page: bool = False
 
-    def live_between(self, start: datetime, end: datetime | None) -> set[str]:
-        """The ids of the live messages created in ``[start, end)``."""
+    def created_between(self, start: datetime, end: datetime | None) -> set[str]:
+        """The ids of the messages, live or deleted, created in ``[start, end)``."""
 
         return {
             message.message_id
             for message in self.messages
-            if message.live and start <= message.created_at and (end is None or message.created_at < end)
+            if start <= message.created_at and (end is None or message.created_at < end)
         }
 
 
