@@ -22,7 +22,7 @@ function renderGroup(choices: Choice[], value: string, onValueChange = vi.fn()) 
 test("up to four choices are radio cards with their descriptions", async () => {
   const onValueChange = renderGroup(FEW, "space");
 
-  expect(screen.getByRole("radiogroup", { name: "Sync scope" })).toBeInTheDocument();
+  expect(screen.getByRole("radiogroup", { name: "Sync scope" })).toHaveAttribute("id", "scope");
   expect(screen.getByRole("radio", { name: "Whole space" })).toBeChecked();
   expect(screen.getByRole("radio", { name: "This page tree" })).toHaveAccessibleDescription("A page and the pages under it");
 

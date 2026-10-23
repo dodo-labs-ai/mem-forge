@@ -13,7 +13,7 @@ export interface Choice {
 export const MAX_RADIO_CHOICES = 4;
 
 interface ChoiceGroupProps {
-  /** Prefix of the ids the cards give their label and description. */
+  /** The id of the select or radio group, which a field label points at, and the prefix of the ids the cards give their label and description. */
   id: string;
   choices: readonly Choice[];
   value: string;
@@ -74,6 +74,7 @@ export function ChoiceGroup({
 
   return (
     <RadioGroup
+      id={id}
       value={value}
       disabled={disabled}
       onValueChange={(next) => {
