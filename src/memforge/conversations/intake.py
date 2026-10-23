@@ -226,16 +226,17 @@ def _require_consistent_poll(conversation_id: str, poll: PollEvidence, returned:
         )
     if complete is not None and poll.outcome is not PollOutcome.REACHED_START:
         if complete < poll.requested.start:
+            ended = "stopped early" if poll.outcome is PollOutcome.STOPPED_EARLY else "ran out of history"
             raise CollectionRejected(
-                f"a poll of conversation {conversation_id} that ended {poll.outcome.value} is complete from before "
-                "its start; upgrade the MemForge agent that collected it"
+                f"a poll of conversation {conversation_id} that {ended} is complete from before its requested start; "
+                "upgrade the MemForge agent that collected it"
             )
         if poll.outcome is PollOutcome.STOPPED_EARLY and poll.requested.end is not None and (
             complete >= poll.requested.end
         ):
             raise CollectionRejected(
-                f"a poll of conversation {conversation_id} stopped early complete from at or after its end; "
-                "upgrade the MemForge agent that collected it"
+                f"a poll of conversation {conversation_id} that stopped early is complete from at or after its "
+                "requested end; upgrade the MemForge agent that collected it"
             )
     earliest = poll.earliest_returned_at
     if earliest is not None and (
