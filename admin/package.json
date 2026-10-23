@@ -21,7 +21,7 @@
     "test:e2e": "playwright test",
     "storybook": "storybook dev --port 6006 --no-open",
     "build-storybook": "storybook build",
-    "gen:api": "uv run --project .. python ../scripts/export_openapi.py openapi/admin.json && openapi-typescript openapi/admin.json -o src/api/schema.gen.ts",
+    "gen:api": "uv run --project .. python ../scripts/export_openapi.py openapi/admin.json && openapi-typescript openapi/admin.json -o src/api/schema.gen.ts && uv run --project .. python ../scripts/export_source_type_forms.py src/test/fixtures/sourceTypeForms.json",
     "check:api": "openapi-typescript openapi/admin.json -o node_modules/.tmp/schema.check.ts && diff -q src/api/schema.gen.ts node_modules/.tmp/schema.check.ts"
   },
   "dependencies": {
