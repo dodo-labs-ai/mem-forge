@@ -2,13 +2,12 @@
 
 ## Unreleased
 
-- A local-agent Jira collection reads each issue through the search that
-  listed it. Jira Data Center writes an issue's `updated` at whole seconds in
-  a search and with milliseconds in an issue read, so the device's check that
-  an issue did not change while it was read compared an inventory revision
-  with a differently written one and failed every collection. The device
-  now reads the full issue by `issuekey = <id> AND (<scope>)` and checks the
-  revision again by the same search after its comments are read.
+- A local-agent Jira collection reads each listed issue with a one-issue
+  search in the Source's scope, `issuekey = <id> AND (<scope>)`, and, when
+  its comments are read apart, confirms its revision with another such
+  search. A search can write an issue's `updated` at a coarser precision
+  than an issue read, so a listed revision is compared only with another
+  search.
 
 - The Admin UI shows a Source's scope change in progress and offers a way
   back. Each row of `GET /sources` carries `scope_transition`: both scopes
