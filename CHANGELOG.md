@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- The Admin UI shows a Source's scope change in progress and offers a way
+  back. Each row of `GET /sources` carries `scope_transition`: both scopes
+  as canonical scope fields, `status`, `members_committed` and
+  `listed_count` (the items the latest complete listing of the new scope
+  holds, a new transition column in both stores, SQLite migration 129; a run
+  without a complete listing keeps the stored count), `error`,
+  `excluded_scopes_due`, `failing_items` (the failure ledger's rows of
+  Documents not committed under the change) and `restore_config`, the
+  viewer's configuration with the previous scope's fields, which
+  `PUT /sources/{id}` saves as a return to the last applied scope (`null`
+  for a conversation Source or a viewer who cannot change the
+  configuration). The new `POST /sources/{id}/scope-change-preview` answers
+  what saving a configuration would do (`unchanged`, `opens_transition`,
+  `supersedes_transition`, `restores_previous_scope` or `refused` with the
+  409's code, mode and message), decided as the update route decides it,
+  and writes nothing. The V2 Source drawer shows the change, its progress
+  and failed items, and "Restore the previous scope" with a confirmation.
+  The V1 configuration dialog, Teams included, warns before saving a change
+  into a mode that cannot list or one that replaces the change in progress,
+  and explains the scope-change refusals; its sync details show the
+  skipped deletion check, the unlisted items kept, and the change in
+  progress.
+
 - A local-agent Jira scope transition now completes, removing only what the
   user's change excluded. Every local-agent sync job is built by one async
   `local_agent_sync_job_payload(db, source)` (the manual and explicit routes

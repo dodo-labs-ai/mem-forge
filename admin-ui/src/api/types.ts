@@ -155,6 +155,11 @@ export interface EntityAlias {
   created_at: string | null;
 }
 
+export type AbsenceCheckSkippedReason =
+  | "scope_listing_failed"
+  | "absence_confirmation_failed"
+  | "absence_confirmation_missing";
+
 export interface SyncStatus {
   created_at?: string | null;
   status: "pending" | "running" | "recovering" | "success" | "partial" | "failed";
@@ -174,6 +179,10 @@ export interface SyncStatus {
   docs_failed?: number;
   memories_extracted?: number;
   skipped_reading_group_count?: number | null;
+  /** Why a finished sync removed nothing although its scope listing was due. */
+  absence_check_skipped_reason?: AbsenceCheckSkippedReason | null;
+  /** Items a finished sync's scope listing left out that the source confirmed it still has; they are kept. */
+  unlisted_present_count?: number | null;
   docs_stored?: number;
   memories_stored?: number;
   current_title?: string | null;
@@ -186,6 +195,34 @@ export interface SyncStatus {
   progress?: SyncProgressSnapshot | null;
   progress_revision?: number;
   progress_updated_at?: string | null;
+}
+
+/**
+ * The scope change a Source is applying. Its syncs commit the items the new
+ * scope lists; nothing is removed until every listed item has committed.
+ */
+export interface SourceScopeTransition {
+  id: string;
+  status: "pending" | "running" | "failed";
+  previous_scope: Record<string, unknown>;
+  target_scope: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+  members_committed: number;
+  /** Items the latest complete listing of the new scope holds; null before a sync listed it. */
+  listed_count: number | null;
+  excluded_scopes_due: boolean;
+  error: string | null;
+  failing_items: SourceFailedItems;
+  /** The configuration that returns to the previous scope; null when the viewer cannot restore it. */
+  restore_config: Record<string, unknown> | null;
+}
+
+/** What saving a configuration would do to a Source's scope (`POST /sources/{id}/scope-change-preview`). */
+export interface SourceScopeChangePreview {
+  outcome: "unchanged" | "opens_transition" | "supersedes_transition" | "restores_previous_scope" | "refused";
+  open_transition: boolean;
+  refusal: { code: string; mode?: string | null; message?: string | null } | null;
 }
 
 export interface SourceFailedItems {
@@ -339,6 +376,8 @@ export interface Source {
   sync?: SyncStatus | null;
   /** The source's items that failed and stay failed until a sync commits them; null for a source that does not sync. */
   failed_items?: SourceFailedItems | null;
+  /** The scope change the source is applying; null when none is in progress. */
+  scope_transition?: SourceScopeTransition | null;
   connection_status?: SourceConnectionStatus | null;
   created_at: string;
   /**
