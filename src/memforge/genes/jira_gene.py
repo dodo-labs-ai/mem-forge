@@ -30,11 +30,11 @@ from memforge.genes.local_adapter_packages import (
     decode_package,
     has_package_manifest,
     open_packaged_source_artifact,
-    package_manifest,
     read_package_body,
     source_artifacts_from_package,
 )
 from memforge.genes.toolkit.config import bearer_headers, bool_config, require_https_base_url, tls_verify
+from memforge.genes.toolkit.local_packages import device_packages
 from memforge.local_agent.jira_contract import validate_jira_observation_identities
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, source_time_iso
 from memforge.models import (
@@ -244,15 +244,6 @@ def _zero_quota_message(mode: str) -> str:
         "Jira REST API quota is zero for this browser-cookie session. "
         "Ask Jira admins to enable REST API quota for this user or session."
     )
-
-
-def _parse_local_package_dt(value: str) -> datetime:
-    if not value:
-        return datetime.fromtimestamp(0, timezone.utc)
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _issue_payload_from_search(issue: dict, config: dict) -> dict:
@@ -506,8 +497,6 @@ class JiraGene(DocumentGene):
                 logger.info("Jira client using local-agent package manifest")
                 return
             local_documents_dir = self._local_agent_documents_dir()
-            if local_documents_dir is None:
-                raise ValueError("Jira local-agent sync requires a local package inbox")
             local_documents_dir.mkdir(parents=True, exist_ok=True)
             self._client = None
             self._request_limiter = None
@@ -533,15 +522,7 @@ class JiraGene(DocumentGene):
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
         """Discover issues via JQL search."""
         if _read_by_local_agent(self.config):
-            manifest = self._local_agent_package_manifest()
-            if has_package_manifest(self.config):
-                async for item in self._discover_local_agent_package_manifest(manifest, since):
-                    yield item
-                return
-            local_documents_dir = self._local_agent_documents_dir()
-            if local_documents_dir is None:
-                raise ValueError("Jira local-agent sync requires a local package inbox")
-            async for item in self._discover_local_agent_packages(local_documents_dir, since):
+            async for item in self._discover_local_agent_packages(since):
                 yield item
             return
 
@@ -1278,74 +1259,31 @@ class JiraGene(DocumentGene):
             source_semantics=source_semantics,
         )
 
-    def _local_agent_documents_dir(self) -> Path | None:
+    def _local_agent_documents_dir(self) -> Path:
         configured = str(self.config.get("local_agent_documents_dir") or "").strip()
-        return Path(configured).expanduser() if configured else None
+        if not configured:
+            raise ValueError("Jira local-agent sync requires a local package inbox")
+        return Path(configured).expanduser()
 
-    def _local_agent_package_manifest(self) -> list[dict]:
-        return package_manifest(self.config)
-
-    async def _discover_local_agent_package_manifest(
-        self,
-        manifest: list[dict],
-        since: datetime | None,
-    ) -> AsyncIterator[ContentItem]:
-        for entry in sorted(
-            manifest,
-            key=lambda item: (str(item.get("last_modified") or ""), str(item.get("doc_id") or "")),
-        ):
-            package_uri = str(entry.get("package_uri") or "").strip()
-            if not package_uri:
+    async def _discover_local_agent_packages(self, since: datetime | None) -> AsyncIterator[ContentItem]:
+        packages = device_packages(
+            self.config,
+            package_kind=LOCAL_AGENT_JIRA_PACKAGE_KIND,
+            inbox=self._local_agent_documents_dir,
+        )
+        for package in packages:
+            if not package.changed_after(since):
                 continue
-            last_modified = _parse_local_package_dt(str(entry.get("last_modified") or ""))
-            if since and last_modified <= since:
-                continue
-            issue_key = str(entry.get("issue_key") or "").strip()
+            issue_key = package.text("issue_key").strip()
             yield ContentItem(
-                item_id=str(entry.get("doc_id") or issue_key),
-                title=str(entry.get("title") or issue_key),
-                source_url=str(entry.get("source_url") or ""),
-                last_modified=last_modified,
+                item_id=package.text("doc_id", issue_key),
+                title=package.text("title", issue_key),
+                source_url=package.text("source_url"),
+                last_modified=package.last_modified,
                 content_type="application/json",
-                space_or_project=str(entry.get("space_or_project") or issue_key.split("-", 1)[0]),
-                version=str(entry.get("version") or ""),
-                author=entry.get("submitted_by"),
+                space_or_project=package.text("space_or_project", issue_key.split("-", 1)[0]),
+                version=package.text("version"),
+                author=package.fields.get("submitted_by"),
                 labels=["jira"],
-                extra={
-                    "package_uri": package_uri,
-                    "package_path": entry.get("package_path"),
-                    "package_sha256": entry.get("package_sha256"),
-                    "input_sha256": entry.get("input_sha256"),
-                    "issue_key": issue_key,
-                },
-            )
-
-    async def _discover_local_agent_packages(
-        self,
-        documents_dir: Path,
-        since: datetime | None,
-    ) -> AsyncIterator[ContentItem]:
-        for package_path in sorted(documents_dir.rglob("*.json")):
-            try:
-                package = json.loads(package_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                logger.warning("Skipping unreadable Jira local-agent package: %s", package_path)
-                continue
-            if package.get("package_kind") != LOCAL_AGENT_JIRA_PACKAGE_KIND:
-                continue
-            last_modified = _parse_local_package_dt(str(package.get("last_modified") or ""))
-            if since and last_modified <= since:
-                continue
-            issue_key = str(package.get("issue_key") or "").strip()
-            yield ContentItem(
-                item_id=str(package.get("doc_id") or issue_key),
-                title=str(package.get("title") or issue_key),
-                source_url=str(package.get("source_url") or ""),
-                last_modified=last_modified,
-                content_type="text/markdown",
-                space_or_project=str(package.get("space_or_project") or issue_key.split("-", 1)[0]),
-                version=str(package.get("version") or ""),
-                author=package.get("author"),
-                labels=["jira"],
-                extra={"package_path": str(package_path), "issue_key": issue_key},
+                extra={**package.locator, "issue_key": issue_key},
             )

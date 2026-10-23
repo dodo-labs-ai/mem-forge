@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from collections.abc import AsyncIterator, Mapping
@@ -21,12 +20,12 @@ from memforge.genes.local_adapter_packages import (
     decode_package,
     has_package_manifest,
     open_packaged_source_artifact,
-    package_manifest,
     read_package_body,
     source_artifacts_from_package,
 )
-from memforge.genes.local_markdown_gene import _parse_dt, _to_markdown
+from memforge.genes.local_markdown_gene import _to_markdown
 from memforge.genes.toolkit.config import int_config, list_config
+from memforge.genes.toolkit.local_packages import device_packages
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSIONS,
     GITHUB_SYMLINK_MODE,
@@ -701,88 +700,35 @@ class GitHubRepoGene(DocumentGene):
             raise RuntimeError(str(exc)) from exc
 
     async def _discover_local_push(self, since: datetime | None) -> AsyncIterator[ContentItem]:
-        manifest = self._package_manifest()
-        if has_package_manifest(self.config):
-            async for item in self._discover_local_push_manifest(manifest, since):
-                yield item
-            return
-        documents_dir = self._documents_dir()
-        selected: list[tuple[Path, dict]] = []
-        for package_path in sorted(documents_dir.rglob("*.json")):
-            try:
-                package = json.loads(package_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                logger.warning("Skipping unreadable GitHub repo package: %s", package_path)
-                continue
-            if package.get("package_kind") != GITHUB_REPO_PACKAGE_KIND:
-                continue
-            if not _package_matches_config(package, self.config):
-                continue
-            selected.append((package_path, package))
-        max_files = int_config(self.config, "max_files", default=DEFAULT_MAX_FILES)
-        if len(selected) > max_files:
-            raise RuntimeError(
-                f"GitHub Repository Internal network / VPN sync matched {len(selected)} files, exceeding max_files={max_files}"
+        packages = [
+            package
+            for package in device_packages(
+                self.config,
+                package_kind=GITHUB_REPO_PACKAGE_KIND,
+                inbox=self._documents_dir,
             )
-        for package_path, package in selected:
-            last_modified = _parse_dt(str(package.get("last_modified") or ""))
-            if since and last_modified <= since:
-                continue
-            yield ContentItem(
-                item_id=package["doc_id"],
-                title=package.get("title") or package["doc_id"],
-                source_url=package.get("source_url", ""),
-                last_modified=last_modified,
-                content_type=package.get("content_type") or "text/markdown",
-                space_or_project=package.get("space_or_project") or "",
-                version=package.get("version", ""),
-                author=package.get("submitted_by"),
-                labels=["github_repo"],
-                extra={
-                    "package_path": str(package_path),
-                    "relative_path": package.get("relative_path"),
-                },
-            )
-
-    async def _discover_local_push_manifest(
-        self,
-        manifest: list[dict],
-        since: datetime | None,
-    ) -> AsyncIterator[ContentItem]:
-        selected = [
-            entry for entry in manifest
-            if str(entry.get("package_uri") or "").strip() and _package_matches_config(entry, self.config)
+            if _package_matches_config(package.fields, self.config)
         ]
         max_files = int_config(self.config, "max_files", default=DEFAULT_MAX_FILES)
-        if len(selected) > max_files:
+        if len(packages) > max_files:
             raise RuntimeError(
-                f"GitHub Repository Internal network / VPN sync matched {len(selected)} files, exceeding max_files={max_files}"
+                f"GitHub Repository Internal network / VPN sync matched {len(packages)} files, exceeding max_files={max_files}"
             )
-        for entry in sorted(
-            selected,
-            key=lambda item: (str(item.get("last_modified") or ""), str(item.get("doc_id") or "")),
-        ):
-            last_modified = _parse_dt(str(entry.get("last_modified") or ""))
-            if since and last_modified <= since:
+        for package in packages:
+            if not package.changed_after(since):
                 continue
-            doc_id = str(entry.get("doc_id") or "")
+            doc_id = str(package.fields["doc_id"])
             yield ContentItem(
                 item_id=doc_id,
-                title=str(entry.get("title") or doc_id),
-                source_url=str(entry.get("source_url") or ""),
-                last_modified=last_modified,
-                content_type=str(entry.get("content_type") or "text/markdown"),
-                space_or_project=str(entry.get("space_or_project") or ""),
-                version=str(entry.get("version") or ""),
-                author=entry.get("submitted_by"),
+                title=package.text("title", doc_id),
+                source_url=package.text("source_url"),
+                last_modified=package.last_modified,
+                content_type=package.text("content_type", "text/markdown"),
+                space_or_project=package.text("space_or_project"),
+                version=package.text("version"),
+                author=package.fields.get("submitted_by"),
                 labels=["github_repo"],
-                extra={
-                    "package_uri": str(entry.get("package_uri")),
-                    "package_path": entry.get("package_path"),
-                    "package_sha256": entry.get("package_sha256"),
-                    "input_sha256": entry.get("input_sha256"),
-                    "relative_path": entry.get("relative_path"),
-                },
+                extra={**package.locator, "relative_path": package.fields.get("relative_path")},
             )
 
     def _documents_dir(self) -> Path:
@@ -790,9 +736,6 @@ class GitHubRepoGene(DocumentGene):
         if not configured:
             raise ValueError("GitHub Repository Internal network / VPN source is missing documents_dir")
         return Path(configured).expanduser()
-
-    def _package_manifest(self) -> list[dict]:
-        return package_manifest(self.config)
 
 
 class _RequestsAsyncClient:
@@ -872,7 +815,7 @@ async def _iter_response_chunks(response: requests.Response) -> AsyncIterator[by
             yield chunk
 
 
-def _package_matches_config(package: dict, config: dict) -> bool:
+def _package_matches_config(package: Mapping[str, Any], config: dict) -> bool:
     configured_repo = str(config.get("repo_url") or "").strip()
     if configured_repo and str(package.get("repo_url") or "").strip() != _parse_repo_url(configured_repo).repo_url:
         return False

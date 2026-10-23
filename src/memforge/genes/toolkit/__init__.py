@@ -8,6 +8,8 @@ you need from its module::
 
 - :mod:`memforge.genes.toolkit.config` reads configuration values: booleans,
   integers, lists, personal access tokens, TLS trust and HTTPS base URLs.
+- :mod:`memforge.genes.toolkit.local_packages` reads the packages a device
+  submitted for a Source, from the run's manifest or the Source's inbox.
 
 The toolkit is transport and configuration only. It creates no business or
 lifecycle state.
