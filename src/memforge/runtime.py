@@ -1091,16 +1091,20 @@ async def run_source_sync(
                 raise SourceSyncActivityConflict(f"source activity heartbeat stopped: {activity_id}")
             return await sync_task
         finally:
-            # A cancelled caller leaves the sync task running; stop it before its client closes.
-            if sync_task is not None and not sync_task.done():
-                sync_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await sync_task
             try:
-                await gene.close()
-            except Exception:
-                # The run's own result or error is what callers act on; a failed release must not replace it.
-                logger.warning("Closing the %s Gene for source %s failed", source["type"], source["id"], exc_info=True)
+                # A cancelled caller leaves the sync task running; stop it before its client closes.
+                if sync_task is not None and not sync_task.done():
+                    sync_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await sync_task
+            finally:
+                try:
+                    await gene.close()
+                except Exception:
+                    # The run's own result or error is what callers act on; a failed release must not replace it.
+                    logger.warning(
+                        "Closing the %s Gene for source %s failed", source["type"], source["id"], exc_info=True
+                    )
     finally:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
