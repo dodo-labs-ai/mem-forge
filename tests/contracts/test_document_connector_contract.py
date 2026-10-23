@@ -282,10 +282,11 @@ async def test_confirm_absent_retries_a_provider_that_asks_to_wait_then_raises(s
         with pytest.raises(Exception):  # noqa: B017 - any error leaves the run's absence unproven
             await connection.gene.confirm_absent(items)
 
-    # The read was sent again after a wait, and the retries ended.
+    # The read was sent again after the wait the answer asked for, and the retries ended.
     read = connection.requests[-1]
     assert connection.requests.count(read) > 1
-    assert connection.waits
+    low, high = fakes_for(source_type).retry_waits[status]
+    assert any(low <= wait <= high for wait in connection.waits), connection.waits
 
 
 # ---------------------------------------------------------------------------

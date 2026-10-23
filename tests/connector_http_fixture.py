@@ -11,11 +11,13 @@ real Gene and the real retry loop run against the fake without waiting::
     assert http.waits == [30.0]           # what the client and its limiter waited for
     assert all(client.is_closed for client in http.clients)
 
-A test that sets a Gene's client by hand builds it with :meth:`client`.
+A test that sets a Gene's client by hand builds it with :meth:`client`, or
+subclasses :class:`AnsweringClient` to answer each request in a method.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from types import ModuleType
@@ -36,12 +38,14 @@ class FakeConnectorHttp:
         self.transport = httpx.MockTransport(handler)
         self.waits: list[float] = []
         self.clients: list[ConnectorHttpClient] = []
+        self.options: list[dict[str, Any]] = []
 
     async def sleep(self, seconds: float) -> None:
         self.waits.append(seconds)
 
     def build(self, **options: Any) -> ConnectorHttpClient:
-        """A client with the Gene's own ``options``, answered by the fake."""
+        """A client with the Gene's own ``options``, answered by the fake; ``self.options`` records them."""
+        self.options.append(options)
         client = ConnectorHttpClient(**options, transport=self.transport, sleep=self.sleep)
         self.clients.append(client)
         return client
@@ -57,3 +61,43 @@ class FakeConnectorHttp:
         """While the block runs, every ``ConnectorHttpClient`` that ``gene_module`` builds is answered by the fake."""
         with patch.object(gene_module, "ConnectorHttpClient", self.build):
             yield self
+
+
+class AnsweringClient(ConnectorHttpClient):
+    """A real ``ConnectorHttpClient`` whose provider is the subclass's :meth:`answer`.
+
+    Every request goes through the client's retry loop to ``answer``, and
+    every wait returns at once (``self.waits`` records them)::
+
+        class SearchClient(AnsweringClient):
+            async def answer(self, method, url, **kwargs):
+                return httpx.Response(200, json={"startAt": kwargs["json"]["startAt"], "total": 0, "issues": []})
+
+        gene._client = SearchClient(base_url="https://jira.example.test")
+    """
+
+    def __init__(self, base_url: str = "https://provider.example.test", **_ignored: Any) -> None:
+        self.waits: list[float] = []
+        super().__init__(
+            product_name="Test",
+            base_url=base_url,
+            timeout=5.0,
+            follow_redirects=True,
+            sleep=self._record_wait,
+            transport=httpx.MockTransport(self._handle),
+        )
+
+    async def answer(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        """The provider's answer to ``method`` on path ``url``; ``kwargs`` holds ``params`` and ``json`` when sent."""
+        raise NotImplementedError
+
+    async def _record_wait(self, seconds: float) -> None:
+        self.waits.append(seconds)
+
+    async def _handle(self, request: httpx.Request) -> httpx.Response:
+        kwargs: dict[str, Any] = {}
+        if request.url.params:
+            kwargs["params"] = dict(request.url.params)
+        if request.content:
+            kwargs["json"] = json.loads(request.content)
+        return await self.answer(request.method, request.url.path, **kwargs)

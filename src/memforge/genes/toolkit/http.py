@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import ssl
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -185,7 +186,10 @@ class ConnectorHttpClient:
     - ``follow_redirects`` says whether a 3xx is followed.
 
     ``limiter``, ``fail_fast`` and ``retry`` set the policy (module
-    docstring). ``sleep`` and ``transport`` exist for tests.
+    docstring). ``clock``, ``sleep`` and ``transport`` exist for tests: the
+    client reads monotonic time only through ``clock`` (``time.monotonic`` by
+    default) and waits only through ``sleep``; a caller that sets a
+    ``deadline`` reads it from :attr:`clock` too.
 
     Close it with ``await client.aclose()``; ``is_closed`` tells whether it
     is. ``Gene.close()`` does this for the client in ``self._client``.
@@ -204,6 +208,7 @@ class ConnectorHttpClient:
         fail_fast: Callable[[httpx.Response], None] | None = None,
         retry: RetryPolicy = DEFAULT_RETRY_POLICY,
         sleep: Sleep = asyncio.sleep,
+        clock: Callable[[], float] = time.monotonic,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.product_name = product_name
@@ -211,6 +216,7 @@ class ConnectorHttpClient:
         self._fail_fast = fail_fast
         self._retry = retry
         self._sleep = sleep
+        self.clock = clock
         self._http = httpx.AsyncClient(
             base_url=base_url,
             headers=dict(headers or {}),
@@ -246,9 +252,11 @@ class ConnectorHttpClient:
         - ``limited=False`` sends it past the client's limiter.
         - ``retry`` replaces the client's :class:`RetryPolicy` for this
           request.
-        - ``deadline`` is a ``time.monotonic()`` instant no retry wait may end
-          after; at the deadline the client gives up as if the attempts had
-          run out.
+        - ``deadline`` is an instant on :attr:`clock` by which every retry
+          must be over: a retry is made only when its wait plus the
+          request's timeout ends by then, and otherwise the client gives up
+          as if the attempts had run out. The first attempt is always sent;
+          a caller that must not start one late checks the clock itself.
 
         ``params``, ``json``, ``headers`` and ``timeout`` are passed to httpx.
         """
@@ -260,6 +268,7 @@ class ConnectorHttpClient:
             send,
             method=method,
             url=url,
+            timeout=timeout,
             streamed=False,
             safe_read=safe_read,
             limited=limited,
@@ -304,6 +313,7 @@ class ConnectorHttpClient:
             send,
             method=method,
             url=url,
+            timeout=timeout,
             streamed=True,
             safe_read=safe_read,
             limited=limited,
@@ -342,6 +352,7 @@ class ConnectorHttpClient:
         *,
         method: str,
         url: str,
+        timeout: httpx.Timeout | float | Any,
         streamed: bool,
         safe_read: bool,
         limited: bool,
@@ -349,6 +360,7 @@ class ConnectorHttpClient:
         deadline: float | None,
     ) -> httpx.Response:
         replayable = safe_read or method.upper() in IDEMPOTENT_METHODS
+        attempt_seconds = self._attempt_seconds(timeout)
         attempt = 0
         while True:
             attempt += 1
@@ -356,7 +368,7 @@ class ConnectorHttpClient:
                 response = await self._attempt(send, policy=policy, attempt=attempt, limited=limited)
             except httpx.TransportError as exc:
                 wait = policy.transport_wait_seconds
-                if not replayable or attempt >= policy.attempts or _passes(deadline, wait):
+                if not replayable or attempt >= policy.attempts or self._too_late(deadline, wait + attempt_seconds):
                     raise self._unreachable(url, attempt, exc) from exc
                 logger.warning(
                     "%s request to %s failed in transport (%s); retrying in %.1f s",
@@ -379,7 +391,7 @@ class ConnectorHttpClient:
                 return response
 
             wait = policy.wait_after(response, attempt)
-            if attempt >= policy.attempts or _passes(deadline, wait):
+            if attempt >= policy.attempts or self._too_late(deadline, wait + attempt_seconds):
                 if streamed:
                     await _read_and_close(response)
                 raise self._exhausted(response, url, attempt)
@@ -411,6 +423,21 @@ class ConnectorHttpClient:
             delay_for_response=lambda response: _limiter_delay(policy, response, attempt),
             sleep=self._sleep,
         )
+
+    def _too_late(self, deadline: float | None, seconds: float) -> bool:
+        """Whether something lasting ``seconds`` from now would end after ``deadline``."""
+        return deadline is not None and self.clock() + seconds > deadline
+
+    def _attempt_seconds(self, timeout: httpx.Timeout | float | Any) -> float:
+        """How long one attempt may last before one of its timeouts ends it: the largest of them, or infinity."""
+        if timeout is httpx.USE_CLIENT_DEFAULT:
+            timeout = self._http.timeout
+        if isinstance(timeout, (int, float)):
+            return float(timeout)
+        if isinstance(timeout, httpx.Timeout):
+            limits = [value for value in (timeout.connect, timeout.read, timeout.write, timeout.pool) if value is not None]
+            return max(limits) if limits else math.inf
+        return math.inf
 
     def _exhausted(self, response: httpx.Response, url: str, attempts: int) -> httpx.HTTPStatusError:
         tried = _attempts_phrase(attempts)
@@ -457,19 +484,15 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
     value = response.headers.get("Retry-After", "").strip()
     if not value:
         return None
-    if value.isdigit():
+    if value.isascii() and value.isdigit():
         return float(value)
     try:
         retry_at = parsedate_to_datetime(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, IndexError, OverflowError):
         return None
     if retry_at.tzinfo is None:
         retry_at = retry_at.replace(tzinfo=timezone.utc)
     return max((retry_at - datetime.now(timezone.utc)).total_seconds(), 0.0)
-
-
-def _passes(deadline: float | None, wait: float) -> bool:
-    return deadline is not None and time.monotonic() + wait > deadline
 
 
 def _attempts_phrase(attempts: int) -> str:
