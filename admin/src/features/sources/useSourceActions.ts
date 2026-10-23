@@ -1,8 +1,13 @@
+import { useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
+import { useApi } from "@/api";
 import { LOCAL_SYNC_START_COMMAND } from "@/features/local-sync";
 import { errorMessage } from "@/lib/errors";
-import { useSetPaused, useSetPinned, useSetUsedInSearches, useStopSync, useSyncSource } from "./api";
+import { sourceSettingsPath } from "@/lib/paths";
+import { configSchemaQuery, useSetPaused, useSetPinned, useSetUsedInSearches, useStopSync, useSyncSource } from "./api";
 import { V1_SOURCES_PATH } from "./constants";
+import { firstGroupWithPurpose } from "./model/configGroups";
 import type { SourceAttentionAction } from "./model/sourceAttention";
 import {
   sourceSyncCanStop,
@@ -21,6 +26,17 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
   const setPaused = useSetPaused();
   const stopSync = useStopSync();
   const signIn = useJiraSignIn();
+  const navigate = useNavigate();
+  const api = useApi();
+  const queryClient = useQueryClient();
+
+  /** Opens the settings step of the type's first content group, or the settings when its form cannot be read. */
+  function openContentStep(source: Source) {
+    queryClient.fetchQuery(configSchemaQuery(api, source.type)).then(
+      (schema) => navigate(sourceSettingsPath(source.id, firstGroupWithPurpose(schema, "content") ?? undefined)),
+      () => navigate(sourceSettingsPath(source.id)),
+    );
+  }
 
   function report(promise: Promise<unknown>, success: string, failure: string) {
     promise.then(
@@ -91,7 +107,7 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
         paused ? "Could not pause the source" : "Could not resume the source",
       );
     },
-    /** @deprecated admin-ui-v1: V2's own source setup dialogs replace this. */
+    /** @deprecated admin-ui-v1: V2's own sign-in panels replace this. */
     openInV1() {
       window.location.assign(V1_SOURCES_PATH);
     },
@@ -115,9 +131,13 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
           this.openInV1();
           return;
         case "configure":
+          navigate(sourceSettingsPath(source.id, "connection"));
+          return;
         case "configure_scope":
+          openContentStep(source);
+          return;
         case "assign_project":
-          this.openInV1();
+          navigate(sourceSettingsPath(source.id, "project"));
           return;
       }
     },

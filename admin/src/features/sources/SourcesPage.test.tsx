@@ -1,11 +1,13 @@
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useLocation } from "react-router-dom";
 import { afterEach, expect, test, vi } from "vitest";
 import { toast } from "sonner";
 import { STANDALONE_TARGET, type WorkspaceTarget } from "@/api";
 import { errorResponse, type Route } from "@/test/fakeApi";
 import { renderRoutes } from "@/test/renderRoutes";
 import { makeFailedItem, makeLocalAgentJob, makeScopeTransition, makeSource } from "@/test/sourceFixtures";
+import { sourceTypeSchema } from "@/test/sourceTypeForms";
 import { SourcesPage } from "./SourcesPage";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -16,6 +18,11 @@ afterEach(() => {
 });
 
 const RETRY_DELAY_MS = 60 * 60_000;
+
+function CurrentLocation() {
+  const location = useLocation();
+  return <output aria-label="Location">{`${location.pathname}${location.search}`}</output>;
+}
 
 function renderPage(
   sources = [makeSource(), makeSource({ id: "src-jira", type: "jira", name: "Payroll Jira", project_binding: null })],
@@ -35,7 +42,7 @@ function renderPage(
     "POST /api/v1/sources/src-wiki/sync": () => ({ status: "pending", run_id: "run-2" }),
     ...routes,
   };
-  return renderRoutes([{ path: "/sources", element: <SourcesPage /> }, { path: "*", element: null }], {
+  return renderRoutes([{ path: "/sources", element: <SourcesPage /> }, { path: "*", element: <CurrentLocation /> }], {
     path: "/sources",
     api,
     workspace,
@@ -102,6 +109,46 @@ test.each([
     expect(warning).not.toBeInTheDocument();
     expect(within(drawer).queryByText(/not recognized/)).not.toBeInTheDocument();
   }
+});
+
+test("Add source opens the type picker in the app", async () => {
+  renderPage();
+  await screen.findByRole("table", { name: "Sources" });
+  await userEvent.click(screen.getByRole("button", { name: "Add source" }));
+  expect(await screen.findByRole("status", { name: "Location" })).toHaveTextContent(/^\/sources\/new$/);
+});
+
+const REPO_OVER_LIMIT = makeSource({
+  id: "src-repo",
+  type: "github_repo",
+  name: "Payroll repo",
+  sync: {
+    status: "failed",
+    run_id: "run-9",
+    started_at: "2026-09-29T10:58:00Z",
+    finished_at: "2026-09-29T11:00:00Z",
+    error_message: "GitHub Repository discovery matched 600 files, exceeding max_files=500",
+    progress: null,
+  },
+});
+
+test.each([
+  ["Configure in the menu", undefined, "/sources/src-wiki/settings"],
+  ["Choose a project", undefined, "/sources/src-jira/settings?step=project"],
+  ["Configure", [makeSource({ connection_status: { state: "action_required", reason: "configuration" } })], "/sources/src-wiki/settings?step=connection"],
+  ["Configure file scope", [REPO_OVER_LIMIT], "/sources/src-repo/settings?step=scope"],
+])("%s opens the source's settings in the app", async (entry, sources, target) => {
+  renderPage(sources, { "GET /api/v1/genes/github_repo/config-schema": () => sourceTypeSchema("github_repo") });
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  if (entry === "Configure in the menu") {
+    await userEvent.click(await within(table).findByRole("button", { name: "More actions for Payroll wiki" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: /^Configure$/ }));
+  } else {
+    await userEvent.click(within(await screen.findByRole("region", { name: "Needs you" })).getByRole("button", { name: entry }));
+  }
+
+  expect(await screen.findByRole("status", { name: "Location" })).toHaveTextContent(target);
 });
 
 test("Sync now starts a sync for that source", async () => {
