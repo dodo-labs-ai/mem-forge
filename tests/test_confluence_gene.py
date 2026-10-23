@@ -1277,3 +1277,22 @@ async def test_fetch_refuses_an_empty_attachment_page_with_a_next_link():
 
     with pytest.raises(SourceArtifactContractError, match="Confluence attachment response cannot advance pagination"):
         await gene.fetch(_attachment_page_item())
+
+
+@pytest.mark.parametrize(
+    ("since", "yielded"),
+    [
+        (datetime(2026, 3, 1, 9, 30, 10, 250_999, tzinfo=timezone.utc), True),  # the page's own millisecond
+        (datetime(2026, 3, 1, 9, 30, 10, 250_000, tzinfo=timezone.utc), True),  # exactly the page's time
+        (datetime(2026, 3, 1, 9, 30, 10, 251_000, tzinfo=timezone.utc), False),  # the next millisecond
+    ],
+    ids=["same-millisecond", "same-instant", "next-millisecond"],
+)
+def test_discovery_compares_since_at_the_millisecond_of_version_when(since, yielded):
+    gene = ConfluenceGene(config={"base_url": "https://wiki.example.com"}, source_id="src-confluence")
+    gene._base_url = "https://wiki.example.com"
+    gene._discovered_page_ids = set()
+
+    item = gene._parse_page(_page("p-1", "Page", "2026-03-01T09:30:10.250Z"), since, set())
+
+    assert (item is not None) is yielded

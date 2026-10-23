@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
@@ -61,6 +61,9 @@ DEFAULT_MAX_PAGES = 200
 # ``ContentItem.extra`` key for the page's source time: its commit time in
 # repository mode, else its sitemap ``lastmod`` or HTTP ``Last-Modified``.
 CONTENT_UPDATED_AT_KEY = "content_updated_at"
+# The westernmost UTC offset in use: a date or time without an offset ends
+# there last.
+_WESTERNMOST_ZONE = timezone(timedelta(hours=-12), "UTC-12")
 
 
 @dataclass(frozen=True)
@@ -670,13 +673,11 @@ class GitHubPagesGene(DocumentGene):
         sitemap_xml, page_urls = sitemap
         items: list[ContentItem] = []
         for url in page_urls:
+            item = await self._content_item_for_url(url)
             lastmod = _lastmod_for_url(sitemap_xml, url)
-            if lastmod:
-                item = await self._content_item_for_url(url)
-                item.last_modified = lastmod
-                item.extra[CONTENT_UPDATED_AT_KEY] = lastmod.isoformat()
-            else:
-                item = await self._content_item_for_url(url)
+            if lastmod is not None:
+                item.last_modified = lastmod.discovery_marker
+                item.extra[CONTENT_UPDATED_AT_KEY] = lastmod.source_time.isoformat()
             items.append(item)
         return items
 
@@ -976,7 +977,28 @@ def _last_modified_from_headers(headers: dict[str, str]) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _lastmod_for_url(sitemap_xml: bytes, url: str) -> datetime | None:
+@dataclass(frozen=True)
+class _Lastmod:
+    """A sitemap ``lastmod``, as the page's source time and as its discovery marker.
+
+    W3C Datetime lets ``lastmod`` name only a date, or a time without an
+    offset, which places it nowhere exact on the timeline. MkDocs, for
+    example, stamps every page with the build date: ``2026-03-01``.
+
+    - ``source_time`` reads it as UTC: ``2026-03-01T00:00:00+00:00``.
+    - ``discovery_marker``, compared with ``since``, is the latest instant it
+      can name in any timezone, its end at UTC-12: ``2026-03-02T11:59:59.999999+00:00``.
+      Read as midnight UTC, a page rebuilt at 14:00 UTC after a 09:30 run
+      would compare earlier than the next ``since`` and be hidden.
+
+    A ``lastmod`` with an offset is one instant, and both are that instant.
+    """
+
+    source_time: datetime
+    discovery_marker: datetime
+
+
+def _lastmod_for_url(sitemap_xml: bytes, url: str) -> _Lastmod | None:
     try:
         root = ET.fromstring(sitemap_xml)
     except ET.ParseError:
@@ -989,8 +1011,27 @@ def _lastmod_for_url(sitemap_xml: bytes, url: str) -> datetime | None:
         lastmod_node = node.find(f"{namespace}lastmod")
         if lastmod_node is None or not lastmod_node.text:
             return None
-        return _parse_datetime(lastmod_node.text.strip())
+        return _parse_lastmod(lastmod_node.text.strip())
     return None
+
+
+def _parse_lastmod(value: str) -> _Lastmod | None:
+    """A sitemap ``lastmod`` (see :class:`_Lastmod`), or ``None`` when it is not an ISO 8601 date or time."""
+    source_time = _parse_datetime(value)
+    if source_time is None:
+        return None
+    try:
+        day = date.fromisoformat(value)
+    except ValueError:
+        day = None
+    if day is not None:
+        next_day_at_westernmost = datetime(day.year, day.month, day.day, tzinfo=_WESTERNMOST_ZONE) + timedelta(days=1)
+        marker = next_day_at_westernmost - timedelta(microseconds=1)
+    elif datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is None:
+        marker = source_time.replace(tzinfo=_WESTERNMOST_ZONE)
+    else:
+        marker = source_time
+    return _Lastmod(source_time=source_time, discovery_marker=marker.astimezone(timezone.utc))
 
 
 def _parse_datetime(value: str) -> datetime | None:
@@ -1085,11 +1126,17 @@ def _is_github_login_response(response: httpx.Response) -> bool:
 
 
 def _is_modified_since(last_modified: datetime, since: datetime | None) -> bool:
+    """Whether a page whose discovery marker is ``last_modified`` changed at or after ``since``.
+
+    A page's times have whole seconds (HTTP ``Last-Modified``, commit times,
+    most sitemaps), so ``since`` is compared at whole seconds too: a page
+    stamped 09:30:10 is yielded for ``since`` 09:30:10.5.
+    """
     if since is None:
         return True
     candidate = last_modified if last_modified.tzinfo else last_modified.replace(tzinfo=timezone.utc)
     baseline = since if since.tzinfo else since.replace(tzinfo=timezone.utc)
-    return candidate > baseline
+    return candidate >= baseline.replace(microsecond=0)
 
 
 def _extract_article_html(html: str) -> str:
