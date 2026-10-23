@@ -1685,6 +1685,38 @@ class AddAliasRequest(BaseModel):
     alias: str
 
 
+class MergedEntitiesResponse(BaseModel):
+    """The two Entities a merge joined: the source is gone, the target holds its references."""
+
+    source_id: int
+    source_name: str
+    target_id: int
+    target_name: str
+
+
+class EntityMergeResponse(BaseModel):
+    ok: bool
+    merged: MergedEntitiesResponse
+
+
+class EntityAliasListResponse(BaseModel):
+    data: list[EntityAliasResponse]
+
+
+class EntityAliasAddedResponse(BaseModel):
+    """The manual alias as given and the normalised form that matching reads."""
+
+    ok: bool
+    alias: str
+    alias_normalized: str
+
+
+class OkResponse(BaseModel):
+    """A change that reports only that it was made."""
+
+    ok: bool
+
+
 # -- Sources / Genes --
 
 
@@ -1977,6 +2009,16 @@ class SourceSyncStatusResponse(BaseModel):
 
 
 class SourceAccessTransitionResponse(BaseModel):
+    """One durable change of a Source's access policy across its whole history.
+
+    The operation is ``queued`` until its worker starts, ``running`` while it
+    re-projects the Source's Memories, and ends ``completed``. A ``failed``
+    operation leaves the Source paused until its owner retries it or reverts
+    it to ``previous_policy``, which ends it ``reverted``.
+    ``processed_memories`` counts the Memories re-projected so far, out of
+    ``total_memories``.
+    """
+
     operation_id: str
     source_id: str
     previous_policy: SourceAccessPolicyValue
@@ -2179,6 +2221,57 @@ class LocalCollectionReceiptResponse(BaseModel):
     job_id: str
     status: Literal["queued"]
     coalesced: bool
+
+
+class SourceSyncRunStateResponse(BaseModel):
+    """Where one admitted sync run stands, read without advancing it."""
+
+    run_id: str
+    status: SourceSyncRunStatus
+
+
+class SourceCreatedResponse(BaseModel):
+    id: str
+    name: str
+    type: str
+    access_policy: SourceAccessPolicyValue
+
+
+class SourceUpdatedResponse(BaseModel):
+    ok: bool
+    id: str
+
+
+class SourcePinResponse(BaseModel):
+    """Whether the Source is now pinned in the caller's Source List."""
+
+    source_id: str
+    pinned: bool
+
+
+class SourceSubscriptionChangeResponse(BaseModel):
+    """The caller's subscription to the Source after the change."""
+
+    ok: bool
+    source_id: str
+    subscription: SourceSubscriptionResponse
+
+
+class SourceCurrentAccessTransitionResponse(BaseModel):
+    """The Source's unfinished access operation, or ``null`` when there is none."""
+
+    transition: SourceAccessTransitionResponse | None
+
+
+class SourceAccessTransitionOperationResponse(BaseModel):
+    transition: SourceAccessTransitionResponse
+
+
+class SourceAccessTransitionQueuedResponse(BaseModel):
+    """A retry or revert admitted for the operation's worker."""
+
+    operation_id: str
+    status: Literal["queued"]
 
 
 class SourceProjectResponse(BaseModel):
@@ -3244,6 +3337,41 @@ async def _require_complete_collection(intake: CollectionIntake, source_id: str,
         raise HTTPException(status_code=409, detail="conversation_manifest_required") from exc
     if missing:
         raise HTTPException(status_code=409, detail="conversation_bodies_incomplete")
+
+
+class AgentSessionOutcomeCountsResponse(BaseModel):
+    """How many processed windows kept a knowledge patch, kept nothing, or failed."""
+
+    knowledge_patched: int
+    no_output: int
+    failed: int
+
+
+class AgentSessionLatestFailureResponse(BaseModel):
+    """The failed windows, with the reason and time of the latest one."""
+
+    count: int
+    reason: str | None
+    last_seen_at: str | None
+
+
+class AgentSessionCompletenessResponse(BaseModel):
+    """Knowledge completeness of agent-session windows, computed on demand.
+
+    ``processed_total`` counts the windows that were processed, patched or
+    not, and ``no_output_fraction`` is the share of them that kept nothing
+    (0 when none was processed). ``total`` also counts failed windows.
+    ``latest_failure`` is ``null`` when no window failed. ``session_id`` and
+    ``source_id`` echo the filters the request named.
+    """
+
+    session_id: str | None
+    source_id: str | None
+    total: int
+    processed_total: int
+    counts: AgentSessionOutcomeCountsResponse
+    no_output_fraction: float
+    latest_failure: AgentSessionLatestFailureResponse | None
 
 
 class AgentSessionWindowRequest(BaseModel):
@@ -6669,7 +6797,7 @@ def create_admin_app(
             can_curate=can_manage_workspace(resolve_request_workspace_role(request)),
         )
 
-    @entity_router.post("/merge")
+    @entity_router.post("/merge", response_model=EntityMergeResponse)
     async def merge_entities(
         req: MergeEntitiesRequest,
         request: Request,
@@ -6706,7 +6834,7 @@ def create_admin_app(
             "merged": merged,
         }
 
-    @entity_router.get("/{entity_id}/aliases")
+    @entity_router.get("/{entity_id}/aliases", response_model=EntityAliasListResponse)
     async def list_entity_aliases(
         entity_id: int,
         request: Request,
@@ -6716,19 +6844,19 @@ def create_admin_app(
         await _require_visible_entity(request, db, entity_id)
 
         aliases = await db.get_aliases_for_entity(entity_id)
-        return {
-            "data": [
+        return EntityAliasListResponse(
+            data=[
                 EntityAliasResponse(
                     alias=a.alias,
                     alias_normalized=a.alias_normalized,
                     source=a.source,
                     created_at=_dt_iso(a.created_at),
-                ).model_dump()
+                )
                 for a in aliases
             ]
-        }
+        )
 
-    @entity_router.post("/{entity_id}/aliases")
+    @entity_router.post("/{entity_id}/aliases", response_model=EntityAliasAddedResponse)
     async def add_entity_alias(
         entity_id: int,
         req: AddAliasRequest,
@@ -6748,7 +6876,7 @@ def create_admin_app(
         )
         return {"ok": True, "alias": req.alias, "alias_normalized": normalized}
 
-    @entity_router.delete("/{entity_id}/aliases/{alias}")
+    @entity_router.delete("/{entity_id}/aliases/{alias}", response_model=OkResponse)
     async def remove_entity_alias(
         entity_id: int,
         alias: str,
@@ -8167,7 +8295,7 @@ def create_admin_app(
         projects = [ResolvedProjectResponse(project_key=key, memory_count=count) for key, count in rows]
         return ResolvedProjectsResponse(source_id=source_id, projects=projects)
 
-    @source_router.put("/{source_id}/subscription")
+    @source_router.put("/{source_id}/subscription", response_model=SourceSubscriptionChangeResponse)
     async def set_source_subscription(
         request: Request,
         source_id: str,
@@ -8190,7 +8318,7 @@ def create_admin_app(
             "subscription": {"enabled": req.enabled},
         }
 
-    @source_router.put("/{source_id}/pin")
+    @source_router.put("/{source_id}/pin", response_model=SourcePinResponse)
     async def pin_source_for_viewer(
         request: Request,
         source_id: str,
@@ -8208,7 +8336,7 @@ def create_admin_app(
         )
         return {"source_id": source_id, "pinned": True}
 
-    @source_router.delete("/{source_id}/pin")
+    @source_router.delete("/{source_id}/pin", response_model=SourcePinResponse)
     async def unpin_source_for_viewer(
         request: Request,
         source_id: str,
@@ -8238,7 +8366,11 @@ def create_admin_app(
             sync_service=sync_service,
         )
 
-    @source_router.post("/{source_id}/access-transitions", status_code=202)
+    @source_router.post(
+        "/{source_id}/access-transitions",
+        status_code=202,
+        response_model=SourceAccessTransitionResponse,
+    )
     async def start_source_access_transition(
         request: Request,
         source_id: str,
@@ -8279,7 +8411,7 @@ def create_admin_app(
         )
         return transition
 
-    @source_router.get("/{source_id}/access-transition")
+    @source_router.get("/{source_id}/access-transition", response_model=SourceCurrentAccessTransitionResponse)
     async def get_source_access_transition(
         request: Request,
         source_id: str,
@@ -8292,7 +8424,10 @@ def create_admin_app(
         _require_source_discoverability(request, source)
         return {"transition": await db.get_active_source_access_transition(source_id)}
 
-    @source_router.get("/{source_id}/access-transitions/{operation_id}")
+    @source_router.get(
+        "/{source_id}/access-transitions/{operation_id}",
+        response_model=SourceAccessTransitionOperationResponse,
+    )
     async def get_source_access_transition_operation(
         request: Request,
         source_id: str,
@@ -8309,7 +8444,10 @@ def create_admin_app(
             raise HTTPException(status_code=404, detail="Access transition not found")
         return {"transition": transition}
 
-    @source_router.post("/{source_id}/access-transitions/{operation_id}/retry")
+    @source_router.post(
+        "/{source_id}/access-transitions/{operation_id}/retry",
+        response_model=SourceAccessTransitionQueuedResponse,
+    )
     async def retry_source_access_transition(
         request: Request,
         source_id: str,
@@ -8348,7 +8486,10 @@ def create_admin_app(
         )
         return {"operation_id": operation_id, "status": "queued"}
 
-    @source_router.post("/{source_id}/access-transitions/{operation_id}/revert")
+    @source_router.post(
+        "/{source_id}/access-transitions/{operation_id}/revert",
+        response_model=SourceAccessTransitionQueuedResponse,
+    )
     async def revert_source_access_transition(
         request: Request,
         source_id: str,
@@ -8500,7 +8641,7 @@ def create_admin_app(
             result["total_memories"] = len(recent_memories)
         return result
 
-    @source_router.post("")
+    @source_router.post("", response_model=SourceCreatedResponse)
     async def create_source(
         request: Request,
         req: CreateSourceRequest,
@@ -8590,7 +8731,7 @@ def create_admin_app(
             return {"outcome": "refused", "open_transition": open_transition, "refusal": _scope_change_refusal(exc.detail)}
         return {"outcome": _scope_change_outcome(change), "open_transition": open_transition}
 
-    @source_router.put("/{source_id}")
+    @source_router.put("/{source_id}", response_model=SourceUpdatedResponse)
     async def update_source(
         request: Request,
         source_id: str,
@@ -8805,7 +8946,7 @@ def create_admin_app(
             "coalesced": not created,
         }
 
-    @source_router.get("/{source_id}/sync-runs/{run_id}")
+    @source_router.get("/{source_id}/sync-runs/{run_id}", response_model=SourceSyncRunStateResponse)
     async def read_source_sync_run(
         request: Request,
         source_id: str,
@@ -8998,7 +9139,11 @@ def create_admin_app(
             "coalesced": run.coalesced,
         }
 
-    @source_router.post("/{source_id}/force-resync", status_code=202)
+    @source_router.post(
+        "/{source_id}/force-resync",
+        status_code=202,
+        response_model=SourceSyncRunReceiptResponse | LocalCollectionReceiptResponse,
+    )
     async def trigger_force_resync(
         request: Request,
         source_id: str,
@@ -9754,7 +9899,7 @@ def create_admin_app(
     # 4b. Agent Session Windows
     # ===================================================================
 
-    @agent_session_router.get("/completeness")
+    @agent_session_router.get("/completeness", response_model=AgentSessionCompletenessResponse)
     async def agent_session_completeness(
         session_id: str | None = None,
         source_id: str | None = None,
