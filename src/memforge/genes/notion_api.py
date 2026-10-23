@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -229,10 +230,11 @@ class NotionApi:
             response.raise_for_status()
             return _cursor_page(_json_object(response, f"children of block {block_id}"), f"children of block {block_id}")
 
-        async for block in paged_by_cursor(fetch, errors=_paging_errors(f"children of block {block_id}")):
-            if block.get("object") != "block" or notion_id(block.get("id")) is None or not block.get("type"):
-                raise RuntimeError(f"Notion listed a child of block {block_id} that is not a block")
-            yield block
+        async with aclosing(paged_by_cursor(fetch, errors=_paging_errors(f"children of block {block_id}"))) as blocks:
+            async for block in blocks:
+                if block.get("object") != "block" or notion_id(block.get("id")) is None or not block.get("type"):
+                    raise RuntimeError(f"Notion listed a child of block {block_id} that is not a block")
+                yield block
 
     async def page_markdown(self, block_id: str) -> NotionMarkdown | None:
         """The enhanced Markdown of a page, or of one block read again, or ``None`` when Notion answers 404.
@@ -277,10 +279,11 @@ class NotionApi:
             response.raise_for_status()
             return _cursor_page(_json_object(response, what), what)
 
-        async for item in paged_by_cursor(fetch, errors=_paging_errors(what)):
-            if item.get("object") != "property_item" or not item.get("type"):
-                raise RuntimeError(f"Notion listed an item of {what} that is not a property item")
-            yield item
+        async with aclosing(paged_by_cursor(fetch, errors=_paging_errors(what))) as items:
+            async for item in items:
+                if item.get("object") != "property_item" or not item.get("type"):
+                    raise RuntimeError(f"Notion listed an item of {what} that is not a property item")
+                yield item
 
     async def query_data_source(self, data_source_id: str) -> AsyncIterator[dict[str, Any]]:
         """Every result of a data source, past Notion's 10,000-result cap, each yielded once.
@@ -340,23 +343,25 @@ class NotionApi:
                     cut_at_cap = True
                 return _cursor_page(data, f"query of data source {data_source_id}")
 
-            async for result in paged_by_cursor(fetch, errors=_paging_errors(f"query of data source {data_source_id}")):
-                result_id = notion_id(result.get("id"))
-                if result.get("object") not in {"page", "data_source"} or result_id is None:
-                    raise RuntimeError(
-                        f"Notion's query of data source {data_source_id} returned a result that is "
-                        "neither a page nor a data source"
-                    )
-                if result_id in seen_in_window:
-                    raise RuntimeError(f"Notion's query of data source {data_source_id} returned {result_id} twice")
-                seen_in_window.add(result_id)
-                created = notion_time(result.get("created_time"), f"result {result_id}")
-                if last_created is not None and created < last_created:
-                    raise RuntimeError(f"Notion's query of data source {data_source_id} is not in created_time order")
-                last_created = created
-                if result_id not in listed:
-                    listed.add(result_id)
-                    yield result
+            results = paged_by_cursor(fetch, errors=_paging_errors(f"query of data source {data_source_id}"))
+            async with aclosing(results):
+                async for result in results:
+                    result_id = notion_id(result.get("id"))
+                    if result.get("object") not in {"page", "data_source"} or result_id is None:
+                        raise RuntimeError(
+                            f"Notion's query of data source {data_source_id} returned a result that is "
+                            "neither a page nor a data source"
+                        )
+                    if result_id in seen_in_window:
+                        raise RuntimeError(f"Notion's query of data source {data_source_id} returned {result_id} twice")
+                    seen_in_window.add(result_id)
+                    created = notion_time(result.get("created_time"), f"result {result_id}")
+                    if last_created is not None and created < last_created:
+                        raise RuntimeError(f"Notion's query of data source {data_source_id} is not in created_time order")
+                    last_created = created
+                    if result_id not in listed:
+                        listed.add(result_id)
+                        yield result
 
             if not cut_at_cap:
                 return

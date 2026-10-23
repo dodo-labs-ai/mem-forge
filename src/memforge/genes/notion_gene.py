@@ -319,8 +319,9 @@ class NotionGene(DocumentGene):
         edited at 09:30 is yielded. The completed walk is recorded as the
         run's listing; a preview stops after its limit and records nothing.
         """
-        async for item in self._walk_scope(since):
-            yield item
+        async with aclosing(self._walk_scope(since)) as items:
+            async for item in items:
+                yield item
         if self._preview_discovery_limit() is None:
             self._record_walked_pages()
 
