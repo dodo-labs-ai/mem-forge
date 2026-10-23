@@ -35,6 +35,7 @@ from memforge.genes.local_adapter_packages import (
 )
 from memforge.genes.toolkit.config import bearer_headers, bool_config, require_https_base_url, tls_verify
 from memforge.genes.toolkit.local_packages import device_packages
+from memforge.genes.toolkit.paging import OffsetPage, PagingErrors, paged_by_offset
 from memforge.local_agent.jira_contract import validate_jira_observation_identities
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, source_time_iso
 from memforge.models import (
@@ -94,6 +95,13 @@ _LISTING_ORDER_BY = "ORDER BY key ASC"
 _ORDER_BY_RE = re.compile(r"\border\s+by\b", re.IGNORECASE)
 # An issue id (digits) or an issue key (project key, hyphen, number).
 _ISSUE_REF_RE = re.compile(r"\d+|[A-Z][A-Z0-9_]*-\d+")
+_SEARCH_PAGING_ERRORS = PagingErrors(
+    start_mismatch="Jira search response startAt does not match the requested page",
+    total_changed="Jira search total changed during pagination",
+    early_end="Jira search ended before the declared total was reached",
+    repeated_item="Jira search returned duplicate issue identity",
+    count_mismatch="Jira search unique issue count did not match total",
+)
 
 
 def _delta_clause(since: datetime) -> str:
@@ -195,6 +203,31 @@ def _issue_ref(item: ContentItem) -> str:
     """The stored issue's stable id, or its key when the stored item does not record the id."""
     ref = str(item.extra.get("issue_id") or item.extra.get("issue_key") or "").strip()
     return ref or item.item_id.removeprefix(_ISSUE_DOC_ID_PREFIX)
+
+
+def _search_page(data: object) -> OffsetPage[dict]:
+    """One search response as a page of issues, or raise when it is not a search result."""
+    if not isinstance(data, dict) or "issues" not in data or not isinstance(data.get("issues"), list):
+        raise RuntimeError("Jira search response is missing an issues list")
+    issues = data["issues"]
+    if any(not isinstance(issue, dict) for issue in issues):
+        raise RuntimeError("Jira search response contains an invalid issue record")
+    total = data.get("total")
+    if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+        raise RuntimeError("Jira search response is missing a valid total")
+    for issue in issues:
+        if (
+            not str(issue.get("id") or "").strip().isdigit()
+            or not str(issue.get("key") or "").strip()
+            or not isinstance(issue.get("fields"), dict)
+        ):
+            raise RuntimeError("Jira search issue is missing a stable id, key, or fields")
+    return OffsetPage(start=data.get("startAt"), items=issues, total=total)
+
+
+def _search_issue_identities(issue: dict) -> tuple[tuple[str, str], tuple[str, str]]:
+    """A searched issue's id and its key, neither of which may repeat within one search."""
+    return ("id", str(issue["id"]).strip()), ("key", str(issue["key"]).strip())
 
 
 def _read_by_local_agent(config: Mapping[str, Any]) -> bool:
@@ -707,30 +740,25 @@ class JiraGene(DocumentGene):
     ) -> AsyncIterator[dict]:
         """Page one JQL search to its declared total, yielding each issue once, or raise.
 
-        A JQL Jira refuses (HTTP 400) raises :class:`JiraQueryRejected`.
+        Each page is asked for at the offset the previous one ended, since
+        Jira may return fewer than ``max_results`` issues. The total must stay
+        the same on every page, and no issue id or key may repeat. A JQL Jira
+        refuses (HTTP 400) raises :class:`JiraQueryRejected`.
         """
-        seen_issue_ids: set[str] = set()
-        seen_issue_keys: set[str] = set()
-        expected_total: int | None = None
-        start_at = 0
 
-        while True:
+        async def fetch(start_at: int) -> OffsetPage[dict]:
+            request_body: dict[str, Any] = {
+                "jql": jql,
+                "startAt": start_at,
+                "maxResults": max_results,
+                "fields": fields,
+            }
+            if expand:
+                request_body["expand"] = expand
+            if not validate_query:
+                request_body["validateQuery"] = False
             try:
-                request_body: dict[str, Any] = {
-                    "jql": jql,
-                    "startAt": start_at,
-                    "maxResults": max_results,
-                    "fields": fields,
-                }
-                if expand:
-                    request_body["expand"] = expand
-                if not validate_query:
-                    request_body["validateQuery"] = False
-                resp = await self._request(
-                    "POST",
-                    "/rest/api/2/search",
-                    json_body=request_body,
-                )
+                resp = await self._request("POST", "/rest/api/2/search", json_body=request_body)
                 data = resp.json()
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 400:
@@ -740,45 +768,10 @@ class JiraGene(DocumentGene):
             except Exception as e:
                 logger.error("Jira search failed: %s", e)
                 raise RuntimeError(f"Jira search failed: {e}") from e
+            return _search_page(data)
 
-            if not isinstance(data, dict) or "issues" not in data or not isinstance(data.get("issues"), list):
-                raise RuntimeError("Jira search response is missing an issues list")
-            issues = data["issues"]
-            if any(not isinstance(issue, dict) for issue in issues):
-                raise RuntimeError("Jira search response contains an invalid issue record")
-            total = data.get("total")
-            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
-                raise RuntimeError("Jira search response is missing a valid total")
-            if expected_total is None:
-                expected_total = total
-            elif total != expected_total:
-                raise RuntimeError("Jira search total changed during pagination")
-            response_start = data.get("startAt")
-            if not isinstance(response_start, int) or isinstance(response_start, bool) or response_start != start_at:
-                raise RuntimeError("Jira search response startAt does not match the requested page")
-            if not issues:
-                if start_at < total:
-                    raise RuntimeError("Jira search ended before the declared total was reached")
-                break
-
-            for issue in issues:
-                issue_id = str(issue.get("id") or "").strip()
-                key = str(issue.get("key") or "").strip()
-                issue_fields = issue.get("fields")
-                if not issue_id.isdigit() or not key or not isinstance(issue_fields, dict):
-                    raise RuntimeError("Jira search issue is missing a stable id, key, or fields")
-                if issue_id in seen_issue_ids or key in seen_issue_keys:
-                    raise RuntimeError("Jira search returned duplicate issue identity")
-                seen_issue_ids.add(issue_id)
-                seen_issue_keys.add(key)
-                yield issue
-
-            # Pagination
-            if start_at + len(issues) >= total:
-                break
-            start_at += len(issues)
-        if len(seen_issue_ids) != (expected_total or 0):
-            raise RuntimeError("Jira search unique issue count did not match total")
+        async for issue in paged_by_offset(fetch, item_ids=_search_issue_identities, errors=_SEARCH_PAGING_ERRORS):
+            yield issue
 
     async def _request(
         self,
