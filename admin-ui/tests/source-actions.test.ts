@@ -311,10 +311,10 @@ assert.match(
   /aria-label=\{`Configure \$\{source\.name\}`\}/,
   "Configure should keep a source-specific accessible label when its text is hidden",
 );
-assert.match(
+assert.doesNotMatch(
   sourceRowSource,
-  /onRetry=\{isPaused \|\| !capabilities\.can_sync \? undefined : onSync\}/,
-  "Paused sources and non-owners should not expose retry sync from the status bar",
+  /<SourceSyncStatusCard(?:(?!\/>)[\s\S])*onRetry/,
+  "The row's primary button retries; the status bar should not offer a second retry",
 );
 assert.doesNotMatch(
   sourceRowSource,
