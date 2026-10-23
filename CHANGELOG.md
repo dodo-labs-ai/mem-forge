@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A Notion document Source: the server collects every page under configured
+  root pages and databases, database rows included, with an internal
+  connection token. Each page is a `notion_page` Unit with a `page_body`
+  Observation, a row also has a `properties` Observation, and each image or
+  PDF Notion hosts is stored as an artifact. A pasted page or database link
+  is saved as its ID.
+
 - A local-agent Jira collection reads each listed issue with a one-issue
   search in the Source's scope, `issuekey = <id> AND (<scope>)`, and, when
   its comments are read apart, confirms its revision with another such
