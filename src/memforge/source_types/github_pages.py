@@ -39,10 +39,10 @@ def _complete_config(config: dict[str, Any], source_id: str, existing_config: Ma
 def _validate_config(config: dict[str, Any], existing_config: Mapping[str, Any]) -> None:
     """Every scope URL of the configured mode stays on the site the Source reads."""
 
-    from memforge.genes.github_pages_gene import _sync_mode, scope_urls_for_config
+    from memforge.genes.github_pages_gene import scope_urls_for_config, sync_mode_for_config
 
     base_url = str(config.get("base_url") or "").strip()
-    key, label = _SCOPE_URL_FIELDS[_sync_mode(config)]
+    key, label = _SCOPE_URL_FIELDS[sync_mode_for_config(config)]
     for url in scope_urls_for_config(config):
         _validate_scope_url(base_url, url, key, label)
 

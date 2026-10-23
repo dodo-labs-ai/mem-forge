@@ -540,7 +540,7 @@ def test_a_panel_condition_on_a_later_group_is_refused() -> None:
 MODE_READERS = {
     ("confluence", "sync_mode"): lambda config: canonical_projection_scope("confluence", config)["sync_mode"],
     ("github_pages", "auth_mode"): github_pages_gene._auth_mode,
-    ("github_pages", "sync_mode"): github_pages_gene._sync_mode,
+    ("github_pages", "sync_mode"): github_pages_gene.sync_mode_for_config,
     ("github_repo", "connection_mode"): github_repo_gene._connection_mode,
     ("jira", "auth_mode"): jira_gene._auth_mode,
     ("jira", "query_mode"): lambda config: canonical_projection_scope("jira", config)["query_mode"],
