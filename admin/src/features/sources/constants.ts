@@ -1,8 +1,8 @@
 /**
- * The V1 Sources page, where setup, configuration and sign-in still happen
- * until this app has its own dialogs for them.
+ * The V1 Sources page, where signing in to a source other than a Jira
+ * browser session still happens until this app has its own sign-in panels.
  *
- * @deprecated admin-ui-v1: V2's own source setup dialogs replace this link.
+ * @deprecated admin-ui-v1: V2's own sign-in panels replace this link.
  */
 export const V1_SOURCES_PATH = "/sources";
 

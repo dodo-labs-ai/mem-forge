@@ -1,5 +1,6 @@
 import { Files, Plus } from "lucide-react";
 import { useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { useProjects, useSharedWorkspace } from "@/api";
 import { localSyncState, useLocalSyncStatus } from "@/features/local-sync";
 import { pluralize } from "@/lib/format";
@@ -17,6 +18,7 @@ import {
 import { Button } from "@/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/ui/select";
 import { errorMessage } from "@/lib/errors";
+import { newSourcePath } from "@/lib/paths";
 import {
   useDeleteSource,
   useLocalSyncJobs,
@@ -26,7 +28,6 @@ import {
   useSources,
   useSourceTypeLabels,
 } from "./api";
-import { V1_SOURCES_PATH } from "./constants";
 import type { SourceListSortMode } from "./model/sourceListOrganization";
 import type { LocalDaemonReadiness } from "./model/sourceReadiness";
 import {
@@ -125,7 +126,7 @@ export function SourcesPage() {
         title="Sources"
         description="Sources are the places MemForge reads from, such as wikis, issue trackers, repositories and coding-agent sessions. Each sync turns new and changed content into memories your agents can search."
         actions={
-          <Button nativeButton={false} render={<a href={V1_SOURCES_PATH} />}>
+          <Button nativeButton={false} render={<Link to={newSourcePath()} />}>
             <Plus />
             Add source
           </Button>
@@ -175,7 +176,7 @@ export function SourcesPage() {
           icon={Files}
           title="No sources yet"
           description="Add a wiki, issue tracker, repository or folder, and MemForge will turn its content into memories."
-          action={<Button nativeButton={false} render={<a href={V1_SOURCES_PATH} />}>Add source</Button>}
+          action={<Button nativeButton={false} render={<Link to={newSourcePath()} />}>Add source</Button>}
         />
       ) : (
         <div ref={tableRef} className="scroll-mt-6 space-y-3">

@@ -29,6 +29,19 @@
   with `SourceConfigInvalid` and `FieldIssue`
   (`memforge.genes.toolkit.config`); and `SourceConfigPolicy` gains `facts`.
 
+- The admin UI V2 adds and configures Sources on its own pages instead of
+  linking to V1. Add source opens a type picker (`/sources/new`) that
+  leaves out managed types and says where each type runs; each type's
+  setup page (`/sources/new/{type}`, `/sources/{id}/settings?step=…`) is
+  drawn from the server's form description, with steps for the name, the
+  type's groups, access, project (with inline project creation) and the
+  automatic sync schedule. It checks the form with config-check as fields
+  are left and before save, fills values the server derives without
+  overwriting what was typed, previews a scope change and sends the
+  change in progress it saw, offers to stop a running sync before saving,
+  and asks before leaving with unsaved changes. Configure, Choose a
+  project and Configure file scope open the matching step.
+
 - A local-agent Jira collection reads each listed issue with a one-issue
   search in the Source's scope, `issuekey = <id> AND (<scope>)`, and, when
   its comments are read apart, confirms its revision with another such
