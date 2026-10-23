@@ -162,7 +162,7 @@ test("Full sync asks first and names the model cost", async () => {
   const dialog = await screen.findByRole("dialog", { name: "Run a full sync of Payroll wiki?" });
   expect(dialog).toHaveTextContent("unchanged ones included");
   expect(dialog).toHaveTextContent("as many model calls as the source's first sync");
-  expect(dialog).toHaveTextContent("use Re-read all documents instead");
+  expect(dialog).toHaveTextContent("use Re-read all documents in the source's row menu instead");
   expect(calls.some((request) => request.method === "POST")).toBe(false);
 
   await userEvent.click(within(dialog).getByRole("button", { name: "Start full sync" }));

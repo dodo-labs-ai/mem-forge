@@ -15,7 +15,8 @@ interface FullSyncDialogProps {
  * a full sync lists the whole source again and processes every document,
  * unchanged ones included, so it repairs content a sync left stale at the
  * cost of a first sync's model calls. Re-reading all documents is the
- * cheaper way to apply an adapter or model change, and the dialog says so.
+ * cheaper way to apply an adapter or model change, and the dialog says so
+ * and where to find it, since the drawer's menu offers only Full sync.
  */
 export function FullSyncDialog({ source, onOpenChange }: FullSyncDialogProps) {
   const fullSync = useFullSync();
@@ -38,8 +39,8 @@ export function FullSyncDialog({ source, onOpenChange }: FullSyncDialogProps) {
             unchanged ones included. It takes as many model calls as the source's first sync.
           </span>
           <span className="mt-2 block">
-            To process documents again after an adapter or model change, use Re-read all documents instead. It counts
-            the model calls before it starts.
+            To process documents again after an adapter or model change, use Re-read all documents in the source's
+            row menu instead. It counts the model calls before it starts.
           </span>
         </>
       }
