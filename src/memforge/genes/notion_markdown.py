@@ -24,6 +24,16 @@ One rule per tag family:
   contents and custom blocks keep only their text, if any;
 - any other tag keeps its inner text.
 
+Notion writes one block per line, with no blank line between blocks, while
+CommonMark joins consecutive lines into one paragraph and lets a paragraph
+after a quote or list item continue it. So every block is followed by a
+blank line, except that the items of one list stay together::
+
+    notion_markdown("First\nSecond\n- one\n- two")
+    # "First\n\nSecond\n\n- one\n- two"
+
+A block equation, ``$$`` lines around its formula, is one block.
+
 Code, fenced or inline, is never changed. ``<unknown>`` tags are resolved
 before this runs (the Gene reads them again), so no rule turns one into a
 link.
@@ -39,6 +49,7 @@ __all__ = ["notion_markdown"]
 _CONTAINERS = ("callout", "details", "columns", "column", "synced_block", "synced_block_reference")
 _OPEN_CONTAINER = re.compile(r"^<(" + "|".join(_CONTAINERS) + r")\b([^>]*)>(.*)$")
 _FENCE = re.compile(r"^\s*(```+|~~~+)")
+_EQUATION = "$$"
 _LIST_ITEM = re.compile(r"^(?:[-*+]|\d+[.)])(?:\s|$)")
 _ATTRIBUTE = re.compile(r'([\w-]+)="([^"]*)"')
 _BLOCK_ATTRIBUTES = re.compile(r'\s*\{(?:[\w-]+="[^"]*"\s*)+\}\s*$')
@@ -69,16 +80,28 @@ def notion_markdown(text: str) -> str:
 
 
 def _convert_blocks(lines: list[str]) -> list[str]:
-    """Convert container blocks and tables line by line, and every other line inline."""
+    """Convert container blocks and tables line by line and every other line inline, one blank line between blocks.
+
+    Items of one list are not separated, so the list stays tight.
+    """
     output: list[str] = []
+    previous_was_list_item: bool | None = None  # None before the first block
+
+    def start_block(is_list_item: bool) -> None:
+        nonlocal previous_was_list_item
+        if previous_was_list_item is not None and not (previous_was_list_item and is_list_item):
+            output.append("")
+        previous_was_list_item = is_list_item
+
     index = 0
     while index < len(lines):
         line = lines[index]
         indent = len(line) - len(line.lstrip("\t"))
         body = line[indent:]
         fence = _FENCE.match(body)
-        if fence:
-            end = _fence_end(lines, index, fence.group(1))
+        if fence or body.strip() == _EQUATION:
+            end = _fence_end(lines, index, fence.group(1) if fence else _EQUATION)
+            start_block(False)
             output.extend(lines[index : end + 1])
             index = end + 1
             continue
@@ -86,15 +109,22 @@ def _convert_blocks(lines: list[str]) -> list[str]:
         if container:
             end, inner = _container(lines, index, indent, container)
             rendered = _render_container(container.group(1), container.group(2), inner)
+            start_block(False)
             output.extend("\t" * indent + rendered_line if rendered_line else "" for rendered_line in rendered)
             index = end + 1
             continue
         if re.match(r"<table\b", body):
             end = next((at for at in range(index, len(lines)) if "</table>" in lines[at]), len(lines) - 1)
+            start_block(False)
             output.extend("\t" * indent + row for row in _table("\n".join(lines[index : end + 1])))
             index = end + 1
             continue
-        output.append(_inline(line))
+        converted = _inline(line)
+        if converted.strip():
+            start_block(_LIST_ITEM.match(body) is not None)
+            output.append(converted)
+        else:
+            output.append("")  # an empty block, or a tag that keeps no text
         index += 1
     return _children_indented_as_commonmark(output)
 

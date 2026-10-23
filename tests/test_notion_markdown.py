@@ -5,10 +5,26 @@ from __future__ import annotations
 from memforge.genes.notion_markdown import notion_markdown
 
 
+def test_blocks_are_separated_so_commonmark_never_joins_them() -> None:
+    text = (
+        "First paragraph\nSecond paragraph\n- one\n\t- nested\n- two\nAfter the list\n"
+        '<callout icon="💡">\n\tA callout\n</callout>\nAfter the callout\n> Quote one\n> Quote two'
+    )
+
+    assert notion_markdown(text) == (
+        "First paragraph\n\nSecond paragraph\n\n- one\n\t- nested\n- two\n\nAfter the list\n\n"
+        "> 💡 A callout\n\nAfter the callout\n\n> Quote one\n\n> Quote two"
+    )
+
+
+def test_a_block_equation_stays_one_block() -> None:
+    assert notion_markdown("Before\n$$\nE = mc^2\n$$\nAfter") == "Before\n\n$$\nE = mc^2\n$$\n\nAfter"
+
+
 def test_callouts_become_commonmark() -> None:
     text = '<callout icon="💡" color="gray_bg">\n\tShip on Friday\n\t- check the build\n\t\t- twice\n</callout>'
 
-    assert notion_markdown(text) == "> 💡 Ship on Friday\n> - check the build\n> \t- twice"
+    assert notion_markdown(text) == "> 💡 Ship on Friday\n>\n> - check the build\n> \t- twice"
 
 
 def test_a_callout_with_an_image_icon_keeps_only_its_text() -> None:
@@ -21,7 +37,7 @@ def test_toggles_become_commonmark() -> None:
         '\t<callout icon="⚠️">\n\t\tNever on Friday\n\t</callout>\n</details>\nAfter'
     )
 
-    assert notion_markdown(text) == "**Release steps**\n\nTag the build\n> ⚠️ Never on Friday\n\nAfter"
+    assert notion_markdown(text) == "**Release steps**\n\nTag the build\n\n> ⚠️ Never on Friday\n\nAfter"
 
 
 def test_a_toggle_inside_a_list_item_stays_in_the_item() -> None:
@@ -31,7 +47,7 @@ def test_a_toggle_inside_a_list_item_stays_in_the_item() -> None:
 
 
 def test_toggleable_headings_become_commonmark() -> None:
-    assert notion_markdown('## Setup {toggle="true" color="blue"}\n\tInstall it') == "## Setup\nInstall it"
+    assert notion_markdown('## Setup {toggle="true" color="blue"}\n\tInstall it') == "## Setup\n\nInstall it"
 
 
 def test_columns_become_commonmark() -> None:
@@ -72,7 +88,7 @@ def test_page_and_database_references_become_commonmark() -> None:
     )
 
     assert notion_markdown(text) == (
-        "[Roadmap](https://app.notion.com/p/abc)\n[https://app.notion.com/p/def](https://app.notion.com/p/def)"
+        "[Roadmap](https://app.notion.com/p/abc)\n\n[https://app.notion.com/p/def](https://app.notion.com/p/def)"
     )
 
 
@@ -101,8 +117,8 @@ def test_media_become_commonmark() -> None:
     )
 
     assert notion_markdown(text) == (
-        "![Diagram](notion-file:a/b/diagram.png)\n[Q3 plan](notion-file:a/c/plan.pdf)\n"
-        "[notion-file:a/d/spec.pdf](notion-file:a/d/spec.pdf)\n[Demo](https://youtube.com/x)\n"
+        "![Diagram](notion-file:a/b/diagram.png)\n\n[Q3 plan](notion-file:a/c/plan.pdf)\n\n"
+        "[notion-file:a/d/spec.pdf](notion-file:a/d/spec.pdf)\n\n[Demo](https://youtube.com/x)\n\n"
         "[https://figma.com/f](https://figma.com/f)"
     )
 
@@ -114,7 +130,7 @@ def test_color_and_style_attributes_become_commonmark() -> None:
         '> Line 1<br>Line 2 {color="gray"}'
     )
 
-    assert notion_markdown(text) == "Plain\ncolored and underlined\n> Line 1\\\n> Line 2"
+    assert notion_markdown(text) == "Plain\n\ncolored and underlined\n\n> Line 1\\\n> Line 2"
 
 
 def test_empty_blocks_and_tables_of_contents_become_commonmark() -> None:
@@ -126,13 +142,15 @@ def test_empty_blocks_and_tables_of_contents_become_commonmark() -> None:
 def test_children_of_a_paragraph_or_heading_never_become_code() -> None:
     text = "# Title\n\tChild\n\t\tGrandchild\nParagraph\n\t```\n\tcode\n\t\tindented\n\t```\n- a\n\t- b"
 
-    assert notion_markdown(text) == "# Title\nChild\nGrandchild\nParagraph\n```\ncode\n\tindented\n```\n- a\n\t- b"
+    assert notion_markdown(text) == (
+        "# Title\n\nChild\n\nGrandchild\n\nParagraph\n\n```\ncode\n\tindented\n```\n\n- a\n\t- b"
+    )
 
 
 def test_code_is_never_converted() -> None:
     text = '```html\n<callout>not a callout</callout>\n```\nInline `<page url="x">y</page>` code'
 
-    assert notion_markdown(text) == text
+    assert notion_markdown(text) == text.replace("```\nInline", "```\n\nInline")
 
 
 def test_autolinks_are_kept() -> None:
