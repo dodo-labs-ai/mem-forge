@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { appPath, appUrl } from "./support/appPath";
 
 const SOURCE = {
   id: "src-wiki",
@@ -36,9 +37,9 @@ test("the Sources page renders in the shell", async ({ page }) => {
     return body === undefined ? route.fulfill({ status: 404, json: { detail: "Not stubbed" } }) : route.fulfill({ json: body });
   });
 
-  await page.goto("/v2/");
+  await page.goto(appPath());
 
-  await expect(page).toHaveURL(/\/v2\/sources$/);
+  await expect(page).toHaveURL(appUrl("sources"));
   await expect(page.getByRole("heading", { name: "Sources" })).toBeVisible();
   await expect(page.getByRole("table", { name: "Sources" }).getByText("Payroll wiki")).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Main" }).getByRole("link", { name: "Sources" })).toHaveAttribute("aria-current", "page");
@@ -79,7 +80,7 @@ test("a source's scope change in progress shows in its drawer and restores the p
     return body === undefined ? route.fulfill({ status: 404, json: { detail: "Not stubbed" } }) : route.fulfill({ json: body });
   });
 
-  await page.goto("/v2/sources");
+  await page.goto(appPath("sources"));
   await page.getByRole("table", { name: "Sources" }).getByText("Payroll wiki").click();
   const drawer = page.getByRole("dialog", { name: "Payroll wiki" });
   await expect(drawer.getByRole("heading", { name: "Scope change in progress" })).toBeVisible();

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { appPath } from "./support/appPath";
 
 const SOURCE = {
   id: "src-jira",
@@ -52,7 +53,7 @@ async function stubApi(page: Page) {
 
 test("the Projects page lists projects with their sources and memories", async ({ page }) => {
   await stubApi(page);
-  await page.goto("/v2/projects");
+  await page.goto(appPath("projects"));
 
   await expect(page.getByRole("heading", { name: "Projects" })).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Main" }).getByRole("link", { name: "Projects" })).toHaveAttribute("aria-current", "page");
@@ -81,10 +82,10 @@ test("the Projects page lists projects with their sources and memories", async (
 
 test("a project's detail page shows its sources and links to its memories", async ({ page }) => {
   await stubApi(page);
-  await page.goto("/v2/projects/PAYROLL_V2");
+  await page.goto(appPath("projects/PAYROLL_V2"));
 
   await expect(page.getByRole("heading", { name: "payroll-v2" })).toBeVisible();
-  await expect(page.getByRole("link", { name: "View memories" })).toHaveAttribute("href", "/v2/memories?project=PAYROLL_V2");
+  await expect(page.getByRole("link", { name: "View memories" })).toHaveAttribute("href", appPath("memories?project=PAYROLL_V2"));
   const sources = page.getByRole("region", { name: "Sources sending memories here" });
   await expect(sources.getByText("PAYR board")).toBeVisible();
   await expect(sources.getByText("611 memories")).toBeVisible();

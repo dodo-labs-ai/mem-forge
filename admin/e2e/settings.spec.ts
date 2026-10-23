@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { appPath, appUrl } from "./support/appPath";
 
 const SETTINGS_ROUTE = "/api/v1/model-settings";
 
@@ -434,7 +435,7 @@ const mainNav = (page: Page) => page.getByRole("navigation", { name: "Main" });
 
 test("Settings saves and validates a model, and asks before leaving with unsaved changes", async ({ page }) => {
   const writes = await stubApi(page, settings());
-  await page.goto("/v2/settings");
+  await page.goto(appPath("settings"));
 
   await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
   await expect(mainNav(page).getByRole("link", { name: "Settings" })).toHaveAttribute("aria-current", "page");
@@ -449,7 +450,7 @@ test("Settings saves and validates a model, and asks before leaving with unsaved
   const dialog = page.getByRole("dialog", { name: "Leave without saving?" });
   await expect(dialog).toContainText("Your changes in Generation model are not saved.");
   await dialog.getByRole("button", { name: "Keep editing" }).click();
-  await expect(page).toHaveURL(/\/v2\/settings$/);
+  await expect(page).toHaveURL(appUrl("settings"));
 
   await generation.getByRole("button", { name: "Save and validate" }).click();
   await expect(generation.getByRole("group", { name: "In use" }).getByText(/^Passed validation/)).toBeVisible();
@@ -471,12 +472,12 @@ test("Settings saves and validates a model, and asks before leaving with unsaved
   ]);
 
   await mainNav(page).getByRole("link", { name: "Sources" }).click();
-  await expect(page).toHaveURL(/\/v2\/sources$/);
+  await expect(page).toHaveURL(appUrl("sources"));
 });
 
 test("a model that fails validation is not put to use, and the page says which model still is", async ({ page }) => {
   await stubApi(page, settings(), { errorCode: "authentication_failed" });
-  await page.goto("/v2/settings");
+  await page.goto(appPath("settings"));
 
   const generation = page.getByRole("region", { name: "Generation model" });
   await generation.getByRole("combobox", { name: "Provider" }).click();
@@ -504,7 +505,7 @@ test("a model that pairs a base URL with environment credentials is saved only o
   page,
 }) => {
   const writes = await stubApi(page, settings({ generation: { active: ENVIRONMENT_GENERATION, candidate: null } }));
-  await page.goto("/v2/settings");
+  await page.goto(appPath("settings"));
 
   const generation = page.getByRole("region", { name: "Generation model" });
   await expect(generation.getByRole("group", { name: "In use" })).toContainText("http://127.0.0.1:4000/v1");
@@ -581,7 +582,7 @@ test("Settings managed by the deployment is read-only", async ({ page }) => {
       vector_index: { ...NO_INDEX, status: "not_managed" },
     }),
   );
-  await page.goto("/v2/settings");
+  await page.goto(appPath("settings"));
 
   await expect(page.getByText("Managed by the deployment environment.")).toBeVisible();
   const generation = page.getByRole("region", { name: "Generation model" });
@@ -602,14 +603,14 @@ test("a fresh installation is led from the page it lands on to Settings, until a
       vector_index: NO_INDEX,
     }),
   );
-  await page.goto("/v2/");
+  await page.goto(appPath());
 
-  await expect(page).toHaveURL(/\/v2\/sources$/);
+  await expect(page).toHaveURL(appUrl("sources"));
   const notice = page.getByRole("status").filter({ hasText: "No generation model is set up" });
   await expect(notice).toContainText("MemForge cannot write memories from your sources until you choose one.");
   await notice.getByRole("link", { name: "Open Settings" }).click();
 
-  await expect(page).toHaveURL(/\/v2\/settings$/);
+  await expect(page).toHaveURL(appUrl("settings"));
   await expect(notice).toHaveCount(0);
   const generation = page.getByRole("region", { name: "Generation model" });
   await expect(generation.getByText("Not set up")).toBeVisible();
@@ -644,7 +645,7 @@ test("changing the embedding model rebuilds the search index, and the new model 
   page,
 }) => {
   const writes = await stubApi(page, settings());
-  await page.goto("/v2/settings");
+  await page.goto(appPath("settings"));
 
   const embedding = page.getByRole("region", { name: "Embedding model" });
   const index = embedding.getByRole("group", { name: "Search index" });
@@ -686,7 +687,7 @@ test("changing the embedding model rebuilds the search index, and the new model 
 
 test("a rebuild that fails says why, leaves the model in use, and succeeds when it is run again", async ({ page }) => {
   const writes = await stubApi(page, settings(), { rebuilds: ["rate_limited", null] });
-  await page.goto("/v2/settings");
+  await page.goto(appPath("settings"));
 
   const embedding = page.getByRole("region", { name: "Embedding model" });
   const index = embedding.getByRole("group", { name: "Search index" });
@@ -723,13 +724,13 @@ test("an installation whose search index does not fit its embedding model is tol
     reindex: null,
   };
   await stubApi(page, settings({ vector_index: required }));
-  await page.goto("/v2/sources");
+  await page.goto(appPath("sources"));
 
   const notice = page.getByRole("status").filter({ hasText: "Vector search is off" });
   await expect(notice).toContainText("Search ranks by matching words until the index is rebuilt in Settings.");
   await notice.getByRole("link", { name: "Open Settings" }).click();
 
-  await expect(page).toHaveURL(/\/v2\/settings$/);
+  await expect(page).toHaveURL(appUrl("settings"));
   const index = page.getByRole("region", { name: "Embedding model" }).getByRole("group", { name: "Search index" });
   await expect(index).toContainText(
     "This index was built with Ollama all-minilm, and MemForge now uses Ollama nomic-embed-text.",
@@ -749,7 +750,7 @@ test("an installation whose search index does not fit its embedding model is tol
 
 test("a generation model without known token limits is asked for them, and passes once they are entered", async ({ page }) => {
   const writes = await stubApi(page, settings(), { limitsUnknown: true });
-  await page.goto("/v2/settings");
+  await page.goto(appPath("settings"));
 
   const generation = page.getByRole("region", { name: "Generation model" });
   await expect(generation.getByRole("group", { name: "Token limits" })).toHaveCount(0);
