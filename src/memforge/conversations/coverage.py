@@ -60,7 +60,12 @@ def proven_interval(
     received_at: datetime,
     margin: timedelta = VISIBILITY_MARGIN,
 ) -> ProvenInterval:
-    """The interval one poll proves complete."""
+    """The interval one poll proves complete.
+
+    A poll that ran out of history read every page, so its earliest returned
+    message is a sound bound, and its complete time is checked at intake for
+    consistency only.
+    """
 
     end = min(poll.started_at, received_at) - margin
     if poll.requested.end is not None:
