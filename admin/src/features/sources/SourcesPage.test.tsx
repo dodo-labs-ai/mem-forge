@@ -490,6 +490,21 @@ test("Stop sync stops the running sync of a source, from its row and from its dr
   expect(within(drawer).getByRole("button", { name: "Syncing" })).toBeDisabled();
 });
 
+test("Configure stays available during a sync, beside Pause, for someone who can configure the source", async () => {
+  const running = makeSource({
+    sync: { status: "running", run_id: "ssr-run", started_at: "2026-10-23T08:00:00Z", finished_at: null, error_message: null, progress: null },
+  });
+  renderPage([running]);
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await userEvent.click(await within(table).findByRole("button", { name: "More actions for Payroll wiki" }));
+
+  for (const name of [/^Configure$/, /Pause syncing/]) {
+    const item = await screen.findByRole("menuitem", { name });
+    expect(item).not.toHaveAttribute("aria-disabled", "true");
+    expect(item).not.toHaveAttribute("data-disabled");
+  }
+});
+
 test("someone who can pause a source but not sync it can still stop its sync", async () => {
   const base = makeSource();
   const running = makeSource({
