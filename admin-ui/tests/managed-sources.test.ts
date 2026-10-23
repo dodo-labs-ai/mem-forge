@@ -26,6 +26,14 @@ assert.equal(canDeleteSourceType("confluence"), true);
 assert.equal(canConfigureSourceType("github_repo"), true);
 assert.equal(canDeleteSourceType("github_repo"), true);
 assert.deepEqual(userConfigurableGenes(genes).map((gene) => gene.name), ["confluence", "jira", "teams"]);
+// hides a source type without a setup form
+assert.deepEqual(
+  userConfigurableGenes([
+    ...genes,
+    { name: "notion", display_name: "Notion", execution_kinds: ["server"] as const },
+  ]).map((gene) => gene.name),
+  ["confluence", "jira", "teams"],
+);
 assert.deepEqual(
   userConfigurableGenes(genes).map((gene) => presentSourceConnection(gene)),
   [
