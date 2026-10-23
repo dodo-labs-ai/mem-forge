@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { resourceClient } from "@/api/client";
 import type { AbsenceCheckSkippedReason, SourceScopeChangePreview, SourceScopeTransition, SyncStatus } from "@/api/types";
 
@@ -88,7 +88,14 @@ export function scopeChangeWarning(preview: SourceScopeChangePreview | undefined
       return {
         tone: "info",
         title: "This replaces the scope change in progress",
-        message: "The source returns to its previous scope. Nothing the previous scope synced is removed.",
+        message: "The source returns to its previous scope, and the change in progress closes. Nothing is removed.",
+      };
+    case "returns_to_previous_scope":
+      return {
+        tone: "info",
+        title: "This replaces the scope change in progress",
+        message:
+          "The source returns to its previous scope. Nothing the previous scope synced is removed. Once a sync lists the previous scope in full, items only the replaced change added are removed.",
       };
     default:
       return null;
@@ -105,24 +112,49 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
 }
 
 /**
+ * The configuration as the preview's cache knows it: a secret field says only
+ * whether it is filled in, so a typed secret never becomes part of a cache key.
+ */
+function previewKey(config: Record<string, unknown>, secretFields: readonly string[]): string {
+  const secrets = new Set(secretFields);
+  return JSON.stringify(
+    Object.entries(config)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([field, value]) => [field, secrets.has(field) ? Boolean(value) : value]),
+  );
+}
+
+/**
  * Asks the server what saving `config` would do to the Source's scope, a
  * moment after the last edit. `config` is null while there is nothing to ask
- * about, such as for a new source or an incomplete form. A configuration the
- * server rejects yields no preview; saving reports it.
+ * about, such as for a new source or an incomplete form. `secretFields` name
+ * the fields that hold secrets, which stay out of the cache key. While the
+ * next answer is on its way, the last one stays. A configuration the server
+ * rejects yields no preview; saving reports it.
  */
-export function useScopeChangePreview(sourceId: string | undefined, config: Record<string, unknown> | null) {
+export function useScopeChangePreview(
+  sourceId: string | undefined,
+  config: Record<string, unknown> | null,
+  secretFields: readonly string[] = [],
+) {
   const serialized = useDebouncedValue(config ? JSON.stringify(config) : null, PREVIEW_DELAY_MS);
+  const debounced = useMemo(
+    () => (serialized ? (JSON.parse(serialized) as Record<string, unknown>) : null),
+    [serialized],
+  );
+  const key = debounced ? previewKey(debounced, secretFields) : null;
   const preview = useQuery<SourceScopeChangePreview>({
-    queryKey: ["scope-change-preview", sourceId, serialized],
+    queryKey: ["scope-change-preview", sourceId, key],
     queryFn: () =>
       resourceClient
-        .post(`/sources/${sourceId}/scope-change-preview`, { config: JSON.parse(serialized!) })
+        .post(`/sources/${sourceId}/scope-change-preview`, { config: debounced })
         .then((response) => response.data as SourceScopeChangePreview),
-    enabled: Boolean(sourceId && serialized),
+    enabled: Boolean(sourceId && key),
+    placeholderData: keepPreviousData,
     retry: false,
     staleTime: 0,
   });
-  return sourceId && serialized ? preview.data : undefined;
+  return sourceId && key ? preview.data : undefined;
 }
 
 const ABSENCE_CHECK_SKIPPED_NOTES: Record<AbsenceCheckSkippedReason, string> = {
@@ -149,17 +181,30 @@ export function lastSyncAbsenceNotes(sync: Pick<SyncStatus, "absence_check_skipp
   return notes;
 }
 
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 /** One line on the scope change a source is applying, for its sync details. */
 export function scopeTransitionSummary(transition: SourceScopeTransition): string {
+  const returning = transition.previous_scope !== null
+    && transition.target_scope !== null
+    && stableJson(transition.previous_scope) === stableJson(transition.target_scope);
+  const heading = returning ? "Returning to the previous scope" : "Scope change in progress";
   if (transition.excluded_scopes_due) {
-    return "Scope change in progress: every listed item is synced, and the next sync completes it.";
+    return `${heading}: every listed item is synced, and the next sync completes it.`;
   }
   if (transition.listed_count === null) {
-    return "Scope change in progress: the next sync lists what the new scope holds.";
+    return `${heading}: the next sync lists what the ${returning ? "previous" : "new"} scope holds.`;
   }
   const synced = Math.min(transition.members_committed, transition.listed_count);
   const failing = transition.failing_items.count;
-  return `Scope change in progress: ${synced} of ${transition.listed_count} listed items synced${
+  return `${heading}: ${synced} of ${transition.listed_count} listed items synced${
     failing > 0 ? `, ${failing} failed` : ""
   }. Nothing is removed until it completes.`;
 }

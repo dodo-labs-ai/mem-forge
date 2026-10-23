@@ -204,8 +204,9 @@ export interface SyncStatus {
 export interface SourceScopeTransition {
   id: string;
   status: "pending" | "running" | "failed";
-  previous_scope: Record<string, unknown>;
-  target_scope: Record<string, unknown>;
+  /** Null, as is `target_scope`, when the viewer cannot read the configuration. */
+  previous_scope: Record<string, unknown> | null;
+  target_scope: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
   members_committed: number;
@@ -220,7 +221,13 @@ export interface SourceScopeTransition {
 
 /** What saving a configuration would do to a Source's scope (`POST /sources/{id}/scope-change-preview`). */
 export interface SourceScopeChangePreview {
-  outcome: "unchanged" | "opens_transition" | "supersedes_transition" | "restores_previous_scope" | "refused";
+  outcome:
+    | "unchanged"
+    | "opens_transition"
+    | "supersedes_transition"
+    | "restores_previous_scope"
+    | "returns_to_previous_scope"
+    | "refused";
   open_transition: boolean;
   refusal: { code: string; mode?: string | null; message?: string | null } | null;
 }

@@ -71,7 +71,13 @@ it("says that saving replaces the scope change in progress", () => {
   expect(scopeChangeWarning(preview({ outcome: "restores_previous_scope", open_transition: true }))).toEqual({
     tone: "info",
     title: "This replaces the scope change in progress",
-    message: "The source returns to its previous scope. Nothing the previous scope synced is removed.",
+    message: "The source returns to its previous scope, and the change in progress closes. Nothing is removed.",
+  });
+  expect(scopeChangeWarning(preview({ outcome: "returns_to_previous_scope", open_transition: true }))).toEqual({
+    tone: "info",
+    title: "This replaces the scope change in progress",
+    message:
+      "The source returns to its previous scope. Nothing the previous scope synced is removed. Once a sync lists the previous scope in full, items only the replaced change added are removed.",
   });
 });
 
@@ -127,6 +133,44 @@ it("asks the server what saving would do, a moment after the last edit", async (
     ["/sources/src-1/scope-change-preview", { config: { spaces: ["ENG"] } }],
     ["/sources/src-1/scope-change-preview", { config: { spaces: ["ENG", "OPS"] } }],
   ]);
+});
+
+it("keeps a typed secret out of the cache key, but sends it", async () => {
+  vi.mocked(resourceClient.post).mockResolvedValue({ data: preview({ outcome: "opens_transition" }) });
+  const client = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+
+  const { result } = renderHook(
+    () => useScopeChangePreview("src-1", { spaces: ["OPS"], pat: "typed-secret" }, ["pat"]),
+    { wrapper },
+  );
+
+  await waitFor(() => expect(result.current?.outcome).toBe("opens_transition"));
+  expect(resourceClient.post).toHaveBeenCalledWith("/sources/src-1/scope-change-preview", {
+    config: { spaces: ["OPS"], pat: "typed-secret" },
+  });
+  expect(JSON.stringify(client.getQueryCache().getAll().map((query) => query.queryKey))).not.toContain("typed-secret");
+});
+
+it("keeps the last answer while the next one is on its way", async () => {
+  let answer: (value: unknown) => void = () => {};
+  vi.mocked(resourceClient.post)
+    .mockResolvedValueOnce({ data: preview({ outcome: "supersedes_transition", open_transition: true }) })
+    .mockImplementationOnce(() => new Promise((resolve) => { answer = resolve; }));
+  const client = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+
+  const { result, rerender } = renderHook(({ config }) => useScopeChangePreview("src-1", config), {
+    wrapper,
+    initialProps: { config: { spaces: ["OPS"] } as Record<string, unknown> | null },
+  });
+  await waitFor(() => expect(result.current?.outcome).toBe("supersedes_transition"));
+  rerender({ config: { spaces: ["OPS", "PAY"] } });
+
+  await waitFor(() => expect(resourceClient.post).toHaveBeenCalledTimes(2));
+  expect(result.current?.outcome).toBe("supersedes_transition");
+  answer({ data: preview({ outcome: "unchanged", open_transition: true }) });
+  await waitFor(() => expect(result.current?.outcome).toBe("unchanged"));
 });
 
 it("asks nothing for a new source or an incomplete form", async () => {
@@ -187,5 +231,11 @@ it("summarizes the scope change in progress in one line", () => {
   );
   expect(scopeTransitionSummary(transition({ excluded_scopes_due: true }))).toBe(
     "Scope change in progress: every listed item is synced, and the next sync completes it.",
+  );
+  expect(scopeTransitionSummary(transition({ target_scope: { spaces: ["ENG"] }, listed_count: null }))).toBe(
+    "Returning to the previous scope: the next sync lists what the previous scope holds.",
+  );
+  expect(scopeTransitionSummary(transition({ previous_scope: null, target_scope: null }))).toBe(
+    "Scope change in progress: 117 of 120 listed items synced, 3 failed. Nothing is removed until it completes.",
   );
 });

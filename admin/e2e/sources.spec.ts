@@ -68,6 +68,9 @@ test("a source's scope change in progress shows in its drawer and restores the p
   await page.route("**/api/**", (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
+    if (request.method() === "POST" && path === "/api/v1/sources/src-wiki/scope-change-preview") {
+      return route.fulfill({ json: { outcome: "returns_to_previous_scope", open_transition: true, refusal: null } });
+    }
     if (request.method() === "PUT" && path === "/api/v1/sources/src-wiki") {
       saved.push(request.postDataJSON());
       return route.fulfill({ json: { ok: true, id: "src-wiki" } });
@@ -85,5 +88,5 @@ test("a source's scope change in progress shows in its drawer and restores the p
   await drawer.getByRole("button", { name: "Restore the previous scope" }).click();
   await page.getByRole("dialog", { name: "Restore the previous scope?" }).getByRole("button", { name: "Restore" }).click();
 
-  await expect.poll(() => saved).toEqual([{ config: restoreConfig }]);
+  await expect.poll(() => saved).toEqual([{ config: restoreConfig, expected_scope_transition_id: "scope-transition-1" }]);
 });

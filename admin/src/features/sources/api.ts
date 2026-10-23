@@ -238,14 +238,36 @@ export function useSetPaused() {
  */
 export function useRestorePreviousScope() {
   const api = useApi();
-  return useSourceMutation(({ sourceId, config }: { sourceId: string; config: Record<string, unknown> }) =>
-    unwrap(
-      api.PUT("/api/v1/sources/{source_id}", {
-        params: { path: { source_id: sourceId } },
-        body: { config },
-      }),
-    ),
+  return useSourceMutation(
+    ({ sourceId, transitionId, config }: { sourceId: string; transitionId: string; config: Record<string, unknown> }) =>
+      unwrap(
+        api.PUT("/api/v1/sources/{source_id}", {
+          params: { path: { source_id: sourceId } },
+          // The server refuses the save when another change, or none, is in progress by then.
+          body: { config, expected_scope_transition_id: transitionId },
+        }),
+      ),
   );
+}
+
+/** What saving `config` would do to the source's scope, read while `enabled`; it saves nothing. */
+export function useScopeChangePreview(sourceId: string, config: Record<string, unknown> | null, enabled: boolean) {
+  const api = useApi();
+  return useQuery({
+    // Kept apart from the source keys, which every source write refreshes.
+    queryKey: ["source-scope-change-preview", sourceId, config] as const,
+    queryFn: () =>
+      unwrap(
+        api.POST("/api/v1/sources/{source_id}/scope-change-preview", {
+          params: { path: { source_id: sourceId } },
+          body: { config: config! },
+        }),
+      ),
+    enabled: enabled && config !== null,
+    staleTime: 0,
+    gcTime: 0,
+    retry: false,
+  });
 }
 
 /**

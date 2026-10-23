@@ -3,11 +3,13 @@ import { ApiError } from "@/api";
 import { errorCodeOf } from "@/api/errors";
 import { makeFailedItem, makeScopeTransition, makeSource } from "@/test/sourceFixtures";
 import {
+  presentRestore,
   presentSourceScopeTransition,
   scopeChangeErrorMessage,
   scopeFieldChanges,
   scopeValueLabel,
   transitionFailedItemsTitle,
+  type ScopeChangePreview,
 } from "./sourceScopeTransition";
 
 describe("presentSourceScopeTransition", () => {
@@ -23,6 +25,7 @@ describe("presentSourceScopeTransition", () => {
     const view = presentSourceScopeTransition(makeSource({ scope_transition: transition }), undefined, { spaces: "Spaces" });
 
     expect(view).toEqual({
+      returning: false,
       status: "The last sync left it open",
       reason: "3 listed Documents have not committed under the transition",
       changes: [{ field: "spaces", label: "Spaces", from: "ENG", to: "ENG, OPS" }],
@@ -71,13 +74,36 @@ describe("presentSourceScopeTransition", () => {
     expect(view?.progressLabel).toBe("1 of 1 listed item synced under the new scope");
   });
 
-  test("a viewer who cannot change the configuration gets no way back", () => {
+  test("a viewer who cannot read the configuration sees the progress, but neither scope nor a way back", () => {
     const view = presentSourceScopeTransition(
-      makeSource({ scope_transition: makeScopeTransition({ restore_config: null }) }),
+      makeSource({
+        scope_transition: makeScopeTransition({ previous_scope: null, target_scope: null, restore_config: null }),
+      }),
       undefined,
     );
 
+    expect(view?.changes).toEqual([]);
     expect(view?.restoreConfig).toBeNull();
+    expect(view?.progressLabel).toBe("117 of 120 listed items synced under the new scope");
+  });
+
+  test("a change back to the previous scope says it returns there", () => {
+    const view = presentSourceScopeTransition(
+      makeSource({
+        scope_transition: makeScopeTransition({
+          previous_scope: { spaces: ["ENG"], sync_mode: "spaces" },
+          target_scope: { sync_mode: "spaces", spaces: ["ENG"] },
+          restore_config: null,
+          members_committed: 3,
+          listed_count: 40,
+        }),
+      }),
+      undefined,
+    );
+
+    expect(view?.returning).toBe(true);
+    expect(view?.changes).toEqual([]);
+    expect(view?.progressLabel).toBe("3 of 40 listed items synced under the previous scope");
   });
 });
 
@@ -105,9 +131,9 @@ describe("scope settings", () => {
     expect(scopeValueLabel(value)).toBe(label);
   });
 
-  test("names the failed items that keep the change open", () => {
-    expect(transitionFailedItemsTitle(1)).toBe("1 failed item keeps the change open");
-    expect(transitionFailedItemsTitle(3)).toBe("3 failed items keep the change open");
+  test("names the failed items not yet synced under the change", () => {
+    expect(transitionFailedItemsTitle(1)).toBe("1 failed item not yet synced under the change");
+    expect(transitionFailedItemsTitle(3)).toBe("3 failed items not yet synced under the change");
   });
 });
 
@@ -134,5 +160,46 @@ describe("scopeChangeErrorMessage", () => {
     expect(errorCodeOf({ detail: { code: "transition_requires_listing", message: "…" } })).toBe("transition_requires_listing");
     expect(errorCodeOf({ detail: { error: "reindex_in_progress", message: "…" } })).toBe("reindex_in_progress");
     expect(errorCodeOf({ detail: "projection_scope_transition_stale" })).toBeNull();
+  });
+});
+
+describe("presentRestore", () => {
+  const preview = (outcome: ScopeChangePreview["outcome"]): ScopeChangePreview => ({
+    outcome,
+    open_transition: true,
+    refusal: null,
+  });
+
+  test("a configuration that cannot list closes the change and removes nothing", () => {
+    expect(presentRestore("Wiki", preview("restores_previous_scope"), false)).toEqual({
+      description: "This closes the scope change in progress and saves Wiki's previous scope again, keeping its other settings. Nothing is removed.",
+      ready: true,
+    });
+  });
+
+  test("a configuration that lists returns through a change that removes what only the replaced change added", () => {
+    const restoring = presentRestore("Wiki", preview("returns_to_previous_scope"), false);
+
+    expect(restoring.ready).toBe(true);
+    expect(restoring.description).toContain("Nothing the previous scope synced is removed.");
+    expect(restoring.description).toContain("items only the replaced change added are removed");
+  });
+
+  test("waits for the preview, and offers nothing when the change moved on or would be refused", () => {
+    expect(presentRestore("Wiki", undefined, false).ready).toBe(false);
+    expect(presentRestore("Wiki", preview("unchanged"), false)).toEqual({
+      description: "The scope change in progress changed while you were looking at it. Reload the source, then try again.",
+      ready: false,
+    });
+    expect(
+      presentRestore("Wiki", { ...preview("refused"), refusal: { code: "projection_scope_transition_active" } }, false),
+    ).toEqual({
+      description: "This source finishes its scope change in progress before it accepts another one. Try again once it completes.",
+      ready: false,
+    });
+  });
+
+  test("a preview that fails still lets the restore go ahead, as the save decides again", () => {
+    expect(presentRestore("Wiki", undefined, true).ready).toBe(true);
   });
 });
