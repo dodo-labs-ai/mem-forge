@@ -5,16 +5,14 @@ import { FormProvider, useForm, useWatch } from "react-hook-form";
 import { isReindexInProgress } from "@/api";
 import { useFetchImageDocuments } from "@/features/sources";
 import { errorMessage } from "@/lib/errors";
-import { ErrorNotice, Notice } from "@/patterns";
+import { describedBy, ErrorNotice, FormField, Notice } from "@/patterns";
 import { Button } from "@/ui/button";
 import { Input } from "@/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/ui/select";
 import { useDiscardCandidate, useDiscoverModels, useSaveCandidate, useStartReindex, useValidateCandidate } from "./api";
 import { ApiKeyField } from "./ApiKeyField";
-import { describedBy } from "./describedBy";
 import { DiscoveryNotice } from "./DiscoveryNotice";
 import { EndpointConflictNotice } from "./EndpointConflictNotice";
-import { FormField } from "./FormField";
 import { discoveryFailure, discoveryOutcome, namedListedModel, onlyListedModel } from "./model/discoveryOutcome";
 import {
   candidateRequest,
