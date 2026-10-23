@@ -66,7 +66,7 @@ CONNECTORS = [
 
 
 def _package(connector: Connector, *, submitted_at: object = SUBMITTED_AT.isoformat(), version: str = "v1") -> dict:
-    """A package as an older device wrote it: it names its submission time but no ``last_modified``."""
+    """A package that names only its submission time, as ``package_time`` allows."""
     return {
         "doc_id": f"{connector.name}-doc",
         "title": "Payroll notes",

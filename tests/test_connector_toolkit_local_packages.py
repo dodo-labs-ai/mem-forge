@@ -56,8 +56,8 @@ def test_a_package_without_any_time_is_refused(fields):
 
 
 def test_a_package_time_that_is_not_iso_8601_is_refused():
-    with pytest.raises(ValueError):
-        package_time({"last_modified": "yesterday"})
+    with pytest.raises(ValueError, match="device package doc-a has an invalid time 'yesterday'"):
+        package_time({"doc_id": "doc-a", "last_modified": "yesterday"})
 
 
 def test_manifest_entries_are_the_packages_with_their_locator():

@@ -104,7 +104,15 @@ def package_time(fields: Mapping[str, Any]) -> datetime:
         raise ValueError(
             f"device package {fields.get('doc_id') or '?'} has neither last_modified nor submitted_at"
         )
-    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).strip())
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"device package {fields.get('doc_id') or '?'} has an invalid time {value!r}"
+            ) from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
