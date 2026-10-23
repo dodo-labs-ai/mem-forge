@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -15,47 +15,16 @@ from memforge.genes.teams_client import (
     TeamsMessagePageSchemaError,
     TeamsMessagePaginationError,
 )
-from memforge.source_artifacts import MAX_SOURCE_ARTIFACT_STORAGE_BYTES, SourceArtifactContractError
+from memforge.source_artifacts import SourceArtifactContractError
+from tests.contracts.conversation_fakes.teams import CHAT, chat_message, message_page, milliseconds, serving
 
 NOW = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
-CHAT = "19:conversation@thread.v2"
-EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
-def _message(message_id: str, created_at: datetime) -> dict:
-    return {
-        "id": message_id,
-        "conversationid": CHAT,
-        "content": f"<p>{message_id}</p>",
-        "messagetype": "RichText/Html",
-        "composetime": created_at.isoformat(),
-    }
+def _page_params(service, index: int) -> dict[str, str]:
+    """The query of the ``index``-th request the client sent the fake service."""
 
-
-def _page(*messages: dict, complete_from: datetime | None = EPOCH) -> MagicMock:
-    """A Chatsvc page certifying the segment start it is complete from, by default the oldest page's epoch.
-
-    ``complete_from=None`` leaves the certificate out.
-    """
-
-    response = MagicMock()
-    body: dict = {"messages": list(messages)}
-    if complete_from is not None:
-        body["_metadata"] = {"lastCompleteSegmentStartTime": _milliseconds(complete_from)}
-    response.json.return_value = body
-    return response
-
-
-def _milliseconds(at: datetime) -> int:
-    return int(at.timestamp() * 1000)
-
-
-def _client(*pages: MagicMock) -> TeamsChatClient:
-    client = TeamsChatClient(region="emea")
-    client._ensure_clients = AsyncMock()
-    client._chat_client = object()
-    client._request = AsyncMock(side_effect=list(pages))
-    return client
+    return dict(service.requests[index].url.params)
 
 
 def test_parse_conversations_preserves_channel_team_identity():
@@ -130,22 +99,14 @@ async def test_request_retries_remote_protocol_error(monkeypatch):
     assert calls == 2
 
 
-@pytest.mark.asyncio
-async def test_validate_uses_retrying_request():
-    client = TeamsChatClient(region="emea")
-    client._ensure_clients = AsyncMock()
-    client._chat_client = object()
-    client._request = AsyncMock(
-        return_value=httpx.Response(
-            200,
-            json={"conversations": []},
-            request=httpx.Request("GET", "https://teams.cloud.microsoft/conversations"),
-        )
-    )
+async def test_validate_retries_a_failed_probe():
+    service = serving(httpx.Response(503), {"conversations": []})
 
-    await client.validate()
+    await service.client().validate()
 
-    client._request.assert_awaited_once()
+    assert [request.url.path for request in service.requests] == ["/api/chatsvc/emea/v1/users/ME/conversations"] * 2
+    assert _page_params(service, 1) == {"pageSize": "1"}
+    assert service.waits == [2.0]
 
 
 def test_parse_message_preserves_real_rest_root_message_id():
@@ -224,17 +185,9 @@ async def test_get_hosted_content_uses_exact_graph_value_route(
     root_message_id,
     expected_path,
 ):
-    client = TeamsChatClient(region="emea")
-    client._ensure_clients = AsyncMock()
-    client._graph_client = object()
-    client._request_bytes = AsyncMock(
-        return_value=(
-            b"\x89PNG\r\n\x1a\nhosted",
-            {"content-type": "image/png", "content-length": "14"},
-        )
-    )
+    service = serving(httpx.Response(200, content=b"\x89PNG\r\n\x1a\nhosted", headers={"content-type": "image/png"}))
 
-    content, media_type = await client.get_hosted_content(
+    content, media_type = await service.client().get_hosted_content(
         conversation_id=("19:channel@example" if conversation_type == "channel" else "19:chat@example"),
         message_id="message-1",
         hosted_content_id="hosted-1",
@@ -245,11 +198,10 @@ async def test_get_hosted_content_uses_exact_graph_value_route(
 
     assert content == b"\x89PNG\r\n\x1a\nhosted"
     assert media_type == "image/png"
-    client._request_bytes.assert_awaited_once_with(
-        client._graph_client,
-        expected_path,
-        max_bytes=MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
-    )
+    [request] = service.requests
+    assert request.url.host == "graph.microsoft.com"
+    assert request.url.raw_path.decode() == f"/v1.0{expected_path}"
+    assert request.headers["Authorization"] == "Bearer graph-token"
 
 
 @pytest.mark.asyncio
@@ -367,7 +319,7 @@ async def test_request_bytes_stops_before_buffering_oversized_body():
 
 
 async def test_a_page_reaching_back_past_the_start_keeps_newer_messages_and_proves_the_start():
-    client = _client(_page(_message("old", NOW - timedelta(days=2)), _message("new", NOW)))
+    client = serving(message_page(chat_message("new", NOW), chat_message("old", NOW - timedelta(days=2)))).client()
 
     poll = await client.read_messages(CHAT, start=NOW - timedelta(days=1), end=None, budget_seconds=60)
 
@@ -376,9 +328,8 @@ async def test_a_page_reaching_back_past_the_start_keeps_newer_messages_and_prov
     assert poll.earliest_complete_page_time == NOW - timedelta(days=2)
 
 
-async def test_running_out_of_pages_before_the_start_is_history_exhausted(monkeypatch):
-    monkeypatch.setattr("memforge.genes.teams_client.asyncio.sleep", AsyncMock())
-    client = _client(_page(_message("newest", NOW)))
+async def test_running_out_of_pages_before_the_start_is_history_exhausted():
+    client = serving(message_page(chat_message("newest", NOW))).client()
 
     poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
 
@@ -388,160 +339,169 @@ async def test_running_out_of_pages_before_the_start_is_history_exhausted(monkey
 
 
 @pytest.mark.parametrize("last_page", ["epoch", "empty"])
-async def test_running_out_of_history_names_the_time_its_read_is_complete_from(monkeypatch, last_page):
-    monkeypatch.setattr("memforge.genes.teams_client.asyncio.sleep", AsyncMock())
+async def test_running_out_of_history_names_the_time_its_read_is_complete_from(last_page):
     certified = NOW - timedelta(hours=1)
     first = NOW - timedelta(hours=3)
-    newer = _page(_message("newest", NOW), _message("deleted-later", NOW - timedelta(days=3)), complete_from=certified)
-    epoch = _page(_message("older", NOW - timedelta(hours=2)), _message("first", first))
-    oldest = epoch if last_page == "epoch" else _page()
-    client = _client(newer, oldest)
+    newer = message_page(
+        chat_message("newest", NOW),
+        chat_message("deleted-later", NOW - timedelta(days=3), deleted_at=NOW - timedelta(minutes=30)),
+        complete_from=certified,
+    )
+    epoch = message_page(chat_message("older", NOW - timedelta(hours=2)), chat_message("first", first))
+    service = serving(newer, epoch if last_page == "epoch" else message_page())
 
-    poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
+    poll = await service.client().read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
 
     assert poll.outcome is PollOutcome.HISTORY_EXHAUSTED
     assert poll.earliest_complete_page_time == (first if last_page == "epoch" else certified)
-    assert client._request.await_count == 2
+    assert len(service.requests) == 2
 
 
 async def test_pages_follow_the_certified_time_cursor_and_repeat_the_boundary_millisecond(monkeypatch):
     monkeypatch.setattr("memforge.genes.teams_client._MAX_PAGE_SIZE", 2)
-    monkeypatch.setattr("memforge.genes.teams_client.asyncio.sleep", AsyncMock())
     older = NOW - timedelta(hours=1)
     before = NOW - timedelta(days=15)
-    client = _client(
-        _page(_message("newest", NOW), _message("older", older), complete_from=older),
-        _page(
-            _message("older", older),
-            _message("same-millisecond", older),
-            _message("before", before),
+    service = serving(
+        message_page(chat_message("newest", NOW), chat_message("older", older), complete_from=older),
+        message_page(
+            chat_message("older", older),
+            chat_message("same-millisecond", older),
+            chat_message("before", before),
             complete_from=before,
         ),
     )
 
-    poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
+    poll = await service.client().read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
 
     assert [message["id"] for message in poll.messages] == ["newest", "older", "same-millisecond"]
     assert poll.outcome is PollOutcome.REACHED_START
-    assert client._request.await_args_list[1].kwargs["params"] == {
-        "pageSize": 2,
+    assert _page_params(service, 1) == {
+        "pageSize": "2",
         "view": "msnp24Equivalent",
-        "startTime": 0,
-        "endTime": _milliseconds(older),
+        "startTime": "0",
+        "endTime": str(milliseconds(older)),
     }
+    assert service.waits == [1.0]
 
 
-async def test_a_backfill_starts_just_before_its_end(monkeypatch):
+async def test_a_backfill_starts_just_before_its_end():
     end = NOW - timedelta(days=3)
-    client = _client(_page(_message("inside", end - timedelta(hours=1)), _message("past", end - timedelta(days=5))))
+    service = serving(
+        message_page(chat_message("inside", end - timedelta(hours=1)), chat_message("past", end - timedelta(days=5)))
+    )
 
-    poll = await client.read_messages(CHAT, start=end - timedelta(days=2), end=end, budget_seconds=60)
+    poll = await service.client().read_messages(CHAT, start=end - timedelta(days=2), end=end, budget_seconds=60)
 
     assert [message["id"] for message in poll.messages] == ["inside"]
-    assert client._request.await_args.kwargs["params"]["endTime"] == int(end.timestamp() * 1000) - 1
+    assert _page_params(service, 0)["endTime"] == str(milliseconds(end) - 1)
 
 
 async def test_a_backfill_ending_just_after_a_page_time_reads_that_millisecond():
     page_time = datetime(2026, 10, 20, 9, 0, 0, 789000, tzinfo=timezone.utc)
-    client = _client(_page(_message("at-page-time", page_time), _message("past", page_time - timedelta(days=5))))
+    service = serving(
+        message_page(
+            chat_message("at-page-time", page_time), chat_message("past", page_time - timedelta(days=5))
+        )
+    )
 
-    poll = await client.read_messages(
+    poll = await service.client().read_messages(
         CHAT, start=page_time - timedelta(days=2), end=page_time + timedelta(microseconds=1), budget_seconds=60
     )
 
     assert [message["id"] for message in poll.messages] == ["at-page-time"]
-    assert client._request.await_args.kwargs["params"]["endTime"] == int(page_time.timestamp() * 1000)
+    assert _page_params(service, 0)["endTime"] == str(milliseconds(page_time))
 
 
 async def test_a_spent_time_budget_stops_early_after_the_last_complete_page(monkeypatch):
     monkeypatch.setattr("memforge.genes.teams_client._MAX_PAGE_SIZE", 1)
-    monkeypatch.setattr("memforge.genes.teams_client.asyncio.sleep", AsyncMock())
     certified = NOW - timedelta(hours=1)
-    client = _client(
-        _page(_message("newest", NOW), _message("deleted-later", NOW - timedelta(days=5)), complete_from=certified),
-        _page(_message("older", NOW - timedelta(hours=2))),
+    service = serving(
+        message_page(
+            chat_message("newest", NOW),
+            chat_message("older-than-its-page", NOW - timedelta(days=5)),
+            complete_from=certified,
+        ),
+        message_page(chat_message("older", NOW - timedelta(hours=2))),
     )
 
-    poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=0)
+    poll = await service.client().read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=0)
 
-    assert {message["id"] for message in poll.messages} == {"newest", "deleted-later"}
+    assert {message["id"] for message in poll.messages} == {"newest", "older-than-its-page"}
     assert poll.outcome is PollOutcome.STOPPED_EARLY
     assert poll.earliest_complete_page_time == certified
-    assert client._request.await_count == 1
+    assert len(service.requests) == 1
 
 
 async def test_a_deleted_older_message_on_a_newer_page_does_not_move_the_cursor(monkeypatch):
     monkeypatch.setattr("memforge.genes.teams_client._MAX_PAGE_SIZE", 3)
-    monkeypatch.setattr("memforge.genes.teams_client.asyncio.sleep", AsyncMock())
     hour_ago = NOW - timedelta(hours=1)
-    deleted = {
-        **_message("deleted", NOW - timedelta(days=20)),
-        "content": "",
-        "properties": {"deletetime": _milliseconds(NOW - timedelta(minutes=5))},
-    }
-    client = _client(
-        _page(_message("newest", NOW), deleted, _message("hour-ago", hour_ago), complete_from=hour_ago),
-        _page(_message("hour-ago", hour_ago), _message("yesterday", NOW - timedelta(days=1))),
+    deleted = chat_message("deleted", NOW - timedelta(days=20), deleted_at=NOW - timedelta(minutes=5))
+    service = serving(
+        message_page(chat_message("newest", NOW), deleted, chat_message("hour-ago", hour_ago), complete_from=hour_ago),
+        message_page(chat_message("hour-ago", hour_ago), chat_message("yesterday", NOW - timedelta(days=1))),
     )
 
-    poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
+    poll = await service.client().read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
 
-    assert {message["id"] for message in poll.messages} >= {"newest", "hour-ago", "yesterday"}
+    assert [message["id"] for message in poll.messages] == ["newest", "hour-ago", "yesterday"]
     assert poll.outcome is PollOutcome.HISTORY_EXHAUSTED
-    assert client._request.await_args_list[1].kwargs["params"]["endTime"] == _milliseconds(hour_ago)
+    assert _page_params(service, 1)["endTime"] == str(milliseconds(hour_ago))
 
 
 async def test_a_page_that_certifies_no_complete_start_fails_the_poll():
-    client = _client(_page(_message("newest", NOW), complete_from=None))
+    client = serving(message_page(chat_message("newest", NOW), complete_from=None)).client()
 
     with pytest.raises(TeamsMessagePageSchemaError, match="does not certify"):
         await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
 
 
 async def test_a_page_certified_from_the_epoch_is_the_oldest_and_bounded_by_its_oldest_message():
-    client = _client(_page(_message("newest", NOW), _message("first", NOW - timedelta(days=2))))
+    service = serving(message_page(chat_message("newest", NOW), chat_message("first", NOW - timedelta(days=2))))
 
-    poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
+    poll = await service.client().read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
 
     assert [message["id"] for message in poll.messages] == ["newest", "first"]
     assert poll.outcome is PollOutcome.HISTORY_EXHAUSTED
-    assert client._request.await_count == 1
+    assert len(service.requests) == 1
 
 
-async def test_a_short_page_certified_from_a_later_time_is_not_the_oldest(monkeypatch):
-    monkeypatch.setattr("memforge.genes.teams_client.asyncio.sleep", AsyncMock())
+async def test_a_short_page_certified_from_a_later_time_is_not_the_oldest():
     certified = NOW - timedelta(hours=1)
-    client = _client(
-        _page(_message("newest", NOW), _message("deleted-later", NOW - timedelta(days=20)), complete_from=certified),
-        _page(),
+    service = serving(
+        message_page(
+            chat_message("newest", NOW),
+            chat_message("deleted-later", NOW - timedelta(days=20), deleted_at=NOW - timedelta(minutes=30)),
+            complete_from=certified,
+        ),
+        message_page(),
     )
 
-    poll = await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
+    poll = await service.client().read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
 
     assert poll.outcome is PollOutcome.HISTORY_EXHAUSTED
-    assert client._request.await_args_list[1].kwargs["params"]["endTime"] == _milliseconds(certified)
+    assert _page_params(service, 1)["endTime"] == str(milliseconds(certified))
 
 
 async def test_a_time_cursor_that_does_not_advance_fails_the_poll(monkeypatch):
     monkeypatch.setattr("memforge.genes.teams_client._MAX_PAGE_SIZE", 1)
-    monkeypatch.setattr("memforge.genes.teams_client.asyncio.sleep", AsyncMock())
-    client = _client(_page(_message("same", NOW), complete_from=NOW), _page(_message("same", NOW), complete_from=NOW))
+    client = serving(
+        message_page(chat_message("same", NOW), complete_from=NOW),
+        message_page(chat_message("same", NOW), complete_from=NOW),
+    ).client()
 
     with pytest.raises(TeamsMessagePaginationError, match="did not advance"):
         await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
 
 
 async def test_a_page_without_a_messages_list_fails_the_poll():
-    response = MagicMock()
-    response.json.return_value = {"error": {"code": "TransientShapeDrift"}}
-    client = _client(response)
+    client = serving({"error": {"code": "TransientShapeDrift"}}).client()
 
     with pytest.raises(ValueError, match="explicit messages list"):
         await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
 
 
 async def test_a_content_message_without_a_source_time_fails_the_poll():
-    client = _client(_page({"id": "m1", "content": "still present"}))
+    client = serving(message_page({"id": "m1", "content": "still present"})).client()
 
     with pytest.raises(ValueError, match="stable id or source timestamp"):
         await client.read_messages(CHAT, start=NOW - timedelta(days=14), end=None, budget_seconds=60)
