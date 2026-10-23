@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { STANDALONE_TARGET } from "@/api/workspace";
 import { APP_BASE_PATH } from "@/app/basePath";
 import type { AdminExtension } from "@/app/extension";
@@ -11,9 +12,9 @@ import { renderAdminApp } from "@/app/render";
  */
 const sharedWorkspace: AdminExtension = {
   id: "e2e-shared-workspace",
-  // Setting the same target again changes nothing, so this holds on every render.
   Wrapper: ({ children, workspace }) => {
-    workspace.setTarget({ ...STANDALONE_TARGET, shared: true });
+    // Shared from the first render on, before any page reads the target.
+    useState(() => workspace.setTarget({ ...STANDALONE_TARGET, shared: true }));
     return children;
   },
 };

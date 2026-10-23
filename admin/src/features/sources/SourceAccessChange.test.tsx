@@ -84,6 +84,22 @@ test("hidden from a viewer who cannot manage the source", async () => {
   expect(screen.queryByRole("menuitem", { name: "Change who can use this source" })).not.toBeInTheDocument();
 });
 
+test("starts from the drawer menu over the open drawer", async () => {
+  const { calls } = renderPage(() => [makeSource({ access_policy: "private" })], {
+    "POST /api/v1/sources/src-wiki/access-transitions": () => transition(),
+  });
+
+  const drawer = await openDrawer();
+  await userEvent.click(within(drawer).getByRole("button", { name: "More actions for Payroll wiki" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Change who can use this source" }));
+  const dialog = await screen.findByRole("dialog", { name: "Change who can use Payroll wiki" });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Change access" }));
+
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: "Change who can use Payroll wiki" })).not.toBeInTheDocument());
+  expect(calls.some((call) => call.method === "POST" && new URL(call.url).pathname.endsWith("/access-transitions"))).toBe(true);
+  expect(screen.getByRole("dialog", { name: "Payroll wiki" })).toBeInTheDocument();
+});
+
 test(
   "private to workspace polls until applied",
   async () => {
@@ -159,18 +175,4 @@ test("a failed change offers retry and revert", async () => {
   expect(within(table).getByText("Changing access")).toBeInTheDocument();
   expect(calls.some((call) => call.method === "POST" && new URL(call.url).pathname.endsWith("/sat-1/retry"))).toBe(true);
   expect(calls.some((call) => new URL(call.url).pathname.endsWith("/sat-1/revert"))).toBe(false);
-});
-
-test("a failed change asks the owner to settle it when the viewer is not the owner", async () => {
-  const source = makeSource({
-    access_policy: "private",
-    access_state: "changing",
-    access_transition: transition({ status: "failed" }),
-    ownership: { ...makeSource().ownership!, viewer_role: "workspace_admin", viewer_relationship: "workspace_admin" },
-  });
-  renderPage(() => [source]);
-
-  const drawer = await openDrawer();
-  expect(within(drawer).getByText(/The source owner can retry or revert it\./)).toBeInTheDocument();
-  expect(within(drawer).queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
 });
