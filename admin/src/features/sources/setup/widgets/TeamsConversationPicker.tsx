@@ -23,7 +23,8 @@ function ConversationIcon({ kind, className }: { kind: TeamsConversation["kind"]
 /**
  * Chooses the Teams conversations a Source syncs: the selected list, then a
  * searchable list of what the Teams session can read (`teams_browse`), once
- * the session check says it is usable. A stored id shows as "Existing
+ * the session check says it is usable. When the check itself fails, the
+ * picker names that failure rather than asking to connect. A stored id shows as "Existing
  * conversation · …" until the list names it. The field holds the ids.
  */
 export default function TeamsConversationPicker({ id, labelId, describedBy, value, onChange, onBlur, invalid, readOnly, config }: ConfigControlProps) {
@@ -71,7 +72,9 @@ export default function TeamsConversationPicker({ id, labelId, describedBy, valu
         <p className="rounded-lg border bg-muted/30 p-3 text-sm text-muted-foreground">
           {session.isPending
             ? "Checking the Teams session…"
-            : "Connect the Teams session in the Teams session step to list conversations. Conversations already selected stay selected."}
+            : session.isError
+              ? `Could not check the Teams session. ${errorMessage(session.error)} Check it again in the Teams session step to list conversations. Conversations already selected stay selected.`
+              : "Connect the Teams session in the Teams session step to list conversations. Conversations already selected stay selected."}
         </p>
       ) : browse.isPending ? (
         <p className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
