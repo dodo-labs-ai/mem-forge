@@ -195,9 +195,10 @@ class NotionFake:
         edited: str | None = None,
         is_archived: bool = False,
         in_trash: bool = False,
+        row_id: str | None = None,
     ) -> str:
         """A row page of ``source`` in ``database``."""
-        row_id = new_id()
+        row_id = row_id or new_id()
         self.pages[row_id] = {
             "object": "page",
             "id": dashed(row_id),
