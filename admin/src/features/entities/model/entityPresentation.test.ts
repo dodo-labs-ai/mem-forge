@@ -15,7 +15,7 @@ test("names an entity by its display name and hints the canonical name only when
 test("tells an admin's alias from one MemForge found", () => {
   const alias = { alias: "Cutoff", alias_normalized: "cutoff", created_at: null };
   expect(aliasOrigin({ ...alias, source: "admin_manual" })).toBe("Added by an admin");
-  expect(aliasOrigin({ ...alias, source: "llm_extracted" })).toBe("Found by MemForge");
+  expect(aliasOrigin({ ...alias, source: "deterministic" })).toBe("Found by MemForge");
 });
 
 test("recognises only the curation refusal", () => {
