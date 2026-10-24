@@ -448,6 +448,24 @@ class MemoryRelationResponse(StructuredResponseModel):
     decisions: list[MemoryRelationDecision]
 
 
+class RefinementVerificationDecision(StructuredResponseModel):
+    """Whether the refinement in one application-issued pair slot states every fact of the old claim."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pair_index: int = Field(ge=0)
+    answer: Literal["preserves", "drops"]
+
+
+class RefinementVerificationResponse(StructuredResponseModel):
+    """Schema for the verification of one proposed revision."""
+
+    model_config = ConfigDict(extra="forbid")
+    direct_answer = True
+
+    decisions: list[RefinementVerificationDecision]
+
+
 class CrossDocumentRelationDecision(StructuredResponseModel):
     """One closed relation label for one application-issued pair slot."""
 
@@ -1996,6 +2014,11 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt, response_format=CandidateAdmissionResponse, model=model, images=images,
         )
+
+    async def verify_refinements(
+        self, prompt: str, *, model: str | None = None,
+    ) -> RefinementVerificationResponse:
+        return await self._call_schema(prompt=prompt, response_format=RefinementVerificationResponse, model=model)
 
     async def classify_memory_relations(
         self,

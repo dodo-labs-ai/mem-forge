@@ -266,7 +266,7 @@ async def test_a_term_labels_every_pinned_memory_whose_claim_holds_it(db) -> Non
         ("support_label", DeterministicCheckLabel.PASS, "supported:supported", "memory-0:eu-memory-0"),
         ("support_label", DeterministicCheckLabel.FAIL, "supported:unsupported", "memory-1:eu-memory-1"),
     ]
-    with pytest.raises(ValueError, match="labelled both"):
+    with pytest.raises(ValueError, match="labelled unsupported by id and supported by its terms"):
         await _seed(db, synced, rubric={
             "expected_support": {"memory-0": "unsupported"}, "expected_support_terms": {"releases": "supported"},
         })
@@ -285,6 +285,14 @@ def test_a_term_matches_a_whole_word_and_inside_unspaced_script() -> None:
 
     assert labels == {"api": "supported", "retry": "unsupported"}
     assert unmatched == ("dlq-x",)
+
+
+def test_a_claim_holding_a_fact_that_no_longer_holds_is_unsupported() -> None:
+    claims = {"merged": "Alerts go only to Slack and must be acknowledged within 15 minutes."}
+
+    labels, _ = rubric_memory_labels({}, {"Slack": "supported", "15": "unsupported"}, claims)
+
+    assert labels == {"merged": "unsupported"}
 
 
 @pytest.mark.parametrize(
