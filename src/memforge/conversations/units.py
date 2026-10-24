@@ -13,11 +13,12 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
 from memforge.conversations.records import MessageIdentity
+from memforge.conversations.undated import is_undated
 
 
 class UnitKind(str, Enum):
@@ -66,7 +67,12 @@ class MemberArtifact:
 
 @dataclass(frozen=True, slots=True)
 class Member:
-    """One message of a Unit: its identity, creation time, canonical record and stored artifacts."""
+    """One message of a Unit: its identity, creation time, canonical record and stored artifacts.
+
+    ``undated`` says whether ``record`` carries no creation time of its own
+    (:mod:`~memforge.conversations.undated`); it is derived from the record
+    when the member is built.
+    """
 
     identity: MessageIdentity
     created_at: datetime
@@ -74,6 +80,10 @@ class Member:
     # The revision of ``record``, as the manifest names it.
     revision: str
     artifacts: tuple[MemberArtifact, ...] = ()
+    undated: bool = field(init=False, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "undated", is_undated(self.record))
 
     @property
     def content_identity(self) -> tuple[str, tuple[tuple[str, str, str], ...]]:

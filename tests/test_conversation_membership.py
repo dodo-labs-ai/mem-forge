@@ -68,10 +68,21 @@ def _coverage(start: str | None = None, end: str = "23:59") -> ConversationCover
     return ConversationCoverage(intervals=intervals, covers_replies=True)
 
 
-def _plan(returned=(), units=(), *, coverage=None, threading=ThreadingModel.INLINE, threads=()):
+def holders_of(units) -> dict[str, tuple[UnitRef, ...]]:
+    """The Units holding each message, by message id, as the store answers for a projection of ``units``."""
+
+    holders: dict[str, dict[str, UnitRef]] = {}
+    for unit in units:
+        for member in unit.members:
+            holders.setdefault(member.identity.message_id, {})[unit.ref.unit_id] = unit.ref
+    return {message_id: tuple(refs.values()) for message_id, refs in holders.items()}
+
+
+def _plan(returned=(), units=(), *, coverage=None, threading=ThreadingModel.INLINE, threads=(), seen=()):
     """Plan over ``units`` read with their members, and ``threads`` known only by reference.
 
-    As the layer reads it, a thread is rooted when it holds its root.
+    As the layer reads it, a thread is rooted when it holds its root, and the
+    store's holders are those of every Unit given.
     """
 
     read_threads = [unit for unit in units if unit.kind is UnitKind.THREAD]
@@ -80,9 +91,11 @@ def _plan(returned=(), units=(), *, coverage=None, threading=ThreadingModel.INLI
         conversation=_conversation(threading),
         coverage=coverage or _coverage(),
         returned=returned,
+        seen_without_record=frozenset(MessageIdentity(CONVERSATION, message_id) for message_id in seen),
         state=ConversationState(
             conversation_id=CONVERSATION,
             units=tuple(units),
+            holders=holders_of((*units, *threads)),
             threads={
                 **{unit.thread_root_id: unit.ref for unit in threads},
                 **{unit.thread_root_id: unit.ref for unit in read_threads},
@@ -302,7 +315,7 @@ def test_a_message_seen_without_its_record_is_carried_and_never_proven_absent():
         conversation=_conversation(),
         coverage=_coverage("09:00"),
         returned=[],
-        state=ConversationState(conversation_id=CONVERSATION, units=(window,)),
+        state=ConversationState(conversation_id=CONVERSATION, units=(window,), holders=holders_of([window])),
         seen_without_record={MessageIdentity(CONVERSATION, "a")},
     )
 
@@ -355,3 +368,71 @@ def test_an_undated_reply_is_never_proven_absent_from_its_thread():
 
     assert plan.units == ()
     assert plan.removals == ()
+
+
+def test_a_plan_refuses_a_state_that_lacks_a_unit_its_read_set_names():
+    window = _window("w", _member("a", "09:00"))
+    thread = _thread("t", "r", _member("r", "10:00"))
+
+    # Without the holder read, the edited message would open a second window.
+    with pytest.raises(ValueError, match="^Unit w was not read for this plan$"):
+        plan_conversation(
+            source_id=SOURCE,
+            conversation=_conversation(),
+            coverage=_coverage(),
+            returned=[_returned("a", "09:00", "edited")],
+            state=ConversationState(conversation_id=CONVERSATION, units=(), holders=holders_of([window])),
+        )
+    with pytest.raises(ValueError, match="Unit t was not read for this plan; Unit w was not read for this plan"):
+        plan_conversation(
+            source_id=SOURCE,
+            conversation=_conversation(),
+            coverage=_coverage(),
+            returned=[_returned("a", "09:00", "edited"), _returned("y", "10:30", root="r")],
+            state=ConversationState(
+                conversation_id=CONVERSATION,
+                units=(),
+                holders=holders_of([window, thread]),
+                threads={"r": thread.ref},
+                rooted_threads=frozenset({"r"}),
+            ),
+        )
+
+
+def _decided(plan, unit: StoredUnit) -> list[str]:
+    """The message ids a stored Unit holds after the plan: projected, removed, or unchanged."""
+
+    if any(removal.unit.provider_key == unit.provider_key for removal in plan.removals):
+        return []
+    planned = {planned.provider_key: planned for planned in plan.units}.get(unit.provider_key, unit)
+    return [member.identity.message_id for member in planned.members]
+
+
+@pytest.mark.parametrize(
+    ("case", "coverage_start", "lent"),
+    [
+        ("returned", "09:00", True),
+        ("seen without record", "09:00", True),
+        ("undated", "09:00", True),
+        ("inside an interval", "09:00", False),
+        ("outside every interval", "10:05", True),
+    ],
+)
+def test_a_held_root_is_lent_to_its_thread_exactly_when_it_is_not_proven_absent(case, coverage_start, lent):
+    root = _undated("r", "10:00") if case == "undated" else _member("r", "10:00")
+    window = _window("w", root, _member("m", "10:10"))
+    thread_key = thread_unit_key(source_id=SOURCE, conversation_id=CONVERSATION, thread_root_id="r")
+    returned = [_returned("m", "10:10"), _returned("x", "10:20", root="r")]
+    if case == "returned":
+        returned.append(_returned("r", "10:00"))
+
+    plan = _plan(
+        returned,
+        [window],
+        coverage=_coverage(coverage_start),
+        seen=("r",) if case == "seen without record" else (),
+    )
+
+    thread_members = _members(plan)[thread_key]
+    assert ("r" in thread_members) is lent
+    assert ("r" in _decided(plan, window)) is lent

@@ -1,9 +1,9 @@
 """Message identity and the fields read from a message record.
 
 A message is identified by its conversation and its provider message id
-together: a Slack ``ts`` is unique only within a channel, and a Teams message
-id is a millisecond timestamp unique only within a chat. Its Observation's
-provider key is the message id, and its locator records the conversation.
+together: a Teams message id is a millisecond timestamp unique only within a
+chat. Its Observation's provider key is the message id, and its locator
+records the conversation.
 
 Each provider declares the canonical record schema of its messages. Every
 schema states the creation time at ``/time`` and the edit time at

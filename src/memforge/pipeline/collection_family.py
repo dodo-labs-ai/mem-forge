@@ -967,10 +967,9 @@ class ConversationFamily(CollectionFamily):
         )
 
     def begin_scope_transition(self, transition: ProjectionScopeTransition) -> None:
-        self.gene.begin_scope_transition(
-            previous_scope=transition.previous_scope,
-            target_scope=transition.target_scope,
-        )
+        """Mark the run as a transition run; its target is the configured selection the Gene plans with."""
+
+        self.gene.begin_scope_transition()
 
     async def document_input(
         self,

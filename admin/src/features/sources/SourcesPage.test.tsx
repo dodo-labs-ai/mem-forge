@@ -599,6 +599,7 @@ async function openScopeChange(source = makeSource({ scope_transition: makeScope
     "POST /api/v1/sources/src-wiki/scope-change-preview": () => ({
       outcome: "returns_to_previous_scope",
       open_transition: true,
+      removes: source.scope_transition?.removes ?? "at_completion",
       refusal: null,
     }),
     ...routes,
@@ -685,6 +686,33 @@ test("a change back to the previous scope reads as returning there, with no rest
   expect(within(section).getByText("Returning to the previous scope")).toBeInTheDocument();
   expect(within(section).getByText("The next sync lists what the previous scope holds.")).toBeInTheDocument();
   expect(within(section).queryByRole("button", { name: "Restore the previous scope" })).not.toBeInTheDocument();
+});
+
+test("a conversation source's change says its next sync removes the deselected conversations, and so does its restore", async () => {
+  const { section } = await openScopeChange(
+    makeSource({
+      scope_transition: makeScopeTransition({
+        status: "pending",
+        previous_scope: { conversation_ids: ["19:a@thread.v2"] },
+        target_scope: { conversation_ids: ["19:a@thread.v2", "19:c@thread.v2"] },
+        members_committed: 0,
+        listed_count: null,
+        error: null,
+        restore_config: { conversation_ids: ["19:a@thread.v2"], initial_history_days: 30 },
+        removes: "next_sync",
+      }),
+    }),
+  );
+
+  expect(within(section).getByText("The next sync removes the conversations the new selection leaves out.")).toBeInTheDocument();
+  expect(within(section).getByText("The change completes once every selected conversation is synced.")).toBeInTheDocument();
+  expect(within(section).queryByText(/Nothing is removed/)).not.toBeInTheDocument();
+  await userEvent.click(within(section).getByRole("button", { name: "Restore the previous scope" }));
+  const confirm = await screen.findByRole("dialog", { name: "Restore the previous scope?" });
+  expect(
+    await within(confirm).findByText(/The next sync removes the conversations the new selection leaves out\. The change completes/),
+  ).toBeInTheDocument();
+  expect(within(confirm).queryByText(/Nothing the previous scope synced is removed/)).not.toBeInTheDocument();
 });
 
 test("a viewer who cannot read the configuration sees the progress, but neither scope nor a way back", async () => {
