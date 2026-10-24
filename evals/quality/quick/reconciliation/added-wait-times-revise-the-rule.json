@@ -1,0 +1,34 @@
+{
+  "situation": "The document adds the wait times to a retry rule it already stated; the fuller claim keeps every fact and revises the old one.",
+  "input": {
+    "candidates": [
+      {
+        "claim": "A failed Kestrel job is retried three times, waiting 10, 60 and 300 seconds between attempts, before it moves to the kestrel-dlq queue.",
+        "memory_type": "decision",
+        "evidence": [
+          {
+            "role": "primary",
+            "excerpt": "A failed Kestrel job is retried three times, waiting 10, 60 and 300 seconds between attempts, before it moves to the kestrel-dlq queue.",
+            "observation": "job-retries",
+            "revision": "v2"
+          }
+        ]
+      }
+    ],
+    "incumbents": [
+      {
+        "id": "old",
+        "claim": "A failed Kestrel job is retried three times before it moves to the kestrel-dlq queue.",
+        "memory_type": "decision"
+      }
+    ],
+    "support": {
+      "old": "supported"
+    }
+  },
+  "rubric": {
+    "expected_incumbents": {
+      "old": "revised"
+    }
+  }
+}

@@ -75,6 +75,7 @@ __all__ = [
     "coordinate",
     "memory_support",
     "plan_rechecks",
+    "revisions_to_verify",
     "supported_refiners",
 ]
 
@@ -262,6 +263,8 @@ class _Ledger:
     rechecked_pairs: frozenset[tuple[int, str]]
     # Candidates the Relation line could not judge even alone.
     unjudged_candidates: frozenset[int] = frozenset()
+    # Revisions whose Refinement verification found a fact of the old claim missing.
+    unverified_revisions: frozenset[tuple[int, str]] = frozenset()
 
     def edges(self, memory_id: str, relation_type: MemoryRelationType) -> list[RelationLedgerEntry]:
         return [
@@ -281,6 +284,7 @@ def _ledger(
     supports: Mapping[str, MemorySupport],
     rechecked_pairs: frozenset[tuple[int, str]],
     unjudged_candidates: frozenset[int],
+    unverified_revisions: frozenset[tuple[int, str]] = frozenset(),
 ) -> _Ledger:
     incumbent_ids = {memory.id for memory in incumbents}
     pairs = {(entry.candidate_index, entry.incumbent_id) for entry in relations}
@@ -298,7 +302,10 @@ def _ledger(
     proofs_by_pair = {(proof.candidate_index, proof.incumbent_id): proof for proof in proofs}
     if len(proofs_by_pair) != len(proofs):
         raise ReconciliationContractError("duplicate_revision_proof", "duplicate revision composition proof")
-    return _Ledger(candidates, incumbents, relations, proofs_by_pair, supports, rechecked_pairs, unjudged_candidates)
+    return _Ledger(
+        candidates, incumbents, relations, proofs_by_pair, supports, rechecked_pairs, unjudged_candidates,
+        unverified_revisions,
+    )
 
 
 def plan_rechecks(
@@ -372,6 +379,45 @@ def supported_refiners(
     return {memory_id: tuple(sorted(indices)) for memory_id, indices in grouped.items()}
 
 
+def revisions_to_verify(
+    *,
+    candidates: Sequence[RawMemory],
+    incumbents: Sequence[Memory],
+    relations: Sequence[RelationLedgerEntry],
+    proofs: Sequence[RevisionCompositionProof] = (),
+    supports: Mapping[str, MemorySupport],
+    rechecked_pairs: frozenset[tuple[int, str]] = frozenset(),
+    unjudged_candidates: frozenset[int] = frozenset(),
+) -> tuple[tuple[int, str], ...]:
+    """Each (Candidate index, old Memory id) the table would revise, before Refinement verification answers.
+
+    The table revises an old Memory whose final Support result keeps it, that no
+    Candidate contradicts and that exactly one Candidate refines with an
+    eligible proof, unless the old Memory is in an unresolved component. Every
+    such pair is verified, also one whose Candidate a later divided treatment
+    might hold back, so no revision is released unverified.
+    """
+    ledger = _ledger(
+        candidates=candidates, incumbents=incumbents, relations=relations, proofs=proofs, supports=supports,
+        rechecked_pairs=rechecked_pairs, unjudged_candidates=unjudged_candidates,
+    )
+    _, unresolved = _unresolved_component(ledger, _seeds(ledger))
+    pairs = []
+    for memory in ledger.incumbents:
+        refiners = ledger.edges(memory.id, MemoryRelationType.REFINES)
+        if (
+            memory.id in unresolved
+            or ledger.supports[memory.id].result not in _KEEPS_SUPPORT
+            or ledger.edges(memory.id, MemoryRelationType.CONTRADICTS)
+            or len(refiners) != 1
+        ):
+            continue
+        proof = ledger.proofs.get((refiners[0].candidate_index, memory.id))
+        if proof is not None and proof.eligible:
+            pairs.append((refiners[0].candidate_index, memory.id))
+    return tuple(pairs)
+
+
 def coordinate(
     *,
     candidates: Sequence[RawMemory],
@@ -381,11 +427,18 @@ def coordinate(
     supports: Mapping[str, MemorySupport],
     rechecked_pairs: frozenset[tuple[int, str]] = frozenset(),
     unjudged_candidates: frozenset[int] = frozenset(),
+    unverified_revisions: frozenset[tuple[int, str]] = frozenset(),
 ) -> Coordination:
-    """Apply the combination table to final Support results and return one operation per claim."""
+    """Apply the combination table to final Support results and return one operation per claim.
+
+    ``unverified_revisions`` are the revisions Refinement verification answered
+    ``drops`` for: their old Memory is kept and the Candidate added, as with an
+    ineligible proof.
+    """
     ledger = _ledger(
         candidates=candidates, incumbents=incumbents, relations=relations, proofs=proofs, supports=supports,
         rechecked_pairs=rechecked_pairs, unjudged_candidates=unjudged_candidates,
+        unverified_revisions=unverified_revisions,
     )
     seeds = _seeds(ledger)
     _, unresolved = _unresolved_component(ledger, seeds)
@@ -486,7 +539,10 @@ def _decide(ledger: _Ledger, memory: Memory) -> _Decision:
         if len(refiners) == 1:
             refiner = refiners[0]
             proof = ledger.proofs.get((refiner.candidate_index, memory.id))
-            if proof is not None and proof.eligible:
+            if (
+                proof is not None and proof.eligible
+                and (refiner.candidate_index, memory.id) not in ledger.unverified_revisions
+            ):
                 return _Decision(
                     ReconcileOperation(
                         action=ReconcileAction.UPDATE,

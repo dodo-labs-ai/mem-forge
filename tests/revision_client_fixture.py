@@ -145,6 +145,18 @@ class RevisionClientFixture:
     def request_tokens(self, prompt, **kwargs):
         return len(prompt)
 
+    # What Refinement verification answers for every pair; verification scenarios change it.
+    refinement_answer = "preserves"
+
+    async def verify_refinements(self, prompt, **kwargs):
+        """Answer the one verified pair with ``refinement_answer``."""
+        from memforge.llm.structured import RefinementVerificationDecision, RefinementVerificationResponse
+
+        self.verified_prompts = [*getattr(self, "verified_prompts", ()), prompt]
+        return RefinementVerificationResponse(
+            decisions=[RefinementVerificationDecision(pair_index=0, answer=self.refinement_answer)],
+        )
+
     async def admit_candidates(self, prompt, **kwargs):
         """Admit every Candidate; admission scenarios have their own contract tests."""
         from tests.llm_fixture import admit_every_candidate
