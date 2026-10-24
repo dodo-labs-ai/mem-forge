@@ -1238,7 +1238,8 @@ def eval_seed_support_cases(ctx: click.Context, spec_path: Path, workspace_id: s
 
     The spec names ``selection_policy_version``, an optional ``role`` and the
     ``cases``, each a ``doc_id`` with its ``rubric`` (``expected_support``:
-    Memory id to ``supported`` or ``unsupported``) and, to pin an update other
+    Memory id to ``supported`` or ``unsupported``, or ``expected_support_terms``:
+    a term the claims hold to a label) and, to pin an update other
     than the latest one the model judged Support in, its ``derivation_id``.
     Requires a maintenance operator.
     """

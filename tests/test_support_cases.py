@@ -20,6 +20,7 @@ from memforge.evals.offline_evaluation import (
     PinnedSupportInput,
     SourceUnitSupportReplayExecutor,
     deterministic_checks,
+    rubric_memory_labels,
 )
 from memforge.evals.source_unit_support_cases import SupportCaseRequest, seed_source_unit_support_cases
 from memforge.derivation_work import DerivationWork
@@ -242,6 +243,48 @@ async def test_a_rubric_names_only_pinned_memories_with_a_known_label(db) -> Non
         await _seed(db, synced, rubric={"expected_support": {"memory-9": "supported"}})
     with pytest.raises(ValueError, match="labels must be one of"):
         await _seed(db, synced, rubric={"expected_support": {"memory-0": "kept"}})
+
+
+async def test_a_term_labels_every_pinned_memory_whose_claim_holds_it(db) -> None:
+    synced = Synced()
+    await synced.run(Client(limit=16000))
+    [pinned] = (await _seed(db, synced, rubric={"expected_support_terms": {"Reviewers": "supported"}})).cases
+    case = await db.get_agent_evaluation_case(pinned.case_id)
+    output = {
+        "supports": [
+            {"memory_id": "memory-0", "evidence_unit_id": "eu-memory-0", "result": "supported"},
+            {"memory_id": "memory-1", "evidence_unit_id": "eu-memory-1", "result": "unsupported"},
+        ],
+    }
+
+    checks = deterministic_checks(
+        case, _ground_truth(case, {"expected_support_terms": {"reviewers": "supported", "EU": "unsupported"}}), output,
+    )
+
+    assert [(check.criterion, check.label, check.reason_code, check.item_id) for check in checks[1:]] == [
+        ("support_label", DeterministicCheckLabel.UNKNOWN, "term_unmatched", "term:EU"),
+        ("support_label", DeterministicCheckLabel.PASS, "supported:supported", "memory-0:eu-memory-0"),
+        ("support_label", DeterministicCheckLabel.FAIL, "supported:unsupported", "memory-1:eu-memory-1"),
+    ]
+    with pytest.raises(ValueError, match="labelled both"):
+        await _seed(db, synced, rubric={
+            "expected_support": {"memory-0": "unsupported"}, "expected_support_terms": {"releases": "supported"},
+        })
+
+
+def test_a_term_matches_a_whole_word_and_inside_unspaced_script() -> None:
+    claims = {
+        "api": "The API rate limit is 100.",
+        "rapid": "Rapid releases ship weekly.",
+        "retry": "失败任务重试三次后进入 kestrel-dlq。",
+    }
+
+    labels, unmatched = rubric_memory_labels(
+        {}, {"api": "supported", "重试": "unsupported", "kestrel-dlq": "unsupported", "dlq-x": "supported"}, claims,
+    )
+
+    assert labels == {"api": "supported", "retry": "unsupported"}
+    assert unmatched == ("dlq-x",)
 
 
 @pytest.mark.parametrize(

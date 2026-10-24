@@ -1159,8 +1159,8 @@ class DerivationCasesSeedRequest(BaseModel):
 class SupportCaseRequest(BaseModel):
     """One synced Document whose applied update to pin as a Support case, by ``doc_id`` or by ``title``
     within ``source_id``. ``derivation_id`` names the update; without it, the Document's latest applied
-    update whose Support the model judged is pinned. The rubric's ``expected_support`` maps Memory ids to
-    ``supported`` or ``unsupported``."""
+    update whose Support the model judged is pinned. The rubric labels Memories ``supported`` or
+    ``unsupported``: ``expected_support`` by Memory id, ``expected_support_terms`` by a term their claims hold."""
 
     model_config = ConfigDict(extra="forbid")
 
