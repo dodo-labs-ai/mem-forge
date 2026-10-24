@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
@@ -3020,7 +3021,7 @@ def deterministic_checks(
                     reason_code="support_output_invalid",
                 ),
             )
-        checks.extend(_support_label_checks(ground_truth.rubric, results))
+        checks.extend(_support_label_checks(ground_truth.rubric, results, _support_claims(case.manifest)))
         pinned_reading = case.manifest.get("reads_images")
         if isinstance(pinned_reading, bool) and output.get("reads_images") is not pinned_reading:
             # A model that reads images differently reads other content than the judged one.
@@ -3192,19 +3193,80 @@ def _support_results(output: Mapping[str, object]) -> list[tuple[str, str, str]]
     return results
 
 
+def _term_pattern(term: str) -> re.Pattern[str]:
+    """Match ``term`` as a whole word, ignoring case.
+
+    Only an ASCII letter, digit or underscore bounds a word, so a term in a
+    script written without spaces, such as Chinese, matches inside a sentence.
+    """
+
+    def bounded(char: str) -> bool:
+        return char.isascii() and (char.isalnum() or char == "_")
+
+    return re.compile(
+        ("(?<![A-Za-z0-9_])" if bounded(term[0]) else "")
+        + re.escape(term)
+        + ("(?![A-Za-z0-9_])" if bounded(term[-1]) else ""),
+        re.IGNORECASE,
+    )
+
+
+def rubric_memory_labels(
+    by_id: Mapping[str, object], by_term: Mapping[str, object], claims: Mapping[str, str],
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Each labelled Memory's label and the terms no claim holds.
+
+    A rubric names a Memory by its id, or by a term its claim holds; a term
+    names every such Memory. Synthetic cohorts use terms because a fresh install
+    extracts new Memory ids on every run. A Memory given two different labels is
+    rejected.
+    """
+
+    labels = {str(memory_id): str(label) for memory_id, label in by_id.items()}
+    unmatched = []
+    for term, label in by_term.items():
+        pattern = _term_pattern(str(term))
+        named = [memory_id for memory_id, claim in claims.items() if pattern.search(claim)]
+        if not named:
+            unmatched.append(str(term))
+        for memory_id in named:
+            if labels.setdefault(memory_id, str(label)) != str(label):
+                raise ValueError(f"Memory {memory_id} is labelled both {labels[memory_id]} and {label}")
+    return labels, tuple(unmatched)
+
+
+def _support_claims(manifest: Mapping[str, object]) -> dict[str, str]:
+    return {
+        str(_mapping(item, "memory").get("id")): str(_mapping(item, "memory").get("content") or "")
+        for item in _mapping_list(manifest, "work_items")
+    }
+
+
 def _support_label_checks(
-    rubric: Mapping[str, object], results: Sequence[tuple[str, str, str]],
+    rubric: Mapping[str, object], results: Sequence[tuple[str, str, str]], claims: Mapping[str, str],
 ) -> list[DeterministicCheck]:
     """Check each pinned Support of a labelled Memory; an unlabelled one found unsupported needs review.
 
     A Memory's label applies to each of its pinned Supports. A Support that
     holds is ``supported`` whether it was read or bound unchanged; one left
-    unresolved cannot be judged against its label.
+    unresolved cannot be judged against its label. A label term that no pinned
+    claim holds cannot be judged either.
     """
 
-    expected = rubric.get("expected_support")
-    expected = expected if isinstance(expected, Mapping) else {}
-    checks = []
+    expected, unmatched = rubric_memory_labels(
+        rubric.get("expected_support") or {},
+        rubric.get("expected_support_terms") or {},
+        claims,
+    )
+    checks = [
+        DeterministicCheck(
+            criterion=SUPPORT_LABEL_CRITERION,
+            label=DeterministicCheckLabel.UNKNOWN,
+            reason_code="term_unmatched",
+            item_id=f"term:{term}",
+        )
+        for term in unmatched
+    ]
     for memory_id, evidence_unit_id, result in results:
         item_id = f"{memory_id}:{evidence_unit_id}"
         actual = (
@@ -3517,14 +3579,22 @@ def _validate_rubric(
     if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION:
         _validate_derivation_rubric(rubric)
     if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_SUPPORT:
-        expected = rubric.get("expected_support")
-        if not isinstance(expected, Mapping):
-            raise ValueError("Support rubric requires expected_support, a mapping of Memory id to label")
-        memory_ids = {str(_mapping(item, "memory").get("id")) for item in _mapping_list(case.manifest, "work_items")}
-        if not set(expected) <= memory_ids:
+        expected = rubric.get("expected_support", {})
+        terms = rubric.get("expected_support_terms", {})
+        if not isinstance(expected, Mapping) or not isinstance(terms, Mapping) or not (
+            "expected_support" in rubric or "expected_support_terms" in rubric
+        ):
+            raise ValueError(
+                "Support rubric requires expected_support (Memory id to label) or expected_support_terms (term to label)"
+            )
+        claims = _support_claims(case.manifest)
+        if not set(expected) <= set(claims):
             raise ValueError("expected_support names only pinned Memories")
-        if any(label not in SUPPORT_LABELS for label in expected.values()):
-            raise ValueError("expected_support labels must be one of " + ", ".join(sorted(SUPPORT_LABELS)))
+        if any(not isinstance(term, str) or not term.strip() for term in terms):
+            raise ValueError("expected_support_terms terms must be non-empty strings")
+        if any(label not in SUPPORT_LABELS for label in [*expected.values(), *terms.values()]):
+            raise ValueError("Support labels must be one of " + ", ".join(sorted(SUPPORT_LABELS)))
+        rubric_memory_labels(expected, terms, claims)
     if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION:
         forbidden = rubric.get("forbidden_destructive_memory_ids", [])
         if not isinstance(forbidden, list):
