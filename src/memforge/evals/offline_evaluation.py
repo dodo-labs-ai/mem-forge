@@ -3271,15 +3271,19 @@ def _term_pattern(term: str) -> re.Pattern[str]:
 def rubric_memory_labels(
     by_id: Mapping[str, object], by_term: Mapping[str, object], claims: Mapping[str, str],
 ) -> tuple[dict[str, str], tuple[str, ...]]:
-    """Each labelled Memory's label and the terms no claim holds.
+    """Each labelled Memory's Support label and the terms no claim holds.
 
     A rubric names a Memory by its id, or by a term its claim holds; a term
     names every such Memory. Synthetic cohorts use terms because a fresh install
-    extracts new Memory ids on every run. A Memory given two different labels is
-    rejected.
+    extracts new Memory ids on every run, and a model may write two labelled
+    facts into one claim. A claim is supported only when every fact it holds
+    is, so a Memory any of its terms labels ``unsupported`` is unsupported. An
+    id label is the maintainer's word for one Memory; a term label that
+    contradicts it is rejected.
     """
 
     labels = {str(memory_id): str(label) for memory_id, label in by_id.items()}
+    by_terms: dict[str, set[str]] = {}
     unmatched = []
     for term, label in by_term.items():
         pattern = _term_pattern(str(term))
@@ -3287,8 +3291,11 @@ def rubric_memory_labels(
         if not named:
             unmatched.append(str(term))
         for memory_id in named:
-            if labels.setdefault(memory_id, str(label)) != str(label):
-                raise ValueError(f"Memory {memory_id} is labelled both {labels[memory_id]} and {label}")
+            by_terms.setdefault(memory_id, set()).add(str(label))
+    for memory_id, term_labels in by_terms.items():
+        label = "unsupported" if "unsupported" in term_labels else "supported"
+        if labels.setdefault(memory_id, label) != label:
+            raise ValueError(f"Memory {memory_id} is labelled {labels[memory_id]} by id and {label} by its terms")
     return labels, tuple(unmatched)
 
 
