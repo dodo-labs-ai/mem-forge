@@ -133,6 +133,22 @@ def test_the_seed_request_names_each_document_within_the_smoke_source(tmp_path: 
         smoke.quality_seed_spec(COHORT, smoke.State(tmp_path / "empty.json"), kind)
 
 
+def test_a_revision_sync_waits_past_the_run_that_finished_before(tmp_path: Path, monkeypatch) -> None:
+    runs = iter(["run-1", "run-1", "run-2"])
+    monkeypatch.setattr(smoke.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(smoke, "_source", lambda _api, _source_id: {
+        "sync": {"run_id": next(runs, "run-2"), "status": "success"}, "doc_count": 6, "memory_count": 11,
+    })
+    state = smoke.State(tmp_path / "state.json")
+    state.set(source_id="src-smoke", sync_run_id="run-1")
+
+    smoke.wait_for_sync("http://api", state, timeout=5, new_run=True)
+
+    assert state.get("sync_run_id") == "run-2"
+    with pytest.raises(smoke.CheckFailed, match="no earlier sync run"):
+        smoke.wait_for_sync("http://api", smoke.State(tmp_path / "fresh.json"), timeout=5, new_run=True)
+
+
 def test_the_run_spec_needs_every_case_pinned() -> None:
     import json
 
