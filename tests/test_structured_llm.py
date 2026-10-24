@@ -892,6 +892,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "extract_projection_fragment_memories": lambda: client.extract_projection_fragment_memories("prompt"),
         "admit_candidates": lambda: client.admit_candidates("prompt"),
         "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
+        "verify_refinements": lambda: client.verify_refinements("prompt"),
         "classify_cross_document_relations": lambda: client.classify_cross_document_relations("prompt"),
         "validate_entity_batch": lambda: client.validate_entity_batch("prompt"),
         "rerank_memories": lambda: client.rerank_memories("prompt"),
