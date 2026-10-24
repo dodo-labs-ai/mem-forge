@@ -126,7 +126,7 @@ export function SourceDetailDrawer({
       <SourceScopeTransitionSection source={source} activity={activity} />
 
       {isManagedSourceType(source.type) ? null : (
-        // Nothing writes to a managed source, so it has no sync runs or schedule.
+        // A managed source takes in no new content, so it has no sync runs or schedule.
         <DrawerSection title="Sync">
           <PropertyList
             items={[

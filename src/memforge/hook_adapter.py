@@ -10,7 +10,8 @@ only through the confirmed MCP ``create_memory`` tool.
 Hook contract: every invocation prints one JSON object with
 ``"continue": true`` and exits 0, so the hook can never block the coding
 client. That holds for an event other than ``SessionStart``, for unreadable
-hook input, and for any mode other than ``context``.
+hook input, and for any mode other than ``context``. The hook always reads its
+input to the end, so the client never writes into a closed pipe.
 
 Example::
 
@@ -78,7 +79,12 @@ def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     mode = arguments[0] if arguments else None
     try:
-        event_name = _event_name(_read_hook_payload()) if mode == CONTEXT_MODE else None
+        if mode == CONTEXT_MODE:
+            event_name = _event_name(_read_hook_payload())
+        else:
+            # Read and discard the payload so a client writing it never meets a closed pipe.
+            sys.stdin.read()
+            event_name = None
     except Exception:  # Unreadable hook input must not block the session.
         event_name = None
     if event_name == SESSION_START_EVENT:

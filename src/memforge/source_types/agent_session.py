@@ -1,4 +1,4 @@
-"""Agent sessions: private Agent Knowledge kept for one coding client and owner."""
+"""Agent sessions: private memories kept from earlier Codex or Claude Code sessions."""
 
 from __future__ import annotations
 

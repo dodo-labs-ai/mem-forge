@@ -1,10 +1,15 @@
 """Private Agent Knowledge Bundle claims.
 
 An agent-session Source holds private concept claims and the Memories they
-back. MemForge no longer derives new claims from coding sessions; this module
-owns the claims that exist: the patch boundary that turns a structured patch
-proposal into stable concept claims and Memories, and the correction and
-retirement lifecycle of those Memories.
+back. Coding sessions add no new claims; agents save memory only through the
+confirmed MCP ``create_memory`` tool. The owner's corrections and retirements
+of claim Memories still run through this module's claim lifecycle, which keeps
+each claim, its concept Markdown and its Memory consistent.
+
+``AgentKnowledgeBundleService.apply_patch_proposal`` is the boundary that
+turns a structured patch proposal into stable concept claims and Memories. It
+creates the claims that the correction and retirement lifecycle acts on, and
+the lifecycle tests use it to seed them.
 """
 
 from __future__ import annotations
@@ -76,9 +81,8 @@ from memforge.pipeline.projection_fragments import (
 from memforge.pipeline.source_projection_adapters import project_source_item
 
 
-# The managed agent patch contract: the generated patch fields and the prompt
-# that asks for them. It is the classifier version of every relation a patch
-# writes and is recorded with every processed agent-session window.
+# The agent patch contract version. It is recorded as the classifier version of
+# every relation a patch writes.
 AGENT_SESSION_INTENT_CONTRACT = "agent_session_intent_v2"
 
 # Program-owned reasons recorded when an agent patch carries no reason of its own.
@@ -264,7 +268,7 @@ class AgentKnowledgeBundleService:
         ``owner_user_id`` and the same ``repo_identifier``.
         ``source_updated_at`` is the time of the session event that authorizes
         the patch, the source time of the concept content it writes; None when
-        that event carries no time. ``submitted_at`` is when the window arrived.
+        that event carries no time. ``submitted_at`` is when the proposal was submitted.
         """
 
         submitted_at = _utc(submitted_at)

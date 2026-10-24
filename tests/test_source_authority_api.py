@@ -83,14 +83,61 @@ def test_exact_sync_receipt_read_preserves_state_and_source_visibility(tmp_path)
         asyncio.run(database.close())
 
 
-def test_agent_session_owner_can_delete_it_but_not_configure_or_sync_it(tmp_path):
+async def _seed_agent_claim_memory(database: Database, *, source_id: str, owner_user_id: str) -> str:
+    """Store one agent-session claim and its Memory, as earlier releases did, and return the Memory id."""
+    from memforge.agent_knowledge import AgentKnowledgeBundleService
+    from memforge.memory.store import MemoryStore
+    from memforge.storage.adapters.sqlite import build_sqlite_adapters
+    from tests.embedding_fixture import unconfigured_embedding
+    from tests.test_agent_knowledge_bundle import RecordingCollection, _proposal
+
+    adapters = build_sqlite_adapters(database, RecordingCollection())
+    store = MemoryStore(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embedding=unconfigured_embedding(),
+    )
+
+    async def embed(_text: str) -> list[float]:
+        return [0.1]
+
+    store._embed = embed
+    result = await AgentKnowledgeBundleService(db=database, memory_store=store).apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id=owner_user_id,
+        source_id=source_id,
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/mem-forge",
+        repo_identifier="github.example.test/platform/mem-forge",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+    assert result.outcome == "applied"
+    return result.memory_id
+
+
+def test_agent_session_owner_can_delete_it_but_not_configure_or_sync_it(tmp_path, monkeypatch):
+    from memforge.memory.store import MemoryStore
     from tests.agent_session_fixture import seed_agent_session_source
 
+    cascaded_sources: list[str] = []
+    delete_source_cascade = MemoryStore.delete_source_cascade
+
+    async def record_cascade(self, source_id, **kwargs):
+        cascaded_sources.append(source_id)
+        return await delete_source_cascade(self, source_id, **kwargs)
+
+    monkeypatch.setattr(MemoryStore, "delete_source_cascade", record_cascade)
     database = _connect_database(tmp_path)
     owner = {"x-test-user": "owner-user", "x-test-workspace-role": "member"}
     admin = {"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"}
     try:
         source = asyncio.run(seed_agent_session_source(database, client="codex", owner_user_id="owner-user"))
+        memory_id = asyncio.run(
+            _seed_agent_claim_memory(database, source_id=source["id"], owner_user_id="owner-user")
+        )
         url = f"/api/v1/sources/{source['id']}"
         with TestClient(_app(tmp_path, database)) as client:
             owner_rows = client.get("/api/v1/sources", headers=owner).json()["data"]
@@ -113,6 +160,9 @@ def test_agent_session_owner_can_delete_it_but_not_configure_or_sync_it(tmp_path
         assert deleted.status_code == 200, deleted.text
         assert deleted.json() == {"ok": True, "deleted_source": source["id"]}
         assert asyncio.run(database.get_source(source["id"]))["status"] == "retired"
+        assert cascaded_sources == [source["id"]]
+        memory = asyncio.run(database.get_memory(memory_id))
+        assert (memory.status, memory.retirement_reason) == ("retired", "source_deleted")
     finally:
         asyncio.run(database.close())
 
