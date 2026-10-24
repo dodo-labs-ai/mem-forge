@@ -228,11 +228,11 @@ async def paged_by_cursor(
         from memforge.genes.toolkit.paging import CursorPage, paged_by_cursor
 
         async def fetch(cursor: str | None) -> CursorPage[dict]:
-            body = {"page_size": 100} | ({"start_cursor": cursor} if cursor else {})
-            data = (await client.post("/v1/search", json=body)).json()
+            params = {"page_size": 100} | ({"start_cursor": cursor} if cursor else {})
+            data = (await client.get(f"/v1/blocks/{block_id}/children", params=params)).json()
             return CursorPage(items=data["results"], has_more=data["has_more"], next_cursor=data["next_cursor"])
 
-        async for result in paged_by_cursor(fetch):
+        async for block in paged_by_cursor(fetch):
             ...
     """
     cursor: str | None = None

@@ -3385,6 +3385,30 @@ def test_logging_without_a_terminal_writes_one_plain_line_per_record(monkeypatch
     assert "│" not in err
 
 
+@pytest.mark.parametrize("verbose", [False, True])
+def test_logging_keeps_httpx_request_lines_and_their_signed_queries_out(monkeypatch, capsys, verbose):
+    from rich.console import Console
+
+    import memforge.main as main_module
+
+    monkeypatch.setattr(main_module, "log_console", Console(stderr=True, force_terminal=False))
+    root = logging.getLogger()
+    httpx_logger = logging.getLogger("httpx")
+    previous_handlers, previous_level, previous_httpx_level = root.handlers[:], root.level, httpx_logger.level
+    try:
+        main_module.setup_logging(verbose=verbose)
+        httpx_logger.info('HTTP Request: GET https://files.example/c.png?X-Amz-Signature=SECRET "HTTP/1.1 200 OK"')
+        httpx_logger.warning("httpx warning still shows")
+    finally:
+        root.handlers = previous_handlers
+        root.setLevel(previous_level)
+        httpx_logger.setLevel(previous_httpx_level)
+
+    err = capsys.readouterr().err
+    assert "SECRET" not in err
+    assert "httpx warning still shows" in err
+
+
 @pytest.mark.asyncio
 async def test_a_conversation_run_syncs_within_its_collection_attempt_and_then_drops_its_bodies(db, tmp_path):
     from memforge.conversations.collections import CollectedBody, StoredCollections
