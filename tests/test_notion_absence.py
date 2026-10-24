@@ -163,6 +163,26 @@ async def test_rediscover_reaches_a_row_of_a_database_nested_in_a_wiki() -> None
     assert f"notion-{row}" in (await gene.list_scope()).doc_ids
 
 
+@pytest.mark.parametrize("container", ["column", "toggle"])
+@pytest.mark.parametrize("parented_to", ["block", "page"])
+async def test_the_walk_and_rediscover_agree_on_a_database_inside_a_column_or_toggle(container, parented_to) -> None:
+    fake = NotionFake()
+    root = fake.add_page("Root")
+    holder = (
+        fake.add_block(fake.add_block(root, "column_list"), "column")
+        if container == "column"
+        else fake.add_block(root, "toggle")
+    )
+    database, (source,) = fake.add_database(holder if parented_to == "block" else root, named_by=holder)
+    row = fake.add_row(database, source, "Row")
+    gene = await connect(fake, root_pages=[root])
+
+    assert f"notion-{row}" in (await gene.list_scope()).doc_ids
+    found = await gene.rediscover(stored(row))
+    assert found is not None
+    assert found.extra == {"page_id": row, "parent_page_id": database, "parent_kind": "database"}
+
+
 async def test_rediscover_climbs_through_a_parent_turned_into_a_wiki() -> None:
     fake = NotionFake()
     root = fake.add_page("Root")
