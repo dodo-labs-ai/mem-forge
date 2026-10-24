@@ -1221,6 +1221,7 @@ class MemoryEngine:
                         llm_model=self.llm_model,
                         recheck=recheck,
                         rechecked_pairs=ledger.carried_pairs,
+                        relation_complete=relation_complete,
                     )
                     supports = dict(result.supports)
             finally:

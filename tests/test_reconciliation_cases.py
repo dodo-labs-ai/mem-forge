@@ -127,6 +127,7 @@ async def test_each_incumbent_reports_what_the_validated_operations_do_to_it(db,
 
     assert output["failure"] is None
     assert output["outcomes"] == {"friday": outcome}
+    assert output["metrics"]["refinement_verification_count"] == (1 if outcome == "revised" else 0)
 
 
 async def test_a_removal_waits_for_a_complete_relation_line(db) -> None:

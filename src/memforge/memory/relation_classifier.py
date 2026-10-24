@@ -151,7 +151,7 @@ async def run_pair_items(runner: LlmBatchRunner, task: ItemTask, *, pair_count: 
     results = []
     for outcome in (await _pair_outcomes(runner, task, pair_count=pair_count, label=label)).values():
         if isinstance(outcome, ItemFailure):
-            raise _classification_error(outcome, pair_count=pair_count, stats=runner.stats)
+            raise _classification_error(outcome, pair_count=pair_count, stats=runner.stats, label=label)
         results.append(outcome[0])
     return results
 
@@ -172,12 +172,12 @@ async def judge_pair_items(
         elif outcome.unjudgeable:
             unjudged.append(UnjudgedPair(pairs[int(item_id)], outcome))
         else:
-            raise _classification_error(outcome, pair_count=len(pairs), stats=runner.stats)
+            raise _classification_error(outcome, pair_count=len(pairs), stats=runner.stats, label=label)
     return results, tuple(unjudged)
 
 
 def _classification_error(
-    failure: ItemFailure, *, pair_count: int, stats: BatchStats,
+    failure: ItemFailure, *, pair_count: int, stats: BatchStats, label: str,
 ) -> MemoryPairClassificationError:
     """Report one unfinished relation item with the usage spent on the whole ledger."""
 
@@ -185,7 +185,7 @@ def _classification_error(
     detail = f": {error}" if error is not None else ""
     provider = error if isinstance(error, StructuredLlmError) else None
     return MemoryPairClassificationError(
-        f"memory relation classification failed ({failure.error_code}){detail}",
+        f"{label} failed ({failure.error_code}){detail}",
         pair_count=pair_count,
         llm_calls=stats.calls,
         prompt_chars=stats.prompt_chars,
