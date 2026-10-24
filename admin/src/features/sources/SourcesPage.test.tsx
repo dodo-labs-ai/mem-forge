@@ -124,7 +124,7 @@ test.each([
   }
 });
 
-test("an agent-session source's drawer shows its last delivered session, not a sync status it cannot have", async () => {
+test("an agent-session source's drawer shows when a session window was last processed, not a sync status it cannot have", async () => {
   const source = makeSource({
     id: "src-claude",
     type: "agent_session",
@@ -150,8 +150,7 @@ test("an agent-session source's drawer shows its last delivered session, not a s
   const table = await screen.findByRole("table", { name: "Sources" });
   await userEvent.click(await within(table).findByText("Claude Code Session"));
   const drawer = await screen.findByRole("dialog", { name: "Claude Code Session" });
-  expect(within(drawer).getByRole("heading", { name: "Sessions" })).toBeInTheDocument();
-  expect(within(drawer).getByText("Last session")).toBeInTheDocument();
+  expect(await within(drawer).findByText("Last window processed")).toBeInTheDocument();
   expect(within(drawer).queryByRole("heading", { name: "Sync" })).not.toBeInTheDocument();
   for (const text of ["Not synced yet", "Status", "Last sync", "Schedule", "Manual only"]) {
     expect(within(drawer).queryByText(text)).not.toBeInTheDocument();
@@ -168,7 +167,7 @@ test("a synced source's drawer keeps its sync status, last sync and schedule", a
   for (const text of ["Status", "Last sync", "Schedule"]) {
     expect(within(drawer).getByText(text)).toBeInTheDocument();
   }
-  expect(within(drawer).queryByText("Last session")).not.toBeInTheDocument();
+  expect(within(drawer).queryByText("Last window processed")).not.toBeInTheDocument();
 });
 
 test("Add source opens the type picker in the app", async () => {

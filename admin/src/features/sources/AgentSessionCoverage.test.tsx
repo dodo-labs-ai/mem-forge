@@ -1,6 +1,7 @@
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { expect, test } from "vitest";
+import { formatDateTime } from "@/lib/format";
 import { errorResponse } from "@/test/fakeApi";
 import { renderWithApi } from "@/test/renderWithApi";
 import { makeSource } from "@/test/sourceFixtures";
@@ -39,6 +40,7 @@ test("shows how the session windows turned out and the projects their memories w
   expect(screen.getByText("12")).toBeInTheDocument();
   expect(screen.getByText("Kept as memory").nextSibling).toHaveTextContent("4");
   expect(screen.getByText("Skipped as low-signal").nextSibling).toHaveTextContent("8");
+  expect(within(screen.getByText("Last window processed").nextSibling as HTMLElement).getByTitle(formatDateTime(SOURCE.last_sync!))).toBeInTheDocument();
   expect(screen.getByText("1 window failed")).toBeInTheDocument();
   expect(screen.getByText(/The model timed out\./)).toBeInTheDocument();
 
@@ -54,7 +56,7 @@ test("shows how the session windows turned out and the projects their memories w
 });
 
 test("a source no window has reached yet says so and warns about nothing", async () => {
-  renderWithApi(<AgentSessionCoverage source={SOURCE} />, {
+  renderWithApi(<AgentSessionCoverage source={{ ...SOURCE, last_sync: null }} />, {
     "GET /api/v1/agent-sessions/completeness": () =>
       completeness({ total: 0, processed_total: 0, counts: { knowledge_patched: 0, no_output: 0, failed: 0 }, latest_failure: null }),
     "GET /api/v1/sources/src-codex/projects": () => ({ source_id: "src-codex", projects: [] }),
@@ -63,6 +65,7 @@ test("a source no window has reached yet says so and warns about nothing", async
 
   expect(await screen.findByText("No session has been kept yet.")).toBeInTheDocument();
   expect(await screen.findByText("Windows processed")).toBeInTheDocument();
+  expect(screen.getByText("Last window processed").nextSibling).toHaveTextContent("None yet");
   expect(screen.queryByText(/failed/)).not.toBeInTheDocument();
 });
 

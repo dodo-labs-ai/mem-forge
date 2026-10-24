@@ -145,20 +145,8 @@ export function SourceDetailDrawer({
 
       <SourceScopeTransitionSection source={source} activity={activity} />
 
-      {isManagedSourceType(source.type) ? (
-        // Its plugin delivers the sessions, so the source has no sync runs or schedule.
-        <DrawerSection title="Sessions">
-          <PropertyList
-            items={[
-              {
-                label: "Last session",
-                value: source.last_sync ? formatRelative(source.last_sync) : "None yet",
-                hint: source.last_sync ? formatDateTime(source.last_sync) : undefined,
-              },
-            ]}
-          />
-        </DrawerSection>
-      ) : (
+      {isManagedSourceType(source.type) ? null : (
+        // A managed source's plugin delivers its content, so it has no sync runs or schedule.
         <DrawerSection title="Sync">
           <PropertyList
             items={[
