@@ -9,7 +9,7 @@ export interface RailStep {
   complete?: boolean;
   /** How many inputs of the step need correcting. */
   errorCount?: number;
-  /** One quiet line under a completed step, such as the site it connects to. */
+  /** One quiet line under a completed step, such as the site it connects to; a long one is cut short, whole in its tooltip. */
   summary?: string;
 }
 
@@ -58,7 +58,7 @@ export function StepRail({ steps, current, onSelect, "aria-label": label, classN
   }
 
   return (
-    <nav aria-label={label} className={className}>
+    <nav aria-label={label} className={cn("min-w-0", className)}>
       <ol className="space-y-0.5">
         {steps.map((step, index) => {
           const isCurrent = step.key === current;
@@ -100,7 +100,9 @@ export function StepRail({ steps, current, onSelect, "aria-label": label, classN
                   {errors > 0 ? (
                     <span className="block text-xs text-tone-danger-foreground">{issueText(errors)}</span>
                   ) : step.complete && step.summary ? (
-                    <span className="block truncate text-xs text-muted-foreground">{step.summary}</span>
+                    <span className="block truncate text-xs text-muted-foreground" title={step.summary}>
+                      {step.summary}
+                    </span>
                   ) : null}
                 </span>
               </button>

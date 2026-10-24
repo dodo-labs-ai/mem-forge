@@ -10,7 +10,8 @@ import type { Source } from "./model/types";
 /**
  * The drawer's "Session coverage" for an agent-session Source: how the
  * session windows its plugin sent turned out (kept as memory, skipped as
- * low-signal, failed), and the projects the kept ones were filed under.
+ * low-signal, failed), when one was last processed, and the projects the
+ * kept ones were filed under.
  */
 export function AgentSessionCoverage({ source }: { source: Source }) {
   const completeness = useAgentSessionCompleteness(source.id);
@@ -34,6 +35,14 @@ export function AgentSessionCoverage({ source }: { source: Source }) {
               { label: "Windows processed", value: formatCount(completeness.data.processed_total) },
               { label: "Kept as memory", value: formatCount(completeness.data.counts.knowledge_patched) },
               { label: "Skipped as low-signal", value: formatCount(completeness.data.counts.no_output) },
+              {
+                label: "Last window processed",
+                value: source.last_sync ? (
+                  <span title={formatDateTime(source.last_sync)}>{formatRelative(source.last_sync)}</span>
+                ) : (
+                  "None yet"
+                ),
+              },
             ]}
           />
           <p className="text-sm text-muted-foreground">
@@ -60,18 +69,23 @@ export function AgentSessionCoverage({ source }: { source: Source }) {
         <p className="text-sm text-muted-foreground">No session has been kept yet.</p>
       ) : (
         <ul aria-label="Projects with memories from sessions" className="divide-y rounded-lg border">
-          {projects.data.map((project) => (
-            <li key={project.project} className="flex flex-wrap items-baseline gap-x-4 gap-y-0.5 p-3 text-sm">
-              <span className="min-w-0 flex-1 font-medium text-foreground">{projectNames.get(project.project) ?? project.project}</span>
-              <span className="text-muted-foreground">{pluralize(project.document_count, "summary", "summaries")}</span>
-              <span className="text-muted-foreground">{pluralize(project.memory_count, "memory", "memories")}</span>
-              {project.last_observed_at ? (
-                <span className="text-xs text-muted-foreground" title={formatDateTime(project.last_observed_at)}>
-                  {formatRelative(project.last_observed_at)}
+          {projects.data.map((project) => {
+            const name = projectNames.get(project.project) ?? project.project;
+            return (
+              <li key={project.project} className="flex flex-wrap items-baseline gap-x-4 gap-y-0.5 p-3 text-sm">
+                <span className="min-w-24 flex-1 truncate font-medium text-foreground" title={name}>
+                  {name}
                 </span>
-              ) : null}
-            </li>
-          ))}
+                <span className="whitespace-nowrap text-muted-foreground">{pluralize(project.document_count, "summary", "summaries")}</span>
+                <span className="whitespace-nowrap text-muted-foreground">{pluralize(project.memory_count, "memory", "memories")}</span>
+                {project.last_observed_at ? (
+                  <span className="whitespace-nowrap text-xs text-muted-foreground" title={formatDateTime(project.last_observed_at)}>
+                    {formatRelative(project.last_observed_at)}
+                  </span>
+                ) : null}
+              </li>
+            );
+          })}
         </ul>
       )}
     </DrawerSection>
