@@ -24,7 +24,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal, cast
+from typing import Any, Awaitable, Callable, Literal, NoReturn, cast
 from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, Request
@@ -2125,14 +2125,6 @@ class SourceConnectionStatusResponse(BaseModel):
     reason: SourceConnectionReason | None = None
 
 
-class UnrecognizedSessionLinesResponse(BaseModel):
-    """Transcript lines the agent client's plugin could not recognize in recent uploads."""
-
-    count: int
-    plugin_version: str | None
-    last_seen_at: str | None
-
-
 class SourceScopeTransitionResponse(BaseModel):
     """The scope change a Source is applying.
 
@@ -2233,13 +2225,6 @@ class SourceResponse(BaseModel):
     connection_status: SourceConnectionStatusResponse | None = Field(
         default=None,
         description="Readiness of a browser-session connection; present only for Sources that use one.",
-    )
-    unrecognized_session_lines: UnrecognizedSessionLinesResponse | None = Field(
-        default=None,
-        description=(
-            "Transcript lines the current plugin version could not recognize in recent uploads; "
-            "present only for agent-session Sources, null when every line was recognized."
-        ),
     )
     ownership: SourceOwnershipResponse
     capabilities: SourceCapabilitiesResponse
@@ -3414,72 +3399,40 @@ async def _require_complete_collection(intake: CollectionIntake, source_id: str,
         raise HTTPException(status_code=409, detail="conversation_bodies_incomplete")
 
 
-class AgentSessionOutcomeCountsResponse(BaseModel):
-    """How many processed windows kept a knowledge patch, kept nothing, or failed."""
-
-    knowledge_patched: int
-    no_output: int
-    failed: int
+AGENT_SESSION_CAPTURE_REMOVED_CODE = "agent_session_capture_removed"
+AGENT_SESSION_CAPTURE_REMOVED_MESSAGE = (
+    "MemForge no longer captures agent sessions automatically. Update the MemForge memory plugin."
+)
 
 
-class AgentSessionLatestFailureResponse(BaseModel):
-    """The failed windows, with the reason and time of the latest one."""
+class AgentSessionCaptureRemovedDetail(BaseModel):
+    """Why an automatic agent-session upload is refused, and what the user does next."""
 
-    count: int
-    reason: str | None
-    last_seen_at: str | None
+    code: Literal["agent_session_capture_removed"]
+    message: str
 
 
-class AgentSessionCompletenessResponse(BaseModel):
-    """Knowledge completeness of agent-session windows, computed on demand.
+class AgentSessionCaptureRemovedResponse(BaseModel):
+    """The ``410 Gone`` body of the removed agent-session capture routes.
 
-    ``processed_total`` counts the windows that were processed, patched or
-    not, and ``no_output_fraction`` is the share of them that kept nothing
-    (0 when none was processed). ``total`` also counts failed windows.
-    ``latest_failure`` is ``null`` when no window failed. ``source_id`` names
-    the Source read, and ``session_id`` echoes the session filter when the
-    request named one.
+    Example::
+
+        {"detail": {"code": "agent_session_capture_removed",
+                    "message": "MemForge no longer captures agent sessions automatically. "
+                               "Update the MemForge memory plugin."}}
     """
 
-    session_id: str | None
-    source_id: str
-    total: int
-    processed_total: int
-    counts: AgentSessionOutcomeCountsResponse
-    no_output_fraction: float
-    latest_failure: AgentSessionLatestFailureResponse | None
+    detail: AgentSessionCaptureRemovedDetail
 
 
-class AgentSessionWindowRequest(BaseModel):
-    schema_version: str = "agent-session-window/v1"
-    plugin_version: str | None = None
-    client: str
-    session_id: str
-    trigger: str
-    workspace: str
-    events: list[dict[str, Any]] = Field(default_factory=list)
-    history_window: dict[str, Any] = Field(default_factory=dict)
-    transcript_markdown: str | None = None
-    repo: str | None = None
-    branch: str | None = None
-    commit_sha: str | None = None
-    receipt: dict[str, Any] = Field(default_factory=dict)
-    retention: str = "none"
-    submitted_at: str | None = None
-    source_updated_at: str | None = None
-    process_now: bool = False
-
-
-class AgentHookReceiptRequest(BaseModel):
-    client: str
-    session_id: str
-    hook: str
-    workspace: str
-    repo: str | None = None
-    branch: str | None = None
-    commit_sha: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    submitted_at: str | None = None
+def _refuse_removed_agent_session_capture() -> NoReturn:
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": AGENT_SESSION_CAPTURE_REMOVED_CODE,
+            "message": AGENT_SESSION_CAPTURE_REMOVED_MESSAGE,
+        },
+    )
 
 
 class AgentHookContextRequest(BaseModel):
@@ -4946,21 +4899,6 @@ async def _build_lifecycle_service(
 ) -> MemoryLifecycleService:
     memory_store = await _build_memory_store(db, config, runtime_provider, audit_context=audit_context)
     return MemoryLifecycleService(db=db, memory_store=memory_store)
-
-
-async def _build_agent_session_window_client(
-    db: Database,
-    config: AppConfig,
-    runtime_provider: RuntimeProvider,
-):
-    """Build the request-scoped client through the active runtime adapter."""
-
-    from memforge.runtime import resolve_models
-
-    return runtime_provider.build_structured_llm_client(
-        await resolve_models(db, config),
-        max_concurrent=config.llm.enrichment_max_concurrent,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -7273,7 +7211,7 @@ def create_admin_app(
         )
 
         # Attach memory_count and sync status to each source
-        from memforge.agent_sessions import AGENT_SESSION_SOURCE_TYPE, recent_unrecognized_session_lines
+        from memforge.agent_sessions import AGENT_SESSION_SOURCE_TYPE
 
         jira_auth_service = JiraAuthSessionService(db)
         for s in sources:
@@ -7294,7 +7232,6 @@ def create_admin_app(
             # can pick a per-client brand mark without decoding opaque source ids.
             if s["type"] == AGENT_SESSION_SOURCE_TYPE:
                 s["client"] = original_config.get("client")
-                s["unrecognized_session_lines"] = await recent_unrecognized_session_lines(db, s["id"])
             else:
                 s["client"] = None
             if (
@@ -10036,132 +9973,38 @@ def create_admin_app(
         }
 
     # ===================================================================
-    # 4b. Agent Session Windows
+    # 4b. Removed agent-session capture
     # ===================================================================
 
-    @agent_session_router.get("/completeness", response_model=AgentSessionCompletenessResponse)
-    async def agent_session_completeness(
-        source_id: str,
-        request: Request,
-        session_id: str | None = None,
-        db: Database = Depends(get_db),
-    ):
-        """Return one Source's window outcome counts and no_output fraction on demand.
+    @agent_session_router.post(
+        "/windows",
+        status_code=410,
+        deprecated=True,
+        responses={410: {"model": AgentSessionCaptureRemovedResponse}},
+    )
+    async def refuse_agent_session_window() -> None:
+        """Refuse an automatic session-window upload from an earlier memory plugin.
 
-        ``session_id`` narrows the read to one session of that Source. The
-        receipts carry failure reasons, so a Source the caller cannot discover
-        answers 404 like an unknown one.
+        MemForge no longer captures agent sessions. The route reads no body,
+        creates no Source, calls no model and takes no Source activity; it
+        answers ``410`` with ``agent_session_capture_removed`` so the upload
+        stops at the plugin. It is removed in the next release.
         """
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_discoverability(request, source)
-        return await db.summarize_agent_session_outcomes(session_id=session_id, source_id=source_id)
+        _refuse_removed_agent_session_capture()
 
-    @agent_session_router.post("/windows")
-    async def submit_agent_session_window_summary(
-        req: AgentSessionWindowRequest,
-        request: Request,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
-    ):
-        """Submit a client transcript window for private agent-knowledge patching."""
-        from memforge.agent_sessions import (
-            AGENT_SESSION_LLM_FAILED_CODE,
-            AGENT_SESSION_WINDOW_RETRY_AFTER_SECONDS,
-            AgentSessionWindowLlmError,
-            agent_session_source_id,
-            submit_agent_session_window,
-        )
+    @hook_router.post(
+        "/receipts",
+        status_code=410,
+        deprecated=True,
+        responses={410: {"model": AgentSessionCaptureRemovedResponse}},
+    )
+    async def refuse_agent_hook_receipt() -> None:
+        """Refuse a turn-end hook receipt from an earlier memory plugin.
 
-        if req.schema_version != "agent-session-window/v1":
-            raise HTTPException(status_code=400, detail=f"unsupported schema_version: {req.schema_version}")
-
-        owner_user_id = resolve_request_principal(request)
-        await _raise_if_source_paused(
-            db,
-            agent_session_source_id(req.client, owner_user_id),
-        )
-
-        structured_client = getattr(request.app.state, "agent_session_window_client", None)
-        if structured_client is None:
-            structured_client = await _build_agent_session_window_client(
-                db,
-                config,
-                runtime_provider,
-            )
-        memory_store = await _build_memory_store(db, config, runtime_provider)
-
-        try:
-            result = await submit_agent_session_window(
-                db=db,
-                config=config,
-                memory_store=memory_store,
-                structured_llm_client=structured_client,
-                client=req.client,
-                session_id=req.session_id,
-                trigger=req.trigger,
-                workspace=req.workspace,
-                events=req.events,
-                history_window=req.history_window,
-                transcript_markdown=req.transcript_markdown,
-                repo=req.repo,
-                branch=req.branch,
-                commit_sha=req.commit_sha,
-                receipt=req.receipt,
-                plugin_version=req.plugin_version,
-                retention=req.retention,
-                submitted_at=req.submitted_at,
-                source_updated_at=req.source_updated_at,
-                process_now=req.process_now,
-                user_id=owner_user_id,
-            )
-        except SourceActivityConflict as e:
-            raise HTTPException(status_code=409, detail=str(e)) from e
-        except AgentSessionWindowLlmError as e:
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "code": AGENT_SESSION_LLM_FAILED_CODE,
-                    "category": e.category,
-                    "error_code": e.error_code,
-                    "message": str(e),
-                },
-                headers={"Retry-After": str(AGENT_SESSION_WINDOW_RETRY_AFTER_SECONDS)},
-            ) from e
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-
-        return {
-            **result,
-            "sync_started": False,
-            "sync_queued": False,
-        }
-
-    @hook_router.post("/receipts")
-    async def record_agent_hook_receipt(
-        req: AgentHookReceiptRequest,
-        db: Database = Depends(get_db),
-    ):
-        """Record a coding-agent lifecycle hook without creating a source document."""
-        from memforge.agent_sessions import submit_agent_hook_receipt as record_hook_receipt
-
-        try:
-            return await record_hook_receipt(
-                db=db,
-                client=req.client,
-                session_id=req.session_id,
-                hook=req.hook,
-                workspace=req.workspace,
-                repo=req.repo,
-                branch=req.branch,
-                commit_sha=req.commit_sha,
-                metadata=req.metadata,
-                submitted_at=req.submitted_at,
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        Same contract as ``POST /api/v1/agent-sessions/windows``: no body is
+        read and nothing is recorded. It is removed in the next release.
+        """
+        _refuse_removed_agent_session_capture()
 
     # ===================================================================
     # 4c. Agent Hook Context

@@ -772,48 +772,6 @@ def test_admin_source_sync_rejects_paused_source(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_agent_session_window_intake_rejects_paused_source_before_llm(
-    db,
-    tmp_path,
-):
-    from memforge.agent_sessions import agent_session_source_id
-    from memforge.server.admin_api import create_admin_app
-
-    source_id = agent_session_source_id("claude-code", "dev")
-    await db.upsert_source(
-        id=source_id,
-        type="agent_session",
-        name="Claude Code Session",
-        config_json=json.dumps({"client": "claude-code"}),
-        status="paused",
-        access_policy="private",
-        owner_user_id="dev",
-    )
-
-    class FailingWindowClient:
-        async def generate_agent_knowledge_patch(self, *args, **kwargs):
-            raise AssertionError("paused source should be rejected before LLM work")
-
-    app = create_admin_app(db=db, config=_config(tmp_path))
-    app.state.agent_session_window_client = FailingWindowClient()
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/agent-sessions/windows",
-            json={
-                "client": "claude-code",
-                "session_id": "session-1",
-                "trigger": "compact",
-                "workspace": "/repo",
-                "events": [{"kind": "decision", "text": "Keep the source paused."}],
-                "process_now": False,
-            },
-        )
-
-    assert response.status_code == 400
-    assert response.json()["detail"] == "Source is paused"
-
-
-@pytest.mark.asyncio
 async def test_sync_service_rejects_paused_source_at_start_boundary(db, tmp_path):
     from memforge.runtime import SourcePausedError, SyncService
 

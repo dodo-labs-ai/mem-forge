@@ -113,7 +113,6 @@ async def _call(client: LiteLlmStructuredClient, operation: str) -> None:
         "change_impact": lambda: client.evaluate_revision_work(
             "prompt", response_format=ChangeImpactWireResponse),
         "admit_candidates": lambda: client.admit_candidates("prompt"),
-        "classify_agent_session_evidence_authority": lambda: client.classify_agent_session_evidence_authority("prompt"),
         "validate_entity_batch": lambda: client.validate_entity_batch("prompt"),
         "rerank_memories": lambda: client.rerank_memories("prompt"),
         "judge_offline_semantics": lambda: client.judge_offline_semantics("prompt"),
@@ -122,7 +121,6 @@ async def _call(client: LiteLlmStructuredClient, operation: str) -> None:
         "assess_claim_revisions": lambda: client.assess_claim_revisions("prompt"),
         "support_assessment": lambda: client.evaluate_revision_work(
             "prompt", response_format=SupportAssessmentWireResponse),
-        "generate_agent_knowledge_patch": lambda: client.generate_agent_knowledge_patch("prompt"),
     }
     try:
         await calls[operation]()
@@ -135,7 +133,6 @@ DIRECT_ANSWER_OPERATIONS = (
     "classify_cross_document_relations",
     "change_impact",
     "admit_candidates",
-    "classify_agent_session_evidence_authority",
     "validate_entity_batch",
     "rerank_memories",
     "judge_offline_semantics",
@@ -145,7 +142,6 @@ REASONED_OPERATIONS = (
     "extract_projection_fragment_memories",
     "assess_claim_revisions",
     "support_assessment",
-    "generate_agent_knowledge_patch",
 )
 
 
