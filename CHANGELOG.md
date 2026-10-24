@@ -48,6 +48,35 @@
   local sync finds. Sign in renews a Teams or Jira browser session in place
   and opens the connection step for a token, so V2 no longer links to V1.
 
+- The admin UI V2 changes who can use a Source in a shared workspace. The
+  row and drawer menus offer "Change who can use this source" to someone
+  who manages it; the change runs through
+  `POST /api/v1/sources/{id}/access-transitions`, and the row and drawer
+  follow it while it runs, with how many memories are updated. A failed
+  change shows its reason, and its owner can retry it or revert it to the
+  previous policy.
+
+- The admin UI V2 shows how many reviews wait for a decision beside Review
+  in the navigation (read every 30 seconds, `99+` above 99), and a chip on a
+  Source's row and drawer when its pipeline checks over the last day found
+  issues, left evaluations pending or want a review, which opens Evaluation
+  scoped to that Source. The row and drawer menus offer "Full sync" beside
+  "Re-read all documents" to someone who can force a resync: after a
+  confirmation that names its model cost, it calls
+  `POST /api/v1/sources/{id}/force-resync`, which lists the whole Source
+  again from its provider or device and processes every document, unchanged
+  ones included. `GET /api/v1/sources/{id}/agent-evaluation` is deprecated
+  and is removed with the V1 admin UI.
+
+- The admin UI V2 has an Entities page under Knowledge (`/entities`): a
+  searchable, paged list of the entities the caller can discover, and a
+  detail page with the entity's aliases and how many memories it is linked
+  to. A workspace admin adds and removes aliases there, and merges the
+  entity into another chosen by name, after a confirmation that shows each
+  entity's current linked memory count; the merge then opens the target.
+  The entity chips on a memory's detail open the Entities list searched for
+  that name.
+
 - A Notion document Source: the server collects every page under configured
   root pages and databases, database rows included, with an internal
   connection token. Each page is a `notion_page` Unit with a `page_body`

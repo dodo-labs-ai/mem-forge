@@ -30,10 +30,6 @@ test("shows the memory's details, relations and evidence", async () => {
   expect(within(details).getByText("payroll-v2")).toBeInTheDocument();
   expect(within(details).getByText("Payroll handbook")).toBeInTheDocument();
 
-  const entities = screen.getByRole("region", { name: "Entities" });
-  expect(within(entities).getByText("Cut-off")).toBeInTheDocument();
-  expect(within(entities).queryByRole("link")).not.toBeInTheDocument();
-
   const related = screen.getByRole("region", { name: "Related memories in other documents" });
   expect(within(related).getByText("Conflicts with")).toBeInTheDocument();
   expect(within(related).getByRole("link", { name: /on-demand lifecycle does not support/ })).toHaveAttribute(
@@ -46,6 +42,17 @@ test("shows the memory's details, relations and evidence", async () => {
   expect(within(evidence).getByText("Primary")).toBeInTheDocument();
   expect(within(evidence).getByRole("link", { name: "Open content" })).toHaveAttribute(
     "href", expect.stringContaining("workspace_id=local"),
+  );
+});
+
+test("entity chips link to the entity search", async () => {
+  renderDetail(makeMemoryDetail());
+
+  const entities = await screen.findByRole("region", { name: "Entities" });
+  expect(within(entities).getByRole("link", { name: "Cut-off" })).toHaveAttribute("href", "/entities?search=Cut-off");
+  expect(within(entities).getByRole("link", { name: "PeriodLifecycle" })).toHaveAttribute(
+    "href",
+    "/entities?search=PeriodLifecycle",
   );
 });
 

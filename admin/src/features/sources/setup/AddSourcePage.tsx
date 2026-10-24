@@ -8,6 +8,7 @@ import { Badge } from "@/ui/badge";
 import { Skeleton } from "@/ui/skeleton";
 import { useSourceTypes } from "../api";
 import { SourceIcon } from "../SourceIcon";
+import { AgentPluginSetupSection } from "./AgentPluginSetup";
 import { addableSourceTypes, canRunOnLocalSync, runBadge } from "./model/sourceTypePicker";
 
 const LOCAL_SYNC_LABELS: Record<LocalSyncState, string> = {
@@ -16,7 +17,10 @@ const LOCAL_SYNC_LABELS: Record<LocalSyncState, string> = {
   offline: "Local sync offline",
 };
 
-/** `/sources/new`: the source types a person can add, each opening its setup page. */
+/**
+ * `/sources/new`: the source types a person can add, each opening its setup
+ * page, and the coding agents whose plugin creates its own Source.
+ */
 export function AddSourcePage() {
   const types = useSourceTypes();
   const localSync = localSyncState(useLocalSyncStatus());
@@ -68,6 +72,7 @@ export function AddSourcePage() {
           ))}
         </ul>
       )}
+      <AgentPluginSetupSection />
     </div>
   );
 }

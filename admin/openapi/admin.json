@@ -1093,7 +1093,7 @@
         "type": "object"
       },
       "AgentSessionCompletenessResponse": {
-        "description": "Knowledge completeness of agent-session windows, computed on demand.\n\n``processed_total`` counts the windows that were processed, patched or\nnot, and ``no_output_fraction`` is the share of them that kept nothing\n(0 when none was processed). ``total`` also counts failed windows.\n``latest_failure`` is ``null`` when no window failed. ``session_id`` and\n``source_id`` echo the filters the request named.",
+        "description": "Knowledge completeness of agent-session windows, computed on demand.\n\n``processed_total`` counts the windows that were processed, patched or\nnot, and ``no_output_fraction`` is the share of them that kept nothing\n(0 when none was processed). ``total`` also counts failed windows.\n``latest_failure`` is ``null`` when no window failed. ``source_id`` names\nthe Source read, and ``session_id`` echoes the session filter when the\nrequest named one.",
         "properties": {
           "counts": {
             "$ref": "#/components/schemas/AgentSessionOutcomeCountsResponse"
@@ -1128,15 +1128,8 @@
             "title": "Session Id"
           },
           "source_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Source Id"
+            "title": "Source Id",
+            "type": "string"
           },
           "total": {
             "title": "Total",
@@ -13245,9 +13238,18 @@
     },
     "/api/v1/agent-sessions/completeness": {
       "get": {
-        "description": "Return window outcome counts and the no_output fraction on demand.",
+        "description": "Return one Source's window outcome counts and no_output fraction on demand.\n\n``session_id`` narrows the read to one session of that Source. The\nreceipts carry failure reasons, so a Source the caller cannot discover\nanswers 404 like an unknown one.",
         "operationId": "agent_session_completeness_api_v1_agent_sessions_completeness_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          },
           {
             "in": "query",
             "name": "session_id",
@@ -13262,22 +13264,6 @@
                 }
               ],
               "title": "Session Id"
-            }
-          },
-          {
-            "in": "query",
-            "name": "source_id",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Source Id"
             }
           }
         ],
@@ -17652,6 +17638,7 @@
     },
     "/api/v1/sources/{source_id}/agent-evaluation": {
       "get": {
+        "deprecated": true,
         "description": "Return a bounded, authorized online-assessment view for one Source.",
         "operationId": "get_source_agent_evaluation_api_v1_sources__source_id__agent_evaluation_get",
         "parameters": [
