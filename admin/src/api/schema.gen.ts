@@ -402,7 +402,11 @@ export interface paths {
         };
         /**
          * Agent Session Completeness
-         * @description Return window outcome counts and the no_output fraction on demand.
+         * @description Return one Source's window outcome counts and no_output fraction on demand.
+         *
+         *     ``session_id`` narrows the read to one session of that Source. The
+         *     receipts carry failure reasons, so a Source the caller cannot discover
+         *     answers 404 like an unknown one.
          */
         get: operations["agent_session_completeness_api_v1_agent_sessions_completeness_get"];
         put?: never;
@@ -2120,6 +2124,7 @@ export interface paths {
         };
         /**
          * Get Source Agent Evaluation
+         * @deprecated
          * @description Return a bounded, authorized online-assessment view for one Source.
          */
         get: operations["get_source_agent_evaluation_api_v1_sources__source_id__agent_evaluation_get"];
@@ -3045,8 +3050,9 @@ export interface components {
          *     ``processed_total`` counts the windows that were processed, patched or
          *     not, and ``no_output_fraction`` is the share of them that kept nothing
          *     (0 when none was processed). ``total`` also counts failed windows.
-         *     ``latest_failure`` is ``null`` when no window failed. ``session_id`` and
-         *     ``source_id`` echo the filters the request named.
+         *     ``latest_failure`` is ``null`` when no window failed. ``source_id`` names
+         *     the Source read, and ``session_id`` echoes the session filter when the
+         *     request named one.
          */
         AgentSessionCompletenessResponse: {
             counts: components["schemas"]["AgentSessionOutcomeCountsResponse"];
@@ -3058,7 +3064,7 @@ export interface components {
             /** Session Id */
             session_id: string | null;
             /** Source Id */
-            source_id: string | null;
+            source_id: string;
             /** Total */
             total: number;
         };
@@ -8067,9 +8073,9 @@ export interface operations {
     };
     agent_session_completeness_api_v1_agent_sessions_completeness_get: {
         parameters: {
-            query?: {
+            query: {
+                source_id: string;
                 session_id?: string | null;
-                source_id?: string | null;
             };
             header?: never;
             path?: never;

@@ -22,6 +22,7 @@ export {
   type ProjectList,
   type ProjectListItem,
 } from "./projects";
+export { reviewQueryKeys, useOpenReviewCount } from "./reviews";
 export {
   STANDALONE_TARGET,
   createWorkspaceController,

@@ -5,6 +5,9 @@ export type { LocalAgentJob, Source, SyncProgressSnapshot, SyncStatus };
 export type SourceConnectionStatus = NonNullable<Source["connection_status"]>;
 export type SyncProgressUnit = NonNullable<SyncProgressSnapshot["progress"]>["unit"];
 
+/** One source's online evaluation over the window the Sources page reads. */
+export type SourceEvaluationHealth = components["schemas"]["AgentEvaluationSourceHealthResponse"];
+
 /** The project fields the Sources page groups by. */
 export type Project = Pick<components["schemas"]["ProjectResponse"], "id" | "key" | "name">;
 

@@ -3410,12 +3410,13 @@ class AgentSessionCompletenessResponse(BaseModel):
     ``processed_total`` counts the windows that were processed, patched or
     not, and ``no_output_fraction`` is the share of them that kept nothing
     (0 when none was processed). ``total`` also counts failed windows.
-    ``latest_failure`` is ``null`` when no window failed. ``session_id`` and
-    ``source_id`` echo the filters the request named.
+    ``latest_failure`` is ``null`` when no window failed. ``source_id`` names
+    the Source read, and ``session_id`` echoes the session filter when the
+    request named one.
     """
 
     session_id: str | None
-    source_id: str | None
+    source_id: str
     total: int
     processed_total: int
     counts: AgentSessionOutcomeCountsResponse
@@ -7517,7 +7518,11 @@ def create_admin_app(
             "assessments": view["assessments"],
         }
 
-    @source_router.get("/{source_id}/agent-evaluation")
+    # Deprecated (admin-ui-v1): only the V1 per-source evaluation dialog calls
+    # this route, and V1 never renders that dialog. The admin UI reads
+    # GET /agent-evaluations/online-overview, scoped by source_id; this route
+    # is removed with the V1 admin UI.
+    @source_router.get("/{source_id}/agent-evaluation", deprecated=True)
     async def get_source_agent_evaluation(
         source_id: str,
         request: Request,
@@ -9954,11 +9959,21 @@ def create_admin_app(
 
     @agent_session_router.get("/completeness", response_model=AgentSessionCompletenessResponse)
     async def agent_session_completeness(
+        source_id: str,
+        request: Request,
         session_id: str | None = None,
-        source_id: str | None = None,
         db: Database = Depends(get_db),
     ):
-        """Return window outcome counts and the no_output fraction on demand."""
+        """Return one Source's window outcome counts and no_output fraction on demand.
+
+        ``session_id`` narrows the read to one session of that Source. The
+        receipts carry failure reasons, so a Source the caller cannot discover
+        answers 404 like an unknown one.
+        """
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
         return await db.summarize_agent_session_outcomes(session_id=session_id, source_id=source_id)
 
     @agent_session_router.post("/windows")
