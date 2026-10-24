@@ -60,11 +60,11 @@ three kinds of cases with the rubrics in `cohort.json`:
 
 Each kind replays with the configured model and prints a summary with a verdict
 below the smoke table. A `fail` names the case and the check; run it again
-before you conclude, since a model's answers vary. When pinning fails because
-a memory is "labelled both" ways, the model merged two labelled facts into one
-claim: choose a more specific term rather than treating it as a regression. To
-test a new situation, add a document pair or a reconciliation file and list it
-in `cohort.json`.
+before you conclude, since a model's answers vary. A model may write two
+labelled facts into one memory; the memory is then expected unsupported when any
+of its terms is, since a claim holds only when all of it does. To test a new
+situation, add a document pair or a reconciliation file and list it in
+`cohort.json`.
 Maintainers also run the same evaluation over cases pinned from a real
 workspace, which stay in that workspace.
 
