@@ -33,20 +33,14 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 
 DEFAULT_WORKSPACE_BINDINGS_FILE = Path.home() / ".memforge" / "workspace-bindings.json"
-WorkspaceBindingSource = Literal["directory", "repository", "hook_default", "none"]
-# Service error codes that mean the request needs a different workspace selector.
+WorkspaceBindingSource = Literal["directory", "repository", "none"]
+# Target keys that earlier plugin releases wrote and no reader uses. The parser
+# accepts and ignores them, so an existing file keeps working, and the
+# memforge-setup skill offers to remove them. ``hook_workspace_id`` chose a
+# workspace for automatic hook uploads, which plugins no longer make.
+OBSOLETE_TARGET_KEYS = frozenset({"hook_workspace_id"})
+# Service error code that means the request needs an explicit workspace selector.
 WORKSPACE_SELECTION_REQUIRED_CODE = "workspace_selection_required"
-WORKSPACE_NOT_FOUND_CODE = "workspace_not_found_or_inaccessible"
-# Every code a WorkspaceBindingError carries: local context cannot select a workspace.
-WORKSPACE_BINDING_ERROR_CODES = frozenset(
-    {
-        "workspace_binding_ambiguous",
-        "workspace_bindings_directory_must_be_absolute",
-        "workspace_bindings_invalid",
-        "workspace_bindings_version_unsupported",
-        "workspace_context_invalid",
-    }
-)
 
 
 class WorkspaceBindingError(ValueError):
@@ -61,7 +55,6 @@ class WorkspaceBindingError(ValueError):
 class TargetWorkspaceBindings:
     repository_bindings: dict[str, str]
     directory_bindings: dict[Path, str]
-    hook_workspace_id: str | None
 
 
 @dataclass(frozen=True)
@@ -104,22 +97,14 @@ def load_workspace_bindings(
         origin = _required_string(raw_origin)
         if origin is None or not isinstance(raw_target, dict):
             raise WorkspaceBindingError("workspace_bindings_invalid")
-        unknown = set(raw_target) - {
-            "repository_bindings",
-            "directory_bindings",
-            "hook_workspace_id",
-        }
+        unknown = set(raw_target) - {"repository_bindings", "directory_bindings"} - OBSOLETE_TARGET_KEYS
         if unknown:
             raise WorkspaceBindingError("workspace_bindings_invalid")
         repositories = _repository_bindings(raw_target.get("repository_bindings", {}))
         directories = _directory_bindings(raw_target.get("directory_bindings", {}))
-        hook_workspace_id = _optional_string(raw_target.get("hook_workspace_id"))
-        if "hook_workspace_id" in raw_target and hook_workspace_id is None:
-            raise WorkspaceBindingError("workspace_bindings_invalid")
         targets[origin] = TargetWorkspaceBindings(
             repository_bindings=repositories,
             directory_bindings=directories,
-            hook_workspace_id=hook_workspace_id,
         )
     return WorkspaceBindings(targets=targets)
 
@@ -129,10 +114,17 @@ def resolve_workspace_binding(
     origin: str,
     working_directory: str | None = None,
     root_paths: Sequence[str] = (),
-    allow_hook_default: bool = False,
     config_path: str | Path | None = None,
 ) -> WorkspaceBindingResolution:
-    """Resolve one local selector without treating the hook fallback as search scope."""
+    """Resolve the workspace a user-confirmed local binding selects.
+
+    ``working_directory`` is the exact directory of one tool call; otherwise
+    ``root_paths`` are the client's negotiated roots. A directory binding beats
+    a repository binding, and roots that select different workspaces fail
+    closed with ``workspace_binding_ambiguous``. Without a binding the result
+    has ``workspace_id=None`` and ``source="none"``, and the service then uses
+    the caller's only accessible workspace or asks for one.
+    """
     bindings = load_workspace_bindings(config_path)
     target = bindings.targets.get(origin)
     locations = (working_directory,) if working_directory is not None else tuple(root_paths)
@@ -158,15 +150,7 @@ def resolve_workspace_binding(
             working_directory=selected.working_directory,
         )
 
-    unbound = _unbound_resolution(resolved_locations)
-    if allow_hook_default and target.hook_workspace_id is not None:
-        return WorkspaceBindingResolution(
-            workspace_id=target.hook_workspace_id,
-            source="hook_default",
-            repo_identifier=unbound.repo_identifier,
-            working_directory=unbound.working_directory,
-        )
-    return unbound
+    return _unbound_resolution(resolved_locations)
 
 
 def _repository_bindings(value: object) -> dict[str, str]:
@@ -296,14 +280,9 @@ def _required_string(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
-def _optional_string(value: object) -> str | None:
-    if value is None:
-        return None
-    return _required_string(value)
-
-
 __all__ = [
     "DEFAULT_WORKSPACE_BINDINGS_FILE",
+    "OBSOLETE_TARGET_KEYS",
     "TargetWorkspaceBindings",
     "WorkspaceBindingError",
     "WorkspaceBindingResolution",

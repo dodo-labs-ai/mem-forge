@@ -1,6 +1,6 @@
 ---
 name: memforge-setup
-description: Inspect and configure MemForge workspace routing for Git repositories, ordinary directories, and automatic hooks. Use when the user asks to bind a local project to a workspace, change or remove that binding, configure the hook fallback, or diagnose workspace selection.
+description: Inspect and configure MemForge workspace routing for Git repositories and ordinary directories. Use when the user asks to bind a local project to a workspace, change or remove that binding, or diagnose workspace selection.
 compatibility: Requires Python 3.12+ and access to the configured MemForge workspace directory.
 ---
 
@@ -17,8 +17,8 @@ hand.
 - Any ordinary non-Git directory is stored in `directory_bindings` by absolute
   path. Descendants inherit it and the most-specific directory wins.
 - An explicit tool `workspace_id` overrides either binding for that call.
-- `hook_workspace_id` is only a fallback for automatic hooks. Interactive MCP
-  tools never use it.
+- Bindings select the workspace for the MemForge MCP tools. Hooks
+  select no workspace: the plugin's only hook adds static usage guidance.
 - API URL and credentials remain in the client's existing configuration. This
   skill never writes or displays credentials and never edits MCP registration.
 
@@ -30,13 +30,20 @@ Resolve the helper relative to this skill, then use:
 python3 "<skill-dir>/scripts/workspace_config.py" --client CLIENT inspect --path "$PWD"
 python3 "<skill-dir>/scripts/workspace_config.py" --client CLIENT bind --path "$PWD" --workspace WORKSPACE
 python3 "<skill-dir>/scripts/workspace_config.py" --client CLIENT unbind --path "$PWD"
-python3 "<skill-dir>/scripts/workspace_config.py" --client CLIENT set-hook-workspace --workspace WORKSPACE
-python3 "<skill-dir>/scripts/workspace_config.py" --client CLIENT clear-hook-workspace
+python3 "<skill-dir>/scripts/workspace_config.py" --client CLIENT remove-obsolete-keys
 ```
 
 `CLIENT` is `codex` or `claude-code`. Binding commands validate the workspace
 against the live configured target. Mutations are previews unless `--apply` is
 present.
+
+## Obsolete keys
+
+`inspect` lists `obsolete_keys`: entries that earlier plugin releases wrote and
+nothing reads, such as `hook_workspace_id`. They are ignored and do not change
+routing. When the list is not empty, tell the user and offer to remove them
+with `remove-obsolete-keys`, following the confirmation workflow below. Never
+remove them without that confirmation.
 
 ## Required confirmation workflow
 
@@ -56,5 +63,5 @@ preview. Inspection is read-only and needs no confirmation.
 ## Completion report
 
 Report the local path or repository identity, workspace, binding source, file
-changed, and that the next MCP call/hook will use it. State that no credentials
+changed, and that the next MCP call will use it. State that no credentials
 or MCP registration changed. A restart is not required.
