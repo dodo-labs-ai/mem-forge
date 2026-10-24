@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, get_args
+from typing import Any, Literal, get_args
 
 from memforge.genes import source_type_supports_sync
+from memforge.genes.family import CollectionFamilyKind
 from memforge.models import AbsenceCheckSkippedReason
 from memforge.local_agent.source_contract import (
     execution_owner_user_id,
@@ -22,6 +23,7 @@ from memforge.release import current_release
 from memforge.source_artifacts import source_artifact_inference_eligibility
 from memforge.source_item_failures import SourceItemFailure
 from memforge.source_projection_config import canonical_projection_scope, canonical_scope_transition
+from memforge.source_types import source_type_descriptor
 from memforge.sync_progress import source_progress_unit, source_sync_progress_from_pipeline
 from memforge.storage.admin_source import SourceAdminReader
 
@@ -341,6 +343,25 @@ def source_failed_items_payload(failures: tuple[SourceItemFailure, ...], *, rele
     }
 
 
+ScopeChangeRemoval = Literal["at_completion", "next_sync"]
+
+
+def scope_change_removes(source_type: str) -> ScopeChangeRemoval:
+    """When a scope change of a Source of this type removes what its new scope leaves out.
+
+    A document transition removes it once it completes (``at_completion``):
+    until then nothing is removed. A conversation transition removes the
+    conversations its new selection leaves out in its next sync
+    (``next_sync``), and completes once every selected conversation it can
+    read is synced.
+    """
+
+    descriptor = source_type_descriptor(source_type)
+    if descriptor is not None and descriptor.family is CollectionFamilyKind.CONVERSATION:
+        return "next_sync"
+    return "at_completion"
+
+
 async def source_scope_transition_payload(
     reader: SourceAdminReader,
     source: dict[str, Any],
@@ -360,7 +381,8 @@ async def source_scope_transition_payload(
     ``OPS`` whose latest sync listed 120 pages, committed 117 and failed 3
     reads ``members_committed`` 117, ``listed_count`` 120 and three failing
     items. ``restore_config`` is filled by the route, which alone holds the
-    configuration the viewer may read.
+    configuration the viewer may read. ``removes`` says when the change
+    removes what the target scope leaves out (:func:`scope_change_removes`).
     """
 
     source_id = str(source.get("id") or "")
@@ -388,6 +410,7 @@ async def source_scope_transition_payload(
         "error": transition.error,
         "failing_items": source_failed_items_payload(failing, release=current_release()),
         "restore_config": None,
+        "removes": scope_change_removes(source_type),
     }
 
 

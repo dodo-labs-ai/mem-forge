@@ -20,10 +20,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi.testclient import TestClient
 
 from memforge.conversations.collect import collect
 from memforge.conversations.collections import ArtifactLink, CollectedBody, StoredCollections
 from memforge.conversations.intake import CollectionIntake
+from memforge.conversations.layer import ConversationLayer
 from memforge.conversations.port import (
     ArtifactBody,
     ConversationAccess,
@@ -40,13 +42,17 @@ from memforge.conversations.units import UnitKind
 from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.genes.teams_gene import TeamsGene
 from memforge.genes.teams_provider import TeamsConversationProvider, teams_conversation_ref, teams_provider_message
+from memforge.pipeline.collection_family import collection_family
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
+from memforge.server.admin_api import create_admin_app
 from memforge.source_adapters.teams import MESSAGE_SCHEMA
 from memforge.source_artifact_inputs import retain_artifact_input
 from memforge.source_projection import ProjectionScopeTransition, ProjectionScopeTransitionStatus
 from memforge.source_projection_config import canonical_projection_scope
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
+from tests.conversation_attempts_fixture import poll_read, without
+from tests.test_startup_runtime import TEST_SOURCE_KEY, _config
 from tests.test_sync_bookkeeping import (
     NoopMemoryEngine,
     ProjectionFragmentRecordingExtractor,
@@ -129,10 +135,12 @@ class FakeTeams:
                 stop_reason="budget",
             )
         before = [m["time"] for m in everything if m["time"] < interval.start]
+        # Without an older message, the oldest page is complete from the chat's oldest message.
+        complete_from = max(before) if before else (everything[-1]["time"] if everything else None)
         return ConversationPoll(
             messages=tuple(teams_provider_message(message, conversation) for message in inside),
             outcome=PollOutcome.REACHED_START if before else PollOutcome.HISTORY_EXHAUSTED,
-            earliest_complete_page_time=max(before) if before else None,
+            earliest_complete_page_time=complete_from,
         )
 
     async def read_artifact(self, conversation, message, artifact):
@@ -145,23 +153,53 @@ class FakeTeams:
 PNG = b"\x89PNG\r\n\x1a\n"
 
 
+UNPROJECTABLE = "cannot be projected"
+
+
+class UnprojectableEngine(_OrderRecordingMemoryEngine):
+    """While ``failing``, fails to commit a Unit whose content holds ``UNPROJECTABLE``, as a failed document."""
+
+    failing = False
+
+    async def prepare_and_commit_projected_lifecycle(self, **kwargs):
+        if self.failing and UNPROJECTABLE in kwargs["document_content"]:
+            raise ValueError("lifecycle commit failed")
+        return await super().prepare_and_commit_projected_lifecycle(**kwargs)
+
+
 class TeamsWorkspace:
-    def __init__(self, db: Database, config: dict, documents: LocalDocumentStore) -> None:
+    def __init__(self, db: Database, config: dict, documents: LocalDocumentStore, app_config) -> None:
         self.db = db
         self.config = config
-        self.engine = _OrderRecordingMemoryEngine(defer=False)
+        self.engine = UnprojectableEngine(defer=False)
         self.documents = documents
+        self.app_config = app_config
         self.attempts = 0
 
-    async def collect_and_sync(self, teams: FakeTeams, *, dry_run: bool = False):
-        """One device job attempt and the sync run it starts, or with ``dry_run`` the plan it would apply."""
+    async def save(self, config: dict) -> None:
+        """Save the Source's configuration as the user does, through the Source route."""
+
+        with TestClient(create_admin_app(db=self.db, config=self.app_config)) as client:
+            response = client.put(f"/api/v1/sources/{SOURCE_ID}", json={"config": config})
+        assert response.status_code == 200, response.text
+        self.config = (await self.db.get_source(SOURCE_ID))["config"]
+
+    async def collect_and_sync(self, teams: FakeTeams, *, dry_run: bool = False, requested_at: datetime | None = None):
+        """One device job attempt and the sync run it starts, or with ``dry_run`` the plan it would apply.
+
+        A dry run plans as the plan route does: the run's collection family
+        binds the attempt and starts the open transition. ``requested_at`` is
+        when the server issued the attempt's request, now unless given.
+        """
 
         self.attempts += 1
         attempt_id = f"job-{self.attempts}:attempt:1"
         gene = TeamsGene(dict(self.config), SOURCE_ID)
         reader = SourceProjectionUnitReader(self.db)
         collections = StoredCollections(self.db, workspace_id=WORKSPACE_ID)
-        request = await gene.issue_collection_request(collections, attempt_id, now=datetime.now(timezone.utc))
+        request = await gene.issue_collection_request(
+            collections, attempt_id, now=requested_at or datetime.now(timezone.utc)
+        )
         collection = await collect(
             teams, request, source_id=SOURCE_ID, collection_attempt_id=attempt_id, config_revision="cfg"
         )
@@ -208,7 +246,11 @@ class TeamsWorkspace:
         await intake.receive_bodies(uploads, source_id=SOURCE_ID, collection_attempt_id=attempt_id)
         assert await intake.missing_bodies_of(SOURCE_ID, attempt_id) == ()
         if dry_run:
-            gene.bind_conversation_run(projection_store=self.db, collections=collections, collection_attempt_id=attempt_id)
+            family = collection_family(gene, db=self.db, doc_store=self.documents, source_id=SOURCE_ID)
+            family.prepare(collection_attempt=CollectionAttempt(WORKSPACE_ID, attempt_id), input_snapshot=None)
+            transition = await self.db.get_open_projection_scope_transition(SOURCE_ID)
+            if transition is not None:
+                family.begin_scope_transition(transition)
             return plan_report(await gene.preview(), source_id=SOURCE_ID), missing
         self.engine.events.clear()
         state = await self._orchestrator().sync_gene(
@@ -268,7 +310,8 @@ def _manifest_payload(collection):
 
 
 @pytest.fixture
-async def workspace(tmp_path):
+async def workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMFORGE_SECRET_KEY", TEST_SOURCE_KEY)
     database = Database(str(tmp_path / "teams.db"))
     await database.connect()
     NoopMemoryEngine.db = database
@@ -280,9 +323,12 @@ async def workspace(tmp_path):
         config_json=json.dumps(config),
         access_policy="workspace",
         owner_user_id="dev",
+        execution_owner_user_id="dev",
     )
     try:
-        yield TeamsWorkspace(database, config, LocalDocumentStore(str(tmp_path / "documents")))
+        yield TeamsWorkspace(
+            database, config, LocalDocumentStore(str(tmp_path / "documents")), _config(tmp_path)
+        )
     finally:
         NoopMemoryEngine.db = None
         await database.close()
@@ -483,6 +529,175 @@ async def test_a_deselected_conversation_is_removed_from_scope_and_the_transitio
     assert set(await workspace.units()) == {f"{UnitKind.WINDOW.value}:m1"}
 
 
+Y_CHAT = "19:y@thread.v2"
+Z_CHAT = "19:z@thread.v2"
+W_CHAT = "19:w@thread.v2"
+
+
+def _selection(*conversation_ids: str) -> dict:
+    return {"conversation_ids": sorted(conversation_ids), "initial_history_days": 30}
+
+
+def _teams_with_each_chat() -> FakeTeams:
+    """X (``CHAT``), Y, Z and W; Y, Z and W each hold two windows, one of which fails while the engine fails."""
+
+    teams = FakeTeams()
+    teams.post(CHAT, "x1", _ago(3), "kept")
+    for chat in (Y_CHAT, Z_CHAT, W_CHAT):
+        name = chat.split(":")[1].split("@")[0]
+        teams.post(chat, f"{name}1", _ago(40), f"{name} projects")
+        teams.post(chat, f"{name}2", _ago(3), f"{name} {UNPROJECTABLE}")
+    return teams
+
+
+async def _held(workspace: TeamsWorkspace) -> dict[str, int]:
+    """How many current Units each conversation of the Source holds."""
+
+    reader = SourceProjectionUnitReader(workspace.db)
+    held = await reader.conversations_held(SOURCE_ID)
+    return {conversation_id: len(await reader.units_of(SOURCE_ID, conversation_id)) for conversation_id in sorted(held)}
+
+
+async def _hold_open(workspace: TeamsWorkspace, teams: FakeTeams, target: dict) -> ProjectionScopeTransition:
+    """Save ``target`` and sync it, held open as production holds it: a Unit commits and one document fails."""
+
+    await workspace.save(target)
+    workspace.engine.failing = True
+    state, _missing = await workspace.collect_and_sync(teams)
+    workspace.engine.failing = False
+    assert state.docs_failed > 0
+    transition = await workspace.db.get_open_projection_scope_transition(SOURCE_ID)
+    assert transition is not None and transition.target_scope == canonical_projection_scope("teams", target)
+    return transition
+
+
+def _removed(caplog) -> set[tuple[str, str]]:
+    """Each conversation the run removed Units of, with the reason, as its removal log names them."""
+
+    removed = set()
+    for record in caplog.records:
+        logged = re.match(r"conversation_units_removed .* conversation=(\S+) reason=(\S+) ", record.getMessage())
+        if logged:
+            removed.add((logged[1], logged[2]))
+    return removed
+
+
+async def test_a_to_b_superseded_by_a_to_c_removes_what_only_b_added_and_completes(workspace, caplog):
+    teams = _teams_with_each_chat()
+    await workspace.collect_and_sync(teams)
+    to_b = await _hold_open(workspace, teams, _selection(CHAT, Y_CHAT))
+    assert await _held(workspace) == {CHAT: 1, Y_CHAT: 1}
+
+    await workspace.save(_selection(CHAT, Z_CHAT))
+    to_c = await workspace.db.get_open_projection_scope_transition(SOURCE_ID)
+    with caplog.at_level(logging.INFO, logger="memforge.genes.conversation_gene"):
+        state, _missing = await workspace.collect_and_sync(teams)
+
+    assert to_c.predecessor_transition_id == to_b.id
+    assert to_c.previous_scope == canonical_projection_scope("teams", _selection(CHAT))
+    assert (state.last_sync_status, state.docs_failed) == ("success", 0)
+    assert _removed(caplog) == {(Y_CHAT, "removed_from_scope")}
+    assert await _held(workspace) == {CHAT: 1, Z_CHAT: 2}
+    assert {transition.id: transition.status for transition in await workspace.db.list_projection_scope_transitions(SOURCE_ID)} == {
+        to_b.id: ProjectionScopeTransitionStatus.SUPERSEDED,
+        to_c.id: ProjectionScopeTransitionStatus.APPLIED,
+    }
+
+
+async def test_a_revert_to_a_removes_what_the_superseded_targets_added(workspace, caplog):
+    teams = _teams_with_each_chat()
+    await workspace.collect_and_sync(teams)
+    to_b = await _hold_open(workspace, teams, _selection(CHAT, Y_CHAT))
+
+    await workspace.save(_selection(CHAT))
+    back_to_a = await workspace.db.get_open_projection_scope_transition(SOURCE_ID)
+    with caplog.at_level(logging.INFO, logger="memforge.genes.conversation_gene"):
+        state, _missing = await workspace.collect_and_sync(teams)
+
+    assert back_to_a.previous_scope == back_to_a.target_scope == canonical_projection_scope("teams", _selection(CHAT))
+    assert back_to_a.predecessor_transition_id == to_b.id
+    assert (state.last_sync_status, state.docs_failed) == ("success", 0)
+    assert _removed(caplog) == {(Y_CHAT, "removed_from_scope")}
+    assert await _held(workspace) == {CHAT: 1}
+    assert await workspace.db.get_open_projection_scope_transition(SOURCE_ID) is None
+
+
+async def test_a_chain_of_three_removes_what_every_superseded_target_added(workspace, caplog):
+    teams = _teams_with_each_chat()
+    await workspace.collect_and_sync(teams)
+    to_b = await _hold_open(workspace, teams, _selection(CHAT, Y_CHAT))
+    with caplog.at_level(logging.INFO, logger="memforge.genes.conversation_gene"):
+        to_c = await _hold_open(workspace, teams, _selection(CHAT, Z_CHAT))
+    removed_by_c = _removed(caplog)
+    held_under_c = await _held(workspace)
+    caplog.clear()
+
+    await workspace.save(_selection(CHAT, W_CHAT))
+    to_d = await workspace.db.get_open_projection_scope_transition(SOURCE_ID)
+    with caplog.at_level(logging.INFO, logger="memforge.genes.conversation_gene"):
+        state, _missing = await workspace.collect_and_sync(teams)
+
+    assert removed_by_c == {(Y_CHAT, "removed_from_scope")}
+    assert held_under_c == {CHAT: 1, Z_CHAT: 1}
+    assert (to_c.predecessor_transition_id, to_d.predecessor_transition_id) == (to_b.id, to_c.id)
+    assert to_d.previous_scope == canonical_projection_scope("teams", _selection(CHAT))
+    assert (state.last_sync_status, state.docs_failed) == ("success", 0)
+    assert _removed(caplog) == {(Z_CHAT, "removed_from_scope")}
+    assert await _held(workspace) == {CHAT: 1, W_CHAT: 2}
+    assert [transition.status for transition in await workspace.db.list_projection_scope_transitions(SOURCE_ID)] == [
+        ProjectionScopeTransitionStatus.APPLIED,
+        ProjectionScopeTransitionStatus.SUPERSEDED,
+        ProjectionScopeTransitionStatus.SUPERSEDED,
+    ]
+
+
+async def test_a_dry_run_of_a_superseding_transition_plans_the_same_removals(workspace):
+    teams = _teams_with_each_chat()
+    await workspace.collect_and_sync(teams)
+    await _hold_open(workspace, teams, _selection(CHAT, Y_CHAT))
+    y_units = {unit.document_id for unit in await SourceProjectionUnitReader(workspace.db).units_of(SOURCE_ID, Y_CHAT)}
+    await workspace.save(_selection(CHAT, Z_CHAT))
+
+    report, _missing = await workspace.collect_and_sync(teams, dry_run=True)
+    held_after_the_dry_run = await _held(workspace)
+    await workspace.collect_and_sync(teams)
+
+    assert {(removal["document_id"], removal["reason"]) for removal in report["removals"]} == {
+        (document_id, "removed_from_scope") for document_id in y_units
+    }
+    assert held_after_the_dry_run == {CHAT: 1, Y_CHAT: 1}
+    assert await SourceProjectionUnitReader(workspace.db).units_of(SOURCE_ID, Y_CHAT) == ()
+
+
+async def test_a_transition_deselects_every_held_conversation_its_target_does_not_select(workspace):
+    teams = _teams_with_each_chat()
+    await workspace.save(_selection(CHAT, Y_CHAT, Z_CHAT))
+    await workspace.collect_and_sync(teams)
+    assert await _held(workspace) == {CHAT: 1, Y_CHAT: 2, Z_CHAT: 2}
+    # The last applied scope says {X, Y, Z}; a transition recorded from {X, Y}
+    # still deselects Z, which the Source holds and the target leaves out.
+    target = _selection(CHAT)
+    await workspace.db.upsert_source(
+        id=SOURCE_ID, type="teams", name="Teams", config_json=json.dumps(target),
+        access_policy="workspace", owner_user_id="dev", execution_owner_user_id="dev",
+    )
+    workspace.config = target
+    await workspace.db.create_projection_scope_transition(
+        ProjectionScopeTransition(
+            id="transition-from-a-narrower-scope",
+            source_id=SOURCE_ID,
+            previous_scope=canonical_projection_scope("teams", _selection(CHAT, Y_CHAT)),
+            target_scope=canonical_projection_scope("teams", target),
+        )
+    )
+
+    state, _missing = await workspace.collect_and_sync(teams)
+
+    assert state.last_sync_status == "success"
+    assert await _held(workspace) == {CHAT: 1}
+    assert await workspace.db.get_open_projection_scope_transition(SOURCE_ID) is None
+
+
 async def test_a_dry_run_reports_the_plan_and_changes_nothing(workspace):
     teams = FakeTeams()
     teams.post(CHAT, "ancient", NOW - timedelta(days=60), "long ago")
@@ -502,15 +717,15 @@ async def test_a_dry_run_reports_the_plan_and_changes_nothing(workspace):
     assert set(await workspace.units()) == {f"{UnitKind.WINDOW.value}:m1", f"{UnitKind.WINDOW.value}:m3"}
 
 
-async def test_rolling_retention_removes_a_window_once_its_latest_message_ages_out(workspace, monkeypatch):
+async def test_rolling_retention_removes_a_window_once_its_latest_message_ages_out(workspace):
     teams = FakeTeams()
     teams.post(CHAT, "old", NOW - timedelta(days=400), "old")
     teams.post(CHAT, "new", _ago(2), "new")
-    # The old window stands for one collected while it was still within Initial History.
-    monkeypatch.setattr("memforge.genes.teams_gene.TEAMS_MAX_INITIAL_HISTORY_DAYS", 500)
-    workspace.config = {"conversation_ids": [CHAT], "initial_history_days": 500}
-    await workspace.collect_and_sync(teams)
-    monkeypatch.undo()
+    # The old window was collected by an attempt requested 40 days ago, while
+    # it was still within Initial History.
+    workspace.config = {"conversation_ids": [CHAT], "initial_history_days": 365}
+    await workspace.collect_and_sync(teams, requested_at=NOW - timedelta(days=40))
+    assert f"{UnitKind.WINDOW.value}:old" in await workspace.units()
 
     workspace.config = {"conversation_ids": [CHAT], "initial_history_days": 365, "rolling_retention_days": 365}
     report, _missing = await workspace.collect_and_sync(teams, dry_run=True)
@@ -540,6 +755,45 @@ async def test_a_poll_that_stops_early_is_continued_by_the_next_attempt_without_
     await workspace.collect_and_sync(teams)
 
     assert "m0" not in {member for members in (await workspace.units()).values() for member in members}
+
+
+async def test_a_backfill_poll_that_stops_early_is_continued_without_removing_anything_unread(workspace):
+    teams = FakeTeams()
+    for index, hours in enumerate((200, 150, 100, 50, 40, 30, 20)):
+        teams.post(CHAT, f"m{index}", _ago(hours), f"message {index}")
+    await workspace.collect_and_sync(teams)
+    teams.delete(CHAT, "m0")
+    # Every poll stops after one page of two messages.
+    teams.poll_limit = 2
+    collections = StoredCollections(workspace.db, workspace_id=WORKSPACE_ID)
+    read: list[tuple[datetime, datetime]] = []
+
+    for _attempt in range(3):
+        state, _missing = await workspace.collect_and_sync(teams)
+
+        assert state.last_sync_status == "success"
+        manifest = await collections.latest_manifest(SOURCE_ID)
+        request = await collections.request(SOURCE_ID, manifest.collection_attempt_id)
+        assert len(request.conversations[0].intervals) <= 3
+        read.extend(_read_by(manifest))
+        following = ConversationLayer.collection_request(
+            selection=TeamsGene(dict(workspace.config), SOURCE_ID).conversation_selection(),
+            now=datetime.now(timezone.utc),
+            previous=manifest,
+        )
+        floor, *backfills = following.conversations[0].intervals
+        regular_end = _read_by(manifest)[0][1]
+        assert without([(floor.start, regular_end)], [*read, *((b.start, b.end) for b in backfills)]) == []
+        # m0 never lay inside a proven interval of a poll that stopped early.
+        assert "m0" in {member for members in (await workspace.units()).values() for member in members}
+    assert any(len(conversation.intervals) == 3 for conversation in request.conversations)
+
+
+def _read_by(manifest) -> list[tuple[datetime, datetime]]:
+    """What each poll of the manifest's one conversation read."""
+
+    (evidence,) = manifest.conversations
+    return [poll_read(poll, received_at=manifest.received_at, conversation=evidence.ref) for poll in evidence.polls]
 
 
 async def test_a_reprocess_reads_each_unit_from_its_committed_input(workspace):
