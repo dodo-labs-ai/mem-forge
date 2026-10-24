@@ -279,7 +279,7 @@ def test_source_list_rows_carry_exactly_the_contract_fields(tmp_path):
         "Codex Session",
     }
     for name, row in rows.items():
-        type_keys = {"Payroll Jira": {"connection_status"}, "Codex Session": {"unrecognized_session_lines"}}
+        type_keys = {"Payroll Jira": {"connection_status"}}
         assert set(row) == SOURCE_KEYS | type_keys.get(name, set()), name
         assert set(row["ownership"]) == {
             "created_by_user_id",
@@ -326,7 +326,6 @@ def test_source_list_rows_carry_exactly_the_contract_fields(tmp_path):
     assert rows["Payroll Jira"]["execution"]["kind"] == "local_agent"
     assert rows["Codex Session"]["client"] == "codex"
     assert rows["Codex Session"]["sync"] is None
-    assert rows["Codex Session"]["unrecognized_session_lines"] is None
 
 
 def test_source_list_validates_rows_shaped_like_the_hana_workspace_store(tmp_path):
@@ -562,7 +561,7 @@ def test_openapi_types_the_sources_page_responses(tmp_path):
         "$ref": "#/components/schemas/LocalAgentJobCreateResponse"
     }
     source = document["components"]["schemas"]["SourceResponse"]
-    assert set(source["properties"]) == SOURCE_KEYS | {"connection_status", "unrecognized_session_lines"}
+    assert set(source["properties"]) == SOURCE_KEYS | {"connection_status"}
     assert set(source["required"]) == SOURCE_KEYS - {
         "last_sync",
         "created_at",

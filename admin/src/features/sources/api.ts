@@ -115,25 +115,6 @@ export function useResolvedProjects(sources: Source[]): ResolvedBySource {
   return resolved;
 }
 
-/** How an agent-session Source's windows turned out: kept as memory, skipped as low-signal, or failed. */
-export function useAgentSessionCompleteness(sourceId: string) {
-  const api = useApi();
-  return useQuery({
-    queryKey: [...sourceKeys.all, "agent-session-completeness", sourceId],
-    queryFn: () => unwrap(api.GET("/api/v1/agent-sessions/completeness", { params: { query: { source_id: sourceId } } })),
-  });
-}
-
-/** The projects a Source's documents were filed under, each with its document and memory counts. */
-export function useSourceProjects(sourceId: string) {
-  const api = useApi();
-  return useQuery({
-    queryKey: [...sourceKeys.all, "projects", sourceId],
-    queryFn: () => unwrap(api.GET("/api/v1/sources/{source_id}/projects", { params: { path: { source_id: sourceId } } })),
-    select: (response) => response.projects,
-  });
-}
-
 /** The sources that send memories to each project, keyed by project key. */
 export function useProjectSources() {
   const sourcesQuery = useSources();

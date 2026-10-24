@@ -413,30 +413,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/agent-sessions/completeness": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Agent Session Completeness
-         * @description Return one Source's window outcome counts and no_output fraction on demand.
-         *
-         *     ``session_id`` narrows the read to one session of that Source. The
-         *     receipts carry failure reasons, so a Source the caller cannot discover
-         *     answers 404 like an unknown one.
-         */
-        get: operations["agent_session_completeness_api_v1_agent_sessions_completeness_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/agent-sessions/windows": {
         parameters: {
             query?: never;
@@ -447,10 +423,16 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Submit Agent Session Window Summary
-         * @description Submit a client transcript window for private agent-knowledge patching.
+         * Refuse Agent Session Window
+         * @deprecated
+         * @description Refuse an automatic session-window upload from an earlier memory plugin.
+         *
+         *     MemForge no longer captures agent sessions. The route reads no body,
+         *     creates no Source, calls no model and takes no Source activity; it
+         *     answers ``410`` with ``agent_session_capture_removed`` so the upload
+         *     stops at the plugin. It is removed in the next release.
          */
-        post: operations["submit_agent_session_window_summary_api_v1_agent_sessions_windows_post"];
+        post: operations["refuse_agent_session_window_api_v1_agent_sessions_windows_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -901,10 +883,14 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Record Agent Hook Receipt
-         * @description Record a coding-agent lifecycle hook without creating a source document.
+         * Refuse Agent Hook Receipt
+         * @deprecated
+         * @description Refuse a turn-end hook receipt from an earlier memory plugin.
+         *
+         *     Same contract as ``POST /api/v1/agent-sessions/windows``: no body is
+         *     read and nothing is recorded. It is removed in the next release.
          */
-        post: operations["record_agent_hook_receipt_api_v1_hooks_receipts_post"];
+        post: operations["refuse_agent_hook_receipt_api_v1_hooks_receipts_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3040,129 +3026,31 @@ export interface components {
             /** Workspace */
             workspace: string;
         };
-        /** AgentHookReceiptRequest */
-        AgentHookReceiptRequest: {
-            /** Branch */
-            branch?: string | null;
-            /** Client */
-            client: string;
-            /** Commit Sha */
-            commit_sha?: string | null;
-            /** Hook */
-            hook: string;
-            /** Metadata */
-            metadata?: {
-                [key: string]: unknown;
-            };
-            /** Repo */
-            repo?: string | null;
-            /** Session Id */
-            session_id: string;
-            /** Submitted At */
-            submitted_at?: string | null;
-            /** Workspace */
-            workspace: string;
+        /**
+         * AgentSessionCaptureRemovedDetail
+         * @description Why an automatic agent-session upload is refused, and what the user does next.
+         */
+        AgentSessionCaptureRemovedDetail: {
+            /**
+             * Code
+             * @constant
+             */
+            code: "agent_session_capture_removed";
+            /** Message */
+            message: string;
         };
         /**
-         * AgentSessionCompletenessResponse
-         * @description Knowledge completeness of agent-session windows, computed on demand.
+         * AgentSessionCaptureRemovedResponse
+         * @description The ``410 Gone`` body of the removed agent-session capture routes.
          *
-         *     ``processed_total`` counts the windows that were processed, patched or
-         *     not, and ``no_output_fraction`` is the share of them that kept nothing
-         *     (0 when none was processed). ``total`` also counts failed windows.
-         *     ``latest_failure`` is ``null`` when no window failed. ``source_id`` names
-         *     the Source read, and ``session_id`` echoes the session filter when the
-         *     request named one.
+         *     Example::
+         *
+         *         {"detail": {"code": "agent_session_capture_removed",
+         *                     "message": "MemForge no longer captures agent sessions automatically. "
+         *                                "Update the MemForge memory plugin."}}
          */
-        AgentSessionCompletenessResponse: {
-            counts: components["schemas"]["AgentSessionOutcomeCountsResponse"];
-            latest_failure: components["schemas"]["AgentSessionLatestFailureResponse"] | null;
-            /** No Output Fraction */
-            no_output_fraction: number;
-            /** Processed Total */
-            processed_total: number;
-            /** Session Id */
-            session_id: string | null;
-            /** Source Id */
-            source_id: string;
-            /** Total */
-            total: number;
-        };
-        /**
-         * AgentSessionLatestFailureResponse
-         * @description The failed windows, with the reason and time of the latest one.
-         */
-        AgentSessionLatestFailureResponse: {
-            /** Count */
-            count: number;
-            /** Last Seen At */
-            last_seen_at: string | null;
-            /** Reason */
-            reason: string | null;
-        };
-        /**
-         * AgentSessionOutcomeCountsResponse
-         * @description How many processed windows kept a knowledge patch, kept nothing, or failed.
-         */
-        AgentSessionOutcomeCountsResponse: {
-            /** Failed */
-            failed: number;
-            /** Knowledge Patched */
-            knowledge_patched: number;
-            /** No Output */
-            no_output: number;
-        };
-        /** AgentSessionWindowRequest */
-        AgentSessionWindowRequest: {
-            /** Branch */
-            branch?: string | null;
-            /** Client */
-            client: string;
-            /** Commit Sha */
-            commit_sha?: string | null;
-            /** Events */
-            events?: {
-                [key: string]: unknown;
-            }[];
-            /** History Window */
-            history_window?: {
-                [key: string]: unknown;
-            };
-            /** Plugin Version */
-            plugin_version?: string | null;
-            /**
-             * Process Now
-             * @default false
-             */
-            process_now: boolean;
-            /** Receipt */
-            receipt?: {
-                [key: string]: unknown;
-            };
-            /** Repo */
-            repo?: string | null;
-            /**
-             * Retention
-             * @default none
-             */
-            retention: string;
-            /**
-             * Schema Version
-             * @default agent-session-window/v1
-             */
-            schema_version: string;
-            /** Session Id */
-            session_id: string;
-            /** Source Updated At */
-            source_updated_at?: string | null;
-            /** Submitted At */
-            submitted_at?: string | null;
-            /** Transcript Markdown */
-            transcript_markdown?: string | null;
-            /** Trigger */
-            trigger: string;
-            /** Workspace */
-            workspace: string;
+        AgentSessionCaptureRemovedResponse: {
+            detail: components["schemas"]["AgentSessionCaptureRemovedDetail"];
         };
         /** ComponentHealth */
         ComponentHealth: {
@@ -6681,8 +6569,6 @@ export interface components {
             sync_schedule?: components["schemas"]["SourceSyncScheduleResponse"] | null;
             /** Type */
             type: string;
-            /** @description Transcript lines the current plugin version could not recognize in recent uploads; present only for agent-session Sources, null when every line was recognized. */
-            unrecognized_session_lines?: components["schemas"]["UnrecognizedSessionLinesResponse"] | null;
         };
         /** SourceScopeChangePreviewRequest */
         SourceScopeChangePreviewRequest: {
@@ -7336,18 +7222,6 @@ export interface components {
             reason: "source_busy" | "source_paused" | "source_not_active" | "source_not_synced" | "source_missing" | "projection_scope_transition_open";
             /** Source Id */
             source_id: string;
-        };
-        /**
-         * UnrecognizedSessionLinesResponse
-         * @description Transcript lines the agent client's plugin could not recognize in recent uploads.
-         */
-        UnrecognizedSessionLinesResponse: {
-            /** Count */
-            count: number;
-            /** Last Seen At */
-            last_seen_at: string | null;
-            /** Plugin Version */
-            plugin_version: string | null;
         };
         /** UpdateSourceRequest */
         UpdateSourceRequest: {
@@ -8169,12 +8043,9 @@ export interface operations {
             };
         };
     };
-    agent_session_completeness_api_v1_agent_sessions_completeness_get: {
+    refuse_agent_session_window_api_v1_agent_sessions_windows_post: {
         parameters: {
-            query: {
-                source_id: string;
-                session_id?: string | null;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -8182,54 +8053,12 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Successful Response */
-            200: {
+            410: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AgentSessionCompletenessResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    submit_agent_session_window_summary_api_v1_agent_sessions_windows_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AgentSessionWindowRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["AgentSessionCaptureRemovedResponse"];
                 };
             };
         };
@@ -8942,35 +8771,22 @@ export interface operations {
             };
         };
     };
-    record_agent_hook_receipt_api_v1_hooks_receipts_post: {
+    refuse_agent_hook_receipt_api_v1_hooks_receipts_post: {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AgentHookReceiptRequest"];
-            };
-        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
-            200: {
+            410: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["AgentSessionCaptureRemovedResponse"];
                 };
             };
         };

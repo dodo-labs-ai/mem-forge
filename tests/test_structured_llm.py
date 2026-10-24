@@ -11,17 +11,17 @@ import json
 import logging
 from time import perf_counter
 import weakref
+from typing import Literal
 
 import litellm
 import pytest
 from PIL import Image
-from pydantic import ConfigDict, ValidationError
+from pydantic import ConfigDict, ValidationError, model_validator
 
 from memforge.evals.agent_evaluation import QualitySignalCollector, quality_signal_scope
 from memforge.llm.capability import CapabilityCheckResponse
 from memforge.llm.providers import ResolvedInvocation
 from memforge.llm.structured import (
-    AgentSessionAuthorityResponse,
     CandidateAdmissionDecision,
     CandidateAdmissionResponse,
     EntityBatchValidationDecision,
@@ -255,28 +255,6 @@ def set_native_schema_support(monkeypatch, supported: bool) -> None:
     )
 
 
-def test_agent_session_authority_response_accepts_typed_decisions():
-    response = AgentSessionAuthorityResponse.model_validate(
-        {
-            "decisions": [
-                {"evidence_id": "E1", "authority_kind": "durable_user_intent"},
-                {"evidence_id": "E2", "authority_kind": "not_authoritative"},
-            ]
-        }
-    )
-
-    assert response.decisions[0].evidence_id == "E1"
-    assert response.decisions[0].is_authoritative is True
-    assert response.decisions[1].is_authoritative is False
-
-
-def test_agent_session_authority_decision_holds_only_the_authority_kind():
-    with pytest.raises(ValidationError):
-        AgentSessionAuthorityResponse.model_validate(
-            {"decisions": [{"evidence_id": "E1", "authority_kind": "design_decision", "reason": "a rule"}]}
-        )
-
-
 def test_memory_extraction_response_rejects_top_level_array():
     with pytest.raises(ValidationError):
         ProjectionFragmentMemoryExtractionResponse.model_validate(
@@ -314,7 +292,7 @@ async def test_litellm_structured_client_uses_response_schema_for_source_support
         )
     )
 
-    response = await client.classify_agent_session_evidence_authority("prompt")
+    response = await client.admit_candidates("prompt")
 
     assert response.decisions == []
     assert calls[0]["model"] == "anthropic/anthropic--claude-sonnet-latest"
@@ -322,7 +300,7 @@ async def test_litellm_structured_client_uses_response_schema_for_source_support
     assert calls[0]["api_key"] == "local-key"
     assert calls[0]["timeout"] == pytest.approx(120.0, abs=0.01)
     assert calls[0]["messages"] == [{"role": "user", "content": "prompt"}]
-    assert calls[0]["response_format"] is AgentSessionAuthorityResponse
+    assert calls[0]["response_format"] is CandidateAdmissionResponse
     assert "tools" not in calls[0]
     assert "tool_choice" not in calls[0]
     assert calls[0]["max_tokens"] == client.request_budget().output_tokens
@@ -544,70 +522,6 @@ async def test_litellm_structured_client_rejects_invalid_image_before_provider_c
     assert telemetry[0].attempt_count == 0
     # No model response exists, so this is a request error, not an invalid response.
     assert telemetry[0].terminal_category == "request_error"
-
-
-@pytest.mark.asyncio
-async def test_litellm_structured_client_uses_response_schema_for_agent_session_authority(monkeypatch):
-    calls = []
-
-    async def fake_acompletion(**kwargs):
-        calls.append(kwargs)
-        return CompletionResponse(
-            '{"decisions":[{"evidence_id":"E1","authority_kind":"durable_user_intent"}]}'
-        )
-
-    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
-    set_native_schema_support(monkeypatch, True)
-    client = LiteLlmStructuredClient(
-        StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
-            base_url="http://localhost:6655/anthropic",
-            api_key="local-key",
-            timeout_s=120.0,
-        )
-    )
-
-    response = await client.classify_agent_session_evidence_authority("prompt")
-
-    assert response.decisions[0].evidence_id == "E1"
-    assert calls[0]["messages"] == [{"role": "user", "content": "prompt"}]
-    assert calls[0]["response_format"] is AgentSessionAuthorityResponse
-    assert calls[0]["max_tokens"] == client.request_budget().output_tokens
-
-
-@pytest.mark.asyncio
-async def test_agent_session_authority_classifier_retries_invalid_native_schema_as_json_text(
-    monkeypatch,
-):
-    calls = []
-
-    async def fake_acompletion(**kwargs):
-        calls.append(kwargs)
-        if len(calls) == 1:
-            return CompletionResponse("not valid json")
-        return CompletionResponse(
-            '{"decisions":[{"evidence_id":"E1","authority_kind":"durable_user_intent"}]}'
-        )
-
-    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
-    set_native_schema_support(monkeypatch, True)
-    client = LiteLlmStructuredClient(
-        StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
-            base_url="http://localhost:6655/anthropic",
-            api_key="local-key",
-            timeout_s=120.0,
-        )
-    )
-
-    response = await client.classify_agent_session_evidence_authority("prompt")
-
-    assert response.decisions[0].evidence_id == "E1"
-    assert response.decisions[0].is_authoritative is True
-    assert len(calls) == 2
-    assert calls[0]["response_format"] is AgentSessionAuthorityResponse
-    assert "response_format" not in calls[1]
-    assert calls[1]["messages"][0]["content"].startswith("prompt\n\nReturn ONLY")
 
 
 @pytest.mark.asyncio
@@ -861,9 +775,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "CrossDocumentRelationResponse": '{"decisions":[]}',
         "EntityBatchValidationResponse": '{"decisions":[]}',
         "RerankResponse": '{"ranking":[]}',
-            "AgentKnowledgePatchModelResponse": '{"action":"no_output"}',
-        "AgentSessionAuthorityResponse": '{"decisions":[]}',
-        "OfflineSemanticJudgeResponse": (
+            "OfflineSemanticJudgeResponse": (
             '{"verdict":"criterion_satisfied",'
             '"confidence":"high"}'
         ),
@@ -895,10 +807,6 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "classify_cross_document_relations": lambda: client.classify_cross_document_relations("prompt"),
         "validate_entity_batch": lambda: client.validate_entity_batch("prompt"),
         "rerank_memories": lambda: client.rerank_memories("prompt"),
-        "generate_agent_knowledge_patch": lambda: client.generate_agent_knowledge_patch("prompt"),
-        "classify_agent_session_evidence_authority": (
-            lambda: client.classify_agent_session_evidence_authority("prompt")
-        ),
         "judge_offline_semantics": lambda: client.judge_offline_semantics(
             "prompt",
             model="gateway/judge-model",
@@ -1542,6 +1450,21 @@ async def test_litellm_structured_client_repairs_invalid_json_first_response(
     assert telemetry[0].terminal_category == "success"
 
 
+class _SelectionResponse(StructuredResponseModel):
+    """A response with a rule that spans fields, so only the model level can state it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["select", "no_output"]
+    primary_event_id: str | None = None
+
+    @model_validator(mode="after")
+    def _no_output_selects_nothing(self) -> "_SelectionResponse":
+        if self.action == "no_output" and self.primary_event_id is not None:
+            raise ValueError("no_output cannot select Evidence events")
+        return self
+
+
 @pytest.mark.asyncio
 async def test_litellm_structured_client_repair_names_model_level_rule(monkeypatch):
     calls = []
@@ -1564,7 +1487,7 @@ async def test_litellm_structured_client_repair_names_model_level_rule(monkeypat
         ),
     )
 
-    response = await client.generate_agent_knowledge_patch("prompt")
+    response = await client.answer_schema("prompt", response_format=_SelectionResponse)
 
     assert response.action == "no_output"
     assert len(calls) == 2

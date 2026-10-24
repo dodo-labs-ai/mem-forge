@@ -150,7 +150,7 @@ def source_ownership_and_capabilities(
                 else can_manage and not managed_source
             )
         ),
-        "can_delete": can_manage and not managed_source,
+        "can_delete": can_manage,
         "can_change_access": can_manage,
     }
     return ownership, capabilities

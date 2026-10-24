@@ -75,7 +75,6 @@ export function SourceRow({
   onSync,
   onStopSync,
   onResume,
-  onShowDetails,
   onShowEvaluation,
   onSubscriptionChange,
   actionsMenu,
@@ -103,7 +102,6 @@ export function SourceRow({
   /** Stops the sync in progress; absent when the viewer cannot sync the source. */
   onStopSync?: () => void;
   onResume?: () => void;
-  onShowDetails: () => void;
   onShowEvaluation: () => void;
   onSubscriptionChange: (enabled: boolean) => void;
   actionsMenu: ReactNode;
@@ -243,18 +241,6 @@ export function SourceRow({
               pending={isSubscriptionPending}
               onChange={onSubscriptionChange}
             />
-          )}
-          {isManaged && (
-            <Button
-              type="button"
-              variant="outline"
-              aria-label="View managed source details"
-              disabled={isDeleting}
-              onClick={onShowDetails}
-            >
-              <Info className="size-4" />
-              <span className="hidden lg:inline">Details</span>
-            </Button>
           )}
           {canConfigure && (
             <Button

@@ -2,7 +2,7 @@
 
 Hooks are lifecycle automation, not a separate memory pipeline.  This module
 builds compact, model-readable context from existing persisted memories and
-source state; agent-session window intake is owned by agent_sessions.py.
+source state.
 
 Hook context is PERSONALIZED retrieval: the principal is supplied by the
 caller (the HTTP handler resolves it server-side, never from the body), and

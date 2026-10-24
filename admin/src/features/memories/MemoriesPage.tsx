@@ -55,7 +55,7 @@ export function MemoriesPage() {
     <div className="space-y-6">
       <PageHeader
         title="Memories"
-        description="What MemForge has learned from your sources and agent sessions. Open a memory to see its evidence."
+        description="What MemForge has learned from your sources and what you asked your agents to remember. Open a memory to see its evidence."
         actions={
           <Button variant="outline" onClick={() => void refresh()}>
             <RefreshCw />
