@@ -192,6 +192,48 @@ def test_unknown_hook_mode_lets_the_client_continue(monkeypatch, capsys, argv):
     assert json.loads(capsys.readouterr().out) == {"continue": True}
 
 
+def test_unknown_hook_mode_reads_the_whole_hook_input(monkeypatch, capsys):
+    from memforge import hook_adapter
+
+    stdin = io.StringIO(json.dumps({"hook_event_name": "Stop", "transcript_path": "/tmp/t.jsonl"}))
+    monkeypatch.setattr(hook_adapter.sys, "stdin", stdin)
+
+    assert hook_adapter.main(["submit-session", "--client", "codex"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"continue": True}
+    assert stdin.read() == ""
+
+
+@pytest.mark.parametrize("client", ["codex", "claude-code"])
+@pytest.mark.parametrize("mode", ["submit-session", "worker-drain"])
+def test_plugin_wrapper_accepts_a_large_payload_for_an_old_hook_mode(client, mode):
+    # An old hooks.json still sends Stop and PreCompact payloads. The payload is
+    # larger than a pipe buffer, so the client's write fails with a broken pipe
+    # unless the hook reads it to the end.
+    root = Path(__file__).resolve().parents[1]
+    wrapper = root / "integrations" / client / "memforge-memory" / "scripts" / "memforge_hook.py"
+    payload = json.dumps({"hook_event_name": "Stop", "last_assistant_message": "x" * 1_000_000})
+
+    process = subprocess.Popen(
+        [sys.executable, str(wrapper), mode, "--client", client],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        process.stdin.write(payload)
+        process.stdin.close()
+        stdout = process.stdout.read()
+        stderr = process.stderr.read()
+        assert process.wait(timeout=5) == 0
+    finally:
+        process.kill()
+        process.wait()
+
+    assert stderr == ""
+    assert json.loads(stdout) == {"continue": True}
+
+
 @pytest.mark.parametrize("event_name", ["Stop", "PreCompact", "SubagentStop", "UserPromptSubmit"])
 def test_context_mode_adds_nothing_outside_session_start(monkeypatch, capsys, event_name):
     from memforge import hook_adapter

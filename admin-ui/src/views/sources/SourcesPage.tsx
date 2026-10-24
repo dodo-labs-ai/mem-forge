@@ -62,11 +62,7 @@ import {
 } from "./sourceConnectionPresentation";
 
 const SOURCE_LABELS: Record<string, { name: string; subtitle: string; description: string }> = {
-  // Per-client agent-session sources returned by the split backend.
-  "src-agent-sessions-codex": { name: "Codex Session", subtitle: "Managed source", description: "Coding-agent session summaries from the Codex plugin" },
-  "src-agent-sessions-claude-code": { name: "Claude Code Session", subtitle: "Managed source", description: "Coding-agent session summaries from the Claude Code plugin" },
-  // Legacy / fallback entry used when the backend returns the singleton type.
-  agent_session: { name: "Agent Session", subtitle: "Managed source", description: "Generated coding-agent session summaries" },
+  agent_session: { name: "Agent Session", subtitle: "Managed source", description: "Private memories kept from earlier Codex or Claude Code sessions" },
   confluence: { name: "Confluence", subtitle: "Knowledge source", description: "Wiki pages and documentation" },
   github_pages: { name: "GitHub Pages", subtitle: "Documentation source", description: "Published documentation pages" },
   jira: { name: "Jira", subtitle: "Work tracking source", description: "Tickets, decisions, and work items" },
@@ -75,8 +71,6 @@ const SOURCE_LABELS: Record<string, { name: string; subtitle: string; descriptio
 };
 
 const SOURCE_ITEM_LABELS: Record<string, string> = {
-  "src-agent-sessions-codex": "summaries",
-  "src-agent-sessions-claude-code": "summaries",
   agent_session: "summaries",
   confluence: "pages",
   github_pages: "documents",
@@ -180,7 +174,7 @@ async function pollLocalAgentSyncJob(
 }
 
 function sourceItemLabel(source: Source): string {
-  return SOURCE_ITEM_LABELS[source.id] ?? SOURCE_ITEM_LABELS[source.type] ?? "documents";
+  return SOURCE_ITEM_LABELS[source.type] ?? "documents";
 }
 
 type SyncAdmissionReceipt = SourceSyncRetryTarget & { createdAt: string | null };
@@ -821,7 +815,7 @@ export function SourcesPage() {
                     };
                     const isManaged = isManagedSourceType(source.type) || isManagedSourceId(source.id);
                     const gene = geneByName.get(source.type);
-                    const sourceLabel = SOURCE_LABELS[source.id] ?? SOURCE_LABELS[source.type] ?? {
+                    const sourceLabel = SOURCE_LABELS[source.type] ?? {
                       name: gene?.display_name ?? source.type,
                       subtitle: gene?.data_shape ?? "",
                     };

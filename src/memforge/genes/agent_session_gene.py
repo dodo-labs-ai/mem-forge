@@ -21,8 +21,8 @@ __all__ = ["AgentSessionGene"]
 
 
 _NO_PROVIDER_CONTENT = (
-    "Agent Session Sources hold Agent Knowledge kept from earlier plugin releases; "
-    "they have no provider content to fetch"
+    "Agent Session Sources hold memories kept from earlier Codex or Claude Code "
+    "sessions; they have no provider content to fetch"
 )
 
 
@@ -30,11 +30,13 @@ class AgentSessionGene(Gene):
     """Private per-client, per-user Sources that hold existing Agent Knowledge.
 
     Each one keeps the private claims recorded for one coding client and owner.
-    MemForge creates no new agent-session Sources and writes nothing to existing
-    ones: coding agents save memory only through the confirmed MCP
-    ``create_memory`` tool. The owner retires a Source by deleting it. The
-    Source declares no execution kinds, so it is never synced and discovery
-    finds nothing.
+    MemForge creates no new agent-session Sources and coding sessions add no new
+    claims: coding agents save memory only through the confirmed MCP
+    ``create_memory`` tool. The owner can still correct or retire a claim
+    Memory, and that change goes through the claim lifecycle in
+    ``memforge.agent_knowledge``, which updates the claim and its concept. The
+    owner retires the whole Source by deleting it. The Source declares no
+    execution kinds, so it is never synced and discovery finds nothing.
     """
 
     @classmethod
@@ -42,7 +44,7 @@ class AgentSessionGene(Gene):
         return GeneMetadata(
             name="agent_session",
             display_name="Agent Session",
-            description="Private Agent Knowledge kept for one Codex or Claude Code owner",
+            description="Private memories kept from earlier Codex or Claude Code sessions",
             default_sync_interval_minutes=0,
             auth_method="local_file",
             data_shape="message",
@@ -60,7 +62,7 @@ class AgentSessionGene(Gene):
                     field_type=ConfigFieldType.STRING,
                     required=False,
                     placeholder="codex",
-                    help_text="Coding client whose Agent Knowledge this Source holds (e.g. 'codex', 'claude-code').",
+                    help_text="Coding client whose memories this Source holds (e.g. 'codex', 'claude-code').",
                     group="client",
                     order=0,
                 ),
