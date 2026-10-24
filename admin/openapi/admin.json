@@ -1092,6 +1092,131 @@
         "title": "AgentHookReceiptRequest",
         "type": "object"
       },
+      "AgentSessionCompletenessResponse": {
+        "description": "Knowledge completeness of agent-session windows, computed on demand.\n\n``processed_total`` counts the windows that were processed, patched or\nnot, and ``no_output_fraction`` is the share of them that kept nothing\n(0 when none was processed). ``total`` also counts failed windows.\n``latest_failure`` is ``null`` when no window failed. ``session_id`` and\n``source_id`` echo the filters the request named.",
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/AgentSessionOutcomeCountsResponse"
+          },
+          "latest_failure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentSessionLatestFailureResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "no_output_fraction": {
+            "title": "No Output Fraction",
+            "type": "number"
+          },
+          "processed_total": {
+            "title": "Processed Total",
+            "type": "integer"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "source_id",
+          "total",
+          "processed_total",
+          "counts",
+          "no_output_fraction",
+          "latest_failure"
+        ],
+        "title": "AgentSessionCompletenessResponse",
+        "type": "object"
+      },
+      "AgentSessionLatestFailureResponse": {
+        "description": "The failed windows, with the reason and time of the latest one.",
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "last_seen_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Seen At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "required": [
+          "count",
+          "reason",
+          "last_seen_at"
+        ],
+        "title": "AgentSessionLatestFailureResponse",
+        "type": "object"
+      },
+      "AgentSessionOutcomeCountsResponse": {
+        "description": "How many processed windows kept a knowledge patch, kept nothing, or failed.",
+        "properties": {
+          "failed": {
+            "title": "Failed",
+            "type": "integer"
+          },
+          "knowledge_patched": {
+            "title": "Knowledge Patched",
+            "type": "integer"
+          },
+          "no_output": {
+            "title": "No Output",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "knowledge_patched",
+          "no_output",
+          "failed"
+        ],
+        "title": "AgentSessionOutcomeCountsResponse",
+        "type": "object"
+      },
       "AgentSessionWindowRequest": {
         "properties": {
           "branch": {
@@ -1266,12 +1391,115 @@
         "title": "ComponentHealth",
         "type": "object"
       },
+      "ConfigCheckRequest": {
+        "properties": {
+          "config": {
+            "additionalProperties": true,
+            "title": "Config",
+            "type": "object"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          }
+        },
+        "required": [
+          "config"
+        ],
+        "title": "ConfigCheckRequest",
+        "type": "object"
+      },
+      "ConfigCheckResponse": {
+        "properties": {
+          "derived": {
+            "additionalProperties": true,
+            "description": "Declared non-secret fields whose effective value the save would change, as it would store them.",
+            "title": "Derived",
+            "type": "object"
+          },
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/ConfigFactResponse"
+            },
+            "title": "Facts",
+            "type": "array"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/FieldIssueResponse"
+            },
+            "title": "Issues",
+            "type": "array"
+          }
+        },
+        "required": [
+          "derived",
+          "facts",
+          "issues"
+        ],
+        "title": "ConfigCheckResponse",
+        "type": "object"
+      },
+      "ConfigConditionResponse": {
+        "properties": {
+          "field": {
+            "title": "Field",
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Values",
+            "type": "array"
+          }
+        },
+        "required": [
+          "field",
+          "values"
+        ],
+        "title": "ConfigConditionResponse",
+        "type": "object"
+      },
+      "ConfigFactResponse": {
+        "properties": {
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "value"
+        ],
+        "title": "ConfigFactResponse",
+        "type": "object"
+      },
       "ConfigFieldResponse": {
         "properties": {
           "advanced": {
             "default": false,
             "title": "Advanced",
             "type": "boolean"
+          },
+          "choices": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ConfigOptionResponse"
+            },
+            "title": "Choices",
+            "type": "array"
           },
           "default": {
             "default": "",
@@ -1281,6 +1509,12 @@
           "field_type": {
             "title": "Field Type",
             "type": "string"
+          },
+          "fixed_after_create": {
+            "default": false,
+            "description": "Chooses the executor; a stored Source keeps it.",
+            "title": "Fixed After Create",
+            "type": "boolean"
           },
           "group": {
             "default": "general",
@@ -1302,6 +1536,8 @@
           },
           "options": {
             "default": [],
+            "deprecated": true,
+            "description": "The values of `choices`.",
             "items": {
               "type": "string"
             },
@@ -1320,8 +1556,34 @@
           },
           "required": {
             "default": true,
+            "description": "Required while the field is visible.",
             "title": "Required",
             "type": "boolean"
+          },
+          "scope": {
+            "default": false,
+            "description": "Changing it changes which items the Source holds.",
+            "title": "Scope",
+            "type": "boolean"
+          },
+          "visible_when": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ConfigConditionResponse"
+            },
+            "title": "Visible When",
+            "type": "array"
+          },
+          "widget": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Widget"
           }
         },
         "required": [
@@ -1334,6 +1596,11 @@
       },
       "ConfigGroupResponse": {
         "properties": {
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
           "key": {
             "title": "Key",
             "type": "string"
@@ -1346,6 +1613,24 @@
             "default": 0,
             "title": "Order",
             "type": "integer"
+          },
+          "panels": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ConfigPanelResponse"
+            },
+            "title": "Panels",
+            "type": "array"
+          },
+          "purpose": {
+            "default": "content",
+            "enum": [
+              "connection",
+              "content",
+              "options"
+            ],
+            "title": "Purpose",
+            "type": "string"
           }
         },
         "required": [
@@ -1353,6 +1638,58 @@
           "label"
         ],
         "title": "ConfigGroupResponse",
+        "type": "object"
+      },
+      "ConfigOptionResponse": {
+        "properties": {
+          "help_text": {
+            "default": "",
+            "title": "Help Text",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          },
+          "visible_when": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ConfigConditionResponse"
+            },
+            "title": "Visible When",
+            "type": "array"
+          }
+        },
+        "required": [
+          "value",
+          "label"
+        ],
+        "title": "ConfigOptionResponse",
+        "type": "object"
+      },
+      "ConfigPanelResponse": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "visible_when": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ConfigConditionResponse"
+            },
+            "title": "Visible When",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ConfigPanelResponse",
         "type": "object"
       },
       "ConversationArtifactLinkRequest": {
@@ -2130,6 +2467,46 @@
         "title": "EmbeddingProfileResponse",
         "type": "object"
       },
+      "EntityAliasAddedResponse": {
+        "description": "The manual alias as given and the normalised form that matching reads.",
+        "properties": {
+          "alias": {
+            "title": "Alias",
+            "type": "string"
+          },
+          "alias_normalized": {
+            "title": "Alias Normalized",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "alias",
+          "alias_normalized"
+        ],
+        "title": "EntityAliasAddedResponse",
+        "type": "object"
+      },
+      "EntityAliasListResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/EntityAliasResponse"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "EntityAliasListResponse",
+        "type": "object"
+      },
       "EntityAliasResponse": {
         "properties": {
           "alias": {
@@ -2237,6 +2614,23 @@
         "title": "EntityListResponse",
         "type": "object"
       },
+      "EntityMergeResponse": {
+        "properties": {
+          "merged": {
+            "$ref": "#/components/schemas/MergedEntitiesResponse"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "merged"
+        ],
+        "title": "EntityMergeResponse",
+        "type": "object"
+      },
       "EntityResponse": {
         "properties": {
           "canonical_name": {
@@ -2271,6 +2665,31 @@
         "title": "EntityResponse",
         "type": "object"
       },
+      "FieldIssueResponse": {
+        "properties": {
+          "key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "message"
+        ],
+        "title": "FieldIssueResponse",
+        "type": "object"
+      },
       "GeneConfigSchemaResponse": {
         "properties": {
           "fields": {
@@ -2288,6 +2707,17 @@
             },
             "title": "Groups",
             "type": "array"
+          },
+          "project_field": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Field"
           }
         },
         "title": "GeneConfigSchemaResponse",
@@ -2326,6 +2756,11 @@
             "title": "Execution Kinds",
             "type": "array"
           },
+          "managed": {
+            "description": "Managed capture, created by the service; the type picker leaves it out.",
+            "title": "Managed",
+            "type": "boolean"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -2338,9 +2773,218 @@
           "default_sync_interval_minutes",
           "auth_method",
           "data_shape",
-          "execution_kinds"
+          "execution_kinds",
+          "managed"
         ],
         "title": "GeneMetadataResponse",
+        "type": "object"
+      },
+      "GitHubRepoPreviewCounts": {
+        "additionalProperties": false,
+        "description": "Files the configured paths and extensions include, and files they leave out.",
+        "properties": {
+          "ignored": {
+            "title": "Ignored",
+            "type": "integer"
+          },
+          "included": {
+            "title": "Included",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "included",
+          "ignored"
+        ],
+        "title": "GitHubRepoPreviewCounts",
+        "type": "object"
+      },
+      "GitHubRepoPreviewItem": {
+        "additionalProperties": false,
+        "description": "One repository file the Source would read.\n\n``relative_path`` is the path the Source names the file by. When it is a\nsymbolic link, ``symlink_chain`` lists the links followed and\n``resolved_relative_path`` is the file whose content is read.",
+        "properties": {
+          "blob_sha": {
+            "title": "Blob Sha",
+            "type": "string"
+          },
+          "bytes": {
+            "title": "Bytes",
+            "type": "integer"
+          },
+          "content_type": {
+            "title": "Content Type",
+            "type": "string"
+          },
+          "file_mode": {
+            "title": "File Mode",
+            "type": "string"
+          },
+          "logical_file_mode": {
+            "title": "Logical File Mode",
+            "type": "string"
+          },
+          "relative_path": {
+            "title": "Relative Path",
+            "type": "string"
+          },
+          "resolved_relative_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved Relative Path"
+          },
+          "symlink_chain": {
+            "items": {
+              "$ref": "#/components/schemas/GitHubSymlinkHop"
+            },
+            "title": "Symlink Chain",
+            "type": "array"
+          }
+        },
+        "required": [
+          "relative_path",
+          "blob_sha",
+          "bytes",
+          "file_mode",
+          "logical_file_mode",
+          "symlink_chain",
+          "resolved_relative_path",
+          "content_type"
+        ],
+        "title": "GitHubRepoPreviewItem",
+        "type": "object"
+      },
+      "GitHubRepoPreviewTreeResult": {
+        "additionalProperties": false,
+        "description": "A remote repository's tree as the daemon's Git access reads it.\n\nThe daemon lists the whole tree at ``commit_sha`` of ``ref`` with the\nconfigured include and exclude paths cleared, so the folder picker can\noffer every folder. ``items`` holds at most the requested number of files,\nand ``counts`` counts all of them. ``extension_counts`` counts the\nincluded files by extension.",
+        "properties": {
+          "commit_sha": {
+            "title": "Commit Sha",
+            "type": "string"
+          },
+          "counts": {
+            "$ref": "#/components/schemas/GitHubRepoPreviewCounts"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
+          },
+          "error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Type"
+          },
+          "exclude_paths": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Exclude Paths",
+            "type": "array"
+          },
+          "extension_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Extension Counts",
+            "type": "object"
+          },
+          "heartbeat_errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Heartbeat Errors"
+          },
+          "include_extensions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Include Extensions",
+            "type": "array"
+          },
+          "include_paths": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Include Paths",
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/GitHubRepoPreviewItem"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "operation": {
+            "title": "Operation",
+            "type": "string"
+          },
+          "profile": {
+            "title": "Profile",
+            "type": "string"
+          },
+          "ref": {
+            "title": "Ref",
+            "type": "string"
+          },
+          "repo_url": {
+            "title": "Repo Url",
+            "type": "string"
+          },
+          "root_tree_sha": {
+            "title": "Root Tree Sha",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "source_id",
+          "profile",
+          "repo_url",
+          "ref",
+          "commit_sha",
+          "root_tree_sha",
+          "include_paths",
+          "exclude_paths",
+          "include_extensions",
+          "counts",
+          "extension_counts",
+          "items"
+        ],
+        "title": "GitHubRepoPreviewTreeResult",
         "type": "object"
       },
       "GitHubRepoTreeItemResponse": {
@@ -2443,6 +3087,31 @@
           "items"
         ],
         "title": "GitHubRepoTreeResponse",
+        "type": "object"
+      },
+      "GitHubSymlinkHop": {
+        "additionalProperties": false,
+        "description": "One symbolic link followed on the way to a file's content.",
+        "properties": {
+          "blob_sha": {
+            "title": "Blob Sha",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "target_path": {
+            "title": "Target Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "blob_sha",
+          "target_path"
+        ],
+        "title": "GitHubSymlinkHop",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -2568,6 +3237,132 @@
           "source_count"
         ],
         "title": "ImageDocumentsResponse",
+        "type": "object"
+      },
+      "JiraAuthResult": {
+        "additionalProperties": false,
+        "description": "A Jira browser session captured on the user's computer and stored for the Source.\n\nOn success ``authenticated`` is true and ``origin`` is the Jira site the\nsession belongs to. ``error`` is ``principal_changed`` when the user signed\nin as a different Jira account than the one the stored session names;\n``old_principal_id`` and ``new_principal_id`` then name both accounts.\n``retryable`` is false for every failure, because renewing again needs the\nuser at the browser.",
+        "properties": {
+          "authenticated": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Authenticated"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
+          },
+          "error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Type"
+          },
+          "heartbeat_errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Heartbeat Errors"
+          },
+          "new_principal_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "New Principal Id"
+          },
+          "old_principal_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Old Principal Id"
+          },
+          "operation": {
+            "title": "Operation",
+            "type": "string"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Origin"
+          },
+          "retryable": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Retryable"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source Id"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "title": "JiraAuthResult",
         "type": "object"
       },
       "JiraSessionExpireRequest": {
@@ -3146,6 +3941,240 @@
           "coalesced"
         ],
         "title": "LocalCollectionReceiptResponse",
+        "type": "object"
+      },
+      "LocalMarkdownPickRootResult": {
+        "additionalProperties": false,
+        "description": "The folder the user chose in the daemon's native folder picker.\n\n``root`` is the chosen absolute path. ``cancelled`` is true when the user\nclosed the picker without choosing, which is not a failure. A daemon with\nno native picker fails the job and asks for the path to be typed instead.",
+        "properties": {
+          "cancelled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cancelled"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
+          },
+          "error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Type"
+          },
+          "heartbeat_errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Heartbeat Errors"
+          },
+          "operation": {
+            "title": "Operation",
+            "type": "string"
+          },
+          "root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Root"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "title": "LocalMarkdownPickRootResult",
+        "type": "object"
+      },
+      "LocalMarkdownPreviewCounts": {
+        "additionalProperties": false,
+        "description": "Files the scan read, and files it left out by reason.",
+        "properties": {
+          "ignored": {
+            "title": "Ignored",
+            "type": "integer"
+          },
+          "included": {
+            "title": "Included",
+            "type": "integer"
+          },
+          "invalid_utf8": {
+            "title": "Invalid Utf8",
+            "type": "integer"
+          },
+          "too_large": {
+            "title": "Too Large",
+            "type": "integer"
+          },
+          "unreadable": {
+            "title": "Unreadable",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "included",
+          "ignored",
+          "too_large",
+          "invalid_utf8",
+          "unreadable"
+        ],
+        "title": "LocalMarkdownPreviewCounts",
+        "type": "object"
+      },
+      "LocalMarkdownPreviewItem": {
+        "additionalProperties": false,
+        "description": "One file under the folder that the Source would read.",
+        "properties": {
+          "bytes": {
+            "title": "Bytes",
+            "type": "integer"
+          },
+          "content_type": {
+            "title": "Content Type",
+            "type": "string"
+          },
+          "raw_hash": {
+            "title": "Raw Hash",
+            "type": "string"
+          },
+          "relative_path": {
+            "title": "Relative Path",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "relative_path",
+          "title",
+          "content_type",
+          "raw_hash",
+          "bytes"
+        ],
+        "title": "LocalMarkdownPreviewItem",
+        "type": "object"
+      },
+      "LocalMarkdownPreviewTreeResult": {
+        "additionalProperties": false,
+        "description": "The files under a local folder that the configured patterns select.\n\n``root`` is the resolved folder and ``vault_id`` the identity its\nDocuments are stored under. ``items`` holds at most the requested number\nof files, and ``counts`` counts all of them.",
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/LocalMarkdownPreviewCounts"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
+          },
+          "error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Type"
+          },
+          "heartbeat_errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Heartbeat Errors"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/LocalMarkdownPreviewItem"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "operation": {
+            "title": "Operation",
+            "type": "string"
+          },
+          "profile": {
+            "title": "Profile",
+            "type": "string"
+          },
+          "root": {
+            "title": "Root",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "vault_id": {
+            "title": "Vault Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "source_id",
+          "profile",
+          "root",
+          "vault_id",
+          "counts",
+          "items"
+        ],
+        "title": "LocalMarkdownPreviewTreeResult",
         "type": "object"
       },
       "LocalSourceConfirmationAnswerRequest": {
@@ -6336,6 +7365,35 @@
         "title": "MergeEntitiesRequest",
         "type": "object"
       },
+      "MergedEntitiesResponse": {
+        "description": "The two Entities a merge joined: the source is gone, the target holds its references.",
+        "properties": {
+          "source_id": {
+            "title": "Source Id",
+            "type": "integer"
+          },
+          "source_name": {
+            "title": "Source Name",
+            "type": "string"
+          },
+          "target_id": {
+            "title": "Target Id",
+            "type": "integer"
+          },
+          "target_name": {
+            "title": "Target Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "source_name",
+          "target_id",
+          "target_name"
+        ],
+        "title": "MergedEntitiesResponse",
+        "type": "object"
+      },
       "ModelApiKeyStatus": {
         "properties": {
           "is_set": {
@@ -7187,6 +8245,20 @@
           "current"
         ],
         "title": "ModelValidationResult",
+        "type": "object"
+      },
+      "OkResponse": {
+        "description": "A change that reports only that it was made.",
+        "properties": {
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "title": "OkResponse",
         "type": "object"
       },
       "ProjectCreateRequest": {
@@ -8356,6 +9428,38 @@
         "title": "ReviewPresentationResponse",
         "type": "object"
       },
+      "SourceAccessTransitionOperationResponse": {
+        "properties": {
+          "transition": {
+            "$ref": "#/components/schemas/SourceAccessTransitionResponse"
+          }
+        },
+        "required": [
+          "transition"
+        ],
+        "title": "SourceAccessTransitionOperationResponse",
+        "type": "object"
+      },
+      "SourceAccessTransitionQueuedResponse": {
+        "description": "A retry or revert admitted for the operation's worker.",
+        "properties": {
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "queued",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "status"
+        ],
+        "title": "SourceAccessTransitionQueuedResponse",
+        "type": "object"
+      },
       "SourceAccessTransitionRequest": {
         "properties": {
           "target_policy": {
@@ -8374,6 +9478,7 @@
         "type": "object"
       },
       "SourceAccessTransitionResponse": {
+        "description": "One durable change of a Source's access policy across its whole history.\n\nThe operation is ``queued`` until its worker starts, ``running`` while it\nre-projects the Source's Memories, and ends ``completed``. A ``failed``\noperation leaves the Source paused until its owner retries it or reverts\nit to ``previous_policy``, which ends it ``reverted``.\n``processed_memories`` counts the Memories re-projected so far, out of\n``total_memories``.",
         "properties": {
           "completed_at": {
             "anyOf": [
@@ -8549,6 +9654,58 @@
           "state"
         ],
         "title": "SourceConnectionStatusResponse",
+        "type": "object"
+      },
+      "SourceCreatedResponse": {
+        "properties": {
+          "access_policy": {
+            "enum": [
+              "private",
+              "workspace"
+            ],
+            "title": "Access Policy",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "type",
+          "access_policy"
+        ],
+        "title": "SourceCreatedResponse",
+        "type": "object"
+      },
+      "SourceCurrentAccessTransitionResponse": {
+        "description": "The Source's unfinished access operation, or ``null`` when there is none.",
+        "properties": {
+          "transition": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceAccessTransitionResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "transition"
+        ],
+        "title": "SourceCurrentAccessTransitionResponse",
         "type": "object"
       },
       "SourceExecutionResponse": {
@@ -8855,6 +10012,25 @@
           "viewer_relationship"
         ],
         "title": "SourceOwnershipResponse",
+        "type": "object"
+      },
+      "SourcePinResponse": {
+        "description": "Whether the Source is now pinned in the caller's Source List.",
+        "properties": {
+          "pinned": {
+            "title": "Pinned",
+            "type": "boolean"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "pinned"
+        ],
+        "title": "SourcePinResponse",
         "type": "object"
       },
       "SourceProjectResponse": {
@@ -9436,6 +10612,29 @@
         "title": "SourceScopeTransitionResponse",
         "type": "object"
       },
+      "SourceSubscriptionChangeResponse": {
+        "description": "The caller's subscription to the Source after the change.",
+        "properties": {
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "subscription": {
+            "$ref": "#/components/schemas/SourceSubscriptionResponse"
+          }
+        },
+        "required": [
+          "ok",
+          "source_id",
+          "subscription"
+        ],
+        "title": "SourceSubscriptionChangeResponse",
+        "type": "object"
+      },
       "SourceSubscriptionRequest": {
         "properties": {
           "enabled": {
@@ -9779,6 +10978,31 @@
           "coalesced"
         ],
         "title": "SourceSyncRunReceiptResponse",
+        "type": "object"
+      },
+      "SourceSyncRunStateResponse": {
+        "description": "Where one admitted sync run stands, read without advancing it.",
+        "properties": {
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "success",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "status"
+        ],
+        "title": "SourceSyncRunStateResponse",
         "type": "object"
       },
       "SourceSyncScheduleRequest": {
@@ -10200,6 +11424,24 @@
         "title": "SourceSyncStopResponse",
         "type": "object"
       },
+      "SourceUpdatedResponse": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "id"
+        ],
+        "title": "SourceUpdatedResponse",
+        "type": "object"
+      },
       "StatsResponse": {
         "properties": {
           "memories_by_status": {
@@ -10346,6 +11588,356 @@
           "selection_policy_version"
         ],
         "title": "SupportCasesSeedRequest",
+        "type": "object"
+      },
+      "TeamsAuthCheckResult": {
+        "additionalProperties": false,
+        "description": "Whether the daemon holds a usable Teams session, without opening a browser.\n\n``expires_in_minutes`` is the time left on the session's soonest-expiring\ntoken, or ``null`` when there is no usable session. A missing or expired\nsession is reported through ``authenticated: false`` and ``error``.",
+        "properties": {
+          "authenticated": {
+            "title": "Authenticated",
+            "type": "boolean"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
+          },
+          "error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Type"
+          },
+          "expires_in_minutes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires In Minutes"
+          },
+          "heartbeat_errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Heartbeat Errors"
+          },
+          "operation": {
+            "title": "Operation",
+            "type": "string"
+          },
+          "region": {
+            "title": "Region",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "region",
+          "authenticated",
+          "expires_in_minutes"
+        ],
+        "title": "TeamsAuthCheckResult",
+        "type": "object"
+      },
+      "TeamsAuthResult": {
+        "additionalProperties": false,
+        "description": "A Teams sign-in through a browser window on the user's computer.\n\nOn success ``authenticated`` is true and ``token_count`` counts the\ntokens the session holds.",
+        "properties": {
+          "authenticated": {
+            "title": "Authenticated",
+            "type": "boolean"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
+          },
+          "error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Type"
+          },
+          "heartbeat_errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Heartbeat Errors"
+          },
+          "operation": {
+            "title": "Operation",
+            "type": "string"
+          },
+          "region": {
+            "title": "Region",
+            "type": "string"
+          },
+          "token_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Token Count"
+          }
+        },
+        "required": [
+          "operation",
+          "region",
+          "authenticated"
+        ],
+        "title": "TeamsAuthResult",
+        "type": "object"
+      },
+      "TeamsBrowseResult": {
+        "additionalProperties": false,
+        "description": "The Teams conversations a Source can read, for the conversation picker.\n\nNames follow Teams' own fields (``displayName``, ``lastActivity``).\nGroup and individual chats are listed by latest activity first. An\nexpired session is renewed once through a browser sign-in before the job\nfails; the four lists are absent from a failed job.",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
+          },
+          "error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Type"
+          },
+          "favorites": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TeamsConversationOption"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Favorites"
+          },
+          "group_chats": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TeamsConversationOption"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Group Chats"
+          },
+          "heartbeat_errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Heartbeat Errors"
+          },
+          "individual_chats": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TeamsConversationOption"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Individual Chats"
+          },
+          "operation": {
+            "title": "Operation",
+            "type": "string"
+          },
+          "region": {
+            "title": "Region",
+            "type": "string"
+          },
+          "teams": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TeamsTeamOption"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Teams"
+          }
+        },
+        "required": [
+          "operation",
+          "region"
+        ],
+        "title": "TeamsBrowseResult",
+        "type": "object"
+      },
+      "TeamsChannelOption": {
+        "additionalProperties": false,
+        "properties": {
+          "displayName": {
+            "title": "Displayname",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "displayName"
+        ],
+        "title": "TeamsChannelOption",
+        "type": "object"
+      },
+      "TeamsConversationOption": {
+        "additionalProperties": false,
+        "description": "A chat or a favourite channel, named by its topic.\n\n``lastActivity`` is the time of the latest message as ISO 8601, when\nTeams reports one; a favourite carries no time.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "lastActivity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Lastactivity"
+          },
+          "topic": {
+            "title": "Topic",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "topic"
+        ],
+        "title": "TeamsConversationOption",
+        "type": "object"
+      },
+      "TeamsTeamOption": {
+        "additionalProperties": false,
+        "description": "A team the user belongs to, with the channels a Source can read.",
+        "properties": {
+          "channels": {
+            "items": {
+              "$ref": "#/components/schemas/TeamsChannelOption"
+            },
+            "title": "Channels",
+            "type": "array"
+          },
+          "displayName": {
+            "title": "Displayname",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "displayName",
+          "channels"
+        ],
+        "title": "TeamsTeamOption",
         "type": "object"
       },
       "UnqueuedSource": {
@@ -11693,7 +13285,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/AgentSessionCompletenessResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -12240,7 +13834,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/EntityMergeResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -12324,7 +13920,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/EntityAliasListResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -12373,7 +13971,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/EntityAliasAddedResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -12423,7 +14023,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -12513,9 +14115,62 @@
         ]
       }
     },
+    "/api/v1/genes/{name}/config-check": {
+      "post": {
+        "description": "What saving this configuration would store and refuse, without saving it.\n\nIt runs save's own steps (``complete`` and every configuration check)\non a copy, and writes nothing: no Source, no inbox, no encrypted\nsecret. ``derived`` holds the declared non-secret fields whose\neffective value the steps change, such as the page tree a pasted\nConfluence page URL names; ``facts`` states what the type can tell\nabout the configuration; ``issues`` holds every refusal. With\n``source_id``, the stored configuration completes the copy as it does\non update, and the caller needs the access that update needs.",
+        "operationId": "check_gene_config_api_v1_genes__name__config_check_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfigCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigCheckResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Gene Config",
+        "tags": [
+          "genes"
+        ]
+      }
+    },
     "/api/v1/genes/{name}/config-schema": {
       "get": {
-        "description": "Get the configuration schema for a gene type (for dynamic UI rendering).",
+        "description": "The form description of a source type, which the admin UI draws without per-type code.\n\nBesides what the Gene declares, each field says whether it is a scope\nfield and whether it is fixed after create, from the type's descriptor.",
         "operationId": "get_gene_config_schema_api_v1_genes__name__config_schema_get",
         "parameters": [
           {
@@ -15263,7 +16918,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourceCreatedResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -15417,7 +17074,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourceUpdatedResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -15458,7 +17117,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourceCurrentAccessTransitionResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -15520,7 +17181,9 @@
           "202": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourceAccessTransitionResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -15570,7 +17233,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourceAccessTransitionOperationResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -15620,7 +17285,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourceAccessTransitionQueuedResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -15670,7 +17337,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourceAccessTransitionQueuedResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -16255,7 +17924,17 @@
           "202": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SourceSyncRunReceiptResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocalCollectionReceiptResponse"
+                    }
+                  ],
+                  "title": "Response Trigger Force Resync Api V1 Sources  Source Id  Force Resync Post"
+                }
               }
             },
             "description": "Successful Response"
@@ -16498,7 +18177,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourcePinResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -16537,7 +18218,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourcePinResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -16981,7 +18664,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourceSubscriptionChangeResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -17099,7 +18784,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SourceSyncRunStateResponse"
+                }
               }
             },
             "description": "Successful Response"

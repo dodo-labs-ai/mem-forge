@@ -165,7 +165,10 @@ def test_admin_source_create_refuses_an_odd_boolean_naming_the_field(tmp_path, m
     response = _create_confluence(tmp_path, value)
 
     assert response.status_code == 400
-    assert "include_children" in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert detail["code"] == "config_invalid"
+    assert [issue["key"] for issue in detail["fields"]] == ["include_children"]
+    assert "include_children" in detail["message"]
 
 
 @pytest.mark.parametrize("value", [False, "No", "1", 0])
@@ -214,7 +217,7 @@ async def test_admin_source_update_refuses_an_odd_boolean_naming_the_field(tmp_p
         saved = client.put("/api/v1/sources/src-pages", json={"config": {**config, "sitemap_authoritative": "YES"}})
 
     assert refused.status_code == 400
-    assert "sitemap_authoritative" in refused.json()["detail"]
+    assert [issue["key"] for issue in refused.json()["detail"]["fields"]] == ["sitemap_authoritative"]
     assert saved.status_code == 200, saved.text
     assert (await db.get_source("src-pages"))["config"]["sitemap_authoritative"] == "YES"
 

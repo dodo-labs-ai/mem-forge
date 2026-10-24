@@ -105,7 +105,10 @@ class LocalMarkdownGene(DocumentGene):
     @classmethod
     def config_schema(cls) -> GeneConfigSchema:
         return GeneConfigSchema(
-            groups=[ConfigGroup(key="vault", label="Vault", order=0)],
+            groups=[
+                ConfigGroup(key="connection", label="Folder", order=0, purpose="connection"),
+                ConfigGroup(key="scope", label="Files to sync", order=1, purpose="content"),
+            ],
             fields=[
                 ConfigField(
                     key="root",
@@ -114,8 +117,9 @@ class LocalMarkdownGene(DocumentGene):
                     required=True,
                     placeholder="/Users/me/notes",
                     help_text="Folder path on the machine running the local daemon.",
-                    group="vault",
+                    group="connection",
                     order=0,
+                    widget="local_folder",
                 ),
                 ConfigField(
                     key="display_label",
@@ -124,8 +128,8 @@ class LocalMarkdownGene(DocumentGene):
                     required=False,
                     placeholder="Engineering notes",
                     help_text="Optional human-readable label shown in source metadata.",
-                    group="vault",
-                    order=1,
+                    group="scope",
+                    order=0,
                 ),
                 ConfigField(
                     key="include",
@@ -134,8 +138,9 @@ class LocalMarkdownGene(DocumentGene):
                     required=False,
                     default="*.md,**/*.md,*.markdown,**/*.markdown,*.txt,**/*.txt,*.json,**/*.json,*.html,**/*.html,*.htm,**/*.htm",
                     help_text="Glob patterns relative to the folder path.",
-                    group="vault",
-                    order=2,
+                    group="scope",
+                    order=1,
+                    advanced=True,
                 ),
                 ConfigField(
                     key="exclude",
@@ -144,8 +149,9 @@ class LocalMarkdownGene(DocumentGene):
                     required=False,
                     default=".obsidian/**,.trash/**,.git/**,**/.git/**",
                     help_text="Glob patterns to skip.",
-                    group="vault",
-                    order=3,
+                    group="scope",
+                    order=2,
+                    advanced=True,
                 ),
             ],
         )

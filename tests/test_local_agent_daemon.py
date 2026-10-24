@@ -11,6 +11,7 @@ import memforge.main as main
 from memforge.api_target import build_host_target, build_target
 import memforge.local_agent.runner as local_agent_runner
 from memforge.local_agent.runner import CloudJobLeaseLost, LocalAgentRunner, _CloudJobLeaseHeartbeat
+from memforge.local_agent.setup_results import TeamsBrowseResult
 from memforge.local_agent.source_contract import SourceSyncRunReceiptError
 from memforge.local_agent.state import LocalAgentStateStore
 from memforge.main import cli
@@ -294,14 +295,12 @@ def test_teams_browse_job_reauths_when_no_local_session(monkeypatch):
         }
     )
 
-    assert result == {
-        "operation": "teams_browse",
-        "region": "emea",
-        "favorites": [],
-        "teams": [],
-        "group_chats": [],
-        "individual_chats": [],
-    }
+    assert (
+        result
+        == TeamsBrowseResult(
+            operation="teams_browse", region="emea", favorites=[], teams=[], group_chats=[], individual_chats=[]
+        ).model_dump()
+    )
     assert calls["browse"] == 2
     assert auth_jobs[0]["operation"] == "teams_auth"
     assert auth_jobs[0]["payload"]["rejected_token_hashes"] == ["old-token-hash"]
