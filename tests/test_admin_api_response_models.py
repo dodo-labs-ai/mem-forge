@@ -13,9 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, TypeAdapter
 
-from memforge.agent_sessions import ensure_agent_session_source
 from memforge.server.admin_api import (
-    AgentSessionCompletenessResponse,
     EntityAliasAddedResponse,
     EntityAliasListResponse,
     EntityMergeResponse,
@@ -32,7 +30,6 @@ from memforge.server.admin_api import (
     SourceSyncRunStateResponse,
     SourceUpdatedResponse,
 )
-from tests.test_agent_session_api import _make_receipt
 from tests.test_source_authority_api import _app, _confluence_payload, _connect_database, _teams_payload
 from tests.test_startup_runtime import TEST_SOURCE_KEY
 
@@ -73,7 +70,6 @@ DECLARED = [
         "202",
         {"SourceSyncRunReceiptResponse", "LocalCollectionReceiptResponse"},
     ),
-    ("get", "/api/v1/agent-sessions/completeness", "200", {"AgentSessionCompletenessResponse"}),
     ("post", "/api/v1/entities/merge", "200", {"EntityMergeResponse"}),
     ("get", "/api/v1/entities/{entity_id}/aliases", "200", {"EntityAliasListResponse"}),
     ("post", "/api/v1/entities/{entity_id}/aliases", "200", {"EntityAliasAddedResponse"}),
@@ -210,33 +206,6 @@ def test_force_resync_answers_a_server_receipt_or_a_local_collection_receipt(cli
     assert local.status_code == 202, local.text
     assert isinstance(receipt.validate_python(server.json()), SourceSyncRunReceiptResponse)
     assert isinstance(receipt.validate_python(local.json()), LocalCollectionReceiptResponse)
-
-
-def test_agent_session_completeness_answers_its_model(client, database):
-    async def seed() -> str:
-        source = await ensure_agent_session_source(database, client="codex", owner_user_id=OWNER["x-test-user"])
-        for index, outcome in enumerate(["knowledge_patched", "no_output", "failed"]):
-            await database.upsert_agent_session_receipt(
-                _make_receipt(
-                    doc_id=f"window-{index}",
-                    session_id="sess-1",
-                    outcome=outcome,
-                    reason="timeout",
-                    source_id=source["id"],
-                )
-            )
-        return source["id"]
-
-    source_id = asyncio.run(seed())
-
-    url = "/api/v1/agent-sessions/completeness"
-    summary = client.get(url, params={"source_id": source_id, "session_id": "sess-1"}, headers=OWNER)
-    empty = client.get(url, params={"source_id": source_id, "session_id": "none"}, headers=OWNER)
-
-    body = _valid(AgentSessionCompletenessResponse, summary)
-    assert body.latest_failure is not None and body.latest_failure.reason == "timeout"
-    assert body.no_output_fraction == 0.5
-    assert _valid(AgentSessionCompletenessResponse, empty).latest_failure is None
 
 
 def test_entity_merge_and_alias_routes_answer_their_models(client, database):

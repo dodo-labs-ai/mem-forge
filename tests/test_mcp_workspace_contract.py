@@ -147,7 +147,7 @@ def test_explicit_workspace_overrides_local_directory_binding(
     assert captured["workspace_id"] == "explicit_workspace"
 
 
-def test_hook_default_is_not_an_interactive_tool_fallback(
+def test_obsolete_hook_workspace_key_does_not_select_a_tool_workspace(
     monkeypatch,
     tmp_path,
 ) -> None:

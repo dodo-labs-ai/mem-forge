@@ -1,12 +1,10 @@
 /**
- * Agent-session Sources: the coding agents whose MemForge plugin captures
- * session windows, and how each one installs it. The plugin creates its
- * Source on the first upload, so nothing is configured in the admin UI
- * beyond these commands.
+ * The coding agents with a MemForge memory plugin, and how each one installs
+ * it. The plugin gives the agent MCP memory tools: it searches Memories and
+ * saves one private Memory when the user asks it to remember something and
+ * confirms. It captures nothing on its own and creates no Source, so nothing
+ * is configured in the admin UI beyond these commands.
  */
-
-/** The source type the plugins write to. */
-export const AGENT_SESSION_SOURCE_TYPE = "agent_session";
 
 /** The GitHub repository that serves the MemForge plugin marketplace. */
 const PLUGIN_MARKETPLACE = "dodo-labs-ai/mem-forge";

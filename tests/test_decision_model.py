@@ -7,12 +7,6 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
-from memforge.agent_sessions import (
-    AGENT_SESSION_AUTHORITY_CONTRACT,
-    AGENT_SESSION_AUTHORITY_TASK,
-    _classify_agent_session_authority,
-    canonicalize_agent_session_events,
-)
 from memforge.config import AppConfig
 from memforge.llm import decision_model
 from memforge.llm.decision_model import EVALUATED_DECISION_TASKS, DecisionTask, decision_task_model
@@ -39,7 +33,6 @@ from memforge.memory.relation_classifier import (
 )
 from memforge.pipeline.revision_work import CHANGE_IMPACT_CONTRACT, CHANGE_IMPACT_TASK, RevisionWorkExecutor
 from memforge.runtime import DefaultRuntimeProvider, resolve_models
-from tests.test_agent_session_api import _AuthorizesAllCandidateUserEvidence, _authorized_events
 from tests.test_change_impact import ImpactClient, cohort, impact_works
 from tests.test_cross_document_relation_classifier import _Client as RelationClient
 from tests.test_cross_document_relation_classifier import _pairs
@@ -67,14 +60,12 @@ def test_every_decision_task_carries_its_current_contract_version() -> None:
         PAIR_REVIEW_TASK,
         CROSS_DOCUMENT_RELATION_TASK,
         ENTITY_ADJUDICATION_TASK,
-        AGENT_SESSION_AUTHORITY_TASK,
     )
     assert [task.contract_version for task in tasks] == [
         CHANGE_IMPACT_CONTRACT,
         MEMORY_PAIR_REVIEW_CONTRACT,
         CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
         ENTITY_ADJUDICATION_CONTRACT,
-        AGENT_SESSION_AUTHORITY_CONTRACT,
     ]
     assert len({task.name for task in tasks}) == len(tasks)
 
@@ -330,51 +321,6 @@ async def test_entity_adjudication_runs_on_the_model_its_registration_selects(
 
     assert client.models == [expected]
     assert result.entity_id("pay service") == candidate.id
-
-
-class DecisionAuthorityClient(_AuthorizesAllCandidateUserEvidence):
-    decision_model = DECISION_MODEL
-
-    def __init__(self):
-        self.models = []
-
-    async def classify_agent_session_evidence_authority(self, prompt: str, **kwargs):
-        self.models.append(kwargs["model"])
-        return await super().classify_agent_session_evidence_authority(prompt, **kwargs)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("registered", "expected"),
-    [
-        pytest.param({}, None, id="unregistered"),
-        pytest.param(
-            {AGENT_SESSION_AUTHORITY_TASK.name: AGENT_SESSION_AUTHORITY_CONTRACT}, DECISION_MODEL, id="registered",
-        ),
-    ],
-)
-async def test_agent_session_authority_runs_on_the_model_its_registration_selects(
-    monkeypatch, registered, expected,
-) -> None:
-    """Unregistered, the window client answers on its own configured model."""
-
-    register(monkeypatch, registered)
-    client = DecisionAuthorityClient()
-
-    classified = await _classify_agent_session_authority(
-        structured_llm_client=client,
-        owner_user_id="owner",
-        client="codex",
-        session_id="session",
-        trigger="Stop",
-        workspace="/workspace/mem-forge",
-        repo_identifier="github.com/dodo-labs-ai/mem-forge",
-        branch="main",
-        events=canonicalize_agent_session_events(_authorized_events()),
-    )
-
-    assert client.models == [expected]
-    assert [event["evidence_role"] for event in classified] == ["primary"]
 
 
 def test_source_lifecycle_operation_identity_names_the_model_of_each_decision_task(monkeypatch) -> None:

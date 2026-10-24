@@ -8,13 +8,11 @@ import subprocess
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 
 from memforge import main
-from memforge.agent_sessions import _primary_event_source_time
 from memforge.config import AppConfig
 from memforge.genes.github_pages_gene import _content_item_from_url
 from memforge.genes.github_repo_gene import LAST_COMMIT_AT_KEY, GitHubRepoGene
@@ -425,24 +423,6 @@ def test_local_file_outside_git_takes_its_modification_time(tmp_path) -> None:
 
     assert main._git_worktree(root) is None
     assert main._local_file_source_time(root, entry, None) == "2026-05-06T07:08:00+00:00"
-
-
-def test_agent_patch_time_is_its_authorizing_event_time() -> None:
-    events = [
-        {"evidence_id": "E1", "timestamp": "2026-06-01T09:00:00Z"},
-        {"evidence_id": "E2", "timestamp": "2026-06-01T09:05:00+02:00"},
-        {"evidence_id": "E3"},
-        {"evidence_id": "E4", "timestamp": "2026-06-01T09:10:00"},
-    ]
-
-    def time_of(event_id: str | None):
-        return _primary_event_source_time(SimpleNamespace(primary_event_id=event_id), events)
-
-    assert time_of("E2") == datetime(2026, 6, 1, 7, 5, tzinfo=timezone.utc)
-    # An event without an offset-aware timestamp has no source time.
-    assert time_of("E3") is None
-    assert time_of("E4") is None
-    assert time_of(None) is None
 
 
 @pytest.mark.asyncio

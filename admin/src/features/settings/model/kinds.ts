@@ -7,7 +7,7 @@ export const KIND_TITLES: Record<ModelKind, string> = {
 };
 
 export const KIND_DESCRIPTIONS: Record<ModelKind, string> = {
-  generation: "Reads source content and writes memories, and summarizes agent sessions.",
+  generation: "Reads source content and writes memories.",
   embedding: "Turns memories into vectors for search.",
 };
 
