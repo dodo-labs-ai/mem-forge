@@ -20,10 +20,6 @@ export function canConfigureSourceType(sourceType: string): boolean {
   return !isManagedSourceType(sourceType);
 }
 
-export function canDeleteSourceType(sourceType: string): boolean {
-  return !isManagedSourceType(sourceType);
-}
-
 export function userConfigurableGenes<T extends NamedSourceType>(genes: readonly T[]): T[] {
   return genes.filter((gene) => canConfigureSourceType(gene.name));
 }

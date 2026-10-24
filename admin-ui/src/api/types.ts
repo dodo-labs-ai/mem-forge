@@ -639,22 +639,6 @@ export interface SourceProjectGroup {
   memoryCount: number;
 }
 
-export interface AgentSessionLatestFailure {
-  count: number;
-  reason: string | null;
-  last_seen_at: string | null;
-}
-
-export interface AgentSessionCompleteness {
-  session_id: string | null;
-  source_id: string | null;
-  total: number;
-  processed_total: number;
-  counts: Record<string, number>;
-  no_output_fraction: number;
-  latest_failure: AgentSessionLatestFailure | null;
-}
-
 export interface JiraAuthSession {
   provider: "jira";
   origin: string;

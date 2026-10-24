@@ -2,11 +2,10 @@ import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from
 import { createPortal } from "react-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
-import { Files, Info, Loader2, LockKeyhole, MoreHorizontal, Pause, Pin, Play, Plus, RefreshCw, Search, ShieldCheck, Trash2, X } from "lucide-react";
+import { Files, Loader2, LockKeyhole, MoreHorizontal, Pause, Pin, Play, Plus, RefreshCw, Search, ShieldCheck, Trash2, X } from "lucide-react";
 import { currentLocalAgentBaseUrl, resourceClient } from "@/api/client";
 import { createLocalAgentJob, getCurrentLocalAgentJobs, getLocalAgentJob } from "@/api/localAgentJobs";
 import type {
-  AgentSessionCompleteness,
   GeneMetadata,
   LocalAgentJobCreateResponse,
   LocalAgentJobStatusResponse,
@@ -15,7 +14,6 @@ import type {
   ResolvedProjectsResponse,
   Source,
   SourceCapabilities,
-  SourceProjectsResponse,
   WorkspaceAgentEvaluationResponse,
 } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
@@ -35,7 +33,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useSharedWorkspace } from "@/state/sharedWorkspace";
-import { timeAgo } from "@/utils/date";
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { activeSyncRunOf } from "./runningSyncSave";
 import { SourceSetupDialog } from "./SourceSetupDialog";
@@ -226,7 +223,6 @@ export function SourcesPage() {
     source?: Source | null;
     initialFocus?: { step: "project" | "content" };
   }>({ sourceType: null, source: null });
-  const [detailsSource, setDetailsSource] = useState<Source | null>(null);
   const [accessSource, setAccessSource] = useState<Source | null>(null);
   const [openMenuSourceId, setOpenMenuSourceId] = useState<string | null>(null);
   const [sourcePendingDelete, setSourcePendingDelete] = useState<Source | null>(null);
@@ -876,7 +872,6 @@ export function SourcesPage() {
                         onResume={() =>
                           setSourceStatus.mutate({ sourceId: source.id, status: "active" })
                         }
-                        onShowDetails={() => setDetailsSource(source)}
                         onShowEvaluation={() => openSourceEvaluation(source.id)}
                         onSubscriptionChange={(enabled) => {
                           if (!capabilities.can_subscribe) return;
@@ -986,13 +981,6 @@ export function SourcesPage() {
         source={accessSource}
         onOpenChange={(open) => {
           if (!open) setAccessSource(null);
-        }}
-      />
-
-      <AgentSessionDetailsDialog
-        source={detailsSource}
-        onOpenChange={(open) => {
-          if (!open) setDetailsSource(null);
         }}
       />
 
@@ -1222,174 +1210,6 @@ function SourceActionsMenu({
   );
 }
 
-function AgentSessionDetailsDialog({
-  source,
-  onOpenChange,
-}: {
-  source: Source | null;
-  onOpenChange: (open: boolean) => void;
-}) {
-  const open = Boolean(source);
-  const projectsQuery = useQuery<SourceProjectsResponse>({
-    queryKey: ["source-projects", source?.id],
-    queryFn: () => {
-      if (!source) throw new Error("source is required");
-      return resourceClient.get(`/sources/${source.id}/projects`).then((response) => response.data);
-    },
-    enabled: open && (source?.type === "agent_session" || (source ? isManagedSourceId(source.id) : false)),
-  });
-  const completenessQuery = useQuery<AgentSessionCompleteness>({
-    queryKey: ["agent-session-completeness", source?.id],
-    queryFn: () => {
-      if (!source) throw new Error("source is required");
-      return resourceClient
-        .get("/agent-sessions/completeness", { params: { source_id: source.id } })
-        .then((response) => response.data);
-    },
-    enabled: open && (source?.type === "agent_session" || (source ? isManagedSourceId(source.id) : false)),
-  });
-
-  if (!source) return null;
-
-  const counts = completenessQuery.data?.counts ?? {};
-  const projects = projectsQuery.data?.projects ?? [];
-  const memoriesCreated = source.memory_count ?? 0;
-  const keptSummaries = counts.package_created ?? 0;
-  const skippedLowSignal = counts.no_output ?? 0;
-  const failedCount = counts.failed ?? 0;
-  const latestFailure = completenessQuery.data?.latest_failure ?? null;
-  const totalProcessed = completenessQuery.data?.processed_total ?? keptSummaries + skippedLowSignal;
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>Agent Session</DialogTitle>
-          <DialogDescription>
-            Automatic memory source populated by coding-agent plugins.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="grid gap-3 sm:grid-cols-2">
-          <DetailMetric
-            label="Memories created"
-            value={formatCount(memoriesCreated)}
-            tone="primary"
-          />
-          <DetailMetric
-            label="Kept summaries"
-            value={formatCount(keptSummaries)}
-            tone="primary"
-          />
-        </div>
-
-        <p className="text-xs text-muted-foreground">
-          Most agent-session windows are conversational or temporary. MemForge keeps
-          only windows likely to help future work and skips the rest as low-signal.
-        </p>
-
-        <details className="rounded-lg border bg-muted/30 text-xs">
-          <summary className="cursor-pointer select-none px-3 py-2 text-muted-foreground hover:text-foreground">
-            Operational details
-          </summary>
-          <dl className="grid grid-cols-2 gap-x-4 gap-y-1 px-3 pb-3 text-muted-foreground">
-            <dt>Windows processed</dt>
-            <dd className="text-right font-medium text-foreground">{formatCount(totalProcessed)}</dd>
-            <dt>Kept summaries</dt>
-            <dd className="text-right font-medium text-foreground">{formatCount(keptSummaries)}</dd>
-            <dt>Skipped low-signal</dt>
-            <dd className="text-right font-medium text-foreground">{formatCount(skippedLowSignal)}</dd>
-            <dt>Needs retry</dt>
-            <dd className="text-right font-medium text-foreground">{formatCount(failedCount)}</dd>
-            {latestFailure?.last_seen_at && (
-              <>
-                <dt>Last retry seen</dt>
-                <dd className="text-right font-medium text-foreground">
-                  {timeAgo(latestFailure.last_seen_at)}
-                </dd>
-              </>
-            )}
-          </dl>
-        </details>
-
-        <div>
-          <div className="flex items-center justify-between gap-3">
-            <h3 className="text-sm font-medium">Projects with extracted memory</h3>
-            <span className="text-xs text-muted-foreground">
-              {memoriesCreated} memories
-            </span>
-          </div>
-
-          <div className="mt-2 overflow-hidden rounded-lg border">
-            {projectsQuery.isPending ? (
-              <div className="flex items-center gap-2 p-3 text-sm text-muted-foreground">
-                <Loader2 className="size-4 animate-spin" />
-                Loading projects...
-              </div>
-            ) : projectsQuery.isError ? (
-              <div className="p-3 text-sm text-destructive">
-                Failed to load project summary.
-              </div>
-            ) : projects.length === 0 ? (
-              <div className="p-3 text-sm text-muted-foreground">
-                No projects observed yet.
-              </div>
-            ) : (
-              <div className="divide-y">
-                {projects.map((project) => (
-                  <div key={project.project} className="grid gap-2 p-3 text-sm sm:grid-cols-[1fr_auto_auto_auto] sm:items-center">
-                    <div className="min-w-0 font-medium">{project.project}</div>
-                    <div className="text-muted-foreground">
-                      <span className="font-medium text-foreground">{project.document_count}</span> summaries
-                    </div>
-                    <div className="text-muted-foreground">
-                      <span className="font-medium text-foreground">{project.memory_count}</span> memories
-                    </div>
-                    <div className="text-xs text-muted-foreground">
-                      {timeAgo(project.last_observed_at)}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-
-        <DialogFooter showCloseButton />
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function DetailMetric({
-  label,
-  value,
-  tone = "default",
-}: {
-  label: string;
-  value: string;
-  tone?: "default" | "primary";
-}) {
-  return (
-    <div className="rounded-lg border p-3">
-      <div className="text-xs text-muted-foreground">{label}</div>
-      <div
-        className={
-          tone === "primary"
-            ? "mt-1 text-2xl font-semibold tracking-tight text-foreground"
-            : "mt-1 text-lg font-semibold"
-        }
-      >
-        {value}
-      </div>
-    </div>
-  );
-}
-
-function formatCount(value: number | undefined): string {
-  return (value ?? 0).toLocaleString();
-}
-
 function StatCard({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-xl bg-card p-4 ring-1 ring-foreground/10">
@@ -1413,7 +1233,6 @@ function AddSourceDialog({
   onConfigureSelected: (sourceType: string) => void;
 }) {
   const configurableGenes = userConfigurableGenes(genes);
-  const [agentSetupClient, setAgentSetupClient] = useState<AgentSessionClient | null>(null);
 
   const renderConfigurableGene = (gene: (typeof configurableGenes)[number]) => {
     const source = SOURCE_LABELS[gene.name] ?? {
@@ -1481,188 +1300,11 @@ function AddSourceDialog({
                   {configurableGenes.map(renderConfigurableGene)}
                 </div>
               </section>
-
-              <section className="space-y-3 border-t pt-5">
-                <div>
-                  <h3 className="text-sm font-semibold text-foreground">Coding agent integrations</h3>
-                  <p className="mt-0.5 text-xs text-muted-foreground">
-                    Installed plugins add these sources automatically.
-                  </p>
-                </div>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  {AGENT_SESSION_CARDS.map((card) => (
-                    <div key={card.client} className="flex min-h-36 flex-col rounded-lg border p-4">
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="flex min-w-0 items-start gap-3">
-                          <SourceIcon
-                            type="agent_session"
-                            client={card.client}
-                            className="mt-0.5 size-6"
-                          />
-                          <div className="min-w-0">
-                            <div className="text-sm font-medium">{card.title}</div>
-                            <div className="mt-1 text-xs text-muted-foreground">
-                              {card.description}
-                            </div>
-                          </div>
-                        </div>
-                        <Badge
-                          variant="outline"
-                          className="border-amber-200 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200"
-                        >
-                          Plugin
-                        </Badge>
-                      </div>
-                      <div className="mt-auto pt-4">
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          onClick={() => setAgentSetupClient(card.client)}
-                        >
-                          <Info className="size-3.5" />
-                          View setup
-                        </Button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </section>
             </div>
           )}
         </DialogContent>
       </Dialog>
-
-      <AgentSessionSetupDialog
-        client={agentSetupClient}
-        onOpenChange={(open) => !open && setAgentSetupClient(null)}
-      />
     </>
-  );
-}
-
-const MEMFORGE_MARKETPLACE_REPO = "dodo-labs-ai/mem-forge";
-const MEMFORGE_PLUGIN_NAME = "memory@memforge";
-
-const CODEX_PLUGIN_COMMANDS = [
-  `codex plugin marketplace add ${MEMFORGE_MARKETPLACE_REPO}`,
-  `codex plugin add ${MEMFORGE_PLUGIN_NAME}`,
-] as const;
-
-const CLAUDE_CODE_PLUGIN_COMMANDS = [
-  `/plugin marketplace add ${MEMFORGE_MARKETPLACE_REPO}`,
-  `/plugin install ${MEMFORGE_PLUGIN_NAME}`,
-] as const;
-
-type AgentSessionClient = "codex" | "claude-code";
-
-const AGENT_SESSION_CARDS: ReadonlyArray<{
-  client: AgentSessionClient;
-  title: string;
-  description: string;
-}> = [
-  {
-    client: "codex",
-    title: "Codex Session",
-    description:
-      "Save Codex coding sessions as memory.",
-  },
-  {
-    client: "claude-code",
-    title: "Claude Code Session",
-    description:
-      "Save Claude Code coding sessions as memory.",
-  },
-];
-
-const AGENT_SESSION_SETUP_BY_CLIENT: Record<
-  AgentSessionClient,
-  { agentName: string; commands: readonly string[]; runFrom: string }
-> = {
-  codex: {
-    agentName: "Codex",
-    commands: CODEX_PLUGIN_COMMANDS,
-    runFrom: "Run these from any terminal where the codex CLI is on PATH:",
-  },
-  "claude-code": {
-    agentName: "Claude Code",
-    commands: CLAUDE_CODE_PLUGIN_COMMANDS,
-    runFrom: "Run these inside an active Claude Code session:",
-  },
-};
-
-function AgentSessionSetupDialog({
-  client,
-  onOpenChange,
-}: {
-  client: AgentSessionClient | null;
-  onOpenChange: (open: boolean) => void;
-}) {
-  const setup = client ? AGENT_SESSION_SETUP_BY_CLIENT[client] : null;
-  return (
-    <Dialog open={Boolean(client)} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{setup ? `${setup.agentName} session setup` : "Agent session setup"}</DialogTitle>
-          <DialogDescription>
-            MemForge is a SaaS service and cannot read local agent transcripts. The plugin runs on
-            your machine, captures session windows, and pushes them to MemForge after each session.
-            No further configuration in this UI is needed; the source appears automatically after
-            the first upload.
-          </DialogDescription>
-        </DialogHeader>
-
-        {setup && (
-          <div className="space-y-5">
-            <AgentPluginInstructions
-              agentName={setup.agentName}
-              runFrom={setup.runFrom}
-              commands={setup.commands}
-            />
-
-            <p className="text-xs text-muted-foreground">
-              After installing, set{" "}
-              <code className="rounded bg-muted px-1 font-mono text-[11px]">MEMFORGE_API_URL</code>{" "}
-              and optionally{" "}
-              <code className="rounded bg-muted px-1 font-mono text-[11px]">MEMFORGE_API_TOKEN</code>{" "}
-              when the plugin should reach a non-default MemForge instance. See{" "}
-              <span className="font-medium text-foreground">
-                docs/quickstart.md
-              </span>{" "}
-              in the MemForge repository for plugin routing.
-            </p>
-          </div>
-        )}
-
-        <DialogFooter>
-          <Button type="button" onClick={() => onOpenChange(false)}>
-            Got it
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function AgentPluginInstructions({
-  agentName,
-  runFrom,
-  commands,
-}: {
-  agentName: string;
-  runFrom: string;
-  commands: readonly string[];
-}) {
-  return (
-    <div className="space-y-2">
-      <div className="text-sm font-medium">{agentName}</div>
-      <p className="text-xs text-muted-foreground">{runFrom}</p>
-      <div className="space-y-1.5">
-        {commands.map((command) => (
-          <CopyableCommand key={command} command={command} />
-        ))}
-      </div>
-    </div>
   );
 }
 
@@ -1682,22 +1324,6 @@ function SourceConnectionBadge({
     <Badge variant="outline" className={`text-[11px] ${tone}`}>
       {label}
     </Badge>
-  );
-}
-
-function CopyableCommand({ command }: { command: string }) {
-  const copy = () => {
-    if (typeof navigator !== "undefined" && navigator.clipboard) {
-      void navigator.clipboard.writeText(command);
-    }
-  };
-  return (
-    <div className="flex items-center gap-2 rounded-md border bg-muted/30 p-2">
-      <code className="flex-1 break-all font-mono text-[11px] text-foreground">{command}</code>
-      <Button type="button" variant="outline" size="sm" onClick={copy}>
-        Copy
-      </Button>
-    </div>
   );
 }
 

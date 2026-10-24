@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { expect, test } from "vitest";
-import { AGENT_PLUGIN_SETUPS } from "./agentSessions";
+import { AGENT_PLUGIN_SETUPS } from "./agentPlugins";
 
 /** The plugin README of a client, at the repository root's `integrations/<client>/memforge-memory/`. */
 function pluginReadme(client: string): string {
