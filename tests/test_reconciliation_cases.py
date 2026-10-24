@@ -129,6 +129,78 @@ async def test_each_incumbent_reports_what_the_validated_operations_do_to_it(db,
     assert output["outcomes"] == {"friday": outcome}
 
 
+async def test_a_removal_waits_for_a_complete_relation_line(db) -> None:
+    client = Client("contradicts")
+    client.invalid = True
+
+    _, output, _ = await _replayed(
+        db, situation("Production releases ship every Thursday.", support="unsupported"), client,
+        {"expected_incumbents": {}},
+    )
+
+    # The Candidate stays unjudged, so DestructiveValidation keeps the unsupported Memory.
+    assert output["failure"] is None
+    assert output["outcomes"] == {"friday": "kept"}
+
+
+@pytest.mark.parametrize(
+    ("relation", "support", "reason"),
+    [
+        # A contradiction of a claim whose Support could not be read waits for a Review.
+        ("contradicts", "unresolved_partial_coverage", "review"),
+        # Production re-reads an unsupported claim an equivalent Candidate restates before rebinding it.
+        ("equivalent", "unsupported", "review:before_recheck"),
+    ],
+)
+async def test_an_undecided_support_never_retires_and_a_recheck_is_named(db, relation, support, reason) -> None:
+    _, output, checks = await _replayed(
+        db, situation("Production releases ship every Friday.", support=support), Client(relation),
+        {"expected_incumbents": {}},
+    )
+
+    assert output["outcomes"] == {"friday": "review"}
+    assert [check.reason_code for check in checks[-1:]] == [reason]
+
+
+async def test_each_of_several_incumbents_gets_its_own_outcome(db) -> None:
+    case_input = situation("Production releases ship every Thursday.", support="unsupported")
+    case_input["incumbents"].append({"id": "tags", "claim": "Release tags use calendar versions.", "memory_type": "convention"})
+    case_input["support"]["tags"] = "unaffected"
+
+    _, output, checks = await _replayed(
+        db, case_input, Client("contradicts"), {"expected_incumbents": {"friday": "retired", "tags": "kept"}},
+    )
+
+    assert output["outcomes"]["friday"] == "retired"
+    assert [check.label for check in checks if check.criterion == "incumbent_outcome"] == [
+        DeterministicCheckLabel.PASS, DeterministicCheckLabel.PASS if output["outcomes"]["tags"] == "kept"
+        else DeterministicCheckLabel.FAIL,
+    ]
+
+
+async def test_a_failed_join_applies_nothing(db, monkeypatch) -> None:
+    from memforge.evals import offline_evaluation
+    from memforge.pipeline.reconciler import ReconciliationFailure, ReconciliationResult
+
+    async def failing_join(*_args, **_kwargs):
+        return ReconciliationResult(operations=[], failure=ReconciliationFailure(
+            error_type="StructuredLlmError", reason_code="refiner_choice_failed", error="fixture",
+        ))
+
+    monkeypatch.setattr(offline_evaluation, "join_support_and_relation", failing_join)
+
+    _, output, checks = await _replayed(
+        db, situation("Production releases ship every Friday.", support="unsupported"), Client("unrelated"),
+        {"expected_incumbents": {"friday": "kept"}},
+    )
+
+    assert output["failure"]["reason_code"] == "refiner_choice_failed" and output["outcomes"] == {}
+    assert [check.criterion for check in checks if check.label is DeterministicCheckLabel.FAIL] == [
+        "incumbent_coverage", "reconciliation_terminal_state",
+    ]
+    assert not [check for check in checks if check.criterion == "incumbent_outcome"]
+
+
 async def test_a_label_gates_the_case_and_an_unlabelled_change_needs_review(db) -> None:
     _, _, labelled = await _replayed(
         db, situation("The test environment deploys every Thursday.", support="unsupported"),
@@ -163,6 +235,27 @@ async def test_an_unknown_document_or_an_invalid_situation_is_not_imported(db) -
         ))
 
 
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda case: case["support"].update(friday={"result": "unsupported", "completeread": False}), "hold only"),
+        (lambda case: case["support"].update(friday={"result": "supported", "complete_read": False}), "applies only"),
+        (lambda case: case["incumbents"].append(dict(FRIDAY)), "distinct ids"),
+        (lambda case: case["candidates"][0].update(valid_from="not-a-date"), "ISO date"),
+        (lambda case: case["incumbents"][0].update(memory_type="event"), "memory_type must be one of"),
+    ],
+)
+async def test_a_malformed_situation_is_rejected(db, change, message) -> None:
+    case_input = situation("Anything.")
+    case_input["incumbents"] = [dict(item) for item in case_input["incumbents"]]
+    change(case_input)
+
+    with pytest.raises(ValueError, match=message):
+        await _import(db, ReconciliationCaseRequest(input=case_input, rubric={"expected_incumbents": {}},
+                                                    doc_id=DOCUMENT.doc_id))
+
+
 async def test_the_seed_route_is_for_a_maintenance_operator_and_reports_skips(db, tmp_path) -> None:
     import httpx
 
@@ -188,6 +281,41 @@ async def test_the_seed_route_is_for_a_maintenance_operator_and_reports_skips(db
     assert responses[False].status_code == 403
     assert responses[True].status_code == 200, responses[True].text
     assert responses[True].json()["skipped"]["document_not_found"] == ["doc-unsynced"]
+
+
+async def test_the_seed_route_imports_a_case_and_rejects_a_malformed_one(db, tmp_path, monkeypatch) -> None:
+    import httpx
+
+    from memforge.config import AppConfig
+    from memforge.server.admin_api import create_admin_app
+    from memforge.storage.database import Database as StoredDatabase
+
+    documents = Documents()
+    for name in ("get_document", "list_documents", "find_source_unit_by_document_id"):
+        monkeypatch.setattr(StoredDatabase, name, lambda _self, *args, _name=name, **kwargs: getattr(documents, _name)(
+            *args, **kwargs))
+    config = AppConfig(base_dir=tmp_path / "memforge")
+    config.sync.worker_enabled = False
+    app = create_admin_app(
+        db=db, config=config, principal_resolver=lambda _request: ACTOR,
+        workspace_role_resolver=lambda _request: "workspace_admin",
+        maintenance_operator_resolver=lambda _request: True,
+    )
+    malformed = situation("Anything.")
+    malformed["support"] = {"friday": "maybe"}
+
+    responses = []
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        for case_input in (situation("Anything."), malformed):
+            responses.append(await client.post("/api/v1/agent-evaluations/reconciliation-cases/seed", json={
+                "selection_policy_version": "reconciliation-v1",
+                "cases": [{"doc_id": DOCUMENT.doc_id, "input": case_input, "rubric": {"expected_incumbents": {}}}],
+            }))
+    imported, rejected = responses
+
+    assert imported.status_code == 200, imported.text
+    assert [case["doc_id"] for case in imported.json()["cases"]] == [DOCUMENT.doc_id]
+    assert rejected.status_code == 400 and "result must be one of" in rejected.json()["detail"]
 
 
 PUBLIC_SITUATIONS = sorted(

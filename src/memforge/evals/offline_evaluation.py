@@ -1113,7 +1113,7 @@ class SourceUnitReconciliationReplayExecutor:
         relation = await assess_relations(
             new_extractions, incumbents, structured_llm_client=self._structured_llm_client, llm_model=model,
         )
-        failure = relation.failure
+        failure, metrics = relation.failure, relation.metrics
         operations: tuple[ReconcileOperation, ...] = ()
         rechecks = ()
         if failure is None:
@@ -1122,13 +1122,16 @@ class SourceUnitReconciliationReplayExecutor:
                 supports=_pinned_supports(manifest), structured_llm_client=self._structured_llm_client,
                 llm_model=model,
             )
-            operations = validate_destructive_operations(
-                result.operations, supports=result.supports,
-                relation_complete=relation.covers(
-                    len(new_extractions), frozenset(memory.id for memory in incumbents),
-                ),
-            ).operations
-            rechecks = result.rechecks
+            # Production applies nothing when the join fails.
+            failure, metrics = result.failure, result.metrics
+            if failure is None:
+                operations = validate_destructive_operations(
+                    result.operations, supports=result.supports,
+                    relation_complete=relation.covers(
+                        len(new_extractions), frozenset(memory.id for memory in incumbents),
+                    ),
+                ).operations
+                rechecks = result.rechecks
         return {
             "case_kind": case.case_kind.value,
             "operations": [_reconcile_operation_payload(operation) for operation in operations],
@@ -1142,9 +1145,9 @@ class SourceUnitReconciliationReplayExecutor:
                 else None
             ),
             "metrics": {
-                "relation_pair_count": relation.metrics.relation_pair_count,
-                "revision_proof_count": relation.metrics.revision_proof_count,
-                "revision_proof_failure_count": relation.metrics.revision_proof_failure_count,
+                "relation_pair_count": metrics.relation_pair_count,
+                "revision_proof_count": metrics.revision_proof_count,
+                "revision_proof_failure_count": metrics.revision_proof_failure_count,
             },
         }
 
@@ -3117,7 +3120,7 @@ def deterministic_checks(
             )
         )
         if output.get("failure") is None:
-            checks.extend(_incumbent_outcome_checks(ground_truth.rubric, output.get("outcomes")))
+            checks.extend(_incumbent_outcome_checks(ground_truth.rubric, output.get("outcomes"), output.get("rechecks")))
     required = ground_truth.rubric.get("required_deterministic_criteria", [])
     present = {check.criterion for check in checks}
     if isinstance(required, list):
@@ -3309,12 +3312,14 @@ def _support_label_checks(
         rubric.get("expected_support_terms") or {},
         claims,
     )
+    # A term is content, so a report names it by its position in the rubric.
+    positions = {term: index for index, term in enumerate(rubric.get("expected_support_terms") or {})}
     checks = [
         DeterministicCheck(
             criterion=SUPPORT_LABEL_CRITERION,
             label=DeterministicCheckLabel.UNKNOWN,
             reason_code="term_unmatched",
-            item_id=f"term:{term}",
+            item_id=f"term:{positions[term]}",
         )
         for term in unmatched
     ]
@@ -3347,30 +3352,41 @@ def _support_label_checks(
     return checks
 
 
-def _incumbent_outcome_checks(rubric: Mapping[str, object], outcomes: object) -> list[DeterministicCheck]:
-    """Check each labelled incumbent's outcome; an unlabelled one the replay does not keep needs review."""
+def _incumbent_outcome_checks(
+    rubric: Mapping[str, object], outcomes: object, rechecks: object,
+) -> list[DeterministicCheck]:
+    """Check each labelled incumbent's outcome; an unlabelled one the replay does not keep needs review.
+
+    An outcome whose incumbent production would re-check first says so in its
+    reason, because the re-check can change it.
+    """
 
     if not isinstance(outcomes, Mapping) or any(outcome not in INCUMBENT_OUTCOMES for outcome in outcomes.values()):
         return [DeterministicCheck(
             criterion=INCUMBENT_OUTCOME_CRITERION, label=DeterministicCheckLabel.FAIL,
             reason_code="incumbent_outcomes_invalid",
         )]
+    rechecked = {
+        str(item.get("memory_id")) for item in rechecks if isinstance(item, Mapping)
+    } if isinstance(rechecks, list) else set()
     expected = rubric.get("expected_incumbents") or {}
     checks = []
-    for incumbent_id, outcome in outcomes.items():
+    for incumbent_id in sorted({*expected, *outcomes}):
+        outcome = outcomes.get(incumbent_id)
+        note = ":before_recheck" if incumbent_id in rechecked else ""
         if incumbent_id in expected:
             label = str(expected[incumbent_id])
             checks.append(DeterministicCheck(
                 criterion=INCUMBENT_OUTCOME_CRITERION,
                 label=DeterministicCheckLabel.PASS if outcome == label else DeterministicCheckLabel.FAIL,
-                reason_code=f"{label}:{outcome}",
+                reason_code=f"{label}:{outcome or 'missing'}{note}",
                 item_id=str(incumbent_id),
             ))
         elif outcome != "kept":
             checks.append(DeterministicCheck(
                 criterion=UNLABELLED_OUTCOME_CRITERION,
                 label=DeterministicCheckLabel.UNKNOWN,
-                reason_code=str(outcome),
+                reason_code=f"{outcome}{note}",
                 item_id=str(incumbent_id),
             ))
     return checks
@@ -3603,9 +3619,10 @@ def _pinned_supports(manifest: Mapping[str, object]) -> dict[str, MemorySupport]
 
     if "support_audits" not in manifest:
         raise ValueError("reconciliation case requires pinned support_audits")
-    claims = {
-        str(item.get("id") or ""): _memory_from_payload(item) for item in _mapping_list(manifest, "incumbents")
-    }
+    incumbents = _mapping_list(manifest, "incumbents")
+    claims = {str(item.get("id") or ""): _memory_from_payload(item) for item in incumbents}
+    if len(claims) != len(incumbents):
+        raise ValueError("incumbents must have distinct ids")
     supports: dict[str, MemorySupport] = {}
     for item in _mapping_list(manifest, "support_audits"):
         incumbent_id = str(item.get("incumbent_id") or "")
@@ -3617,9 +3634,13 @@ def _pinned_supports(manifest: Mapping[str, object]) -> dict[str, MemorySupport]
             raise ValueError(
                 "support_audits result must be one of: " + ", ".join(result.value for result in SupportResult)
             ) from None
+        if not set(item) <= {"incumbent_id", "result", "complete_read", "reason"}:
+            raise ValueError("support_audits entries hold only incumbent_id, result, complete_read and reason")
         complete_read = item.get("complete_read", True)
         if not isinstance(complete_read, bool):
             raise ValueError("support_audits complete_read must be a boolean")
+        if "complete_read" in item and result is not SupportResult.UNSUPPORTED:
+            raise ValueError("support_audits complete_read applies only to an unsupported result")
         claim = claims[incumbent_id]
         evidence = RawMemory(
             content=claim.content, memory_type=claim.memory_type,
@@ -3634,8 +3655,7 @@ def _pinned_supports(manifest: Mapping[str, object]) -> dict[str, MemorySupport]
             else SupportAssessment(supported=False, reason=reason, memory=None, complete_read=complete_read)
             if result is SupportResult.UNSUPPORTED
             else SupportAssessment(
-                supported=True, reason=reason, memory=evidence,
-                rebound=result is SupportResult.UNAFFECTED, complete_read=result is SupportResult.SUPPORTED,
+                supported=True, reason=reason, memory=evidence, rebound=result is SupportResult.UNAFFECTED,
             )
         ])
     if sorted(supports) != sorted(claims):

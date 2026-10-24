@@ -262,7 +262,7 @@ async def test_a_term_labels_every_pinned_memory_whose_claim_holds_it(db) -> Non
     )
 
     assert [(check.criterion, check.label, check.reason_code, check.item_id) for check in checks[1:]] == [
-        ("support_label", DeterministicCheckLabel.UNKNOWN, "term_unmatched", "term:EU"),
+        ("support_label", DeterministicCheckLabel.UNKNOWN, "term_unmatched", "term:1"),
         ("support_label", DeterministicCheckLabel.PASS, "supported:supported", "memory-0:eu-memory-0"),
         ("support_label", DeterministicCheckLabel.FAIL, "supported:unsupported", "memory-1:eu-memory-1"),
     ]
