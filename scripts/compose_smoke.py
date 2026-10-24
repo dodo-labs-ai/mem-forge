@@ -505,13 +505,20 @@ def _source(api: str, source_id: str) -> dict[str, Any]:
     raise CheckFailed(f"source {source_id} is not listed")
 
 
-def wait_for_sync(api: str, state: State, *, timeout: float) -> str:
-    """Wait until the source's sync has finished; its documents have to have given memories."""
+def wait_for_sync(api: str, state: State, *, timeout: float, new_run: bool = False) -> str:
+    """Wait until the source's sync has finished; its documents have to have given memories.
+
+    With ``new_run``, the sync that finished before must not count: a later run
+    has to finish.
+    """
     source_id = state.get("source_id")
+    earlier_run = state.get("sync_run_id") if new_run else None
 
     def synced() -> str | None:
         source = _source(api, source_id)
         sync = source.get("sync") or {}
+        if earlier_run is not None and sync.get("run_id") == earlier_run:
+            return None
         if sync.get("status") == "failed":
             raise CheckFailed(f"the sync failed: {sync.get('error_message')}")
         if sync.get("status") not in FINISHED_SYNC_STATES:
@@ -525,7 +532,10 @@ def wait_for_sync(api: str, state: State, *, timeout: float) -> str:
 
     outcome = wait_until(synced, timeout=timeout, interval=5, what="the source sync")
     source = _source(api, source_id)
-    state.set(source_docs=source["doc_count"], source_memories=source["memory_count"])
+    state.set(
+        source_docs=source["doc_count"], source_memories=source["memory_count"],
+        sync_run_id=(source.get("sync") or {}).get("run_id"),
+    )
     return outcome
 
 
@@ -617,17 +627,36 @@ def _extraction_prompt_hash() -> str:
 
 
 
-def quality_seed_spec(cohort_file: Path, state: State) -> str:
-    """The seed request of the cohort file: each case names its Document by title within the smoke source."""
+# The cohort file's list of each case kind, and the CLI command that pins it.
+QUALITY_CASE_KINDS = {
+    "derivation": ("cases", "seed-derivation-cases"),
+    "support": ("support_cases", "seed-support-cases"),
+    "reconciliation": ("reconciliation_cases", "seed-reconciliation-cases"),
+}
+
+
+def quality_seed_spec(cohort_file: Path, state: State, kind: str) -> str:
+    """The seed request of one case kind of the cohort file.
+
+    Each case names its Document by its current title within the smoke source;
+    a reconciliation case reads its hand-written situation from the file it
+    names, next to the cohort file.
+    """
     cohort = json.loads(cohort_file.read_text(encoding="utf-8"))
     source_id = state.get("source_id")
     if not source_id:
         raise CheckFailed("no source was added before the quality checks")
+    cases = []
+    for case in cohort[QUALITY_CASE_KINDS[kind][0]]:
+        if kind == "reconciliation":
+            situation = json.loads((cohort_file.parent / case["file"]).read_text(encoding="utf-8"))
+            case = {"title": case["title"], "input": situation["input"], "rubric": situation["rubric"]}
+        cases.append({**case, "source_id": source_id})
     return json.dumps(
         {
-            "selection_policy_version": cohort["selection_policy_version"],
+            "selection_policy_version": f"{cohort['selection_policy_version']}-{kind}",
             "role": cohort["role"],
-            "cases": [{**case, "source_id": source_id} for case in cohort["cases"]],
+            "cases": cases,
         }
     )
 
@@ -686,10 +715,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     sync = api_command("wait-sync", "wait for the source's sync")
     sync.add_argument("--timeout", type=float, default=900)
+    sync.add_argument("--new-run", action="store_true", help="wait for a run other than the one that last finished")
 
     api_command("search", "search the source's memories")
     seed_spec = api_command("quality-seed-spec", "print the quality cohort's seed request")
     seed_spec.add_argument("--cohort", type=Path, required=True)
+    seed_spec.add_argument("--kind", choices=tuple(QUALITY_CASE_KINDS), required=True)
     run_spec = api_command("quality-run-spec", "print the quality run spec for a seed answer read from stdin")
     run_spec.add_argument("--cohort", type=Path, required=True)
     api_command("persisted", "check what was recorded before the restart")
@@ -717,11 +748,11 @@ def run(args: argparse.Namespace) -> str:
     if args.command == "sync":
         return request_sync(args.api, state)
     if args.command == "wait-sync":
-        return wait_for_sync(args.api, state, timeout=args.timeout)
+        return wait_for_sync(args.api, state, timeout=args.timeout, new_run=args.new_run)
     if args.command == "search":
         return search_source(args.api, state)
     if args.command == "quality-seed-spec":
-        return quality_seed_spec(args.cohort, state)
+        return quality_seed_spec(args.cohort, state, args.kind)
     if args.command == "quality-run-spec":
         return quality_run_spec(args.cohort, json.load(sys.stdin))
     return check_persisted(args.api, state)

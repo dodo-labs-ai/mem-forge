@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- The quick quality evaluation covers document updates. `compose_smoke.sh
+  --quality` syncs second versions of the synthetic documents and evaluates
+  Support cases of those updates and hand-written reconciliation cases next to
+  the extraction cases. A Support rubric may name memories by a term their
+  claims hold (`expected_support_terms`). Reconciliation replay carries each
+  candidate's evidence and each old memory's validity, pins any Support
+  result, applies the same destructive validation as a sync, and reports each
+  old memory as `kept`, `review`, `revised` or `retired`, which the rubric's
+  `expected_incumbents` checks; it replaces `forbidden_destructive_memory_ids`,
+  and `support_audits` name a `result` instead of `supported`. Hand-written
+  situations are imported with `memforge eval seed-reconciliation-cases` or
+  `POST /api/v1/agent-evaluations/reconciliation-cases/seed`.
+
 - A Notion document Source: the server collects every page under configured
   root pages and databases, database rows included, with an internal
   connection token. Each page is a `notion_page` Unit with a `page_body`
