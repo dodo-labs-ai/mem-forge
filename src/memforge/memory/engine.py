@@ -67,6 +67,7 @@ from memforge.memory.lifecycle_planner import (
     lifecycle_plan_id,
 )
 from memforge.memory.quality import classify_memory_candidate
+from memforge.memory.refinement_verification import REFINEMENT_VERIFICATION_TASK
 from memforge.memory.relation_classifier import PAIR_REVIEW_TASK
 from memforge.pipeline.projection_fragments import (
     SupportRevalidationLimitation,
@@ -1220,6 +1221,7 @@ class MemoryEngine:
                         llm_model=self.llm_model,
                         recheck=recheck,
                         rechecked_pairs=ledger.carried_pairs,
+                        relation_complete=relation_complete,
                     )
                     supports = dict(result.supports)
             finally:
@@ -1254,6 +1256,13 @@ class MemoryEngine:
                     "reconciliation_revision_proof_count": reconciliation_metrics.revision_proof_count,
                     "reconciliation_revision_proof_failure_count": (
                         reconciliation_metrics.revision_proof_failure_count
+                    ),
+                    "refinement_verification_count": reconciliation_metrics.refinement_verification_count,
+                    "refinement_verification_dropped_count": (
+                        reconciliation_metrics.refinement_verification_dropped_count
+                    ),
+                    "refinement_verification_unjudged_count": (
+                        reconciliation_metrics.refinement_verification_unjudged_count
                     ),
                     "coordinator_recheck_count": len(result.rechecks),
                     "coordinator_review_count": sum(len(operation.reviews) for operation in result.operations),
@@ -1827,7 +1836,7 @@ def _lifecycle_decision_task_models(client: Any, llm_model: str) -> dict[str, st
 
     return {
         task.name: decision_task_model(client, task, llm_model)
-        for task in (CHANGE_IMPACT_TASK, PAIR_REVIEW_TASK)
+        for task in (CHANGE_IMPACT_TASK, PAIR_REVIEW_TASK, REFINEMENT_VERIFICATION_TASK)
     }
 
 
@@ -1847,6 +1856,7 @@ def _source_lifecycle_operation_input_hash(
 ) -> str:
     """Digest the exact reconciliation manifest without persisting source content."""
 
+    from memforge.memory.refinement_verification import REFINEMENT_VERIFICATION_CONTRACT
     from memforge.memory.relation_classifier import MEMORY_PAIR_REVIEW_CONTRACT
     from memforge.pipeline.claim_revision import CLAIM_REVISION_CONTRACT
     from memforge.pipeline.revision_assessment import REVISION_SUPPORT_CONTRACT, REVISION_INPUT_POLICY
@@ -1854,7 +1864,7 @@ def _source_lifecycle_operation_input_hash(
     manifest = {
         "semantic_contract": "/".join((REVISION_SUPPORT_CONTRACT, CANDIDATE_ADMISSION_CONTRACT,
                                        CLAIM_REVISION_CONTRACT, MEMORY_PAIR_REVIEW_CONTRACT,
-                                       REVISION_INPUT_POLICY)),
+                                       REFINEMENT_VERIFICATION_CONTRACT, REVISION_INPUT_POLICY)),
         "input_policy_identity": input_policy_identity,
         "projection_identity_hash": source_derivation_projection_identity_hash(projection),
         "candidates": [

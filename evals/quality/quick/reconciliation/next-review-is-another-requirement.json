@@ -1,0 +1,34 @@
+{
+  "situation": "A later review sets a new requirement about the same policy; the earlier review's requirement is a separate fact, not replaced.",
+  "input": {
+    "candidates": [
+      {
+        "claim": "At the October review, teams must adopt retry policy v2 before GA; v1 is outdated, and each team reports what it changed and how it was tested.",
+        "memory_type": "decision",
+        "evidence": [
+          {
+            "role": "primary",
+            "excerpt": "October review: retry policy v2 is mandatory for GA, and v1 is outdated. Each team reports what it changed, how it was tested, and whether the change is merged.",
+            "observation": "review-notes",
+            "revision": "v2"
+          }
+        ]
+      }
+    ],
+    "incumbents": [
+      {
+        "id": "old",
+        "claim": "At the September review, each team must test the retry policy locally and report gaps in the framework to the platform team.",
+        "memory_type": "decision"
+      }
+    ],
+    "support": {
+      "old": "supported"
+    }
+  },
+  "rubric": {
+    "expected_incumbents": {
+      "old": "kept"
+    }
+  }
+}

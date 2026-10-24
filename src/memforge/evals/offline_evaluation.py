@@ -1116,20 +1116,18 @@ class SourceUnitReconciliationReplayExecutor:
         failure, metrics = relation.failure, relation.metrics
         operations: tuple[ReconcileOperation, ...] = ()
         rechecks = ()
+        relation_complete = relation.covers(len(new_extractions), frozenset(memory.id for memory in incumbents))
         if failure is None:
             result = await join_support_and_relation(
                 relation, new_extractions=new_extractions, existing_memories=incumbents,
                 supports=_pinned_supports(manifest), structured_llm_client=self._structured_llm_client,
-                llm_model=model,
+                llm_model=model, relation_complete=relation_complete,
             )
             # Production applies nothing when the join fails.
             failure, metrics = result.failure, result.metrics
             if failure is None:
                 operations = validate_destructive_operations(
-                    result.operations, supports=result.supports,
-                    relation_complete=relation.covers(
-                        len(new_extractions), frozenset(memory.id for memory in incumbents),
-                    ),
+                    result.operations, supports=result.supports, relation_complete=relation_complete,
                 ).operations
                 rechecks = result.rechecks
         return {
@@ -1148,6 +1146,9 @@ class SourceUnitReconciliationReplayExecutor:
                 "relation_pair_count": metrics.relation_pair_count,
                 "revision_proof_count": metrics.revision_proof_count,
                 "revision_proof_failure_count": metrics.revision_proof_failure_count,
+                "refinement_verification_count": metrics.refinement_verification_count,
+                "refinement_verification_dropped_count": metrics.refinement_verification_dropped_count,
+                "refinement_verification_unjudged_count": metrics.refinement_verification_unjudged_count,
             },
         }
 
@@ -3268,15 +3269,19 @@ def _term_pattern(term: str) -> re.Pattern[str]:
 def rubric_memory_labels(
     by_id: Mapping[str, object], by_term: Mapping[str, object], claims: Mapping[str, str],
 ) -> tuple[dict[str, str], tuple[str, ...]]:
-    """Each labelled Memory's label and the terms no claim holds.
+    """Each labelled Memory's Support label and the terms no claim holds.
 
     A rubric names a Memory by its id, or by a term its claim holds; a term
     names every such Memory. Synthetic cohorts use terms because a fresh install
-    extracts new Memory ids on every run. A Memory given two different labels is
-    rejected.
+    extracts new Memory ids on every run, and a model may write two labelled
+    facts into one claim. A claim is supported only when every fact it holds
+    is, so a Memory any of its terms labels ``unsupported`` is unsupported. An
+    id label is the maintainer's word for one Memory; a term label that
+    contradicts it is rejected.
     """
 
     labels = {str(memory_id): str(label) for memory_id, label in by_id.items()}
+    by_terms: dict[str, set[str]] = {}
     unmatched = []
     for term, label in by_term.items():
         pattern = _term_pattern(str(term))
@@ -3284,8 +3289,11 @@ def rubric_memory_labels(
         if not named:
             unmatched.append(str(term))
         for memory_id in named:
-            if labels.setdefault(memory_id, str(label)) != str(label):
-                raise ValueError(f"Memory {memory_id} is labelled both {labels[memory_id]} and {label}")
+            by_terms.setdefault(memory_id, set()).add(str(label))
+    for memory_id, term_labels in by_terms.items():
+        label = "unsupported" if "unsupported" in term_labels else "supported"
+        if labels.setdefault(memory_id, label) != label:
+            raise ValueError(f"Memory {memory_id} is labelled {labels[memory_id]} by id and {label} by its terms")
     return labels, tuple(unmatched)
 
 

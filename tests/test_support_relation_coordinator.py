@@ -20,6 +20,7 @@ from memforge.pipeline.support_relation_coordinator import (
     coordinate,
     memory_support,
     plan_rechecks,
+    revisions_to_verify,
     supported_refiners,
 )
 
@@ -494,3 +495,50 @@ def test_several_supports_of_one_claim_combine_by_precedence(assessments, expect
 def test_an_incomplete_support_ledger_fails_closed() -> None:
     with pytest.raises(ReconciliationContractError):
         _coordinate([], [], {})
+
+
+def test_every_revision_the_table_would_apply_is_verified_and_a_dropped_one_is_not_applied() -> None:
+    refines = dict(direction=RelationDirection.CHALLENGER_TO_CANDIDATE)
+    candidates = [_candidate("c refines m1"), _candidate("d refines m2")]
+    incumbents = [_old("m1"), _old("m2"), _old("m3")]
+    # c also restates m2, so a divided treatment would hold c back; d's revision of m2 is still verified.
+    relations = [
+        _edge(0, REFINES, "m1", **refines), _edge(0, EQUIVALENT, "m2"), _edge(1, REFINES, "m2", **refines),
+        _edge(1, CONTRADICTS, "m3"),
+    ]
+    proofs = [RevisionCompositionProof(0, "m1", True, True, True), RevisionCompositionProof(1, "m2", True, True, True)]
+    supports = {"m1": _support(SUPPORTED), "m2": _support(UNAFFECTED), "m3": _support(SUPPORTED)}
+
+    pairs = revisions_to_verify(
+        candidates=candidates, incumbents=incumbents, relations=relations, proofs=proofs, supports=supports,
+    )
+    assert pairs == ((0, "m1"), (1, "m2"))
+
+    single = dict(candidates=[candidates[0]], incumbents=[_old("m1")], relations=[relations[0]],
+                  proofs=[proofs[0]], supports={"m1": _support(SUPPORTED)})
+    verified = coordinate(**single)
+    dropped = coordinate(**single, unverified_revisions=frozenset({(0, "m1")}))
+
+    assert _by_memory(verified.operations)["m1"].action is ReconcileAction.UPDATE
+    assert _by_memory(dropped.operations)["m1"].action is ReconcileAction.NOOP
+    assert _additions(dropped.operations) == [candidates[0]]
+
+
+@pytest.mark.parametrize(
+    ("result", "relations", "proof"),
+    [
+        (UNSUPPORTED, [REFINES], RevisionCompositionProof(0, "mem-old", True, True, True)),
+        (PARTIAL, [REFINES], RevisionCompositionProof(0, "mem-old", True, True, True)),
+        (SUPPORTED, [REFINES], RevisionCompositionProof(0, "mem-old", True, False, True)),
+        (SUPPORTED, [REFINES, CONTRADICTS], RevisionCompositionProof(0, "mem-old", True, True, True)),
+    ],
+)
+def test_no_pair_is_verified_unless_the_table_would_revise_it(result, relations, proof) -> None:
+    refines = dict(direction=RelationDirection.CHALLENGER_TO_CANDIDATE)
+    edges = [_edge(index, relation, **(refines if relation is REFINES else {}))
+             for index, relation in enumerate(relations)]
+
+    assert revisions_to_verify(
+        candidates=[_candidate(f"c{index}") for index in range(len(relations))], incumbents=[_old()],
+        relations=edges, proofs=[proof], supports={"mem-old": _support(result)},
+    ) == ()

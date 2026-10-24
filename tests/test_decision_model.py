@@ -25,6 +25,7 @@ from memforge.memory.entity_resolver import (
 )
 from memforge.memory.engine import _lifecycle_decision_task_models, _source_lifecycle_operation_input_hash
 from memforge.models import Entity
+from memforge.memory.refinement_verification import REFINEMENT_VERIFICATION_TASK
 from memforge.memory.relation_classifier import (
     MEMORY_PAIR_REVIEW_CONTRACT,
     PAIR_REVIEW_TASK,
@@ -330,8 +331,14 @@ def test_source_lifecycle_operation_identity_names_the_model_of_each_decision_ta
     register(monkeypatch, {CHANGE_IMPACT_TASK.name: CHANGE_IMPACT_CONTRACT})
     registered = _lifecycle_decision_task_models(client, MAIN_MODEL)
 
-    assert unregistered == {CHANGE_IMPACT_TASK.name: MAIN_MODEL, PAIR_REVIEW_TASK.name: MAIN_MODEL}
-    assert registered == {CHANGE_IMPACT_TASK.name: DECISION_MODEL, PAIR_REVIEW_TASK.name: MAIN_MODEL}
+    assert unregistered == {
+        CHANGE_IMPACT_TASK.name: MAIN_MODEL, PAIR_REVIEW_TASK.name: MAIN_MODEL,
+        REFINEMENT_VERIFICATION_TASK.name: MAIN_MODEL,
+    }
+    assert registered == {
+        CHANGE_IMPACT_TASK.name: DECISION_MODEL, PAIR_REVIEW_TASK.name: MAIN_MODEL,
+        REFINEMENT_VERIFICATION_TASK.name: MAIN_MODEL,
+    }
     inputs = dict(
         projection=SimpleNamespace(),
         candidates=[],

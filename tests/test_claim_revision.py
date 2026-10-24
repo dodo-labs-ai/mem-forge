@@ -334,3 +334,154 @@ async def test_conflicting_current_refiners_skip_their_incumbent():
     assert result.failure is None
     [operation] = result.operations
     assert operation.memory is None and operation.support_revalidation_skipped
+
+
+async def _refine(client, *, supported=True):
+    return await reconcile_memories(
+        new_extractions=[candidate()],
+        existing_memories=[memory()],
+        llm_model="test-model", structured_llm_client=client,
+        supports=dict([pinned("memory", supported)]),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_revision_applies_only_when_its_pair_alone_is_verified():
+    preserving, dropping = Client("refines", "challenger_to_candidate"), Client("refines", "challenger_to_candidate")
+    dropping.refinement_answer = "drops"
+
+    revised, kept = await _refine(preserving), await _refine(dropping)
+
+    assert [op.action for op in revised.operations] == [ReconcileAction.UPDATE]
+    # A dropped fact counts as an ineligible proof: the old Memory stays and the Candidate is added.
+    assert [op.action for op in kept.operations] == [ReconcileAction.ADD, ReconcileAction.NOOP]
+    [prompt] = preserving.verified_prompts
+    assert "US releases require two reviewers." in prompt
+    assert "US releases require two reviewers from distinct teams." in prompt
+    assert '"pair_index": 0' in prompt and "<claim_catalog>" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_a_revision_that_cannot_be_verified_stays_uncertain():
+    from memforge.llm.structured import RefinementVerificationDecision, RefinementVerificationResponse
+
+    class Unanswerable(Client):
+        async def verify_refinements(self, prompt, **kwargs):
+            return RefinementVerificationResponse(
+                decisions=[RefinementVerificationDecision(pair_index=7, answer="preserves")],
+            )
+
+    result = await _refine(Unanswerable("refines", "challenger_to_candidate"))
+
+    assert result.failure is None and result.unresolved_candidate_count == 1
+    [operation] = result.operations
+    assert operation.action == ReconcileAction.NOOP and operation.relation_undecided
+
+
+@pytest.mark.asyncio
+async def test_a_failed_verification_call_fails_the_revision():
+    class Unreachable(Client):
+        async def verify_refinements(self, prompt, **kwargs):
+            raise StructuredLlmError("gateway timed out", terminal_category="deadline_exceeded", error_code="Timeout")
+
+    result = await _refine(Unreachable("refines", "challenger_to_candidate"))
+
+    assert result.failure is not None and result.failure.retryable and result.operations == []
+    assert "refinement verification failed" in result.failure.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("relation", "direction", "supported", "eligibility"),
+    [
+        # The Support line rejected the old claim: the coordinator's unresolved rule decides, not a revision.
+        ("refines", "challenger_to_candidate", False, True),
+        # No eligible proof, so nothing would be revised.
+        ("refines", "challenger_to_candidate", True, False),
+        ("contradicts", "symmetric", True, True),
+        ("equivalent", "symmetric", True, True),
+    ],
+)
+async def test_only_a_revision_otherwise_certain_is_verified(relation, direction, supported, eligibility):
+    client = Client(relation, direction, eligibility=eligibility)
+
+    await _refine(client, supported=supported)
+
+    assert getattr(client, "verified_prompts", []) == []
+
+
+
+def _refinement_ledger(*memory_ids):
+    from memforge.pipeline.reconciler import RelationLine
+    from memforge.pipeline.support_relation_coordinator import RelationLedgerEntry, RevisionCompositionProof
+    from memforge.memory.evidence import RelationDirection
+    from memforge.memory.relation_classifier import MemoryRelationType
+
+    return RelationLine(
+        entries=tuple(
+            RelationLedgerEntry(index, memory_id, MemoryRelationType.REFINES, RelationDirection.CHALLENGER_TO_CANDIDATE)
+            for index, memory_id in enumerate(memory_ids)
+        ),
+        proofs=tuple(RevisionCompositionProof(index, memory_id, True, True, True) for index, memory_id in enumerate(memory_ids)),
+        completed_candidate_count=len(memory_ids), incumbent_ids=frozenset(memory_ids),
+    )
+
+
+def _named(memory_id, claim):
+    from dataclasses import replace as replaced
+
+    return replaced(memory(), id=memory_id, content=claim)
+
+
+@pytest.mark.asyncio
+async def test_the_callers_coverage_verdict_decides_whether_revisions_are_verified():
+    """A Candidate carried from a pending Review lengthens the Candidate list; it must not switch verification off."""
+    from memforge.pipeline.reconciler import join_support_and_relation
+
+    carried = RawMemory(content="A carried claim from a pending Review.", memory_type="fact")
+    results = {}
+    for complete in (True, False):
+        client = Client("refines", "challenger_to_candidate")
+        client.refinement_answer = "drops"
+        results[complete] = (client, await join_support_and_relation(
+            _refinement_ledger("memory"), new_extractions=[candidate(), carried], existing_memories=[memory()],
+            supports=dict([pinned("memory", True)]), structured_llm_client=client, llm_model="test-model",
+            relation_complete=complete,
+        ))
+
+    verifying, verified = results[True]
+    assert len(verifying.verified_prompts) == 1
+    assert ReconcileAction.UPDATE not in [op.action for op in verified.operations]
+    # An incomplete line withholds every revision downstream, so nothing is asked.
+    skipping, _ = results[False]
+    assert getattr(skipping, "verified_prompts", []) == []
+
+
+@pytest.mark.asyncio
+async def test_each_pair_takes_its_own_answer():
+    from memforge.llm.structured import RefinementVerificationDecision, RefinementVerificationResponse
+    from memforge.pipeline.reconciler import join_support_and_relation
+
+    class PerClaim(Client):
+        async def verify_refinements(self, prompt, **kwargs):
+            answer = "drops" if "Old claim one." in prompt else "preserves"
+            index = 7 if "Old claim three." in prompt else 0
+            return RefinementVerificationResponse(decisions=[RefinementVerificationDecision(pair_index=index, answer=answer)])
+
+    incumbents = [_named("m1", "Old claim one."), _named("m2", "Old claim two."), _named("m3", "Old claim three.")]
+    candidates = [RawMemory(content=f"New claim {n}.", memory_type="fact") for n in ("one", "two", "three")]
+
+    result = await join_support_and_relation(
+        _refinement_ledger("m1", "m2", "m3"), new_extractions=candidates, existing_memories=incumbents,
+        supports={memory_id: pinned(memory_id, True)[1] for memory_id in ("m1", "m2", "m3")},
+        structured_llm_client=PerClaim("refines", "challenger_to_candidate"), llm_model="test-model",
+        relation_complete=True,
+    )
+
+    by_memory = {op.memory_id: op for op in result.operations if op.memory_id}
+    assert by_memory["m1"].action is ReconcileAction.NOOP and not by_memory["m1"].relation_undecided
+    assert by_memory["m2"].action is ReconcileAction.UPDATE
+    assert by_memory["m3"].relation_undecided
+    assert [op.memory.content for op in result.operations if op.action is ReconcileAction.ADD] == ["New claim one."]
+    assert (result.metrics.refinement_verification_count, result.metrics.refinement_verification_dropped_count,
+            result.metrics.refinement_verification_unjudged_count) == (3, 1, 1)
