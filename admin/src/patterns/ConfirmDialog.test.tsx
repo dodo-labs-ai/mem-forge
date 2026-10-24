@@ -79,3 +79,15 @@ test("a dialog that is not ready cannot go ahead", () => {
   renderTwoStepDialog(vi.fn(), false);
   expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
 });
+
+test("the confirmation text can be selected and copied", async () => {
+  const user = userEvent.setup();
+  renderDialog(vi.fn().mockResolvedValue(undefined));
+  const label = screen.getByText("Payroll wiki").closest("label");
+
+  expect(label).toHaveClass("select-text");
+  expect(label).not.toHaveClass("select-none");
+  await user.click(screen.getByRole("button", { name: "Copy Payroll wiki" }));
+
+  expect(await navigator.clipboard.readText()).toBe("Payroll wiki");
+});

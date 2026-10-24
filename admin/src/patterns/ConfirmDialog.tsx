@@ -1,4 +1,6 @@
-import { useState, type ReactNode } from "react";
+import { Copy } from "lucide-react";
+import { useRef, useState, type ReactNode } from "react";
+import { toast } from "sonner";
 import { errorMessage } from "@/lib/errors";
 import { Button } from "@/ui/button";
 import {
@@ -36,6 +38,13 @@ interface ConfirmDialogProps {
   onConfirm: () => Promise<unknown>;
 }
 
+function copyConfirmationText(text: string) {
+  navigator.clipboard.writeText(text).then(
+    () => toast.success("Name copied"),
+    () => toast.error("Could not copy"),
+  );
+}
+
 export function ConfirmDialog({
   open,
   onOpenChange,
@@ -50,6 +59,7 @@ export function ConfirmDialog({
   onConfirm,
 }: ConfirmDialogProps) {
   const [typed, setTyped] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
   const [continued, setContinued] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -85,17 +95,35 @@ export function ConfirmDialog({
 
   return (
     <Dialog open={open} onOpenChange={reset}>
-      <DialogContent showCloseButton={false}>
+      {/* A dialog that asks for the text at once opens on its input, not on the Copy button before it. */}
+      <DialogContent
+        showCloseButton={false}
+        initialFocus={confirmationText !== undefined && continueLabel === undefined ? inputRef : undefined}
+      >
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
         {confirmationText !== undefined && !reviewing ? (
           <div className="space-y-1.5">
-            <Label htmlFor="confirm-dialog-text">
-              Type <span className="font-mono font-medium">{confirmationText}</span> to confirm
-            </Label>
+            <div className="flex items-start gap-2">
+              {/* A sentence, not a flex row: a long name wraps inside it and can be selected. */}
+              <Label htmlFor="confirm-dialog-text" className="block min-w-0 flex-1 leading-normal select-text">
+                Type <span className="font-mono font-medium break-words select-all">{confirmationText}</span> to
+                confirm
+              </Label>
+              <Button
+                type="button"
+                size="icon-sm"
+                variant="ghost"
+                aria-label={`Copy ${confirmationText}`}
+                onClick={() => copyConfirmationText(confirmationText)}
+              >
+                <Copy aria-hidden />
+              </Button>
+            </div>
             <Input
+              ref={inputRef}
               id="confirm-dialog-text"
               value={typed}
               onChange={(event) => setTyped(event.target.value)}
