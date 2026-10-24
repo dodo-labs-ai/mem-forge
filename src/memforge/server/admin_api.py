@@ -2788,12 +2788,6 @@ def _source_paused_http_error() -> HTTPException:
     return HTTPException(status_code=400, detail="Source is paused")
 
 
-async def _raise_if_source_paused(db: Database, source_id: str) -> None:
-    source = await db.get_source(source_id)
-    if source and source.get("status") == SOURCE_PAUSED_STATUS:
-        raise _source_paused_http_error()
-
-
 class LocalSourcePackageRequest(BaseModel):
     """One raw local-source package pushed by the local daemon/adapter.
 
