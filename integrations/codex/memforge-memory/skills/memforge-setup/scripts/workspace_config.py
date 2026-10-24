@@ -22,6 +22,7 @@ sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 from memforge_plugin_config import configured_api_token, configured_target  # noqa: E402
 from memforge_repo_identity import normalize_repo_identifier  # noqa: E402
 from memforge_workspace_bindings import (  # noqa: E402
+    OBSOLETE_TARGET_KEYS,
     WorkspaceBindingError,
     load_workspace_bindings,
     resolve_workspace_binding,
@@ -128,6 +129,16 @@ def _cleanup(document: dict[str, Any], origin: str) -> None:
         document["targets"].pop(origin)
 
 
+def _obsolete_entries(document: dict[str, Any]) -> list[dict[str, Any]]:
+    """List every obsolete key in the file, for every target origin."""
+    return [
+        {"origin": origin, "key": key, "value": target[key]}
+        for origin, target in document.get("targets", {}).items()
+        if isinstance(target, dict)
+        for key in sorted(OBSOLETE_TARGET_KEYS & set(target))
+    ]
+
+
 def _atomic_write(path: Path, document: dict[str, Any]) -> None:
     if path.is_symlink():
         raise SetupError(f"refusing symlinked binding file: {path}")
@@ -172,7 +183,7 @@ def _mutate(args: argparse.Namespace) -> dict[str, Any]:
     target = configured_target()
     result = _base(args, path, target)
 
-    if args.operation in {"bind", "set-hook-workspace"}:
+    if args.operation == "bind":
         workspace_id = args.workspace.strip()
         if not workspace_id:
             raise SetupError("workspace must not be empty")
@@ -181,36 +192,18 @@ def _mutate(args: argparse.Namespace) -> dict[str, Any]:
     else:
         workspace_id = None
 
-    target_document = _target_document(document, target.origin)
-    if args.operation in {"bind", "unbind"}:
-        local_path, repository = _path_context(args.path)
-        directory_bindings = target_document.setdefault("directory_bindings", {})
-        repository_bindings = target_document.setdefault("repository_bindings", {})
-        if args.operation == "bind":
-            if repository is not None:
-                repository_bindings[repository] = workspace_id
-                binding_kind, binding_key = "repository", repository
-            else:
-                directory_bindings[str(local_path)] = workspace_id
-                binding_kind, binding_key = "directory", str(local_path)
-        elif str(local_path) in directory_bindings:
-            directory_bindings.pop(str(local_path))
-            binding_kind, binding_key = "directory", str(local_path)
-        elif repository is not None and repository in repository_bindings:
-            repository_bindings.pop(repository)
-            binding_kind, binding_key = "repository", repository
-        else:
-            raise SetupError("no exact directory or repository binding exists for this path")
-        result.update(binding_kind=binding_kind, binding_key=binding_key, workspace_id=workspace_id)
-    elif args.operation == "set-hook-workspace":
-        target_document["hook_workspace_id"] = workspace_id
-        result["workspace_id"] = workspace_id
-    elif args.operation == "clear-hook-workspace":
-        if "hook_workspace_id" not in target_document:
-            raise SetupError("hook workspace fallback is not configured for this target")
-        result["workspace_id"] = target_document.pop("hook_workspace_id")
+    if args.operation == "remove-obsolete-keys":
+        removed = _obsolete_entries(document)
+        if not removed:
+            raise SetupError("the binding file has no obsolete keys")
+        for entry in removed:
+            document["targets"][entry["origin"]].pop(entry["key"])
+            _cleanup(document, entry["origin"])
+        result["removed_obsolete_keys"] = removed
+    else:
+        _bind_or_unbind(args, document, target.origin, workspace_id, result)
+        _cleanup(document, target.origin)
 
-    _cleanup(document, target.origin)
     result["planned_document"] = document
     if args.apply:
         if args.expect_digest != before_digest:
@@ -220,6 +213,35 @@ def _mutate(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def _bind_or_unbind(
+    args: argparse.Namespace,
+    document: dict[str, Any],
+    origin: str,
+    workspace_id: str | None,
+    result: dict[str, Any],
+) -> None:
+    target_document = _target_document(document, origin)
+    local_path, repository = _path_context(args.path)
+    directory_bindings = target_document.setdefault("directory_bindings", {})
+    repository_bindings = target_document.setdefault("repository_bindings", {})
+    if args.operation == "bind":
+        if repository is not None:
+            repository_bindings[repository] = workspace_id
+            binding_kind, binding_key = "repository", repository
+        else:
+            directory_bindings[str(local_path)] = workspace_id
+            binding_kind, binding_key = "directory", str(local_path)
+    elif str(local_path) in directory_bindings:
+        directory_bindings.pop(str(local_path))
+        binding_kind, binding_key = "directory", str(local_path)
+    elif repository is not None and repository in repository_bindings:
+        repository_bindings.pop(repository)
+        binding_kind, binding_key = "repository", repository
+    else:
+        raise SetupError("no exact directory or repository binding exists for this path")
+    result.update(binding_kind=binding_kind, binding_key=binding_key, workspace_id=workspace_id)
+
+
 def _inspect(args: argparse.Namespace) -> dict[str, Any]:
     path = workspace_bindings_path()
     target = configured_target()
@@ -227,17 +249,15 @@ def _inspect(args: argparse.Namespace) -> dict[str, Any]:
     resolution = resolve_workspace_binding(
         origin=target.origin,
         working_directory=str(local_path),
-        allow_hook_default=False,
     )
     document = _load_document(path)
-    target_document = document.get("targets", {}).get(target.origin, {})
     return {
         **_base(args, path, target),
         "path": str(local_path),
         "repository": repository,
         "effective_workspace_id": resolution.workspace_id,
         "effective_source": resolution.source,
-        "hook_workspace_id": target_document.get("hook_workspace_id"),
+        "obsolete_keys": _obsolete_entries(document),
     }
 
 
@@ -254,13 +274,9 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--workspace", required=True)
         command.add_argument("--apply", action="store_true")
         command.add_argument("--expect-digest")
-    hook = subparsers.add_parser("set-hook-workspace")
-    hook.add_argument("--workspace", required=True)
-    hook.add_argument("--apply", action="store_true")
-    hook.add_argument("--expect-digest")
-    clear = subparsers.add_parser("clear-hook-workspace")
-    clear.add_argument("--apply", action="store_true")
-    clear.add_argument("--expect-digest")
+    obsolete = subparsers.add_parser("remove-obsolete-keys")
+    obsolete.add_argument("--apply", action="store_true")
+    obsolete.add_argument("--expect-digest")
     return parser
 
 

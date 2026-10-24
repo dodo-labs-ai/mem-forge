@@ -1,7 +1,7 @@
 {
   "name": "memory",
-  "version": "0.2.0-beta.1",
-  "description": "MemForge hook integration for Claude Code.",
+  "version": "0.2.0-beta.2",
+  "description": "MemForge memory for Claude Code: session-start guidance and MCP memory tools.",
   "author": {
     "name": "MemForge Team"
   },
