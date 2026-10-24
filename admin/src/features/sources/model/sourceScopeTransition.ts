@@ -22,6 +22,8 @@ export interface SourceScopeTransitionView {
   returning: boolean;
   /** Where the change stands, in a few words. */
   status: string;
+  /** What the change removes, and when. */
+  summary: string;
   /** Why the last sync left it open, as the server recorded it; null when there is nothing to add. */
   reason: string | null;
   /** The settings the change moves; empty when it returns to the previous scope or the viewer cannot read them. */
@@ -103,7 +105,22 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
+/**
+ * What a conversation source's change removes, and when it completes. Its next
+ * sync removes the deselected conversations, and nothing is listed.
+ */
+const CONVERSATION_REMOVAL = "The next sync removes the conversations the new selection leaves out.";
+const CONVERSATION_COMPLETION = "The change completes once every selected conversation is synced.";
+
+function summary(transition: SourceScopeTransition, returning: boolean): string {
+  if (transition.removes === "next_sync") return CONVERSATION_REMOVAL;
+  return returning
+    ? "Nothing the previous scope synced is removed. Once a sync lists it in full, items only the replaced change added are removed."
+    : "Nothing is removed until every item the new scope lists is synced. Each sync retries the items that failed.";
+}
+
 function progressLabel(transition: SourceScopeTransition, returning: boolean): string {
+  if (transition.removes === "next_sync") return CONVERSATION_COMPLETION;
   if (transition.excluded_scopes_due) {
     return "Every listed item is synced. The next sync checks what the previous scope held, then completes the change.";
   }
@@ -125,6 +142,7 @@ export function presentSourceScopeTransition(
   return {
     returning,
     status: STATUS_LABELS[transition.status],
+    summary: summary(transition, returning),
     reason: transition.status === "failed" && !transition.excluded_scopes_due ? transition.error : null,
     changes: scopeFieldChanges(transition, labels),
     progressLabel: progressLabel(transition, returning),
@@ -138,8 +156,6 @@ const SCOPE_CHANGE_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   source_sync_running: "A sync of this source is running. Stop the sync, then try again.",
   projection_scope_transition_stale:
     "The scope change in progress changed while you were looking at it. Reload the source, then try again.",
-  projection_scope_transition_active:
-    "This source finishes its scope change in progress before it accepts another one. Try again once it completes.",
   source_provider_namespace_immutable:
     "This change points the source at another site or project. Create a new source for it instead.",
   source_execution_mode_immutable:
@@ -170,8 +186,9 @@ export interface RestorePresentation {
  * The restore confirmation for a source, from the preview of saving its
  * restore configuration. A configuration that cannot list closes the change
  * and removes nothing. One that lists opens a change back to the previous
- * scope, which removes what only the replaced change added once a sync lists
- * the previous scope in full.
+ * scope, which removes what only the replaced change added: once a sync lists
+ * the previous scope in full for a document source, and in the next sync for a
+ * conversation source.
  */
 export function presentRestore(
   sourceName: string,
@@ -195,7 +212,9 @@ export function presentRestore(
       return {
         description:
           `This replaces the scope change in progress with a change back to ${sourceName}'s previous scope, keeping its other settings. `
-          + "Nothing the previous scope synced is removed. Once a sync lists the previous scope in full, items only the replaced change added are removed.",
+          + (preview.removes === "next_sync"
+            ? `${CONVERSATION_REMOVAL} ${CONVERSATION_COMPLETION}`
+            : "Nothing the previous scope synced is removed. Once a sync lists the previous scope in full, items only the replaced change added are removed."),
         ready: true,
       };
     case "refused":

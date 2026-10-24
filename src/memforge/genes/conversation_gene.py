@@ -74,10 +74,6 @@ class ConversationGene(Gene):
     def conversation_selection(self) -> ConversationSelection:
         """The selected conversations and time-scope policy of this Source's configuration."""
 
-    @abstractmethod
-    def selected_conversation_ids(self, projection_scope: Mapping[str, Any]) -> tuple[str, ...]:
-        """The conversations a projection scope of this Source selects."""
-
     def stored_unit_payload(self, body: bytes) -> Mapping[str, Any] | None:
         """The conversation Unit payload of a stored input this connector wrote in another form, if it did."""
 
@@ -125,13 +121,14 @@ class ConversationGene(Gene):
     def collection_attempt_id(self) -> str:
         return self._require_run().collection_attempt_id
 
-    def begin_scope_transition(self, *, previous_scope: Mapping[str, Any], target_scope: Mapping[str, Any]) -> None:
-        """Remove, in this run, every conversation the transition deselects."""
+    def begin_scope_transition(self) -> None:
+        """Mark this run as a run of an open Projection Scope transition.
 
-        run = self._require_run()
-        run.deselected = frozenset(self.selected_conversation_ids(previous_scope)) - frozenset(
-            self.selected_conversation_ids(target_scope)
-        )
+        Every run of the transition, starting with its first, removes the
+        conversations it deselects (:meth:`preview`).
+        """
+
+        self._require_run().in_transition = True
 
     def removals(self) -> dict[str, SourceRemoval]:
         """The Documents this attempt removes, each with its reason and the attempt that decided it.
@@ -175,7 +172,9 @@ class ConversationGene(Gene):
 
         Every target conversation the Source can read has poll evidence in the
         manifest, and no current Unit belongs to a conversation outside the
-        selection. A target the Source cannot read, or that is gone, does not
+        selection. That second test is the deselection every run of the
+        transition removes (:meth:`preview`), so it holds once those removals
+        commit. A target the Source cannot read, or that is gone, does not
         hold the transition open.
         """
 
@@ -204,21 +203,35 @@ class ConversationGene(Gene):
             yield item
 
     async def preview(self) -> SourcePlan:
-        """Plan this attempt from its Collection Manifest without projecting anything."""
+        """Plan this attempt from its Collection Manifest without projecting anything.
+
+        A run of an open transition deselects every conversation the Source
+        holds that the configured selection, the transition's target, leaves
+        out. Held conversations come only from the last applied scope and the
+        targets superseded since, so a chain of supersessions, or a return to
+        the last applied scope, removes what only a superseded target added,
+        with no walk of the chain. For example, A = {X} applied, A→B with
+        B = {X, Y} superseded by A→C with C = {X, Z}: the first run of A→C
+        removes Y's Units as removed from scope.
+        """
 
         run = self._require_run()
         manifest = await run.collections.manifest(self.source_id, run.collection_attempt_id)
         if manifest is None:
             raise CollectionMissing(f"collection attempt {run.collection_attempt_id} has no Collection Manifest")
         run.manifest = manifest
+        selection = self.conversation_selection()
+        deselected: frozenset[str] = frozenset()
+        if run.in_transition:
+            deselected = await run.reader.conversations_held(self.source_id) - frozenset(selection.conversation_ids)
         bodies = await run.collections.bodies(self.source_id, run.collection_attempt_id)
         run.plan = await run.layer.plan(
             manifest=manifest,
             bodies={identity: body.record for identity, body in bodies.items()},
             uploaded_artifacts=await run.collections.uploaded_artifacts(self.source_id, bodies),
-            selection=self.conversation_selection(),
+            selection=selection,
             attempt_started_at=manifest.received_at,
-            deselected_conversation_ids=run.deselected,
+            deselected_conversation_ids=deselected,
         )
         return run.plan
 
@@ -269,7 +282,7 @@ class _ConversationRun:
         self.reader = reader
         self.collections = collections
         self.collection_attempt_id = collection_attempt_id
-        self.deselected: frozenset[str] = frozenset()
+        self.in_transition = False
         self.manifest: CollectionManifest | None = None
         self.plan: SourcePlan | None = None
 

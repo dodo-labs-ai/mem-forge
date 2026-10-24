@@ -51,16 +51,24 @@ class PollOutcome(str, Enum):
     provider that may place an older message on a newer page, such as Teams
     placing a deleted message where it was deleted, takes that time from its
     own certificate, never from the times of the messages it returned.
+
+    A poll that returned a message names the time its read is complete from,
+    whatever its outcome; only a poll that returned nothing may name none.
     """
 
     # The read was complete from before the requested start, so the provider
-    # showed history at least that far back.
+    # showed history at least that far back; the complete time lies before
+    # that start.
     REACHED_START = "reached_start"
-    # Paging finished without showing one: the provider has nothing older to
-    # show, which may be hidden history as well as the conversation's start.
+    # Paging read every page the provider holds before the requested start was
+    # reached: the provider has nothing older to show, which may be hidden
+    # history as well as the conversation's start. The complete time is the
+    # oldest page's, at or after the requested start.
     HISTORY_EXHAUSTED = "history_exhausted"
     # Paging stopped before either, for example on a time budget. What was
-    # read contiguously from the newest message still counts.
+    # read contiguously from the newest message still counts, from the time
+    # the last fully read page is complete from, which lies inside the
+    # requested interval.
     STOPPED_EARLY = "stopped_early"
 
 
@@ -172,8 +180,10 @@ class ConversationPoll:
     messages: tuple[ProviderMessage, ...]
     outcome: PollOutcome
     # The time the read is complete from (see PollOutcome): earlier than the
-    # requested start when paging reached it; when paging stopped early, the
-    # time the last fully read page is complete from.
+    # requested start when paging reached it; the oldest page's, at or after
+    # the requested start, when history ran out; when paging stopped early,
+    # the time the last fully read page is complete from, inside the requested
+    # interval. A poll that returned a message always names it.
     earliest_complete_page_time: datetime | None = None
     stop_reason: str = ""
 

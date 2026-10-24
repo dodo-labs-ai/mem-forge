@@ -173,7 +173,6 @@ agents that do the work.
   <tr>
     <td>Planned</td>
     <td nowrap>
-      <img src="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/icons/slack.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Slack&nbsp;&nbsp;&nbsp;
       <img src="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/icons/obsidian.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Obsidian
     </td>
   </tr>

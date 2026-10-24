@@ -17,11 +17,12 @@ from memforge.conversations.layer import ConversationSelection
 from memforge.conversations.membership import PlannedUnit
 from memforge.conversations.projection import unit_payload
 from memforge.conversations.records import MessageIdentity, record_created_at, record_revision
+from memforge.conversations.time_scope import MAX_INITIAL_HISTORY_DAYS
 from memforge.conversations.units import Member
 from memforge.genes.conversation_gene import ConversationGene
 from memforge.genes.teams_provider import teams_conversation_label
 from memforge.genes.toolkit.config import FieldIssue, SourceConfigInvalid
-from memforge.local_agent.source_contract import TEAMS_MAX_INITIAL_HISTORY_DAYS, TEAMS_ROLLING_RETENTION_PRESETS
+from memforge.local_agent.source_contract import TEAMS_ROLLING_RETENTION_PRESETS
 from memforge.local_agent.teams_contract import validate_teams_canonical_messages
 from memforge.models import (
     ConfigField,
@@ -152,12 +153,12 @@ class TeamsGene(ConversationGene):
         config["conversation_ids"] = list(conversation_ids)
         if "initial_history_days" not in config:
             config["initial_history_days"] = config.get("max_age_days", 14)
-        history_rule = f"Teams initial history must be between 1 and {TEAMS_MAX_INITIAL_HISTORY_DAYS} days"
+        history_rule = f"Teams initial history must be between 1 and {MAX_INITIAL_HISTORY_DAYS} days"
         try:
             initial_history_days = int(config["initial_history_days"])
         except (TypeError, ValueError):
             raise _refused("initial_history_days", history_rule) from None
-        if not 1 <= initial_history_days <= TEAMS_MAX_INITIAL_HISTORY_DAYS:
+        if not 1 <= initial_history_days <= MAX_INITIAL_HISTORY_DAYS:
             raise _refused("initial_history_days", history_rule)
         config["initial_history_days"] = initial_history_days
         retention = config.get("rolling_retention_days")
@@ -185,16 +186,13 @@ class TeamsGene(ConversationGene):
         """Nothing to authenticate on the server: the device holds the Teams session."""
 
     def conversation_selection(self) -> ConversationSelection:
+        from memforge.local_agent.source_contract import canonical_teams_conversation_ids
+
         return ConversationSelection(
-            conversation_ids=self.selected_conversation_ids(self.config),
+            conversation_ids=canonical_teams_conversation_ids(self.config),
             initial_history_days=int(self.config["initial_history_days"]),
             rolling_retention_days=self.config.get("rolling_retention_days"),
         )
-
-    def selected_conversation_ids(self, projection_scope: Mapping[str, Any]) -> tuple[str, ...]:
-        from memforge.local_agent.source_contract import canonical_teams_conversation_ids
-
-        return canonical_teams_conversation_ids(projection_scope)
 
     def stored_unit_payload(self, body: bytes) -> Mapping[str, Any] | None:
         """The conversation Unit payload of a stored input in window-package form."""

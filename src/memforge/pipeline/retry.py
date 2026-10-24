@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ async def retry_async(
     base_delay: float = 2.0,
     retryable_exceptions: tuple = (Exception,),
     description: str = "API call",
+    sleep: Callable[[float], Awaitable[object]] | None = None,
 ) -> T:
     """Retry an async operation with exponential backoff.
 
@@ -41,6 +43,8 @@ async def retry_async(
         Tuple of exception types that should trigger a retry.
     description:
         Human-readable description for log messages.
+    sleep:
+        Waits out each backoff delay; ``asyncio.sleep`` by default.
 
     Returns
     -------
@@ -63,7 +67,7 @@ async def retry_async(
                     "%s failed (attempt %d/%d): %s. Retrying in %.1fs...",
                     description, attempt + 1, max_retries + 1, e, delay,
                 )
-                await asyncio.sleep(delay)
+                await (sleep or asyncio.sleep)(delay)
             else:
                 logger.error(
                     "%s failed after %d attempts: %s",

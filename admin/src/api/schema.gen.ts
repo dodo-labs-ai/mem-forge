@@ -2184,8 +2184,9 @@ export interface paths {
          * Plan Conversation Collection
          * @description What one uploaded device collection attempt would change, without processing it.
          *
-         *     The plan is the one a sync run would make now, including the removals
-         *     of an open Projection Scope transition.
+         *     The plan is the one a sync run would make now: the run's collection
+         *     family binds the attempt and starts the open Projection Scope
+         *     transition, with its removals, as the run does.
          */
         post: operations["plan_conversation_collection_api_v1_sources__source_id__conversation_collection_plan_post"];
         delete?: never;
@@ -2493,9 +2494,10 @@ export interface paths {
          * @description What saving this configuration would do to the Source's scope, without saving it.
          *
          *     The configuration form reads it before saving, to warn about a mode
-         *     that cannot list a scope change and about replacing the change in
-         *     progress. It decides as ``PUT /sources/{id}`` does, from the same
-         *     stored facts; a configuration the source type rejects answers 400.
+         *     that cannot list a scope change, about replacing the change in
+         *     progress, and about when removal happens. It decides as
+         *     ``PUT /sources/{id}`` does, from the same stored facts; a
+         *     configuration the source type rejects answers 400.
          */
         post: operations["preview_source_scope_change_api_v1_sources__source_id__scope_change_preview_post"];
         delete?: never;
@@ -6626,14 +6628,20 @@ export interface components {
          * @description What saving a configuration would do to the Source's scope, decided as ``PUT /sources/{id}`` decides it.
          *
          *     - ``unchanged``: the scope stays as it is.
-         *     - ``opens_transition``: a scope change opens; nothing is removed until it completes.
-         *     - ``supersedes_transition``: the change replaces the scope change in progress.
+         *     - ``opens_transition``: a scope change opens.
+         *     - ``supersedes_transition``: the change replaces the scope change in progress with a change
+         *       from the last applied scope to the new one.
          *     - ``restores_previous_scope``: the change returns to the last applied scope, which the
          *       configuration cannot list. The change in progress closes, none opens, and nothing is removed.
          *     - ``returns_to_previous_scope``: the change returns to the last applied scope and replaces the
-         *       change in progress with a change back to it. Nothing that scope synced is removed; once a
-         *       sync lists it in full, what only the replaced change added is removed.
+         *       change in progress with a change back to it. Nothing that scope synced is removed; what only
+         *       the replaced change added is removed as ``removes`` says.
          *     - ``refused``: saving answers 409, as ``refusal`` says.
+         *
+         *     ``removes`` says when a change that opens removes what its new scope leaves out:
+         *     ``at_completion`` for a document Source, where nothing is removed until a sync lists the new
+         *     scope in full and every listed item has committed; ``next_sync`` for a conversation Source,
+         *     whose next sync removes the conversations the new selection leaves out.
          *
          *     ``open_transition`` says whether a scope change is in progress now.
          */
@@ -6646,6 +6654,12 @@ export interface components {
              */
             outcome: "unchanged" | "opens_transition" | "supersedes_transition" | "restores_previous_scope" | "returns_to_previous_scope" | "refused";
             refusal?: components["schemas"]["SourceScopeChangeRefusalResponse"] | null;
+            /**
+             * Removes
+             * @description When a change that opens removes what the new scope leaves out: at_completion (a document Source) or next_sync (a conversation Source).
+             * @enum {string}
+             */
+            removes: "at_completion" | "next_sync";
         };
         /**
          * SourceScopeChangeRefusalResponse
@@ -6654,7 +6668,7 @@ export interface components {
         SourceScopeChangeRefusalResponse: {
             /**
              * Code
-             * @description scope_change_requires_listing, transition_requires_listing, projection_scope_transition_active, source_provider_namespace_immutable or source_execution_mode_immutable.
+             * @description scope_change_requires_listing, transition_requires_listing, source_provider_namespace_immutable or source_execution_mode_immutable.
              */
             code: string;
             /** Message */
@@ -6670,23 +6684,29 @@ export interface components {
          * @description The scope change a Source is applying.
          *
          *     A change of what a Source syncs opens a transition from the last applied
-         *     scope to the new one. Its syncs commit the items the new scope lists,
-         *     and once every listed item has committed, the change completes and what
-         *     the new scope leaves out is removed. Until then nothing is removed.
-         *     ``members_committed`` of ``listed_count`` items have committed; the
-         *     count is ``null`` until a sync lists the new scope in full.
-         *     ``failing_items`` are the failed items not yet committed under the
-         *     change; one the new scope lists keeps it open until a sync commits it,
-         *     and one only the previous scope held is settled when the change
-         *     completes.
+         *     scope to the new one. ``removes`` says when what the new scope leaves
+         *     out is removed:
+         *
+         *     - ``at_completion`` (a document Source): its syncs commit the items the
+         *       new scope lists, and once every listed item has committed, the change
+         *       completes and what the new scope leaves out is removed. Until then
+         *       nothing is removed. ``members_committed`` of ``listed_count`` items
+         *       have committed; the count is ``null`` until a sync lists the new scope
+         *       in full. ``failing_items`` are the failed items not yet committed under
+         *       the change; one the new scope lists keeps it open until a sync commits
+         *       it, and one only the previous scope held is settled when the change
+         *       completes.
+         *     - ``next_sync`` (a conversation Source): the next sync removes the
+         *       conversations the new selection leaves out, and the change completes
+         *       once every selected conversation is synced. Nothing is listed, so
+         *       ``listed_count`` stays ``null``.
          *
          *     Saving ``restore_config`` with ``PUT /sources/{id}``, with this
          *     transition's ``id`` as ``expected_scope_transition_id``, returns to the
          *     previous scope: it replaces the change in progress, and nothing the
          *     previous scope synced is removed. It is ``null`` when the viewer cannot
-         *     change the configuration, the Source cannot replace a change in progress
-         *     and waits for it to complete, or the change already returns to the
-         *     previous scope.
+         *     change the configuration, or the change already returns to the previous
+         *     scope.
          */
         SourceScopeTransitionResponse: {
             /** Created At */
@@ -6715,6 +6735,12 @@ export interface components {
             previous_scope: {
                 [key: string]: unknown;
             } | null;
+            /**
+             * Removes
+             * @description When the change removes what the new scope leaves out: at_completion, once every listed item has committed (a document Source); next_sync, the deselected conversations in the next sync (a conversation Source).
+             * @enum {string}
+             */
+            removes: "at_completion" | "next_sync";
             /** Restore Config */
             restore_config: {
                 [key: string]: unknown;
