@@ -148,7 +148,8 @@ class _Visit:
 
     ``context`` is the nearest page or database above the step, as
     ``(id32, "page" | "database")``; ``named_by`` is the page, block or
-    database whose children named a database.
+    database whose children named a database. A child database is in the
+    tree when its own parent is either of them.
     """
 
     kind: str
@@ -427,7 +428,9 @@ class NotionGene(DocumentGene):
                     continue
                 if database.get("in_trash") is True:
                     continue
-                if notion_parent(database, f"database {visit.object_id}")[1] != visit.named_by:
+                # Notion may parent a database in a column or toggle to that block or to the page holding it.
+                parent_id = notion_parent(database, f"database {visit.object_id}")[1]
+                if parent_id not in {visit.named_by, visit.context[0]}:
                     counts["skipped_outside_tree"] += 1
                     continue
                 stack.extend(reversed(_database_visits(database, visit.object_id, counts)))
